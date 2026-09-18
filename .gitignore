@@ -1,0 +1,27 @@
+# Local configuration and secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# JavaScript / TypeScript
+node_modules/
+.pnpm-store/
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Rust
+target/
+
+# Logs and local runtime artifacts
+*.log
+logs/
+tmp/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

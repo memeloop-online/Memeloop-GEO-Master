@@ -2,16 +2,17 @@
 
 只保留未完成工作和当前验收目标；完成项从本文件移除，细节写入 `WORKLOG.md`。
 
-## 当前：W01 工程基础
+## 当前：W02 组织、项目与总览
 
-- [ ] 建立 Rust workspace、API 服务、健康检查、配置与测试。
-- [ ] 建立 React/Vite/Fluent UI 工作台、路由、主题和测试。
-- [ ] 定义 OpenAPI、统一错误、操作资源、SSE 事件信封和幂等中间件。
-- [ ] 建立本地 PostgreSQL/NATS/Redis/S3 开发环境与迁移骨架。
-- [ ] 建立格式化、静态检查、单元测试和 CI。
-- [ ] 完成 W01 本地启动与验收。
+- [ ] 实现 Operator/Tenant/Project 领域、PostgreSQL 仓储和作用域测试。
+- [ ] 实现项目创建、查询与更新 API，并接入持久化幂等记录。
+- [ ] 将 P01 四步向导接入 API；P02 使用真实项目/运行摘要数据。
+- [ ] 为 W02 增加 OpenAPI、前后端测试和本地演示种子。
 
-## 下一步
+## 待补验证
 
-- [ ] W02：Operator/Tenant/Project、P01 设置与 P02 总览。
-- [ ] 首个纵切：知识 → 基线 → 策略 → 内容 → 检查 → 账号池 → WordPress/Ghost 发布 → 验证 → 复测。
+- [ ] 容器镜像可用后，以 `GEO_TEST_DATABASE_URL` 在空 PostgreSQL 上执行嵌入迁移集成测试。
+
+## 纵切目标
+
+- [ ] 知识 → 基线 → 策略 → 内容 → 检查 → 账号池 → WordPress/Ghost 发布 → 验证 → 复测。

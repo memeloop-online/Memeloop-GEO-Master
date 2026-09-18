@@ -1,0 +1,11 @@
+[package]
+name = "geo-persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

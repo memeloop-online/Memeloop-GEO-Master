@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect frontend workspace
+        id: workspace
+        shell: bash
+        run: |
+          present=false
+          for directory in apps packages; do
+            if [[ -d "$directory" ]] && find "$directory" -name package.json -print -quit | grep -q .; then
+              present=true
+              break
+            fi
+          done
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        if: steps.workspace.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies
+        if: steps.workspace.outputs.present == 'true'
+        shell: bash
+        run: |
+          corepack enable
+          if [[ -f pnpm-lock.yaml ]]; then
+            pnpm install --frozen-lockfile
+          else
+            pnpm install --no-frozen-lockfile
+          fi
+
+      - name: Check frontend format, types, and tests
+        if: steps.workspace.outputs.present == 'true'
+        run: |
+          pnpm run format:check
+          pnpm run typecheck
+          pnpm run test
+          pnpm run build
+
+      - name: Report deferred frontend setup
+        if: steps.workspace.outputs.present != 'true'
+        run: echo "No frontend workspace yet; checks will run when apps/ or packages/ contains package.json."
+
+  backend:
+    name: Backend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Rust workspace
+        id: workspace
+        shell: bash
+        run: echo "present=$([[ -f Cargo.toml ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust
+        if: steps.workspace.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check backend format, lint, and tests
+        if: steps.workspace.outputs.present == 'true'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --all-targets
+
+      - name: Report deferred backend setup
+        if: steps.workspace.outputs.present != 'true'
+        run: echo "No Cargo.toml yet; checks will run when the Rust workspace is added."
