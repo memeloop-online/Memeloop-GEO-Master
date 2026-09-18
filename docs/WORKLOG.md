@@ -30,3 +30,12 @@
 - 前端格式、类型检查、8 项测试和生产构建通过；Rust 格式、Clippy `-D warnings`、16 项测试通过，另有 1 项 PostgreSQL 实库测试因未配置 `GEO_TEST_DATABASE_URL` 跳过。
 - Astra 对照冻结计划审计 W02：现有估算的文档/平台/样本推导仍无真实能力快照依据；下一步改为三类独立且可为 unknown 的分母，并在同一事务创建配置版本、Cycle、两份未封存 manifest、Operation、Workflow 和 outbox。
 - `0004_tenant_rls.sql` 仍是安全 no-op；在所有 repository 完成事务级 scope 和非 bypass 角色实测前，不宣称生产 RLS 已完成。
+- 完成 W02 配置契约：项目时区、周报日/时间与截止、上一自然周窗口、文档范围、发布范围、目标、版本化来源引用；草稿允许不完整，启动使用独立严格校验。
+- 周报窗口按项目时区的下一次周报触发计算，覆盖周日 23:59 截止、跨年和 DST 缺口；总览更新时间不再错误使用未来截止时间。
+- 估算改为文档、文档×平台、AI 测量三类独立分母及三阶段费用；KnowledgeRelease、CapabilitySnapshot、MeasurementProtocol、PricingSnapshot 未形成时返回 unknown 和明确阻塞原因，不根据资料数量伪造覆盖。
+- PostgreSQL `0005_atomic_project_start.sql` 与 repository 在同一事务创建 ProjectConfigRevision、OptimizationCycle、两份未封存 manifest、WorkflowRun、Operation、`cycle.created` outbox、启动记录和项目当前句柄；内存实现使用单锁并通过故障注入验证失败不留部分状态。
+- 启动命令使用 `expected_revision`、稳定 Operation ID、哈希后的幂等键和请求哈希；同键同请求重放同一回执，同键异请求或不同键重复启动冲突；GET `/projects/:id/start` 支持刷新恢复。
+- P01 收口为三步，草稿只创建一次并按 revision 串行自动保存；产品和目标用户可选且可通过 PATCH `null` 清空；P02 展示持久化配置、周期和两份 manifest 句柄。
+- 文件上传 API 尚未实现，P01 明确提示且只提交真实可用的 URL、文本、对象引用和已有知识集合引用；上传会话与解析转入 W03。
+- 真实浏览器完成“登录 → 工作区 → 三步配置 → unknown 估算 → 原子启动 → 总览 → 刷新恢复”验收；两份清单显示为未封存骨架，资料、基线和计划均未伪称完成，本轮无新增控制台错误。
+- 前端格式、类型、11 项测试和生产构建通过；Rust 格式、Clippy `-D warnings`、13 项 API、1 项应用、3 项领域、3 项持久化测试及 doctest 通过。另有 2 项 PostgreSQL 条件测试因未配置 `GEO_TEST_DATABASE_URL` 跳过。

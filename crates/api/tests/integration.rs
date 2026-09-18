@@ -212,12 +212,11 @@ async fn project_lifecycle_is_session_scoped_and_idempotent() {
     assert_eq!(estimate.status(), StatusCode::OK);
     let estimate_body: Value =
         serde_json::from_slice(&to_bytes(estimate.into_body(), 64 * 1024).await.unwrap()).unwrap();
-    assert!(!estimate_body["basis"].as_array().unwrap().is_empty());
+    assert_eq!(estimate_body["coverage"]["documents"]["state"], "unknown");
+    assert_eq!(estimate_body["costs"]["total"]["state"], "unknown");
+    assert!(estimate_body["blockers"].as_array().unwrap().len() >= 4);
     assert!(!estimate_body["assumptions"].as_array().unwrap().is_empty());
-    assert!(
-        estimate_body["total"]["minimum_minor"].as_i64().unwrap()
-            <= estimate_body["total"]["maximum_minor"].as_i64().unwrap()
-    );
+    assert_eq!(estimate_body["budget"]["measurement_reserve_minor"], 20000);
 
     let start = app
         .clone()
@@ -227,21 +226,21 @@ async fn project_lifecycle_is_session_scoped_and_idempotent() {
             &cookie,
             Some(&csrf),
             Some("project-start-1"),
-            "",
+            r#"{"expected_revision":1}"#,
         ))
         .await
         .unwrap();
     assert_eq!(start.status(), StatusCode::ACCEPTED);
     let start_body = to_bytes(start.into_body(), 64 * 1024).await.unwrap();
-    let operation: Value = serde_json::from_slice(&start_body).unwrap();
-    assert_eq!(operation["kind"], "project.start");
-    assert_eq!(operation["result"]["frozen_revision"], 1);
+    let acceptance: Value = serde_json::from_slice(&start_body).unwrap();
+    assert_eq!(acceptance["status"], "accepted");
     assert_eq!(
-        operation["result"]["initial_sources"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
+        acceptance["document_manifest"]["state"],
+        "awaiting_knowledge"
+    );
+    assert_eq!(
+        acceptance["distribution_manifest"]["state"],
+        "awaiting_documents"
     );
 
     let start_replay = app
@@ -252,7 +251,7 @@ async fn project_lifecycle_is_session_scoped_and_idempotent() {
             &cookie,
             Some(&csrf),
             Some("project-start-1"),
-            "",
+            r#"{"expected_revision":1}"#,
         ))
         .await
         .unwrap();
@@ -261,6 +260,28 @@ async fn project_lifecycle_is_session_scoped_and_idempotent() {
         to_bytes(start_replay.into_body(), 64 * 1024).await.unwrap(),
         start_body
     );
+
+    let started_overview = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/projects/{project_id}/overview?tenant_id={tenant_id}"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started_overview.status(), StatusCode::OK);
+    let started_overview: Value = serde_json::from_slice(
+        &to_bytes(started_overview.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(started_overview["cycle"]["status"], "not_started");
+    assert_eq!(started_overview["cycle"]["awaiting_knowledge"], true);
+    assert_eq!(started_overview["knowledge"]["status"], "empty");
+    assert_eq!(started_overview["benchmark"]["status"], "not_started");
 
     let stale_patch = app
         .clone()
@@ -376,7 +397,7 @@ async fn viewer_can_read_projects_but_cannot_estimate_patch_or_start() {
             "monthly_budget_minor":1000,
             "budget_currency":"CNY",
             "monitoring_reserve_percent":20,
-            "initial_sources":[]
+            "initial_sources":[{"kind":"url","value":"https://example.com","visibility":"public"}]
         }
     }"#;
     let created = app
@@ -451,7 +472,7 @@ async fn viewer_can_read_projects_but_cannot_estimate_patch_or_start() {
             &viewer_cookie,
             Some(&viewer_csrf),
             Some("viewer-fixture-start"),
-            "",
+            r#"{"expected_revision":1}"#,
         ))
         .await
         .unwrap();
@@ -459,7 +480,7 @@ async fn viewer_can_read_projects_but_cannot_estimate_patch_or_start() {
 }
 
 #[tokio::test]
-async fn start_recovers_from_a_persisted_operation_marker() {
+async fn start_replay_and_get_return_the_persisted_acceptance() {
     let operation_store = Arc::new(geo_api::MemoryOperationStore::default());
     let state = AppState::with_stores_and_auth_and_projects(
         operation_store.clone(),
@@ -486,7 +507,7 @@ async fn start_recovers_from_a_persisted_operation_marker() {
             "monthly_budget_minor":1000,
             "budget_currency":"CNY",
             "monitoring_reserve_percent":20,
-            "initial_sources":[]
+            "initial_sources":[{"kind":"url","value":"https://example.com","visibility":"public"}]
         }
     }"#;
     let created = app
@@ -505,24 +526,8 @@ async fn start_recovers_from_a_persisted_operation_marker() {
         serde_json::from_slice(&to_bytes(created.into_body(), 64 * 1024).await.unwrap()).unwrap();
     let project_id: geo_domain::ProjectId = created["id"].as_str().unwrap().parse().unwrap();
     let key = "recoverable-start";
-    let operation_scope = TenantScope::new(
-        DEVELOPMENT_OPERATOR_ID,
-        DEVELOPMENT_TENANT_ID,
-        Some(project_id),
-    );
-    let mut operation = Operation::queued("project.start", operation_scope.clone());
-    operation.id = geo_api::project_start_operation_id(&operation_scope, key);
-    operation.result = Some(json!({
-        "project_id": project_id,
-        "frozen_revision": 1,
-        "config_revision": 1,
-        "project_revision": 2,
-        "initial_sources": []
-    }));
-    let operation_id = operation.id;
-    operation_store.insert(operation).await;
 
-    let recovered = app
+    let started = app
         .clone()
         .oneshot(authenticated_json_request(
             "POST",
@@ -530,14 +535,46 @@ async fn start_recovers_from_a_persisted_operation_marker() {
             &cookie,
             Some(&csrf),
             Some(key),
-            "",
+            r#"{"expected_revision":1}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(recovered.status(), StatusCode::ACCEPTED);
-    let recovered: Value =
-        serde_json::from_slice(&to_bytes(recovered.into_body(), 64 * 1024).await.unwrap()).unwrap();
-    assert_eq!(recovered["id"], operation_id.to_string());
+    assert_eq!(started.status(), StatusCode::ACCEPTED);
+    let started = to_bytes(started.into_body(), 64 * 1024).await.unwrap();
+
+    let replay = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects/{project_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some(key),
+            r#"{"expected_revision":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        to_bytes(replay.into_body(), 64 * 1024).await.unwrap(),
+        started
+    );
+
+    let persisted = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/projects/{project_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(persisted.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(persisted.into_body(), 64 * 1024).await.unwrap(),
+        started
+    );
 
     let detail = app
         .oneshot(authenticated_request(
@@ -581,7 +618,7 @@ async fn concurrent_same_key_start_returns_one_deterministic_operation() {
             "monthly_budget_minor":1000,
             "budget_currency":"CNY",
             "monitoring_reserve_percent":20,
-            "initial_sources":[]
+            "initial_sources":[{"kind":"url","value":"https://example.com","visibility":"public"}]
         }
     }"#;
     let created = app
@@ -606,7 +643,7 @@ async fn concurrent_same_key_start_returns_one_deterministic_operation() {
         &cookie,
         Some(&csrf),
         Some("concurrent-start"),
-        "",
+        r#"{"expected_revision":1}"#,
     );
     let request_b = authenticated_json_request(
         "POST",
@@ -614,7 +651,7 @@ async fn concurrent_same_key_start_returns_one_deterministic_operation() {
         &cookie,
         Some(&csrf),
         Some("concurrent-start"),
-        "",
+        r#"{"expected_revision":1}"#,
     );
     let (response_a, response_b) =
         tokio::join!(app.clone().oneshot(request_a), app.oneshot(request_b));
@@ -628,7 +665,7 @@ async fn concurrent_same_key_start_returns_one_deterministic_operation() {
     let body_b: Value =
         serde_json::from_slice(&to_bytes(response_b.into_body(), 64 * 1024).await.unwrap())
             .unwrap();
-    assert_eq!(body_a["id"], body_b["id"]);
+    assert_eq!(body_a["operation_id"], body_b["operation_id"]);
     assert_eq!(operation_store.len().await, 1);
 }
 
@@ -648,6 +685,213 @@ fn authenticated_request(
         builder = builder.header(geo_api::CSRF_HEADER, csrf);
     }
     builder.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn atomic_start_enforces_draft_start_and_business_idempotency_contracts() {
+    let state = AppState::development_with_password("test-password");
+    let mut events = state.events().subscribe();
+    let app = router(state);
+    let (cookie, csrf, _) = login(&app).await;
+    let tenant_id = DEVELOPMENT_TENANT_ID.to_string();
+
+    let empty = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("empty-draft"),
+            r#"{"display_name":"Empty draft","settings":{}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::CREATED);
+    let empty: Value =
+        serde_json::from_slice(&to_bytes(empty.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let empty_id = empty["id"].as_str().unwrap();
+    let never_started = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/projects/{empty_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(never_started.status(), StatusCode::NOT_FOUND);
+    let invalid_start = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects/{empty_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("empty-start"),
+            r#"{"expected_revision":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_start.status(), StatusCode::BAD_REQUEST);
+
+    let valid = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("url-only-draft"),
+            r#"{
+                "display_name":"URL-only source",
+                "settings":{
+                    "brand_name":"Acme",
+                    "product_name":"Widget",
+                    "market":"CN",
+                    "language":"zh-CN",
+                    "target_audience":"Administrators",
+                    "objective":"Improve answer coverage",
+                    "initial_sources":[{"kind":"url","value":"https://example.com","visibility":"public"}]
+                }
+            }"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::CREATED);
+    let valid: Value =
+        serde_json::from_slice(&to_bytes(valid.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let valid_id = valid["id"].as_str().unwrap();
+    let cleared = app
+        .clone()
+        .oneshot({
+            let mut request = authenticated_json_request(
+                "PATCH",
+                &format!("/api/v1/projects/{valid_id}?tenant_id={tenant_id}"),
+                &cookie,
+                Some(&csrf),
+                Some("clear-optionals"),
+                r#"{
+                    "revision":1,
+                    "settings":{
+                        "product_name":null,
+                        "target_audience":null,
+                        "objective":null
+                    }
+                }"#,
+            );
+            request
+                .headers_mut()
+                .insert("if-match", "1".parse().unwrap());
+            request
+        })
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let cleared: Value =
+        serde_json::from_slice(&to_bytes(cleared.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(cleared["settings"]["product_name"], Value::Null);
+    assert_eq!(cleared["settings"]["target_audience"], Value::Null);
+    assert_eq!(cleared["settings"]["objective"], Value::Null);
+
+    let stale = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects/{valid_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("stale-start"),
+            r#"{"expected_revision":99}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let started = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects/{valid_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("business-key"),
+            r#"{"expected_revision":2}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::ACCEPTED);
+    let started = to_bytes(started.into_body(), 64 * 1024).await.unwrap();
+    let event = events.recv().await.expect("cycle.created event");
+    assert_eq!(event.event_type, "cycle.created");
+    assert_eq!(
+        event.project_id.map(|value| value.to_string()),
+        Some(valid_id.to_owned())
+    );
+    assert_eq!(event.aggregate_version, 1);
+
+    let same_key_other_body = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects/{valid_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("business-key"),
+            r#"{"expected_revision":3}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(same_key_other_body.status(), StatusCode::CONFLICT);
+    let other_key = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects/{valid_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("different-business-key"),
+            r#"{"expected_revision":2}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_key.status(), StatusCode::CONFLICT);
+
+    let persisted = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/projects/{valid_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(persisted.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(persisted.into_body(), 64 * 1024).await.unwrap(),
+        started
+    );
+
+    let status_patch = app
+        .oneshot({
+            let mut request = authenticated_json_request(
+                "PATCH",
+                &format!("/api/v1/projects/{valid_id}?tenant_id={tenant_id}"),
+                &cookie,
+                Some(&csrf),
+                Some("forged-status"),
+                r#"{"revision":3,"status":"active"}"#,
+            );
+            request
+                .headers_mut()
+                .insert("if-match", "3".parse().unwrap());
+            request
+        })
+        .await
+        .unwrap();
+    assert_eq!(status_patch.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]

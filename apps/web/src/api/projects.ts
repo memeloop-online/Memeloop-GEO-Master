@@ -1,31 +1,66 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor, type QueryScope } from "../auth/types";
-import { apiFetch, type ApiRequestOptions } from "./client";
+import { ApiError, apiFetch, type ApiRequestOptions } from "./client";
 
 export type ProjectStatus = "draft" | "active" | "paused" | "archived";
 export type ResourceMode = "own" | "platform" | "mixed";
-export type SourceKind = "url" | "text";
+export type SourceKind = "url" | "text" | "object" | "knowledge_collection";
 export type SourceVisibility = "public" | "internal";
 
 export interface InitialSource {
   kind: SourceKind;
   value: string;
   visibility: SourceVisibility;
+  version_ref?: string | null;
+  content_hash?: string | null;
+}
+
+export interface ReportSchedule {
+  report_weekday: string;
+  report_local_time: string;
+  cutoff_weekday: string;
+  cutoff_local_time: string;
+  period_policy: "previous_calendar_week";
+}
+
+export interface DocumentScope {
+  all_active_products: boolean;
+  excluded_product_ids: string[];
+  markets: string[];
+  languages: string[];
+  content_types: string[];
+  question_clusters: Array<{
+    key: string;
+    state: "pending_resolution" | "resolved";
+  }>;
+}
+
+export interface DistributionScope {
+  mode: "all_eligible" | "explicit";
+  included_platform_ids: string[];
+  excluded_platform_ids: string[];
+  resource_pool_ids: string[];
+  replication_policy: "one_account_per_platform";
 }
 
 export interface ProjectSettings {
   brand_name: string;
-  product_name: string;
+  product_name?: string | null;
   market: string;
   language: string;
+  target_audience?: string | null;
+  objective?: string | null;
   competitors: string[];
+  initial_sources: InitialSource[];
   resource_mode: ResourceMode;
-  monthly_budget_minor: number;
   budget_currency: string;
+  monthly_budget_minor: number;
   monitoring_reserve_percent: number;
-  target_audience?: string;
-  initial_sources?: InitialSource[];
+  report_timezone: string;
+  report_schedule: ReportSchedule;
+  document_scope: DocumentScope;
+  distribution_scope: DistributionScope;
 }
 
 export interface Project {
@@ -35,6 +70,9 @@ export interface Project {
   status: ProjectStatus;
   revision: number;
   settings: ProjectSettings;
+  current_config_revision_id?: string | null;
+  current_cycle_id?: string | null;
+  start_operation_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -50,57 +88,79 @@ export interface CreateProjectInput {
   settings: ProjectSettings;
 }
 
-export interface ProjectEstimateRange {
-  minimum_minor: number;
-  maximum_minor: number;
+export interface CountEstimate {
+  state: "unknown" | "estimated" | "frozen";
+  value: number | null;
+  min: number | null;
+  max: number | null;
+  basis_refs: string[];
+  reason: string | null;
 }
 
-export interface ProjectEstimateCoverage {
-  source_count: number;
-  document_count: number;
-  document_platform_target_count: number;
-  measurement_sample_count: number;
+export interface MoneyEstimate {
+  state: "unknown" | "estimated" | "frozen";
+  value_minor: number | null;
+  min_minor: number | null;
+  max_minor: number | null;
+  basis_refs: string[];
+  reason: string | null;
 }
 
-/**
- * A deterministic planning estimate. It describes planned resource coverage
- * and cost ranges only; it is not an outcome forecast.
- */
 export interface ProjectEstimate {
-  currency: string;
-  requested_monthly_budget_minor: number;
-  monitoring_reserve_minor: number;
-  coverage: ProjectEstimateCoverage;
-  phase_one: ProjectEstimateRange;
-  phase_two: ProjectEstimateRange;
-  total: ProjectEstimateRange;
-  basis: string[];
+  settings_hash: string;
+  estimator_version: string;
+  pricing_snapshot_id: string | null;
+  capability_snapshot_id: string | null;
+  coverage: {
+    documents: CountEstimate;
+    document_platform_targets: CountEstimate;
+    measurement_samples: CountEstimate;
+  };
+  costs: {
+    phase_one_documents: MoneyEstimate;
+    phase_two_distribution: MoneyEstimate;
+    measurement: MoneyEstimate;
+    total: MoneyEstimate;
+  };
+  budget: {
+    monthly_limit_minor: number;
+    measurement_reserve_minor: number;
+    currency: string;
+  };
+  blockers: Array<{
+    code: string;
+    scope: string;
+    reason: string;
+  }>;
   assumptions: string[];
 }
 
-export type OperationStatus = "queued" | "running" | "succeeded" | "failed";
-
-/** The asynchronous handle returned after a project start is accepted. */
-export interface ProjectStartOperation {
-  id: string;
-  kind: string;
-  status: OperationStatus;
-  result?: unknown;
-  error?: unknown;
-  created_at: string;
-  updated_at: string;
+export interface ProjectManifestAcceptance {
+  manifest_id: string;
+  revision: number;
+  state: string;
+  sealed: boolean;
+  expected_count: number | null;
 }
 
+/** A durable server-side acceptance, retrievable after navigation or refresh. */
 export interface ProjectStartAcceptance {
-  projectId: string;
-  operation?: ProjectStartOperation;
-  acceptedAt: string;
+  operation_id: string;
+  cycle_id: string;
+  config_revision_id: string;
+  document_manifest: ProjectManifestAcceptance;
+  distribution_manifest: ProjectManifestAcceptance;
+  status: "accepted";
+  operation_url: string;
+}
+
+export interface StartProjectInput {
+  expected_revision: number;
 }
 
 export interface UpdateProjectInput {
   revision: number;
   display_name?: string;
-  status?: ProjectStatus;
   settings?: Partial<ProjectSettings>;
 }
 
@@ -162,8 +222,8 @@ export const projectQueryKeys = {
       ...scopeKey(scope),
       inputKey,
     ] as const,
-  startAcceptance: (scope: QueryScope) =>
-    [...projectQueryKeys.all, "start-acceptance", ...scopeKey(scope)] as const,
+  start: (scope: QueryScope) =>
+    [...projectQueryKeys.all, "start", ...scopeKey(scope)] as const,
 };
 
 export function listProjects(tenantId: string): Promise<ProjectListResponse> {
@@ -206,16 +266,37 @@ export function estimateProject(
 export function startProject(
   tenantId: string,
   projectId: string,
+  input: StartProjectInput,
   idempotencyKey?: ApiRequestOptions["idempotencyKey"],
-): Promise<ProjectStartOperation | undefined> {
-  return apiFetch<ProjectStartOperation | undefined>(
+): Promise<ProjectStartAcceptance> {
+  return apiFetch<ProjectStartAcceptance>(
     `/projects/${encodeURIComponent(projectId)}/start`,
     {
       method: "POST",
+      body: input,
       tenantId,
       idempotencyKey,
     },
   );
+}
+
+/**
+ * A project without an accepted start is normal: the server returns 404 until
+ * the first acceptance exists.
+ */
+export async function getProjectStart(
+  projectId: string,
+  tenantId: string,
+): Promise<ProjectStartAcceptance | undefined> {
+  try {
+    return await apiFetch<ProjectStartAcceptance>(
+      `/projects/${encodeURIComponent(projectId)}/start`,
+      { tenantId },
+    );
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return undefined;
+    throw error;
+  }
 }
 
 export function updateProject(
@@ -335,29 +416,24 @@ export function useProjectEstimateQuery(
   });
 }
 
-/**
- * Keeps an accepted start handle scoped to the authenticated tenant/project.
- * The cache is cleared by AuthProvider when the session changes.
- */
-export function useProjectStartAcceptance(
+export function useProjectStartQuery(
   tenantId: string | undefined,
   projectId: string | undefined,
 ) {
   const scope = useScope(tenantId, projectId);
   return useQuery({
     queryKey: scope
-      ? projectQueryKeys.startAcceptance(scope)
+      ? projectQueryKeys.start(scope)
       : [
           ...projectQueryKeys.all,
-          "start-acceptance",
+          "start",
           "anonymous",
           "",
           tenantId ?? "",
           projectId ?? null,
         ],
-    queryFn: async () => undefined as ProjectStartAcceptance | undefined,
-    enabled: false,
-    staleTime: Infinity,
+    queryFn: () => getProjectStart(projectId!, tenantId!),
+    enabled: Boolean(scope && projectId),
   });
 }
 
@@ -390,27 +466,25 @@ export function useStartProjectMutation(tenantId: string | undefined) {
   return useMutation({
     mutationFn: ({
       projectId,
+      expectedRevision,
       idempotencyKey,
     }: {
       projectId: string;
+      expectedRevision: number;
       idempotencyKey: string;
     }) => {
       if (!tenantId) throw new Error("请先选择工作区。");
-      return startProject(tenantId, projectId, idempotencyKey);
+      return startProject(
+        tenantId,
+        projectId,
+        { expected_revision: expectedRevision },
+        idempotencyKey,
+      );
     },
-    onSuccess: async (operation, { projectId }) => {
+    onSuccess: async (_acceptance, { projectId }) => {
       if (!tenantId || !session) return;
       const projectScope = queryScopeFor(session, tenantId, projectId);
       const listScope = queryScopeFor(session, tenantId);
-      const acceptance: ProjectStartAcceptance = {
-        projectId,
-        operation,
-        acceptedAt: new Date().toISOString(),
-      };
-      queryClient.setQueryData(
-        projectQueryKeys.startAcceptance(projectScope),
-        acceptance,
-      );
       await Promise.all([
         queryClient.invalidateQueries({
           queryKey: projectQueryKeys.list(listScope),
@@ -420,6 +494,9 @@ export function useStartProjectMutation(tenantId: string | undefined) {
         }),
         queryClient.invalidateQueries({
           queryKey: projectQueryKeys.overview(projectScope),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: projectQueryKeys.start(projectScope),
         }),
       ]);
     },

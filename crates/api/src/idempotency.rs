@@ -189,16 +189,10 @@ pub async fn json_command_idempotency_middleware(
         Err(_) => return request_too_large_response(request_context),
     };
     let hash = body_hash(&body);
-    let allow_start_recovery = parts.uri.path().trim_end_matches('/').ends_with("/start");
 
     let token = match store.begin(&scope, &key, &hash).await {
         Ok(IdempotencyDecision::New(token)) => token,
         Ok(IdempotencyDecision::Replay(response)) => return replay_response(response),
-        Ok(IdempotencyDecision::InFlight) if allow_start_recovery => IdempotencyToken {
-            scope: scope.storage_key(),
-            key: key.clone(),
-            body_hash: hash.clone(),
-        },
         Ok(IdempotencyDecision::InFlight) => {
             return error_response(
                 AppError::conflict(

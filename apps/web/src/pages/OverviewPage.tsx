@@ -11,12 +11,11 @@ import {
   ArrowSyncRegular,
   DataUsageRegular,
 } from "@fluentui/react-icons";
-import { useLocation, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import {
   type ProjectOverview,
-  type ProjectStartAcceptance,
   useProjectOverviewQuery,
-  useProjectStartAcceptance,
+  useProjectStartQuery,
 } from "../api/projects";
 import { LoopProgress, type LoopStep } from "../components/LoopProgress";
 import { StatusPill } from "../components/StatusPill";
@@ -52,6 +51,16 @@ function projectStatus(status: ProjectOverview["project"]["status"]) {
     archived: "已归档",
   } as const;
   return labels[status];
+}
+
+function resourceModeLabel(
+  mode: ProjectOverview["project"]["settings"]["resource_mode"],
+) {
+  return {
+    own: "客户自有资源",
+    platform: "总部资源",
+    mixed: "混合资源",
+  }[mode];
 }
 
 function buildLoop(overview: ProjectOverview): LoopStep[] {
@@ -158,13 +167,13 @@ function actionHref(base: string, href: string) {
 
 export function OverviewPage() {
   const { tenantId, projectId } = useParams();
-  const location = useLocation();
   const { data, isPending, isError, refetch, isFetching } =
     useProjectOverviewQuery(tenantId, projectId);
-  const { data: cachedStartAcceptance } = useProjectStartAcceptance(
-    tenantId,
-    projectId,
-  );
+  const {
+    data: startAcceptance,
+    isFetching: isStartFetching,
+    refetch: refetchStart,
+  } = useProjectStartQuery(tenantId, projectId);
 
   if (isPending) {
     return (
@@ -189,15 +198,6 @@ export function OverviewPage() {
 
   const base = `/app/${tenantId}/${projectId}`;
   const savedSources = data.project.settings.initial_sources?.length ?? 0;
-  const routeStartAcceptance = (
-    location.state as { projectStartAcceptance?: ProjectStartAcceptance } | null
-  )?.projectStartAcceptance;
-  const startAcceptance =
-    routeStartAcceptance?.projectId === projectId
-      ? routeStartAcceptance
-      : cachedStartAcceptance?.projectId === projectId
-        ? cachedStartAcceptance
-        : undefined;
   const baselineNotStarted = data.benchmark.status === "not_started";
   const sourceNotice =
     data.knowledge.status === "empty" && savedSources > 0
@@ -226,8 +226,11 @@ export function OverviewPage() {
           <Button
             appearance="secondary"
             icon={<ArrowSyncRegular />}
-            disabled={isFetching}
-            onClick={() => void refetch()}
+            disabled={isFetching || isStartFetching}
+            onClick={() => {
+              void refetch();
+              void refetchStart();
+            }}
           >
             刷新
           </Button>
@@ -244,11 +247,11 @@ export function OverviewPage() {
       {startAcceptance && (
         <MessageBar intent="success" className="persistent-notice">
           <MessageBarBody>
-            启动 Operation 已受理
-            {startAcceptance.operation?.id
-              ? `（${startAcceptance.operation.id}）`
-              : ""}
-            。项目配置与来源已冻结；后续工作会异步排队，并不代表资料已经导入或效果已经产生。
+            项目已启动（受理操作 {startAcceptance.operation_id}
+            ）。文档与分发清单骨架已创建，尚未封存并等待知识处理；这不代表资料已经解析、基线已经建立或计划正在运行。
+            配置修订 {startAcceptance.config_revision_id} · 文档清单{" "}
+            {startAcceptance.document_manifest.manifest_id} · 分发清单{" "}
+            {startAcceptance.distribution_manifest.manifest_id}
           </MessageBarBody>
         </MessageBar>
       )}
@@ -372,7 +375,7 @@ export function OverviewPage() {
             {data.next_action ? (
               <div className="overview-next-action">
                 <div>
-                  <span>{data.next_action.code}</span>
+                  <span>下一步</span>
                   <strong>{data.next_action.label}</strong>
                 </div>
                 <Button
@@ -407,11 +410,13 @@ export function OverviewPage() {
             <dl className="project-meta-list">
               <div>
                 <dt>产品</dt>
-                <dd>{data.project.settings.product_name}</dd>
+                <dd>{data.project.settings.product_name || "—"}</dd>
               </div>
               <div>
                 <dt>资源模式</dt>
-                <dd>{data.project.settings.resource_mode}</dd>
+                <dd>
+                  {resourceModeLabel(data.project.settings.resource_mode)}
+                </dd>
               </div>
               <div>
                 <dt>月度预算</dt>

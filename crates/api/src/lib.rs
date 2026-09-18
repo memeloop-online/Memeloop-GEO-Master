@@ -19,14 +19,14 @@ use axum::{
 };
 use futures_util::StreamExt;
 use geo_domain::{
-    AppError, DEFAULT_SESSION_TTL_SECS, EventEnvelope, InitialSource, Membership,
-    MemoryAuthRepository, Operation, Operator, Project, ProjectCreate, ProjectId, ProjectOverview,
-    ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings, ProjectStatus, ResourceMode,
-    Role, TenantId, TenantScope, User,
+    AppError, DEFAULT_SESSION_TTL_SECS, DistributionScope, DocumentScope, EventEnvelope,
+    InitialSource, Membership, MemoryAuthRepository, Operation, Operator, Project, ProjectCreate,
+    ProjectId, ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
+    ProjectStartAcceptance, ProjectStartCommand, ReportSchedule, ResourceMode, Role, TenantId,
+    TenantScope, User, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{Database, PgAuthRepository, PgIdempotencyStore, PgProjectRepository};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
@@ -298,18 +298,27 @@ struct ProjectListQuery {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 struct ProjectSettingsPatchRequest {
     pub brand_name: Option<String>,
-    pub product_name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub product_name: Option<Option<String>>,
     pub market: Option<String>,
     pub language: Option<String>,
-    pub target_audience: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub target_audience: Option<Option<String>>,
     pub competitors: Option<Vec<String>>,
     pub initial_sources: Option<Vec<InitialSource>>,
     pub resource_mode: Option<ResourceMode>,
     pub budget_currency: Option<String>,
     pub monthly_budget_minor: Option<i64>,
     pub monitoring_reserve_percent: Option<u8>,
+    pub report_timezone: Option<String>,
+    pub report_schedule: Option<ReportSchedule>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub objective: Option<Option<String>>,
+    pub document_scope: Option<DocumentScope>,
+    pub distribution_scope: Option<DistributionScope>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -320,31 +329,43 @@ struct ProjectPatchRequest {
     pub slug: Option<String>,
     pub display_name: Option<String>,
     pub brand_name: Option<String>,
-    pub product_name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub product_name: Option<Option<String>>,
     pub market: Option<String>,
     pub language: Option<String>,
-    pub target_audience: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub target_audience: Option<Option<String>>,
     pub competitors: Option<Vec<String>>,
     pub initial_sources: Option<Vec<InitialSource>>,
     pub resource_mode: Option<ResourceMode>,
     pub budget_currency: Option<String>,
     pub monthly_budget_minor: Option<i64>,
     pub monitoring_reserve_percent: Option<u8>,
+    pub report_timezone: Option<String>,
+    pub report_schedule: Option<ReportSchedule>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub objective: Option<Option<String>>,
+    pub document_scope: Option<DocumentScope>,
+    pub distribution_scope: Option<DistributionScope>,
     pub settings: Option<ProjectSettingsPatchRequest>,
 }
 
 impl ProjectPatchRequest {
     fn into_domain(self) -> (Option<i64>, ProjectPatch) {
         let settings = self.settings.unwrap_or_default();
+        let product_name = self.product_name.or(settings.product_name);
+        let target_audience = self.target_audience.or(settings.target_audience);
+        let objective = self.objective.or(settings.objective);
         let patch = ProjectPatch {
             slug: self.slug,
             display_name: self.display_name,
             brand_name: self.brand_name.or(settings.brand_name),
-            product_name: self.product_name.or(settings.product_name),
+            product_name: product_name.clone().flatten(),
+            clear_product_name: matches!(product_name, Some(None)),
             market: self.market.or(settings.market),
             language: self.language.or(settings.language),
-            target_audience: self.target_audience.or(settings.target_audience),
-            clear_target_audience: false,
+            target_audience: target_audience.clone().flatten(),
+            clear_target_audience: matches!(target_audience, Some(None)),
             competitors: self.competitors.or(settings.competitors),
             initial_sources: self.initial_sources.or(settings.initial_sources),
             resource_mode: self.resource_mode.or(settings.resource_mode),
@@ -353,6 +374,12 @@ impl ProjectPatchRequest {
             monitoring_reserve_percent: self
                 .monitoring_reserve_percent
                 .or(settings.monitoring_reserve_percent),
+            report_timezone: self.report_timezone.or(settings.report_timezone),
+            report_schedule: self.report_schedule.or(settings.report_schedule),
+            objective: objective.clone().flatten(),
+            clear_objective: matches!(objective, Some(None)),
+            document_scope: self.document_scope.or(settings.document_scope),
+            distribution_scope: self.distribution_scope.or(settings.distribution_scope),
             // Lifecycle transitions are commands (for example /start), not
             // ordinary configuration patches.
             status: None,
@@ -361,33 +388,83 @@ impl ProjectPatchRequest {
     }
 }
 
+/// Serde represents both a missing `Option<Option<T>>` field and an explicit
+/// JSON null as `None` by default. PATCH needs three states, so wrapping the
+/// parsed inner option lets callers distinguish missing from present-null.
+fn deserialize_present_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateState {
+    Unknown,
+    Estimated,
+    Frozen,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct EstimateRange {
-    pub minimum_minor: i64,
-    pub maximum_minor: i64,
+pub struct CountEstimate {
+    pub state: EstimateState,
+    pub value: Option<u64>,
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+    pub basis_refs: Vec<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MoneyEstimate {
+    pub state: EstimateState,
+    pub value_minor: Option<i64>,
+    pub min_minor: Option<i64>,
+    pub max_minor: Option<i64>,
+    pub basis_refs: Vec<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EstimateCoverage {
-    pub source_count: u64,
-    pub document_count: u64,
-    pub document_platform_target_count: u64,
-    pub measurement_sample_count: u64,
+    pub documents: CountEstimate,
+    pub document_platform_targets: CountEstimate,
+    pub measurement_samples: CountEstimate,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EstimateCosts {
+    pub phase_one_documents: MoneyEstimate,
+    pub phase_two_distribution: MoneyEstimate,
+    pub measurement: MoneyEstimate,
+    pub total: MoneyEstimate,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EstimateBudget {
+    pub currency: String,
+    pub monthly_limit_minor: i64,
+    pub measurement_reserve_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EstimateBlocker {
+    pub code: String,
+    pub scope: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProjectEstimateResponse {
-    pub currency: String,
-    pub requested_monthly_budget_minor: i64,
-    pub monitoring_reserve_minor: i64,
+    pub settings_hash: String,
+    pub estimator_version: String,
+    pub pricing_snapshot_id: Option<String>,
+    pub capability_snapshot_id: Option<String>,
     pub coverage: EstimateCoverage,
-    pub phase_one: EstimateRange,
-    pub phase_two: EstimateRange,
-    pub total: EstimateRange,
-    /// Human-readable inputs used by the deterministic estimate.
-    pub basis: Vec<String>,
-    /// Explicitly avoids implying a guaranteed traffic, citation, or revenue
-    /// outcome from a budget estimate.
+    pub costs: EstimateCosts,
+    pub budget: EstimateBudget,
+    pub blockers: Vec<EstimateBlocker>,
     pub assumptions: Vec<String>,
 }
 
@@ -864,84 +941,96 @@ async fn get_project_overview(
         .await
         .map_err(|error| api_error(error, context.request_id))?
         .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
-    Ok(Json(ProjectOverview::empty(project)))
-}
-
-fn saturating_i64(value: i128) -> i64 {
-    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    let start = state
+        .project_repository
+        .get_start(&scope, id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    Ok(Json(ProjectOverview::from_start(project, start)))
 }
 
 fn estimate_project(
     input: ProjectCreate,
-    scope: &TenantScope,
+    _scope: &TenantScope,
 ) -> Result<ProjectEstimateResponse, AppError> {
-    let slug = input.slug.unwrap_or_else(|| "estimate".to_owned());
-    let project = Project::new(
-        ProjectId::from(Uuid::new_v4()),
-        scope,
-        slug,
-        input.display_name,
-        input.settings,
-    )?;
-    let settings = project.settings;
-    let source_count = settings.initial_sources.len() as u64;
-    let document_count = source_count
-        .saturating_add(settings.competitors.len() as u64)
-        .max(1);
-    let platform_count = match settings.resource_mode {
-        ResourceMode::Own => 1,
-        ResourceMode::Platform => 2,
-        ResourceMode::Mixed => 3,
+    // Estimation has no writes and intentionally does not pretend that source
+    // locators determine documents, platform targets, samples, or pricing.
+    let settings = input.settings.validate_draft()?;
+    let reserve = ((settings.monthly_budget_minor as i128)
+        .saturating_mul(settings.monitoring_reserve_percent as i128)
+        / 100) as i64;
+    let unknown_count = |reason: &str| CountEstimate {
+        state: EstimateState::Unknown,
+        value: None,
+        min: None,
+        max: None,
+        basis_refs: Vec::new(),
+        reason: Some(reason.to_owned()),
     };
-    let target_count = document_count.saturating_mul(platform_count);
-    let measurement_count = target_count.saturating_mul(2);
-    let base = (document_count as i128)
-        .saturating_mul(800)
-        .saturating_add((target_count as i128).saturating_mul(300));
-    let phase_one = EstimateRange {
-        minimum_minor: saturating_i64(base),
-        maximum_minor: saturating_i64(base.saturating_mul(2)),
+    let unknown_money = |reason: &str| MoneyEstimate {
+        state: EstimateState::Unknown,
+        value_minor: None,
+        min_minor: None,
+        max_minor: None,
+        basis_refs: Vec::new(),
+        reason: Some(reason.to_owned()),
     };
-    let phase_two_base = (target_count as i128).saturating_mul(250);
-    let phase_two = EstimateRange {
-        minimum_minor: saturating_i64(phase_two_base),
-        maximum_minor: saturating_i64(phase_two_base.saturating_mul(2)),
-    };
-    let total = EstimateRange {
-        minimum_minor: phase_one
-            .minimum_minor
-            .saturating_add(phase_two.minimum_minor),
-        maximum_minor: phase_one
-            .maximum_minor
-            .saturating_add(phase_two.maximum_minor),
-    };
-    let reserve = saturating_i64(
-        (settings.monthly_budget_minor as i128)
-            .saturating_mul(settings.monitoring_reserve_percent as i128)
-            / 100,
-    );
     Ok(ProjectEstimateResponse {
-        currency: settings.budget_currency,
-        requested_monthly_budget_minor: settings.monthly_budget_minor,
-        monitoring_reserve_minor: reserve,
+        settings_hash: settings_hash(&settings)?,
+        estimator_version: "w02-prerequisites-unknown-v1".to_owned(),
+        pricing_snapshot_id: None,
+        capability_snapshot_id: None,
         coverage: EstimateCoverage {
-            source_count,
-            document_count,
-            document_platform_target_count: target_count,
-            measurement_sample_count: measurement_count,
+            documents: unknown_count(
+                "KnowledgeRelease is not available; document manifest is not frozen.",
+            ),
+            document_platform_targets: unknown_count(
+                "CapabilitySnapshot is not available; distribution targets are not expanded.",
+            ),
+            measurement_samples: unknown_count(
+                "MeasurementProtocol is not available; measurement samples are not planned.",
+            ),
         },
-        phase_one,
-        phase_two,
-        total,
-        basis: vec![
-            "范围按来源数、竞争品牌数和资源模式推导首轮文档与平台目标数量".to_owned(),
-            "首轮费用按文档生产与平台目标展开的固定成本区间计算".to_owned(),
-            "后续测量按每个文档×平台目标预留两个样本作为计划分母".to_owned(),
+        costs: EstimateCosts {
+            phase_one_documents: unknown_money(
+                "PricingSnapshot and frozen document denominator are unavailable.",
+            ),
+            phase_two_distribution: unknown_money(
+                "PricingSnapshot, CapabilitySnapshot, and distribution denominator are unavailable.",
+            ),
+            measurement: unknown_money("PricingSnapshot and MeasurementProtocol are unavailable."),
+            total: unknown_money("Component costs are not known."),
+        },
+        budget: EstimateBudget {
+            currency: settings.budget_currency,
+            monthly_limit_minor: settings.monthly_budget_minor,
+            measurement_reserve_minor: reserve,
+        },
+        blockers: vec![
+            EstimateBlocker {
+                code: "knowledge_release_unavailable".to_owned(),
+                scope: "documents".to_owned(),
+                reason: "W02 has not resolved immutable knowledge inputs.".to_owned(),
+            },
+            EstimateBlocker {
+                code: "capability_snapshot_unavailable".to_owned(),
+                scope: "document_platform_targets".to_owned(),
+                reason: "No eligible platform/account capability snapshot is frozen.".to_owned(),
+            },
+            EstimateBlocker {
+                code: "measurement_protocol_unavailable".to_owned(),
+                scope: "measurement_samples".to_owned(),
+                reason: "No measurement protocol or sample plan is frozen.".to_owned(),
+            },
+            EstimateBlocker {
+                code: "pricing_snapshot_unavailable".to_owned(),
+                scope: "costs".to_owned(),
+                reason: "No applicable price list snapshot is frozen.".to_owned(),
+            },
         ],
         assumptions: vec![
-            "这是资源与预算区间，不是曝光、引用、转化或收益承诺".to_owned(),
-            "实际可用平台、账号状态、内容长度和失败重试会改变最终费用".to_owned(),
-            "估算不会创建项目、扣款、预留资金或启动外部任务".to_owned(),
+            "Estimate is side-effect free: it creates no project, reservation, or task.".to_owned(),
+            "Zero budget permits later free knowledge work but must block paid actions.".to_owned(),
         ],
     })
 }
@@ -991,8 +1080,9 @@ pub fn project_start_operation_id(scope: &TenantScope, idempotency_key: &str) ->
     path = "/api/v1/projects/{id}/start",
     security(("sessionCookie" = [])),
     params(("id" = ProjectId, Path, description = "Project ID")),
+    request_body = ProjectStartRequest,
     responses(
-        (status = 202, description = "Project start operation", body = Operation),
+        (status = 202, description = "Atomic project start acceptance", body = ProjectStartAcceptance),
         (status = 403, description = "Membership cannot start projects", body = ErrorResponse),
         (status = 409, description = "Project is already started or revision changed", body = ErrorResponse)
     )
@@ -1003,6 +1093,7 @@ async fn start_project(
     headers: HeaderMap,
     Extension(auth): Extension<AuthContext>,
     Extension(context): Extension<RequestContext>,
+    Json(input): Json<ProjectStartRequest>,
 ) -> Result<Response, ApiError> {
     require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
     let idempotency_key = headers
@@ -1037,104 +1128,90 @@ async fn start_project(
         .map_err(|error| api_error(error, context.request_id))?
         .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
 
-    // The operation is the durable recovery marker. A retry that reaches this
-    // handler after a process crash can finish the draft->active transition
-    // or return the already-created operation without creating another one.
-    if let Some(operation) = state
-        .operation_store
-        .get(&operation_scope, operation_id)
-        .await
-        .map_err(|error| api_error(error, context.request_id))?
-    {
-        if project.status == ProjectStatus::Draft {
-            match state
-                .project_repository
-                .update(
-                    &auth.scope,
-                    id,
-                    project.revision,
-                    ProjectPatch {
-                        status: Some(ProjectStatus::Active),
-                        ..ProjectPatch::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(error) if error.code == geo_domain::ErrorCode::Conflict => {
-                    let current = state
-                        .project_repository
-                        .get(&auth.scope, id)
-                        .await
-                        .map_err(|error| api_error(error, context.request_id))?
-                        .ok_or_else(|| {
-                            api_error(AppError::not_found("project not found"), context.request_id)
-                        })?;
-                    if current.status != ProjectStatus::Active {
-                        return Err(api_error(error, context.request_id));
-                    }
-                }
-                Err(error) => return Err(api_error(error, context.request_id)),
-            }
-        }
-        return Ok((StatusCode::ACCEPTED, Json(operation)).into_response());
-    }
-
-    if project.status != ProjectStatus::Draft {
-        return Err(api_error(
-            AppError::conflict("project has already been started"),
-            context.request_id,
-        ));
-    }
-    let frozen_revision = project.revision;
-    let frozen_sources = project.settings.initial_sources.clone();
-    let mut operation = Operation::queued("project.start", operation_scope);
-    operation.id = operation_id;
-    operation.result = Some(json!({
-        "project_id": id,
-        "frozen_revision": frozen_revision,
-        "config_revision": frozen_revision,
-        "project_revision": frozen_revision + 1,
-        "initial_sources": frozen_sources,
-    }));
-    // Persist the recovery marker first. If the process exits after this
-    // commit, a same-key retry resumes the status transition instead of
-    // returning a permanent idempotency conflict.
-    state
-        .operation_store
-        .save(operation.clone())
+    let normalized_settings = project
+        .settings
+        .clone()
+        .validate_draft()
+        .map_err(|error| api_error(error, context.request_id))?;
+    let frozen_settings_hash = settings_hash(&normalized_settings)
+        .map_err(|error| api_error(error, context.request_id))?;
+    let command = ProjectStartCommand {
+        expected_revision: input.expected_revision,
+        idempotency_key_hash: hash_idempotency_key(&idempotency_key),
+        request_hash: start_request_hash(id, input.expected_revision, &frozen_settings_hash),
+        settings_hash: frozen_settings_hash,
+        operation_id,
+    };
+    let acceptance = state
+        .project_repository
+        .start(&auth.scope, id, command)
         .await
         .map_err(|error| api_error(error, context.request_id))?;
-    match state
-        .project_repository
-        .update(
-            &auth.scope,
-            id,
-            frozen_revision,
-            ProjectPatch {
-                status: Some(ProjectStatus::Active),
-                ..ProjectPatch::default()
-            },
-        )
-        .await
-    {
-        Ok(_) => {}
-        Err(error) if error.code == geo_domain::ErrorCode::Conflict => {
-            let current = state
-                .project_repository
-                .get(&auth.scope, id)
-                .await
-                .map_err(|error| api_error(error, context.request_id))?
-                .ok_or_else(|| {
-                    api_error(AppError::not_found("project not found"), context.request_id)
-                })?;
-            if current.status != ProjectStatus::Active {
-                return Err(api_error(error, context.request_id));
-            }
-        }
-        Err(error) => return Err(api_error(error, context.request_id)),
+    // PostgreSQL writes this operation in the same start transaction. The
+    // in-memory adapter mirrors it in the existing operation store so normal
+    // operation lookup remains available in development and tests.
+    if !state.durable_storage() {
+        let mut operation = Operation::queued("project.start", operation_scope.clone());
+        operation.id = acceptance.operation_id;
+        operation.result = Some(serde_json::to_value(&acceptance).map_err(|error| {
+            api_error(
+                AppError::new(
+                    geo_domain::ErrorCode::Internal,
+                    format!("start acceptance cannot be serialized: {error}"),
+                ),
+                context.request_id,
+            )
+        })?);
+        state
+            .operation_store
+            .save(operation)
+            .await
+            .map_err(|error| api_error(error, context.request_id))?;
+        state.publish_event(EventEnvelope::new(
+            "cycle.created",
+            operation_scope,
+            acceptance.cycle_id,
+            1,
+            acceptance.operation_id,
+        ));
     }
-    Ok((StatusCode::ACCEPTED, Json(operation)).into_response())
+    Ok((StatusCode::ACCEPTED, Json(acceptance)).into_response())
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectStartRequest {
+    pub expected_revision: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/start",
+    security(("sessionCookie" = [])),
+    params(("id" = ProjectId, Path, description = "Project ID")),
+    responses(
+        (status = 200, description = "Persisted project start acceptance", body = ProjectStartAcceptance),
+        (status = 404, description = "Project has not been started in this tenant", body = ErrorResponse)
+    )
+)]
+async fn get_project_start(
+    State(state): State<AppState>,
+    Path(id): Path<ProjectId>,
+    Extension(scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<ProjectStartAcceptance>, ApiError> {
+    state
+        .project_repository
+        .get_start(&scope, id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .map(|view| Json(view.acceptance))
+        .ok_or_else(|| {
+            api_error(
+                AppError::not_found("project start not found"),
+                context.request_id,
+            )
+        })
 }
 
 #[utoipa::path(
@@ -1222,6 +1299,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         get_project_overview,
         estimate_project_handler,
         start_project,
+        get_project_start,
         get_operation,
         events
     ),
@@ -1240,9 +1318,16 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         ProjectPatchRequest,
         ProjectSettingsPatchRequest,
         ProjectOverview,
-        EstimateRange,
+        EstimateState,
+        CountEstimate,
         EstimateCoverage,
+        EstimateCosts,
+        MoneyEstimate,
+        EstimateBudget,
+        EstimateBlocker,
         ProjectEstimateResponse,
+        ProjectStartRequest,
+        ProjectStartAcceptance,
         ErrorResponse,
         Operation,
         geo_domain::OperationStatus,
@@ -1288,11 +1373,21 @@ pub fn router(state: AppState) -> Router {
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", get(get_project).patch(patch_project))
         .route("/projects/{id}/overview", get(get_project_overview))
-        .route("/projects/{id}/start", post(start_project))
         .layer(middleware::from_fn_with_state(
             idempotency_store,
             json_command_idempotency_middleware,
         ))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // Project start owns its durable idempotency boundary.  It must not be
+    // intercepted by the generic HTTP idempotency cache, whose in-flight
+    // state cannot represent a committed business start transaction.
+    let start_routes: Router<AppState> = Router::new()
+        .route(
+            "/projects/{id}/start",
+            get(get_project_start).post(start_project),
+        )
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(auth_scope_from_request));
 
@@ -1324,6 +1419,7 @@ pub fn router(state: AppState) -> Router {
                 .route("/openapi.json", get(openapi_json))
                 .merge(auth_routes)
                 .merge(estimate_routes)
+                .merge(start_routes)
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))

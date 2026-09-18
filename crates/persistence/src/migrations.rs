@@ -28,6 +28,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 4,
         description: "tenant rls deferred until transaction-local scope wiring is complete",
     },
+    MigrationMetadata {
+        version: 5,
+        description: "atomic project start",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {
