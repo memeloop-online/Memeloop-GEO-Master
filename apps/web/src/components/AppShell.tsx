@@ -11,6 +11,7 @@ import {
 } from "@fluentui/react-components";
 import {
   AddCircleRegular,
+  ArrowExitRegular,
   BookInformationRegular,
   CalendarLtrRegular,
   ChevronDownRegular,
@@ -28,7 +29,11 @@ import {
   SettingsRegular,
   TextBulletListSquareRegular,
 } from "@fluentui/react-icons";
-import { NavLink, Outlet, useParams } from "react-router-dom";
+import { NavLink, Outlet, useNavigate, useParams } from "react-router-dom";
+import { useAuth } from "../auth/AuthProvider";
+import { membershipForTenant } from "../auth/types";
+import { useProjectsQuery } from "../api/projects";
+import { ErrorState, LoadingState } from "./AsyncState";
 
 type NavItem = { to: string; label: string; code: string; icon: ReactElement };
 
@@ -52,7 +57,12 @@ const navItems: NavItem[] = [
     code: "P04",
     icon: <DocumentDataRegular />,
   },
-  { to: "ask", label: "企业问答", code: "P05", icon: <SearchRegular /> },
+  {
+    to: "knowledge/ask",
+    label: "企业问答",
+    code: "P05",
+    icon: <SearchRegular />,
+  },
   {
     to: "campaigns",
     label: "优化计划",
@@ -118,7 +128,38 @@ const navItems: NavItem[] = [
 
 export function AppShell() {
   const [collapsed, setCollapsed] = useState(false);
-  const { tenantId = "acme", projectId = "northstar" } = useParams();
+  const [loggingOut, setLoggingOut] = useState(false);
+  const navigate = useNavigate();
+  const { tenantId, projectId } = useParams();
+  const { session, logout } = useAuth();
+  const {
+    data: projects,
+    isPending,
+    isError,
+    refetch,
+  } = useProjectsQuery(tenantId);
+  const membership = membershipForTenant(session, tenantId);
+  const currentProject = projects?.items.find(
+    (project) => project.id === projectId,
+  );
+  const projectLabel = isPending
+    ? "正在加载项目"
+    : (currentProject?.display_name ??
+      (isError ? "项目列表暂时不可用" : "未找到项目"));
+  const projectMeta = currentProject
+    ? `${currentProject.settings.market} · ${currentProject.settings.language}`
+    : (membership?.tenant_display_name ?? tenantId);
+
+  async function handleLogout() {
+    setLoggingOut(true);
+    try {
+      await logout();
+      navigate("/login", { replace: true });
+    } finally {
+      setLoggingOut(false);
+    }
+  }
+
   return (
     <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar" aria-label="主导航">
@@ -177,31 +218,97 @@ export function AppShell() {
             <Button
               appearance="subtle"
               className="project-switcher"
-              icon={<Avatar name="N" color="brand" size={28} />}
+              icon={<Avatar name={projectLabel} color="brand" size={28} />}
               iconPosition="before"
             >
               <span>
-                <b>Northstar AI 助手</b>
-                <small>
-                  {tenantId} / {projectId}
-                </small>
+                <b>{projectLabel}</b>
+                <small>{projectMeta}</small>
               </span>
               <ChevronDownRegular />
             </Button>
           </MenuTrigger>
           <MenuPopover>
             <MenuList>
-              <MenuItem>Northstar AI 助手（当前）</MenuItem>
-              <MenuItem disabled>切换项目（即将提供）</MenuItem>
+              {isPending && <MenuItem disabled>正在加载项目…</MenuItem>}
+              {projects?.items.map((project) => (
+                <MenuItem
+                  key={project.id}
+                  onClick={() =>
+                    navigate(`/app/${tenantId}/${project.id}/overview`)
+                  }
+                >
+                  {project.display_name}
+                  {project.id === projectId ? "（当前）" : ""}
+                </MenuItem>
+              ))}
+              {!isPending && !isError && projects?.items.length === 0 && (
+                <MenuItem disabled>当前工作区还没有项目</MenuItem>
+              )}
+              {projects?.next_cursor && (
+                <MenuItem disabled>仅显示前 50 个项目</MenuItem>
+              )}
+              {isError && (
+                <MenuItem onClick={() => void refetch()}>重新加载项目</MenuItem>
+              )}
+              <MenuItem
+                onClick={() => navigate(`/setup?tenant_id=${tenantId}`)}
+              >
+                创建项目
+              </MenuItem>
+              <MenuItem onClick={() => navigate("/workspaces")}>
+                切换工作区
+              </MenuItem>
             </MenuList>
           </MenuPopover>
         </Menu>
         <div className="topbar-actions">
           <Button appearance="subtle">帮助</Button>
-          <Avatar name="林" color="colorful" aria-label="当前用户" />
+          <Menu>
+            <MenuTrigger disableButtonEnhancement>
+              <Button
+                appearance="subtle"
+                icon={
+                  <Avatar
+                    name={session?.user.display_name ?? "用户"}
+                    color="colorful"
+                  />
+                }
+                aria-label="用户菜单"
+              >
+                <span className="user-menu-name">
+                  {session?.user.display_name}
+                </span>
+              </Button>
+            </MenuTrigger>
+            <MenuPopover>
+              <MenuList>
+                <MenuItem disabled>{session?.user.login_name}</MenuItem>
+                <MenuItem onClick={() => navigate("/workspaces")}>
+                  切换工作区
+                </MenuItem>
+                <MenuItem
+                  icon={<ArrowExitRegular />}
+                  disabled={loggingOut}
+                  onClick={() => void handleLogout()}
+                >
+                  {loggingOut ? "正在退出…" : "退出登录"}
+                </MenuItem>
+              </MenuList>
+            </MenuPopover>
+          </Menu>
         </div>
       </header>
       <main className="page-content">
+        {isError && (
+          <ErrorState
+            title="项目切换列表暂时不可用"
+            detail="当前页面仍可使用；请重试以切换项目。"
+            onRetry={() => void refetch()}
+            intent="warning"
+          />
+        )}
+        {isPending && <LoadingState compact label="正在加载项目工作区" />}
         <Outlet />
       </main>
     </div>

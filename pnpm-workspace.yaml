@@ -1,3 +1,6 @@
 packages:
   - apps/*
   - packages/*
+
+overrides:
+  keyborg: 3.498.0

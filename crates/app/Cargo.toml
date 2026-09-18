@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 geo-api = { path = "../api" }
+geo-persistence = { path = "../persistence" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

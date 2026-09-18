@@ -29,7 +29,20 @@ variables are documented in [`.env.example`](.env.example).
 Once the frontend and Rust workspaces are present, use the root commands:
 
 ```powershell
-pnpm dev
+$env:GEO_DEV_PASSWORD = "choose-a-local-password"
+cargo run -p geo-app
+```
+
+In a second terminal, start the browser application. Vite keeps the browser
+same-origin and proxies `/api` to the loopback API:
+
+```powershell
+pnpm --dir apps/web dev
+```
+
+Run the verification suites with:
+
+```powershell
 pnpm format:check
 pnpm typecheck
 pnpm test

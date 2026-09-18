@@ -1,12 +1,20 @@
 import { Button, Tooltip } from "@fluentui/react-components";
 import { ArrowRightRegular } from "@fluentui/react-icons";
 import { useParams } from "react-router-dom";
-import type { LoopStep } from "../data/demo";
 import { StatusPill } from "./StatusPill";
+
+export type ProgressState = "complete" | "active" | "blocked" | "queued";
+
+export interface LoopStep {
+  id: string;
+  label: string;
+  state: ProgressState;
+  detail: string;
+}
 
 const targetByStep: Record<string, string> = {
   knowledge: "knowledge",
-  questions: "ask",
+  questions: "knowledge/ask",
   baseline: "measurement",
   strategy: "campaigns",
   content: "content",
@@ -18,7 +26,15 @@ const targetByStep: Record<string, string> = {
   optimize: "campaigns",
 };
 
-export function LoopProgress({ steps }: { steps: LoopStep[] }) {
+export function LoopProgress({
+  steps,
+  status = "active",
+  statusText,
+}: {
+  steps: LoopStep[];
+  status?: "complete" | "active" | "blocked" | "queued";
+  statusText?: string;
+}) {
   const { tenantId, projectId } = useParams();
   const base = `/app/${tenantId}/${projectId}`;
   return (
@@ -28,7 +44,7 @@ export function LoopProgress({ steps }: { steps: LoopStep[] }) {
           <h2>自动优化闭环</h2>
           <p>点击步骤查看当前阶段的筛选详情。</p>
         </div>
-        <StatusPill status="active" text="持续运行" />
+        <StatusPill status={status} text={statusText} />
       </div>
       <div className="loop-scroll">
         <ol className="loop-progress">

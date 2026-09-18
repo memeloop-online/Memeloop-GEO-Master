@@ -519,6 +519,163 @@ input {
   place-items: center;
 }
 
+.async-state {
+  display: grid;
+  gap: 12px;
+  justify-items: start;
+  width: min(520px, 100%);
+  margin: 48px auto;
+  padding: 28px;
+  border: 1px solid #e1e4e8;
+  border-radius: 8px;
+  background: #fff;
+}
+.async-state-loading {
+  min-height: 180px;
+  align-content: center;
+}
+.async-state-loading .fui-Skeleton {
+  display: grid;
+  width: 100%;
+  gap: 10px;
+}
+.async-error {
+  margin: 0 0 16px;
+}
+.async-error .fui-MessageBarBody {
+  display: grid;
+  gap: 4px;
+}
+.async-empty-state h2,
+.async-unauthorized h1 {
+  margin: 0;
+  font-size: 20px;
+}
+.async-empty-state p,
+.async-unauthorized p {
+  margin: 0;
+  color: #616161;
+  line-height: 1.5;
+}
+.async-unauthorized {
+  justify-items: center;
+  text-align: center;
+}
+.async-unauthorized > svg {
+  color: #a4262c;
+}
+.guard-page {
+  min-height: 100vh;
+  padding: 24px;
+  background: #f5f6f8;
+}
+
+.login-page,
+.workspace-page {
+  min-height: 100vh;
+  padding: 32px 24px;
+  background: #f5f6f8;
+}
+.login-page {
+  display: grid;
+  place-items: center;
+}
+.login-card {
+  display: grid;
+  gap: 22px;
+  width: min(420px, 100%);
+  padding: 32px;
+}
+.login-card h1 {
+  margin: 3px 0 6px;
+  font-size: 24px;
+}
+.login-card p:not(.eyebrow):not(.login-note) {
+  margin: 0;
+  color: #616161;
+}
+.login-brand {
+  height: auto;
+  padding: 0;
+}
+.login-form {
+  display: grid;
+  gap: 16px;
+}
+.login-form .fui-Button {
+  justify-content: center;
+  margin-top: 4px;
+}
+.login-note {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  margin: 0;
+  color: #707070;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.login-note svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+.workspace-page {
+  min-height: 100vh;
+}
+.workspace-page > .page-hero,
+.workspace-grid {
+  width: min(1040px, 100%);
+  margin-right: auto;
+  margin-left: auto;
+}
+.workspace-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+.workspace-card {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+  min-height: 250px;
+  padding: 20px;
+}
+.workspace-card .fui-CardHeader {
+  margin: 0;
+}
+.workspace-card h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.workspace-card p {
+  margin: 0;
+  color: #616161;
+  font-size: 13px;
+}
+.workspace-project-empty {
+  padding: 10px;
+  border-radius: 4px;
+  background: #f5f6f8;
+}
+.workspace-project-list {
+  display: grid;
+  gap: 6px;
+}
+.workspace-project-list .fui-Button {
+  justify-content: flex-start;
+}
+.workspace-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: auto;
+}
+.user-menu-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .setup-card {
   max-width: 880px;
   margin: 0 auto;
@@ -608,6 +765,82 @@ input {
 }
 .review-grid .fui-MessageBar {
   grid-column: 1 / -1;
+}
+.estimate-panel {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid #c7dff4;
+  border-radius: 6px;
+  background: #f8fbfe;
+}
+.estimate-panel h3 {
+  margin: 3px 0 0;
+  font-size: 17px;
+}
+.estimate-panel > div > p:not(.eyebrow) {
+  margin: 4px 0 0;
+  color: #616161;
+  font-size: 13px;
+}
+.estimate-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.estimate-grid > div {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid #d9e5f0;
+  border-radius: 4px;
+  background: #fff;
+}
+.estimate-grid span,
+.estimate-coverage dt {
+  color: #616161;
+  font-size: 12px;
+}
+.estimate-grid strong {
+  font-size: 15px;
+}
+.estimate-grid .estimate-total {
+  grid-column: 1 / -1;
+  border-left: 3px solid #0f6cbd;
+}
+.estimate-coverage {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+.estimate-coverage > div {
+  padding: 8px 0;
+  border-top: 1px solid #d9e5f0;
+}
+.estimate-coverage dt,
+.estimate-coverage dd {
+  margin: 0;
+}
+.estimate-coverage dd {
+  margin-top: 3px;
+  font-weight: 600;
+}
+.estimate-notes {
+  display: grid;
+  gap: 12px;
+}
+.estimate-notes strong,
+.estimate-notes li {
+  font-size: 12px;
+}
+.estimate-notes ul {
+  display: grid;
+  gap: 4px;
+  margin: 6px 0 0;
+  padding-left: 20px;
+  color: #505050;
 }
 .setup-footer {
   display: flex;
@@ -786,6 +1019,13 @@ input {
   .review-grid {
     grid-template-columns: 1fr;
   }
+  .estimate-grid,
+  .estimate-coverage {
+    grid-template-columns: 1fr;
+  }
+  .estimate-grid .estimate-total {
+    grid-column: auto;
+  }
   .review-grid .fui-MessageBar {
     grid-column: auto;
   }
@@ -793,6 +1033,17 @@ input {
     grid-template-columns: 1fr;
     height: auto;
     gap: 24px;
+  }
+  .login-page,
+  .workspace-page,
+  .guard-page {
+    padding: 16px;
+  }
+  .login-card {
+    padding: 24px 20px;
+  }
+  .user-menu-name {
+    display: none;
   }
   .sidebar .brand {
     padding-left: 17px;

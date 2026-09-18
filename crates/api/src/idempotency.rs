@@ -7,7 +7,7 @@ use axum::{
     response::Response,
 };
 use geo_domain::{AppError, TenantScope};
-use serde::{Deserialize, Serialize};
+pub use geo_domain::{IdempotencyDecision, IdempotencyStore, IdempotencyToken, StoredResponse};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
@@ -27,43 +27,6 @@ pub const MAX_IDEMPOTENCY_RESPONSE_BYTES: usize = 1_048_576;
 struct StorageKey {
     scope: String,
     key: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredResponse {
-    pub status: u16,
-    pub content_type: String,
-    pub body: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdempotencyToken {
-    pub scope: String,
-    pub key: String,
-    pub body_hash: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IdempotencyDecision {
-    New(IdempotencyToken),
-    Replay(StoredResponse),
-    InFlight,
-}
-
-#[async_trait]
-pub trait IdempotencyStore: Send + Sync {
-    async fn begin(
-        &self,
-        scope: &TenantScope,
-        key: &str,
-        body_hash: &str,
-    ) -> Result<IdempotencyDecision, AppError>;
-
-    async fn complete(
-        &self,
-        token: &IdempotencyToken,
-        response: StoredResponse,
-    ) -> Result<(), AppError>;
 }
 
 #[derive(Debug, Clone)]
@@ -226,10 +189,16 @@ pub async fn json_command_idempotency_middleware(
         Err(_) => return request_too_large_response(request_context),
     };
     let hash = body_hash(&body);
+    let allow_start_recovery = parts.uri.path().trim_end_matches('/').ends_with("/start");
 
     let token = match store.begin(&scope, &key, &hash).await {
         Ok(IdempotencyDecision::New(token)) => token,
         Ok(IdempotencyDecision::Replay(response)) => return replay_response(response),
+        Ok(IdempotencyDecision::InFlight) if allow_start_recovery => IdempotencyToken {
+            scope: scope.storage_key(),
+            key: key.clone(),
+            body_hash: hash.clone(),
+        },
         Ok(IdempotencyDecision::InFlight) => {
             return error_response(
                 AppError::conflict(

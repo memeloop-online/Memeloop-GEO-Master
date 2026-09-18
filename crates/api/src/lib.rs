@@ -7,18 +7,27 @@ mod storage;
 
 use axum::{
     Json, Router,
-    extract::{Extension, Path, State},
-    http::StatusCode,
-    middleware,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
+    extract::{Extension, Path, Query, State},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{IF_MATCH, SET_COOKIE},
     },
-    routing::get,
+    middleware,
+    response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use futures_util::StreamExt;
-use geo_domain::{AppError, EventEnvelope, Operation, TenantScope};
-use serde::Serialize;
+use geo_domain::{
+    AppError, DEFAULT_SESSION_TTL_SECS, EventEnvelope, InitialSource, Membership,
+    MemoryAuthRepository, Operation, Operator, Project, ProjectCreate, ProjectId, ProjectOverview,
+    ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings, ProjectStatus, ResourceMode,
+    Role, TenantId, TenantScope, User,
+};
+use geo_persistence::{Database, PgAuthRepository, PgIdempotencyStore, PgProjectRepository};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
     sync::{
@@ -32,8 +41,20 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 pub use context::{
-    CORRELATION_ID_HEADER, OPERATOR_ID_HEADER, PROJECT_ID_HEADER, REQUEST_ID_HEADER,
-    RequestContext, TENANT_ID_HEADER, dev_scope_middleware, scope_from_headers,
+    AuthContext, AuthMiddlewareState, CORRELATION_ID_HEADER, CSRF_HEADER, DEV_SESSION_COOKIE_NAME,
+    OPERATOR_ID_HEADER, OriginConfig, PROJECT_ID_HEADER, REQUEST_ID_HEADER, RequestContext,
+    SESSION_COOKIE_NAME, SessionCookieConfig, SharedAuthRepository, TENANT_ID_HEADER,
+    TENANT_SELECTOR_HEADER, auth_scope_from_extension, auth_scope_from_extensions,
+    auth_scope_from_middleware_state, auth_scope_from_request, auth_scope_middleware,
+    auth_scope_with_repository, auth_scope_with_repository_and_cookie,
+    csrf_origin_from_config_extension, csrf_origin_from_middleware_state, csrf_origin_from_request,
+    csrf_origin_middleware, csrf_origin_with_config, csrf_origin_with_scheme, dev_scope_middleware,
+    host_from_headers, no_store_middleware, request_host, resolve_auth_context,
+    resolve_auth_context_with_cookie, scope_from_headers, session_auth_from_extension,
+    session_auth_from_extensions, session_auth_from_middleware_state, session_auth_from_request,
+    session_auth_middleware, session_auth_with_repository_and_cookie, validate_origin,
+    validate_origin_headers, validate_origin_headers_with_config, validate_origin_with_config,
+    validate_origin_with_scheme,
 };
 pub use error::{ApiError, ErrorResponse, api_error, error_response};
 pub use idempotency::{
@@ -41,24 +62,40 @@ pub use idempotency::{
     MAX_IDEMPOTENCY_REQUEST_BYTES, MAX_IDEMPOTENCY_RESPONSE_BYTES, MemoryIdempotencyStore,
     SharedIdempotencyStore, StoredResponse, body_hash, json_command_idempotency_middleware,
 };
-pub use storage::{EventBus, MemoryOperationStore, OperationStore};
+pub use storage::{EventBus, MemoryOperationStore, OperationStore, PgOperationStore};
 
 #[derive(Clone)]
 pub struct AppState {
     operation_store: Arc<dyn OperationStore>,
     idempotency_store: Arc<dyn IdempotencyStore>,
+    auth_repository: SharedAuthRepository,
+    project_repository: Arc<dyn ProjectRepository>,
     events: EventBus,
     ready: Arc<AtomicBool>,
+    durable_storage: bool,
+    origin_scheme: Arc<str>,
+    origin_config: OriginConfig,
 }
 
 impl AppState {
     /// Construct the explicitly non-durable development state.
     pub fn development() -> Self {
+        // Tests and in-process callers must opt into a password explicitly;
+        // the default state gets an unpredictable bootstrap secret.
+        Self::development_with_password(&Uuid::new_v4().to_string())
+    }
+
+    pub fn development_with_password(password: &str) -> Self {
         Self {
             operation_store: Arc::new(MemoryOperationStore::default()),
             idempotency_store: Arc::new(MemoryIdempotencyStore::default()),
+            auth_repository: Arc::new(MemoryAuthRepository::development_with_password(password)),
+            project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
             events: EventBus::default(),
             ready: Arc::new(AtomicBool::new(false)),
+            durable_storage: false,
+            origin_scheme: Arc::from("http"),
+            origin_config: OriginConfig::local_http(),
         }
     }
 
@@ -67,12 +104,86 @@ impl AppState {
         idempotency_store: Arc<dyn IdempotencyStore>,
         events: EventBus,
     ) -> Self {
+        Self::with_stores_and_auth_and_projects(
+            operation_store,
+            idempotency_store,
+            Arc::new(MemoryAuthRepository::development_with_password(
+                &Uuid::new_v4().to_string(),
+            )),
+            Arc::new(geo_domain::MemoryProjectRepository::default()),
+            events,
+            false,
+        )
+    }
+
+    pub fn with_stores_and_auth(
+        operation_store: Arc<dyn OperationStore>,
+        idempotency_store: Arc<dyn IdempotencyStore>,
+        auth_repository: SharedAuthRepository,
+        events: EventBus,
+        durable_storage: bool,
+    ) -> Self {
+        Self::with_stores_and_auth_and_projects(
+            operation_store,
+            idempotency_store,
+            auth_repository,
+            Arc::new(geo_domain::MemoryProjectRepository::default()),
+            events,
+            durable_storage,
+        )
+    }
+
+    pub fn with_stores_and_auth_and_projects(
+        operation_store: Arc<dyn OperationStore>,
+        idempotency_store: Arc<dyn IdempotencyStore>,
+        auth_repository: SharedAuthRepository,
+        project_repository: Arc<dyn ProjectRepository>,
+        events: EventBus,
+        durable_storage: bool,
+    ) -> Self {
         Self {
             operation_store,
             idempotency_store,
+            auth_repository,
+            project_repository,
             events,
             ready: Arc::new(AtomicBool::new(false)),
+            durable_storage,
+            origin_scheme: Arc::from("http"),
+            origin_config: OriginConfig::local_http(),
         }
+    }
+
+    pub fn with_origin_scheme(mut self, scheme: impl Into<Arc<str>>) -> Self {
+        self.origin_scheme = scheme.into();
+        self.origin_config = OriginConfig::new(self.origin_scheme.clone());
+        self
+    }
+
+    pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.origin_config = OriginConfig::from_allowed_origins(origins);
+        self
+    }
+
+    pub fn with_origin_config(mut self, origin_config: OriginConfig) -> Self {
+        self.origin_scheme = origin_config.scheme.clone();
+        self.origin_config = origin_config;
+        self
+    }
+
+    pub fn from_database(database: &Database) -> Self {
+        Self::with_stores_and_auth_and_projects(
+            Arc::new(PgOperationStore::from_database(database)),
+            Arc::new(PgIdempotencyStore::from_database(database)),
+            Arc::new(PgAuthRepository::from_database(database)),
+            Arc::new(PgProjectRepository::from_database(database)),
+            EventBus::default(),
+            true,
+        )
     }
 
     pub fn operation_store(&self) -> Arc<dyn OperationStore> {
@@ -81,6 +192,26 @@ impl AppState {
 
     pub fn idempotency_store(&self) -> Arc<dyn IdempotencyStore> {
         Arc::clone(&self.idempotency_store)
+    }
+
+    pub fn auth_repository(&self) -> SharedAuthRepository {
+        Arc::clone(&self.auth_repository)
+    }
+
+    pub fn project_repository(&self) -> Arc<dyn ProjectRepository> {
+        Arc::clone(&self.project_repository)
+    }
+
+    pub fn durable_storage(&self) -> bool {
+        self.durable_storage
+    }
+
+    pub fn origin_scheme(&self) -> &str {
+        &self.origin_scheme
+    }
+
+    pub fn origin_config(&self) -> &OriginConfig {
+        &self.origin_config
     }
 
     pub fn events(&self) -> EventBus {
@@ -107,12 +238,198 @@ pub struct HealthResponse {
     pub durable_storage: bool,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LoginRequest {
+    pub login_name: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AuthConfigResponse {
+    pub mode: &'static str,
+    pub session_cookie_name: &'static str,
+    pub csrf_header: &'static str,
+    pub tenant_selector_query: &'static str,
+    pub tenant_selector_header: &'static str,
+    pub same_origin_required: bool,
+    pub session_ttl_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub development_login_name: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MembershipView {
+    pub tenant_id: TenantId,
+    pub tenant_slug: String,
+    pub tenant_display_name: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserView {
+    pub id: geo_domain::UserId,
+    pub login_name: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OperatorView {
+    pub id: geo_domain::OperatorId,
+    pub slug: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AuthSessionResponse {
+    pub user: UserView,
+    pub operator: OperatorView,
+    pub memberships: Vec<MembershipView>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub csrf_token: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct ProjectListQuery {
+    /// Maximum number of projects to return. The API accepts 1 through 100;
+    /// omitted values use the conservative default of 50.
+    limit: Option<String>,
+    /// Opaque cursor returned by the previous page.
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+struct ProjectSettingsPatchRequest {
+    pub brand_name: Option<String>,
+    pub product_name: Option<String>,
+    pub market: Option<String>,
+    pub language: Option<String>,
+    pub target_audience: Option<String>,
+    pub competitors: Option<Vec<String>>,
+    pub initial_sources: Option<Vec<InitialSource>>,
+    pub resource_mode: Option<ResourceMode>,
+    pub budget_currency: Option<String>,
+    pub monthly_budget_minor: Option<i64>,
+    pub monitoring_reserve_percent: Option<u8>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ProjectPatchRequest {
+    /// The revision echoed by clients. If present it must match If-Match.
+    pub revision: Option<i64>,
+    pub slug: Option<String>,
+    pub display_name: Option<String>,
+    pub brand_name: Option<String>,
+    pub product_name: Option<String>,
+    pub market: Option<String>,
+    pub language: Option<String>,
+    pub target_audience: Option<String>,
+    pub competitors: Option<Vec<String>>,
+    pub initial_sources: Option<Vec<InitialSource>>,
+    pub resource_mode: Option<ResourceMode>,
+    pub budget_currency: Option<String>,
+    pub monthly_budget_minor: Option<i64>,
+    pub monitoring_reserve_percent: Option<u8>,
+    pub settings: Option<ProjectSettingsPatchRequest>,
+}
+
+impl ProjectPatchRequest {
+    fn into_domain(self) -> (Option<i64>, ProjectPatch) {
+        let settings = self.settings.unwrap_or_default();
+        let patch = ProjectPatch {
+            slug: self.slug,
+            display_name: self.display_name,
+            brand_name: self.brand_name.or(settings.brand_name),
+            product_name: self.product_name.or(settings.product_name),
+            market: self.market.or(settings.market),
+            language: self.language.or(settings.language),
+            target_audience: self.target_audience.or(settings.target_audience),
+            clear_target_audience: false,
+            competitors: self.competitors.or(settings.competitors),
+            initial_sources: self.initial_sources.or(settings.initial_sources),
+            resource_mode: self.resource_mode.or(settings.resource_mode),
+            budget_currency: self.budget_currency.or(settings.budget_currency),
+            monthly_budget_minor: self.monthly_budget_minor.or(settings.monthly_budget_minor),
+            monitoring_reserve_percent: self
+                .monitoring_reserve_percent
+                .or(settings.monitoring_reserve_percent),
+            // Lifecycle transitions are commands (for example /start), not
+            // ordinary configuration patches.
+            status: None,
+        };
+        (self.revision, patch)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EstimateRange {
+    pub minimum_minor: i64,
+    pub maximum_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EstimateCoverage {
+    pub source_count: u64,
+    pub document_count: u64,
+    pub document_platform_target_count: u64,
+    pub measurement_sample_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ProjectEstimateResponse {
+    pub currency: String,
+    pub requested_monthly_budget_minor: i64,
+    pub monitoring_reserve_minor: i64,
+    pub coverage: EstimateCoverage,
+    pub phase_one: EstimateRange,
+    pub phase_two: EstimateRange,
+    pub total: EstimateRange,
+    /// Human-readable inputs used by the deterministic estimate.
+    pub basis: Vec<String>,
+    /// Explicitly avoids implying a guaranteed traffic, citation, or revenue
+    /// outcome from a budget estimate.
+    pub assumptions: Vec<String>,
+}
+
+fn user_view(user: &User) -> UserView {
+    UserView {
+        id: user.id,
+        login_name: user.email.clone(),
+        display_name: user.display_name.clone(),
+    }
+}
+
+fn operator_view(operator: &Operator) -> OperatorView {
+    OperatorView {
+        id: operator.id,
+        slug: operator.slug.clone(),
+        display_name: operator.display_name.clone(),
+    }
+}
+
+fn membership_view(membership: Membership) -> MembershipView {
+    MembershipView {
+        tenant_id: membership.tenant_id,
+        tenant_slug: membership.tenant_slug,
+        tenant_display_name: membership.tenant_display_name,
+        role: match membership.role {
+            geo_domain::Role::CustomerAdmin => "tenant_admin",
+            geo_domain::Role::CustomerMember => "member",
+            geo_domain::Role::CustomerReadOnly => "viewer",
+            geo_domain::Role::Operator => "operator_agent",
+            geo_domain::Role::ResourceAdmin => "resource_admin",
+            geo_domain::Role::OemAdmin => "operator_admin",
+        }
+        .to_owned(),
+    }
+}
+
 impl HealthResponse {
-    fn live() -> Self {
+    fn live(state: &AppState) -> Self {
         Self {
             status: "ok",
             service: "geo-api",
-            durable_storage: false,
+            durable_storage: state.durable_storage(),
         }
     }
 
@@ -120,7 +437,7 @@ impl HealthResponse {
         Self {
             status: if state.is_ready() { "ok" } else { "not_ready" },
             service: "geo-api",
-            durable_storage: false,
+            durable_storage: state.durable_storage(),
         }
     }
 }
@@ -130,8 +447,10 @@ impl HealthResponse {
     path = "/health/live",
     responses((status = 200, description = "Process is alive", body = HealthResponse))
 )]
-async fn health_live() -> impl IntoResponse {
-    Json(HealthResponse::live())
+async fn health_live(State(state): State<AppState>) -> impl IntoResponse {
+    // The live endpoint is intentionally independent from database readiness,
+    // but still reports whether this process was assembled with durable stores.
+    Json(HealthResponse::live(&state))
 }
 
 #[utoipa::path(
@@ -153,7 +472,675 @@ async fn health_ready(State(state): State<AppState>) -> Response {
 
 #[utoipa::path(
     get,
+    path = "/api/v1/auth/config",
+    responses((status = 200, description = "Authentication configuration", body = AuthConfigResponse))
+)]
+async fn auth_config(State(state): State<AppState>) -> Response {
+    let mut response = Json(AuthConfigResponse {
+        mode: if state.durable_storage() {
+            "persistent"
+        } else {
+            "development"
+        },
+        session_cookie_name: if state.durable_storage() {
+            SESSION_COOKIE_NAME
+        } else {
+            DEV_SESSION_COOKIE_NAME
+        },
+        csrf_header: CSRF_HEADER,
+        tenant_selector_query: "tenant_id",
+        tenant_selector_header: TENANT_SELECTOR_HEADER,
+        same_origin_required: true,
+        session_ttl_seconds: DEFAULT_SESSION_TTL_SECS,
+        development_login_name: (!state.durable_storage())
+            .then_some(geo_domain::DEVELOPMENT_USER_EMAIL),
+    })
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/login",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Authenticated session", body = AuthSessionResponse),
+        (status = 401, description = "Invalid credentials", body = ErrorResponse)
+    )
+)]
+async fn auth_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(request_context): Extension<RequestContext>,
+    Json(input): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    validate_origin_headers_with_config(&headers, state.origin_config())
+        .map_err(|error| api_error(error, request_context.request_id))?;
+    let host = host_from_headers(&headers)
+        .map_err(|error| api_error(error, request_context.request_id))?;
+    let operator = state
+        .auth_repository()
+        .operator_for_host(&host)
+        .await
+        .map_err(|error| api_error(error, request_context.request_id))?
+        .ok_or_else(|| {
+            api_error(
+                AppError::unauthorized("request host is not configured"),
+                request_context.request_id,
+            )
+        })?;
+    let identity = state
+        .auth_repository()
+        .authenticate(operator.id, &input.login_name, &input.password)
+        .await
+        .map_err(|error| api_error(error, request_context.request_id))?
+        .ok_or_else(|| {
+            api_error(
+                AppError::unauthorized("invalid email or password"),
+                request_context.request_id,
+            )
+        })?;
+    let credentials = state
+        .auth_repository()
+        .create_session(
+            identity.operator.id,
+            identity.user.id,
+            chrono::Duration::seconds(DEFAULT_SESSION_TTL_SECS),
+        )
+        .await
+        .map_err(|error| api_error(error, request_context.request_id))?;
+    let cookie_name = if state.durable_storage() {
+        SESSION_COOKIE_NAME
+    } else {
+        DEV_SESSION_COOKIE_NAME
+    };
+    let secure = state.durable_storage();
+    let cookie = format!(
+        "{cookie_name}={}; Path=/; Max-Age={DEFAULT_SESSION_TTL_SECS}; HttpOnly; SameSite=Lax{}",
+        credentials.token,
+        if secure { "; Secure" } else { "" }
+    );
+    let mut response = Json(AuthSessionResponse {
+        user: user_view(&identity.user),
+        operator: operator_view(&identity.operator),
+        memberships: identity
+            .memberships
+            .into_iter()
+            .map(membership_view)
+            .collect(),
+        expires_at: credentials.session.expires_at,
+        csrf_token: credentials.session.csrf_token().to_owned(),
+    })
+    .into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(|_| {
+            api_error(
+                AppError::new(geo_domain::ErrorCode::Internal, "invalid session cookie"),
+                request_context.request_id,
+            )
+        })?,
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/session",
+    security(("sessionCookie" = [])),
+    responses((status = 200, description = "Current authenticated session", body = AuthSessionResponse))
+)]
+async fn auth_session(Extension(auth): Extension<AuthContext>) -> Response {
+    let mut response = Json(AuthSessionResponse {
+        user: user_view(&auth.user),
+        operator: operator_view(&auth.operator),
+        memberships: auth.memberships.into_iter().map(membership_view).collect(),
+        expires_at: auth.session.expires_at,
+        csrf_token: auth.session.csrf_token().to_owned(),
+    })
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/auth/session",
+    security(("sessionCookie" = [])),
+    responses((status = 204, description = "Session revoked"))
+)]
+async fn auth_logout(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(request_context): Extension<RequestContext>,
+) -> Result<Response, ApiError> {
+    state
+        .auth_repository()
+        .revoke_session(auth.operator.id, auth.session.id)
+        .await
+        .map_err(|error| api_error(error, request_context.request_id))?;
+    let clear_dev =
+        format!("{DEV_SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+    let clear_prod =
+        format!("{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure");
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&clear_dev).map_err(|_| {
+            api_error(
+                AppError::new(geo_domain::ErrorCode::Internal, "invalid session cookie"),
+                request_context.request_id,
+            )
+        })?,
+    );
+    response.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&clear_prod).map_err(|_| {
+            api_error(
+                AppError::new(geo_domain::ErrorCode::Internal, "invalid session cookie"),
+                request_context.request_id,
+            )
+        })?,
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+fn selected_membership(auth: &AuthContext) -> Option<&Membership> {
+    auth.memberships
+        .iter()
+        .find(|membership| membership.tenant_id == auth.scope.tenant_id && membership.active)
+}
+
+fn require_project_writer(auth: &AuthContext) -> Result<(), AppError> {
+    match selected_membership(auth).map(|membership| membership.role) {
+        Some(Role::CustomerAdmin | Role::CustomerMember) => Ok(()),
+        Some(Role::CustomerReadOnly) => Err(AppError::forbidden(
+            "viewer membership cannot change projects",
+        )),
+        Some(_) => Err(AppError::forbidden(
+            "membership role cannot change customer projects",
+        )),
+        None => Err(AppError::forbidden(
+            "user is not a member of the selected tenant",
+        )),
+    }
+}
+
+fn parse_project_limit(value: Option<&str>) -> Result<usize, AppError> {
+    let limit = value
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| AppError::invalid_request("limit must be an integer"))
+        })
+        .transpose()?
+        .unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::invalid_request("limit must be between 1 and 100"));
+    }
+    Ok(limit)
+}
+
+fn parse_if_match(headers: &HeaderMap) -> Result<i64, AppError> {
+    let value = headers
+        .get(IF_MATCH)
+        .ok_or_else(|| AppError::invalid_request("If-Match header is required"))?
+        .to_str()
+        .map_err(|_| AppError::invalid_request("invalid If-Match header"))?
+        .trim();
+    let value = value.strip_prefix("W/").unwrap_or(value).trim();
+    let value = value.trim_matches('"');
+    if value.is_empty() || value == "*" {
+        return Err(AppError::invalid_request(
+            "If-Match must contain a numeric project revision",
+        ));
+    }
+    value
+        .parse::<i64>()
+        .map_err(|_| AppError::invalid_request("If-Match must contain a numeric project revision"))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects",
+    security(("sessionCookie" = [])),
+    params(
+        ("limit" = Option<String>, Query, description = "Page size from 1 to 100"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor from the previous page")
+    ),
+    responses(
+        (status = 200, description = "Tenant-scoped project page", body = ProjectPage),
+        (status = 400, description = "Invalid pagination parameters", body = ErrorResponse)
+    )
+)]
+async fn list_projects(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectListQuery>,
+    Extension(scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<ProjectPage>, ApiError> {
+    let limit = parse_project_limit(query.limit.as_deref())
+        .map_err(|error| api_error(error, context.request_id))?;
+    let page = state
+        .project_repository
+        .list_page(&scope, limit, query.cursor.as_deref())
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    Ok(Json(page))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects",
+    security(("sessionCookie" = [])),
+    request_body = ProjectCreate,
+    responses(
+        (status = 201, description = "Project created", body = Project),
+        (status = 403, description = "Membership cannot create projects", body = ErrorResponse),
+        (status = 409, description = "Project slug already exists", body = ErrorResponse)
+    )
+)]
+async fn create_project(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Json(input): Json<ProjectCreate>,
+) -> Result<Response, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
+    let project = state
+        .project_repository
+        .create(&auth.scope, input)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    Ok((StatusCode::CREATED, Json(project)).into_response())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}",
+    security(("sessionCookie" = [])),
+    params(("id" = ProjectId, Path, description = "Project ID")),
+    responses(
+        (status = 200, description = "Project", body = Project),
+        (status = 404, description = "Project does not exist in this tenant", body = ErrorResponse)
+    )
+)]
+async fn get_project(
+    State(state): State<AppState>,
+    Path(id): Path<ProjectId>,
+    Extension(scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<Project>, ApiError> {
+    state
+        .project_repository
+        .get(&scope, id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .map(Json)
+        .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/projects/{id}",
+    security(("sessionCookie" = [])),
+    params(("id" = ProjectId, Path, description = "Project ID")),
+    request_body = ProjectPatchRequest,
+    responses(
+        (status = 200, description = "Updated project", body = Project),
+        (status = 400, description = "Missing or invalid If-Match", body = ErrorResponse),
+        (status = 403, description = "Membership cannot update projects", body = ErrorResponse),
+        (status = 409, description = "Project revision conflict", body = ErrorResponse)
+    )
+)]
+async fn patch_project(
+    State(state): State<AppState>,
+    Path(id): Path<ProjectId>,
+    headers: HeaderMap,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Json(input): Json<ProjectPatchRequest>,
+) -> Result<Json<Project>, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
+    let expected_revision =
+        parse_if_match(&headers).map_err(|error| api_error(error, context.request_id))?;
+    let (body_revision, patch) = input.into_domain();
+    if let Some(body_revision) = body_revision
+        && body_revision != expected_revision
+    {
+        return Err(api_error(
+            AppError::conflict("request revision does not match If-Match"),
+            context.request_id,
+        ));
+    }
+    if patch.status.is_some() {
+        return Err(api_error(
+            AppError::invalid_request("project status changes must use the start operation"),
+            context.request_id,
+        ));
+    }
+    let updated = state
+        .project_repository
+        .update(&auth.scope, id, expected_revision, patch)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    Ok(Json(updated.project))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/overview",
+    security(("sessionCookie" = [])),
+    params(("id" = ProjectId, Path, description = "Project ID")),
+    responses(
+        (status = 200, description = "Project overview", body = ProjectOverview),
+        (status = 404, description = "Project does not exist in this tenant", body = ErrorResponse)
+    )
+)]
+async fn get_project_overview(
+    State(state): State<AppState>,
+    Path(id): Path<ProjectId>,
+    Extension(scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<ProjectOverview>, ApiError> {
+    let project = state
+        .project_repository
+        .get(&scope, id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
+    Ok(Json(ProjectOverview::empty(project)))
+}
+
+fn saturating_i64(value: i128) -> i64 {
+    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn estimate_project(
+    input: ProjectCreate,
+    scope: &TenantScope,
+) -> Result<ProjectEstimateResponse, AppError> {
+    let slug = input.slug.unwrap_or_else(|| "estimate".to_owned());
+    let project = Project::new(
+        ProjectId::from(Uuid::new_v4()),
+        scope,
+        slug,
+        input.display_name,
+        input.settings,
+    )?;
+    let settings = project.settings;
+    let source_count = settings.initial_sources.len() as u64;
+    let document_count = source_count
+        .saturating_add(settings.competitors.len() as u64)
+        .max(1);
+    let platform_count = match settings.resource_mode {
+        ResourceMode::Own => 1,
+        ResourceMode::Platform => 2,
+        ResourceMode::Mixed => 3,
+    };
+    let target_count = document_count.saturating_mul(platform_count);
+    let measurement_count = target_count.saturating_mul(2);
+    let base = (document_count as i128)
+        .saturating_mul(800)
+        .saturating_add((target_count as i128).saturating_mul(300));
+    let phase_one = EstimateRange {
+        minimum_minor: saturating_i64(base),
+        maximum_minor: saturating_i64(base.saturating_mul(2)),
+    };
+    let phase_two_base = (target_count as i128).saturating_mul(250);
+    let phase_two = EstimateRange {
+        minimum_minor: saturating_i64(phase_two_base),
+        maximum_minor: saturating_i64(phase_two_base.saturating_mul(2)),
+    };
+    let total = EstimateRange {
+        minimum_minor: phase_one
+            .minimum_minor
+            .saturating_add(phase_two.minimum_minor),
+        maximum_minor: phase_one
+            .maximum_minor
+            .saturating_add(phase_two.maximum_minor),
+    };
+    let reserve = saturating_i64(
+        (settings.monthly_budget_minor as i128)
+            .saturating_mul(settings.monitoring_reserve_percent as i128)
+            / 100,
+    );
+    Ok(ProjectEstimateResponse {
+        currency: settings.budget_currency,
+        requested_monthly_budget_minor: settings.monthly_budget_minor,
+        monitoring_reserve_minor: reserve,
+        coverage: EstimateCoverage {
+            source_count,
+            document_count,
+            document_platform_target_count: target_count,
+            measurement_sample_count: measurement_count,
+        },
+        phase_one,
+        phase_two,
+        total,
+        basis: vec![
+            "范围按来源数、竞争品牌数和资源模式推导首轮文档与平台目标数量".to_owned(),
+            "首轮费用按文档生产与平台目标展开的固定成本区间计算".to_owned(),
+            "后续测量按每个文档×平台目标预留两个样本作为计划分母".to_owned(),
+        ],
+        assumptions: vec![
+            "这是资源与预算区间，不是曝光、引用、转化或收益承诺".to_owned(),
+            "实际可用平台、账号状态、内容长度和失败重试会改变最终费用".to_owned(),
+            "估算不会创建项目、扣款、预留资金或启动外部任务".to_owned(),
+        ],
+    })
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/estimate",
+    security(("sessionCookie" = [])),
+    request_body = ProjectCreate,
+    responses(
+        (status = 200, description = "Deterministic resource and budget range", body = ProjectEstimateResponse),
+        (status = 403, description = "Membership cannot estimate projects", body = ErrorResponse)
+    )
+)]
+async fn estimate_project_handler(
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Json(input): Json<ProjectCreate>,
+) -> Result<Json<ProjectEstimateResponse>, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
+    estimate_project(input, &auth.scope)
+        .map(Json)
+        .map_err(|error| api_error(error, context.request_id))
+}
+
+/// Stable operation identity for project starts. The id binds the server-side
+/// tenant scope, project, and idempotency key without storing the client key
+/// as business data in the operation payload.
+pub fn project_start_operation_id(scope: &TenantScope, idempotency_key: &str) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"geo.project.start.v1\0");
+    digest.update(scope.storage_key().as_bytes());
+    digest.update([0]);
+    digest.update(idempotency_key.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // UUID version 5 / RFC 4122 variant bits make the deterministic value
+    // recognizable as a UUID while retaining the hash-derived identity.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{id}/start",
+    security(("sessionCookie" = [])),
+    params(("id" = ProjectId, Path, description = "Project ID")),
+    responses(
+        (status = 202, description = "Project start operation", body = Operation),
+        (status = 403, description = "Membership cannot start projects", body = ErrorResponse),
+        (status = 409, description = "Project is already started or revision changed", body = ErrorResponse)
+    )
+)]
+async fn start_project(
+    State(state): State<AppState>,
+    Path(id): Path<ProjectId>,
+    headers: HeaderMap,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Response, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
+    let idempotency_key = headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .ok_or_else(|| {
+            api_error(
+                AppError::invalid_request("missing Idempotency-Key header"),
+                context.request_id,
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            api_error(
+                AppError::invalid_request("invalid Idempotency-Key header"),
+                context.request_id,
+            )
+        })?
+        .trim()
+        .to_owned();
+    if idempotency_key.is_empty() {
+        return Err(api_error(
+            AppError::invalid_request("Idempotency-Key must not be empty"),
+            context.request_id,
+        ));
+    }
+    let operation_scope = TenantScope::new(auth.scope.operator_id, auth.scope.tenant_id, Some(id));
+    let operation_id = project_start_operation_id(&operation_scope, &idempotency_key);
+    let project = state
+        .project_repository
+        .get(&auth.scope, id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
+
+    // The operation is the durable recovery marker. A retry that reaches this
+    // handler after a process crash can finish the draft->active transition
+    // or return the already-created operation without creating another one.
+    if let Some(operation) = state
+        .operation_store
+        .get(&operation_scope, operation_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+    {
+        if project.status == ProjectStatus::Draft {
+            match state
+                .project_repository
+                .update(
+                    &auth.scope,
+                    id,
+                    project.revision,
+                    ProjectPatch {
+                        status: Some(ProjectStatus::Active),
+                        ..ProjectPatch::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.code == geo_domain::ErrorCode::Conflict => {
+                    let current = state
+                        .project_repository
+                        .get(&auth.scope, id)
+                        .await
+                        .map_err(|error| api_error(error, context.request_id))?
+                        .ok_or_else(|| {
+                            api_error(AppError::not_found("project not found"), context.request_id)
+                        })?;
+                    if current.status != ProjectStatus::Active {
+                        return Err(api_error(error, context.request_id));
+                    }
+                }
+                Err(error) => return Err(api_error(error, context.request_id)),
+            }
+        }
+        return Ok((StatusCode::ACCEPTED, Json(operation)).into_response());
+    }
+
+    if project.status != ProjectStatus::Draft {
+        return Err(api_error(
+            AppError::conflict("project has already been started"),
+            context.request_id,
+        ));
+    }
+    let frozen_revision = project.revision;
+    let frozen_sources = project.settings.initial_sources.clone();
+    let mut operation = Operation::queued("project.start", operation_scope);
+    operation.id = operation_id;
+    operation.result = Some(json!({
+        "project_id": id,
+        "frozen_revision": frozen_revision,
+        "config_revision": frozen_revision,
+        "project_revision": frozen_revision + 1,
+        "initial_sources": frozen_sources,
+    }));
+    // Persist the recovery marker first. If the process exits after this
+    // commit, a same-key retry resumes the status transition instead of
+    // returning a permanent idempotency conflict.
+    state
+        .operation_store
+        .save(operation.clone())
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    match state
+        .project_repository
+        .update(
+            &auth.scope,
+            id,
+            frozen_revision,
+            ProjectPatch {
+                status: Some(ProjectStatus::Active),
+                ..ProjectPatch::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(error) if error.code == geo_domain::ErrorCode::Conflict => {
+            let current = state
+                .project_repository
+                .get(&auth.scope, id)
+                .await
+                .map_err(|error| api_error(error, context.request_id))?
+                .ok_or_else(|| {
+                    api_error(AppError::not_found("project not found"), context.request_id)
+                })?;
+            if current.status != ProjectStatus::Active {
+                return Err(api_error(error, context.request_id));
+            }
+        }
+        Err(error) => return Err(api_error(error, context.request_id)),
+    }
+    Ok((StatusCode::ACCEPTED, Json(operation)).into_response())
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/operations/{id}",
+    security(("sessionCookie" = [])),
     params(("id" = Uuid, Path, description = "Operation ID")),
     responses(
         (status = 200, description = "Operation", body = Operation),
@@ -168,10 +1155,9 @@ async fn get_operation(
 ) -> Result<Json<Operation>, ApiError> {
     let operation = state
         .operation_store
-        .get(id)
+        .get(&scope, id)
         .await
-        .map_err(|error| api_error(error, context.request_id))?
-        .filter(|operation| scope.contains(&operation.scope));
+        .map_err(|error| api_error(error, context.request_id))?;
     operation.map(Json).ok_or_else(|| {
         api_error(
             AppError::not_found("operation not found"),
@@ -183,6 +1169,7 @@ async fn get_operation(
 #[utoipa::path(
     get,
     path = "/api/v1/events",
+    security(("sessionCookie" = [])),
     responses((status = 200, description = "Server-sent event stream", content_type = "text/event-stream"))
 )]
 async fn events(
@@ -219,11 +1206,43 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
     info(
         title = "Memeloop GEO API",
         version = "0.1.0",
-        description = "W01 modular-monolith HTTP contract; persistence is not implemented yet."
+        description = "W02 project setup and overview API with server-side sessions and tenant scopes."
     ),
-    paths(health_live, health_ready, get_operation, events),
+    paths(
+        health_live,
+        health_ready,
+        auth_config,
+        auth_login,
+        auth_session,
+        auth_logout,
+        list_projects,
+        create_project,
+        get_project,
+        patch_project,
+        get_project_overview,
+        estimate_project_handler,
+        start_project,
+        get_operation,
+        events
+    ),
     components(schemas(
         HealthResponse,
+        LoginRequest,
+        AuthConfigResponse,
+        AuthSessionResponse,
+        UserView,
+        OperatorView,
+        MembershipView,
+        Project,
+        ProjectCreate,
+        ProjectSettings,
+        ProjectPage,
+        ProjectPatchRequest,
+        ProjectSettingsPatchRequest,
+        ProjectOverview,
+        EstimateRange,
+        EstimateCoverage,
+        ProjectEstimateResponse,
         ErrorResponse,
         Operation,
         geo_domain::OperationStatus,
@@ -234,27 +1253,67 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::EventEnvelope,
         geo_domain::AppError,
         geo_domain::ErrorCode
-    ))
+    )),
+    modifiers(&SecurityModifier)
 )]
 pub struct ApiDoc;
+
+struct SecurityModifier;
+
+impl utoipa::Modify for SecurityModifier {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "sessionCookie",
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("__Host-geo_session"))),
+            );
+        }
+    }
+}
 
 pub fn openapi() -> utoipa::openapi::OpenApi {
     ApiDoc::openapi()
 }
 
-/// Build the HTTP router. Scoped routes use the development header adapter;
-/// replace that middleware with authenticated server-side identity resolution
-/// before production deployment.
+/// Build the HTTP router. All business routes use server-resolved identity;
+/// the legacy header adapter remains exported only for isolated compatibility
+/// tests and is intentionally not installed here.
 pub fn router(state: AppState) -> Router {
     let idempotency_store = state.idempotency_store();
-    let scoped = Router::new()
+    let middleware_state = state.clone();
+    let scoped: Router<AppState> = Router::new()
         .route("/operations/{id}", get(get_operation))
         .route("/events", get(events))
-        .route_layer(middleware::from_fn_with_state(
+        .route("/projects", get(list_projects).post(create_project))
+        .route("/projects/{id}", get(get_project).patch(patch_project))
+        .route("/projects/{id}/overview", get(get_project_overview))
+        .route("/projects/{id}/start", post(start_project))
+        .layer(middleware::from_fn_with_state(
             idempotency_store,
             json_command_idempotency_middleware,
         ))
-        .route_layer(middleware::from_fn(dev_scope_middleware));
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // Estimation only validates and computes a range. It intentionally stays
+    // outside the idempotency middleware because it has no external side
+    // effect or durable reservation to protect.
+    let estimate_routes: Router<AppState> = Router::new()
+        .route("/projects/estimate", post(estimate_project_handler))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    let auth_session_routes: Router<AppState> = Router::new()
+        .route("/auth/session", get(auth_session).delete(auth_logout))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(session_auth_from_request));
+
+    let auth_routes: Router<AppState> = Router::new()
+        .route("/auth/config", get(auth_config))
+        .route("/auth/login", post(auth_login))
+        .merge(auth_session_routes)
+        .layer(middleware::from_fn(no_store_middleware));
 
     Router::new()
         .route("/health/live", get(health_live))
@@ -263,8 +1322,11 @@ pub fn router(state: AppState) -> Router {
             "/api/v1",
             Router::new()
                 .route("/openapi.json", get(openapi_json))
+                .merge(auth_routes)
+                .merge(estimate_routes)
                 .merge(scoped),
         )
+        .layer(Extension(middleware_state))
         .layer(middleware::from_fn(context::request_context_middleware))
         .with_state(state)
 }

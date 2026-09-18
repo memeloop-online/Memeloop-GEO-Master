@@ -11,10 +11,24 @@ pub struct MigrationMetadata {
     pub description: &'static str,
 }
 
-const MIGRATION_METADATA: &[MigrationMetadata] = &[MigrationMetadata {
-    version: 1,
-    description: "initial schema",
-}];
+const MIGRATION_METADATA: &[MigrationMetadata] = &[
+    MigrationMetadata {
+        version: 1,
+        description: "initial schema",
+    },
+    MigrationMetadata {
+        version: 2,
+        description: "projects",
+    },
+    MigrationMetadata {
+        version: 3,
+        description: "auth sessions",
+    },
+    MigrationMetadata {
+        version: 4,
+        description: "tenant rls deferred until transaction-local scope wiring is complete",
+    },
+];
 
 pub fn embedded_migrations() -> &'static Migrator {
     &MIGRATOR

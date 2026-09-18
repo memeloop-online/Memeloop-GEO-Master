@@ -15,6 +15,7 @@ rust-version = "1.96"
 
 [workspace.dependencies]
 async-trait = "0.1"
+argon2 = "0.5"
 axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 futures-util = "0.3"
@@ -24,6 +25,7 @@ sqlx = { version = "0.8", default-features = false, features = ["chrono", "json"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+rand_core = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

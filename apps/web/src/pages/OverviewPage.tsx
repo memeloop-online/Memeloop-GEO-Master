@@ -1,66 +1,180 @@
-import { useQuery } from "@tanstack/react-query";
 import {
   Button,
   Card,
   CardHeader,
-  DataGrid,
-  DataGridBody,
-  DataGridCell,
-  DataGridHeader,
-  DataGridHeaderCell,
-  DataGridRow,
   MessageBar,
   MessageBarBody,
   Spinner,
-  TableCellLayout,
-  createTableColumn,
-  type TableColumnDefinition,
 } from "@fluentui/react-components";
 import {
-  ArrowTrendingRegular,
-  PlayRegular,
+  ArrowRightRegular,
   ArrowSyncRegular,
+  DataUsageRegular,
 } from "@fluentui/react-icons";
-import { useParams } from "react-router-dom";
-import { getOverviewDemo, type OverviewData } from "../data/demo";
-import { LoopProgress } from "../components/LoopProgress";
+import { useLocation, useParams } from "react-router-dom";
+import {
+  type ProjectOverview,
+  type ProjectStartAcceptance,
+  useProjectOverviewQuery,
+  useProjectStartAcceptance,
+} from "../api/projects";
+import { LoopProgress, type LoopStep } from "../components/LoopProgress";
 import { StatusPill } from "../components/StatusPill";
 
-type Run = OverviewData["runs"][number];
+function formatMinor(currency: string, minor: number) {
+  const amount = minor / 100;
+  try {
+    return new Intl.NumberFormat("zh-CN", {
+      style: "currency",
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(amount);
+  } catch {
+    return `${currency} ${amount.toFixed(2)}`;
+  }
+}
 
-const runColumns: TableColumnDefinition<Run>[] = [
-  createTableColumn<Run>({
-    columnId: "name",
-    renderHeaderCell: () => "最近运行",
-    renderCell: (run) => (
-      <TableCellLayout description={run.detail}>{run.name}</TableCellLayout>
-    ),
-  }),
-  createTableColumn<Run>({
-    columnId: "status",
-    renderHeaderCell: () => "状态",
-    renderCell: (run) => <StatusPill status={run.status} />,
-  }),
-  createTableColumn<Run>({
-    columnId: "at",
-    renderHeaderCell: () => "时间",
-    renderCell: (run) => run.at,
-  }),
-];
+function formatTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
+function projectStatus(status: ProjectOverview["project"]["status"]) {
+  const labels = {
+    draft: "草稿",
+    active: "已启动",
+    paused: "已暂停",
+    archived: "已归档",
+  } as const;
+  return labels[status];
+}
+
+function buildLoop(overview: ProjectOverview): LoopStep[] {
+  const sourceCount = overview.knowledge.source_count;
+  const savedSources = overview.project.settings.initial_sources?.length ?? 0;
+  const knowledge =
+    overview.knowledge.status === "ready"
+      ? {
+          state: "complete" as const,
+          detail: `${sourceCount} 个来源 · ${overview.knowledge.fact_count} 条事实`,
+        }
+      : overview.knowledge.status === "importing"
+        ? {
+            state: "active" as const,
+            detail: `${sourceCount} 个来源正在导入`,
+          }
+        : {
+            state: "queued" as const,
+            detail:
+              savedSources > 0
+                ? `已冻结 ${savedSources} 个来源，W03 才会导入`
+                : "—",
+          };
+  const benchmark =
+    overview.benchmark.status === "ready"
+      ? {
+          state: "complete" as const,
+          detail: `${overview.benchmark.effective_samples ?? "—"} / ${overview.benchmark.planned_samples} 有效样本`,
+        }
+      : overview.benchmark.status === "running"
+        ? {
+            state: "active" as const,
+            detail: `正在建立基线 · ${overview.benchmark.effective_samples ?? "—"} / ${overview.benchmark.planned_samples}`,
+          }
+        : {
+            state: "queued" as const,
+            detail: "尚未建立",
+          };
+  const cycle =
+    overview.cycle.status === "running"
+      ? { state: "active" as const, detail: "正在运行" }
+      : overview.cycle.status === "paused"
+        ? { state: "blocked" as const, detail: "已暂停后续执行" }
+        : { state: "queued" as const, detail: "—" };
+
+  return [
+    { id: "knowledge", label: "知识", ...knowledge },
+    {
+      id: "questions",
+      label: "问题",
+      state: overview.benchmark.question_count > 0 ? "active" : "queued",
+      detail:
+        overview.benchmark.question_count > 0
+          ? `${overview.benchmark.question_count} 个问题`
+          : "—",
+    },
+    { id: "baseline", label: "基线", ...benchmark },
+    { id: "strategy", label: "策略", state: "queued", detail: "—" },
+    { id: "content", label: "内容", state: "queued", detail: "—" },
+    { id: "checks", label: "检查", state: "queued", detail: "—" },
+    { id: "schedule", label: "调度", state: "queued", detail: "—" },
+    {
+      id: "publish",
+      label: "发布",
+      state: overview.content.published_count > 0 ? "complete" : "queued",
+      detail:
+        overview.content.published_count > 0
+          ? `${overview.content.published_count} 个已发布`
+          : "—",
+    },
+    {
+      id: "verify",
+      label: "验证",
+      state: overview.content.verified_count > 0 ? "complete" : "queued",
+      detail:
+        overview.content.verified_count > 0
+          ? `${overview.content.verified_count} 个已验证`
+          : "—",
+    },
+    { id: "remeasure", label: "复测", state: "queued", detail: "—" },
+    { id: "optimize", label: "优化", ...cycle },
+  ];
+}
+
+function cyclePill(overview: ProjectOverview) {
+  if (overview.cycle.status === "running") {
+    return <StatusPill status="active" text="持续运行" />;
+  }
+  if (overview.cycle.status === "paused") {
+    return <StatusPill status="blocked" text="已暂停" />;
+  }
+  return (
+    <StatusPill
+      status="queued"
+      text={overview.project.status === "active" ? "等待知识处理" : "尚未启动"}
+    />
+  );
+}
+
+function actionHref(base: string, href: string) {
+  if (href.startsWith("/")) return href;
+  return `${base}/${href.replace(/^\/+/, "")}`;
+}
 
 export function OverviewPage() {
   const { tenantId, projectId } = useParams();
-  const { data, isPending, isError, refetch, isFetching } = useQuery({
-    queryKey: ["overview", tenantId, projectId],
-    queryFn: getOverviewDemo,
-  });
-  if (isPending)
+  const location = useLocation();
+  const { data, isPending, isError, refetch, isFetching } =
+    useProjectOverviewQuery(tenantId, projectId);
+  const { data: cachedStartAcceptance } = useProjectStartAcceptance(
+    tenantId,
+    projectId,
+  );
+
+  if (isPending) {
     return (
       <div className="page-loading">
         <Spinner label="正在加载项目总览" />
       </div>
     );
-  if (isError || !data)
+  }
+
+  if (isError || !data) {
     return (
       <MessageBar intent="error">
         <MessageBarBody>
@@ -71,62 +185,146 @@ export function OverviewPage() {
         </Button>
       </MessageBar>
     );
+  }
+
   const base = `/app/${tenantId}/${projectId}`;
+  const savedSources = data.project.settings.initial_sources?.length ?? 0;
+  const routeStartAcceptance = (
+    location.state as { projectStartAcceptance?: ProjectStartAcceptance } | null
+  )?.projectStartAcceptance;
+  const startAcceptance =
+    routeStartAcceptance?.projectId === projectId
+      ? routeStartAcceptance
+      : cachedStartAcceptance?.projectId === projectId
+        ? cachedStartAcceptance
+        : undefined;
+  const baselineNotStarted = data.benchmark.status === "not_started";
+  const sourceNotice =
+    data.knowledge.status === "empty" && savedSources > 0
+      ? `已保存并冻结 ${savedSources} 个知识来源；W03 才会开始导入资料，目前没有已解析资料。`
+      : data.knowledge.status === "empty"
+        ? "还没有企业知识。导入产品资料、官网内容或常见问题，系统将提取可追溯事实。"
+        : null;
+
   return (
     <div className="overview-page">
       <section className="page-hero overview-hero">
         <div>
           <p className="eyebrow">P02 · 项目总览</p>
-          <h1>{data.project.name}</h1>
+          <h1>{data.project.display_name}</h1>
           <p>
-            {data.project.market}　·　观察期 {data.project.period}
+            {data.project.settings.market} · {data.project.settings.language} ·{" "}
+            {projectStatus(data.project.status)}
           </p>
         </div>
         <div className="hero-actions">
           <div className="budget">
-            <span>预算余额</span>
-            <strong>{data.project.budgetLeft}</strong>
-            <small>{data.project.budgetDetail}</small>
+            <span>项目状态</span>
+            <strong>{projectStatus(data.project.status)}</strong>
+            <small>更新于 {formatTime(data.updated_at)}</small>
           </div>
-          <Button appearance="primary" icon={<PlayRegular />}>
-            启动自动优化
+          <Button
+            appearance="secondary"
+            icon={<ArrowSyncRegular />}
+            disabled={isFetching}
+            onClick={() => void refetch()}
+          >
+            刷新
           </Button>
         </div>
       </section>
 
-      <MessageBar intent="warning" className="persistent-notice">
-        <MessageBarBody>
-          <b>1 项内容已阻断：</b>
-          定价事实存在冲突，系统已停止其后续外部请求；其他已排期任务不受影响。
-        </MessageBarBody>
-        <Button as="a" href={`${base}/content`} appearance="subtle">
-          查看内容
-        </Button>
-      </MessageBar>
+      {data.cycle.status === "paused" && (
+        <MessageBar intent="warning" className="persistent-notice">
+          <MessageBarBody>
+            自动优化已暂停：新的外部请求不会开始；在途请求仍可能完成并产生费用。
+          </MessageBarBody>
+        </MessageBar>
+      )}
+      {startAcceptance && (
+        <MessageBar intent="success" className="persistent-notice">
+          <MessageBarBody>
+            启动 Operation 已受理
+            {startAcceptance.operation?.id
+              ? `（${startAcceptance.operation.id}）`
+              : ""}
+            。项目配置与来源已冻结；后续工作会异步排队，并不代表资料已经导入或效果已经产生。
+          </MessageBarBody>
+        </MessageBar>
+      )}
+      {sourceNotice && (
+        <MessageBar intent="info" className="persistent-notice">
+          <MessageBarBody>{sourceNotice}</MessageBarBody>
+        </MessageBar>
+      )}
 
-      <LoopProgress steps={data.loop} />
+      <LoopProgress
+        steps={buildLoop(data)}
+        status={
+          data.cycle.status === "running"
+            ? "active"
+            : data.cycle.status === "paused"
+              ? "blocked"
+              : "queued"
+        }
+        statusText={
+          data.cycle.status === "running"
+            ? "持续运行"
+            : data.cycle.status === "paused"
+              ? "已暂停"
+              : data.project.status === "active"
+                ? "等待知识处理"
+                : "尚未启动"
+        }
+      />
 
       <section className="metric-grid" aria-label="项目关键指标">
-        {data.metrics.map((metric) => (
-          <Card
-            key={metric.label}
-            className={`metric-card tone-${metric.tone ?? "neutral"}`}
-          >
-            <span>{metric.label}</span>
-            <strong>{metric.value}</strong>
-            <small>{metric.detail}</small>
-          </Card>
-        ))}
+        <Card className="metric-card">
+          <span>已解析知识来源</span>
+          <strong>{data.knowledge.source_count}</strong>
+          <small>
+            {data.knowledge.status === "ready"
+              ? `${data.knowledge.fact_count} 条事实可用`
+              : (sourceNotice ?? "—")}
+          </small>
+        </Card>
+        <Card className="metric-card">
+          <span>有效 / 计划样本</span>
+          <strong>
+            {data.benchmark.effective_samples ?? "—"} /{" "}
+            {data.benchmark.planned_samples}
+          </strong>
+          <small>
+            {baselineNotStarted ? "尚未建立" : data.benchmark.status}
+          </small>
+        </Card>
+        <Card className="metric-card">
+          <span>已发布资产</span>
+          <strong>{data.content.published_count}</strong>
+          <small>
+            {data.content.verified_count} 已验证 · {data.content.blocked_count}{" "}
+            已阻断
+          </small>
+        </Card>
+        <Card className="metric-card">
+          <span>本期已结算成本</span>
+          <strong>
+            {formatMinor(data.cost.currency, data.cost.settled_minor)}
+          </strong>
+          <small>
+            已预留 {formatMinor(data.cost.currency, data.cost.reserved_minor)}
+          </small>
+        </Card>
       </section>
 
       <div className="overview-columns">
-        <section className="column-main" aria-label="趋势与最近运行">
+        <section className="column-main" aria-label="基线和下一步">
           <Card className="panel-card">
             <CardHeader
               header={
                 <div>
-                  <h2>分平台趋势与观测面</h2>
-                  <p>指标按观测面隔离，不混合计算。</p>
+                  <h2>基线与测量</h2>
+                  <p>按有效样本展示；缺测始终显示为“—”，不会按 0 计算。</p>
                 </div>
               }
               action={
@@ -134,202 +332,136 @@ export function OverviewPage() {
                   as="a"
                   href={`${base}/measurement`}
                   appearance="subtle"
-                  icon={<ArrowTrendingRegular />}
+                  icon={<DataUsageRegular />}
                 >
                   查看测量
                 </Button>
               }
             />
-            <div className="trend-list">
-              {data.trends.map((trend) => (
-                <TrendRow key={trend.platform} {...trend} />
-              ))}
+            <div className="overview-summary-list">
+              <div>
+                <span>问题</span>
+                <strong>{data.benchmark.question_count}</strong>
+              </div>
+              <div>
+                <span>计划样本</span>
+                <strong>{data.benchmark.planned_samples}</strong>
+              </div>
+              <div>
+                <span>有效样本</span>
+                <strong>{data.benchmark.effective_samples ?? "—"}</strong>
+              </div>
+              <div>
+                <span>状态</span>
+                <strong>
+                  {baselineNotStarted ? "尚未建立" : data.benchmark.status}
+                </strong>
+              </div>
             </div>
           </Card>
-          <Card className="panel-card runs-card">
-            <CardHeader
-              header={
-                <div>
-                  <h2>最近运行、阻断与待确认</h2>
-                  <p>外部响应中断时先对账，避免重复发布。</p>
-                </div>
-              }
-              action={
-                <Button
-                  as="a"
-                  href={`${base}/publications`}
-                  appearance="subtle"
-                >
-                  查看全部
-                </Button>
-              }
-            />
-            <DataGrid
-              items={data.runs}
-              columns={runColumns}
-              getRowId={(run) => run.id}
-              size="small"
-              className="runs-table"
-            >
-              <DataGridHeader>
-                <DataGridRow>
-                  {({ renderHeaderCell }) => (
-                    <DataGridHeaderCell>
-                      {renderHeaderCell()}
-                    </DataGridHeaderCell>
-                  )}
-                </DataGridRow>
-              </DataGridHeader>
-              <DataGridBody<Run>>
-                {({ item, rowId }) => (
-                  <DataGridRow<Run> key={rowId}>
-                    {({ renderCell }) => (
-                      <DataGridCell>{renderCell(item)}</DataGridCell>
-                    )}
-                  </DataGridRow>
-                )}
-              </DataGridBody>
-            </DataGrid>
-          </Card>
-        </section>
-        <aside className="column-side" aria-label="当前机会与资源状态">
           <Card className="panel-card">
             <CardHeader
               header={
                 <div>
-                  <h2>当前机会与建议动作</h2>
-                  <p>按业务权重、差距、可行动性与成本排序。</p>
+                  <h2>当前闭环状态</h2>
+                  <p>只显示当前服务已返回的动作与状态。</p>
                 </div>
               }
+              action={cyclePill(data)}
             />
-            <div className="opportunity-list">
-              {data.opportunities.map((item) => (
-                <div className="opportunity" key={item.title}>
-                  <div>
-                    <StatusPill
-                      status={
-                        item.priority === "high"
-                          ? "blocked"
-                          : item.priority === "medium"
-                            ? "active"
-                            : "queued"
-                      }
-                      text={
-                        item.priority === "high"
-                          ? "优先处理"
-                          : item.priority === "medium"
-                            ? "处理中"
-                            : "待排期"
-                      }
-                    />
-                    <h3>{item.title}</h3>
-                    <p>{item.detail}</p>
-                  </div>
-                  <Button
-                    as="a"
-                    href={`${base}/campaigns`}
-                    appearance="secondary"
-                  >
-                    {item.action}
-                  </Button>
+            {data.next_action ? (
+              <div className="overview-next-action">
+                <div>
+                  <span>{data.next_action.code}</span>
+                  <strong>{data.next_action.label}</strong>
                 </div>
-              ))}
-            </div>
+                <Button
+                  as="a"
+                  href={actionHref(base, data.next_action.href)}
+                  appearance="secondary"
+                  icon={<ArrowRightRegular />}
+                >
+                  查看下一步
+                </Button>
+              </div>
+            ) : (
+              <div className="overview-empty-state">
+                <strong>
+                  {baselineNotStarted ? "等待知识处理" : "暂无可执行动作"}
+                </strong>
+                <p>—</p>
+              </div>
+            )}
           </Card>
-          <Card className="panel-card root-cause-card">
+        </section>
+        <aside className="column-side" aria-label="项目配置与成本">
+          <Card className="panel-card">
             <CardHeader
               header={
                 <div>
-                  <h2>根因聚合、预算与资源</h2>
-                  <p>同一根因聚合显示，避免逐条告警。</p>
+                  <h2>项目配置</h2>
+                  <p>已保存的真实项目元数据。</p>
                 </div>
-              }
-              action={
-                <Button
-                  appearance="subtle"
-                  icon={<ArrowSyncRegular />}
-                  disabled={isFetching}
-                >
-                  刷新
-                </Button>
               }
             />
-            <div className="cause-list">
-              {data.causes.map((cause) => (
-                <div className="cause" key={cause.label}>
-                  <span className="cause-count">{cause.count}</span>
-                  <div>
-                    <b>{cause.label}</b>
-                    <small>{cause.detail}</small>
-                  </div>
+            <dl className="project-meta-list">
+              <div>
+                <dt>产品</dt>
+                <dd>{data.project.settings.product_name}</dd>
+              </div>
+              <div>
+                <dt>资源模式</dt>
+                <dd>{data.project.settings.resource_mode}</dd>
+              </div>
+              <div>
+                <dt>月度预算</dt>
+                <dd>
+                  {formatMinor(
+                    data.project.settings.budget_currency,
+                    data.project.settings.monthly_budget_minor,
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt>测量预留</dt>
+                <dd>{data.project.settings.monitoring_reserve_percent}%</dd>
+              </div>
+              <div>
+                <dt>竞品</dt>
+                <dd>
+                  {data.project.settings.competitors.length > 0
+                    ? data.project.settings.competitors.join("、")
+                    : "—"}
+                </dd>
+              </div>
+            </dl>
+          </Card>
+          <Card className="panel-card">
+            <CardHeader
+              header={
+                <div>
+                  <h2>成本状态</h2>
+                  <p>预留与已结算成本分别展示。</p>
                 </div>
-              ))}
-            </div>
-            <div className="resource-summary">
-              <span>资源池健康</span>
-              <StatusPill status="complete" text="全部可用" />
+              }
+            />
+            <div className="overview-summary-list compact">
+              <div>
+                <span>已预留</span>
+                <strong>
+                  {formatMinor(data.cost.currency, data.cost.reserved_minor)}
+                </strong>
+              </div>
+              <div>
+                <span>已结算</span>
+                <strong>
+                  {formatMinor(data.cost.currency, data.cost.settled_minor)}
+                </strong>
+              </div>
             </div>
           </Card>
         </aside>
       </div>
     </div>
-  );
-}
-
-function TrendRow({
-  platform,
-  surface,
-  rate,
-  change,
-  sample,
-  points,
-}: OverviewData["trends"][number]) {
-  return (
-    <div className="trend-row">
-      <div className="trend-label">
-        <b>{platform}</b>
-        <span>{surface}</span>
-      </div>
-      <Sparkline points={points} />
-      <div className="trend-rate">
-        <strong>{rate}</strong>
-        <span className={change.startsWith("+") ? "positive" : ""}>
-          {change}
-        </span>
-        <small>{sample}</small>
-      </div>
-    </div>
-  );
-}
-
-function Sparkline({ points }: { points: number[] }) {
-  if (points.length === 0)
-    return <div className="sparkline no-data">正在建立基线</div>;
-  const width = 150;
-  const height = 42;
-  const max = Math.max(...points);
-  const min = Math.min(...points);
-  const range = max - min || 1;
-  const d = points
-    .map(
-      (point, index) =>
-        `${index === 0 ? "M" : "L"} ${index * (width / (points.length - 1))} ${height - ((point - min) / range) * 29 - 6}`,
-    )
-    .join(" ");
-  return (
-    <svg
-      className="sparkline"
-      viewBox={`0 0 ${width} ${height}`}
-      role="img"
-      aria-label="趋势上升"
-    >
-      <path
-        d={d}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2.5"
-        vectorEffect="non-scaling-stroke"
-      />
-    </svg>
   );
 }
