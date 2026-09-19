@@ -77,6 +77,5 @@ the browser, logs, or messages.
 
 ## License
 
-This community edition is licensed under [AGPL-3.0-only](LICENSE). Commercial
-licensing is available separately. See [CONTRIBUTING.md](CONTRIBUTING.md) before
-submitting a contribution.
+This project is licensed under the [Apache License 2.0](LICENSE). See
+[CONTRIBUTING.md](CONTRIBUTING.md) before submitting a contribution.
