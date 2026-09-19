@@ -3,6 +3,7 @@
 mod context;
 mod error;
 mod idempotency;
+mod knowledge;
 mod storage;
 
 use axum::{
@@ -20,12 +21,15 @@ use axum::{
 use futures_util::StreamExt;
 use geo_domain::{
     AppError, DEFAULT_SESSION_TTL_SECS, DistributionScope, DocumentScope, EventEnvelope,
-    InitialSource, Membership, MemoryAuthRepository, Operation, Operator, Project, ProjectCreate,
-    ProjectId, ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
+    InitialSource, KnowledgeRepository, Membership, MemoryAuthRepository,
+    MemoryKnowledgeRepository, Operation, Operator, Project, ProjectCreate, ProjectId,
+    ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
     ProjectStartAcceptance, ProjectStartCommand, ReportSchedule, ResourceMode, Role, TenantId,
     TenantScope, User, hash_idempotency_key, settings_hash, start_request_hash,
 };
-use geo_persistence::{Database, PgAuthRepository, PgIdempotencyStore, PgProjectRepository};
+use geo_persistence::{
+    Database, PgAuthRepository, PgIdempotencyStore, PgKnowledgeRepository, PgProjectRepository,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -70,6 +74,7 @@ pub struct AppState {
     idempotency_store: Arc<dyn IdempotencyStore>,
     auth_repository: SharedAuthRepository,
     project_repository: Arc<dyn ProjectRepository>,
+    knowledge_repository: Arc<dyn KnowledgeRepository>,
     events: EventBus,
     ready: Arc<AtomicBool>,
     durable_storage: bool,
@@ -91,6 +96,7 @@ impl AppState {
             idempotency_store: Arc::new(MemoryIdempotencyStore::default()),
             auth_repository: Arc::new(MemoryAuthRepository::development_with_password(password)),
             project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
+            knowledge_repository: Arc::new(MemoryKnowledgeRepository::default()),
             events: EventBus::default(),
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage: false,
@@ -141,11 +147,32 @@ impl AppState {
         events: EventBus,
         durable_storage: bool,
     ) -> Self {
+        Self::with_stores_and_auth_and_projects_and_knowledge(
+            operation_store,
+            idempotency_store,
+            auth_repository,
+            project_repository,
+            Arc::new(MemoryKnowledgeRepository::default()),
+            events,
+            durable_storage,
+        )
+    }
+
+    pub fn with_stores_and_auth_and_projects_and_knowledge(
+        operation_store: Arc<dyn OperationStore>,
+        idempotency_store: Arc<dyn IdempotencyStore>,
+        auth_repository: SharedAuthRepository,
+        project_repository: Arc<dyn ProjectRepository>,
+        knowledge_repository: Arc<dyn KnowledgeRepository>,
+        events: EventBus,
+        durable_storage: bool,
+    ) -> Self {
         Self {
             operation_store,
             idempotency_store,
             auth_repository,
             project_repository,
+            knowledge_repository,
             events,
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage,
@@ -176,11 +203,12 @@ impl AppState {
     }
 
     pub fn from_database(database: &Database) -> Self {
-        Self::with_stores_and_auth_and_projects(
+        Self::with_stores_and_auth_and_projects_and_knowledge(
             Arc::new(PgOperationStore::from_database(database)),
             Arc::new(PgIdempotencyStore::from_database(database)),
             Arc::new(PgAuthRepository::from_database(database)),
             Arc::new(PgProjectRepository::from_database(database)),
+            Arc::new(PgKnowledgeRepository::from_database(database)),
             EventBus::default(),
             true,
         )
@@ -200,6 +228,10 @@ impl AppState {
 
     pub fn project_repository(&self) -> Arc<dyn ProjectRepository> {
         Arc::clone(&self.project_repository)
+    }
+
+    pub fn knowledge_repository(&self) -> Arc<dyn KnowledgeRepository> {
+        Arc::clone(&self.knowledge_repository)
     }
 
     pub fn durable_storage(&self) -> bool {
@@ -946,7 +978,26 @@ async fn get_project_overview(
         .get_start(&scope, id)
         .await
         .map_err(|error| api_error(error, context.request_id))?;
-    Ok(Json(ProjectOverview::from_start(project, start)))
+    let mut overview = ProjectOverview::from_start(project, start);
+    let knowledge_scope = TenantScope::new(scope.operator_id, scope.tenant_id, Some(id));
+    let knowledge = state
+        .knowledge_repository()
+        .overview(&knowledge_scope)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    overview.knowledge.source_count = knowledge.source_count;
+    overview.knowledge.fact_count = knowledge.fact_count;
+    overview.knowledge.status = if knowledge.current_release_id.is_some() {
+        geo_domain::OverviewKnowledgeStatus::Ready
+    } else if knowledge.importing_count > 0 {
+        geo_domain::OverviewKnowledgeStatus::Importing
+    } else {
+        geo_domain::OverviewKnowledgeStatus::Empty
+    };
+    if knowledge.current_release_id.is_some() {
+        overview.cycle.awaiting_knowledge = false;
+    }
+    Ok(Json(overview))
 }
 
 fn estimate_project(
@@ -1300,6 +1351,20 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         estimate_project_handler,
         start_project,
         get_project_start,
+        knowledge::capabilities,
+        knowledge::create_upload_session,
+        knowledge::put_upload_content,
+        knowledge::complete_upload,
+        knowledge::import_batch,
+        knowledge::materialize_initial_sources,
+        knowledge::list_sources,
+        knowledge::get_source,
+        knowledge::get_source_version,
+        knowledge::list_products,
+        knowledge::list_facts,
+        knowledge::current_release,
+        knowledge::search,
+        knowledge::ask,
         get_operation,
         events
     ),
@@ -1328,6 +1393,29 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         ProjectEstimateResponse,
         ProjectStartRequest,
         ProjectStartAcceptance,
+        knowledge::KnowledgeProjectQuery,
+        knowledge::ImportBatchRequest,
+        geo_domain::KnowledgeCapability,
+        geo_domain::UploadSessionCommand,
+        geo_domain::UploadSession,
+        geo_domain::ImportItem,
+        geo_domain::ImportAcceptance,
+        geo_domain::ImportBatchAcceptance,
+        geo_domain::Source,
+        geo_domain::SourceDetail,
+        geo_domain::SourceVersion,
+        geo_domain::Chunk,
+        geo_domain::ChunkLocator,
+        geo_domain::ImportJob,
+        geo_domain::Product,
+        geo_domain::Fact,
+        geo_domain::KnowledgeRelease,
+        geo_domain::CurrentKnowledgeRelease,
+        geo_domain::KnowledgeSearchRequest,
+        geo_domain::KnowledgeEvidence,
+        geo_domain::KnowledgeSearchResult,
+        geo_domain::KnowledgeAnswerStatus,
+        geo_domain::KnowledgeAskResult,
         ErrorResponse,
         Operation,
         geo_domain::OperationStatus,
@@ -1399,6 +1487,13 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(auth_scope_from_request));
 
+    // Knowledge uploads carry raw bytes and completion has its own durable
+    // idempotency boundary, so this router intentionally stays outside the
+    // JSON idempotency middleware.
+    let knowledge_routes = knowledge::routes()
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
     let auth_session_routes: Router<AppState> = Router::new()
         .route("/auth/session", get(auth_session).delete(auth_logout))
         .layer(middleware::from_fn(csrf_origin_from_request))
@@ -1420,6 +1515,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(auth_routes)
                 .merge(estimate_routes)
                 .merge(start_routes)
+                .merge(knowledge_routes)
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))

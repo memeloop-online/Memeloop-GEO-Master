@@ -168,6 +168,7 @@ export interface ProjectOverview {
   project: Project;
   cycle: {
     status: "not_started" | "running" | "paused";
+    awaiting_knowledge: boolean;
   };
   knowledge: {
     source_count: number;

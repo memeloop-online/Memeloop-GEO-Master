@@ -56,9 +56,21 @@ export function setUnauthorizedHandler(
 
 export interface ApiRequestOptions extends Omit<RequestInit, "body"> {
   body?: unknown;
-  /** A resource selector, never an identity or authorization claim. */
+  /**
+   * Resource selectors only. Authentication and operator/tenant authorization
+   * are derived from the session on the server; callers must not add identity
+   * headers.
+   */
   tenantId?: string;
+  projectId?: string;
   idempotencyKey?: string;
+  /**
+   * File bytes are deliberately not put through the JSON/idempotency
+   * middleware used for regular API commands.
+   */
+  idempotency?: "auto" | "omit";
+  /** Send an already encoded request payload (for example a File). */
+  rawBody?: BodyInit;
   csrf?: "required" | "omit";
   unauthorized?: "handle" | "ignore";
 }
@@ -78,10 +90,15 @@ export function createIdempotencyKey(): string {
   );
 }
 
-function withTenantSelector(path: string, tenantId: string | undefined) {
-  if (!tenantId) return path;
+function withResourceSelectors(
+  path: string,
+  tenantId: string | undefined,
+  projectId: string | undefined,
+) {
+  if (!tenantId && !projectId) return path;
   const url = new URL(path, window.location.origin);
-  url.searchParams.set("tenant_id", tenantId);
+  if (tenantId) url.searchParams.set("tenant_id", tenantId);
+  if (projectId) url.searchParams.set("project_id", projectId);
   return `${url.pathname}${url.search}`;
 }
 
@@ -90,7 +107,10 @@ export async function apiFetch<T>(
   {
     body,
     tenantId,
+    projectId,
     idempotencyKey,
+    idempotency = "auto",
+    rawBody,
     csrf = "required",
     unauthorized = "handle",
     ...init
@@ -101,28 +121,37 @@ export async function apiFetch<T>(
 
   const method = (init.method ?? "GET").toUpperCase();
   const isCommand = !["GET", "HEAD", "OPTIONS"].includes(method);
-  if (isCommand && idempotencyKey) {
+  if (isCommand && idempotency !== "omit" && idempotencyKey) {
     headers.set("Idempotency-Key", idempotencyKey);
-  } else if (isCommand && !path.startsWith("/auth/")) {
+  } else if (
+    isCommand &&
+    idempotency !== "omit" &&
+    !path.startsWith("/auth/")
+  ) {
     headers.set("Idempotency-Key", createIdempotencyKey());
   }
   if (isCommand && csrf === "required" && csrfToken) {
     headers.set("X-CSRF-Token", csrfToken);
   }
-  if (body !== undefined) {
+  if (body !== undefined && rawBody === undefined) {
     headers.set("Content-Type", "application/json");
   }
 
   let response: Response;
   try {
     response = await fetch(
-      `${apiBaseUrl}${withTenantSelector(path, tenantId)}`,
+      `${apiBaseUrl}${withResourceSelectors(path, tenantId, projectId)}`,
       {
         ...init,
         method,
         headers,
         credentials: "same-origin",
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body:
+          rawBody !== undefined
+            ? rawBody
+            : body === undefined
+              ? undefined
+              : JSON.stringify(body),
       },
     );
   } catch (error) {

@@ -4,8 +4,11 @@ import { AppShell } from "./components/AppShell";
 import { LoginPage } from "./pages/LoginPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { OverviewPage } from "./pages/OverviewPage";
+import { KnowledgeAskPage } from "./pages/KnowledgeAskPage";
+import { KnowledgePage } from "./pages/KnowledgePage";
 import { SetupEntry } from "./pages/SetupEntry";
 import { SetupPage } from "./pages/SetupPage";
+import { SourceDetailPage } from "./pages/SourceDetailPage";
 import { WorkbenchPage } from "./pages/WorkbenchPage";
 import { WorkspacePage } from "./pages/WorkspacePage";
 
@@ -22,18 +25,12 @@ export function AppRoutes() {
             <Route index element={<Navigate replace to="overview" />} />
             <Route path="setup" element={<SetupPage />} />
             <Route path="overview" element={<OverviewPage />} />
-            <Route
-              path="knowledge"
-              element={<WorkbenchPage page="knowledge" />}
-            />
+            <Route path="knowledge" element={<KnowledgePage />} />
             <Route
               path="knowledge/sources/:id"
-              element={<WorkbenchPage page="source" />}
+              element={<SourceDetailPage />}
             />
-            <Route
-              path="knowledge/ask"
-              element={<WorkbenchPage page="ask" />}
-            />
+            <Route path="knowledge/ask" element={<KnowledgeAskPage />} />
             <Route
               path="ask"
               element={<Navigate replace to="../knowledge/ask" />}

@@ -25,6 +25,10 @@ pub struct ErrorResponse {
     pub code: ErrorCode,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
     pub request_id: Uuid,
 }
@@ -53,6 +57,18 @@ pub fn error_response(
     (
         status,
         Json(ErrorResponse {
+            field: error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("field"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            retryable: matches!(
+                error.code,
+                ErrorCode::NotReady
+                    | ErrorCode::CapabilityMissing
+                    | ErrorCode::DependencyUnavailable
+            ),
             code: error.code,
             message: error.message,
             details: error.details,

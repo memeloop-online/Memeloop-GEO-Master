@@ -14,8 +14,16 @@ import {
   ArrowRightRegular,
   CheckmarkRegular,
   DeleteRegular,
+  DocumentArrowUpRegular,
 } from "@fluentui/react-icons";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  type FileUploadProgress,
+  type ImportItemResult,
+  type KnowledgePurpose,
+  materializeInitialSources,
+  useUploadFilesMutation,
+} from "../api/knowledge";
 import { createIdempotencyKey } from "../api/client";
 import {
   type CreateProjectInput,
@@ -68,6 +76,27 @@ type SourceDraft = {
 };
 type FieldErrors = Record<string, string>;
 type SaveState = "idle" | "saving" | "saved" | "error";
+type SetupFileState =
+  | "waiting"
+  | "creating_session"
+  | "uploading"
+  | "completing"
+  | "accepted"
+  | "failed";
+type UploadedFileSource = {
+  sourceId: string;
+  sourceVersionId: string | null;
+  contentHash: string | null;
+  visibility: SourceVisibility;
+};
+type SetupFile = {
+  id: string;
+  file: File;
+  purpose: KnowledgePurpose;
+  state: SetupFileState;
+  detail?: string;
+  sourceRef?: UploadedFileSource;
+};
 
 function isUrl(value: string) {
   try {
@@ -181,6 +210,33 @@ function sourceValues(sources: SourceDraft[]): InitialSource[] {
       version_ref: source.versionRef.trim() || null,
       content_hash: source.contentHash.trim() || null,
     }));
+}
+
+function uploadedFileSourceValues(files: SetupFile[]): InitialSource[] {
+  return files.flatMap((file) => {
+    if (file.state !== "accepted" || !file.sourceRef) return [];
+    return [
+      {
+        kind: "object",
+        value: file.sourceRef.sourceId,
+        visibility: file.sourceRef.visibility,
+        version_ref: file.sourceRef.sourceVersionId,
+        content_hash: file.sourceRef.contentHash,
+      },
+    ];
+  });
+}
+
+function setupFileStatusLabel(state: SetupFileState) {
+  const labels: Record<SetupFileState, string> = {
+    waiting: "等待创建草稿",
+    creating_session: "正在创建上传会话",
+    uploading: "正在上传",
+    completing: "正在核验并提交",
+    accepted: "已受理解析",
+    failed: "上传失败",
+  };
+  return labels[state];
 }
 
 function defaultTimezone() {
@@ -367,6 +423,8 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
       contentHash: "",
     },
   ]);
+  const [files, setFiles] = useState<SetupFile[]>([]);
+  const [filePurpose, setFilePurpose] = useState<KnowledgePurpose>("public");
   const [productName, setProductName] = useState("");
   const [market, setMarket] = useState("中国大陆");
   const [language, setLanguage] = useState("简体中文");
@@ -392,7 +450,14 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
   );
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveError, setSaveError] = useState<Error | null>(null);
+  const [materializing, setMaterializing] = useState(false);
+  const [materializationError, setMaterializationError] =
+    useState<Error | null>(null);
+  const [materializationFailures, setMaterializationFailures] = useState<
+    ImportItemResult[]
+  >([]);
   const updateProject = useUpdateProjectMutation(tenantId, draft?.id ?? "");
+  const uploadFiles = useUploadFilesMutation(tenantId, draft?.id);
   const draftRef = useRef<Project | null>(null);
   const persistedFingerprintRef = useRef<string | null>(null);
   const saveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
@@ -420,7 +485,10 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
         target_audience: targetAudience.trim() || null,
         objective: objective.trim(),
         competitors,
-        initial_sources: sourceValues(sources),
+        initial_sources: [
+          ...sourceValues(sources),
+          ...uploadedFileSourceValues(files),
+        ],
         resource_mode: resourceMode,
         monthly_budget_minor: budgetMinor,
         budget_currency: budgetCurrency.trim().toUpperCase(),
@@ -456,6 +524,7 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
     competitors,
     cutoffLocalTime,
     cutoffWeekday,
+    files,
     language,
     market,
     monthlyBudget,
@@ -544,15 +613,110 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
   const commandPending =
     createProject.isPending ||
     updateProject.isPending ||
-    startProject.isPending;
+    startProject.isPending ||
+    materializing;
+  const filesStillUploading = files.some(
+    (file) =>
+      file.state === "waiting" ||
+      file.state === "creating_session" ||
+      file.state === "uploading" ||
+      file.state === "completing",
+  );
 
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
 
+  useEffect(() => {
+    if (!draft || !tenantId || uploadFiles.isPending) return;
+    const nextWaitingFile = files.find((entry) => entry.state === "waiting");
+    if (!nextWaitingFile) return;
+    const queuedFiles = files
+      .filter(
+        (entry) =>
+          entry.state === "waiting" &&
+          entry.purpose === nextWaitingFile.purpose,
+      )
+      .map((entry) => entry.file);
+    if (queuedFiles.length === 0) return;
+
+    void uploadFiles.mutateAsync({
+      files: queuedFiles,
+      purpose: nextWaitingFile.purpose,
+      onProgress: (progress: FileUploadProgress) => {
+        const acceptedSource = progress.result?.source;
+        const acceptedVersion = progress.result?.source_version;
+        const acceptedWithoutSource =
+          progress.state === "accepted" && !acceptedSource?.source_id;
+        if (progress.state === "accepted") setStartSubmissionKey(null);
+        setFiles((previous) =>
+          previous.map((entry) => {
+            if (entry.file !== progress.file) return entry;
+            const state: SetupFileState = acceptedWithoutSource
+              ? "failed"
+              : progress.state === "creating_session" ||
+                  progress.state === "uploading" ||
+                  progress.state === "completing" ||
+                  progress.state === "accepted" ||
+                  progress.state === "failed"
+                ? progress.state
+                : "waiting";
+            return {
+              ...entry,
+              state,
+              detail:
+                (acceptedWithoutSource
+                  ? "上传已完成，但服务端没有返回可冻结的来源引用；不会启动项目。"
+                  : progress.error?.message) ??
+                (progress.state === "accepted"
+                  ? progress.result?.status === "succeeded"
+                    ? "资料处理已完成"
+                    : "资料已提交，离开页面后仍会继续处理"
+                  : undefined),
+              sourceRef:
+                progress.state === "accepted" && acceptedSource?.source_id
+                  ? {
+                      sourceId: acceptedSource.source_id,
+                      sourceVersionId:
+                        acceptedVersion?.source_version_id ?? null,
+                      contentHash: acceptedVersion?.content_sha256 ?? null,
+                      visibility: entry.purpose,
+                    }
+                  : undefined,
+            };
+          }),
+        );
+      },
+    });
+  }, [draft, files, tenantId, uploadFiles]);
+
+  function addFiles(nextFiles: FileList | null) {
+    if (!nextFiles) return;
+    recordEdited();
+    const maxSize = 100 * 1024 * 1024;
+    setFiles((previous) => [
+      ...previous,
+      ...Array.from(nextFiles)
+        .slice(0, Math.max(0, 100 - previous.length))
+        .map((file) => ({
+          id: crypto.randomUUID(),
+          file,
+          purpose: filePurpose,
+          state:
+            file.size > maxSize ? ("failed" as const) : ("waiting" as const),
+          detail:
+            file.size > maxSize
+              ? "单文件不能超过 100MB，未创建上传会话。"
+              : undefined,
+        })),
+    ]);
+  }
+
   function recordEdited() {
     if (startProject.isError) startProject.reset();
     setStartSubmissionKey(null);
+    setMaterializationError(null);
+    setMaterializationFailures([]);
     if (saveState === "error") {
       setSaveState("idle");
       setSaveError(null);
@@ -686,6 +850,25 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
     if (!tenantId || !configurationIsValid || !estimate.data) return;
     const saved = await flushDraft();
     if (!saved) return;
+    setMaterializing(true);
+    setMaterializationError(null);
+    try {
+      const result = await materializeInitialSources(tenantId, saved.id);
+      setMaterializationFailures(
+        result.items.filter(
+          (item) => item.status === "failed" || item.status === "cancelled",
+        ),
+      );
+    } catch (error) {
+      setMaterializationError(
+        error instanceof Error
+          ? error
+          : new Error("初始资料暂时无法提交到知识库。"),
+      );
+      setMaterializing(false);
+      return;
+    }
+    setMaterializing(false);
     const idempotencyKey = startSubmissionKey ?? createIdempotencyKey();
     setStartSubmissionKey(idempotencyKey);
     try {
@@ -702,10 +885,18 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
   }
 
   function finalAction() {
-    if (sourceValues(sources).length === 0) {
+    if (filesStillUploading) {
       setErrors((previous) => ({
         ...previous,
-        sources: "启动项目前请至少添加一个初始资料。",
+        sources: "等待资料上传完成后再启动项目。",
+      }));
+      return;
+    }
+    const hasAcceptedFileSource = uploadedFileSourceValues(files).length > 0;
+    if (sourceValues(sources).length === 0 && !hasAcceptedFileSource) {
+      setErrors((previous) => ({
+        ...previous,
+        sources: "启动项目前请至少添加一个 URL、文本、引用或上传完成的文件。",
       }));
       setCurrent(0);
       return;
@@ -727,15 +918,21 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
   }
 
   const estimateWaiting = isLast && (estimate.isPending || estimate.isFetching);
-  const finalButtonLabel = estimateWaiting
-    ? "正在计算估算…"
-    : estimate.isError || !estimate.data
-      ? "重试估算"
-      : startProject.isPending
-        ? "正在受理启动…"
-        : startProject.isError
-          ? "重试启动"
-          : "启动项目";
+  const finalButtonLabel = filesStillUploading
+    ? "等待资料上传完成"
+    : estimateWaiting
+      ? "正在计算估算…"
+      : materializing
+        ? "正在准备初始资料…"
+        : materializationError
+          ? "重试准备资料并启动"
+          : estimate.isError || !estimate.data
+            ? "重试估算"
+            : startProject.isPending
+              ? "正在受理启动…"
+              : startProject.isError
+                ? "重试启动"
+                : "启动项目";
 
   return (
     <div className="setup-page">
@@ -776,6 +973,13 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
             <MessageBar intent="error" aria-live="polite">
               <MessageBarBody>
                 草稿尚未保存：{saveError.message}。请重试保存后再继续。
+              </MessageBarBody>
+            </MessageBar>
+          )}
+          {isLast && filesStillUploading && (
+            <MessageBar intent="warning" aria-live="polite">
+              <MessageBarBody>
+                等待资料上传完成。文件完成后会写入不可编辑的来源引用，并随草稿更新后才能启动。
               </MessageBarBody>
             </MessageBar>
           )}
@@ -918,10 +1122,85 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
                   添加资料引用
                 </Button>
               </div>
+              <section className="setup-file-upload">
+                <div>
+                  <b>上传文件</b>
+                  <p>
+                    先保存草稿以取得项目 ID，再按“创建会话 → 上传字节 →
+                    完成核验”上传。
+                    已受理的资料离开或刷新页面后仍由服务端继续处理。
+                  </p>
+                </div>
+                <div className="setup-file-actions">
+                  <Field label="文件用途">
+                    <Select
+                      value={filePurpose}
+                      onChange={(_, data) => {
+                        recordEdited();
+                        setFilePurpose(data.value as KnowledgePurpose);
+                      }}
+                    >
+                      <option value="public">公开资料</option>
+                      <option value="internal">内部资料</option>
+                    </Select>
+                  </Field>
+                  <input
+                    id="setup-file-picker"
+                    hidden
+                    type="file"
+                    multiple
+                    accept=".pdf,.docx,.xlsx,.csv,.md,.markdown,.txt"
+                    onChange={(event) => {
+                      addFiles(event.target.files);
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                  <label
+                    className="setup-file-picker"
+                    htmlFor="setup-file-picker"
+                  >
+                    <DocumentArrowUpRegular />
+                    选择文件
+                  </label>
+                </div>
+                {files.length > 0 && (
+                  <div className="setup-file-list" aria-live="polite">
+                    {files.map((entry) => (
+                      <div key={entry.id}>
+                        <span>
+                          <b>{entry.file.name}</b>
+                          <small>
+                            {(entry.file.size / 1024 / 1024).toFixed(2)} MB ·{" "}
+                            {setupFileStatusLabel(entry.state)}
+                            {entry.detail ? `：${entry.detail}` : ""}
+                          </small>
+                        </span>
+                        <Button
+                          appearance="subtle"
+                          size="small"
+                          disabled={
+                            entry.state === "creating_session" ||
+                            entry.state === "uploading" ||
+                            entry.state === "completing"
+                          }
+                          onClick={() => {
+                            recordEdited();
+                            setFiles((previous) =>
+                              previous.filter((file) => file.id !== entry.id),
+                            );
+                          }}
+                        >
+                          移除
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
               <MessageBar intent="info">
                 <MessageBarBody>
-                  文件上传 API 尚未接入，因此此处不会假装上传文件。已填写的
-                  URL、文本或引用会作为初始资料配置保存，并在启动时冻结。
+                  URL、文本或已有引用仍会作为初始资料配置保存；文件会在草稿创建后
+                  立即走真实上传接口，上传失败项会保留实际原因。
                 </MessageBarBody>
               </MessageBar>
             </div>
@@ -1180,6 +1459,30 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
                   </MessageBarBody>
                 </MessageBar>
               )}
+              {materializationError && (
+                <MessageBar intent="error" aria-live="polite">
+                  <MessageBarBody>
+                    初始资料暂时无法提交到知识库：{materializationError.message}
+                    。项目尚未启动；请重试准备资料并启动。
+                  </MessageBarBody>
+                </MessageBar>
+              )}
+              {materializationFailures.length > 0 && (
+                <MessageBar intent="warning" aria-live="polite">
+                  <MessageBarBody>
+                    {materializationFailures.length} 项初始资料暂未处理：
+                    {materializationFailures
+                      .map(
+                        (item) =>
+                          item.error?.message ??
+                          item.error?.reason ??
+                          item.client_item_id,
+                      )
+                      .join("；")}
+                    。项目仍会启动为“等待知识”，可在资料中心查看和补充。
+                  </MessageBarBody>
+                </MessageBar>
+              )}
               {startProject.isError && (
                 <MessageBar intent="error" aria-live="polite">
                   <MessageBarBody>
@@ -1212,7 +1515,11 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
           </Button>
           <Button
             appearance="primary"
-            disabled={estimateWaiting || commandPending}
+            disabled={
+              estimateWaiting ||
+              commandPending ||
+              (isLast && filesStillUploading)
+            }
             onClick={isLast ? finalAction : () => void nextStep()}
             icon={isLast ? <CheckmarkRegular /> : <ArrowRightRegular />}
           >

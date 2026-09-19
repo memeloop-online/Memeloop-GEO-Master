@@ -14,6 +14,10 @@ pub struct EventEnvelope {
     pub tenant_id: TenantId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<ProjectId>,
+    /// Optional to preserve compatibility with W01/W02 event payloads that
+    /// predate explicit cycle association.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<Uuid>,
     pub aggregate_id: Uuid,
     pub aggregate_version: u64,
     pub occurred_at: DateTime<Utc>,
@@ -43,6 +47,7 @@ impl EventEnvelope {
             operator_id: scope.operator_id,
             tenant_id: scope.tenant_id,
             project_id: scope.project_id,
+            cycle_id: None,
             aggregate_id,
             aggregate_version,
             occurred_at: Utc::now(),

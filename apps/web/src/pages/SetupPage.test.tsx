@@ -175,7 +175,7 @@ const estimate = {
 
 const overview = {
   project: { ...projectForRevision(3), status: "active" as const },
-  cycle: { status: "not_started" as const },
+  cycle: { status: "not_started" as const, awaiting_knowledge: true },
   knowledge: { source_count: 0, fact_count: 0, status: "empty" as const },
   benchmark: {
     question_count: 0,
@@ -444,5 +444,408 @@ describe("project setup workflow", () => {
       expect(headers.get("x-tenant-id")).toBeNull();
       expect(headers.get("x-project-id")).toBeNull();
     }
+  });
+
+  it("creates the draft before using the real upload-session byte sequence", async () => {
+    const fallback = requestHandler();
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const path = pathFor(request);
+        const method = init?.method ?? "GET";
+        if (path.endsWith("/knowledge/upload-sessions") && method === "POST") {
+          return Promise.resolve(
+            response({
+              upload_session_id: "upload-a",
+              filename: "manual.md",
+              expected_size: 4,
+              purpose: "public",
+              state: "created",
+            }),
+          );
+        }
+        if (path.endsWith("/upload-a/content") && method === "PUT") {
+          return Promise.resolve(response(undefined, 204));
+        }
+        if (path.endsWith("/upload-a/complete") && method === "POST") {
+          return Promise.resolve(
+            response(
+              {
+                client_item_id: "upload-a",
+                status: "queued",
+                source: {
+                  source_id: "source-a",
+                  revision: 1,
+                  kind: "file",
+                  name: "manual.md",
+                  purpose: "public",
+                  state: "active",
+                  product_ids: [],
+                },
+                source_version: {
+                  source_version_id: "version-a",
+                  source_id: "source-a",
+                  version: 1,
+                  content_sha256: "hash-a",
+                },
+                import_job: {},
+              },
+              202,
+            ),
+          );
+        }
+        if (
+          path.endsWith("/knowledge/materialize-initial-sources") &&
+          method === "POST"
+        ) {
+          return Promise.resolve(response({ items: [] }, 202));
+        }
+        return fallback(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", {
+      randomUUID: () => "upload-client-id",
+      subtle: {
+        digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer),
+      },
+    });
+    const user = userEvent.setup();
+    renderSetup();
+
+    await user.type(
+      await screen.findByRole("textbox", { name: "品牌名称" }),
+      "Northstar AI",
+    );
+    const file = new File(["demo"], "manual.md", { type: "" });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: vi.fn().mockResolvedValue(new TextEncoder().encode("demo").buffer),
+    });
+    await user.upload(screen.getByLabelText("选择文件"), file);
+    await user.click(screen.getByRole("button", { name: "保存为草稿" }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([request, init]) =>
+            pathFor(request) ===
+              "/api/v1/knowledge/upload-sessions/upload-a/complete" &&
+            init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+    const projectCreate = fetchMock.mock.calls.find(
+      ([request, init]) =>
+        pathFor(request) === "/api/v1/projects" && init?.method === "POST",
+    );
+    const sessionCreate = fetchMock.mock.calls.find(
+      ([request, init]) =>
+        pathFor(request) === "/api/v1/knowledge/upload-sessions" &&
+        init?.method === "POST",
+    );
+    expect(projectCreate).toBeDefined();
+    expect(sessionCreate).toBeDefined();
+    expect(fetchMock.mock.calls.indexOf(projectCreate!)).toBeLessThan(
+      fetchMock.mock.calls.indexOf(sessionCreate!),
+    );
+    expect(
+      JSON.parse(String((sessionCreate?.[1] as RequestInit).body)),
+    ).toMatchObject({
+      filename: "manual.md",
+      declared_media_type: "text/markdown",
+      expected_sha256: "0".repeat(64),
+      purpose: "public",
+    });
+    for (const [, init] of fetchMock.mock.calls) {
+      const headers = new Headers((init as RequestInit | undefined)?.headers);
+      expect(headers.get("x-operator-id")).toBeNull();
+      expect(headers.get("x-tenant-id")).toBeNull();
+      expect(headers.get("x-project-id")).toBeNull();
+    }
+  });
+
+  it("freezes an accepted file source into the draft before starting a file-only project", async () => {
+    const fallback = requestHandler();
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const path = pathFor(request);
+        const method = init?.method ?? "GET";
+        if (path.endsWith("/knowledge/upload-sessions") && method === "POST") {
+          return Promise.resolve(
+            response({
+              upload_session_id: "upload-a",
+              filename: "manual.txt",
+              expected_size: 4,
+              purpose: "internal",
+              state: "created",
+            }),
+          );
+        }
+        if (path.endsWith("/upload-a/content") && method === "PUT") {
+          return Promise.resolve(response(undefined, 204));
+        }
+        if (path.endsWith("/upload-a/complete") && method === "POST") {
+          return Promise.resolve(
+            response(
+              {
+                client_item_id: "upload-a",
+                status: "queued",
+                source: {
+                  source_id: "source-file-a",
+                  revision: 1,
+                  kind: "file",
+                  name: "manual.txt",
+                  purpose: "internal",
+                  state: "active",
+                  product_ids: [],
+                },
+                source_version: {
+                  source_version_id: "version-file-a",
+                  source_id: "source-file-a",
+                  version: 1,
+                  content_sha256: "file-sha-a",
+                },
+              },
+              202,
+            ),
+          );
+        }
+        return fallback(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", {
+      randomUUID: () => "upload-client-id",
+      subtle: {
+        digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer),
+      },
+    });
+    const user = userEvent.setup();
+    renderSetup();
+
+    await user.type(
+      await screen.findByRole("textbox", { name: "品牌名称" }),
+      "Northstar AI",
+    );
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "文件用途" }),
+      "internal",
+    );
+    const file = new File(["demo"], "manual.txt", { type: "text/plain" });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: vi.fn().mockResolvedValue(new TextEncoder().encode("demo").buffer),
+    });
+    await user.upload(screen.getByLabelText("选择文件"), file);
+    await user.click(screen.getByRole("button", { name: "保存为草稿" }));
+    await screen.findByText(/已受理解析/);
+
+    await user.click(screen.getByRole("button", { name: "下一步" }));
+    await screen.findByRole("heading", { name: "目标与市场" });
+    await user.click(screen.getByRole("button", { name: "下一步" }));
+    await screen.findByRole("heading", { name: "发布资源与预算" });
+    await screen.findByRole("heading", { name: "资源与预算估算" });
+    await user.click(screen.getByRole("button", { name: "启动项目" }));
+    await screen.findByText(/项目已启动（受理操作 operation-a）/);
+
+    const sourcePatch = fetchMock.mock.calls.find(([request, init]) => {
+      if (
+        pathFor(request) !== "/api/v1/projects/project-a" ||
+        init?.method !== "PATCH"
+      ) {
+        return false;
+      }
+      const body = JSON.parse(String(init.body)) as {
+        settings?: { initial_sources?: unknown[] };
+      };
+      return Boolean(
+        body.settings?.initial_sources?.some(
+          (source) =>
+            typeof source === "object" &&
+            source !== null &&
+            (source as { value?: string }).value === "source-file-a",
+        ),
+      );
+    });
+    const start = fetchMock.mock.calls.find(
+      ([request, init]) =>
+        pathFor(request) === "/api/v1/projects/project-a/start" &&
+        init?.method === "POST",
+    );
+    const materialize = fetchMock.mock.calls.find(
+      ([request, init]) =>
+        pathFor(request) === "/api/v1/knowledge/materialize-initial-sources" &&
+        init?.method === "POST",
+    );
+    expect(sourcePatch).toBeDefined();
+    expect(materialize).toBeDefined();
+    expect(start).toBeDefined();
+    const materializeUrl = new URL(
+      String(materialize?.[0]),
+      "http://localhost",
+    );
+    expect(materializeUrl.searchParams.get("tenant_id")).toBe("tenant-a");
+    expect(materializeUrl.searchParams.get("project_id")).toBe("project-a");
+    expect(fetchMock.mock.calls.indexOf(sourcePatch!)).toBeLessThan(
+      fetchMock.mock.calls.indexOf(materialize!),
+    );
+    expect(fetchMock.mock.calls.indexOf(materialize!)).toBeLessThan(
+      fetchMock.mock.calls.indexOf(start!),
+    );
+    expect(
+      JSON.parse(String((sourcePatch?.[1] as RequestInit).body)),
+    ).toMatchObject({
+      settings: {
+        initial_sources: [
+          {
+            kind: "object",
+            value: "source-file-a",
+            visibility: "internal",
+            version_ref: "version-file-a",
+            content_hash: "file-sha-a",
+          },
+        ],
+      },
+    });
+  });
+
+  it("does not start when materializing the initial sources fails at HTTP level", async () => {
+    const fallback = requestHandler();
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          pathFor(request) ===
+            "/api/v1/knowledge/materialize-initial-sources" &&
+          init?.method === "POST"
+        ) {
+          return Promise.resolve(
+            response({ message: "knowledge service unavailable" }, 503),
+          );
+        }
+        return fallback(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderSetup();
+
+    await advanceToLaunch(user);
+    await user.click(screen.getByRole("button", { name: "启动项目" }));
+
+    expect(
+      await screen.findByText(/初始资料暂时无法提交到知识库/),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([request, init]) =>
+          pathFor(request) === "/api/v1/projects/project-a/start" &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  it("starts when materialization returns item failures, preserving awaiting-knowledge handling", async () => {
+    const fallback = requestHandler();
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          pathFor(request) ===
+            "/api/v1/knowledge/materialize-initial-sources" &&
+          init?.method === "POST"
+        ) {
+          return Promise.resolve(
+            response(
+              {
+                items: [
+                  {
+                    client_item_id: "website",
+                    status: "failed",
+                    error: { message: "URL 抓取能力未配置" },
+                  },
+                ],
+              },
+              202,
+            ),
+          );
+        }
+        return fallback(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderSetup();
+
+    await advanceToLaunch(user);
+    await user.click(screen.getByRole("button", { name: "启动项目" }));
+
+    expect(
+      await screen.findByText(/项目已启动（受理操作 operation-a）/),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([request, init]) =>
+          pathFor(request) ===
+            "/api/v1/knowledge/materialize-initial-sources" &&
+          init?.method === "POST",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not enable start while a selected file is still uploading", async () => {
+    const fallback = requestHandler();
+    let uploadContentStarted: (() => void) | undefined;
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const path = pathFor(request);
+        const method = init?.method ?? "GET";
+        if (path.endsWith("/knowledge/upload-sessions") && method === "POST") {
+          return Promise.resolve(
+            response({
+              upload_session_id: "upload-pending",
+              filename: "manual.txt",
+              expected_size: 4,
+              purpose: "public",
+              state: "created",
+            }),
+          );
+        }
+        if (path.endsWith("/upload-pending/content") && method === "PUT") {
+          return new Promise<Response>((resolve) => {
+            uploadContentStarted = () => resolve(response(undefined, 204));
+          });
+        }
+        return fallback(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", {
+      randomUUID: () => "upload-pending-id",
+      subtle: {
+        digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer),
+      },
+    });
+    const user = userEvent.setup();
+    renderSetup();
+
+    await user.type(
+      await screen.findByRole("textbox", { name: "品牌名称" }),
+      "Northstar AI",
+    );
+    const file = new File(["demo"], "manual.txt", { type: "text/plain" });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: vi.fn().mockResolvedValue(new TextEncoder().encode("demo").buffer),
+    });
+    await user.upload(screen.getByLabelText("选择文件"), file);
+    await user.click(screen.getByRole("button", { name: "保存为草稿" }));
+    await waitFor(() => expect(uploadContentStarted).toBeDefined());
+
+    await user.click(screen.getByRole("button", { name: "下一步" }));
+    await screen.findByRole("heading", { name: "目标与市场" });
+    await user.click(screen.getByRole("button", { name: "下一步" }));
+    await screen.findByRole("heading", { name: "发布资源与预算" });
+    await screen.findByRole("heading", { name: "资源与预算估算" });
+
+    expect(
+      screen.getByRole("button", { name: "等待资料上传完成" }),
+    ).toBeDisabled();
+    expect(screen.getAllByText(/等待资料上传完成/)).toHaveLength(2);
   });
 });

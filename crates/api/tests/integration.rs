@@ -12,7 +12,7 @@ use geo_api::{
 };
 use geo_domain::{
     DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, DEVELOPMENT_USER_EMAIL, EventEnvelope,
-    Membership, MemoryAuthRepository, Operation, Role, TenantScope, User,
+    Membership, MemoryAuthRepository, Operation, Role, TenantScope, User, sha256_hex,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -88,6 +88,301 @@ fn authenticated_json_request(
         builder = builder.header("idempotency-key", idempotency_key);
     }
     builder.body(Body::from(body.to_owned())).unwrap()
+}
+
+fn authenticated_bytes_request(
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    csrf: &str,
+    idempotency_key: Option<&str>,
+    body: Vec<u8>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", "localhost:8080")
+        .header("origin", "http://localhost:5173")
+        .header("cookie", cookie)
+        .header("content-type", "application/octet-stream")
+        .header(geo_api::CSRF_HEADER, csrf);
+    if let Some(key) = idempotency_key {
+        builder = builder.header("idempotency-key", key);
+    }
+    builder.body(Body::from(body)).unwrap()
+}
+
+#[tokio::test]
+async fn knowledge_upload_text_release_search_and_capability_contracts() {
+    let app = router(AppState::development_with_password("test-password"));
+    let (cookie, csrf, _) = login(&app).await;
+    let tenant_id = DEVELOPMENT_TENANT_ID.to_string();
+    let created = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("knowledge-project"),
+            r#"{"display_name":"Knowledge project","settings":{}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let project: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    let selector = format!("tenant_id={tenant_id}&project_id={project_id}");
+    let bytes = b"Acme Widget includes a two year warranty.\n\nBlue is available.".to_vec();
+    let session = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/knowledge/upload-sessions?{selector}"),
+            &cookie,
+            Some(&csrf),
+            None,
+            &json!({
+                "filename":"widget.md",
+                "declared_media_type":"text/markdown",
+                "expected_size":bytes.len(),
+                "expected_sha256":sha256_hex(&bytes),
+                "purpose":"public"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let session_status = session.status();
+    let session_bytes = to_bytes(session.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(
+        session_status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&session_bytes)
+    );
+    let session: Value = serde_json::from_slice(&session_bytes).unwrap();
+    assert_eq!(session["expected_sha256"], sha256_hex(&bytes));
+    let session_id = session["upload_session_id"].as_str().unwrap();
+    let upload_uri = format!("/api/v1/knowledge/upload-sessions/{session_id}/content?{selector}");
+    let uploaded = app
+        .clone()
+        .oneshot(authenticated_bytes_request(
+            "PUT",
+            &upload_uri,
+            &cookie,
+            &csrf,
+            None,
+            bytes.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    let complete_uri =
+        format!("/api/v1/knowledge/upload-sessions/{session_id}/complete?{selector}");
+    let complete = app
+        .clone()
+        .oneshot(authenticated_bytes_request(
+            "POST",
+            &complete_uri,
+            &cookie,
+            &csrf,
+            Some("upload-complete"),
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete.status(), StatusCode::ACCEPTED);
+    let complete_body = to_bytes(complete.into_body(), 64 * 1024).await.unwrap();
+    let accepted: Value = serde_json::from_slice(&complete_body).unwrap();
+    assert_eq!(accepted["status"], "succeeded");
+    assert!(accepted["release"]["knowledge_release_id"].is_string());
+    let source_id = accepted["source"]["source_id"].as_str().unwrap();
+    let replay = app
+        .clone()
+        .oneshot(authenticated_bytes_request(
+            "POST",
+            &complete_uri,
+            &cookie,
+            &csrf,
+            Some("upload-complete"),
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        to_bytes(replay.into_body(), 64 * 1024).await.unwrap(),
+        complete_body
+    );
+    let different_key = app
+        .clone()
+        .oneshot(authenticated_bytes_request(
+            "POST",
+            &complete_uri,
+            &cookie,
+            &csrf,
+            Some("other-complete"),
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(different_key.status(), StatusCode::CONFLICT);
+    let detail = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/knowledge/sources/{source_id}?{selector}"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: Value =
+        serde_json::from_slice(&to_bytes(detail.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(detail["chunks"].as_array().unwrap().len(), 2);
+    let ask = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/knowledge/ask?{selector}"),
+            &cookie,
+            Some(&csrf),
+            None,
+            r#"{"query":"warranty"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ask.status(), StatusCode::OK);
+    let ask: Value =
+        serde_json::from_slice(&to_bytes(ask.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(ask["mode"], "evidence_only");
+    assert_eq!(ask["answer_status"], "answered");
+    assert_eq!(ask["evidence"][0]["source_id"], source_id);
+    assert_eq!(ask["evidence"][0]["purpose"], "public");
+
+    let internal = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/knowledge/imports?{selector}"),
+            &cookie,
+            Some(&csrf),
+            None,
+            r#"{"items":[{"client_item_id":"internal","kind":"text","name":"internal","purpose":"internal","text":"Secret launch code"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(internal.status(), StatusCode::ACCEPTED);
+    let public_secret = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/knowledge/search?{selector}"),
+            &cookie,
+            Some(&csrf),
+            None,
+            r#"{"query":"secret"}"#,
+        ))
+        .await
+        .unwrap();
+    let public_secret: Value = serde_json::from_slice(
+        &to_bytes(public_secret.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(public_secret["evidence"].as_array().unwrap().is_empty());
+
+    let capabilities = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/knowledge/capabilities?{selector}"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    let capabilities: Value =
+        serde_json::from_slice(&to_bytes(capabilities.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(capabilities["max_upload_bytes"], 100 * 1024 * 1024);
+    assert_eq!(capabilities["max_batch_files"], 100);
+    assert_eq!(capabilities["pdf_parser"], false);
+
+    let pdf_bytes = b"%PDF-not-parsed".to_vec();
+    let pdf_session = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/knowledge/upload-sessions?{selector}"),
+            &cookie,
+            Some(&csrf),
+            None,
+            &json!({
+                "filename":"unparsed.pdf",
+                "declared_media_type":"application/pdf",
+                "expected_size":pdf_bytes.len(),
+                "expected_sha256":sha256_hex(&pdf_bytes),
+                "purpose":"public"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let pdf_session: Value =
+        serde_json::from_slice(&to_bytes(pdf_session.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
+    let pdf_id = pdf_session["upload_session_id"].as_str().unwrap();
+    let pdf_upload = app
+        .clone()
+        .oneshot(authenticated_bytes_request(
+            "PUT",
+            &format!("/api/v1/knowledge/upload-sessions/{pdf_id}/content?{selector}"),
+            &cookie,
+            &csrf,
+            None,
+            pdf_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(pdf_upload.status(), StatusCode::OK);
+    let pdf_complete = app
+        .clone()
+        .oneshot(authenticated_bytes_request(
+            "POST",
+            &format!("/api/v1/knowledge/upload-sessions/{pdf_id}/complete?{selector}"),
+            &cookie,
+            &csrf,
+            Some("pdf-complete"),
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(pdf_complete.status(), StatusCode::ACCEPTED);
+    let pdf_complete: Value =
+        serde_json::from_slice(&to_bytes(pdf_complete.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(pdf_complete["status"], "failed");
+    assert_eq!(pdf_complete["error"]["code"], "capability_missing");
+
+    let overview = app
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/projects/{project_id}/overview?tenant_id={tenant_id}"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    let overview: Value =
+        serde_json::from_slice(&to_bytes(overview.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(overview["knowledge"]["source_count"], 3);
+    assert_eq!(overview["knowledge"]["status"], "ready");
+    assert_eq!(overview["cycle"]["awaiting_knowledge"], false);
 }
 
 #[tokio::test]

@@ -116,6 +116,130 @@ describe("authentication and workspace guards", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("shows ready knowledge as waiting for coverage planning instead of waiting for processing", async () => {
+    const readyOverview = {
+      project: {
+        id: "project-a",
+        slug: "northstar-ai",
+        display_name: "Northstar AI",
+        status: "active",
+        revision: 3,
+        settings: {
+          brand_name: "Northstar AI",
+          product_name: "Northstar Pro",
+          market: "中国大陆",
+          language: "简体中文",
+          target_audience: null,
+          objective: "提升产品在购买决策问题中的可见度",
+          competitors: [],
+          initial_sources: [],
+          resource_mode: "mixed",
+          monthly_budget_minor: 6000000,
+          budget_currency: "CNY",
+          monitoring_reserve_percent: 20,
+          report_timezone: "Asia/Shanghai",
+          report_schedule: {
+            report_weekday: "monday",
+            report_local_time: "09:00",
+            cutoff_weekday: "sunday",
+            cutoff_local_time: "23:59",
+            period_policy: "previous_calendar_week",
+          },
+          document_scope: {
+            all_active_products: true,
+            excluded_product_ids: [],
+            markets: ["中国大陆"],
+            languages: ["简体中文"],
+            content_types: ["product_page"],
+            question_clusters: [],
+          },
+          distribution_scope: {
+            mode: "all_eligible",
+            included_platform_ids: [],
+            excluded_platform_ids: [],
+            resource_pool_ids: [],
+            replication_policy: "one_account_per_platform",
+          },
+        },
+        created_at: "2026-09-18T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+      },
+      cycle: { status: "not_started", awaiting_knowledge: false },
+      knowledge: { source_count: 1, fact_count: 3, status: "ready" },
+      benchmark: {
+        question_count: 0,
+        planned_samples: 0,
+        effective_samples: null,
+        status: "not_started",
+      },
+      content: { published_count: 0, verified_count: 0, blocked_count: 0 },
+      cost: { currency: "CNY", reserved_minor: 0, settled_minor: 0 },
+      next_action: {
+        code: "import_knowledge",
+        label: "导入资料",
+        href: "knowledge",
+      },
+      updated_at: "2026-09-19T00:00:00Z",
+    };
+    const acceptance = {
+      operation_id: "operation-a",
+      cycle_id: "cycle-a",
+      config_revision_id: "config-a",
+      document_manifest: {
+        manifest_id: "documents-a",
+        revision: 1,
+        state: "awaiting_knowledge",
+        sealed: false,
+        expected_count: null,
+      },
+      distribution_manifest: {
+        manifest_id: "distribution-a",
+        revision: 1,
+        state: "awaiting_documents",
+        sealed: false,
+        expected_count: null,
+      },
+      status: "accepted",
+      operation_url: "/operations/operation-a",
+    };
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(request), "http://localhost");
+        if (url.pathname.endsWith("/auth/session")) {
+          return Promise.resolve(response(session));
+        }
+        if (url.pathname.endsWith("/projects/project-a/overview")) {
+          return Promise.resolve(response(readyOverview));
+        }
+        if (
+          url.pathname.endsWith("/projects/project-a/start") &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return Promise.resolve(response(acceptance));
+        }
+        if (url.pathname.endsWith("/projects")) {
+          return Promise.resolve(response({ items: [], next_cursor: null }));
+        }
+        return Promise.resolve(response({}));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp("/app/tenant-a/project-a/overview");
+
+    expect(
+      await screen.findAllByText("知识版本已形成，等待文档覆盖规划/清单封存"),
+    ).not.toHaveLength(0);
+    expect(screen.queryByText("等待知识处理")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /文档与分发清单骨架已创建，知识版本已形成，仍等待文档覆盖规划与文档清单封存/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("查看企业知识")).toBeInTheDocument();
+    expect(screen.queryByText("导入资料")).not.toBeInTheDocument();
+  });
+
   it("logs out through the user menu and clears the protected route", async () => {
     const fetchMock = vi.fn(
       (request: RequestInfo | URL, init?: RequestInit) => {

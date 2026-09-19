@@ -32,6 +32,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 5,
         description: "atomic project start",
     },
+    MigrationMetadata {
+        version: 6,
+        description: "knowledge import",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

@@ -63,6 +63,25 @@ function resourceModeLabel(
   }[mode];
 }
 
+function knowledgeIsReadyForPlanning(overview: ProjectOverview) {
+  return (
+    overview.knowledge.status === "ready" && !overview.cycle.awaiting_knowledge
+  );
+}
+
+function knowledgePhaseText(overview: ProjectOverview) {
+  if (knowledgeIsReadyForPlanning(overview)) {
+    return "知识版本已形成，等待文档覆盖规划/清单封存";
+  }
+  if (overview.knowledge.status === "importing") {
+    return "资料正在处理";
+  }
+  if (overview.cycle.awaiting_knowledge) {
+    return "等待知识处理";
+  }
+  return "等待文档覆盖规划/清单封存";
+}
+
 function buildLoop(overview: ProjectOverview): LoopStep[] {
   const sourceCount = overview.knowledge.source_count;
   const savedSources = overview.project.settings.initial_sources?.length ?? 0;
@@ -155,7 +174,11 @@ function cyclePill(overview: ProjectOverview) {
   return (
     <StatusPill
       status="queued"
-      text={overview.project.status === "active" ? "等待知识处理" : "尚未启动"}
+      text={
+        overview.project.status === "active"
+          ? knowledgePhaseText(overview)
+          : "尚未启动"
+      }
     />
   );
 }
@@ -199,8 +222,17 @@ export function OverviewPage() {
   const base = `/app/${tenantId}/${projectId}`;
   const savedSources = data.project.settings.initial_sources?.length ?? 0;
   const baselineNotStarted = data.benchmark.status === "not_started";
-  const sourceNotice =
-    data.knowledge.status === "empty" && savedSources > 0
+  const knowledgeReadyForPlanning = knowledgeIsReadyForPlanning(data);
+  const nextAction =
+    knowledgeReadyForPlanning && data.next_action?.code === "import_knowledge"
+      ? {
+          label: "查看企业知识",
+          href: "knowledge",
+        }
+      : data.next_action;
+  const sourceNotice = knowledgeReadyForPlanning
+    ? `知识版本已形成，包含 ${data.knowledge.source_count} 个来源和 ${data.knowledge.fact_count} 条事实。等待文档覆盖规划与清单封存；基线、计划和发布尚未开始。`
+    : data.knowledge.status === "empty" && savedSources > 0
       ? `已保存并冻结 ${savedSources} 个知识来源；W03 才会开始导入资料，目前没有已解析资料。`
       : data.knowledge.status === "empty"
         ? "还没有企业知识。导入产品资料、官网内容或常见问题，系统将提取可追溯事实。"
@@ -248,7 +280,10 @@ export function OverviewPage() {
         <MessageBar intent="success" className="persistent-notice">
           <MessageBarBody>
             项目已启动（受理操作 {startAcceptance.operation_id}
-            ）。文档与分发清单骨架已创建，尚未封存并等待知识处理；这不代表资料已经解析、基线已经建立或计划正在运行。
+            ）。文档与分发清单骨架已创建，
+            {knowledgeReadyForPlanning
+              ? "知识版本已形成，仍等待文档覆盖规划与文档清单封存；这不代表基线已经建立或计划正在运行。"
+              : "尚未封存并等待知识处理；这不代表资料已经解析、基线已经建立或计划正在运行。"}
             配置修订 {startAcceptance.config_revision_id} · 文档清单{" "}
             {startAcceptance.document_manifest.manifest_id} · 分发清单{" "}
             {startAcceptance.distribution_manifest.manifest_id}
@@ -276,7 +311,7 @@ export function OverviewPage() {
             : data.cycle.status === "paused"
               ? "已暂停"
               : data.project.status === "active"
-                ? "等待知识处理"
+                ? knowledgePhaseText(data)
                 : "尚未启动"
         }
       />
@@ -372,15 +407,15 @@ export function OverviewPage() {
               }
               action={cyclePill(data)}
             />
-            {data.next_action ? (
+            {nextAction ? (
               <div className="overview-next-action">
                 <div>
                   <span>下一步</span>
-                  <strong>{data.next_action.label}</strong>
+                  <strong>{nextAction.label}</strong>
                 </div>
                 <Button
                   as="a"
-                  href={actionHref(base, data.next_action.href)}
+                  href={actionHref(base, nextAction.href)}
                   appearance="secondary"
                   icon={<ArrowRightRegular />}
                 >
@@ -390,7 +425,11 @@ export function OverviewPage() {
             ) : (
               <div className="overview-empty-state">
                 <strong>
-                  {baselineNotStarted ? "等待知识处理" : "暂无可执行动作"}
+                  {knowledgeReadyForPlanning
+                    ? "等待文档覆盖规划/清单封存"
+                    : baselineNotStarted
+                      ? knowledgePhaseText(data)
+                      : "暂无可执行动作"}
                 </strong>
                 <p>—</p>
               </div>

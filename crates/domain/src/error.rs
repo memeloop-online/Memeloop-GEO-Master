@@ -13,6 +13,7 @@ pub enum ErrorCode {
     NotFound,
     Conflict,
     NotReady,
+    CapabilityMissing,
     DependencyUnavailable,
     Internal,
 }
@@ -26,6 +27,7 @@ impl ErrorCode {
             Self::NotFound => 404,
             Self::Conflict => 409,
             Self::NotReady => 503,
+            Self::CapabilityMissing => 503,
             Self::DependencyUnavailable => 503,
             Self::Internal => 500,
         }
@@ -78,5 +80,9 @@ impl AppError {
 
     pub fn not_ready(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::NotReady, message)
+    }
+
+    pub fn capability_missing(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::CapabilityMissing, message)
     }
 }
