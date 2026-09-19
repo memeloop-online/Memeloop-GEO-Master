@@ -1,14 +1,271 @@
 # Memeloop GEO 产品与开发规格书
 
-版本：1.0  
+版本：1.1
 产品形态：多租户 SaaS、自动化托管、企业定制、OEM 白标
 
-技术栈：TypeScript / React / Fluent UI；Rust
+技术栈：TypeScript / React / Fluent UI / MemeLoop React UI；Rust；Rust 托管 JavaScript Runtime
 
 首发运营商：模因循环、位面张量
 
-冻结日期：2026-09-18  
-状态：实施基线。本次按用户提供的完整规格恢复主体并纳入“两层 fan-out → reduce → 下一轮”架构；此后需求、进度和实施记录写入 TODO.md 与 WORKLOG.md，不再直接改写冻结基线。
+初始冻结日期：2026-09-18
+P00 增补日期：2026-09-19
+状态：实施基线。1.1 按用户明确要求加入最高优先级 P00 AI 工作台、MemeLoop 编排核心与 Rust 托管 JavaScript Runtime；除再次收到明确产品变更要求外，需求、进度和实施记录写入 TODO.md 与 WORKLOG.md，不再直接改写本基线。
+
+---
+
+## 0. P00：AI 工作台
+
+P00 是整个 Memeloop GEO 的默认入口和最高优先级工作包。客户应能够通过自然语言、粘贴内容或上传文件完成已有 GEO 功能；P01—P16 保留为可深链的专业详情页，用于查看原始资料、矩阵、证据、版本、费用或执行细节，而不是要求普通用户逐页填写表单。
+
+### 0.1 产品原则
+
+- 项目默认路由为 `/app/:tenantId/:projectId/chat`；具体会话为 `/chat/:conversationId`。项目根路径优先进入最近活动会话，无会话时进入 P00 欢迎页。
+- 首次启动也可以在 P00 完成。Agent 逐步取得品牌、资料、市场、语言、目标、资源与预算；只在缺少不可推断的必要字段时提问，不增加发布审批或重复确认。
+- 所有已交付 GEO 能力都必须注册为可发现、可授权、可幂等的业务工具。正常路径不以“请去某个页面操作”作为回答；需要查看或编辑细节时返回具体资源卡片和深链接。
+- 对话可以创建后台任务。用户离开页面、断网或关闭浏览器后任务继续；重新进入会话时从持久事件游标恢复。
+- “停止当前回答”和“暂停自动运营”是两个动作：前者取消当前 turn 后续的新模型及工具调用，后者停止项目领取新的业务任务。两者都不能假装撤销已发送发布、已发生费用或正在核对的未知结果。
+- 账号重新登录、OAuth、支付和浏览器权限等必须由用户实际操作的步骤以对话卡片打开专用界面；密码、Cookie、API Key 和支付信息不能写进聊天消息。
+- 发布仍不需要人工审核。内容、预算、权限或平台风控失败时，系统自动阻断对应分支并给出原因；没有“人工点击允许发布”的隐藏闭环。
+
+### 0.2 页面布局与交互
+
+```text
+┌────────────────────────────────────────────────────────────────────────────┐
+│ 项目 / 工作区        Agent 运行状态       预算摘要       [暂停自动运营]   │
+├──────────────────┬──────────────────────────────────────┬──────────────────┤
+│ + 新对话         │ P00 · AI 工作台                      │ 本轮详情         │
+│                  │                                      │                  │
+│ 今天             │ Agent 消息、工具运行、结果卡片       │ 运行分支         │
+│  · 导入企业资料  │                                      │ 来源证据         │
+│  · 本周优化      │ [资料已入库] [2 个文档分支运行中]    │ 预算与费用       │
+│                  │ [查看知识] [查看清单] [查看报告]      │                  │
+│ 后台运行         │                                      │ 完整详情深链接   │
+│  · 文档 fan-out  │                                      │                  │
+│  · 平台分发      │                                      │                  │
+│                  │ ──────────────────────────────────── │                  │
+│ 查看项目详情 ▸   │ [＋文件] 输入要完成的工作…    [发送] │                  │
+└──────────────────┴──────────────────────────────────────┴──────────────────┘
+```
+
+- 左栏显示新对话、会话历史、后台运行和折叠的“查看项目详情”；P01—P16 仍在侧边栏中，但 P00 固定在第一项。
+- 主区使用 `@memeloop/react-ui` 的会话、消息、工具结果、附件和运行状态能力；现有 Fluent UI 应用壳、导航和业务卡片继续使用。
+- 当前上游 Web UI 使用 MUI/assistant-ui 时，只在 P00 局部挂载 ThemeProvider，映射 OEM 品牌色、字体、圆角、间距和明暗主题；不启用全局 CssBaseline，不覆盖 Fluent 样式、焦点或弹层层级。
+- 上游聊天组件支持的通用能力直接复用；批量文件、业务结果卡片和安全 turn 操作通过正式 slot/adapter 扩展。通用缺口优先向 MemeLoop 上游补充，不在 GEO 长期维护第二套聊天框架。
+- 主区支持拖拽、粘贴、选择文件、仅附件消息和多附件批次。每个附件独立显示上传、核验、解析、可用或失败状态；单文件失败不丢失整条消息。
+- Agent 输出的“已完成”“已启动”“已发布”“已结算”等状态只能来自结构化工具结果，不能根据模型自由文本推断。
+- 来源、KnowledgeRelease、DocumentManifest、DistributionManifest、Publication、MeasurementSample、ReportSnapshot 和账单结果均渲染为带稳定资源 ID 的卡片，并可以进入原 P01—P16 详情。
+- 默认隐藏会造成错误理解的“删除后重试”语义。编辑消息创建新 turn/分支；重试保留旧运行和外部副作用审计，不暗示旧发布已撤回。
+
+### 0.3 对话与附件流程
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant UI as P00 / MemeLoop React UI
+    participant API as Rust API
+    participant OBJ as 对象存储与解析
+    participant RT as Rust JS Worker
+    participant ML as MemeLoop Loop
+    participant LLM as Token Center / OpenAI-compatible
+
+    U->>UI: 输入任务并选择多个文件
+    UI->>API: 创建附件上传会话
+    UI->>API: 上传字节并完成哈希核验
+    API->>OBJ: 保存、检测、解析
+    UI->>API: 提交消息与附件引用
+    API-->>UI: 202 messageId / turnId / runId
+    API->>RT: 领取持久 Run
+    RT->>ML: 恢复 profile、checkpoint 与作用域
+    ML->>LLM: 对话或工具选择
+    ML->>API: 调用白名单 GEO 业务工具
+    API-->>ML: 结构化结果与资源引用
+    RT-->>API: 持久事件、消息与 checkpoint
+    API-->>UI: SSE 历史重放与实时事件
+```
+
+附件流程要求：
+
+1. 客户端生成稳定请求幂等键；文件先走 Rust 上传 API，浏览器不直接持有对象存储长期凭据。
+2. 服务端核验声明大小、实际大小、真实 MIME、SHA-256、租户归属和恶意内容；重复内容只在当前租户内去重，不能通过哈希探测其他客户资料。
+3. `AttachmentReference`、原始对象、解析版本、KnowledgeSource 与 SourceVersion 分开建模；只有显式知识导入工具才把附件加入知识库。
+4. 消息可以在附件解析期间受理。依赖附件的工具等待所需解析结果；无关附件或无关分支继续执行。
+5. 模型只按需读取经过用途、权限、长度和证据过滤的文本片段，不把原始大文件直接塞入上下文。
+6. 沿用每文件 100MB、每批最多 100 个文件的产品限制；实际套餐可以在此上限内进一步收紧。
+
+### 0.4 MemeLoop 与 Rust 的职责边界
+
+MemeLoop 是唯一 Agent 运行模型和循环核心。GEO 不复制 ReAct、消息模型、提示词拼接、工具循环、子 Agent 协调或脚本工作流。
+
+MemeLoop 负责：
+
+- `agent-tool-loop`：理解用户意图、调用模型、选择工具、解释结构化结果；
+- `agent-agent-loop`：运行 GEO `.mjs` 工作流，组织“两层 fan-out → reduce → 下一轮”、子 Agent、重试策略和 checkpoint；
+- canonical conversation/message、LoopProfile、工具权限、脚本生命周期和运行步骤；
+- 面向 React 的会话 adapter 和消息/附件呈现。
+
+Rust 业务服务负责：
+
+- 从登录会话确定 operator、tenant、project、member 和角色，模型不能自由指定或扩大作用域；
+- 知识、文档清单、平台清单、内容、账号、出口、发布、测量、报告和账务的合法状态迁移；
+- 预算预留与结算、限流、租约、fencing token、幂等、outbox、查回和证据保存；
+- 判断某个业务项是否已经完成，以及返回可验证的结构化结果；
+- 对模型请求提供受控出站代理，密钥不进入浏览器、JS 堆、消息、checkpoint 或日志。
+
+JS 工作流不直接连接 PostgreSQL、Redis、对象存储、文件系统、任意网络或子进程。它只能调用 Rust 注入的白名单 host ops。checkpoint 不是业务完成凭据；发布、费用或测量是否成功必须读取 Rust 业务记录。
+
+### 0.5 两层 fan-out 与 reduce 的 MemeLoop 编排
+
+- 第一层 fan-out 的 `.mjs` 工作流分页读取冻结的 DocumentManifest，以 `cycle_id + manifest_revision + document_key` 形成确定分支 ID；每个分支调用证据检索、简报、正文和自动检查工具。
+- 第二层 fan-out 分页读取冻结的 DistributionManifest，以 `document_revision_id + platform_target_id` 形成确定分支 ID；分支独立调用渠道变体、账号/出口分配、发布和查回工具。
+- reduce 工作流只读取冻结清单、发布证据和独立 AI 测量样本，按周报截止形成 ReportSnapshot 与下一轮增量动作。
+- 不能把完整笛卡尔积一次交给 `Promise.all`。MemeLoop 脚本按页领取，Rust 同时执行租户配额、队列容量、预算、平台频控和背压。
+- 分支重启后通过 checkpoint 与业务 ledger 跳过已完成步骤；外部发送后、回执前崩溃进入结果未知和查回，不重新盲发。
+- 任何清单项失败都保留原分母与原因；无关分支继续。阶段完成表示每项已有明确结果，不表示全部成功。
+
+### 0.6 Rust 托管 JavaScript Runtime
+
+首选实现为独立 Rust `agent-worker` 进程嵌入 `deno_core`/V8。Axum API 进程不直接执行租户 JS；API 只受理命令、保存状态和流式读取持久事件。
+
+运行时要求：
+
+- 每个活动 run 使用独立 isolate/context，或使用经过完整清理验证的执行槽；跨租户不得残留 registry、插件、全局变量、消息或脚本状态。
+- 仅加载构建期批准的 MemeLoop server bundle 和按摘要锁定的 GEO `.mjs` 脚本；租户不能提交 JavaScript 源码或任意包名。
+- 默认禁止 `file:`、`http:`、`https:`、`data:` 和任意 specifier import；模块加载器只认批准的内置模块表和脚本摘要。
+- JS 不读取环境变量，不接触数据库连接、凭据、任意文件、网络或进程；模型调用、工具调用、日志和 checkpoint 均通过 typed host ops。
+- 设置堆内存、CPU/墙钟、输出字节、模型调用、工具调用、子任务深度、fan-out 并发和上下文预算；超限取消 run，必要时终止 worker 进程。
+- JS isolate 不是完整安全边界；生产仍使用独立容器、只读根文件系统、非特权用户、网络策略、资源配额和受限服务账号。
+- JS 堆与 await 栈不做持久快照。进程重启后从脚本入口重入，按 PostgreSQL checkpoint、run state 和业务 ledger 恢复。
+- Windows 开发与 Linux 生产都必须通过 compatibility spike。若 V8 构建或分发不满足要求，备选为 `rquickjs`/QuickJS；只有 Promise、AsyncIterable、ESM loader、异常、取消和 MemeLoop 专用 bundle 探针全部通过后才可切换。
+
+不得把完整 `memeloop` 根入口直接塞入嵌入引擎。构建独立 server bundle，只引用 loop/runtime/conversation/permission 等宿主中立入口，排除 libp2p、Solid、终端、Node 文件工具和原生扩展。缺少稳定入口时先向 MemeLoop 上游增加正式 embedded-runtime export。
+
+### 0.7 Agent 持久化模型
+
+复用 MemeLoop canonical 类型，不建立平行 `GeoChatMessage`、`message.id` 或 `agentId` 别名。数据库列名差异只在 repository 边界映射。
+
+| 实体 | 关键字段与不变量 |
+|---|---|
+| AgentDefinition / LoopProfile | 不可变版本、loop ID、工具白名单、提示词、模型路由 ID、脚本摘要；不保存 API Key |
+| AgentInstance | canonical instance、definition、node、conversation 标识；关联租户、项目和配置版本 |
+| Conversation | conversation ID、租户/项目、创建主体、父会话/父 run、标题、归档状态；子会话默认折叠 |
+| Message | canonical message ID、conversation ID、origin node、timestamp、Lamport clock、role、content、tool calls、attachments |
+| Turn | turn ID、根用户消息、幂等键哈希、状态、取消版本、前序 turn；同会话只有一个活动 turn |
+| Run | run ID、parent run、turn、loop/profile/script 版本、输入快照、租约、fencing token、状态、截止与配额 |
+| Checkpoint | `(run_id, checkpoint_scope, step_key)` 唯一；输入摘要、结果引用和版本必须匹配后才能复用 |
+| ToolCallLedger | toolCall ID、参数摘要、业务幂等键、权限/预算判定、意图/尝试/结果引用、未知状态与费用关联 |
+| ConversationEvent | 会话/run 作用域、递增持久游标、事件 ID、类型、受权限控制的 payload 与时间 |
+
+消息、turn、run、第一条 event 和 outbox 在受理请求时原子写入。编辑消息创建新 turn；删除对话或 turn 只归档可见性，不删除发布审计、费用和业务成果。
+
+### 0.8 API 与实时恢复
+
+P00 最小 API：
+
+```text
+POST   /api/v1/agent/conversations
+GET    /api/v1/agent/conversations
+GET    /api/v1/agent/conversations/{conversation_id}
+POST   /api/v1/agent/conversations/{conversation_id}/messages
+GET    /api/v1/agent/conversations/{conversation_id}/events
+POST   /api/v1/agent/turns/{turn_id}/cancel
+POST   /api/v1/agent/turns/{turn_id}/retry
+GET    /api/v1/agent/runs/{run_id}
+POST   /api/v1/agent/attachments/upload-sessions
+PUT    /api/v1/agent/attachments/upload-sessions/{id}/content
+POST   /api/v1/agent/attachments/upload-sessions/{id}/complete
+GET    /api/v1/agent/attachments/{attachment_id}
+```
+
+提交消息返回：
+
+```json
+{
+  "status": "accepted",
+  "conversation_id": "uuid",
+  "message_id": "uuid",
+  "turn_id": "uuid",
+  "run_id": "uuid",
+  "events_url": "/api/v1/agent/conversations/.../events"
+}
+```
+
+- `POST messages` 使用客户端稳定幂等键；同键同请求返回同一 acceptance，同键异请求冲突。
+- SSE 支持 `Last-Event-ID`：先从 PostgreSQL 重放历史，再接实时尾流；持久 event ID 去重，过期游标返回“重新取得快照”，不能静默漏事件。
+- 浏览器断线不取消 run。长连接期间周期性重新校验会话与成员资格；撤权后停止推送。
+- 取消标志按 run 持久化并向子运行传播。取消后不发起新的模型、工具或子任务调用；在途外部发布、结果查回和费用核对继续。
+- 新消息创建新 run，不能通过清除 conversation 级取消标志复活旧 run。
+- 实时 UI 进度使用持久事件。若 MemeLoop script 返回值和 `runtime.emit` 同时产生同一逻辑步骤，必须以稳定事件 ID 去重。
+
+### 0.9 GEO Agent 工具
+
+工具使用版本化名称和严格 JSON Schema，服务端忽略或拒绝模型提供的身份作用域字段。首批工具：
+
+```text
+geo.project.get
+geo.project.create_or_update_draft
+geo.project.estimate
+geo.project.start
+geo.knowledge.import_attachments
+geo.knowledge.import_text
+geo.knowledge.search
+geo.knowledge.get_source
+geo.document_manifest.get
+geo.document_manifest.plan_or_resume
+geo.run.get
+geo.run.pause_project
+```
+
+后续按工作包增加内容、账号、发布、测量、报告和账务工具。工具默认 deny，只显式允许当前 profile 所需项；不注册终端、任意文件写入、任意 HTTP、远程执行等通用工具。
+
+`permission_request` 不转化为人工审批队列：未允许工具自动拒绝并返回能力原因。缺少业务必要信息可以使用 ask-question；这属于收集输入，不是发布放行。
+
+### 0.10 模型 Provider、Token Center 与秘密
+
+- OpenAI-compatible endpoint 由服务端环境或 Secret Manager 注入，开发/内网默认可配置 `GEO_AI_BASE_URL=https://token.k3s.onetwo.website/v1`。
+- 密钥只通过 `GEO_AI_API_KEY` 或 Secret Manager 注入；不能写入 Git、前端 `VITE_*`、消息、附件、checkpoint、脚本、错误详情或日志。
+- `GEO_AI_DEFAULT_MODEL` 只保存模型路由标识。对话、附件和租户输入不能覆盖 provider host 或注入新的外部 URL。
+- JS 中的 MemeLoop `ILLMProvider` 通过 Rust host op 调用模型；Rust 执行 HTTP/SSE、超时、取消、429 backoff、用量记录和脱敏。
+- 多租户生产模式通过稳定 `key_id` 映射 memeloop-token-center 凭据。环境直连模式只用于明确的开发/部署配置，不冒充完成租户 Token Center 集成。
+- Provider 契约测试覆盖 JSON、SSE、分片 tool arguments、多 tool calls、usage、错误、超时和取消；搜索/引用等扩展能力单独探测，普通聊天成功不代表其可用。
+- 内容生成可以按已配置规则回退模型；固定 AI 测量协议不能静默更换提供方、模型或观测面。
+
+### 0.11 上游接入与版本策略
+
+- 上游来源为 `https://github.com/memeloop-online/memeloop`，MIT 许可；保留许可证、依赖清单和 SBOM。
+- 首个 compatibility spike 钉死已评估的 `memeloop@0.3.3` 与 `@memeloop/react-ui@0.2.3` 精确版本及 pnpm integrity，同时记录对应上游源码快照与构建哈希；不得使用 `latest`、浮动分支或未记录的本地源码。
+- 只从 `memeloop/loop-api`、`memeloop/conversation`、`memeloop/orchestration/portable`、`@memeloop/react-ui/chat`、`/chat/core`、`/agent` 等窄入口引入，避免把无关网络、Native 或表单依赖打入 P00。
+- 上游升级必须通过 canonical message、附件、script loader、checkpoint、工具权限、SSE adapter 和 Rust bridge 兼容测试后整体更新。
+- 上游通用缺口以最小补丁和测试提交；GEO 只保留业务 tool、业务卡片和 host adapter，不复制 MemeLoop Agent Runtime。
+
+### 0.12 P00 首个纵向切片与验收
+
+首个纵向切片：
+
+```text
+上传 Markdown/TXT
+→ 对话触发知识导入
+→ 带来源回答
+→ 创建后台 GEO run
+→ 从冻结清单展开至少两个文档分支
+→ 汇总分支状态与费用
+→ 断线/重启恢复
+→ 点击证据进入 P04
+```
+
+合并阻断验收：
+
+1. 项目默认进入 P00；仅通过对话和附件完成首个纵切，无审批页。
+2. 原生 MemeLoop loop 真正执行 `user → model tool call → Rust business tool → assistant`，不是前端伪回答。
+3. 多附件、仅附件、上传中断、单文件失败、解析失败和重复提交均保留逐项状态。
+4. SSE 断线重连、重复/乱序事件、过期游标和撤权有效；消息、工具副作用与费用不重复。
+5. 在工具执行前、执行后 checkpoint 前和子分支完成后重启；完成分支不重复执行。
+6. 取消只停止新动作；未知发布和费用继续核对；新 turn 不复活已取消 run。
+7. 跨租户会话、附件、哈希、事件和工具访问全部拒绝；只读成员不能调用写工具。
+8. 内部资料和恶意“忽略规则”附件不能绕过权限、用途、预算和风控。
+9. JS 死循环、超内存、任意 import、网络、文件和进程访问被终止或拒绝，不拖垮 API。
+10. mock OpenAI 的 JSON/SSE/tool-call/usage/error 契约通过；真实内网 endpoint 另做不落密钥的冒烟测试。
+11. Fluent/MemeLoop UI 的明暗主题、OEM 品牌、窄屏、键盘、焦点和弹层通过实机验证。
+12. P00 纵切不替代原规格的真实发布、测量、商业和容量验收；未接入能力必须明确显示未完成。
 
 ---
 
@@ -43,6 +300,7 @@ flowchart LR
 
 首版包含：
 
+- AI 工作台：默认通过对话、附件和后台 Agent 运行使用全部已交付 GEO 能力。
 - 企业知识库：资料导入、结构化产品知识、检索问答、来源定位、增量更新。
 - GEO 诊断：问题集、基线采样、竞品与信源差距、站点检查。
 - 增长计划：选题、内容生产、渠道适配、自动排期、预算控制。
@@ -139,6 +397,7 @@ flowchart TB
 
 | 编号 | 页面 | 路由后缀 | 默认落点 |
 |---|---|---|---|
+| P00 | AI 工作台 | `/chat`、`/chat/:conversationId` | 最近活动会话或欢迎页 |
 | P01 | 项目启动 | `/setup` | 未完成启动的步骤 |
 | P02 | 项目总览 | `/overview` | 最近 30 天 |
 | P03 | 企业知识库 | `/knowledge` | 产品与事实 |
@@ -194,7 +453,7 @@ OEM 管理区使用 `/operator`：
 - 小于 1100px 时三栏变两栏，证据放入侧栏。
 - 小于 768px 时单栏显示，保留查看、暂停和重新连接；复杂批量映射使用全屏步骤页。
 
-Fluent UI v9 提供表格、标签页、输入、菜单、对话框、侧栏、通知和状态组件。步骤条使用统一封装组件，不依赖某个未经确认存在的组件名称。
+Fluent UI v9 提供应用壳、表格、标签页、输入、菜单、对话框、侧栏、通知和状态组件。P00 在应用壳内复用 MemeLoop React UI 的会话、消息、附件与 Agent 运行组件；两套主题只在明确边界内组合，不做全局样式覆盖。步骤条使用统一封装组件，不依赖某个未经确认存在的组件名称。
 
 ### 3.2 共用交互
 
@@ -1339,9 +1598,10 @@ OEM 管理员可以配置：
 
 | 工作包 | 交付内容 | 依赖 |
 |---|---|---|
+| W00 AI 工作台与 Agent Runtime | P00、MemeLoop React UI、对话/附件、Rust JS Worker、持久消息/Run/Checkpoint、模型与 GEO 工具桥接 | W01 的身份与租户底座 |
 | W01 应用底座 | 登录会话、租户边界、导航、主题、API 客户端、异步状态组件 | 无 |
-| W02 项目启动 | P01、配置保存、资源与预算估算、启动任务 | W01 |
-| W03 企业知识库 | P03—P05、资料解析、事实、检索、更新影响 | W01 |
+| W02 项目启动 | P01、配置保存、资源与预算估算、启动任务及对应 Agent 工具 | W01、W00 |
+| W03 企业知识库 | P03—P05、资料解析、事实、检索、更新影响及对应 Agent 工具 | W01、W00 |
 | W04 问题与基线 | 问题集、版本、采样协议、首批测量适配器 | W03 |
 | W05 增长计划 | P06—P07、机会、简报、版本化工作流 | W03、W04 |
 | W06 内容工作台 | P08—P09、媒体、生成、自动修正、渠道变体 | W03、W05 |
@@ -1352,7 +1612,7 @@ OEM 管理员可以配置：
 | W11 容量与恢复 | 压测、故障注入、备份恢复、运行指标 | W03—W10 |
 | W12 移动扩展 | Appium 池、设备网络验证、云手机供应适配契约 | W07、W08 |
 
-首批发布适配器为 X、WordPress、Ghost、企业托管站点；知乎网页适配器单独验证和上线。首批测量按国内与海外各至少一个真实端通道完成，具体连接器只有通过实测才显示为可用。
+交付顺序调整为：先在现有 W01—W03 基础上完成 W00 首个纵切，再继续 W03 文档清单及后续工作包。首批发布适配器为 X、WordPress、Ghost、企业托管站点；知乎网页适配器单独验证和上线。首批测量按国内与海外各至少一个真实端通道完成，具体连接器只有通过实测才显示为可用。
 
 ### 15.1 两层 fan-out / reduce 的工作包落点
 
@@ -1360,6 +1620,7 @@ OEM 管理员可以配置：
 
 | 工作包 | 架构增量与验收 |
 |---|---|
+| W00 | MemeLoop 脚本编排两层 fan-out/reduce，Rust 业务工具保存清单与副作用；持久 checkpoint、确定分支 ID、分页并发和重启恢复通过验收 |
 | W01、W02 | 三阶段状态组件、项目时区/周报截止、范围与预算估算；一次启动创建本轮清单，无新增确认/审批步骤 |
 | W03 | 知识版本到全部主文档的使用关系与更新影响；只失效受影响分支，内部资料退出公开生成 |
 | W04 | 独立 AI 渠道测量清单、计划分母、样本身份与冻结集隔离；缺测进入汇聚但不计未提及 |
@@ -1392,7 +1653,7 @@ OEM 管理员可以配置：
 
 ### 16.2 前端与交互
 
-P01—P16 每页覆盖：
+P00—P16 每页覆盖：
 
 - 空态；
 - 首次加载；
@@ -1475,4 +1736,4 @@ P01—P16 每页覆盖：
 6. 到周报截止时仍有未知发布、观察窗口未结束或缺测，按时生成带覆盖缺口的部分周报；无本周全量测量不伪造新趋势，未知结果继续查回且预算不提前释放。
 7. 重复报告事件只生成一个同版本快照与一组下一轮动作；迟到证据生成显式更正版本或归入下一周期，旧报告和费用历史不变。没有内容/目标变化的下一轮复用已有公开资产，不换轮次重复发布。
 8. 冻结评估题和逐题答案只用于独立评价与报告，不进入文档选题、内容生成或下一轮优化输入；知识包不注入验收提问，API/网页/APP 无静默替换。
-9. P01—P16 原有交互与状态验收仍全部通过；新增矩阵、清单、周报和证据详情覆盖权限、窄屏、键盘和跨租户隔离。最终演示完整展示“企业资料 → 全部主文档 → 全部适用平台 → 证据与 AI 测量 reduce → 周报 → 下一轮增量”。
+9. P00—P16 原有交互与状态验收仍全部通过；新增矩阵、清单、周报和证据详情覆盖权限、窄屏、键盘和跨租户隔离。最终演示完整展示“企业资料 → 全部主文档 → 全部适用平台 → 证据与 AI 测量 reduce → 周报 → 下一轮增量”。

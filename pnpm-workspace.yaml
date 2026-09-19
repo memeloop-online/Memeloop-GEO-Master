@@ -4,3 +4,4 @@ packages:
 
 overrides:
   keyborg: 3.498.0
+  assistant-cloud: 0.2.1

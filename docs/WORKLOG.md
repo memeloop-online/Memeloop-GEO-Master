@@ -46,3 +46,8 @@
 - 真实浏览器完成“登录 → 创建项目 → 粘贴公开资料 → 资料物化 → 启动 → 总览 → P03 → P04 → P05 查询‘质保’ → 回到来源详情”验收；总览显示知识版本已形成但文档清单仍待规划/封存，浏览器控制台无错误。
 - W03-A 验证通过：Rust 格式、Clippy `-D warnings`、14 项 API、1 项应用、8 项领域、3 项持久化测试及 doctest；前端格式、类型、23 项测试和生产构建。2 项 PostgreSQL 条件测试仍因未配置 `GEO_TEST_DATABASE_URL` 跳过。
 - 当前能力边界如实暴露：只有 text/plain 与 text/markdown 能确定性解析；PDF/DOCX/XLSX/CSV、URL 抓取、OCR、向量、LLM 回答和结构化事实提取尚未接入；内存对象适配器不具备重启持久性。
+- 用户明确将 P00 AI 工作台提升为最高优先级，并授权修改已冻结计划；产品规格升级为 1.1，新增对话/附件默认入口、MemeLoop 两层 fan-out/reduce 编排、Rust 托管 JavaScript Runtime、持久 Agent 状态与验收。
+- 核对 `memeloop-online/memeloop`：上游为 MIT，具备 AgentToolLoop、AgentAgentLoop、`.mjs` 脚本、LoopProfile、权限、checkpoint 接口与 React UI adapter；GitHub 检查快照为 `7e9aec265a8870ec45cd186112d65108fb6b606d`。
+- 同时核对当前 npm 精确版本 `memeloop@0.3.3` 与 `@memeloop/react-ui@0.2.3`；后者仍以 MUI/assistant-ui Web 组件为主，但提供窄入口、canonical adapter、附件与长会话投影能力。计划要求在 P00 局部组合主题，不污染 Fluent 应用壳。
+- 明确运行时边界：MemeLoop 负责 Agent 与脚本编排；Rust 负责身份、权限、预算、清单、发布、测量、费用和外部副作用真相。JS 无 SQL、任意网络、文件、进程或环境变量权限。
+- 停止尚未进入编码的 W03-B Astra 设计任务以节省成本；W03-A 已提交，后续从 P00 首个纵切恢复 W03 文档清单开发。
