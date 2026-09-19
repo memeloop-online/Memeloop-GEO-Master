@@ -5,6 +5,7 @@
 //! that role is ready to persist state. Database credentials are supplied at
 //! runtime through configuration; they are never embedded in this crate.
 
+mod agent;
 mod auth;
 mod config;
 mod database;
@@ -15,6 +16,7 @@ mod migrations;
 mod projects;
 mod scope;
 
+pub use agent::PgAgentRepository;
 pub use auth::PgAuthRepository;
 pub use config::{DatabaseConfig, DatabaseConfigError};
 pub use database::{Database, HealthCheck};

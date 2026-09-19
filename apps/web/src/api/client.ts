@@ -102,6 +102,22 @@ function withResourceSelectors(
   return `${url.pathname}${url.search}`;
 }
 
+/**
+ * Builds an API URL using the same resource selectors as apiFetch. This is
+ * intentionally exported for browser-native transports such as EventSource,
+ * which cannot use apiFetch while still needing the current tenant/project
+ * scope.
+ */
+export function apiRequestUrl(
+  path: string,
+  {
+    tenantId,
+    projectId,
+  }: Pick<ApiRequestOptions, "tenantId" | "projectId"> = {},
+) {
+  return `${apiBaseUrl}${withResourceSelectors(path, tenantId, projectId)}`;
+}
+
 export async function apiFetch<T>(
   path: string,
   {
@@ -139,21 +155,18 @@ export async function apiFetch<T>(
 
   let response: Response;
   try {
-    response = await fetch(
-      `${apiBaseUrl}${withResourceSelectors(path, tenantId, projectId)}`,
-      {
-        ...init,
-        method,
-        headers,
-        credentials: "same-origin",
-        body:
-          rawBody !== undefined
-            ? rawBody
-            : body === undefined
-              ? undefined
-              : JSON.stringify(body),
-      },
-    );
+    response = await fetch(apiRequestUrl(path, { tenantId, projectId }), {
+      ...init,
+      method,
+      headers,
+      credentials: "same-origin",
+      body:
+        rawBody !== undefined
+          ? rawBody
+          : body === undefined
+            ? undefined
+            : JSON.stringify(body),
+    });
   } catch (error) {
     throw new ApiError(
       0,

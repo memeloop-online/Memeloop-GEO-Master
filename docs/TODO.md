@@ -4,8 +4,8 @@
 
 ## 当前：W00 AI 工作台与 Agent Runtime
 
-- [ ] 钉死 MemeLoop 依赖与兼容探针；交付 P00 默认路由、会话/附件 UI 和现有详情深链。
-- [ ] 建立 Conversation、Message、Turn、Run、Checkpoint、ToolCallLedger 与持久 SSE。
+- [ ] 完成 Rust JS Runtime、MemeLoop server bundle、Promise/ESM/取消/隔离兼容探针。
+- [ ] 将 Conversation、Message、Turn、Run、Checkpoint、ToolCallLedger、附件引用与 SSE 落到 PostgreSQL。
 - [ ] 建立隔离的 Rust JS Worker、MemeLoop loop bundle、模型 Provider host op 和 GEO 工具桥接。
 - [ ] 跑通“附件入库 → 带来源回答 → 两个文档分支 fan-out → 恢复 → 结果汇总”首个纵切。
 

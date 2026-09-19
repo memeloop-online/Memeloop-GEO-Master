@@ -345,7 +345,7 @@ describe("project setup workflow", () => {
     await user.click(screen.getByRole("button", { name: "启动项目" }));
 
     expect(
-      await screen.findByText(/项目已启动（受理操作 operation-a）/),
+      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
     ).toBeInTheDocument();
     expect(
       postCalls(fetchMock).filter(
@@ -386,7 +386,7 @@ describe("project setup workflow", () => {
     ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "重试启动" }));
     expect(
-      await screen.findByText(/项目已启动（受理操作 operation-a）/),
+      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
     ).toBeInTheDocument();
 
     const starts = postCalls(fetchMock).filter(
@@ -417,6 +417,8 @@ describe("project setup workflow", () => {
 
     await advanceToLaunch(user);
     await user.click(screen.getByRole("button", { name: "启动项目" }));
+    await screen.findByRole("heading", { name: "从一个项目任务开始" });
+    await user.click(screen.getByRole("link", { name: "P02 · 项目总览" }));
     await screen.findByText(/项目已启动（受理操作 operation-a）/);
     const startReadsBeforeRefresh = fetchMock.mock.calls.filter(
       ([request, init]) =>
@@ -644,7 +646,7 @@ describe("project setup workflow", () => {
     await screen.findByRole("heading", { name: "发布资源与预算" });
     await screen.findByRole("heading", { name: "资源与预算估算" });
     await user.click(screen.getByRole("button", { name: "启动项目" }));
-    await screen.findByText(/项目已启动（受理操作 operation-a）/);
+    await screen.findByRole("heading", { name: "从一个项目任务开始" });
 
     const sourcePatch = fetchMock.mock.calls.find(([request, init]) => {
       if (
@@ -777,7 +779,7 @@ describe("project setup workflow", () => {
     await user.click(screen.getByRole("button", { name: "启动项目" }));
 
     expect(
-      await screen.findByText(/项目已启动（受理操作 operation-a）/),
+      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
     ).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(

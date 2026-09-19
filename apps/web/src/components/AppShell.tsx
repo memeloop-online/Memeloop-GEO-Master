@@ -14,6 +14,7 @@ import {
   ArrowExitRegular,
   BookInformationRegular,
   CalendarLtrRegular,
+  ChatRegular,
   ChevronDownRegular,
   DataUsageRegular,
   DocumentBulletListRegular,
@@ -38,6 +39,12 @@ import { ErrorState, LoadingState } from "./AsyncState";
 type NavItem = { to: string; label: string; code: string; icon: ReactElement };
 
 const navItems: NavItem[] = [
+  {
+    to: "chat",
+    label: "AI 工作台",
+    code: "P00",
+    icon: <ChatRegular />,
+  },
   {
     to: "setup",
     label: "项目设置向导",
@@ -235,7 +242,7 @@ export function AppShell() {
                 <MenuItem
                   key={project.id}
                   onClick={() =>
-                    navigate(`/app/${tenantId}/${project.id}/overview`)
+                    navigate(`/app/${tenantId}/${project.id}/chat`)
                   }
                 >
                   {project.display_name}

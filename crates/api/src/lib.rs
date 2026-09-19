@@ -1,5 +1,6 @@
 //! Axum HTTP boundary for the GEO modular monolith.
 
+mod agent;
 mod context;
 mod error;
 mod idempotency;
@@ -20,12 +21,13 @@ use axum::{
 };
 use futures_util::StreamExt;
 use geo_domain::{
-    AppError, DEFAULT_SESSION_TTL_SECS, DistributionScope, DocumentScope, EventEnvelope,
-    InitialSource, KnowledgeRepository, Membership, MemoryAuthRepository,
-    MemoryKnowledgeRepository, Operation, Operator, Project, ProjectCreate, ProjectId,
-    ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
-    ProjectStartAcceptance, ProjectStartCommand, ReportSchedule, ResourceMode, Role, TenantId,
-    TenantScope, User, hash_idempotency_key, settings_hash, start_request_hash,
+    AgentRepository, AgentRuntime, AppError, DEFAULT_SESSION_TTL_SECS, DistributionScope,
+    DocumentScope, EventEnvelope, InitialSource, KnowledgeRepository, Membership,
+    MemoryAgentRepository, MemoryAuthRepository, MemoryKnowledgeRepository, MissingAgentRuntime,
+    Operation, Operator, Project, ProjectCreate, ProjectId, ProjectOverview, ProjectPage,
+    ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
+    ReportSchedule, ResourceMode, Role, TenantId, TenantScope, User, hash_idempotency_key,
+    settings_hash, start_request_hash,
 };
 use geo_persistence::{
     Database, PgAuthRepository, PgIdempotencyStore, PgKnowledgeRepository, PgProjectRepository,
@@ -72,6 +74,8 @@ pub use storage::{EventBus, MemoryOperationStore, OperationStore, PgOperationSto
 pub struct AppState {
     operation_store: Arc<dyn OperationStore>,
     idempotency_store: Arc<dyn IdempotencyStore>,
+    agent_repository: Arc<dyn AgentRepository>,
+    agent_runtime: Arc<dyn AgentRuntime>,
     auth_repository: SharedAuthRepository,
     project_repository: Arc<dyn ProjectRepository>,
     knowledge_repository: Arc<dyn KnowledgeRepository>,
@@ -94,6 +98,8 @@ impl AppState {
         Self {
             operation_store: Arc::new(MemoryOperationStore::default()),
             idempotency_store: Arc::new(MemoryIdempotencyStore::default()),
+            agent_repository: Arc::new(MemoryAgentRepository::default()),
+            agent_runtime: Arc::new(MissingAgentRuntime),
             auth_repository: Arc::new(MemoryAuthRepository::development_with_password(password)),
             project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
             knowledge_repository: Arc::new(MemoryKnowledgeRepository::default()),
@@ -170,6 +176,8 @@ impl AppState {
         Self {
             operation_store,
             idempotency_store,
+            agent_repository: Arc::new(MemoryAgentRepository::default()),
+            agent_runtime: Arc::new(MissingAgentRuntime),
             auth_repository,
             project_repository,
             knowledge_repository,
@@ -212,10 +220,31 @@ impl AppState {
             EventBus::default(),
             true,
         )
+        .with_agent_repository(Arc::new(
+            geo_persistence::PgAgentRepository::from_database(database),
+        ))
     }
 
     pub fn operation_store(&self) -> Arc<dyn OperationStore> {
         Arc::clone(&self.operation_store)
+    }
+
+    pub fn agent_repository(&self) -> Arc<dyn AgentRepository> {
+        Arc::clone(&self.agent_repository)
+    }
+
+    pub fn agent_runtime(&self) -> Arc<dyn AgentRuntime> {
+        Arc::clone(&self.agent_runtime)
+    }
+
+    pub fn with_agent_repository(mut self, repository: Arc<dyn AgentRepository>) -> Self {
+        self.agent_repository = repository;
+        self
+    }
+
+    pub fn with_agent_runtime(mut self, runtime: Arc<dyn AgentRuntime>) -> Self {
+        self.agent_runtime = runtime;
+        self
     }
 
     pub fn idempotency_store(&self) -> Arc<dyn IdempotencyStore> {
@@ -1366,7 +1395,13 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         knowledge::search,
         knowledge::ask,
         get_operation,
-        events
+        events,
+        agent::create_conversation,
+        agent::list_conversations,
+        agent::get_conversation,
+        agent::append_message,
+        agent::cancel_turn,
+        agent::conversation_events
     ),
     components(schemas(
         HealthResponse,
@@ -1425,7 +1460,30 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::ProjectId,
         geo_domain::EventEnvelope,
         geo_domain::AppError,
-        geo_domain::ErrorCode
+        geo_domain::ErrorCode,
+        geo_domain::Conversation,
+        geo_domain::ConversationDetail,
+        geo_domain::ConversationEvent,
+        geo_domain::ConversationId,
+        geo_domain::ConversationStatus,
+        geo_domain::CreateConversation,
+        geo_domain::AppendMessage,
+        geo_domain::SubmitAcceptance,
+        geo_domain::Message,
+        geo_domain::MessageRole,
+        geo_domain::AttachmentReference,
+        geo_domain::AttachmentId,
+        geo_domain::ObjectRef,
+        geo_domain::Turn,
+        geo_domain::TurnId,
+        geo_domain::TurnStatus,
+        geo_domain::Run,
+        geo_domain::RunId,
+        geo_domain::RunStatus,
+        geo_domain::RuntimeCapability,
+        geo_domain::RuntimeCapabilityStatus,
+        agent::ConversationPage,
+        agent::AgentSubmitResponse
     )),
     modifiers(&SecurityModifier)
 )]
@@ -1462,10 +1520,36 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}", get(get_project).patch(patch_project))
         .route("/projects/{id}/overview", get(get_project_overview))
         .layer(middleware::from_fn_with_state(
-            idempotency_store,
+            idempotency_store.clone(),
             json_command_idempotency_middleware,
         ))
         .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    let agent_routes: Router<AppState> = Router::new()
+        .route(
+            "/agent/conversations",
+            get(agent::list_conversations).post(agent::create_conversation),
+        )
+        .route(
+            "/agent/conversations/{conversation_id}",
+            get(agent::get_conversation),
+        )
+        .route(
+            "/agent/conversations/{conversation_id}/messages",
+            post(agent::append_message),
+        )
+        .route(
+            "/agent/conversations/{conversation_id}/events",
+            get(agent::conversation_events),
+        )
+        .route("/agent/turns/{turn_id}/cancel", post(agent::cancel_turn))
+        .layer(middleware::from_fn_with_state(
+            idempotency_store.clone(),
+            json_command_idempotency_middleware,
+        ))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(agent::project_scope_middleware))
         .layer(middleware::from_fn(auth_scope_from_request));
 
     // Project start owns its durable idempotency boundary.  It must not be
@@ -1516,6 +1600,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(estimate_routes)
                 .merge(start_routes)
                 .merge(knowledge_routes)
+                .merge(agent_routes)
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))

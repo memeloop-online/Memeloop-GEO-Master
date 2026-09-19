@@ -105,7 +105,7 @@ function WorkspaceCard({
             <Button
               key={project.id}
               onClick={() =>
-                navigate(`/app/${membership.tenant_id}/${project.id}/overview`)
+                navigate(`/app/${membership.tenant_id}/${project.id}/chat`)
               }
               appearance="secondary"
               icon={<ArrowRightRegular />}

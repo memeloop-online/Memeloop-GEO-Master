@@ -51,3 +51,9 @@
 - 同时核对当前 npm 精确版本 `memeloop@0.3.3` 与 `@memeloop/react-ui@0.2.3`；后者仍以 MUI/assistant-ui Web 组件为主，但提供窄入口、canonical adapter、附件与长会话投影能力。计划要求在 P00 局部组合主题，不污染 Fluent 应用壳。
 - 明确运行时边界：MemeLoop 负责 Agent 与脚本编排；Rust 负责身份、权限、预算、清单、发布、测量、费用和外部副作用真相。JS 无 SQL、任意网络、文件、进程或环境变量权限。
 - 停止尚未进入编码的 W03-B Astra 设计任务以节省成本；W03-A 已提交，后续从 P00 首个纵切恢复 W03 文档清单开发。
+- P00 第一阶段基础已落地：项目根、项目选择和启动完成后默认进入 `/chat`；P00 固定为侧边栏第一项，局部 MUI ThemeProvider 内复用 `@memeloop/react-ui` 的 `AgentChatView`，保留 Fluent 应用壳。
+- 新增项目隔离的 Conversation、Message、Turn、Run、AttachmentReference、RuntimeCapability 与递增 ConversationEvent 契约；内存仓库实现幂等消息受理、同键异请求冲突、仅附件消息、前序 turn、取消、事件重放和跨项目隔离。
+- 新增 `/api/v1/agent/*` 会话、消息、取消与 SSE API；SSE 先订阅再重放以封闭丢事件窗口，支持 `after` 与 `Last-Event-ID`。未配置 Rust JS Runtime 时服务端结构化记录 `capability_missing`，前端只显示真实用户消息和明确提示，不伪造 AI 回答。
+- PostgreSQL AgentRepository 目前明确 fail closed，尚未安装会话/checkpoint 迁移；附件选择只展示“需先上传为对象引用”，尚未接对象上传 adapter；Rust JS Worker、MemeLoop server bundle、模型 Provider 与 GEO 工具桥接仍未完成。
+- P00 回归通过：Rust format、Clippy `-D warnings`、1 项 P00 API、14 项既有 API、1 项应用、12 项领域、3 项持久化测试；前端格式、类型、28 项测试和生产构建。2 项 PostgreSQL 条件测试仍因未配置 `GEO_TEST_DATABASE_URL` 跳过。
+- 真实浏览器完成“登录 → 创建并启动项目 → 项目根重定向 P00 → 新建会话 → 提交任务 → 显示 Rust JS Runtime 未配置 → 刷新恢复消息与运行状态”验收；P00 视觉布局、首项导航和无模拟回复行为通过。

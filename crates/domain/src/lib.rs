@@ -3,6 +3,7 @@
 //! The types in this crate deliberately do not depend on a database or an HTTP
 //! framework.  They are the stable boundary used by the modular monolith.
 
+mod agent;
 mod auth;
 mod error;
 mod event;
@@ -12,6 +13,13 @@ mod operation;
 mod project;
 mod tenancy;
 
+pub use agent::{
+    AgentRepository, AgentRuntime, AppendMessage, AttachmentId, AttachmentReference, Conversation,
+    ConversationDetail, ConversationEvent, ConversationEventId, ConversationId, ConversationStatus,
+    CreateConversation, MemoryAgentRepository, Message, MessageId, MessageRole,
+    MissingAgentRuntime, ObjectRef, Run, RunId, RunStatus, RuntimeCapability,
+    RuntimeCapabilityStatus, SharedAgentRepository, SubmitAcceptance, Turn, TurnId, TurnStatus,
+};
 pub use auth::{
     AuthRepository, DEFAULT_SESSION_TTL_SECS, DEVELOPMENT_USER_EMAIL, LoginIdentity, Membership,
     MemoryAuthRepository, Role, Session, SessionCredentials, SessionId, User, UserId, hash_token,

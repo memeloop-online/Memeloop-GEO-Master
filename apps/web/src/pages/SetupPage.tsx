@@ -877,7 +877,7 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
         expectedRevision: saved.revision,
         idempotencyKey,
       });
-      navigate(`/app/${tenantId}/${saved.id}/overview`, { replace: true });
+      navigate(`/app/${tenantId}/${saved.id}/chat`, { replace: true });
     } catch {
       // The server receives the same idempotency key on retry. The draft is
       // retained, so a failed start cannot make a second project.

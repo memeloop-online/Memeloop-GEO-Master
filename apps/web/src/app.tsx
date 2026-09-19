@@ -6,6 +6,7 @@ import { NotFoundPage } from "./pages/NotFoundPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { KnowledgeAskPage } from "./pages/KnowledgeAskPage";
 import { KnowledgePage } from "./pages/KnowledgePage";
+import { AgentWorkbenchPage } from "./pages/AgentWorkbenchPage";
 import { SetupEntry } from "./pages/SetupEntry";
 import { SetupPage } from "./pages/SetupPage";
 import { SourceDetailPage } from "./pages/SourceDetailPage";
@@ -22,7 +23,12 @@ export function AppRoutes() {
         <Route path="/setup" element={<SetupEntry />} />
         <Route element={<RequireMembership />}>
           <Route path="/app/:tenantId/:projectId" element={<AppShell />}>
-            <Route index element={<Navigate replace to="overview" />} />
+            <Route index element={<Navigate replace to="chat" />} />
+            <Route path="chat" element={<AgentWorkbenchPage />} />
+            <Route
+              path="chat/:conversationId"
+              element={<AgentWorkbenchPage />}
+            />
             <Route path="setup" element={<SetupPage />} />
             <Route path="overview" element={<OverviewPage />} />
             <Route path="knowledge" element={<KnowledgePage />} />
