@@ -57,3 +57,4 @@
 - PostgreSQL AgentRepository 目前明确 fail closed，尚未安装会话/checkpoint 迁移；附件选择只展示“需先上传为对象引用”，尚未接对象上传 adapter；Rust JS Worker、MemeLoop server bundle、模型 Provider 与 GEO 工具桥接仍未完成。
 - P00 回归通过：Rust format、Clippy `-D warnings`、1 项 P00 API、14 项既有 API、1 项应用、12 项领域、3 项持久化测试；前端格式、类型、28 项测试和生产构建。2 项 PostgreSQL 条件测试仍因未配置 `GEO_TEST_DATABASE_URL` 跳过。
 - 真实浏览器完成“登录 → 创建并启动项目 → 项目根重定向 P00 → 新建会话 → 提交任务 → 显示 Rust JS Runtime 未配置 → 刷新恢复消息与运行状态”验收；P00 视觉布局、首项导航和无模拟回复行为通过。
+- 完成脱离历史对话的工程交接审计，新增 `HANDOFF.md`，集中说明文档权威顺序、产品主线、实现/未实现边界、运行模式、验证命令、关键代码入口和 W00 下一任务；README 与精简待办只增加交接入口，冻结产品规格未改动。

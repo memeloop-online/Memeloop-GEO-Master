@@ -5,9 +5,20 @@ Engine Optimization lifecycle: governed enterprise knowledge, baseline
 measurement, strategy, content, automated checks, channel publication,
 verification, and continuous re-measurement.
 
-The repository is a pnpm/Rust monorepo. Its first implementation milestone
-(W01) establishes the shared development environment, application shell, API
-foundation, contract generation, tests, and CI.
+The repository is a pnpm/Rust monorepo. The current implementation includes
+the shared platform foundation, atomic project start, the first enterprise
+knowledge vertical slice, and the P00 AI workbench foundation.
+
+## Project documentation
+
+- [`docs/product-plan-v1.md`](docs/product-plan-v1.md) is the complete product
+  and engineering specification.
+- [`docs/TODO.md`](docs/TODO.md) contains only unfinished work and current
+  acceptance targets.
+- [`docs/WORKLOG.md`](docs/WORKLOG.md) records completed work, verification,
+  constraints, and technical decisions.
+- [`docs/HANDOFF.md`](docs/HANDOFF.md) is the standalone engineering handoff
+  for continuing without prior conversation context.
 
 ## Local development
 
