@@ -864,6 +864,7 @@ dependencies = [
  "futures-util",
  "geo-domain",
  "geo-persistence",
+ "geo-worker",
  "hex",
  "http",
  "serde",

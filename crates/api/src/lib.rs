@@ -1,10 +1,12 @@
 //! Axum HTTP boundary for the GEO modular monolith.
 
 mod agent;
+mod agent_runtime;
 mod context;
 mod error;
 mod idempotency;
 mod knowledge;
+mod run_executor;
 mod storage;
 
 use axum::{
@@ -46,6 +48,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+pub use agent_runtime::{EmbeddedAgentRuntime, RepositoryHostOps};
 pub use context::{
     AuthContext, AuthMiddlewareState, CORRELATION_ID_HEADER, CSRF_HEADER, DEV_SESSION_COOKIE_NAME,
     OPERATOR_ID_HEADER, OriginConfig, PROJECT_ID_HEADER, REQUEST_ID_HEADER, RequestContext,
