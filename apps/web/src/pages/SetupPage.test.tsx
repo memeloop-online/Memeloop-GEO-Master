@@ -99,9 +99,12 @@ const acceptance = {
   operation_url: "/operations/operation-a",
 };
 
+// Mirrors the real payload from `estimate_project` in crates/api/src/lib.rs:
+// English prose in `reason`, and blockers carrying a structured `code`/`scope`.
+// The UI must not parse the prose, so the fixture must not pre-translate it.
 const estimate = {
   settings_hash: "settings-hash-a",
-  estimator_version: "v2",
+  estimator_version: "w02-prerequisites-unknown-v1",
   pricing_snapshot_id: null,
   capability_snapshot_id: null,
   coverage: {
@@ -111,7 +114,8 @@ const estimate = {
       min: null,
       max: null,
       basis_refs: [],
-      reason: "待知识规划",
+      reason:
+        "KnowledgeRelease is not available; document manifest is not frozen.",
     },
     document_platform_targets: {
       state: "unknown" as const,
@@ -119,7 +123,8 @@ const estimate = {
       min: null,
       max: null,
       basis_refs: [],
-      reason: "待能力快照",
+      reason:
+        "CapabilitySnapshot is not available; distribution targets are not expanded.",
     },
     measurement_samples: {
       state: "unknown" as const,
@@ -127,7 +132,8 @@ const estimate = {
       min: null,
       max: null,
       basis_refs: [],
-      reason: "待测量协议",
+      reason:
+        "MeasurementProtocol is not available; measurement samples are not planned.",
     },
   },
   costs: {
@@ -137,7 +143,8 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "待知识规划",
+      reason:
+        "PricingSnapshot and frozen document denominator are unavailable.",
     },
     phase_two_distribution: {
       state: "unknown" as const,
@@ -145,7 +152,8 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "待能力快照",
+      reason:
+        "PricingSnapshot, CapabilitySnapshot, and distribution denominator are unavailable.",
     },
     measurement: {
       state: "unknown" as const,
@@ -153,7 +161,7 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "待测量协议",
+      reason: "PricingSnapshot and MeasurementProtocol are unavailable.",
     },
     total: {
       state: "unknown" as const,
@@ -161,7 +169,7 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "待能力快照",
+      reason: "Component costs are not known.",
     },
   },
   budget: {
@@ -169,8 +177,32 @@ const estimate = {
     measurement_reserve_minor: 1200000,
     currency: "CNY",
   },
-  blockers: [],
-  assumptions: ["能力与知识处理完成后会冻结覆盖。"],
+  blockers: [
+    {
+      code: "knowledge_release_unavailable",
+      scope: "documents",
+      reason: "W02 has not resolved immutable knowledge inputs.",
+    },
+    {
+      code: "capability_snapshot_unavailable",
+      scope: "document_platform_targets",
+      reason: "No eligible platform/account capability snapshot is frozen.",
+    },
+    {
+      code: "measurement_protocol_unavailable",
+      scope: "measurement_samples",
+      reason: "No measurement protocol or sample plan is frozen.",
+    },
+    {
+      code: "pricing_snapshot_unavailable",
+      scope: "costs",
+      reason: "No applicable price list snapshot is frozen.",
+    },
+  ],
+  assumptions: [
+    "Estimate is side-effect free: it creates no project, reservation, or task.",
+    "Zero budget permits later free knowledge work but must block paid actions.",
+  ],
 };
 
 const overview = {
@@ -266,6 +298,20 @@ function patchCalls(fetchMock: ReturnType<typeof vi.fn>) {
   return fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
 }
 
+/** The rendered value of the estimate row whose label (or coverage term) is
+ * `name`. Reading it per row is what makes the scope-to-label mapping testable;
+ * a page-wide `getAllByText` cannot tell one row's label from another's. */
+function estimateRowValue(name: string) {
+  const row = screen.getByText(name).closest("div");
+  return row?.querySelector("strong")?.textContent ?? null;
+}
+
+/** The explanation line rendered under the same estimate row. */
+function estimateRowExplanation(name: string) {
+  const row = screen.getByText(name).closest("div");
+  return row?.querySelector("small")?.textContent ?? null;
+}
+
 async function advanceToLaunch(
   user: ReturnType<typeof userEvent.setup>,
   { saveFirst = false }: { saveFirst?: boolean } = {},
@@ -317,7 +363,7 @@ describe("project setup workflow", () => {
     expect(createBody.settings.target_audience).toBeNull();
   });
 
-  it("shows unknown estimates honestly while retaining known budget values", async () => {
+  it("labels each unknown estimate from the blocker that owns its scope", async () => {
     const fetchMock = requestHandler();
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
@@ -325,12 +371,30 @@ describe("project setup workflow", () => {
 
     await advanceToLaunch(user);
 
-    expect(screen.getAllByText("待知识规划").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("待能力快照").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("待测量协议").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("月度预算").length).toBeGreaterThan(0);
+    // Every cost row is blocked by the `costs`-scoped pricing blocker. A row
+    // whose prose also mentions a capability or measurement snapshot must not
+    // be relabelled by that incidental mention.
+    expect(estimateRowValue("第一阶段文档成本")).toBe("待分项估算");
+    expect(estimateRowValue("第二阶段分发成本")).toBe("待分项估算");
+    expect(estimateRowValue("测量成本")).toBe("待分项估算");
+    expect(estimateRowValue("预计总成本")).toBe("待分项估算");
+    // Each coverage row keeps its own scope's label.
+    expect(estimateRowValue("文档")).toBe("待知识规划");
+    expect(estimateRowValue("文档 × 平台目标")).toBe("待能力快照");
+    expect(estimateRowValue("测量样本")).toBe("待测量协议");
+
+    // The reason behind an unknown row is shown, not discarded, and it is the
+    // translated blocker text rather than the raw English payload string.
+    expect(estimateRowExplanation("预计总成本")).toBe(
+      "适用价格表尚未形成快照，因此当前不展示总价。",
+    );
+    expect(screen.queryByText(/PricingSnapshot/)).not.toBeInTheDocument();
+
+    // Known values are still shown, and the total still spans the grid.
     expect(screen.getByText("¥60,000.00")).toBeInTheDocument();
-    expect(screen.queryByText(/预计总资源成本区间/)).not.toBeInTheDocument();
+    expect(screen.getByText("预计总成本").closest("div")).toHaveClass(
+      "estimate-total",
+    );
   });
 
   it("creates one draft, serializes revision patches, and starts that revision", async () => {
