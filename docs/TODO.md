@@ -5,9 +5,13 @@
 
 ## 当前：W00 AI 工作台与 Agent Runtime
 
-- [ ] 完成 Rust JS Runtime、MemeLoop server bundle、Promise/ESM/取消/隔离兼容探针。
-- [ ] 将 Conversation、Message、Turn、Run、Checkpoint、ToolCallLedger、附件引用与 SSE 落到 PostgreSQL。
-- [ ] 建立隔离的 Rust JS Worker、MemeLoop loop bundle、模型 Provider host op 和 GEO 工具桥接。
+- [ ] 增加启动期重启对账：进程内没有任何优雅关闭，退出时在飞的 run 会永久停在 `running`。需要启动扫描发现遗留 run 并落终态；该做法在单进程下成立、多副本下错误，落地时必须把这个假设显式写进代码而非留给读者推断。
+- [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
+- [ ] 给隔离体设置堆上限：`EmbeddedAgentRuntime::start` 传入 `None`，`install_heap_limit_guard` 目前是死代码，失控循环只受 turn deadline 约束。
+- [ ] 驱动 checkpoint 与 tool-call ledger：两者已有持久化实现，但运行路径尚未写入。
+- [ ] 落地真实 MemeLoop bundle 加载：打包配方已实证（见 `WORKLOG.md` 2026-09-21），但**产物存放与第三方许可策略需先定夺**——自包含 ESM 为 1.5 MB，内含 zod/acorn/json5/semver 代码，合并入仓库须保留相应许可声明。
+- [ ] 实现模型 Provider 与 Token Center 真实调用；`model_complete` 目前如实返回 `capability_missing`。
+- [ ] 实现 GEO 工具桥接：`manifest_read`、`publish_submit`、`measure_sample` 目前如实返回 `capability_missing`。
 - [ ] 跑通“附件入库 → 带来源回答 → 两个文档分支 fan-out → 恢复 → 结果汇总”首个纵切。
 
 ## 排队：W03 企业知识库
@@ -29,7 +33,7 @@
 
 ## 待补验证
 
-- [ ] 以 `GEO_TEST_DATABASE_URL` 在空 PostgreSQL 上执行迁移、W02 原子启动、租户可见性、RLS 和重启恢复集成测试。
+- [ ] 以非 bypass 角色实测 FORCE RLS。迁移、W02 原子启动、租户可见性、Agent 持久化与重启恢复、run 声明/完成已可用一次性 PostgreSQL 实库验证通过（14/14，见 `WORKLOG.md`）；`0004_tenant_rls.sql` 仍是安全 no-op。
 
 ## 纵切目标
 
