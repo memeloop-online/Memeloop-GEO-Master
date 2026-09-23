@@ -114,7 +114,8 @@ const estimate = {
       min: null,
       max: null,
       basis_refs: [],
-      reason: "KnowledgeRelease is not available; document manifest is not frozen.",
+      reason:
+        "KnowledgeRelease is not available; document manifest is not frozen.",
     },
     document_platform_targets: {
       state: "unknown" as const,
@@ -142,7 +143,8 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "PricingSnapshot and frozen document denominator are unavailable.",
+      reason:
+        "PricingSnapshot and frozen document denominator are unavailable.",
     },
     phase_two_distribution: {
       state: "unknown" as const,
