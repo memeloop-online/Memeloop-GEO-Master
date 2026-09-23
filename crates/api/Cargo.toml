@@ -12,6 +12,7 @@ chrono.workspace = true
 futures-util.workspace = true
 geo-domain = { path = "../domain" }
 geo-persistence = { path = "../persistence" }
+geo-worker = { path = "../worker" }
 hex.workspace = true
 http.workspace = true
 serde.workspace = true

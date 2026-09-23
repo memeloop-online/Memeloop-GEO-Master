@@ -19,7 +19,7 @@ use utoipa::ToSchema;
 
 use crate::{
     ApiError, AppState, IDEMPOTENCY_KEY_HEADER, PROJECT_ID_HEADER, RequestContext, api_error,
-    context, error_response, require_project_writer,
+    context, error_response, require_project_writer, run_executor,
 };
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -273,6 +273,16 @@ pub(crate) async fn append_message(
         )
         .await
         .map_err(|error| api_error(error, request_id(context)))?;
+    // Scheduled only after the acceptance has committed: the response below
+    // states that the turn was accepted, never that it has started, and the run
+    // can take minutes.  The executor claims the run atomically, so a replayed
+    // Idempotency-Key cannot start a second turn.
+    run_executor::dispatch(
+        state.agent_runtime(),
+        state.agent_repository(),
+        scope,
+        &acceptance,
+    );
     Ok((
         StatusCode::ACCEPTED,
         Json(AgentSubmitResponse::from(acceptance)),
