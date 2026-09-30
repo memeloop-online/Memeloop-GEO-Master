@@ -11,7 +11,7 @@
 - [ ] 验证隔离体堆上限：`start` 与 `run_turn` 已共用默认 64 MiB V8 堆限制及 near-heap 终止守卫，正常执行和超内存子进程回归待运行；另需限制进程总内存和并发，V8 堆限制不覆盖这些资源。
 - [ ] 在 V8 构建可用后运行宿主输出预算测试；`op_host_emit` 已限制单事件 64 KiB、累计 1 MiB 和 1,024 事件，恢复 checkpoint 不会提高限制。
 - [ ] 驱动 checkpoint 与 tool-call ledger：两者已有持久化实现，但运行路径尚未写入。
-- [ ] 落地真实 MemeLoop bundle 加载：打包配方已实证（见 `WORKLOG.md` 2026-09-21），但**产物存放与第三方许可策略需先定夺**——自包含 ESM 为 1.5 MB，内含 zod/acorn/json5/semver 代码，合并入仓库须保留相应许可声明。
+- [ ] 将 `pnpm agent:bundle` 生成的真实 MemeLoop ESM 接入 Rust 内存加载器；单回合 Node smoke 已通过，仍需补工具循环、精确消息/附件契约、持久状态适配、内嵌 V8 测试与产物摘要验证。生成文件不入库，分发时携带第三方许可。
 - [ ] 实现模型 Provider 与 Token Center 真实调用；`model_complete` 目前如实返回 `capability_missing`。
 - [ ] 实现 GEO 工具桥接：`manifest_read`、`publish_submit`、`measure_sample` 目前如实返回 `capability_missing`。
 - [ ] 跑通“附件入库 → 带来源回答 → 两个文档分支 fan-out → 恢复 → 结果汇总”首个纵切。

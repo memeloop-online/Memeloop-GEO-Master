@@ -2,6 +2,8 @@
 
 ## 2026-09-30
 
+- 修复 checkpoint 恢复可能将自定义限额重置为更宽默认值的问题：恢复沿用当前 Rust 策略，安装前验证每条/总字节数及事件条数；输入先受序列化大小上限限制，拒绝时保留原状态。新增回归，格式与 diff 检查通过，V8 原生测试仍待执行。
+- 新增真实 `memeloop@0.3.3` 的可复现 ESM 构建入口 `pnpm agent:bundle`，依赖来自锁文件，生成输出忽略且附第三方许可说明。Node smoke 2/2 通过，确认调用上游 `createAgentToolLoopRunner` 经测试模型桥接产生完成事件。当前只验证单回合，不代表工具循环、真实模型、Rust 加载、持久恢复或 fan-out/reduce 已完成。
 - 后续验证进展：本次命令临时使用公共 Cargo 镜像并保持 `--locked`，成功下载依赖；领域与持久化测试执行成功，14 项需要独立 PostgreSQL 的测试跳过，本机 Docker Engine 不可用。V8 预编译库的默认下载仍失败，正在通过官方 Release 下载，未在仓库记录任何私有下载地址。
 - 领域与持久化 `clippy --all-targets -- -D warnings` 通过，`cargo fmt --all -- --check` 与 `git diff --check` 通过；不将这些检查扩称为尚未编译运行的 API/Worker 验证。
 - 补齐 `EmbeddedAgentRuntime::start` 与 `run_turn` 的 V8 堆限制和 near-heap 终止守卫，默认 64 MiB、可显式配置且拒绝低于 16 MiB 的值；新增正常执行、参数校验和带父进程截止的超内存回归，待 V8 下载完成执行。V8 堆限制不等于进程内存隔离，宿主输出与总内存限制仍未完成。

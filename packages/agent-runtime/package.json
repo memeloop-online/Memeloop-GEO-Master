@@ -1,0 +1,13 @@
+{
+  "name": "@memeloop-geo/agent-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "node ../../scripts/bundle-agent.mjs",
+    "format": "prettier --write \"src/**/*.mjs\" \"test/**/*.mjs\" \"*.md\" \"package.json\"",
+    "format:check": "prettier --check \"src/**/*.mjs\" \"test/**/*.mjs\" \"*.md\" \"package.json\"",
+    "test": "node ../../scripts/bundle-agent.mjs && node --test test/agent-loop.test.mjs"
+  }
+}
