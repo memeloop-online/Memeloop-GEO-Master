@@ -2,6 +2,13 @@
 
 ## 2026-10-01
 
+- 第二批功能集成：MemeLoop 原生 function-tool 循环已接知识检索；Provider/worker/bridge 保留工具定义、assistant tool calls 和 tool-result messages，不把纯工具响应的空正文当作最终答案。Node 4 项、真实 V8 bundle 2 项、本地应用 bundle 装配 1 项通过。
+- 文档 `manifest_read` 已接 scoped sealed snapshot、版本/游标分页与全量覆盖统计，规划 ID 与可空正文版本分开。4 项 API host 回归和 30 项 worker host 测试通过；对话 registry 目前仅注册知识检索，文档正文尚未生成。
+- P00 多附件上传纵切完成：逐项状态与重试、附件-only 提交、已成功引用保留、专用原始字节 API、作用域/摘要/元数据核验。附件存储与知识导入分离，UI 明示模型当前未读取附件。修复 PostgreSQL 上传 LEFT JOIN 的锁定目标为 `FOR UPDATE OF session`，新增附件/普通知识上传实库回归待 CI 执行。
+- Token Center HTTP 适配使用可信预置租户/主体/key 映射，先校验元数据再 copy，不自行创建 key、不缓存明文；6 项本地 HTTP 契约测试通过。正式租户配置、权益/路由、应用装配及费用仍未完成。
+- 新增 PostgreSQL CI 首跑 `36760856248`：13 项通过、2 项失败。确认启动幂等重放错误读取了后来变化的清单，改为读取原始 operation acceptance；重启对账测试改用独立 UUID schema，避免扫描并行测试活动 run。保留失败证据，修复待下一次 CI 实库复验。
+- 整合后 workspace Clippy `-D warnings` 与 all-targets 本地测试通过（16 项 PostgreSQL 测试仍默认忽略）；真实 bundle 和应用装配测试另行显式运行通过。Windows LNK4098 链接警告仍存在。
+- 同批整合前端 format/typecheck、39 项 UI/API 测试及生产构建通过；保留大 chunk 警告。以上为自动化结果，未冒充浏览器实机交互验收。
 - `d22346f` 的 Actions `36757347202` 已确认 Linux/Windows 全部成功，Linux 包含真实 bundle 与应用装配测试，Windows 成功上传 V8 artifact。本机重新检查 Docker daemon 仍不可用；CI 增加一次性 PostgreSQL 17 service，显式执行原来被忽略的 repository 实库测试，等待该新配置实际执行结果，不以配置存在当作验收通过。
 - 交付本地 P00 启动装配与 P07 只读清单纵切：显式环境配置加载摘要核验后的真实 MemeLoop bundle，经 Rust Provider 调模型；P07 接规划/GET，刷新不触发写操作，viewer 可读，知识版本更新后仍展示已封存快照。仍不包含正文生成、生产租户凭据、多回合恢复或外部发布。
 - 本轮基础纵切验证：前端 35 项测试、TypeScript 检查、生产 build 通过；workspace Clippy `-D warnings` 通过。此前同批改动的 workspace all-targets 测试已通过，PostgreSQL 条件测试未运行，真实 bundle 应用装配测试另行通过。后续工具协议改动需要重新回归，不能沿用这组结果。前端保留大 chunk 警告。

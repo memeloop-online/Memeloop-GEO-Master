@@ -2,7 +2,11 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
   type ReactNode,
 } from "react";
 import {
@@ -27,6 +31,9 @@ import {
   cancelAgentTurn,
   openAgentEventStream,
   postAgentMessage,
+  uploadAgentAttachment,
+  type AgentAttachmentReference,
+  type AgentAttachmentUploadState,
   type AgentConversationDetail,
   type AgentConversationSummary,
   type AgentMessage,
@@ -35,6 +42,7 @@ import {
   useAgentConversationsQuery,
   useCreateAgentConversationMutation,
 } from "../api/agent";
+import { createIdempotencyKey } from "../api/client";
 import { ErrorState, EmptyState, LoadingState } from "../components/AsyncState";
 
 const agentTheme = createTheme({
@@ -103,6 +111,26 @@ function unavailableRuntimeNotice(runs: readonly AgentRun[]) {
     ? `${runtime} 尚未配置，本次未生成 AI 回复。`
     : `${runtime} 当前不可用，本次未生成 AI 回复。`;
 }
+
+interface PendingAttachment {
+  id: string;
+  file: File;
+  status: "waiting" | AgentAttachmentUploadState | "failed";
+  createKey: string;
+  completeKey: string;
+  sessionId?: string;
+  contentUploaded?: boolean;
+  reference?: AgentAttachmentReference;
+}
+
+const uploadLabels: Record<PendingAttachment["status"], string> = {
+  waiting: "等待上传",
+  creating_session: "创建上传会话",
+  uploading: "上传字节中",
+  completing: "核验中",
+  uploaded: "对象已核验；尚未解析或导入知识库",
+  failed: "上传失败",
+};
 
 function ConversationList({
   activeConversationId,
@@ -185,15 +213,106 @@ function AgentChat({
   projectId: string;
   onRefresh: () => Promise<void>;
 }) {
-  const [selectedFile, setSelectedFile] = useState<File>();
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [attachmentNotice, setAttachmentNotice] = useState<string>();
   const [localTurnId, setLocalTurnId] = useState<string>();
   const [runtimeNotice, setRuntimeNotice] = useState<string>();
+  const picker = useRef<HTMLInputElement>(null);
+  const submissionInFlight = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const pendingSubmission = useRef<
+    { signature: string; key: string } | undefined
+  >(undefined);
+  const selectedFile = attachments[0]?.file;
   const activeRun = orderedRuns(conversation.runs).find((run) =>
     ["queued", "running"].includes(run.status),
   );
   const activeTurnId = activeRun?.turn_id ?? localTurnId;
   const capabilityNotice = unavailableRuntimeNotice(conversation.runs);
   const displayedRuntimeNotice = capabilityNotice ?? runtimeNotice;
+
+  function addFiles(files: readonly File[]) {
+    if (!files.length) return;
+    setAttachments((current) => {
+      const available = Math.max(0, 100 - current.length);
+      const accepted = files.slice(0, available).filter((file) => {
+        if (file.size > 100 * 1024 * 1024) {
+          setAttachmentNotice("每个附件最大为 100 MB。");
+          return false;
+        }
+        return true;
+      });
+      if (files.length > available) {
+        setAttachmentNotice("每批最多选择 100 个附件。");
+      }
+      return [
+        ...current,
+        ...accepted.map((file) => ({
+          id: createIdempotencyKey(),
+          file,
+          status: "waiting" as const,
+          createKey: createIdempotencyKey(),
+          completeKey: createIdempotencyKey(),
+        })),
+      ];
+    });
+  }
+
+  function updateAttachment(id: string, update: Partial<PendingAttachment>) {
+    setAttachments((current) =>
+      current.map((item) => (item.id === id ? { ...item, ...update } : item)),
+    );
+  }
+
+  async function upload(item: PendingAttachment) {
+    if (item.reference) return item.reference;
+    try {
+      const reference = await uploadAgentAttachment(
+        tenantId,
+        projectId,
+        item.file,
+        {
+          createKey: item.createKey,
+          completeKey: item.completeKey,
+          sessionId: item.sessionId,
+          contentUploaded: item.contentUploaded,
+          onProgress: (status, sessionId) =>
+            updateAttachment(item.id, {
+              status,
+              sessionId,
+              contentUploaded:
+                item.contentUploaded ||
+                status === "completing" ||
+                status === "uploaded",
+            }),
+        },
+      );
+      updateAttachment(item.id, { status: "uploaded", reference });
+      return reference;
+    } catch (error) {
+      updateAttachment(item.id, { status: "failed" });
+      throw error;
+    }
+  }
+
+  function onPickerChange(event: ChangeEvent<HTMLInputElement>) {
+    addFiles(Array.from(event.target.files ?? []));
+    event.target.value = "";
+  }
+
+  function onDropCapture(event: DragEvent<HTMLElement>) {
+    if (!event.dataTransfer.files.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    addFiles(Array.from(event.dataTransfer.files));
+  }
+
+  function onPasteCapture(event: ClipboardEvent<HTMLElement>) {
+    if (!event.clipboardData.files.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    addFiles(Array.from(event.clipboardData.files));
+  }
 
   const adapter = useMemo<WebMemeLoopChatAdapter>(
     () => ({
@@ -203,29 +322,80 @@ function AgentChat({
       isLoading: false,
       error: null,
       sendMessage: async ({ text, file }) => {
+        if (submissionInFlight.current) return;
         const content = text.trim();
-        if (!content) return;
-        if (file || selectedFile) {
-          throw new Error("agent-upload-reference-required");
-        }
-        setRuntimeNotice(undefined);
-        const acceptance = await postAgentMessage(
-          tenantId,
-          projectId,
-          conversation.conversation.id,
-          { content, attachments: [] },
-        );
-        setLocalTurnId(
-          ["queued", "running"].includes(acceptance.run_status)
-            ? acceptance.turn_id
-            : undefined,
-        );
-        if (acceptance.error?.code === "capability_missing") {
-          setRuntimeNotice(
-            "Rust JS Agent Runtime 尚未配置，本次未生成 AI 回复。",
+        const batch = attachments.length
+          ? attachments
+          : file
+            ? [
+                {
+                  id: createIdempotencyKey(),
+                  file,
+                  status: "waiting" as const,
+                  createKey: createIdempotencyKey(),
+                  completeKey: createIdempotencyKey(),
+                },
+              ]
+            : [];
+        if (!content && !batch.length) return;
+        submissionInFlight.current = true;
+        setSubmitting(true);
+        try {
+          setAttachmentNotice(undefined);
+          const results = await Promise.allSettled(batch.map(upload));
+          if (results.some((result) => result.status === "rejected")) {
+            setAttachmentNotice(
+              "部分附件上传失败。已核验的附件会保留；请重试失败项后再次发送。",
+            );
+            throw new Error("agent-attachment-upload-incomplete");
+          }
+          const references = results.map(
+            (result) =>
+              (result as PromiseFulfilledResult<AgentAttachmentReference>)
+                .value,
           );
+          const signature = JSON.stringify({
+            content,
+            attachmentIds: references.map(
+              (reference) => reference.attachment_id,
+            ),
+          });
+          if (pendingSubmission.current?.signature !== signature) {
+            pendingSubmission.current = {
+              signature,
+              key: createIdempotencyKey(),
+            };
+          }
+          setRuntimeNotice(undefined);
+          const acceptance = await postAgentMessage(
+            tenantId,
+            projectId,
+            conversation.conversation.id,
+            { content, attachments: references },
+            pendingSubmission.current.key,
+          );
+          setLocalTurnId(
+            ["queued", "running"].includes(acceptance.run_status)
+              ? acceptance.turn_id
+              : undefined,
+          );
+          if (references.length) {
+            setRuntimeNotice(
+              "附件引用已提交；当前 AI 运行时尚未接入附件解析与读取，不能视为已阅读附件。",
+            );
+          }
+          if (acceptance.error?.code === "capability_missing") {
+            setRuntimeNotice(
+              "Rust JS Agent Runtime 尚未配置，本次未生成 AI 回复。",
+            );
+          }
+          await onRefresh();
+          pendingSubmission.current = undefined;
+          setAttachments([]);
+        } finally {
+          submissionInFlight.current = false;
+          setSubmitting(false);
         }
-        await onRefresh();
       },
       cancel: async () => {
         if (!activeTurnId) return;
@@ -241,6 +411,7 @@ function AgentChat({
         throw new Error("agent-turn-retry-unavailable");
       },
       onError: () => {
+        if (attachmentNotice) return;
         setRuntimeNotice(
           "操作未完成。请确认 Agent 运行时已配置且当前项目有权限后重试。",
         );
@@ -252,7 +423,8 @@ function AgentChat({
       conversation.messages,
       onRefresh,
       projectId,
-      selectedFile,
+      attachments,
+      attachmentNotice,
       tenantId,
     ],
   );
@@ -266,7 +438,15 @@ function AgentChat({
   );
 
   return (
-    <section className="agent-chat-column" aria-label="AI 对话">
+    <section
+      className="agent-chat-column"
+      aria-label="AI 对话"
+      onDragOverCapture={(event) => {
+        if (event.dataTransfer.types.includes("Files")) event.preventDefault();
+      }}
+      onDropCapture={onDropCapture}
+      onPasteCapture={onPasteCapture}
+    >
       <div className="agent-chat-titlebar">
         <div>
           <p className="eyebrow">P00 · AI 工作台</p>
@@ -278,20 +458,63 @@ function AgentChat({
           </span>
         )}
       </div>
-      {selectedFile && (
+      {attachmentNotice && (
         <MessageBar intent="warning" className="agent-file-reference-notice">
-          <MessageBarBody>
-            已选择“{selectedFile.name}
-            ”。当前聊天接口只接受已上传对象的附件引用，
-            文件不会作为浏览器原始内容发送。
-          </MessageBarBody>
+          <MessageBarBody>{attachmentNotice}</MessageBarBody>
+        </MessageBar>
+      )}
+      {attachments.length > 0 && (
+        <div className="agent-file-reference-notice" aria-label="待发送附件">
+          <p>
+            附件上传只核验对象；不会自动导入知识库，当前 AI 尚不能读取附件。
+          </p>
+          {attachments.map((item) => (
+            <div key={item.id}>
+              <span>
+                {item.file.name} · {uploadLabels[item.status]}
+              </span>
+              {item.status === "failed" && (
+                <Button
+                  appearance="subtle"
+                  onClick={() =>
+                    void upload(item).catch(() =>
+                      setAttachmentNotice("附件重试失败，请稍后再试。"),
+                    )
+                  }
+                >
+                  重试 {item.file.name}
+                </Button>
+              )}
+              <Button
+                appearance="subtle"
+                icon={<DismissRegular />}
+                aria-label={`移除文件 ${item.file.name}`}
+                onClick={() =>
+                  setAttachments((current) =>
+                    current.filter((candidate) => candidate.id !== item.id),
+                  )
+                }
+              />
+            </div>
+          ))}
           <Button
             appearance="subtle"
-            icon={<DismissRegular />}
-            aria-label={`移除文件 ${selectedFile.name}`}
-            onClick={() => setSelectedFile(undefined)}
-          />
-        </MessageBar>
+            disabled={Boolean(activeTurnId) || submitting}
+            onClick={() =>
+              void adapter
+                .sendMessage({ text: "", file: selectedFile })
+                .catch(() =>
+                  setAttachmentNotice(
+                    (previous) =>
+                      previous ??
+                      "附件上传或消息提交未完成，已核验的引用已保留，请重试。",
+                  ),
+                )
+            }
+          >
+            仅发送附件
+          </Button>
+        </div>
       )}
       {displayedRuntimeNotice && (
         <MessageBar intent="warning" className="agent-runtime-notice">
@@ -304,8 +527,31 @@ function AgentChat({
             adapter={adapter}
             empty={empty}
             selectedFile={selectedFile}
-            onFileSelect={setSelectedFile}
-            onClearFile={() => setSelectedFile(undefined)}
+            onFileSelect={(file) => addFiles([file])}
+            onClearFile={() => setAttachments((current) => current.slice(1))}
+            onClearAttachments={() => setAttachments([])}
+            renderAttachmentPicker={({ disabled }) => (
+              <>
+                <input
+                  ref={picker}
+                  type="file"
+                  multiple
+                  aria-label="选择多个附件"
+                  data-testid="agent-multi-file-input"
+                  style={{ display: "none" }}
+                  disabled={disabled}
+                  onChange={onPickerChange}
+                />
+                <Button
+                  size="small"
+                  appearance="subtle"
+                  disabled={disabled}
+                  onClick={() => picker.current?.click()}
+                >
+                  添加文件
+                </Button>
+              </>
+            )}
             placeholder="描述你希望 AI 协助完成的项目任务"
             composerLabels={{
               input: "输入任务",

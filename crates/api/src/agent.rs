@@ -1,5 +1,6 @@
 use axum::{
     Json,
+    body::to_bytes,
     extract::{Extension, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, Uri},
     middleware::Next,
@@ -7,14 +8,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use geo_domain::{
-    AppError, AppendMessage, Conversation, ConversationDetail, ConversationEvent, ConversationId,
-    CreateConversation, ProjectId, Run, SubmitAcceptance, TenantScope, TurnId,
+    AppError, AppendMessage, AttachmentId, AttachmentReference, Conversation, ConversationDetail,
+    ConversationEvent, ConversationId, CreateConversation, KnowledgePurpose, MAX_UPLOAD_BYTES,
+    ProjectId, Run, StoredObject, SubmitAcceptance, TenantScope, TurnId, UploadSession,
+    UploadSessionCommand,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, convert::Infallible, sync::Arc, time::Duration};
 use tokio::{sync::broadcast, time::Interval};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, IDEMPOTENCY_KEY_HEADER, PROJECT_ID_HEADER, RequestContext, api_error,
@@ -155,6 +159,187 @@ fn request_hash(input: &AppendMessage) -> Result<String, AppError> {
     Ok(hex::encode(Sha256::digest(body)))
 }
 
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentUploadCommand {
+    pub filename: String,
+    pub declared_media_type: String,
+    pub expected_size: u64,
+    pub expected_sha256: String,
+}
+
+fn attachment_reference(object: StoredObject, filename: String) -> AttachmentReference {
+    AttachmentReference {
+        attachment_id: AttachmentId::new(object.object_id),
+        object_id: object.object_id.to_string(),
+        filename,
+        media_type: Some(object.detected_media_type),
+        size_bytes: Some(object.actual_size),
+        sha256: Some(object.sha256),
+        object_version: Some(object.object_version.to_string()),
+    }
+}
+
+fn required_upload_key(headers: &HeaderMap) -> Result<&str, AppError> {
+    let key = headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .ok_or_else(|| AppError::invalid_request("missing Idempotency-Key header"))?
+        .to_str()
+        .map_err(|_| AppError::invalid_request("invalid Idempotency-Key header"))?
+        .trim();
+    if key.is_empty() {
+        return Err(AppError::invalid_request(
+            "Idempotency-Key must not be empty",
+        ));
+    }
+    Ok(key)
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/agent/attachments/upload-sessions",
+    security(("sessionCookie" = [])), request_body = AttachmentUploadCommand,
+    responses((status = 201, body = UploadSession))
+)]
+pub(crate) async fn create_attachment_upload(
+    State(state): State<AppState>,
+    Extension(auth): Extension<context::AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<AgentScopeQuery>,
+    Json(input): Json<AttachmentUploadCommand>,
+) -> Result<(StatusCode, Json<UploadSession>), ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, request_id(context)))?;
+    let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    let session = state
+        .knowledge_repository()
+        .create_upload_session(
+            &scope,
+            UploadSessionCommand {
+                filename: input.filename,
+                declared_media_type: input.declared_media_type,
+                expected_size: input.expected_size,
+                expected_sha256: input.expected_sha256,
+                purpose: KnowledgePurpose::Internal,
+            },
+        )
+        .await
+        .map_err(|error| api_error(error, request_id(context)))?;
+    Ok((StatusCode::CREATED, Json(session)))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/agent/attachments/upload-sessions/{id}/content",
+    security(("sessionCookie" = [])),
+    params(("id" = Uuid, Path)),
+    request_body(content = String, content_type = "application/octet-stream"),
+    responses((status = 200, body = UploadSession))
+)]
+pub(crate) async fn put_attachment_content(
+    State(state): State<AppState>,
+    Extension(auth): Extension<context::AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<AgentScopeQuery>,
+    Path(id): Path<Uuid>,
+    request: Request,
+) -> Result<Json<UploadSession>, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, request_id(context)))?;
+    let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    let bytes = to_bytes(request.into_body(), MAX_UPLOAD_BYTES as usize + 1)
+        .await
+        .map_err(|_| {
+            api_error(
+                AppError::invalid_request("uploaded content exceeds maximum upload size"),
+                request_id(context),
+            )
+        })?;
+    state
+        .knowledge_repository()
+        .put_upload_content(&scope, id, bytes.to_vec())
+        .await
+        .map(Json)
+        .map_err(|error| api_error(error, request_id(context)))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/agent/attachments/upload-sessions/{id}/complete",
+    security(("sessionCookie" = [])),
+    params(("id" = Uuid, Path)),
+    responses((status = 200, body = AttachmentReference))
+)]
+pub(crate) async fn complete_attachment_upload(
+    State(state): State<AppState>,
+    Extension(auth): Extension<context::AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<AgentScopeQuery>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AttachmentReference>, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, request_id(context)))?;
+    let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    let key =
+        required_upload_key(&headers).map_err(|error| api_error(error, request_id(context)))?;
+    let (object, filename) = state
+        .knowledge_repository()
+        .complete_attachment_upload(&scope, id, key)
+        .await
+        .map_err(|error| api_error(error, request_id(context)))?;
+    Ok(Json(attachment_reference(object, filename)))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/agent/attachments/{id}",
+    security(("sessionCookie" = [])),
+    params(("id" = AttachmentId, Path)),
+    responses((status = 200, body = AttachmentReference))
+)]
+pub(crate) async fn get_attachment(
+    State(state): State<AppState>,
+    Extension(auth): Extension<context::AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<AgentScopeQuery>,
+    Path(id): Path<AttachmentId>,
+) -> Result<Json<AttachmentReference>, ApiError> {
+    let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    let (object, filename) = state
+        .knowledge_repository()
+        .get_attachment_object(&scope, id.as_uuid())
+        .await
+        .map_err(|error| api_error(error, request_id(context)))?
+        .ok_or_else(|| {
+            api_error(
+                AppError::not_found("attachment not found"),
+                request_id(context),
+            )
+        })?;
+    Ok(Json(attachment_reference(object, filename)))
+}
+
+async fn verify_attachments(
+    state: &AppState,
+    scope: &TenantScope,
+    attachments: &[AttachmentReference],
+) -> Result<(), AppError> {
+    for supplied in attachments {
+        let (object, filename) = state
+            .knowledge_repository()
+            .get_attachment_object(scope, supplied.attachment_id.as_uuid())
+            .await?
+            .ok_or_else(|| AppError::not_found("attachment not found"))?;
+        if *supplied != attachment_reference(object, filename) {
+            return Err(AppError::invalid_request(
+                "attachment metadata does not match committed object",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/agent/conversations",
@@ -258,6 +443,9 @@ pub(crate) async fn append_message(
 ) -> Result<(StatusCode, Json<AgentSubmitResponse>), ApiError> {
     require_project_writer(&auth).map_err(|error| api_error(error, request_id(context)))?;
     let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    verify_attachments(&state, &scope, &input.attachments)
+        .await
         .map_err(|error| api_error(error, request_id(context)))?;
     let request_hash =
         request_hash(&input).map_err(|error| api_error(error, request_id(context)))?;

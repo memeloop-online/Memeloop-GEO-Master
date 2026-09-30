@@ -11,10 +11,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use geo_provider::{
-    CompletionRequest, Message, NormalizedCompletion, ProviderClient, ProviderError,
-    ProviderSurface, RequestControl, SearchMode, SecretRef, TokenCenter, Transport,
+    CompletionRequest, FunctionCall, FunctionDefinition, Message, NormalizedCompletion,
+    ProviderClient, ProviderError, ProviderSurface, RequestControl, SearchMode, SecretRef,
+    TokenCenter, ToolCall, ToolDefinition, Transport,
 };
-use geo_worker::{HostOp, HostOpError, ModelCompletion, ModelCompletionRequest, TenantScope};
+use geo_worker::{
+    HostOp, HostOpError, ModelCompletion, ModelCompletionRequest, ModelToolCall, TenantScope,
+};
 
 /// The API-side model capability used by [`crate::RepositoryHostOps`].
 ///
@@ -123,28 +126,7 @@ where
         } else {
             route.model
         };
-        let provider_request = CompletionRequest {
-            model,
-            messages: {
-                let mut messages = Vec::with_capacity(2);
-                if let Some(system) = request.system.as_ref() {
-                    messages.push(Message {
-                        role: "system".into(),
-                        content: system.clone(),
-                    });
-                }
-                messages.push(Message {
-                    role: "user".into(),
-                    content: request.prompt.clone(),
-                });
-                messages
-            },
-            max_output_tokens: request.max_output_tokens,
-            temperature: None,
-            surface: ProviderSurface::OfficialApi,
-            search_mode: SearchMode::Disabled,
-            include_citations: false,
-        };
+        let provider_request = provider_request(model, request);
         let control = RequestControl::new(self.timeout)
             .map_err(|error| map_provider_error(error, self.timeout))?;
         client
@@ -245,26 +227,7 @@ where
                 "requested model is not allowed by the provider route",
             ));
         }
-        let mut messages = Vec::with_capacity(2);
-        if let Some(system) = request.system.as_ref() {
-            messages.push(Message {
-                role: "system".into(),
-                content: system.clone(),
-            });
-        }
-        messages.push(Message {
-            role: "user".into(),
-            content: request.prompt.clone(),
-        });
-        let provider_request = CompletionRequest {
-            model,
-            messages,
-            max_output_tokens: request.max_output_tokens,
-            temperature: None,
-            surface: ProviderSurface::OfficialApi,
-            search_mode: SearchMode::Disabled,
-            include_citations: false,
-        };
+        let provider_request = provider_request(model, request);
         let control = RequestControl::new(self.timeout)
             .map_err(|error| map_provider_error(error, self.timeout))?;
         let completion = self
@@ -276,9 +239,80 @@ where
     }
 }
 
+fn provider_request(model: String, request: &ModelCompletionRequest) -> CompletionRequest {
+    let mut messages = Vec::with_capacity(request.messages.len().max(1) + 1);
+    if let Some(system) = request.system.as_ref() {
+        messages.push(Message {
+            role: "system".into(),
+            content: Some(system.clone()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    if request.messages.is_empty() {
+        messages.push(Message {
+            role: "user".into(),
+            content: Some(request.prompt.clone()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    } else {
+        messages.extend(request.messages.iter().map(|message| Message {
+            role: message.role.clone(),
+            content: message.content.clone(),
+            tool_calls: message.tool_calls.iter().map(map_tool_call).collect(),
+            tool_call_id: message.tool_call_id.clone(),
+        }));
+    }
+    CompletionRequest {
+        model,
+        messages,
+        tools: request
+            .tools
+            .iter()
+            .map(|tool| ToolDefinition {
+                kind: tool.kind.clone(),
+                function: FunctionDefinition {
+                    name: tool.function.name.clone(),
+                    description: tool.function.description.clone(),
+                    parameters: tool.function.parameters.clone(),
+                },
+            })
+            .collect(),
+        max_output_tokens: request.max_output_tokens,
+        temperature: None,
+        surface: ProviderSurface::OfficialApi,
+        search_mode: SearchMode::Disabled,
+        include_citations: false,
+    }
+}
+
+fn map_tool_call(call: &ModelToolCall) -> ToolCall {
+    ToolCall {
+        id: call.id.clone(),
+        kind: call.kind.clone(),
+        function: FunctionCall {
+            name: call.function.name.clone(),
+            arguments: call.function.arguments.clone(),
+        },
+    }
+}
+
 fn map_completion(completion: NormalizedCompletion) -> ModelCompletion {
     ModelCompletion {
         text: completion.text,
+        tool_calls: completion
+            .tool_calls
+            .into_iter()
+            .map(|call| ModelToolCall {
+                id: call.id,
+                kind: call.kind,
+                function: geo_worker::ModelToolFunctionCall {
+                    name: call.function.name,
+                    arguments: call.function.arguments,
+                },
+            })
+            .collect(),
         model: completion.model,
         prompt_tokens: completion.usage.prompt_tokens,
         completion_tokens: completion.usage.completion_tokens,
@@ -389,6 +423,8 @@ mod tests {
                     system: Some("system".into()),
                     model: None,
                     max_output_tokens: Some(64),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
                 },
             )
             .await
@@ -397,6 +433,7 @@ mod tests {
             result,
             ModelCompletion {
                 text: "answer".into(),
+                tool_calls: Vec::new(),
                 model: "model-a".into(),
                 prompt_tokens: 2,
                 completion_tokens: 3,
@@ -450,6 +487,8 @@ mod tests {
                     system: None,
                     model: Some("model-untrusted".into()),
                     max_output_tokens: None,
+                    messages: Vec::new(),
+                    tools: Vec::new(),
                 },
             )
             .await
@@ -481,6 +520,8 @@ mod tests {
                     system: None,
                     model: Some("model-requested".into()),
                     max_output_tokens: None,
+                    messages: Vec::new(),
+                    tools: Vec::new(),
                 },
             )
             .await
@@ -493,5 +534,92 @@ mod tests {
             transport.requests.lock().unwrap()[0].body["model"],
             "model-requested"
         );
+    }
+
+    struct ToolTransport {
+        requests: Mutex<Vec<TransportRequest>>,
+    }
+
+    #[async_trait]
+    impl Transport for ToolTransport {
+        async fn send(
+            &self,
+            request: TransportRequest,
+            _control: RequestControl,
+        ) -> Result<TransportResponse, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(TransportResponse {
+                status: 200,
+                body: r#"{"id":"req-2","model":"model-a","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"knowledge_search","arguments":"{\"query\":\"warranty\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_definition_and_assistant_result_roundtrip_through_bridge() {
+        let transport = Arc::new(ToolTransport {
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = ProviderClient::new(
+            "https://provider.invalid/v1",
+            SecretRef::new("tenant-provider-ref").unwrap(),
+            Arc::clone(&transport),
+            Arc::new(Token),
+        )
+        .unwrap();
+        let bridge = ProviderClientBridge::new(client, "model-a", Duration::from_secs(2)).unwrap();
+        let request = ModelCompletionRequest {
+            prompt: String::new(),
+            system: None,
+            model: None,
+            max_output_tokens: None,
+            tools: vec![geo_worker::ModelToolDefinition {
+                kind: "function".into(),
+                function: geo_worker::ModelToolFunctionDefinition {
+                    name: "knowledge_search".into(),
+                    description: "Search scoped knowledge".into(),
+                    parameters: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}}),
+                },
+            }],
+            messages: vec![geo_worker::ModelMessage {
+                role: "user".into(),
+                content: Some("question".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }],
+        };
+        let result = bridge.complete(&scope(), &request).await.unwrap();
+        assert!(result.text.is_empty());
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        assert_eq!(
+            result.tool_calls[0].function.arguments,
+            r#"{"query":"warranty"}"#
+        );
+        {
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(
+                requests[0].body["tools"][0]["function"]["name"],
+                "knowledge_search"
+            );
+            assert_eq!(requests[0].body["messages"][0]["content"], "question");
+        }
+
+        let mut followup = request;
+        followup.messages.push(geo_worker::ModelMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: result.tool_calls,
+            tool_call_id: None,
+        });
+        followup.messages.push(geo_worker::ModelMessage {
+            role: "tool".into(),
+            content: Some("{\"result\":\"found\"}".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call_1".into()),
+        });
+        bridge.complete(&scope(), &followup).await.unwrap();
+        let requests = transport.requests.lock().unwrap();
+        assert!(requests[1].body["messages"][1]["content"].is_null());
+        assert_eq!(requests[1].body["messages"][2]["tool_call_id"], "call_1");
     }
 }

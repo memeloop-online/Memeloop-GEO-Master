@@ -202,6 +202,8 @@ mod tests {
             system: None,
             model: Some("other-model".into()),
             max_output_tokens: Some(32),
+            messages: Vec::new(),
+            tools: Vec::new(),
         };
         assert!(bridge.complete(&scope, &request).await.is_err());
         assert_eq!(*transport.0.lock().unwrap(), 0);

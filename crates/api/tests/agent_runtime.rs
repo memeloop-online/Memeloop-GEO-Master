@@ -150,6 +150,7 @@ impl HostOps for Recorder {
         self.stall().await;
         Ok(ModelCompletion {
             text: format!("bridge:{}", request.prompt.trim()),
+            tool_calls: Vec::new(),
             model: "recorder".to_owned(),
             prompt_tokens: 5,
             completion_tokens: 3,
@@ -637,10 +638,12 @@ async fn unimplemented_host_ops_report_capability_missing_rather_than_a_result()
         system: None,
         model: None,
         max_output_tokens: None,
+        messages: Vec::new(),
+        tools: Vec::new(),
     };
     let manifest = ManifestReadRequest {
         manifest_id: None,
-        kind: ManifestKind::Document,
+        kind: ManifestKind::Distribution,
         revision: None,
         cursor: None,
         limit: None,

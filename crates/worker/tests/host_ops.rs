@@ -112,6 +112,7 @@ impl HostOps for FakeHostOps {
                 prompt_tokens: 11,
                 completion_tokens: 7,
                 finish_reason: "stop".to_owned(),
+                tool_calls: Vec::new(),
             },
         )
         .await
@@ -164,9 +165,13 @@ impl HostOps for FakeHostOps {
                 state: "frozen".to_owned(),
                 sealed: false,
                 expected_count: None,
+                coverage: None,
                 items: vec![ManifestItem {
                     branch_id: "document-key-1".to_owned(),
-                    document_revision_id: uuid::Uuid::new_v4(),
+                    document_manifest_item_id: Some(uuid::Uuid::new_v4()),
+                    planning_state: Some(geo_worker::ManifestPlanningState::Planned),
+                    block_reason: None,
+                    document_revision_id: None,
                     platform_target_id: None,
                 }],
                 next_cursor: None,
@@ -541,7 +546,65 @@ async fn manifest_read_returns_the_frozen_manifest_state() {
     assert_eq!(value["kind"], "document");
     assert_eq!(value["sealed"], false);
     assert_eq!(value["items"][0]["branch_id"], "document-key-1");
+    assert!(value["items"][0].get("document_revision_id").is_none());
     assert_eq!(ops.seen(), vec![HostOp::ManifestRead]);
+}
+
+#[test]
+fn planning_items_do_not_require_generated_revisions_but_distribution_items_do() {
+    let id = uuid::Uuid::new_v4();
+    let request = ManifestReadRequest {
+        manifest_id: Some(id),
+        kind: geo_worker::ManifestKind::Document,
+        revision: Some(1),
+        cursor: None,
+        limit: Some(1),
+    };
+    let item = ManifestItem {
+        branch_id: "document-branch".into(),
+        document_manifest_item_id: Some(uuid::Uuid::new_v4()),
+        planning_state: Some(geo_worker::ManifestPlanningState::Blocked),
+        block_reason: Some("missing_evidence".into()),
+        document_revision_id: None,
+        platform_target_id: None,
+    };
+    let page = ManifestPage {
+        kind: request.kind,
+        manifest_id: id,
+        revision: 1,
+        state: "ready".into(),
+        sealed: true,
+        expected_count: Some(1),
+        coverage: Some(geo_worker::ManifestCoverage {
+            total: 1,
+            planned: 0,
+            blocked: 1,
+            deferred: 0,
+            not_applicable: 0,
+        }),
+        items: vec![item],
+        next_cursor: None,
+    };
+    page.validate_for(&request)
+        .expect("a planning item has no generated revision");
+    let distribution_request = ManifestReadRequest {
+        kind: geo_worker::ManifestKind::Distribution,
+        ..request
+    };
+    let mut distribution_page = ManifestPage {
+        kind: geo_worker::ManifestKind::Distribution,
+        ..page
+    };
+    assert!(
+        distribution_page
+            .validate_for(&distribution_request)
+            .is_err()
+    );
+    distribution_page.items[0].document_revision_id = Some(uuid::Uuid::new_v4());
+    distribution_page.items[0].platform_target_id = Some(uuid::Uuid::new_v4());
+    distribution_page
+        .validate_for(&distribution_request)
+        .expect("distribution needs a generated revision and target");
 }
 
 #[tokio::test]

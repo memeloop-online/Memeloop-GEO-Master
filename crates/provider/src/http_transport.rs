@@ -167,8 +167,11 @@ mod tests {
                     model: "test-model".into(),
                     messages: vec![Message {
                         role: "user".into(),
-                        content: "test".into(),
+                        content: Some("test".into()),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
                     }],
+                    tools: Vec::new(),
                     max_output_tokens: None,
                     temperature: None,
                     surface: ProviderSurface::OfficialApi,

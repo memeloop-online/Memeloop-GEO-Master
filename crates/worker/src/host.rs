@@ -426,6 +426,7 @@ pub trait HostOps: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCompletionRequest {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -434,17 +435,97 @@ pub struct ModelCompletionRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<ModelMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ModelToolDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelMessage {
+    pub role: String,
+    /// Null is valid for assistant messages that contain tool calls.
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ModelToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelToolDefinition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ModelToolFunctionDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelToolFunctionDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ModelToolFunctionCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelToolFunctionCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCompletion {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ModelToolCall>,
     /// The routing identifier that actually answered, so a run can record which
     /// model produced its content.
     pub model: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub finish_reason: String,
+}
+
+#[cfg(test)]
+mod model_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_tool_loop_payload_roundtrips_without_scope_or_endpoint_fields() {
+        let request = json!({
+            "messages": [
+                {"role":"user","content":"question"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"knowledge_search","arguments":"{\"query\":\"warranty\"}"}}
+                ]},
+                {"role":"tool","content":"{\"answer\":\"found\"}","tool_call_id":"call_1"}
+            ],
+            "tools":[{"type":"function","function":{
+                "name":"knowledge_search","description":"Search project knowledge",
+                "parameters":{"type":"object","properties":{"query":{"type":"string"}}}
+            }}]
+        });
+        let parsed: ModelCompletionRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), request);
+        assert_eq!(parsed.messages[1].content, None);
+        assert_eq!(parsed.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        let mut forbidden = request;
+        forbidden["tenant_id"] = json!("different-tenant");
+        assert!(serde_json::from_value::<ModelCompletionRequest>(forbidden).is_err());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,9 +558,35 @@ pub struct ManifestReadRequest {
 pub struct ManifestItem {
     /// The deterministic branch identity for this item.
     pub branch_id: String,
-    pub document_revision_id: Uuid,
+    /// Planning identity exists before a document revision is generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_manifest_item_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_state: Option<ManifestPlanningState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_revision_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_target_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestPlanningState {
+    Planned,
+    Blocked,
+    Deferred,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestCoverage {
+    pub total: u64,
+    pub planned: u64,
+    pub blocked: u64,
+    pub deferred: u64,
+    pub not_applicable: u64,
 }
 
 /// A manifest page.  `sealed` and `expected_count` are reported as they are: an
@@ -494,6 +601,8 @@ pub struct ManifestPage {
     pub sealed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ManifestCoverage>,
     pub items: Vec<ManifestItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
@@ -617,9 +726,18 @@ impl ManifestPage {
         if self.items.len() > request.limit.unwrap_or(100) as usize
             || self.items.iter().any(|item| {
                 item.branch_id.is_empty()
-                    || item.document_revision_id.is_nil()
-                    || (matches!(self.kind, ManifestKind::Distribution)
-                        && item.platform_target_id.is_none_or(|id| id.is_nil()))
+                    || item.document_revision_id.is_some_and(|id| id.is_nil())
+                    || item.document_manifest_item_id.is_some_and(|id| id.is_nil())
+                    || item.platform_target_id.is_some_and(|id| id.is_nil())
+                    || match self.kind {
+                        ManifestKind::Document => {
+                            item.document_manifest_item_id.is_none()
+                                || item.planning_state.is_none()
+                        }
+                        ManifestKind::Distribution => {
+                            item.document_revision_id.is_none() || item.platform_target_id.is_none()
+                        }
+                    }
             })
         {
             return Err("manifest page contains invalid or excess items".to_owned());

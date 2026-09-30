@@ -12,12 +12,12 @@
 
 ## 当前：W00 AI 工作台与 Agent Runtime
 
-- [ ] 验收启动期重启对账：已实现显式 `GEO_SINGLE_PROCESS_EXECUTOR=true` 下 running → failed；需实库回归、部署文档和多副本租约方案。默认关闭，滚动部署或多副本不得开启；queued 恢复仍未实现。
+- [ ] 验收启动期重启对账：已实现显式 `GEO_SINGLE_PROCESS_EXECUTOR=true` 下 running → failed；CI 实库测试隔离修复待复验，多副本租约与 queued 恢复仍未实现。默认关闭，滚动部署或多副本不得开启。
 - [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
 - [ ] 驱动中途 checkpoint 恢复与 Rust-owned tool-call ledger：executor 已接完成结果存档，但它不是中途恢复；工具 intent/attempt/outcome 必须由 Rust 实际调用前后写入，不能信任 JS 自报。
-- [ ] 真实 MemeLoop 单回合及本地应用摘要装配已通过；接下来接工具循环、消息/附件契约、持久恢复。生成文件不入库，分发时携带第三方许可。
-- [ ] 接正式租户 Token Center：HTTP transport、scope 路由、模型白名单和本地开发装配已有测试；生产租户凭据解析与费用未接。
-- [ ] 实现 GEO 工具桥接：`manifest_read`、`publish_submit`、`measure_sample` 目前如实返回 `capability_missing`。
+- [ ] 真实 MemeLoop 知识检索工具循环与本地应用装配已通过；补持久会话历史、附件读取/显式知识导入、中途恢复及其他业务工具。P00 多附件上传已接，上传不等于解析。
+- [ ] 接正式租户 Token Center 应用装配：HTTP 凭据适配已有契约测试；补可信租户映射的持久配置、秘密注入、权益/路由及费用。
+- [ ] 扩展 GEO 工具桥接：文档 `manifest_read` 已接；补分发清单、`publish_submit`、`measure_sample`，并注册相应 MemeLoop 业务工具。
 - [ ] 跑通“附件入库 → 带来源回答 → 两个文档分支 fan-out → 恢复 → 结果汇总”首个纵切。
 
 ## 排队：W03 企业知识库

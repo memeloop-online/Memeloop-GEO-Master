@@ -6,6 +6,8 @@
 
 mod http_transport;
 pub use http_transport::HttpTransport;
+mod token_center;
+pub use token_center::{HttpTokenCenter, TokenCenterKeyMapping};
 
 use std::fmt;
 use std::sync::{
@@ -189,13 +191,47 @@ pub trait Transport: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
-    pub content: String,
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,6 +256,7 @@ impl CompletionRequest {
                 "at least one message is required".into(),
             ));
         }
+        let mut pending_calls = std::collections::BTreeSet::new();
         for message in &self.messages {
             if !matches!(
                 message.role.as_str(),
@@ -229,9 +266,74 @@ impl CompletionRequest {
                     "message role is not supported".into(),
                 ));
             }
-            if message.content.trim().is_empty() || message.content.len() > MAX_MESSAGE_LENGTH {
+            if message
+                .content
+                .as_ref()
+                .is_some_and(|content| content.len() > MAX_MESSAGE_LENGTH)
+            {
                 return Err(ProviderError::InvalidRequest(
-                    "message content must be non-empty and within the size limit".into(),
+                    "message content exceeds the size limit".into(),
+                ));
+            }
+            match message.role.as_str() {
+                "assistant" if !message.tool_calls.is_empty() => {
+                    if message.tool_call_id.is_some() {
+                        return Err(ProviderError::InvalidRequest(
+                            "assistant cannot carry tool_call_id".into(),
+                        ));
+                    }
+                    for call in &message.tool_calls {
+                        validate_tool_call(call).map_err(ProviderError::InvalidRequest)?;
+                        if !pending_calls.insert(call.id.as_str()) {
+                            return Err(ProviderError::InvalidRequest(
+                                "duplicate tool call id".into(),
+                            ));
+                        }
+                    }
+                }
+                "tool" => {
+                    if !message.tool_calls.is_empty()
+                        || message
+                            .content
+                            .as_ref()
+                            .is_none_or(|content| content.is_empty())
+                        || !message
+                            .tool_call_id
+                            .as_ref()
+                            .is_some_and(|id| pending_calls.remove(id.as_str()))
+                    {
+                        return Err(ProviderError::InvalidRequest(
+                            "tool message must contain content and reference a pending tool call"
+                                .into(),
+                        ));
+                    }
+                }
+                _ if !message.tool_calls.is_empty()
+                    || message.tool_call_id.is_some()
+                    || message
+                        .content
+                        .as_ref()
+                        .is_none_or(|content| content.trim().is_empty()) =>
+                {
+                    return Err(ProviderError::InvalidRequest(
+                        "message must contain non-empty content and no tool fields".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if !pending_calls.is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "each assistant tool call must have a matching tool result".into(),
+            ));
+        }
+        for tool in &self.tools {
+            if tool.kind != "function"
+                || !valid_function_name(&tool.function.name)
+                || !tool.function.parameters.is_object()
+            {
+                return Err(ProviderError::InvalidRequest(
+                    "invalid function tool definition".into(),
                 ));
             }
         }
@@ -280,8 +382,33 @@ impl CompletionRequest {
         if self.include_citations {
             body["include"] = json!(["web_search_call.action.sources"]);
         }
+        if !self.tools.is_empty() {
+            body["tools"] = json!(self.tools);
+        }
         body
     }
+}
+
+fn validate_tool_call(call: &ToolCall) -> Result<(), String> {
+    if call.kind != "function"
+        || call.id.trim().is_empty()
+        || !valid_function_name(&call.function.name)
+    {
+        return Err("invalid function tool call identity".into());
+    }
+    if !serde_json::from_str::<Value>(&call.function.arguments).is_ok_and(|value| value.is_object())
+    {
+        return Err("function tool arguments must be a JSON object".into());
+    }
+    Ok(())
+}
+
+fn valid_function_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +432,7 @@ pub struct NormalizedCompletion {
     pub request_id: String,
     pub model: String,
     pub text: String,
+    pub tool_calls: Vec<ToolCall>,
     pub finish_reason: String,
     pub citations: Vec<Citation>,
     pub usage: TokenUsage,
@@ -508,15 +636,51 @@ pub fn normalize_response(
     let message = choice
         .get("message")
         .ok_or_else(|| ProviderError::InvalidResponse("response is missing message".into()))?;
-    let text = message
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ProviderError::InvalidResponse("response is missing text content".into()))?;
+    let tool_calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => {
+            let calls: Vec<ToolCall> = serde_json::from_value(value.clone()).map_err(|_| {
+                ProviderError::InvalidResponse("response contains malformed tool_calls".into())
+            })?;
+            if calls.is_empty() {
+                return Err(ProviderError::InvalidResponse(
+                    "response contains empty tool_calls".into(),
+                ));
+            }
+            for call in &calls {
+                validate_tool_call(call).map_err(ProviderError::InvalidResponse)?;
+            }
+            let ids = calls
+                .iter()
+                .map(|call| &call.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            if ids.len() != calls.len() {
+                return Err(ProviderError::InvalidResponse(
+                    "response repeats a tool call id".into(),
+                ));
+            }
+            calls
+        }
+    };
+    let text = match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        None | Some(Value::Null) if !tool_calls.is_empty() => String::new(),
+        _ => {
+            return Err(ProviderError::InvalidResponse(
+                "response is missing text content".into(),
+            ));
+        }
+    };
     let finish_reason = choice
         .get("finish_reason")
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_owned();
+    if tool_calls.is_empty() && (text.trim().is_empty() || finish_reason == "tool_calls") {
+        return Err(ProviderError::InvalidResponse(
+            "response has neither answer content nor tool calls".into(),
+        ));
+    }
     let usage = value
         .get("usage")
         .ok_or_else(|| ProviderError::InvalidResponse("response is missing usage".into()))?;
@@ -556,7 +720,8 @@ pub fn normalize_response(
     Ok(NormalizedCompletion {
         request_id: request_id.into(),
         model: model.into(),
-        text: text.into(),
+        text,
+        tool_calls,
         finish_reason,
         citations,
         usage: TokenUsage {
@@ -630,8 +795,11 @@ mod tests {
             model: "configured-model".into(),
             messages: vec![Message {
                 role: "user".into(),
-                content: "hello".into(),
+                content: Some("hello".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             }],
+            tools: Vec::new(),
             max_output_tokens: Some(32),
             temperature: None,
             surface: ProviderSurface::OfficialApi,
@@ -675,6 +843,68 @@ mod tests {
         assert_eq!(result.text, "answer");
         assert_eq!(result.citations[0].url, "https://example.invalid/a");
         assert_eq!(result.usage.total_tokens, 9);
+    }
+
+    #[test]
+    fn function_tools_and_null_content_roundtrip_with_strict_result_validation() {
+        let mut input = request();
+        input.search_mode = SearchMode::Disabled;
+        input.include_citations = false;
+        input.tools = vec![ToolDefinition {
+            kind: "function".into(),
+            function: FunctionDefinition {
+                name: "knowledge_search".into(),
+                description: "Search allowed knowledge".into(),
+                parameters: json!({"type":"object","properties":{"query":{"type":"string"}}}),
+            },
+        }];
+        assert_eq!(
+            input.to_provider_body()["tools"][0]["function"]["name"],
+            "knowledge_search"
+        );
+        let call = json!({"id":"call_1","type":"function","function":{"name":"knowledge_search","arguments":"{\"query\":\"warranty\"}"}});
+        let answer = json!({
+            "id":"req-2", "model":"answered-model",
+            "choices":[{"message":{"content":null,"tool_calls":[call.clone()]},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":4,"completion_tokens":5,"total_tokens":9}
+        });
+        let normalized = normalize_response(&answer.to_string(), &input).unwrap();
+        assert_eq!(normalized.text, "");
+        assert_eq!(normalized.tool_calls[0].id, "call_1");
+        input.messages.push(Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: normalized.tool_calls,
+            tool_call_id: None,
+        });
+        input.messages.push(Message {
+            role: "tool".into(),
+            content: Some("{\"result\":\"found\"}".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call_1".into()),
+        });
+        input.validate().unwrap();
+        let body = input.to_provider_body();
+        assert!(body["messages"][1]["content"].is_null());
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(body["messages"][2]["role"], "tool");
+        let mut orphan = input.clone();
+        orphan.messages[2].tool_call_id = Some("wrong".into());
+        assert!(matches!(
+            orphan.validate(),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+        for invalid in [
+            json!({"id":"req-2","model":"m","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"knowledge_search","arguments":"not-json"}}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+            json!({"id":"req-2","model":"m","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"knowledge_search"}}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+            json!({"id":"req-2","model":"m","choices":[{"message":{"content":null}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+            json!({"id":"req-2","model":"m","choices":[{"message":{"content":""},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+        ] {
+            assert!(matches!(
+                normalize_response(&invalid.to_string(), &input),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+        }
     }
 
     #[tokio::test]

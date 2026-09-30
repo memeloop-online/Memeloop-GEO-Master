@@ -814,7 +814,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
             "SELECT session.filename,session.declared_media_type,session.expected_size,session.expected_sha256,session.purpose,session.state,session.expires_at,
                     blob.content,blob.actual_size,blob.sha256
              FROM knowledge_upload_sessions session LEFT JOIN knowledge_upload_blobs blob ON blob.upload_session_id=session.upload_session_id
-             WHERE session.upload_session_id=$1 AND session.operator_id=$2 AND session.tenant_id=$3 AND session.project_id=$4 FOR UPDATE",
+             WHERE session.upload_session_id=$1 AND session.operator_id=$2 AND session.tenant_id=$3 AND session.project_id=$4 FOR UPDATE OF session",
         ).bind(id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project_id.as_uuid())
         .fetch_optional(&mut *transaction).await.map_err(database_error)?
         .ok_or_else(|| AppError::not_found("upload session not found"))?;
@@ -936,6 +936,176 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)?;
         Ok(acceptance)
+    }
+
+    async fn complete_attachment_upload(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<(StoredObject, String), AppError> {
+        if idempotency_key.trim().is_empty() {
+            return Err(AppError::invalid_request(
+                "Idempotency-Key must not be empty",
+            ));
+        }
+        let project_id = Self::project_id(scope)?;
+        let key_hash = sha256_hex(idempotency_key.trim().as_bytes());
+        let mut transaction = self.transaction(scope).await?;
+        let row = sqlx::query(
+            "SELECT session.filename,session.declared_media_type,session.expected_size,
+                    session.expected_sha256,session.state,session.expires_at,
+                    session.committed_object_id,session.completion_idempotency_key_hash,
+                    blob.content,blob.actual_size,blob.sha256
+             FROM knowledge_upload_sessions session
+             LEFT JOIN knowledge_upload_blobs blob ON blob.upload_session_id=session.upload_session_id
+             WHERE session.upload_session_id=$1 AND session.operator_id=$2
+               AND session.tenant_id=$3 AND session.project_id=$4 FOR UPDATE OF session",
+        )
+        .bind(id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_optional(&mut *transaction).await.map_err(database_error)?
+        .ok_or_else(|| AppError::not_found("upload session not found"))?;
+        let state: String = row.get("state");
+        if state == "committed" {
+            if row
+                .get::<Option<String>, _>("completion_idempotency_key_hash")
+                .as_deref()
+                != Some(&key_hash)
+            {
+                return Err(AppError::conflict(
+                    "upload session was completed with a different idempotency key",
+                ));
+            }
+            let object_id: Uuid = row
+                .get::<Option<Uuid>, _>("committed_object_id")
+                .ok_or_else(|| AppError::conflict("upload session was already imported"))?;
+            transaction.commit().await.map_err(database_error)?;
+            let result = self
+                .get_attachment_object(scope, object_id)
+                .await?
+                .ok_or_else(|| AppError::conflict("upload session was already imported"))?;
+            return Ok(result);
+        }
+        if row.get::<chrono::DateTime<Utc>, _>("expires_at") <= Utc::now() {
+            sqlx::query("UPDATE knowledge_upload_sessions SET state='expired',revision=revision+1,updated_at=now() WHERE upload_session_id=$1")
+                .bind(id).execute(&mut *transaction).await.map_err(database_error)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Err(AppError::conflict("upload session has expired"));
+        }
+        if state != "uploaded" {
+            return Err(AppError::conflict(
+                "upload session content is not ready to complete",
+            ));
+        }
+        let content: Option<Vec<u8>> = row.get("content");
+        let size: Option<i64> = row.get("actual_size");
+        let hash: Option<String> = row.get("sha256");
+        let expected_size: i64 = row.get("expected_size");
+        let expected_hash: String = row.get("expected_sha256");
+        if content.as_ref().is_none_or(|bytes| {
+            bytes.len() as i64 != expected_size || sha256_hex(bytes) != expected_hash
+        }) || size != Some(expected_size)
+            || hash.as_deref() != Some(&expected_hash)
+        {
+            sqlx::query("UPDATE knowledge_upload_sessions SET state='failed',revision=revision+1,updated_at=now() WHERE upload_session_id=$1")
+                .bind(id).execute(&mut *transaction).await.map_err(database_error)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Err(AppError::invalid_request(
+                "uploaded content size or sha256 does not match upload session",
+            ));
+        }
+        let object = StoredObject {
+            object_id: Uuid::new_v4(),
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id,
+            object_version: 1,
+            backend: "postgres_blob".to_owned(),
+            opaque_key: format!("upload/{id}"),
+            actual_size: expected_size as u64,
+            detected_media_type: row.get("declared_media_type"),
+            sha256: expected_hash,
+            state: StoredObjectState::Committed,
+            created_at: Utc::now(),
+        };
+        sqlx::query(
+            "INSERT INTO knowledge_stored_objects
+             (object_id,operator_id,tenant_id,project_id,object_version,backend,opaque_key,actual_size,detected_media_type,sha256,state,created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'committed',$11)",
+        )
+        .bind(object.object_id).bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid()).bind(project_id.as_uuid())
+        .bind(object.object_version).bind(&object.backend).bind(&object.opaque_key)
+        .bind(object.actual_size as i64).bind(&object.detected_media_type)
+        .bind(&object.sha256).bind(object.created_at)
+        .execute(&mut *transaction).await.map_err(database_error)?;
+        sqlx::query(
+            "UPDATE knowledge_upload_sessions
+             SET state='committed',revision=revision+1,committed_object_id=$1,
+                 staging_object_ref='agent-attachment',
+                 completion_idempotency_key_hash=$2,updated_at=now()
+             WHERE upload_session_id=$3",
+        )
+        .bind(object.object_id)
+        .bind(&key_hash)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let filename: String = row.get("filename");
+        transaction.commit().await.map_err(database_error)?;
+        Ok((object, filename))
+    }
+
+    async fn get_attachment_object(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+    ) -> Result<Option<(StoredObject, String)>, AppError> {
+        let project_id = Self::project_id(scope)?;
+        let mut transaction = self.transaction(scope).await?;
+        let row = sqlx::query(
+            "SELECT object.object_id,object.object_version,object.backend,object.opaque_key,
+                    object.actual_size,object.detected_media_type,object.sha256,object.created_at,
+                    session.filename
+             FROM knowledge_stored_objects object
+             JOIN knowledge_upload_sessions session
+               ON session.committed_object_id=object.object_id
+              AND session.operator_id=object.operator_id AND session.tenant_id=object.tenant_id
+              AND session.project_id=object.project_id
+             WHERE object.object_id=$1 AND object.operator_id=$2 AND object.tenant_id=$3
+               AND object.project_id=$4 AND object.state='committed'
+               AND session.staging_object_ref='agent-attachment'",
+        )
+        .bind(id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(row.map(|row| {
+            let filename = row.get("filename");
+            (
+                StoredObject {
+                    object_id: row.get("object_id"),
+                    operator_id: scope.operator_id,
+                    tenant_id: scope.tenant_id,
+                    project_id,
+                    object_version: row.get("object_version"),
+                    backend: row.get("backend"),
+                    opaque_key: row.get("opaque_key"),
+                    actual_size: row.get::<i64, _>("actual_size") as u64,
+                    detected_media_type: row.get("detected_media_type"),
+                    sha256: row.get("sha256"),
+                    state: StoredObjectState::Committed,
+                    created_at: row.get("created_at"),
+                },
+                filename,
+            )
+        }))
     }
 
     async fn import_batch(

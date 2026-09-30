@@ -1419,6 +1419,10 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         agent::list_conversations,
         agent::get_conversation,
         agent::append_message,
+        agent::create_attachment_upload,
+        agent::put_attachment_content,
+        agent::complete_attachment_upload,
+        agent::get_attachment,
         agent::cancel_turn,
         agent::conversation_events
     ),
@@ -1508,7 +1512,8 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::RuntimeCapability,
         geo_domain::RuntimeCapabilityStatus,
         agent::ConversationPage,
-        agent::AgentSubmitResponse
+        agent::AgentSubmitResponse,
+        agent::AttachmentUploadCommand
     )),
     modifiers(&SecurityModifier)
 )]
@@ -1569,10 +1574,30 @@ pub fn router(state: AppState) -> Router {
             get(agent::conversation_events),
         )
         .route("/agent/turns/{turn_id}/cancel", post(agent::cancel_turn))
+        .route(
+            "/agent/attachments/upload-sessions",
+            post(agent::create_attachment_upload),
+        )
+        .route(
+            "/agent/attachments/upload-sessions/{id}/complete",
+            post(agent::complete_attachment_upload),
+        )
+        .route("/agent/attachments/{id}", get(agent::get_attachment))
         .layer(middleware::from_fn_with_state(
             idempotency_store.clone(),
             json_command_idempotency_middleware,
         ))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(agent::project_scope_middleware))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // Raw upload bytes exceed the JSON command cache's 1 MiB buffer. The
+    // knowledge repository verifies bytes and scopes the session itself.
+    let agent_attachment_bytes: Router<AppState> = Router::new()
+        .route(
+            "/agent/attachments/upload-sessions/{id}/content",
+            axum::routing::put(agent::put_attachment_content),
+        )
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(agent::project_scope_middleware))
         .layer(middleware::from_fn(auth_scope_from_request));
@@ -1625,6 +1650,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(estimate_routes)
                 .merge(start_routes)
                 .merge(knowledge_routes)
+                .merge(agent_attachment_bytes)
                 .merge(agent_routes)
                 .merge(scoped),
         )

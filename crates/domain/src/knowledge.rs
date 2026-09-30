@@ -843,6 +843,19 @@ pub trait KnowledgeRepository: Send + Sync {
         id: Uuid,
         idempotency_key: &str,
     ) -> Result<ImportAcceptance, AppError>;
+    /// Commit verified upload bytes as an object without creating a knowledge source.
+    async fn complete_attachment_upload(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<(StoredObject, String), AppError>;
+    /// Read committed object metadata and the original upload filename within scope.
+    async fn get_attachment_object(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+    ) -> Result<Option<(StoredObject, String)>, AppError>;
     async fn import_batch(
         &self,
         scope: &TenantScope,
@@ -918,6 +931,7 @@ struct MemoryState {
     current_release: HashMap<String, Uuid>,
     import_items: HashMap<(String, String), (String, ImportAcceptance)>,
     upload_completions: HashMap<(Uuid, String), ImportAcceptance>,
+    attachment_completions: HashMap<Uuid, String>,
 }
 
 impl MemoryKnowledgeRepository {
@@ -1453,6 +1467,129 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             .upload_completions
             .insert(completion_key, acceptance.clone());
         Ok(acceptance)
+    }
+
+    async fn complete_attachment_upload(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<(StoredObject, String), AppError> {
+        Self::require_project(scope)?;
+        if idempotency_key.trim().is_empty() {
+            return Err(AppError::invalid_request(
+                "Idempotency-Key must not be empty",
+            ));
+        }
+        let mut state = self.state.write().await;
+        let session = state
+            .upload_sessions
+            .get(&id)
+            .filter(|session| Self::in_scope(scope, *session))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("upload session not found"))?;
+        let key_hash = sha256_hex(idempotency_key.trim().as_bytes());
+        if session.state == UploadSessionState::Committed {
+            if state
+                .upload_completions
+                .keys()
+                .any(|(session_id, _)| *session_id == id)
+                || session.operation_id.is_some()
+            {
+                return Err(AppError::conflict("upload session was already imported"));
+            }
+            if state.attachment_completions.get(&id) != Some(&key_hash) {
+                return Err(AppError::conflict(
+                    "upload session was completed with a different idempotency key",
+                ));
+            }
+            let object = state
+                .stored_objects
+                .get(&session.committed_object_id.expect("committed object"))
+                .cloned()
+                .ok_or_else(|| AppError::not_found("attachment object not found"))?;
+            return Ok((object, session.filename));
+        }
+        if session.expires_at <= Utc::now() {
+            state
+                .upload_sessions
+                .get_mut(&id)
+                .expect("session exists")
+                .state = UploadSessionState::Expired;
+            return Err(AppError::conflict("upload session has expired"));
+        }
+        if session.state != UploadSessionState::Uploaded {
+            return Err(AppError::conflict(
+                "upload session content is not ready to complete",
+            ));
+        }
+        let content = state
+            .upload_bytes
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::conflict("upload content has not been received"))?;
+        let hash = sha256_hex(&content);
+        if content.len() as u64 != session.expected_size || hash != session.expected_sha256 {
+            let session = state.upload_sessions.get_mut(&id).expect("session exists");
+            session.state = UploadSessionState::Failed;
+            session.revision += 1;
+            return Err(AppError::invalid_request(
+                "uploaded content size or sha256 does not match upload session",
+            ));
+        }
+        let object = StoredObject {
+            object_id: Uuid::new_v4(),
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id: scope.project_id.expect("validated project"),
+            object_version: 1,
+            backend: "memory".to_owned(),
+            opaque_key: format!("memory-object/{}", Uuid::new_v4()),
+            actual_size: session.expected_size,
+            detected_media_type: session.declared_media_type.clone(),
+            sha256: hash,
+            state: StoredObjectState::Committed,
+            created_at: Utc::now(),
+        };
+        state.object_bytes.insert(object.object_id, content);
+        state
+            .stored_objects
+            .insert(object.object_id, object.clone());
+        let updated = state.upload_sessions.get_mut(&id).expect("session exists");
+        updated.state = UploadSessionState::Committed;
+        updated.revision += 1;
+        updated.committed_object_id = Some(object.object_id);
+        state.attachment_completions.insert(id, key_hash);
+        Ok((object, session.filename))
+    }
+
+    async fn get_attachment_object(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+    ) -> Result<Option<(StoredObject, String)>, AppError> {
+        Self::require_project(scope)?;
+        let state = self.state.read().await;
+        let Some(object) = state
+            .stored_objects
+            .get(&id)
+            .filter(|object| {
+                object.state == StoredObjectState::Committed && Self::in_scope(scope, *object)
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(session) = state.upload_sessions.values().find(|session| {
+            session.committed_object_id == Some(id)
+                && state
+                    .attachment_completions
+                    .contains_key(&session.upload_session_id)
+                && Self::in_scope(scope, *session)
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some((object, session.filename.clone())))
     }
 
     async fn import_batch(

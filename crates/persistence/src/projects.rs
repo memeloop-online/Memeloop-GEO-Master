@@ -369,10 +369,26 @@ impl ProjectRepository for PgProjectRepository {
             .fetch_one(&mut *transaction)
             .await
             .map_err(map_database_error)?;
-            transaction.commit().await.map_err(map_database_error)?;
             if hashes.0 == command.idempotency_key_hash && hashes.1 == command.request_hash {
-                return Ok(existing);
+                // Replay the original accepted command, not a view whose
+                // manifest states may have advanced since startup. GET start
+                // remains the live read model.
+                let result: Value = sqlx::query_scalar(
+                    "SELECT result FROM operations
+                     WHERE operation_id=$1 AND operator_id=$2 AND tenant_id=$3 AND project_id=$4",
+                )
+                .bind(existing.operation_id)
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(id.as_uuid())
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(map_database_error)?;
+                let original = serde_json::from_value(result).map_err(serialization_error)?;
+                transaction.commit().await.map_err(map_database_error)?;
+                return Ok(original);
             }
+            transaction.commit().await.map_err(map_database_error)?;
             if hashes.0 == command.idempotency_key_hash {
                 return Err(AppError::conflict(
                     "Idempotency-Key was already used with a different project start request",

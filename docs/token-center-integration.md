@@ -41,7 +41,9 @@ GEO 的 operator/tenant/principal 映射必须由 Rust 根据已认证 scope 选
 `src/api/cloud_principals.rs`、`src/db/credentials/keys.rs`、`src/model.rs`、
 `schemas/key-create.schema.json`、`openapi/openapi.yaml`。
 
-当前仓库有 TokenCenter trait、scope-aware Provider bridge 和 HTTP transport，
-尚未实现以上正式租户映射与协议适配。开发环境进程级 key 不能冒充这一集成。
+当前仓库有 TokenCenter trait、scope-aware Provider bridge 和 HTTP transport。
+`crates/provider/src/token_center.rs` 已实现预置映射的元数据校验与 copy 协议，
+六项本地 HTTP 契约测试覆盖成功、作用域/状态/代际不匹配、错误脱敏等。
+正式租户映射的持久配置与应用装配尚未接通；开发环境进程级 key 不能冒充这一集成。
 验收需要：跨租户拒绝、未付费拒绝、无路由、余额不足、撤销、轮换、响应缺 key、
 请求超时和凭据不进入任何持久消息。测试使用本地契约服务器和测试凭据。

@@ -28,14 +28,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use geo_domain::{
-    AgentRuntime, AppError, ErrorCode, KnowledgeRepository, RUNTIME_NOT_CONFIGURED,
-    RuntimeCapability, TenantScope, TurnInput, TurnReport,
+    AgentRuntime, AppError, DocumentManifestItemState, DocumentManifestState, ErrorCode,
+    KnowledgeRepository, RUNTIME_NOT_CONFIGURED, RuntimeCapability, TenantScope, TurnInput,
+    TurnReport,
 };
 use geo_worker::{
     HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
-    HostOpError, HostOpErrorCode, HostOps, HostRuntime, ManifestPage, ManifestReadRequest,
-    MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
-    PublishRequest, TURN_COMPLETION_TOPIC, WorkerError,
+    HostOpError, HostOpErrorCode, HostOps, HostRuntime, ManifestCoverage, ManifestItem,
+    ManifestKind, ManifestPage, ManifestPlanningState, ManifestReadRequest, MeasureRequest,
+    MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt, PublishRequest,
+    TURN_COMPLETION_TOPIC, WorkerError,
 };
 use serde_json::{Value, json};
 
@@ -437,9 +439,9 @@ fn error_code_for_host_op(code: HostOpErrorCode) -> ErrorCode {
 /// a complete one is never an acceptable stand-in for a capability that is
 /// absent.
 ///
-/// This set is deliberately incomplete while the provider bridge, manifest item
-/// iteration, publishing and measurement are unbuilt, so an assembly over it
-/// alone is not [`EmbeddedAgentRuntime::configured`].
+/// This set is deliberately incomplete while distribution iteration, publishing
+/// and measurement are unbuilt, so an assembly over it alone is not
+/// [`EmbeddedAgentRuntime::configured`].
 pub struct RepositoryHostOps {
     knowledge: Arc<dyn KnowledgeRepository>,
     model_provider: Option<SharedModelProvider>,
@@ -512,15 +514,143 @@ impl HostOps for RepositoryHostOps {
 
     async fn manifest_read(
         &self,
-        _scope: &TenantScope,
-        _request: ManifestReadRequest,
+        scope: &TenantScope,
+        request: ManifestReadRequest,
     ) -> Result<ManifestPage, HostOpError> {
-        // The manifest header is stored, but its items are not readable yet, and
-        // an empty item list would read as "this manifest has no work".
-        Err(HostOpError::capability_missing(
-            HostOp::ManifestRead,
-            "manifest item iteration is not implemented yet",
-        ))
+        let op = HostOp::ManifestRead;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        if request.kind != ManifestKind::Document {
+            return Err(HostOpError::capability_missing(
+                op,
+                "distribution manifest iteration is not implemented yet",
+            ));
+        }
+        // Discovery needs a Rust-owned cycle/run binding. An arbitrary JS
+        // request must not select whichever project manifest happens to exist.
+        let manifest_id = request.manifest_id.ok_or_else(|| {
+            HostOpError::invalid_request(op, "a bound document manifest ID is required")
+        })?;
+        if manifest_id.is_nil() {
+            return Err(HostOpError::invalid_request(
+                op,
+                "manifest ID must be non-zero",
+            ));
+        }
+        let limit = request.limit.unwrap_or(100);
+        if !(1..=100).contains(&limit) {
+            return Err(HostOpError::invalid_request(
+                op,
+                "limit must be between 1 and 100",
+            ));
+        }
+        let manifest = self
+            .knowledge
+            .get_document_manifest(scope, manifest_id)
+            .await
+            .map_err(|error| worker_error(op, error))?
+            .ok_or_else(|| HostOpError::not_found(op, "document manifest not found"))?;
+        if !manifest.sealed {
+            return Err(HostOpError::failed(
+                op,
+                "document manifest is not a sealed snapshot",
+            ));
+        }
+        if request
+            .revision
+            .is_some_and(|revision| revision != manifest.revision)
+        {
+            return Err(HostOpError::invalid_request(
+                op,
+                "document manifest revision does not match",
+            ));
+        }
+        let offset = match request.cursor.as_deref() {
+            Some(cursor) => {
+                let (version, position, digest) = {
+                    let mut parts = cursor.split('.');
+                    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                        (Some(version), Some(position), Some(digest), None) => {
+                            (version, position, digest)
+                        }
+                        _ => {
+                            return Err(HostOpError::invalid_request(
+                                op,
+                                "invalid manifest cursor",
+                            ));
+                        }
+                    }
+                };
+                let offset = position
+                    .parse::<usize>()
+                    .map_err(|_| HostOpError::invalid_request(op, "invalid manifest cursor"))?;
+                if version != "v1"
+                    || offset >= manifest.items.len()
+                    || digest
+                        != manifest_cursor_digest(scope, manifest_id, manifest.revision, offset)
+                {
+                    return Err(HostOpError::invalid_request(
+                        op,
+                        "manifest cursor does not match the scoped snapshot",
+                    ));
+                }
+                offset
+            }
+            None => 0,
+        };
+        let end = offset
+            .saturating_add(limit as usize)
+            .min(manifest.items.len());
+        let items = manifest.items[offset..end]
+            .iter()
+            .map(|item| ManifestItem {
+                branch_id: item.document_key.clone(),
+                document_manifest_item_id: Some(item.document_manifest_item_id),
+                planning_state: Some(match item.state {
+                    DocumentManifestItemState::Planned => ManifestPlanningState::Planned,
+                    DocumentManifestItemState::Blocked => ManifestPlanningState::Blocked,
+                    DocumentManifestItemState::Deferred => ManifestPlanningState::Deferred,
+                    DocumentManifestItemState::NotApplicable => {
+                        ManifestPlanningState::NotApplicable
+                    }
+                }),
+                block_reason: item.block_reason.clone(),
+                // A planning item has no generated revision. Never manufacture
+                // a UUID merely to satisfy a publishing-oriented DTO.
+                document_revision_id: None,
+                platform_target_id: None,
+            })
+            .collect();
+        let next_cursor = (end < manifest.items.len()).then(|| {
+            format!(
+                "v1.{end}.{}",
+                manifest_cursor_digest(scope, manifest_id, manifest.revision, end)
+            )
+        });
+        Ok(ManifestPage {
+            kind: ManifestKind::Document,
+            manifest_id,
+            revision: manifest.revision,
+            state: match manifest.state {
+                DocumentManifestState::AwaitingKnowledge => "awaiting_knowledge",
+                DocumentManifestState::Planning => "planning",
+                DocumentManifestState::Ready => "ready",
+                DocumentManifestState::Closed => "closed",
+            }
+            .to_owned(),
+            sealed: manifest.sealed,
+            expected_count: manifest.expected_count,
+            coverage: Some(ManifestCoverage {
+                total: manifest.coverage.total,
+                planned: manifest.coverage.planned,
+                blocked: manifest.coverage.blocked,
+                deferred: manifest.coverage.deferred,
+                not_applicable: manifest.coverage.not_applicable,
+            }),
+            items,
+            next_cursor,
+        })
     }
 
     async fn publish_submit(
@@ -546,6 +676,21 @@ impl HostOps for RepositoryHostOps {
     }
 }
 
+fn manifest_cursor_digest(
+    scope: &TenantScope,
+    manifest_id: uuid::Uuid,
+    revision: i32,
+    offset: usize,
+) -> String {
+    geo_domain::sha256_hex(
+        format!(
+            "geo.manifest.page.v1|{}|{manifest_id}|{revision}|{offset}",
+            scope.storage_key()
+        )
+        .as_bytes(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +710,7 @@ mod tests {
         ) -> Result<ModelCompletion, HostOpError> {
             Ok(ModelCompletion {
                 text: request.prompt.clone(),
+                tool_calls: Vec::new(),
                 model: "fake-model".into(),
                 prompt_tokens: 1,
                 completion_tokens: 1,
@@ -622,6 +768,8 @@ mod tests {
             system: None,
             model: None,
             max_output_tokens: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
         };
         let result = ops.model_complete(&test_scope(), request).await.unwrap();
         assert_eq!(result.text, "hello");

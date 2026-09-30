@@ -7,8 +7,8 @@ use geo_domain::{
     InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, MessageRole, ObjectRef,
     ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand, RecordToolCall,
     RunCompletion, RunStatus, RuntimeCapability, SourceKind, StoreCheckpoint, TenantScope,
-    ToolCallDecision, ToolCallOutcome, TurnStatus, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    ToolCallDecision, ToolCallOutcome, TurnStatus, UploadSessionCommand, hash_idempotency_key,
+    settings_hash, sha256_hex, start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgAgentRepository, PgKnowledgeRepository, PgProjectRepository,
@@ -361,6 +361,145 @@ async fn seed_project(pool: &PgPool, operator_id: Uuid, tenant_id: Uuid, label: 
     .await
     .expect("project");
     project_id
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn attachment_upload_commits_object_without_knowledge_import_and_ordinary_upload_imports() {
+    let database = connect().await;
+    let repository = PgKnowledgeRepository::from_database(&database);
+    let scope = seed_scope(database.pool(), "attachment-upload").await;
+    let sibling = seed_sibling_scope(database.pool(), &scope, "attachment-other").await;
+    let bytes = b"Attachment-only notes";
+    let session = repository
+        .create_upload_session(
+            &scope,
+            UploadSessionCommand {
+                filename: "notes.txt".to_owned(),
+                declared_media_type: "text/plain".to_owned(),
+                expected_size: bytes.len() as u64,
+                expected_sha256: sha256_hex(bytes),
+                purpose: KnowledgePurpose::Internal,
+            },
+        )
+        .await
+        .expect("create attachment upload session");
+    assert_eq!(
+        repository
+            .put_upload_content(&scope, session.upload_session_id, bytes.to_vec())
+            .await
+            .expect("upload attachment bytes")
+            .state,
+        geo_domain::UploadSessionState::Uploaded
+    );
+    assert!(
+        repository
+            .complete_attachment_upload(&sibling, session.upload_session_id, "other")
+            .await
+            .is_err(),
+        "another project cannot complete this upload"
+    );
+    let (object, filename) = repository
+        .complete_attachment_upload(&scope, session.upload_session_id, "attachment-key")
+        .await
+        .expect("complete attachment-only upload");
+    assert_eq!(filename, "notes.txt");
+    assert_eq!(object.actual_size, bytes.len() as u64);
+    assert_eq!(object.sha256, sha256_hex(bytes));
+    assert_eq!(object.state, geo_domain::StoredObjectState::Committed);
+    assert_eq!(
+        repository
+            .complete_attachment_upload(&scope, session.upload_session_id, "attachment-key")
+            .await
+            .expect("idempotent completion"),
+        (object.clone(), filename.clone())
+    );
+    assert!(
+        repository
+            .complete_attachment_upload(&scope, session.upload_session_id, "different-key")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        repository
+            .get_attachment_object(&scope, object.object_id)
+            .await
+            .expect("read attachment"),
+        Some((object.clone(), filename))
+    );
+    assert!(
+        repository
+            .get_attachment_object(&sibling, object.object_id)
+            .await
+            .expect("scoped attachment read")
+            .is_none()
+    );
+    assert!(
+        repository
+            .list_sources(&scope)
+            .await
+            .expect("source listing")
+            .is_empty(),
+        "attaching must not create a knowledge source"
+    );
+
+    // The existing knowledge completion path has the same nullable-blob join;
+    // exercise its row lock too and verify that it still imports normally.
+    let import_bytes = b"Knowledge import text";
+    let import_session = repository
+        .create_upload_session(
+            &scope,
+            UploadSessionCommand {
+                filename: "knowledge.txt".to_owned(),
+                declared_media_type: "text/plain".to_owned(),
+                expected_size: import_bytes.len() as u64,
+                expected_sha256: sha256_hex(import_bytes),
+                purpose: KnowledgePurpose::Public,
+            },
+        )
+        .await
+        .expect("create knowledge upload");
+    repository
+        .put_upload_content(
+            &scope,
+            import_session.upload_session_id,
+            import_bytes.to_vec(),
+        )
+        .await
+        .expect("upload knowledge bytes");
+    let imported = repository
+        .complete_upload(&scope, import_session.upload_session_id, "knowledge-key")
+        .await
+        .expect("complete ordinary knowledge import");
+    assert!(imported.source.is_some());
+    assert!(imported.release.is_some());
+    assert_eq!(
+        repository
+            .complete_upload(&scope, import_session.upload_session_id, "knowledge-key")
+            .await
+            .expect("idempotent knowledge replay"),
+        imported
+    );
+    assert_eq!(
+        repository
+            .list_sources(&scope)
+            .await
+            .expect("sources after import")
+            .len(),
+        1
+    );
+    let imported_object_id = imported
+        .source_version
+        .as_ref()
+        .and_then(|version| version.object_id)
+        .expect("imported object ID");
+    assert!(
+        repository
+            .get_attachment_object(&scope, imported_object_id)
+            .await
+            .expect("knowledge object is not an agent attachment")
+            .is_none()
+    );
 }
 
 fn message(content: &str) -> AppendMessage {
@@ -1276,8 +1415,31 @@ async fn agent_begin_run_claims_a_queued_run_exactly_once() {
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
 async fn agent_single_process_startup_reconciles_only_running_runs() {
-    let database = connect().await;
-    let pool = database.pool().clone();
+    // This operation intentionally scans all running rows in a single-process
+    // deployment. Isolate its schema from parallel repository tests rather
+    // than weakening the production query or disrupting their active runs.
+    let url = std::env::var("GEO_TEST_DATABASE_URL").expect("test database");
+    let admin = PgPoolOptions::new()
+        .connect(&url)
+        .await
+        .expect("admin pool");
+    let schema = format!("reconcile_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .expect("isolated schema");
+    let options = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .expect("connection options")
+        .options([("search_path", schema.as_str())]);
+    let pool = PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .expect("isolated pool");
+    geo_persistence::MIGRATOR
+        .run(&pool)
+        .await
+        .expect("isolated migrations");
     let repository = PgAgentRepository::new(pool.clone());
     let scope = seed_scope(&pool, "reconcile").await;
     let conversation = create_conversation(&repository, &scope).await;
@@ -1310,7 +1472,7 @@ async fn agent_single_process_startup_reconciles_only_running_runs() {
         )
         .await
         .expect("append queued message");
-    let restarted = PgAgentRepository::new(pool);
+    let restarted = PgAgentRepository::new(pool.clone());
     assert_eq!(
         restarted.reconcile_running_runs().await.expect("reconcile"),
         1
@@ -1357,6 +1519,13 @@ async fn agent_single_process_startup_reconciles_only_running_runs() {
     assert_eq!(queued_detail.runs[0].id, queued.run.id);
     assert_eq!(queued_detail.runs[0].status, RunStatus::Queued);
     assert_eq!(queued_detail.turns[0].status, TurnStatus::Queued);
+    pool.close().await;
+    // Only the UUID-named schema created by this test is removed.
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .expect("remove isolated schema");
+    admin.close().await;
 }
 
 #[tokio::test]

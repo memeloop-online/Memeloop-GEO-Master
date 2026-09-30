@@ -24,6 +24,8 @@ const TURN_DEADLINE: Duration = Duration::from_secs(30);
 #[derive(Debug, Default)]
 struct RecordingHostOps {
     model_calls: Mutex<Vec<(String, ModelCompletionRequest)>>,
+    search_calls: Mutex<Vec<(String, KnowledgeSearchRequest)>>,
+    tool_turn: bool,
 }
 
 impl RecordingHostOps {
@@ -31,6 +33,13 @@ impl RecordingHostOps {
         self.model_calls
             .lock()
             .expect("model call recorder must not be poisoned")
+            .clone()
+    }
+
+    fn search_calls(&self) -> Vec<(String, KnowledgeSearchRequest)> {
+        self.search_calls
+            .lock()
+            .expect("search call recorder must not be poisoned")
             .clone()
     }
 
@@ -49,12 +58,36 @@ impl HostOps for RecordingHostOps {
         scope: &TenantScope,
         request: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
-        self.model_calls
+        let mut calls = self
+            .model_calls
             .lock()
-            .expect("model call recorder must not be poisoned")
-            .push((scope.storage_key(), request));
+            .expect("model call recorder must not be poisoned");
+        calls.push((scope.storage_key(), request));
+        if self.tool_turn && calls.len() == 1 {
+            return Ok(serde_json::from_value(serde_json::json!({
+                "text": "",
+                "tool_calls": [{
+                    "id": "search-call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "knowledge_search",
+                        "arguments": "{\"query\":\"warranty\",\"limit\":2}"
+                    }
+                }],
+                "model": "probe-model",
+                "prompt_tokens": 7,
+                "completion_tokens": 4,
+                "finish_reason": "tool_calls"
+            }))
+            .expect("tool completion fixture must match the host DTO"));
+        }
         Ok(ModelCompletion {
-            text: "The warranty lasts two years.".to_owned(),
+            text: if self.tool_turn {
+                "The warranty lasts two years (Manual).".to_owned()
+            } else {
+                "The warranty lasts two years.".to_owned()
+            },
+            tool_calls: Vec::new(),
             model: "probe-model".to_owned(),
             prompt_tokens: 7,
             completion_tokens: 4,
@@ -64,10 +97,37 @@ impl HostOps for RecordingHostOps {
 
     async fn knowledge_search(
         &self,
-        _scope: &TenantScope,
-        _request: KnowledgeSearchRequest,
+        scope: &TenantScope,
+        request: KnowledgeSearchRequest,
     ) -> Result<KnowledgeSearchResult, HostOpError> {
-        Err(Self::unavailable(HostOp::KnowledgeSearch))
+        if !self.tool_turn {
+            return Err(Self::unavailable(HostOp::KnowledgeSearch));
+        }
+        self.search_calls
+            .lock()
+            .expect("search call recorder must not be poisoned")
+            .push((scope.storage_key(), request));
+        Ok(serde_json::from_value(serde_json::json!({
+            "knowledge_release_id": null,
+            "evidence": [{
+                "source_id": uuid::Uuid::from_u128(10),
+                "source_version_id": uuid::Uuid::from_u128(11),
+                "chunk_id": uuid::Uuid::from_u128(12),
+                "source_name": "Manual",
+                "purpose": "public",
+                "locator": {
+                    "kind": "text",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "start_char": 0,
+                    "end_char": 9
+                },
+                "text": "Two years",
+                "quote": "Two years"
+            }],
+            "capability_missing": null
+        }))
+        .expect("evidence fixture must match the domain DTO"))
     }
 
     async fn manifest_read(
@@ -93,6 +153,80 @@ impl HostOps for RecordingHostOps {
     ) -> Result<MeasureSample, HostOpError> {
         Err(Self::unavailable(HostOp::Measure))
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires `pnpm agent:bundle`; run with `cargo test -p geo-worker --test memeloop_bundle -- --ignored`"]
+async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust() {
+    let source = generated_bundle();
+    let bundle = [(BUNDLE_SPECIFIER, source.as_str())];
+    let provider = Arc::new(RecordingHostOps {
+        tool_turn: true,
+        ..Default::default()
+    });
+    let scope = test_scope();
+    let expected_scope = scope.storage_key();
+    let bridge = HostBridge::new(
+        Arc::clone(&provider) as Arc<dyn HostOps>,
+        scope,
+        tokio::runtime::Handle::current(),
+    );
+    let mut runtime = HostRuntime::new(&bundle, bridge, Some(64 * 1024 * 1024))
+        .expect("the generated bundle must construct");
+    runtime.install_heap_limit_guard(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    runtime
+        .call_main(
+            BUNDLE_SPECIFIER,
+            &serde_json::json!({
+                "conversation_id": "conversation-tool-probe-0001",
+                "prompt": "What is the warranty?",
+                "run_id": "run-tool-probe-0001",
+                "timestamp": 1_700_000_000_000_u64,
+                "turn_id": "turn-tool-probe-0001",
+            })
+            .to_string(),
+            TURN_DEADLINE,
+        )
+        .await
+        .expect("MemeLoop must perform model → search → model through the Rust host");
+
+    let calls = provider.model_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, expected_scope);
+    assert_eq!(calls[0].1.tools.len(), 1);
+    assert_eq!(calls[0].1.tools[0].function.name, "knowledge_search");
+    assert_eq!(calls[1].1.messages.last().unwrap().role, "tool");
+    assert_eq!(
+        calls[1].1.messages.last().unwrap().tool_call_id.as_deref(),
+        Some("search-call-1")
+    );
+    assert!(
+        calls[1]
+            .1
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("Two years")
+    );
+    let searches = provider.search_calls();
+    assert_eq!(searches.len(), 1);
+    assert_eq!(searches[0].0, expected_scope);
+    assert_eq!(searches[0].1.query, "warranty");
+    assert_eq!(searches[0].1.limit, 2);
+    let state = runtime.host_state();
+    let completed = state
+        .events
+        .iter()
+        .find(|event| event.topic == "loop.completed")
+        .unwrap();
+    let completion: serde_json::Value = serde_json::from_str(&completed.payload).unwrap();
+    assert_eq!(
+        completion["answer"],
+        "The warranty lasts two years (Manual)."
+    );
 }
 
 fn generated_bundle_path() -> PathBuf {

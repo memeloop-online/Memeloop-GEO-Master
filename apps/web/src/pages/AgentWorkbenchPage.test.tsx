@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -170,5 +171,169 @@ describe("P00 AI workbench routing", () => {
       screen.getByText("Rust JS Agent Runtime 尚未配置，本次未生成 AI 回复。"),
     ).toBeInTheDocument();
     expect(screen.getByText("此对话还没有消息")).toBeInTheDocument();
+  });
+
+  it("keeps verified attachments after a partial failure, retries only the failed file, and submits references", async () => {
+    const bytes = new Uint8Array([1, 2]);
+    vi.stubGlobal("crypto", {
+      subtle: {
+        digest: vi.fn().mockResolvedValue(new Uint8Array(32).fill(0xab)),
+      },
+      randomUUID: (() => {
+        let index = 0;
+        return () => `uuid-${++index}`;
+      })(),
+    });
+    const detail = {
+      conversation: {
+        id: "conversation-a",
+        title: "附件任务",
+        status: "active",
+        revision: 1,
+        created_at: "2026-09-19T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+      },
+      messages: [],
+      turns: [],
+      runs: [],
+    };
+    let failedOnce = false;
+    let messageFailedOnce = false;
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(request);
+        requests.push({ url, init });
+        if (url.endsWith("/auth/session"))
+          return Promise.resolve(response(session));
+        if (url.includes("/projects?"))
+          return Promise.resolve(response({ items: [], next_cursor: null }));
+        if (url.includes("/agent/conversations/conversation-a/messages")) {
+          if (!messageFailedOnce) {
+            messageFailedOnce = true;
+            return Promise.resolve(
+              response({ code: "temporarily_unavailable" }, 503),
+            );
+          }
+          return Promise.resolve(
+            response({
+              status: "accepted",
+              conversation_id: "conversation-a",
+              message_id: "message-a",
+              turn_id: "turn-a",
+              run_id: "run-a",
+              events_url: "/events",
+              run_status: "failed",
+              error: { code: "capability_missing" },
+            }),
+          );
+        }
+        if (url.includes("/agent/conversations/conversation-a?"))
+          return Promise.resolve(response(detail));
+        if (url.includes("/agent/conversations?"))
+          return Promise.resolve(
+            response({ items: [detail.conversation], next_cursor: null }),
+          );
+        if (
+          url.includes("/agent/attachments/upload-sessions/") &&
+          url.includes("/content?")
+        ) {
+          if (url.includes("/session-second/") && !failedOnce) {
+            failedOnce = true;
+            return Promise.resolve(response({ code: "upload_failed" }, 503));
+          }
+          return Promise.resolve(response({ upload_session_id: "uploaded" }));
+        }
+        if (
+          url.includes("/agent/attachments/upload-sessions/") &&
+          url.includes("/complete?")
+        ) {
+          const first = url.includes("/session-first/");
+          return Promise.resolve(
+            response({
+              attachment_id: first ? "attachment-first" : "attachment-second",
+              object_id: first ? "object-first" : "object-second",
+              filename: first ? "first.txt" : "second.txt",
+              media_type: "text/plain",
+              size_bytes: 2,
+              sha256: "ab".repeat(32),
+              object_version: "1",
+            }),
+          );
+        }
+        if (url.includes("/agent/attachments/upload-sessions?")) {
+          const body = JSON.parse(String(init?.body)) as { filename: string };
+          return Promise.resolve(
+            response(
+              {
+                upload_session_id:
+                  body.filename === "first.txt"
+                    ? "session-first"
+                    : "session-second",
+              },
+              201,
+            ),
+          );
+        }
+        return Promise.resolve(response({}));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp("/app/tenant-a/project-a/chat/conversation-a");
+    await screen.findByTestId("memeloop-agent-chat");
+    const fileInput = screen.getByTestId("agent-multi-file-input");
+    const first = new File([bytes], "first.txt", { type: "text/plain" });
+    const second = new File([bytes], "second.txt", { type: "text/plain" });
+    for (const file of [first, second]) {
+      Object.defineProperty(file, "arrayBuffer", {
+        value: () => Promise.resolve(bytes.buffer),
+      });
+    }
+    fireEvent.change(fileInput, { target: { files: [first, second] } });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "仅发送附件" }));
+    expect(await screen.findByText(/部分附件上传失败/)).toBeInTheDocument();
+    expect(screen.getByText(/first.txt · 对象已核验/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "重试 second.txt" }),
+    ).toBeInTheDocument();
+    expect(
+      requests.filter(({ url }) => url.includes("/messages?")),
+    ).toHaveLength(0);
+
+    await user.click(screen.getByRole("button", { name: "重试 second.txt" }));
+    await screen.findByText(/second.txt · 对象已核验/);
+    await user.click(screen.getByRole("button", { name: "仅发送附件" }));
+    await waitFor(() =>
+      expect(
+        requests.filter(({ url }) => url.includes("/messages?")),
+      ).toHaveLength(1),
+    );
+    expect(await screen.findByText(/消息提交未完成/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "仅发送附件" }));
+    await waitFor(() =>
+      expect(
+        requests.filter(({ url }) => url.includes("/messages?")),
+      ).toHaveLength(2),
+    );
+    const messages = requests.filter(({ url }) => url.includes("/messages?"));
+    expect(new Headers(messages[0].init?.headers).get("Idempotency-Key")).toBe(
+      new Headers(messages[1].init?.headers).get("Idempotency-Key"),
+    );
+    const message = messages[1];
+    expect(JSON.parse(String(message.init?.body))).toEqual({
+      content: "",
+      attachments: [
+        expect.objectContaining({ attachment_id: "attachment-first" }),
+        expect.objectContaining({ attachment_id: "attachment-second" }),
+      ],
+    });
+    expect(
+      requests.filter(({ url }) => url.includes("/session-first/content?")),
+    ).toHaveLength(1);
+    expect(
+      requests.filter(({ url }) => url.includes("/session-second/content?")),
+    ).toHaveLength(2);
+    expect(requests.some(({ url }) => url.includes("/knowledge/"))).toBe(false);
   });
 });
