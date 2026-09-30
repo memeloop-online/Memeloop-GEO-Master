@@ -3,16 +3,23 @@
 只保留未完成工作和当前验收目标；完成项从本文件移除，细节写入 `WORKLOG.md`。
 无历史对话的接手入口见 `HANDOFF.md`。
 
+## 交付时间（北京时间）
+
+- 2026-10-01 18:00：P00 Provider、真实 bundle、知识分支与恢复纵切；每 5 分钟检查可交付增量，只有验证通过的改动提交。
+- 2026-10-02 12:00：发布连接器、账号/出口配置、幂等与公开查回纵切。
+- 2026-10-02 20:00：独立 AI 搜索测量、引用证据、周报 reduce 纵切。
+- 2026-10-03 12:00：全链路验收和交接；10 月 3 日为项目验收截止日，以上为内部目标，不代表已完成。
+
 ## 当前：W00 AI 工作台与 Agent Runtime
 
-- [ ] 在 Windows 本地开发文档中验证从 GitHub Actions 下载 `rusty-v8-msvc-<sha>` artifact、执行哈希校验恢复脚本后，`cargo check --workspace` 不再触发 V8 网络下载。
+- [ ] CI artifact 全链路实测：fixture 已通过，仍需成功的 Windows Actions run、下载 artifact 和干净本地缓存构建；此前仅验证本机已有 archive，不能算完成 CI 下载验收。
 - [ ] 在 current-thread 运行时验证模块求值和 `main` 死循环的独立墙钟终止；实现已改为 OS 线程守卫，测试必须在 V8 构建可用后执行，不能依赖被 JS 阻塞的 Tokio 定时器。
-- [ ] 增加启动期重启对账：进程内没有任何优雅关闭，退出时在飞的 run 会永久停在 `running`。需要启动扫描发现遗留 run 并落终态；该做法在单进程下成立、多副本下错误，落地时必须把这个假设显式写进代码而非留给读者推断。
+- [ ] 验收启动期重启对账：已实现显式 `GEO_SINGLE_PROCESS_EXECUTOR=true` 下 running → failed；需实库回归、部署文档和多副本租约方案。默认关闭，滚动部署或多副本不得开启；queued 恢复仍未实现。
 - [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
 - [ ] 验证隔离体堆上限：`start` 与 `run_turn` 已共用默认 64 MiB V8 堆限制及 near-heap 终止守卫，正常执行和超内存子进程回归待运行；另需限制进程总内存和并发，V8 堆限制不覆盖这些资源。
 - [ ] 在 V8 构建可用后运行宿主输出预算测试；`op_host_emit` 已限制单事件 64 KiB、累计 1 MiB 和 1,024 事件，恢复 checkpoint 不会提高限制。
-- [ ] 驱动 checkpoint 与 tool-call ledger：两者已有持久化实现，但运行路径尚未写入。
-- [ ] 将 `pnpm agent:bundle` 生成的真实 MemeLoop ESM 接入 Rust 内存加载器；单回合 Node smoke 已通过，仍需补工具循环、精确消息/附件契约、持久状态适配、内嵌 V8 测试与产物摘要验证。生成文件不入库，分发时携带第三方许可。
+- [ ] 驱动中途 checkpoint 恢复与 Rust-owned tool-call ledger：executor 已接完成结果存档，但它不是中途恢复；工具 intent/attempt/outcome 必须由 Rust 实际调用前后写入，不能信任 JS 自报。
+- [ ] 将真实 MemeLoop ESM 接入 Rust：64 MiB 堆下探针发现缺少 `TextEncoder`，需补运行时编码能力，再验工具循环、消息/附件契约、持久恢复与产物摘要。生成文件不入库，分发时携带第三方许可。
 - [ ] 实现模型 Provider 与 Token Center 真实调用；`model_complete` 目前如实返回 `capability_missing`。
 - [ ] 实现 GEO 工具桥接：`manifest_read`、`publish_submit`、`measure_sample` 目前如实返回 `capability_missing`。
 - [ ] 跑通“附件入库 → 带来源回答 → 两个文档分支 fan-out → 恢复 → 结果汇总”首个纵切。

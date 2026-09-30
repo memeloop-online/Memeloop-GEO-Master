@@ -1,5 +1,13 @@
 # 工作日志
 
+## 2026-10-01
+
+- 审核 CI archive 收集逻辑发现旧版依赖 `.rusty_v8/*.lib.gz`，而上游默认缓存名是 URL 转义路径，干净 runner 也不会自动留下原名压缩包。改为按 `Cargo.lock` 精确版本下载官方 Windows/MSVC archive、完整解压校验、生成哈希与元数据，再恢复缓存供 CI 构建；artifact 上传独立于后续测试结果，但要求下载与恢复成功。
+- 本机恢复脚本 fixture 通过，覆盖 URL 缓存名、内容一致、Linux target、哈希篡改和路径穿越拒绝。GitHub 最新已完成 run 仍属于此前 main，尚无本轮 artifact；不将本机已有 archive 的成功构建算作 CI 下载链路验收。
+- 在生产同样的 64 MiB V8 堆上限下执行真实 MemeLoop bundle 探针，发现 `TextEncoder is not defined`，Node smoke 无法覆盖该差异。保留失败测试作为运行时兼容缺口证据，真实 bundle 尚未跑通。
+- Provider bridge、重启对账、完成结果存档等并行代码整合后，`cargo test -p geo-api --lib --quiet` 11 项通过。JS metadata 不得写入权威 ToolCallLedger；完成结果存档也不等于执行中 checkpoint 恢复。整仓与数据库验收仍需单独验证。
+- CI 修复已提交 `9b0b881` 并推送集成分支，Actions run `36744486610` 已确认运行中，结果与下载验收待追踪。`cargo test -p geo-domain --lib --quiet` 24 项通过；整仓测试暂受 SSE 测试适配器中 Duration 类型不匹配阻断，不能声称整仓通过。
+
 ## 2026-09-30
 
 - 修复 checkpoint 恢复可能将自定义限额重置为更宽默认值的问题：恢复沿用当前 Rust 策略，安装前验证每条/总字节数及事件条数；输入先受序列化大小上限限制，拒绝时保留原状态。新增回归，格式与 diff 检查通过，V8 原生测试仍待执行。
@@ -134,3 +142,4 @@
 - CI 新增 Windows/MSVC 专用 `rusty-v8-msvc-<commit>` artifact：包含精确 `.lib.gz`、SHA-256 清单、target、rustc 与 V8 版本元数据；Linux bundle 单独上传，不能充当 Windows V8 缓存。
 - 新增 `scripts/fetch-v8-artifact.ps1`：校验 target 与每个 archive 的 SHA-256 后，仅复制到 `CARGO_HOME\.rusty_v8`。README 已记录 `gh run download` → 校验恢复 → `cargo check` 的本地开发流程。
 - 本机已验证当前锁定 `v8 150.4.0` 的 Windows archive 已落在 `I:\cargo\.rusty_v8`（约 39 MB）；本地 Cargo 可直接复用该缓存。完整 CI artifact 下载链路待下一次 GitHub Actions 成功运行后复核。
+- 加强 V8 artifact 恢复：README 现在按当前 commit 选择成功的 CI run；恢复脚本要求完整 target/V8/rustc 元数据，拒绝空清单、重复或带路径分隔符的 archive，并保留 URL 转义后的 Cargo cache 键。新增 PowerShell 回归覆盖正常恢复、Linux target、哈希篡改和路径穿越拒绝；Windows CI 在上传前从干净 Cargo home 复跑恢复脚本。当前本地 fixture 测试通过，真实 GitHub Actions 下载链路仍需成功 run 后复核。
