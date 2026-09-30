@@ -16,6 +16,20 @@ jobs:
     name: Linux Rust/V8 + frontend (5-minute milestone)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: geo_ci
+          POSTGRES_PASSWORD: disposable-ci-only
+          POSTGRES_DB: geo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U geo_ci -d geo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -83,6 +97,14 @@ jobs:
           cargo test -p geo-worker --test memeloop_bundle -- --ignored 2>&1 | tee logs/cargo-memeloop-bundle.log
           cargo test -p geo-app generated_bundle_runs_one_turn_through_assembled_provider -- --ignored 2>&1 | tee logs/cargo-app-bundle.log
 
+      - name: Test repositories against disposable PostgreSQL
+        env:
+          GEO_TEST_DATABASE_URL: postgres://geo_ci:disposable-ci-only@127.0.0.1:5432/geo_test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p geo-persistence --test postgres -- --ignored 2>&1 | tee logs/cargo-postgres.log
+
       - name: Write 5-minute milestone summary
         if: always()
         shell: bash
@@ -93,6 +115,7 @@ jobs:
             echo "- Linux frontend checks, Rust/V8 checks, and generated bundle verification are configured in this job."
             echo "- The Linux-generated JavaScript bundle is uploaded with third-party notices; it is not a Windows/MSVC rusty_v8 cache."
             echo "- Test logs are uploaded separately for failed-run diagnosis."
+            echo "- PostgreSQL repository tests use an isolated service container; this does not prove non-bypass FORCE RLS."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload generated MemeLoop bundle and notices

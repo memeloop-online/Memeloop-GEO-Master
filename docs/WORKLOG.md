@@ -2,6 +2,7 @@
 
 ## 2026-10-01
 
+- `d22346f` 的 Actions `36757347202` 已确认 Linux/Windows 全部成功，Linux 包含真实 bundle 与应用装配测试，Windows 成功上传 V8 artifact。本机重新检查 Docker daemon 仍不可用；CI 增加一次性 PostgreSQL 17 service，显式执行原来被忽略的 repository 实库测试，等待该新配置实际执行结果，不以配置存在当作验收通过。
 - 交付本地 P00 启动装配与 P07 只读清单纵切：显式环境配置加载摘要核验后的真实 MemeLoop bundle，经 Rust Provider 调模型；P07 接规划/GET，刷新不触发写操作，viewer 可读，知识版本更新后仍展示已封存快照。仍不包含正文生成、生产租户凭据、多回合恢复或外部发布。
 - 本轮基础纵切验证：前端 35 项测试、TypeScript 检查、生产 build 通过；workspace Clippy `-D warnings` 通过。此前同批改动的 workspace all-targets 测试已通过，PostgreSQL 条件测试未运行，真实 bundle 应用装配测试另行通过。后续工具协议改动需要重新回归，不能沿用这组结果。前端保留大 chunk 警告。
 - 同步交接与待办中的过时装配、P07 和并发门槛描述。规格书只清理一个部署地址，改为环境变量说明，产品范围与验收不变；此清理不等于已清除 Git 历史。
