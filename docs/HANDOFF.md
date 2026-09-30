@@ -1,10 +1,10 @@
 # Memeloop GEO 工程交接说明
 
-更新时间：2026-09-30
+更新时间：2026-10-01
 
 适用分支：`integration/w00-pr-stack`（本地集成，尚未合并到 `main`）
 
-当前实现基线：W00 PR 栈与独立线程墙钟守卫；验证进度见 `WORKLOG.md`
+当前实现基线：W00 运行时兼容、Provider HTTP/路由、SSE 重验与项目级文档清单；精确验证进度见 `WORKLOG.md`，应用默认 AI 装配仍未开启。
 
 本文是脱离历史对话后的工程入口。接手者不需要读取 Codex、聊天记录或本地代理上下文；产品范围、当前状态、未完成任务和验证方式均以仓库内容为准。
 
@@ -103,19 +103,19 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ## 4. 仍未实现，禁止误判为完成
 
-- 真实 MemeLoop bundle 在嵌入式引擎中的加载（引擎契约本身已由 `crates/worker` 验证）。`memeloop/loop-api` 的传递闭包不含任何 `node:` 内建导入，外部依赖只有 `zod`/`acorn`/`json5`/`semver` 四个纯 JS 包；剩余工作是把它们经既有内存加载器注入，并从 `createAgentToolLoopRunner` 这个可移植入口进入。详见 `WORKLOG.md` 中 2026-09-21 的更正记录。
-- **重启对账**：run executor 已在进程内驱动真实 turn，但进程内**没有任何优雅关闭**，因此退出时在飞的 run 会永久停在 `running`。需要启动期扫描。注意该做法在单进程下成立、**多副本下错误**，落地时必须把这个假设显式写进代码。
+- 真实 MemeLoop bundle 单回合已通过嵌入式 V8 探针；剩余为应用启动装配、工具循环、附件和会话历史、持久恢复及分支编排。构建入口 `pnpm agent:bundle`，产物不提交。
+- **重启对账**：已接 `GEO_SINGLE_PROCESS_EXECUTOR=true` 启动扫描，只适用于整个数据库严格单执行进程，默认关闭。滚动部署、多副本不得启用；queued 恢复、租约和优雅关闭仍未实现，PostgreSQL 对账测试待实库验收。
 - **回合进行中的实时取消**：`cancel_turn` 语义正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
-- **隔离体资源限制验证**：`start` 和 `run_turn` 已共用默认 64 MiB V8 堆限制及 near-heap 终止守卫，新增回归仍待本轮执行。这不限制 Rust 宿主事件、ArrayBuffer 等堆外资源或进程总内存，仍需输出预算、并发控制与进程隔离。
-- **checkpoint 与 tool-call ledger** 已有持久化实现，但运行路径尚未写入。
+- **隔离体资源限制**：64 MiB V8 堆、near-heap 终止、独立墙钟和 Rust 输出预算均已回归通过；并发控制、堆外资源和进程总内存限制仍需实现。
+- **checkpoint 与 tool-call ledger**：executor 已写完成结果存档，中途恢复及 Rust 调用侧 intent/attempt/outcome 尚未接通。
 - 模型 Provider、Token Center 真实调用、流式模型事件和模型费用记账；`model_complete` 目前如实返回 `capability_missing`。
 - GEO 工具桥接实现；`manifest_read`、`publish_submit`、`measure_sample` 目前如实返回 `capability_missing`。
 - P00 文件选择到对象存储引用的完整上传适配。
-- 知识文档清单的生成与封存、文档 × 平台发布矩阵、真实连接器/账号池/出口池执行。
+- 项目级知识文档清单已支持规划与封存；产品级细化、正文生成、文档 × 平台矩阵、真实连接器/账号池/出口池仍待实现。
 - 独立 AI 渠道测量、证据 reduce、不可变周报和自动进入下一轮。
 - PostgreSQL 全仓库事务级 tenant scope、FORCE RLS 和非 bypass 角色验收。
 
-PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍 fail closed，不能回退内存。Agent 运行路径尚未使用持久 checkpoint 和 tool-call ledger。复制 `.env.example` 不会自动把变量载入 Rust 进程，PowerShell 中需要显式设置环境变量。
+PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍 fail closed，不能回退内存。完成结果存档不代表中途恢复或工具副作用账本。复制 `.env.example` 不会自动把变量载入 Rust 进程，PowerShell 中需要显式设置环境变量。
 
 ## 5. 本地启动
 

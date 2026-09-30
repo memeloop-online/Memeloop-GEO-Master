@@ -5,6 +5,9 @@ use thiserror::Error;
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
     pub ready_on_start: bool,
+    /// Enables startup reconciliation of persisted `running` runs. This is
+    /// valid only when this process is the sole executor for the database.
+    pub single_process_executor: bool,
     /// The in-memory adapter is only valid for an explicitly supplied local
     /// development password.  It is never a production fallback.
     pub dev_password: Option<String>,
@@ -17,6 +20,7 @@ impl Default for AppConfig {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
             ready_on_start: true,
+            single_process_executor: false,
             dev_password: None,
             allowed_origins: vec![
                 "http://localhost:5173".to_owned(),
@@ -49,6 +53,10 @@ impl AppConfig {
             Err(_) => defaults.bind_addr,
         };
         let ready_on_start = env_bool("GEO_READY_ON_START", defaults.ready_on_start)?;
+        let single_process_executor = env_bool(
+            "GEO_SINGLE_PROCESS_EXECUTOR",
+            defaults.single_process_executor,
+        )?;
         let dev_password = match env::var("GEO_DEV_PASSWORD") {
             Ok(value) => Some(value),
             Err(env::VarError::NotPresent) => None,
@@ -72,6 +80,7 @@ impl AppConfig {
         Ok(Self {
             bind_addr,
             ready_on_start,
+            single_process_executor,
             dev_password,
             allowed_origins,
         })
@@ -130,6 +139,10 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.bind_addr.port(), 8080);
         assert!(config.ready_on_start);
+        assert!(
+            !config.single_process_executor,
+            "startup reconciliation must be opt-in so multi-replica deployments are safe by default"
+        );
         assert!(config.dev_password.is_none());
         assert!(config.bind_addr.ip().is_loopback());
     }

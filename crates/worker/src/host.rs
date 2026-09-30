@@ -33,7 +33,7 @@ pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope}
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v1";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v2";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -93,9 +93,9 @@ impl HostOp {
         match self {
             Self::ModelComplete => "model.complete.v1",
             Self::KnowledgeSearch => "knowledge.search.v1",
-            Self::ManifestRead => "manifest.read.v1",
-            Self::Publish => "publish.submit.v1",
-            Self::Measure => "measure.sample.v1",
+            Self::ManifestRead => "manifest.read.v2",
+            Self::Publish => "publish.submit.v2",
+            Self::Measure => "measure.sample.v2",
         }
     }
 
@@ -104,9 +104,9 @@ impl HostOp {
         match self {
             Self::ModelComplete => "op_host_model_complete_v1",
             Self::KnowledgeSearch => "op_host_knowledge_search_v1",
-            Self::ManifestRead => "op_host_manifest_read_v1",
-            Self::Publish => "op_host_publish_submit_v1",
-            Self::Measure => "op_host_measure_sample_v1",
+            Self::ManifestRead => "op_host_manifest_read_v2",
+            Self::Publish => "op_host_publish_submit_v2",
+            Self::Measure => "op_host_measure_sample_v2",
         }
     }
 
@@ -192,18 +192,23 @@ pub enum HostOpErrorCode {
     /// The Rust-side provider or bridge failed.
     Failed,
     /// The external effect may have happened but no receipt was observed.
+    /// Reconcile by the stable business key; do not resubmit blindly.
     UnknownResult,
+    /// The same stable business idempotency key was used with a different
+    /// payload.  This is a caller conflict, never a safe retry.
+    IdempotencyConflict,
     /// The bridge could not produce a trustworthy result.
     Internal,
 }
 
 impl HostOpErrorCode {
     /// Whether retrying the same op with the same request could plausibly
-    /// succeed.  Mirrors the vocabulary the loop needs for backoff decisions.
+    /// succeed.  An unknown external effect requires reconciliation, not a
+    /// resend, even though a later query may succeed.
     pub const fn retryable(self) -> bool {
         matches!(
             self,
-            Self::BudgetExceeded | Self::DeadlineExceeded | Self::Failed | Self::UnknownResult
+            Self::BudgetExceeded | Self::DeadlineExceeded | Self::Failed
         )
     }
 }
@@ -227,7 +232,12 @@ impl HostOpError {
             op,
             code,
             message: message.into(),
-            retryable: code.retryable(),
+            retryable: code.retryable()
+                && !(matches!(op, HostOp::Publish | HostOp::Measure)
+                    && matches!(
+                        code,
+                        HostOpErrorCode::DeadlineExceeded | HostOpErrorCode::Failed
+                    )),
         }
     }
 
@@ -265,6 +275,10 @@ impl HostOpError {
 
     pub fn unknown_result(op: HostOp, message: impl Into<String>) -> Self {
         Self::new(op, HostOpErrorCode::UnknownResult, message)
+    }
+
+    pub fn idempotency_conflict(op: HostOp, message: impl Into<String>) -> Self {
+        Self::new(op, HostOpErrorCode::IdempotencyConflict, message)
     }
 
     pub fn budget_exceeded(op: HostOp, max_calls: u32) -> Self {
@@ -366,6 +380,10 @@ fn is_credential_shaped(token: &str) -> bool {
 ///   [`HostOpError::capability_missing`].  Fabricating a plausible result is
 ///   never acceptable, and a genuinely absent capability must reach the user as
 ///   an explicit failure.
+/// - Before an external effect, implementations must resolve the supplied
+///   intent/target IDs against the run's frozen, scope-owned manifest, reserve
+///   the stable key with its binding hash durably, and persist an attempt.
+///   UUID shape validation by the worker is not authorization.
 #[async_trait]
 pub trait HostOps: Send + Sync {
     async fn model_complete(
@@ -441,6 +459,11 @@ pub enum ManifestKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestReadRequest {
+    /// The frozen manifest to read.  `None` is only a discovery request; a
+    /// production implementation must resolve it from the run's Rust-owned
+    /// state and must never accept a project or tenant selector from JS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_id: Option<Uuid>,
     pub kind: ManifestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<i32>,
@@ -478,14 +501,21 @@ pub struct ManifestPage {
 
 /// One document revision addressed to one platform target.
 ///
-/// The branch identity and the idempotency key are derived by Rust from the
-/// frozen manifest, so a script cannot submit the same branch twice under a new
-/// key or invent a target.
+/// The script presents a frozen intent and target.  The Rust implementation
+/// must verify their membership and derive the external key from its own
+/// scoped ledger; presenting a well-formed UUID does not authorize a target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishRequest {
+    /// Stable logical publication intent.  Retries reuse this ID and must not
+    /// create a replacement intent merely because an external result is
+    /// unknown.
+    pub publication_intent_id: Uuid,
     pub document_revision_id: Uuid,
     pub platform_target_id: Uuid,
+    /// SHA-256 of `body`, lower-case hexadecimal.  The Rust bridge verifies it
+    /// before any connector is called, binding the intent to its payload.
+    pub payload_sha256: String,
     pub body: String,
 }
 
@@ -512,22 +542,219 @@ pub struct PublishReceipt {
 }
 
 /// One measurement sample from an independent AI channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementSurface {
+    OfficialApi,
+    ConsumerWeb,
+    MobileApp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeasureRequest {
     pub measurement_protocol_id: Uuid,
+    /// Stable scheduled sample target.  Technical retries reuse this ID and
+    /// therefore do not increase the measurement denominator.
+    pub scheduled_sample_id: Uuid,
     pub question: String,
-    /// The observation surface named by the frozen protocol.
+    /// Provider/channel identifier named by the frozen protocol.
     pub channel: String,
+    /// Observation surfaces have separate denominators and may not be
+    /// silently substituted when one becomes unavailable.
+    pub surface: MeasurementSurface,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasureSample {
     pub sample_id: Uuid,
     pub channel: String,
+    pub surface: MeasurementSurface,
     pub answer: String,
+    /// Reference to immutable raw request/response evidence.  Citation refs
+    /// alone are insufficient because a no-citation answer is still a sample.
+    pub observation_ref: Uuid,
     pub evidence_refs: Vec<Uuid>,
     pub observed_at: DateTime<Utc>,
+}
+
+/// Maximum payload sizes enforced before a connector or measurement adapter is
+/// reached.  These are deliberately conservative; larger artifacts belong in
+/// object storage and are referenced by a versioned content ID.
+pub const MAX_PUBLISH_BODY_BYTES: usize = 256 * 1024;
+pub const MAX_MEASUREMENT_QUESTION_BYTES: usize = 16 * 1024;
+
+impl ManifestReadRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.revision.is_some_and(|revision| revision <= 0) {
+            return Err("manifest revision must be positive".to_owned());
+        }
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 512)
+        {
+            return Err("manifest cursor exceeds 512 bytes".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl ManifestPage {
+    pub fn validate_for(&self, request: &ManifestReadRequest) -> Result<(), String> {
+        if self.manifest_id.is_nil()
+            || self.kind != request.kind
+            || self.revision <= 0
+            || request
+                .manifest_id
+                .is_some_and(|manifest_id| manifest_id != self.manifest_id)
+            || request
+                .revision
+                .is_some_and(|revision| revision != self.revision)
+        {
+            return Err("manifest page does not match the requested frozen manifest".to_owned());
+        }
+        if self.items.len() > request.limit.unwrap_or(100) as usize
+            || self.items.iter().any(|item| {
+                item.branch_id.is_empty()
+                    || item.document_revision_id.is_nil()
+                    || (matches!(self.kind, ManifestKind::Distribution)
+                        && item.platform_target_id.is_none_or(|id| id.is_nil()))
+            })
+        {
+            return Err("manifest page contains invalid or excess items".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl PublishRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.publication_intent_id.is_nil()
+            || self.document_revision_id.is_nil()
+            || self.platform_target_id.is_nil()
+        {
+            return Err("publication IDs must be non-zero UUIDs".to_owned());
+        }
+        if self.body.is_empty() {
+            return Err("publication body must not be empty".to_owned());
+        }
+        if self.body.len() > MAX_PUBLISH_BODY_BYTES {
+            return Err(format!(
+                "publication body exceeds {MAX_PUBLISH_BODY_BYTES} bytes"
+            ));
+        }
+        if !is_sha256_hex(&self.payload_sha256)
+            || geo_domain::sha256_hex(self.body.as_bytes()) != self.payload_sha256
+        {
+            return Err("payload_sha256 must match the publication body".to_owned());
+        }
+        Ok(())
+    }
+
+    /// An opaque, scope-bound key suitable for a connector's idempotency
+    /// ledger.  The payload hash is deliberately *not* in this key: the ledger
+    /// compares the stored hash separately, so a changed body under the same
+    /// logical intent conflicts instead of silently becoming a new publish.
+    pub fn idempotency_key(&self, scope: &TenantScope) -> String {
+        let material = format!(
+            "geo.publication.v1|{}|{}",
+            scope.storage_key(),
+            self.publication_intent_id,
+        );
+        geo_domain::sha256_hex(material.as_bytes())
+    }
+
+    /// Bind the stable key to both destination and content.  The durable
+    /// ledger rejects a different digest under an existing intent.
+    pub fn binding_hash(&self) -> String {
+        let material = format!(
+            "{}|{}|{}",
+            self.document_revision_id, self.platform_target_id, self.payload_sha256
+        );
+        geo_domain::sha256_hex(material.as_bytes())
+    }
+}
+
+impl PublishReceipt {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.publish_attempt_id.is_nil()
+            || (matches!(self.state, PublishState::Published)
+                && self.evidence_ref.is_none_or(|id| id.is_nil()))
+        {
+            return Err("publication receipt lacks an attempt or published evidence".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl MeasureRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.measurement_protocol_id.is_nil() || self.scheduled_sample_id.is_nil() {
+            return Err(
+                "measurement protocol and scheduled sample IDs must be non-zero UUIDs".to_owned(),
+            );
+        }
+        if self.question.trim().is_empty() {
+            return Err("measurement question must not be empty".to_owned());
+        }
+        if self.question.len() > MAX_MEASUREMENT_QUESTION_BYTES {
+            return Err(format!(
+                "measurement question exceeds {MAX_MEASUREMENT_QUESTION_BYTES} bytes"
+            ));
+        }
+        if self.channel.trim().is_empty() || self.channel.len() > 128 {
+            return Err("measurement channel must be between 1 and 128 bytes".to_owned());
+        }
+        Ok(())
+    }
+
+    /// A stable key for a scheduled observation.  Repeating the technical
+    /// request therefore replays/queries the same sample rather than creating
+    /// an extra denominator entry.
+    pub fn idempotency_key(&self, scope: &TenantScope) -> String {
+        let material = format!(
+            "geo.measurement.v1|{}|{}|{}",
+            scope.storage_key(),
+            self.scheduled_sample_id,
+            self.measurement_protocol_id
+        );
+        geo_domain::sha256_hex(material.as_bytes())
+    }
+
+    /// Bind the scheduled sample to its exact question and observation
+    /// surface, preventing a fallback from changing a frozen denominator.
+    pub fn binding_hash(&self) -> String {
+        let material = serde_json::to_vec(&(
+            self.measurement_protocol_id,
+            &self.question,
+            &self.channel,
+            self.surface,
+        ))
+        .expect("measurement identity contains only serializable fields");
+        geo_domain::sha256_hex(&material)
+    }
+}
+
+impl MeasureSample {
+    pub fn validate_for(&self, request: &MeasureRequest) -> Result<(), String> {
+        if self.sample_id != request.scheduled_sample_id
+            || self.channel != request.channel
+            || self.surface != request.surface
+            || self.observation_ref.is_nil()
+        {
+            return Err(
+                "measurement sample does not match its scheduled target or raw evidence".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value == value.to_ascii_lowercase()
 }
 
 /// Per-run invocation accounting.
@@ -620,8 +847,9 @@ impl HostBridge {
         self
     }
 
-    /// Shares the run's cancellation flag.  Raising it fails in-flight ops with
-    /// a typed `cancelled` error and stops later ones before they start.
+    /// Shares the run's cancellation flag.  Raising it stops later ops before
+    /// they start; an in-flight publication or measurement becomes uncertain
+    /// and requires reconciliation instead of a blind retry.
     pub fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
         self.cancellation = cancellation;
         self
@@ -699,8 +927,20 @@ where
     tokio::select! {
         biased;
         result = &mut work => result,
-        () = &mut cancellation => Err(HostOpError::cancelled(op)),
-        () = &mut deadline => Err(HostOpError::deadline_exceeded(op, limits.timeout_ms)),
+        () = &mut cancellation => {
+            if matches!(op, HostOp::Publish | HostOp::Measure) {
+                Err(HostOpError::unknown_result(op, "in-flight external result must be reconciled after cancellation"))
+            } else {
+                Err(HostOpError::cancelled(op))
+            }
+        },
+        () = &mut deadline => {
+            if matches!(op, HostOp::Publish | HostOp::Measure) {
+                Err(HostOpError::unknown_result(op, "in-flight external result must be reconciled after deadline"))
+            } else {
+                Err(HostOpError::deadline_exceeded(op, limits.timeout_ms))
+            }
+        },
     }
 }
 
@@ -727,6 +967,7 @@ async fn wait_for_cancellation(cancellation: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn every_declared_op_has_a_distinct_name_and_slot() {
@@ -785,6 +1026,163 @@ mod tests {
             redacted.contains("https://token.example/v1"),
             "an endpoint is not a credential: {redacted}"
         );
+    }
+
+    #[test]
+    fn publication_intent_replays_same_payload_and_conflicts_on_changed_payload() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let intent = Uuid::new_v4();
+        let document = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let request = |body: &str| PublishRequest {
+            publication_intent_id: intent,
+            document_revision_id: document,
+            platform_target_id: target,
+            payload_sha256: geo_domain::sha256_hex(body.as_bytes()),
+            body: body.to_owned(),
+        };
+        let first = request("first revision");
+        let replay = request("first revision");
+        let conflict = request("changed revision");
+        let mut ledger = HashMap::new();
+        let key = first.idempotency_key(&scope);
+        assert_eq!(first.validate(), Ok(()));
+        ledger.insert(key.clone(), first.binding_hash());
+        assert_eq!(replay.idempotency_key(&scope), key);
+        assert_eq!(ledger.get(&key), Some(&replay.binding_hash()));
+        assert_eq!(conflict.idempotency_key(&scope), key);
+        assert_ne!(ledger.get(&key), Some(&conflict.binding_hash()));
+        assert_ne!(
+            ledger.get(&key),
+            Some(
+                &PublishRequest {
+                    platform_target_id: Uuid::new_v4(),
+                    ..first.clone()
+                }
+                .binding_hash()
+            )
+        );
+        let error = HostOpError::idempotency_conflict(
+            HostOp::Publish,
+            "publication intent is bound to a different payload",
+        );
+        assert_eq!(error.code, HostOpErrorCode::IdempotencyConflict);
+        assert!(!error.retryable);
+        assert_ne!(
+            first.idempotency_key(&TenantScope::new(
+                scope.operator_id,
+                Uuid::new_v4().into(),
+                scope.project_id,
+            )),
+            key
+        );
+    }
+
+    #[test]
+    fn external_effects_fail_closed_and_require_evidence() {
+        for op in [HostOp::Publish, HostOp::Measure] {
+            for code in [
+                HostOpErrorCode::Failed,
+                HostOpErrorCode::DeadlineExceeded,
+                HostOpErrorCode::UnknownResult,
+            ] {
+                assert!(
+                    !HostOpError::new(op, code, "unconfirmed external result").retryable,
+                    "{op:?}/{code:?} must reconcile rather than resend"
+                );
+            }
+        }
+        let receipt = PublishReceipt {
+            publish_attempt_id: Uuid::new_v4(),
+            state: PublishState::Published,
+            external_url: None,
+            evidence_ref: None,
+        };
+        assert!(receipt.validate().is_err());
+        assert!(
+            PublishReceipt {
+                evidence_ref: Some(Uuid::new_v4()),
+                ..receipt
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn scheduled_measurement_identity_is_scope_bound_and_surface_stable() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let request = MeasureRequest {
+            measurement_protocol_id: Uuid::new_v4(),
+            scheduled_sample_id: Uuid::new_v4(),
+            question: "How is the product described?".to_owned(),
+            channel: "test-channel".to_owned(),
+            surface: MeasurementSurface::ConsumerWeb,
+        };
+        assert_eq!(request.validate(), Ok(()));
+        let different_surface = MeasureRequest {
+            surface: MeasurementSurface::OfficialApi,
+            ..request.clone()
+        };
+        assert_eq!(
+            request.idempotency_key(&scope),
+            different_surface.idempotency_key(&scope)
+        );
+        assert_ne!(request.binding_hash(), different_surface.binding_hash());
+        let sample = MeasureSample {
+            sample_id: request.scheduled_sample_id,
+            channel: request.channel.clone(),
+            surface: request.surface,
+            answer: "No answer".to_owned(),
+            observation_ref: Uuid::new_v4(),
+            evidence_refs: Vec::new(),
+            observed_at: Utc::now(),
+        };
+        assert_eq!(sample.validate_for(&request), Ok(()));
+        assert!(
+            MeasureSample {
+                surface: MeasurementSurface::OfficialApi,
+                ..sample
+            }
+            .validate_for(&request)
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_effect_timeout_and_cancellation_require_reconciliation() {
+        for op in [HostOp::Publish, HostOp::Measure] {
+            let cancelled = Arc::new(AtomicBool::new(true));
+            let error = under_budget(
+                op,
+                HostOpLimits::new(50, 1),
+                cancelled,
+                std::future::pending::<Result<(), HostOpError>>(),
+            )
+            .await
+            .expect_err("an in-flight cancellation is uncertain");
+            assert_eq!(error.code, HostOpErrorCode::UnknownResult);
+            assert!(!error.retryable);
+
+            let error = under_budget(
+                op,
+                HostOpLimits::new(1, 1),
+                Arc::new(AtomicBool::new(false)),
+                std::future::pending::<Result<(), HostOpError>>(),
+            )
+            .await
+            .expect_err("an in-flight deadline is uncertain");
+            assert_eq!(error.code, HostOpErrorCode::UnknownResult);
+            assert!(!error.retryable);
+        }
     }
 
     #[tokio::test]

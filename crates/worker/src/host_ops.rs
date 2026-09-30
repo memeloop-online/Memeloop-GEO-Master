@@ -139,19 +139,23 @@ pub async fn op_host_knowledge_search_v1(
 /// Reads one page of a frozen document or distribution manifest.
 #[op2]
 #[string]
-pub async fn op_host_manifest_read_v1(
+pub async fn op_host_manifest_read_v2(
     state: Rc<RefCell<OpState>>,
     #[string] request: String,
 ) -> Result<String, JsErrorBox> {
     let op = HostOp::ManifestRead;
     let bridge = bridge(&state.borrow())?;
     let request = parse_request::<ManifestReadRequest>(op, &request)?;
+    if let Err(reason) = request.validate() {
+        return Err(js_error(HostOpError::invalid_request(op, reason)));
+    }
     if request.limit.is_some_and(|limit| limit == 0 || limit > 100) {
         return Err(js_error(HostOpError::invalid_request(
             op,
             "limit must be between 1 and 100",
         )));
     }
+    let requested = request.clone();
     let page = bridge
         .invoke(op, |bridge| async move {
             bridge
@@ -160,28 +164,28 @@ pub async fn op_host_manifest_read_v1(
                 .await
         })
         .await?;
-    if page.items.len() > 100 {
-        return Err(js_error(HostOpError::internal(
-            op,
-            "manifest page exceeded the declared page size",
-        )));
+    if let Err(reason) = page.validate_for(&requested) {
+        return Err(js_error(HostOpError::internal(op, reason)));
     }
     Ok(encode(op, &page)?)
 }
 
 /// Submits one document revision to one platform target.
 ///
-/// The branch identity and the idempotency key are derived by Rust from the
-/// frozen manifest, so a script cannot re-key a duplicate submission.
+/// The Rust capability must verify this target against the frozen manifest
+/// and use the durable intent key; the script cannot authorize its own target.
 #[op2]
 #[string]
-pub async fn op_host_publish_submit_v1(
+pub async fn op_host_publish_submit_v2(
     state: Rc<RefCell<OpState>>,
     #[string] request: String,
 ) -> Result<String, JsErrorBox> {
     let op = HostOp::Publish;
     let bridge = bridge(&state.borrow())?;
     let request = parse_request::<PublishRequest>(op, &request)?;
+    if let Err(reason) = request.validate() {
+        return Err(js_error(HostOpError::invalid_request(op, reason)));
+    }
     let receipt = bridge
         .invoke(op, |bridge| async move {
             bridge
@@ -190,19 +194,26 @@ pub async fn op_host_publish_submit_v1(
                 .await
         })
         .await?;
+    if let Err(reason) = receipt.validate() {
+        return Err(js_error(HostOpError::unknown_result(op, reason)));
+    }
     Ok(encode(op, &receipt)?)
 }
 
 /// Takes one independent AI channel measurement sample.
 #[op2]
 #[string]
-pub async fn op_host_measure_sample_v1(
+pub async fn op_host_measure_sample_v2(
     state: Rc<RefCell<OpState>>,
     #[string] request: String,
 ) -> Result<String, JsErrorBox> {
     let op = HostOp::Measure;
     let bridge = bridge(&state.borrow())?;
     let request = parse_request::<MeasureRequest>(op, &request)?;
+    if let Err(reason) = request.validate() {
+        return Err(js_error(HostOpError::invalid_request(op, reason)));
+    }
+    let requested = request.clone();
     let sample = bridge
         .invoke(op, |bridge| async move {
             bridge
@@ -211,6 +222,9 @@ pub async fn op_host_measure_sample_v1(
                 .await
         })
         .await?;
+    if let Err(reason) = sample.validate_for(&requested) {
+        return Err(js_error(HostOpError::internal(op, reason)));
+    }
     Ok(encode(op, &sample)?)
 }
 

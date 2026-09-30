@@ -7,10 +7,11 @@ use axum::{
     routing::{get, post, put},
 };
 use geo_domain::{
-    AppError, CurrentKnowledgeRelease, ImportAcceptance, ImportBatchAcceptance, ImportItem,
-    InitialSourceKind, KnowledgeAskResult, KnowledgeCapability, KnowledgeSearchRequest,
-    KnowledgeSearchResult, MAX_UPLOAD_BYTES, Product, ProjectId, Source, SourceDetail,
-    SourceVersion, TenantScope, UploadSession, UploadSessionCommand,
+    AppError, CurrentKnowledgeRelease, DocumentManifest, DocumentManifestPlanRequest,
+    ImportAcceptance, ImportBatchAcceptance, ImportItem, InitialSourceKind, KnowledgeAskResult,
+    KnowledgeCapability, KnowledgeSearchRequest, KnowledgeSearchResult, MAX_UPLOAD_BYTES, Product,
+    ProjectId, Source, SourceDetail, SourceVersion, TenantScope, UploadSession,
+    UploadSessionCommand,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -539,6 +540,74 @@ pub(crate) async fn current_release(
 
 #[utoipa::path(
     post,
+    path = "/api/v1/knowledge/document-manifests/plan",
+    security(("sessionCookie" = [])),
+    params(("project_id" = ProjectId, Query)),
+    request_body = DocumentManifestPlanRequest,
+    responses((status = 200, body = DocumentManifest), (status = 400, body = ErrorResponse))
+)]
+pub(crate) async fn plan_document_manifest(
+    State(state): State<AppState>,
+    Query(query): Query<KnowledgeProjectQuery>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Json(request): Json<DocumentManifestPlanRequest>,
+) -> Result<Json<DocumentManifest>, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
+    let scope = knowledge_scope(&state, &auth.scope, query.project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    if request.manifest_id.is_nil() {
+        return Err(api_error(
+            AppError::invalid_request("manifest_id must not be nil"),
+            context.request_id,
+        ));
+    }
+    let project = state
+        .project_repository()
+        .get(&scope, query.project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
+    let start = state
+        .project_repository()
+        .get_start(&scope, query.project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .ok_or_else(|| {
+            api_error(
+                AppError::conflict("project has not started"),
+                context.request_id,
+            )
+        })?;
+    if start.acceptance.document_manifest.manifest_id != request.manifest_id {
+        return Err(api_error(
+            AppError::not_found("document manifest not found"),
+            context.request_id,
+        ));
+    }
+    if geo_domain::settings_hash(&project.settings)
+        .map_err(|error| api_error(error, context.request_id))?
+        != start.settings_hash
+    {
+        return Err(api_error(
+            AppError::conflict("project settings changed since the cycle started"),
+            context.request_id,
+        ));
+    }
+    let mut document_scope = project.settings.document_scope.clone();
+    document_scope.markets = project.settings.effective_markets();
+    document_scope.languages = project.settings.effective_languages();
+    state
+        .knowledge_repository()
+        .plan_document_manifest(&scope, request, document_scope)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(error, context.request_id))
+}
+
+#[utoipa::path(
+    post,
     path = "/api/v1/knowledge/search",
     security(("sessionCookie" = [])),
     params(("project_id" = ProjectId, Query)),
@@ -615,6 +684,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/knowledge/products", get(list_products))
         .route("/knowledge/facts", get(list_facts))
         .route("/knowledge/releases/current", get(current_release))
+        .route(
+            "/knowledge/document-manifests/plan",
+            post(plan_document_manifest),
+        )
         .route("/knowledge/search", post(search))
         .route("/knowledge/ask", post(ask))
 }

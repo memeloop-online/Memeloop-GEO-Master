@@ -32,6 +32,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let state = AppState::from_database(&database)
             .with_allowed_origins(config.allowed_origins.clone())
             .with_agent_runtime(runtime);
+        if config.single_process_executor {
+            let reconciled = state.reconcile_running_runs().await?;
+            info!(
+                reconciled,
+                "reconciled abandoned agent runs during single-process startup"
+            );
+        }
         state.set_ready(true);
         (state, true)
     } else {
@@ -39,6 +46,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let state = AppState::development_with_password(password)
             .with_allowed_origins(config.allowed_origins.clone())
             .with_agent_runtime(runtime);
+        if config.single_process_executor {
+            let reconciled = state.reconcile_running_runs().await?;
+            info!(
+                reconciled,
+                "reconciled abandoned agent runs during single-process startup"
+            );
+        }
         if config.ready_on_start {
             state.set_ready(true);
         }

@@ -203,9 +203,11 @@ impl HostOps for FakeHostOps {
             HostOp::Measure,
             scope,
             MeasureSample {
-                sample_id: uuid::Uuid::new_v4(),
+                sample_id: request.scheduled_sample_id,
                 channel: request.channel,
+                surface: request.surface,
                 answer: "the warranty is twenty-four months".to_owned(),
+                observation_ref: uuid::Uuid::new_v4(),
                 evidence_refs: vec![request.measurement_protocol_id],
                 observed_at: Utc::now(),
             },
@@ -575,8 +577,10 @@ async fn publish_submit_returns_a_typed_receipt() {
         r#"
         import { hostOps, attempt } from "./host-ops.js";
         await attempt("publish", () => hostOps.publishSubmit({
+          publication_intent_id: "00000000-0000-4000-8000-000000000004",
           document_revision_id: "00000000-0000-4000-8000-000000000001",
           platform_target_id: "00000000-0000-4000-8000-000000000002",
+          payload_sha256: "28c190665631daa107fd8f9436571508d3c3177cc8c4b3f3545fc06b345dc6b0",
           body: "final copy",
         }));
         "#,
@@ -603,8 +607,10 @@ async fn measure_sample_returns_an_observed_sample() {
         import { hostOps, attempt } from "./host-ops.js";
         await attempt("measure", () => hostOps.measureSample({
           measurement_protocol_id: "00000000-0000-4000-8000-000000000003",
+          scheduled_sample_id: "00000000-0000-4000-8000-000000000005",
           question: "how long is the warranty?",
           channel: "independent-search",
+          surface: "consumer_web",
         }));
         "#,
         bridge(Arc::clone(&ops)),
@@ -616,6 +622,9 @@ async fn measure_sample_returns_an_observed_sample() {
 
     let value = assert_success(&outcome(&runtime.host_state(), "measure"));
     assert_eq!(value["channel"], "independent-search");
+    assert_eq!(value["surface"], "consumer_web");
+    assert_eq!(value["sample_id"], "00000000-0000-4000-8000-000000000005");
+    assert!(value["observation_ref"].as_str().is_some());
     assert_eq!(value["answer"], "the warranty is twenty-four months");
     assert_eq!(
         value["evidence_refs"][0],
@@ -704,6 +713,66 @@ async fn out_of_range_requests_are_refused() {
         "no capability may be consulted: {:?}",
         ops.seen()
     );
+}
+
+#[tokio::test]
+async fn side_effect_requests_fail_before_the_bridge_when_their_identity_is_invalid() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("changed-body", () => hostOps.publishSubmit({
+          publication_intent_id: "00000000-0000-4000-8000-000000000004",
+          document_revision_id: "00000000-0000-4000-8000-000000000001",
+          platform_target_id: "00000000-0000-4000-8000-000000000002",
+          payload_sha256: "28c190665631daa107fd8f9436571508d3c3177cc8c4b3f3545fc06b345dc6b0",
+          body: "changed copy",
+        }));
+        await attempt("foreign-publish", () => hostOps.publishSubmit({
+          publication_intent_id: "00000000-0000-4000-8000-000000000004",
+          document_revision_id: "00000000-0000-4000-8000-000000000001",
+          platform_target_id: "00000000-0000-4000-8000-000000000002",
+          payload_sha256: "28c190665631daa107fd8f9436571508d3c3177cc8c4b3f3545fc06b345dc6b0",
+          body: "final copy",
+          tenant_id: "00000000-0000-4000-8000-00000000000f",
+        }));
+        await attempt("missing-sample-id", () => hostOps.measureSample({
+          measurement_protocol_id: "00000000-0000-4000-8000-000000000003",
+          question: "how long is the warranty?",
+          channel: "independent-search",
+          surface: "consumer_web",
+        }));
+        await attempt("wrong-surface", () => hostOps.measureSample({
+          measurement_protocol_id: "00000000-0000-4000-8000-000000000003",
+          scheduled_sample_id: "00000000-0000-4000-8000-000000000005",
+          question: "how long is the warranty?",
+          channel: "independent-search",
+          surface: "unverified",
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+    for topic in [
+        "changed-body",
+        "foreign-publish",
+        "missing-sample-id",
+        "wrong-surface",
+    ] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "invalid_request",
+            if topic.contains("publish") || topic == "changed-body" {
+                "publish"
+            } else {
+                "measure"
+            },
+        );
+    }
+    assert!(ops.seen().is_empty(), "invalid effects reached the bridge");
 }
 
 /// The scope a capability runs under is the one the worker was assembled with,

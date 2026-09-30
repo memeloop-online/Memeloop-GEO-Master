@@ -9,14 +9,16 @@
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use geo_domain::{
-    AppError, Chunk, CurrentKnowledgeRelease, Fact, ImportAcceptance, ImportBatchAcceptance,
+    AppError, Chunk, CurrentKnowledgeRelease, DocumentManifest, DocumentManifestCoverage,
+    DocumentManifestItem, DocumentManifestItemState, DocumentManifestPlanRequest,
+    DocumentManifestState, DocumentScope, Fact, ImportAcceptance, ImportBatchAcceptance,
     ImportItem, ImportJob, ImportStage, ImportStatus, KnowledgeAnswerStatus, KnowledgeAskResult,
     KnowledgeCapability, KnowledgeCoverage, KnowledgeEvidence, KnowledgeOverview, KnowledgePurpose,
     KnowledgeRelease, KnowledgeRepository, KnowledgeSearchRequest, KnowledgeSearchResult,
     MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES, Operation, OperationStatus, Product, Source,
     SourceDetail, SourceKind, SourceState, SourceVersion, StoredObject, StoredObjectState,
     TenantScope, UPLOAD_SESSION_TTL_SECONDS, UploadSession, UploadSessionCommand,
-    UploadSessionState, deterministic_chunks, sha256_hex,
+    UploadSessionState, deterministic_chunks, plan_document_manifest, sha256_hex,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -1146,6 +1148,229 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         };
         transaction.commit().await.map_err(database_error)?;
         Ok(result)
+    }
+
+    async fn plan_document_manifest(
+        &self,
+        scope: &TenantScope,
+        request: DocumentManifestPlanRequest,
+        document_scope: DocumentScope,
+    ) -> Result<DocumentManifest, AppError> {
+        let project_id = Self::project_id(scope)?;
+        let release = self
+            .get_release(scope, request.knowledge_release_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("knowledge release not found"))?;
+        let mut transaction = self.transaction(scope).await?;
+        let row = sqlx::query(
+            "SELECT manifest.revision,manifest.sealed,manifest.input_refs,
+                    manifest.scope_hash,manifest.expected_count,config.settings
+             FROM document_manifests manifest
+             JOIN optimization_cycles cycle
+               ON cycle.cycle_id=manifest.cycle_id AND cycle.operator_id=manifest.operator_id
+              AND cycle.tenant_id=manifest.tenant_id AND cycle.project_id=manifest.project_id
+             JOIN project_config_revisions config
+               ON config.config_revision_id=cycle.config_revision_id
+             WHERE manifest.manifest_id=$1 AND manifest.operator_id=$2
+               AND manifest.tenant_id=$3 AND manifest.project_id=$4
+             FOR UPDATE OF manifest",
+        )
+        .bind(request.manifest_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| AppError::not_found("document manifest not found"))?;
+        let frozen_settings: geo_domain::ProjectSettings =
+            serde_json::from_value(row.get("settings")).map_err(serialization_error)?;
+        let mut frozen_scope = frozen_settings.document_scope.clone();
+        frozen_scope.markets = frozen_settings.effective_markets();
+        frozen_scope.languages = frozen_settings.effective_languages();
+        if frozen_scope != document_scope {
+            return Err(AppError::conflict(
+                "document scope differs from frozen project configuration",
+            ));
+        }
+        let scope_hash =
+            sha256_hex(&serde_json::to_vec(&document_scope).map_err(serialization_error)?);
+        if row.get::<bool, _>("sealed") {
+            let previous: Value = row.get("input_refs");
+            if previous["knowledge_release_id"] != json!(request.knowledge_release_id)
+                || previous["planner_version"] != json!(geo_domain::DOCUMENT_PLANNER_VERSION)
+                || previous["scope_hash"] != json!(scope_hash)
+            {
+                return Err(AppError::conflict(
+                    "document manifest is sealed with different planning input",
+                ));
+            }
+            let item_rows = sqlx::query(
+                "SELECT document_manifest_item_id,knowledge_release_id,document_key,
+                        content_type,product_id,market,language,state,block_reason,dependency_hash,
+                        source_version_refs
+                 FROM document_manifest_items
+                 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND manifest_id=$4
+                 ORDER BY document_key",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project_id.as_uuid())
+            .bind(request.manifest_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            let items = item_rows
+                .iter()
+                .map(|item| {
+                    Ok(DocumentManifestItem {
+                        document_manifest_item_id: item.get("document_manifest_item_id"),
+                        manifest_id: request.manifest_id,
+                        knowledge_release_id: item.get("knowledge_release_id"),
+                        document_key: item.get("document_key"),
+                        content_type: item.get("content_type"),
+                        product_id: item.get("product_id"),
+                        market: item.get("market"),
+                        language: item.get("language"),
+                        state: match item.get::<String, _>("state").as_str() {
+                            "planned" => DocumentManifestItemState::Planned,
+                            "blocked" => DocumentManifestItemState::Blocked,
+                            "deferred" => DocumentManifestItemState::Deferred,
+                            "not_applicable" => DocumentManifestItemState::NotApplicable,
+                            _ => {
+                                return Err(AppError::new(
+                                    geo_domain::ErrorCode::Internal,
+                                    "invalid document item state",
+                                ));
+                            }
+                        },
+                        block_reason: item.get("block_reason"),
+                        dependency_hash: item.get("dependency_hash"),
+                        source_version_refs: serde_json::from_value(
+                            item.get("source_version_refs"),
+                        )
+                        .map_err(serialization_error)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, AppError>>()?;
+            let mut coverage = DocumentManifestCoverage {
+                total: items.len() as u64,
+                ..DocumentManifestCoverage::default()
+            };
+            for item in &items {
+                match item.state {
+                    DocumentManifestItemState::Planned => coverage.planned += 1,
+                    DocumentManifestItemState::Blocked => coverage.blocked += 1,
+                    DocumentManifestItemState::Deferred => coverage.deferred += 1,
+                    DocumentManifestItemState::NotApplicable => coverage.not_applicable += 1,
+                }
+            }
+            let expected_count: Option<i64> = row.get("expected_count");
+            if expected_count != Some(items.len() as i64) {
+                return Err(AppError::new(
+                    geo_domain::ErrorCode::Internal,
+                    "sealed document manifest count does not match persisted items",
+                ));
+            }
+            let manifest = DocumentManifest {
+                manifest_id: request.manifest_id,
+                operator_id: scope.operator_id,
+                tenant_id: scope.tenant_id,
+                project_id,
+                revision: row.get("revision"),
+                knowledge_release_id: request.knowledge_release_id,
+                planner_version: geo_domain::DOCUMENT_PLANNER_VERSION.to_owned(),
+                state: DocumentManifestState::Ready,
+                sealed: true,
+                expected_count,
+                scope_hash,
+                items,
+                coverage,
+            };
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(manifest);
+        }
+        let public_refs = sqlx::query_scalar::<_, Uuid>(
+            "SELECT link.source_version_id
+             FROM knowledge_release_source_versions link
+             JOIN knowledge_source_versions version ON version.source_version_id=link.source_version_id
+             JOIN knowledge_sources source ON source.source_id=version.source_id
+             WHERE link.knowledge_release_id=$1 AND link.operator_id=$2
+               AND link.tenant_id=$3 AND link.project_id=$4 AND source.purpose='public'
+             ORDER BY link.source_version_id",
+        )
+        .bind(request.knowledge_release_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let mut manifest = plan_document_manifest(
+            scope,
+            &release,
+            request.manifest_id,
+            &document_scope,
+            &public_refs,
+        )?;
+        manifest.revision = row.get("revision");
+        let input_refs = json!({
+            "knowledge_release_id": request.knowledge_release_id,
+            "planner_version": manifest.planner_version,
+            "scope_hash": manifest.scope_hash,
+        });
+        sqlx::query(
+            "UPDATE document_manifests
+             SET state='ready', sealed=true, expected_count=$1, scope_hash=$2,
+                 input_refs=$3
+             WHERE manifest_id=$4 AND operator_id=$5 AND tenant_id=$6 AND project_id=$7",
+        )
+        .bind(manifest.expected_count)
+        .bind(&manifest.scope_hash)
+        .bind(input_refs)
+        .bind(request.manifest_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        for item in &manifest.items {
+            sqlx::query(
+                "INSERT INTO document_manifest_items
+                 (document_manifest_item_id,operator_id,tenant_id,project_id,manifest_id,
+                  knowledge_release_id,document_key,content_type,product_id,market,language,
+                  state,block_reason,dependency_hash,source_version_refs)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                 ON CONFLICT (operator_id,tenant_id,project_id,manifest_id,document_key)
+                 DO NOTHING",
+            )
+            .bind(item.document_manifest_item_id)
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project_id.as_uuid())
+            .bind(item.manifest_id)
+            .bind(item.knowledge_release_id)
+            .bind(&item.document_key)
+            .bind(&item.content_type)
+            .bind(item.product_id)
+            .bind(&item.market)
+            .bind(&item.language)
+            .bind(match item.state {
+                DocumentManifestItemState::Planned => "planned",
+                DocumentManifestItemState::Blocked => "blocked",
+                DocumentManifestItemState::Deferred => "deferred",
+                DocumentManifestItemState::NotApplicable => "not_applicable",
+            })
+            .bind(&item.block_reason)
+            .bind(&item.dependency_hash)
+            .bind(serde_json::to_value(&item.source_version_refs).map_err(serialization_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(manifest)
     }
 
     async fn search(

@@ -6,6 +6,7 @@ mod context;
 mod error;
 mod idempotency;
 mod knowledge;
+mod provider_bridge;
 mod run_executor;
 mod storage;
 
@@ -70,6 +71,10 @@ pub use idempotency::{
     IDEMPOTENCY_KEY_HEADER, IdempotencyDecision, IdempotencyStore, IdempotencyToken,
     MAX_IDEMPOTENCY_REQUEST_BYTES, MAX_IDEMPOTENCY_RESPONSE_BYTES, MemoryIdempotencyStore,
     SharedIdempotencyStore, StoredResponse, body_hash, json_command_idempotency_middleware,
+};
+pub use provider_bridge::{
+    ModelProviderBridge, ProviderClientBridge, ProviderRoute, ProviderRouteResolver,
+    RoutedProviderClientBridge, SharedModelProvider,
 };
 pub use storage::{EventBus, MemoryOperationStore, OperationStore, PgOperationStore};
 
@@ -288,6 +293,15 @@ impl AppState {
 
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    /// Reconcile abandoned in-flight runs before this process accepts work.
+    ///
+    /// The repository operation is deliberately not started by `router` or a
+    /// request handler. It is a startup-only hook and must be enabled only
+    /// when this process is the sole executor for the database.
+    pub async fn reconcile_running_runs(&self) -> Result<u64, AppError> {
+        self.agent_repository.reconcile_running_runs().await
     }
 
     pub fn publish_event(&self, event: EventEnvelope) -> usize {
@@ -1395,6 +1409,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         knowledge::list_products,
         knowledge::list_facts,
         knowledge::current_release,
+        knowledge::plan_document_manifest,
         knowledge::search,
         knowledge::ask,
         get_operation,
@@ -1449,6 +1464,12 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::Fact,
         geo_domain::KnowledgeRelease,
         geo_domain::CurrentKnowledgeRelease,
+        geo_domain::DocumentManifest,
+        geo_domain::DocumentManifestCoverage,
+        geo_domain::DocumentManifestItem,
+        geo_domain::DocumentManifestItemState,
+        geo_domain::DocumentManifestPlanRequest,
+        geo_domain::DocumentManifestState,
         geo_domain::KnowledgeSearchRequest,
         geo_domain::KnowledgeEvidence,
         geo_domain::KnowledgeSearchResult,

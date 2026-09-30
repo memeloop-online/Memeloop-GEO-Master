@@ -731,6 +731,14 @@ pub trait AgentRepository: Send + Sync {
         run_id: RunId,
         completion: RunCompletion,
     ) -> Result<Option<RunTransition>, AppError>;
+    /// Closes runs that were marked `running` when this process last stopped.
+    ///
+    /// This is intentionally a process-level operation with no tenant scope:
+    /// it is only valid during single-process startup, before the API accepts
+    /// work. Deployments with multiple execution replicas must not call it,
+    /// because a replica cannot distinguish another live executor's run from
+    /// one abandoned by a crashed process.
+    async fn reconcile_running_runs(&self) -> Result<u64, AppError>;
     async fn replay_events(
         &self,
         scope: &TenantScope,
@@ -1372,6 +1380,64 @@ impl AgentRepository for MemoryAgentRepository {
         }))
     }
 
+    async fn reconcile_running_runs(&self) -> Result<u64, AppError> {
+        // The memory repository only exists in explicitly single-process
+        // development mode, so its whole state is the abandoned-process
+        // boundary.  Hold the write lock while transitioning every run so a
+        // request cannot claim one between the scan and the update.
+        let mut state = self.state.write().await;
+        let run_ids = state
+            .runs
+            .values()
+            .filter(|run| run.status == RunStatus::Running)
+            .map(|run| run.id)
+            .collect::<Vec<_>>();
+        let mut reconciled = 0;
+        for run_id in run_ids {
+            let Some(run) = state.runs.get(&run_id).cloned() else {
+                continue;
+            };
+            let Some(conversation) = state.conversations.get(&run.conversation_id).cloned() else {
+                continue;
+            };
+            let now = Utc::now();
+            let error = AppError::new(
+                crate::ErrorCode::DependencyUnavailable,
+                "run was abandoned when the single-process executor restarted",
+            );
+            let mut failed = run;
+            failed.status = RunStatus::Failed;
+            failed.error = Some(error.clone());
+            failed.updated_at = now;
+            let Some(mut turn) = state.turns.get(&failed.turn_id).cloned() else {
+                continue;
+            };
+            if matches!(turn.status, TurnStatus::Queued | TurnStatus::Running) {
+                turn.status = TurnStatus::Failed;
+                turn.updated_at = now;
+                state.turns.insert(turn.id, turn.clone());
+            }
+            state.runs.insert(failed.id, failed.clone());
+            let mut updated_conversation = conversation;
+            updated_conversation.revision += 1;
+            updated_conversation.updated_at = now;
+            state
+                .conversations
+                .insert(updated_conversation.id, updated_conversation.clone());
+            self.emit(
+                &mut state,
+                &updated_conversation,
+                "run.failed",
+                Some(failed.turn_id),
+                Some(failed.id),
+                json!({"run_id": failed.id, "status": failed.status, "error": error, "reason": "process_restart"}),
+            )
+            .await;
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
     async fn replay_events(
         &self,
         scope: &TenantScope,
@@ -1855,6 +1921,55 @@ mod tests {
                 .expect("begin")
                 .is_none(),
             "a cancelled run must not be claimable"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_fails_abandoned_running_run_once() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        repository
+            .begin_run(&scope, run.id)
+            .await
+            .expect("begin")
+            .expect("claim");
+
+        assert_eq!(
+            repository
+                .reconcile_running_runs()
+                .await
+                .expect("reconcile"),
+            1
+        );
+        let detail = repository
+            .get_conversation(&scope, run.conversation_id)
+            .await
+            .expect("detail")
+            .expect("conversation");
+        assert_eq!(detail.runs[0].status, RunStatus::Failed);
+        assert_eq!(detail.turns[0].status, TurnStatus::Failed);
+        assert_eq!(
+            detail.runs[0].error.as_ref().map(|error| error.code),
+            Some(crate::ErrorCode::DependencyUnavailable)
+        );
+        assert_eq!(
+            repository
+                .reconcile_running_runs()
+                .await
+                .expect("idempotent reconcile"),
+            0
+        );
+        let events = repository
+            .replay_events(&scope, run.conversation_id, Some(0))
+            .await
+            .expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "run.failed")
+                .count(),
+            1
         );
     }
 

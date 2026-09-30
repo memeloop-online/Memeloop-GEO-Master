@@ -135,8 +135,9 @@ async fn generated_memeloop_bundle_runs_a_turn_through_the_rust_host() {
         scope,
         tokio::runtime::Handle::current(),
     );
-    let mut runtime =
-        HostRuntime::new(&bundle, bridge, None).expect("the generated bundle must construct");
+    let mut runtime = HostRuntime::new(&bundle, bridge, Some(64 * 1024 * 1024))
+        .expect("the generated bundle must construct within the production heap budget");
+    runtime.install_heap_limit_guard(Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
     assert_eq!(
         runtime.allowlisted_specifiers(),

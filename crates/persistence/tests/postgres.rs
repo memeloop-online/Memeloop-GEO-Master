@@ -3,12 +3,16 @@ use std::time::Duration;
 
 use geo_domain::{
     AgentRepository, AppendMessage, AttachmentId, AttachmentReference, CreateConversation,
-    ErrorCode, InitialSource, InitialSourceKind, InitialSourceVisibility, MessageRole, ObjectRef,
+    DocumentManifestPlanRequest, ErrorCode, ImportItem, InitialSource, InitialSourceKind,
+    InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, MessageRole, ObjectRef,
     ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand, RecordToolCall,
-    RunCompletion, RunStatus, RuntimeCapability, StoreCheckpoint, TenantScope, ToolCallDecision,
-    ToolCallOutcome, TurnStatus, hash_idempotency_key, settings_hash, start_request_hash,
+    RunCompletion, RunStatus, RuntimeCapability, SourceKind, StoreCheckpoint, TenantScope,
+    ToolCallDecision, ToolCallOutcome, TurnStatus, hash_idempotency_key, settings_hash,
+    start_request_hash,
 };
-use geo_persistence::{Database, DatabaseConfig, PgAgentRepository, PgProjectRepository};
+use geo_persistence::{
+    Database, DatabaseConfig, PgAgentRepository, PgKnowledgeRepository, PgProjectRepository,
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -139,6 +143,79 @@ async fn atomic_start_and_scope_visibility_hold_when_postgres_is_configured() {
     assert_eq!(acceptance.document_manifest.expected_count, None);
     assert_eq!(acceptance.document_manifest.state, "awaiting_knowledge");
     assert_eq!(acceptance.distribution_manifest.state, "awaiting_documents");
+    let project_scope = TenantScope::new(scope.operator_id, scope.tenant_id, Some(project.id));
+    let knowledge = PgKnowledgeRepository::from_database(&database);
+    let imported = knowledge
+        .import_batch(
+            &project_scope,
+            vec![ImportItem {
+                client_item_id: format!("manifest-public-{tenant_id}"),
+                kind: SourceKind::Text,
+                name: "Public source".to_owned(),
+                purpose: KnowledgePurpose::Public,
+                text: Some("Public company description".to_owned()),
+                url: None,
+                object_id: None,
+                knowledge_release_id: None,
+            }],
+        )
+        .await
+        .expect("import");
+    let request = DocumentManifestPlanRequest {
+        manifest_id: acceptance.document_manifest.manifest_id,
+        knowledge_release_id: imported.items[0]
+            .release
+            .as_ref()
+            .expect("release")
+            .knowledge_release_id,
+    };
+    let mut document_scope = frozen.document_scope.clone();
+    document_scope.markets = frozen.effective_markets();
+    document_scope.languages = frozen.effective_languages();
+    let manifest = knowledge
+        .plan_document_manifest(&project_scope, request.clone(), document_scope.clone())
+        .await
+        .expect("seal finite document manifest");
+    assert_eq!(manifest.expected_count, Some(1));
+    assert_eq!(manifest.coverage.planned, 1);
+    assert_eq!(manifest.items[0].source_version_refs.len(), 1);
+    assert_eq!(
+        manifest,
+        knowledge
+            .plan_document_manifest(&project_scope, request.clone(), document_scope.clone())
+            .await
+            .expect("read sealed manifest")
+    );
+    let stored_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM document_manifest_items WHERE manifest_id=$1")
+            .bind(request.manifest_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("count persisted items");
+    assert_eq!(stored_count, 1);
+    assert!(
+        knowledge
+            .plan_document_manifest(
+                &TenantScope::new(scope.operator_id, other_tenant_id.into(), Some(project.id)),
+                request.clone(),
+                document_scope.clone()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        knowledge
+            .plan_document_manifest(
+                &project_scope,
+                request,
+                geo_domain::DocumentScope {
+                    markets: vec!["GB".to_owned()],
+                    ..document_scope
+                }
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(
         repository
             .start(&scope, project.id, command)
@@ -1140,6 +1217,92 @@ async fn agent_begin_run_claims_a_queued_run_exactly_once() {
         1,
         "only the winning claim may be recorded"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn agent_single_process_startup_reconciles_only_running_runs() {
+    let database = connect().await;
+    let pool = database.pool().clone();
+    let repository = PgAgentRepository::new(pool.clone());
+    let scope = seed_scope(&pool, "reconcile").await;
+    let conversation = create_conversation(&repository, &scope).await;
+    let running = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("resume"),
+            "reconcile-key".to_owned(),
+            "reconcile-body".to_owned(),
+            RuntimeCapability::available("deno_core", Some("0.412.0".to_owned())),
+        )
+        .await
+        .expect("append message");
+    repository
+        .begin_run(&scope, running.run.id)
+        .await
+        .expect("begin run")
+        .expect("claim");
+
+    let queued_conversation = create_conversation(&repository, &scope).await;
+    let queued = repository
+        .append_message(
+            &scope,
+            queued_conversation.id,
+            message("not started"),
+            "reconcile-queued-key".to_owned(),
+            "reconcile-queued-body".to_owned(),
+            RuntimeCapability::available("deno_core", Some("0.412.0".to_owned())),
+        )
+        .await
+        .expect("append queued message");
+    let restarted = PgAgentRepository::new(pool);
+    assert_eq!(
+        restarted.reconcile_running_runs().await.expect("reconcile"),
+        1
+    );
+    assert_eq!(
+        restarted
+            .reconcile_running_runs()
+            .await
+            .expect("repeated reconcile"),
+        0
+    );
+
+    let detail = restarted
+        .get_conversation(&scope, conversation.id)
+        .await
+        .expect("detail")
+        .expect("conversation");
+    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    assert_eq!(detail.turns[0].status, TurnStatus::Failed);
+    assert_eq!(
+        detail.runs[0].error.as_ref().map(|error| error.code),
+        Some(ErrorCode::DependencyUnavailable)
+    );
+    assert_eq!(detail.messages.len(), 1, "no answer was fabricated");
+    let events = restarted
+        .replay_events(&scope, conversation.id, Some(0))
+        .await
+        .expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "run.failed")
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| {
+        event.event_type == "run.failed" && event.payload["reason"] == "process_restart"
+    }));
+    let queued_detail = restarted
+        .get_conversation(&scope, queued_conversation.id)
+        .await
+        .expect("queued detail")
+        .expect("queued conversation");
+    assert_eq!(queued_detail.runs[0].id, queued.run.id);
+    assert_eq!(queued_detail.runs[0].status, RunStatus::Queued);
+    assert_eq!(queued_detail.turns[0].status, TurnStatus::Queued);
 }
 
 #[tokio::test]

@@ -39,6 +39,8 @@ use geo_worker::{
 };
 use serde_json::{Value, json};
 
+use crate::provider_bridge::SharedModelProvider;
+
 /// The bundle and capabilities one production runtime is assembled from.
 ///
 /// The entry specifier is configuration rather than a constant so that this
@@ -415,6 +417,7 @@ fn error_code_for_host_op(code: HostOpErrorCode) -> ErrorCode {
         HostOpErrorCode::Denied => ErrorCode::Forbidden,
         HostOpErrorCode::NotFound => ErrorCode::NotFound,
         HostOpErrorCode::InvalidRequest => ErrorCode::InvalidRequest,
+        HostOpErrorCode::IdempotencyConflict => ErrorCode::Conflict,
         // Operational rather than a programming error: the run's own budget or
         // deadline ran out, or the bridge could not produce a trustworthy
         // result for an effect that may have happened.
@@ -440,13 +443,24 @@ fn error_code_for_host_op(code: HostOpErrorCode) -> ErrorCode {
 /// alone is not [`EmbeddedAgentRuntime::configured`].
 pub struct RepositoryHostOps {
     knowledge: Arc<dyn KnowledgeRepository>,
+    model_provider: Option<SharedModelProvider>,
 }
 
 impl RepositoryHostOps {
     /// The ops that read product state, over the repositories the API process
     /// already holds.
     pub fn new(knowledge: Arc<dyn KnowledgeRepository>) -> Self {
-        Self { knowledge }
+        Self {
+            knowledge,
+            model_provider: None,
+        }
+    }
+
+    /// Attaches the provider capability while keeping its endpoint and token
+    /// implementation outside worker requests and persisted state.
+    pub fn with_model_provider(mut self, provider: SharedModelProvider) -> Self {
+        self.model_provider = Some(provider);
+        self
     }
 }
 
@@ -474,13 +488,16 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
 impl HostOps for RepositoryHostOps {
     async fn model_complete(
         &self,
-        _scope: &TenantScope,
-        _request: ModelCompletionRequest,
+        scope: &TenantScope,
+        request: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
-        Err(HostOpError::capability_missing(
-            HostOp::ModelComplete,
-            "no model provider bridge is configured",
-        ))
+        let Some(provider) = self.model_provider.as_ref() else {
+            return Err(HostOpError::capability_missing(
+                HostOp::ModelComplete,
+                "no model provider bridge is configured",
+            ));
+        };
+        provider.complete(scope, &request).await
     }
 
     async fn knowledge_search(
@@ -533,7 +550,29 @@ impl HostOps for RepositoryHostOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_bridge::ModelProviderBridge;
+    use async_trait::async_trait;
     use geo_worker::HostOpErrorCode;
+    use std::sync::Arc;
+
+    struct FakeModelProvider;
+
+    #[async_trait]
+    impl ModelProviderBridge for FakeModelProvider {
+        async fn complete(
+            &self,
+            _scope: &TenantScope,
+            request: &ModelCompletionRequest,
+        ) -> Result<ModelCompletion, HostOpError> {
+            Ok(ModelCompletion {
+                text: request.prompt.clone(),
+                model: "fake-model".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                finish_reason: "stop".into(),
+            })
+        }
+    }
 
     /// The published codes are a vocabulary, not a pass-through: a repository
     /// refusal must arrive at a script as one of the classes the surface
@@ -572,6 +611,30 @@ mod tests {
             assert_eq!(mapped.op, HostOp::KnowledgeSearch);
             assert_eq!(mapped.code, expected, "{mapped:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn repository_host_ops_delegates_model_completion_to_injected_bridge() {
+        let ops =
+            RepositoryHostOps::new(Arc::new(geo_domain::MemoryKnowledgeRepository::default()))
+                .with_model_provider(Arc::new(FakeModelProvider));
+        let request = ModelCompletionRequest {
+            prompt: "hello".into(),
+            system: None,
+            model: None,
+            max_output_tokens: None,
+        };
+        let result = ops.model_complete(&test_scope(), request).await.unwrap();
+        assert_eq!(result.text, "hello");
+        assert_eq!(result.model, "fake-model");
+    }
+
+    fn test_scope() -> TenantScope {
+        TenantScope::new(
+            uuid::Uuid::new_v4().into(),
+            uuid::Uuid::new_v4().into(),
+            Some(uuid::Uuid::new_v4().into()),
+        )
     }
 
     /// An unconfigured runtime reports the same reason the domain's own missing

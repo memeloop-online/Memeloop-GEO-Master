@@ -66,6 +66,127 @@ async fn login_as(app: &Router, login_name: &str, password: &str) -> (String, St
     (cookie, csrf, body)
 }
 
+#[tokio::test]
+async fn knowledge_release_plans_a_scoped_sealed_document_manifest() {
+    let app = router(AppState::development_with_password("test-password"));
+    let (cookie, csrf, _) = login(&app).await;
+    let tenant_id = DEVELOPMENT_TENANT_ID.to_string();
+    let created = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("manifest-project"),
+            &json!({
+                "display_name": "Manifest project",
+                "settings": {
+                    "brand_name": "Example",
+                    "market": "US",
+                    "language": "en",
+                    "initial_sources": [{
+                        "kind": "url",
+                        "value": "https://example.com",
+                        "visibility": "public"
+                    }],
+                    "document_scope": {
+                        "markets": ["US", "GB"],
+                        "languages": ["en"],
+                        "content_types": ["company_profile", "faq"]
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let project: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    let start = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/projects/{project_id}/start?tenant_id={tenant_id}"),
+            &cookie,
+            Some(&csrf),
+            Some("manifest-start"),
+            r#"{"expected_revision":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::ACCEPTED);
+    let start: Value =
+        serde_json::from_slice(&to_bytes(start.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let selector = format!("tenant_id={tenant_id}&project_id={project_id}");
+    let imported = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/knowledge/imports?{selector}"),
+            &cookie,
+            Some(&csrf),
+            Some("manifest-import"),
+            &json!({"items":[{"client_item_id":"public","kind":"text","name":"Website",
+                "purpose":"public","text":"Public company description"}]})
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(imported.status(), StatusCode::ACCEPTED);
+    let imported: Value =
+        serde_json::from_slice(&to_bytes(imported.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let input = json!({
+        "manifest_id": start["document_manifest"]["manifest_id"],
+        "knowledge_release_id": imported["items"][0]["release"]["knowledge_release_id"]
+    })
+    .to_string();
+    let uri = format!("/api/v1/knowledge/document-manifests/plan?{selector}");
+    let planned = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &uri,
+            &cookie,
+            Some(&csrf),
+            Some("manifest-plan"),
+            &input,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(planned.status(), StatusCode::OK);
+    let planned: Value =
+        serde_json::from_slice(&to_bytes(planned.into_body(), 128 * 1024).await.unwrap()).unwrap();
+    assert_eq!(planned["expected_count"], 4);
+    assert_eq!(planned["coverage"]["planned"], 4);
+    assert_eq!(planned["items"].as_array().unwrap().len(), 4);
+    assert!(
+        planned["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| { item["source_version_refs"].as_array().unwrap().len() == 1 })
+    );
+    let replay = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &uri,
+            &cookie,
+            Some(&csrf),
+            Some("manifest-plan-replay"),
+            &input,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: Value =
+        serde_json::from_slice(&to_bytes(replay.into_body(), 128 * 1024).await.unwrap()).unwrap();
+    assert_eq!(replay, planned);
+}
+
 fn authenticated_json_request(
     method: &str,
     uri: &str,

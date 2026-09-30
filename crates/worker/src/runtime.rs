@@ -131,12 +131,18 @@ impl EmbeddedIsolate {
         let loader = InMemoryModuleLoader::from_static(bundle);
         let create_params = heap_limit_bytes
             .map(|limit| deno_core::v8::Isolate::create_params().heap_limits(0, limit));
-        let runtime = JsRuntime::new(RuntimeOptions {
+        let mut runtime = JsRuntime::new(RuntimeOptions {
             module_loader: Some(Rc::new(loader.clone())),
             extensions,
             create_params,
             ..Default::default()
         });
+        runtime
+            .execute_script("ext:geo_worker/encoding.js", include_str!("encoding.js"))
+            .expect("the static UTF-8 bootstrap must initialize");
+        runtime
+            .execute_script("ext:geo_worker/abort.js", include_str!("abort.js"))
+            .expect("the static abort bootstrap must initialize");
         Self { runtime, loader }
     }
 
@@ -534,7 +540,107 @@ mod tests {
     use crate::bundle::PROBE_BUNDLE;
     use crate::ops::HostState;
 
-    use super::{EmbeddedIsolate, geo_probe};
+    use super::{EmbeddedIsolate, ProbeRuntime, geo_probe};
+
+    #[test]
+    fn abort_bootstrap_propagates_reason_and_notifies_once() {
+        let mut runtime = ProbeRuntime::new();
+        runtime
+            .execute_script(
+                "abort-check.js",
+                r#"
+                const controller = new AbortController();
+                const signal = controller.signal;
+                if (signal.aborted) throw new Error("fresh signal aborted");
+                const reason = new Error("cancelled");
+                let calls = 0;
+                let onabortCalls = 0;
+                signal.onabort = () => onabortCalls++;
+                const removed = () => { throw new Error("removed listener called"); };
+                signal.addEventListener("abort", removed);
+                signal.removeEventListener("abort", removed);
+                signal.addEventListener("abort", event => {
+                  if (event.target !== signal) throw new Error("wrong target");
+                  calls++;
+                }, { once: true });
+                controller.abort(reason);
+                controller.abort(new Error("ignored"));
+                if (!signal.aborted || signal.reason !== reason ||
+                    calls !== 1 || onabortCalls !== 1)
+                  throw new Error("abort state or listeners");
+                if ("_abort" in signal) throw new Error("signal exposes mutation");
+                let constructible = true;
+                try { new AbortSignal(); }
+                catch (error) { constructible = !(error instanceof TypeError); }
+                if (constructible) throw new Error("signal constructed without controller");
+                let thrown = false;
+                try { signal.throwIfAborted(); }
+                catch (error) {
+                  thrown = error === reason;
+                }
+                if (!thrown) throw new Error("throwIfAborted reason");
+                "#,
+            )
+            .expect("abort propagation must retain the first reason");
+    }
+
+    #[test]
+    fn utf8_bootstrap_handles_unicode_and_buffer_boundaries() {
+        let mut runtime = ProbeRuntime::new();
+        runtime
+            .execute_script(
+                "encoding-check.js",
+                r#"
+                const check = (condition, detail) => {
+                  if (!condition) throw new Error(detail);
+                };
+                const encoder = new TextEncoder();
+                check(encoder.encoding === "utf-8", "encoder label");
+                check(Array.from(encoder.encode("é😀\ud800")).join(",") ===
+                  "195,169,240,159,152,128,239,191,189", "UTF-8 and lone surrogate");
+                const short = new Uint8Array(5);
+                check(JSON.stringify(encoder.encodeInto("é😀z", short)) ===
+                  '{"read":1,"written":2}', "scalar must not be split");
+                check(Array.from(short).join(",") === "195,169,0,0,0", "no partial scalar");
+                const full = new Uint8Array(7);
+                check(JSON.stringify(encoder.encodeInto("é😀z", full)) ===
+                  '{"read":4,"written":7}', "astral code unit accounting");
+                check(Array.from(full).join(",") === "195,169,240,159,152,128,122",
+                  "encoded bytes");
+                const replacement = new Uint8Array(3);
+                check(JSON.stringify(encoder.encodeInto("\ud800", replacement)) ===
+                  '{"read":1,"written":3}', "lone surrogate count");
+                check(Array.from(replacement).join(",") === "239,191,189",
+                  "lone surrogate replacement");
+                const fatal = new TextDecoder("UTF-8", { fatal: true });
+                check(fatal.decode(full) === "é😀z", "roundtrip");
+                check(fatal.decode(new Uint8Array([0xef, 0xbb, 0xbf, 65])) === "A",
+                  "BOM stripped");
+                check(new TextDecoder("utf8", { ignoreBOM: true }).decode(
+                  new Uint8Array([0xef, 0xbb, 0xbf, 65])) === "\ufeffA", "BOM preserved");
+                for (const invalid of [
+                  [0xc0, 0x80], [0xe0, 0x80, 0x80], [0xed, 0xa0, 0x80],
+                  [0xf4, 0x90, 0x80, 0x80], [0xe2, 0x82], [0x80]
+                ]) {
+                  let threw = false;
+                  try { fatal.decode(new Uint8Array(invalid)); }
+                  catch (error) { threw = error instanceof TypeError; }
+                  check(threw, "fatal malformed UTF-8 " + invalid);
+                }
+                check(new TextDecoder().decode(new Uint8Array([0xff])) === "\ufffd",
+                  "replacement mode");
+                let unsupported = false;
+                try { new TextDecoder("utf-16le"); }
+                catch (error) { unsupported = error instanceof RangeError; }
+                check(unsupported, "unsupported encoding must fail");
+                unsupported = false;
+                try { fatal.decode(new Uint8Array([65]), { stream: true }); }
+                catch (error) { unsupported = error instanceof TypeError; }
+                check(unsupported, "unsupported streaming must fail");
+                "#,
+            )
+            .expect("UTF-8 bootstrap must preserve required text encoding semantics");
+    }
 
     #[test]
     fn checkpoint_restore_keeps_the_installed_policy_and_is_atomic() {

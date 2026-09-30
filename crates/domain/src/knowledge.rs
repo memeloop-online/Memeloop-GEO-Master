@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::{
     AppError, ErrorCode, Operation, OperationStatus, OperatorId, ProjectId, TenantId, TenantScope,
 };
+use crate::{DocumentScope, QuestionClusterState};
 
 pub const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 /// The JSON idempotency middleware buffers at most 1 MiB including syntax
@@ -459,6 +460,249 @@ pub struct KnowledgeRelease {
     pub created_at: DateTime<Utc>,
 }
 
+/// The finite first-stage document fan-out.  This is a planning artifact, not
+/// generated content.  A manifest is immutable after it is sealed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DocumentManifest {
+    pub manifest_id: Uuid,
+    pub operator_id: OperatorId,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub revision: i32,
+    pub knowledge_release_id: Uuid,
+    pub planner_version: String,
+    pub state: DocumentManifestState,
+    pub sealed: bool,
+    pub expected_count: Option<i64>,
+    pub scope_hash: String,
+    pub items: Vec<DocumentManifestItem>,
+    pub coverage: DocumentManifestCoverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentManifestState {
+    AwaitingKnowledge,
+    Planning,
+    Ready,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentManifestItemState {
+    Planned,
+    Blocked,
+    Deferred,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DocumentManifestItem {
+    pub document_manifest_item_id: Uuid,
+    pub manifest_id: Uuid,
+    pub knowledge_release_id: Uuid,
+    pub document_key: String,
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<Uuid>,
+    pub market: String,
+    pub language: String,
+    pub state: DocumentManifestItemState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
+    pub dependency_hash: String,
+    pub source_version_refs: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+pub struct DocumentManifestCoverage {
+    pub total: u64,
+    pub planned: u64,
+    pub blocked: u64,
+    pub deferred: u64,
+    pub not_applicable: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentManifestPlanRequest {
+    pub manifest_id: Uuid,
+    pub knowledge_release_id: Uuid,
+}
+
+pub const DOCUMENT_PLANNER_VERSION: &str = "deterministic-document-v1";
+
+/// Build a bounded, stable set of document branches from a frozen release.
+/// The order and keys are deterministic, so callers can safely page or resume
+/// fan-out without re-creating completed branches.
+pub fn plan_document_manifest(
+    scope: &TenantScope,
+    release: &KnowledgeRelease,
+    manifest_id: Uuid,
+    document_scope: &DocumentScope,
+    public_source_version_refs: &[Uuid],
+) -> Result<DocumentManifest, AppError> {
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::invalid_request("project_id is required for document planning"))?;
+    if release.operator_id != scope.operator_id
+        || release.tenant_id != scope.tenant_id
+        || release.project_id != project_id
+    {
+        return Err(AppError::not_found("knowledge release not found"));
+    }
+    let markets = normalized_dimension(&document_scope.markets, "default");
+    let languages = normalized_dimension(&document_scope.languages, "default");
+    let content_types = normalized_dimension(&document_scope.content_types, "company_profile");
+    let question_clusters = {
+        let values = document_scope
+            .question_clusters
+            .iter()
+            .filter(|cluster| cluster.state == QuestionClusterState::Resolved)
+            .map(|cluster| cluster.key.trim().to_owned())
+            .filter(|key| !key.is_empty())
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            vec!["general".to_owned()]
+        } else {
+            normalized_dimension(&values, "general")
+        }
+    };
+    let expected_count = markets
+        .len()
+        .checked_mul(languages.len())
+        .and_then(|count| count.checked_mul(content_types.len()))
+        .and_then(|count| count.checked_mul(question_clusters.len()))
+        .ok_or_else(|| AppError::invalid_request("document coverage exceeds maximum"))?;
+    if expected_count > 10_000 {
+        return Err(AppError::invalid_request(
+            "document coverage exceeds 10,000 planned items",
+        ));
+    }
+    let mut items = Vec::new();
+    // Product extraction is intentionally not part of W03's deterministic
+    // parser yet.  A product-less project branch keeps the denominator
+    // explicit and can later be replaced by product-specific branches without
+    // changing the document key contract.
+    for market in markets {
+        for language in &languages {
+            for content_type in &content_types {
+                for question_cluster in &question_clusters {
+                    let dimensions = serde_json::to_vec(&(
+                        market.as_str(),
+                        language.as_str(),
+                        content_type.as_str(),
+                        question_cluster.as_str(),
+                    ))
+                    .map_err(|_| {
+                        AppError::new(
+                            ErrorCode::Internal,
+                            "document dimensions could not be encoded",
+                        )
+                    })?;
+                    let document_key = format!("project:{}", sha256_hex(&dimensions));
+                    let dependency_hash = sha256_hex(
+                        format!(
+                            "{}\n{}\n{}",
+                            document_key,
+                            DOCUMENT_PLANNER_VERSION,
+                            public_source_version_refs
+                                .iter()
+                                .map(Uuid::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                        .as_bytes(),
+                    );
+                    let (state, block_reason) = if public_source_version_refs.is_empty() {
+                        (
+                            DocumentManifestItemState::Blocked,
+                            Some("knowledge_release_has_no_public_sources".to_owned()),
+                        )
+                    } else {
+                        (DocumentManifestItemState::Planned, None)
+                    };
+                    items.push(DocumentManifestItem {
+                        document_manifest_item_id: deterministic_uuid(&format!(
+                            "{}:{document_key}",
+                            manifest_id
+                        )),
+                        manifest_id,
+                        knowledge_release_id: release.knowledge_release_id,
+                        document_key,
+                        content_type: content_type.clone(),
+                        product_id: None,
+                        market: market.clone(),
+                        language: language.clone(),
+                        state,
+                        block_reason,
+                        dependency_hash,
+                        source_version_refs: public_source_version_refs.to_vec(),
+                    });
+                }
+            }
+        }
+    }
+    items.sort_by(|left, right| left.document_key.cmp(&right.document_key));
+    let scope_hash = sha256_hex(
+        serde_json::to_vec(document_scope)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "document scope could not be encoded"))?
+            .as_slice(),
+    );
+    let mut coverage = DocumentManifestCoverage {
+        total: items.len() as u64,
+        ..DocumentManifestCoverage::default()
+    };
+    for item in &items {
+        match item.state {
+            DocumentManifestItemState::Planned => coverage.planned += 1,
+            DocumentManifestItemState::Blocked => coverage.blocked += 1,
+            DocumentManifestItemState::Deferred => coverage.deferred += 1,
+            DocumentManifestItemState::NotApplicable => coverage.not_applicable += 1,
+        }
+    }
+    Ok(DocumentManifest {
+        manifest_id,
+        operator_id: scope.operator_id,
+        tenant_id: scope.tenant_id,
+        project_id,
+        revision: 1,
+        knowledge_release_id: release.knowledge_release_id,
+        planner_version: DOCUMENT_PLANNER_VERSION.to_owned(),
+        state: DocumentManifestState::Ready,
+        sealed: true,
+        expected_count: Some(expected_count as i64),
+        scope_hash,
+        items,
+        coverage,
+    })
+}
+
+fn normalized_dimension(values: &[String], fallback: &str) -> Vec<String> {
+    let mut values = values
+        .iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    if values.is_empty() {
+        vec![fallback.to_owned()]
+    } else {
+        values
+    }
+}
+
+fn deterministic_uuid(value: &str) -> Uuid {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CurrentKnowledgeRelease {
     pub project_id: ProjectId,
@@ -628,6 +872,12 @@ pub trait KnowledgeRepository: Send + Sync {
         scope: &TenantScope,
         id: Uuid,
     ) -> Result<Option<KnowledgeRelease>, AppError>;
+    async fn plan_document_manifest(
+        &self,
+        scope: &TenantScope,
+        request: DocumentManifestPlanRequest,
+        document_scope: DocumentScope,
+    ) -> Result<DocumentManifest, AppError>;
     async fn search(
         &self,
         scope: &TenantScope,
@@ -659,6 +909,7 @@ struct MemoryState {
     products: HashMap<Uuid, Product>,
     facts: HashMap<Uuid, Fact>,
     releases: HashMap<Uuid, KnowledgeRelease>,
+    document_manifests: HashMap<Uuid, DocumentManifest>,
     current_release: HashMap<String, Uuid>,
     import_items: HashMap<(String, String), (String, ImportAcceptance)>,
     upload_completions: HashMap<(Uuid, String), ImportAcceptance>,
@@ -1513,6 +1764,60 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             .cloned())
     }
 
+    async fn plan_document_manifest(
+        &self,
+        scope: &TenantScope,
+        request: DocumentManifestPlanRequest,
+        document_scope: DocumentScope,
+    ) -> Result<DocumentManifest, AppError> {
+        Self::require_project(scope)?;
+        let state = self.state.read().await;
+        let release = state
+            .releases
+            .get(&request.knowledge_release_id)
+            .filter(|release| Self::in_scope(scope, *release))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("knowledge release not found"))?;
+        let mut public_refs = release
+            .source_version_refs
+            .iter()
+            .filter_map(|id| {
+                state.versions.get(id).and_then(|version| {
+                    state
+                        .sources
+                        .get(&version.source_id)
+                        .filter(|source| source.purpose == KnowledgePurpose::Public)
+                        .map(|_| *id)
+                })
+            })
+            .collect::<Vec<_>>();
+        public_refs.sort_unstable();
+        drop(state);
+        let manifest = plan_document_manifest(
+            scope,
+            &release,
+            request.manifest_id,
+            &document_scope,
+            &public_refs,
+        )?;
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.document_manifests.get(&request.manifest_id) {
+            if existing.knowledge_release_id != request.knowledge_release_id
+                || existing.scope_hash != manifest.scope_hash
+                || existing.planner_version != manifest.planner_version
+            {
+                return Err(AppError::conflict(
+                    "document manifest ID was already used with different planning input",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        state
+            .document_manifests
+            .insert(manifest.manifest_id, manifest.clone());
+        Ok(manifest)
+    }
+
     async fn search(
         &self,
         scope: &TenantScope,
@@ -1769,10 +2074,11 @@ fn import_item_hash(item: &ImportItem) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImportItem, KnowledgePurpose, KnowledgeRepository, KnowledgeSearchRequest,
-        MemoryKnowledgeRepository, SourceKind, UploadSessionCommand, sha256_hex,
+        DocumentManifestItemState, DocumentManifestPlanRequest, ImportItem, KnowledgePurpose,
+        KnowledgeRepository, KnowledgeSearchRequest, MemoryKnowledgeRepository, SourceKind,
+        UploadSessionCommand, sha256_hex,
     };
-    use crate::TenantScope;
+    use crate::{DocumentScope, TenantScope};
     use uuid::Uuid;
 
     fn scope() -> TenantScope {
@@ -1928,6 +2234,214 @@ mod tests {
                 .put_upload_content(&other, session.upload_session_id, b"x".to_vec())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn document_manifest_is_finite_deterministic_and_replayed_without_internal_sources() {
+        let repository = MemoryKnowledgeRepository::default();
+        let scope = scope();
+        let imported = repository
+            .import_batch(
+                &scope,
+                vec![
+                    ImportItem {
+                        client_item_id: "public".to_owned(),
+                        kind: SourceKind::Text,
+                        name: "public".to_owned(),
+                        purpose: KnowledgePurpose::Public,
+                        text: Some("Public description".to_owned()),
+                        url: None,
+                        object_id: None,
+                        knowledge_release_id: None,
+                    },
+                    ImportItem {
+                        client_item_id: "internal".to_owned(),
+                        kind: SourceKind::Text,
+                        name: "internal".to_owned(),
+                        purpose: KnowledgePurpose::Internal,
+                        text: Some("Private planning notes".to_owned()),
+                        url: None,
+                        object_id: None,
+                        knowledge_release_id: None,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let release = imported.items[1].release.as_ref().unwrap();
+        let scope_spec = DocumentScope {
+            markets: vec!["CN".to_owned(), "US".to_owned()],
+            languages: vec!["zh".to_owned()],
+            content_types: vec!["company_profile".to_owned(), "faq".to_owned()],
+            ..DocumentScope::default()
+        };
+        let request = DocumentManifestPlanRequest {
+            manifest_id: Uuid::new_v4(),
+            knowledge_release_id: release.knowledge_release_id,
+        };
+        let first = repository
+            .plan_document_manifest(&scope, request.clone(), scope_spec.clone())
+            .await
+            .unwrap();
+        assert!(first.sealed);
+        assert_eq!(first.expected_count, Some(4));
+        assert_eq!(first.coverage.planned, 4);
+        assert_eq!(first.items.len(), 4);
+        assert!(
+            first
+                .items
+                .iter()
+                .all(|item| item.state == DocumentManifestItemState::Planned)
+        );
+        assert!(
+            first
+                .items
+                .iter()
+                .all(|item| item.source_version_refs.len() == 1)
+        );
+        assert_eq!(
+            first,
+            repository
+                .plan_document_manifest(&scope, request.clone(), scope_spec.clone())
+                .await
+                .unwrap()
+        );
+        let internal_change = repository
+            .import_batch(
+                &scope,
+                vec![ImportItem {
+                    client_item_id: "internal-2".to_owned(),
+                    kind: SourceKind::Text,
+                    name: "internal-2".to_owned(),
+                    purpose: KnowledgePurpose::Internal,
+                    text: Some("Another private note".to_owned()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let next = repository
+            .plan_document_manifest(
+                &scope,
+                DocumentManifestPlanRequest {
+                    manifest_id: Uuid::new_v4(),
+                    knowledge_release_id: internal_change.items[0]
+                        .release
+                        .as_ref()
+                        .unwrap()
+                        .knowledge_release_id,
+                },
+                scope_spec.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| &item.dependency_hash)
+                .collect::<Vec<_>>(),
+            next.items
+                .iter()
+                .map(|item| &item.dependency_hash)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first.items[0].source_version_refs,
+            next.items[0].source_version_refs
+        );
+        assert!(
+            repository
+                .plan_document_manifest(
+                    &scope,
+                    request,
+                    DocumentScope {
+                        markets: vec!["GB".to_owned()],
+                        ..scope_spec
+                    }
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_only_release_keeps_blocked_denominator() {
+        let repository = MemoryKnowledgeRepository::default();
+        let scope = scope();
+        let imported = repository
+            .import_batch(
+                &scope,
+                vec![ImportItem {
+                    client_item_id: "internal".to_owned(),
+                    kind: SourceKind::Text,
+                    name: "internal".to_owned(),
+                    purpose: KnowledgePurpose::Internal,
+                    text: Some("Internal source".to_owned()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let manifest = repository
+            .plan_document_manifest(
+                &scope,
+                DocumentManifestPlanRequest {
+                    manifest_id: Uuid::new_v4(),
+                    knowledge_release_id: imported.items[0]
+                        .release
+                        .as_ref()
+                        .unwrap()
+                        .knowledge_release_id,
+                },
+                DocumentScope::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest.expected_count, Some(1));
+        assert_eq!(manifest.coverage.blocked, 1);
+        assert!(manifest.items[0].source_version_refs.is_empty());
+        assert_eq!(
+            manifest.items[0].block_reason.as_deref(),
+            Some("knowledge_release_has_no_public_sources")
+        );
+    }
+
+    #[test]
+    fn document_planner_rejects_unbounded_cross_product() {
+        let scope = scope();
+        let release = super::KnowledgeRelease {
+            knowledge_release_id: Uuid::new_v4(),
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id: scope.project_id.unwrap(),
+            sequence: 1,
+            previous_release_id: None,
+            source_version_refs: vec![],
+            fact_revision_refs: vec![],
+            index_build_id: "test".to_owned(),
+            pipeline_versions: serde_json::json!({}),
+            content_hash: sha256_hex(b"test"),
+            coverage: super::KnowledgeCoverage {
+                source_version_count: 0,
+                chunk_count: 0,
+                failed_source_count: 0,
+                blocked_reasons: vec![],
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let spec = DocumentScope {
+            markets: (0..101).map(|i| format!("market-{i}")).collect(),
+            languages: (0..101).map(|i| format!("lang-{i}")).collect(),
+            ..DocumentScope::default()
+        };
+        assert!(
+            super::plan_document_manifest(&scope, &release, Uuid::new_v4(), &spec, &[],).is_err()
         );
     }
 }

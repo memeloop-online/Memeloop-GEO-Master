@@ -510,6 +510,25 @@ pub async fn resolve_auth_context_with_cookie(
     resolve_auth_context_input(repository, input).await
 }
 
+pub(crate) async fn resolve_auth_context_from_parts(
+    repository: &dyn AuthRepository,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    require_tenant: bool,
+    expected_cookie_name: Option<&str>,
+) -> Result<AuthContext, AppError> {
+    let input = {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(uri.clone())
+            .body(axum::body::Body::empty())
+            .map_err(|_| AppError::invalid_request("invalid stream request"))?;
+        *request.headers_mut() = headers.clone();
+        auth_request_input(&request, require_tenant, expected_cookie_name)?
+    };
+    resolve_auth_context_input(repository, input).await
+}
+
 #[derive(Debug)]
 struct AuthRequestInput {
     host: String,

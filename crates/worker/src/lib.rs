@@ -40,8 +40,9 @@ pub use host::{
     HOST_OP_ERROR_BOOTSTRAP, HOST_OP_ERROR_NAME, HOST_OPS_VERSION, HostBridge, HostOp,
     HostOpBudgets, HostOpError, HostOpErrorCode, HostOpLimits, HostOpMeter, HostOps,
     KnowledgeSearchRequest, KnowledgeSearchResult, ManifestItem, ManifestKind, ManifestPage,
-    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest, PublishState, TenantScope, redact_secrets,
+    ManifestReadRequest, MeasureRequest, MeasureSample, MeasurementSurface, ModelCompletion,
+    ModelCompletionRequest, PublishReceipt, PublishRequest, PublishState, TenantScope,
+    redact_secrets,
 };
 pub use host_runtime::HostRuntime;
 pub use loader::InMemoryModuleLoader;

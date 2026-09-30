@@ -803,6 +803,138 @@ impl AgentRepository for PgAgentRepository {
         }))
     }
 
+    async fn reconcile_running_runs(&self) -> Result<u64, AppError> {
+        // This process-wide operation is called only before a single-process
+        // server starts accepting work. It must not be used by multi-replica
+        // deployments: a live run owned by another replica is indistinguishable
+        // from a run abandoned by a crashed process.
+        let mut reconciled = 0_u64;
+        let mut cursor: Option<(DateTime<Utc>, Uuid)> = None;
+        loop {
+            let candidates = sqlx::query_as::<_, RunRow>(
+                r#"SELECT run_id, conversation_id, turn_id, operator_id, tenant_id, project_id,
+                          status, capability, error, cancel_version, created_at, updated_at
+                     FROM agent_runs
+                    WHERE status = 'running'
+                      AND ($1::TIMESTAMPTZ IS NULL OR (created_at, run_id) > ($1, $2))
+                    ORDER BY created_at, run_id
+                    LIMIT 256"#,
+            )
+            .bind(cursor.map(|(created_at, _)| created_at))
+            .bind(cursor.map(|(_, run_id)| run_id))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?;
+            if candidates.is_empty() {
+                break;
+            }
+            for candidate in candidates {
+                cursor = Some((candidate.created_at, candidate.run_id));
+                let candidate = Run::try_from(candidate)?;
+                let scope = candidate.scope();
+                let mut transaction = self.transaction(&scope).await?;
+                let Some(conversation) =
+                    lock_conversation(&mut transaction, &scope, candidate.conversation_id).await?
+                else {
+                    transaction.commit().await.map_err(database_error)?;
+                    continue;
+                };
+                let Some(row) = sqlx::query_as::<_, RunRow>(
+                    r#"SELECT run_id, conversation_id, turn_id, operator_id, tenant_id, project_id,
+                              status, capability, error, cancel_version, created_at, updated_at
+                         FROM agent_runs
+                        WHERE run_id = $1 AND operator_id = $2 AND tenant_id = $3
+                          AND project_id = $4
+                        FOR UPDATE"#,
+                )
+                .bind(candidate.id.as_uuid())
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(candidate.project_id.as_uuid())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                else {
+                    transaction.commit().await.map_err(database_error)?;
+                    continue;
+                };
+                let mut run = Run::try_from(row)?;
+                if run.status != RunStatus::Running {
+                    transaction.commit().await.map_err(database_error)?;
+                    continue;
+                }
+                let Some(turn_row) = sqlx::query_as::<_, TurnRow>(
+                    r#"SELECT turn_id, conversation_id, root_message_id, previous_turn_id, run_id,
+                              status, cancel_version, created_at, updated_at
+                         FROM agent_turns
+                        WHERE turn_id = $1 AND operator_id = $2 AND tenant_id = $3
+                          AND project_id = $4
+                        FOR UPDATE"#,
+                )
+                .bind(run.turn_id.as_uuid())
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(run.project_id.as_uuid())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                else {
+                    transaction.commit().await.map_err(database_error)?;
+                    continue;
+                };
+                let mut turn = Turn::try_from(turn_row)?;
+                if !matches!(turn.status, TurnStatus::Queued | TurnStatus::Running) {
+                    transaction.commit().await.map_err(database_error)?;
+                    continue;
+                }
+                let now = Utc::now();
+                let error = AppError::new(
+                    geo_domain::ErrorCode::DependencyUnavailable,
+                    "run was abandoned when the single-process executor restarted",
+                );
+                run.status = RunStatus::Failed;
+                run.error = Some(error.clone());
+                run.updated_at = now;
+                turn.status = TurnStatus::Failed;
+                turn.updated_at = now;
+                update_turn_status(&mut transaction, &conversation, &turn).await?;
+                update_run_status(&mut transaction, &run).await?;
+                sqlx::query(
+                    r#"UPDATE agent_conversations
+                          SET revision = revision + 1, updated_at = $4
+                        WHERE conversation_id = $1 AND operator_id = $2
+                          AND tenant_id = $3 AND project_id = $5"#,
+                )
+                .bind(conversation.id.as_uuid())
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(now)
+                .bind(candidate.project_id.as_uuid())
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                let event = insert_event(
+                    &mut transaction,
+                    &conversation,
+                    "run.failed",
+                    Some(turn.id),
+                    Some(run.id),
+                    json!({
+                        "run_id": run.id,
+                        "status": run.status,
+                        "error": error,
+                        "reason": "process_restart"
+                    }),
+                )
+                .await?;
+                transaction.commit().await.map_err(database_error)?;
+                self.publish([event]);
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
+    }
+
     async fn replay_events(
         &self,
         scope: &TenantScope,

@@ -33,14 +33,17 @@ pub use error::{AppError, ErrorCode};
 pub use event::EventEnvelope;
 pub use idempotency::{IdempotencyDecision, IdempotencyStore, IdempotencyToken, StoredResponse};
 pub use knowledge::{
-    Chunk, ChunkKind, ChunkLocator, CurrentKnowledgeRelease, EvidenceRef, Fact, FactStatus,
+    Chunk, ChunkKind, ChunkLocator, CurrentKnowledgeRelease, DOCUMENT_PLANNER_VERSION,
+    DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
+    DocumentManifestPlanRequest, DocumentManifestState, EvidenceRef, Fact, FactStatus,
     ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, ImportStage, ImportStatus,
     KnowledgeAnswerStatus, KnowledgeAskResult, KnowledgeCapability, KnowledgeCoverage,
     KnowledgeEvidence, KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
     KnowledgeSearchRequest, KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES,
     MemoryKnowledgeRepository, Product, ProductState, Source, SourceDetail, SourceKind,
     SourceState, SourceVersion, StoredObject, StoredObjectState, UPLOAD_SESSION_TTL_SECONDS,
-    UploadSession, UploadSessionCommand, UploadSessionState, deterministic_chunks, sha256_hex,
+    UploadSession, UploadSessionCommand, UploadSessionState, deterministic_chunks,
+    plan_document_manifest, sha256_hex,
 };
 pub use operation::{Operation, OperationStatus};
 pub use project::{

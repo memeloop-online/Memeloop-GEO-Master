@@ -1,9 +1,11 @@
 //! Provider-side transport for OpenAI-compatible model APIs.
 //!
-//! This crate deliberately does not contain an HTTP implementation.  The
-//! application supplies a [`Transport`] and a [`TokenCenter`] implementation,
-//! which keeps endpoints and credentials outside the worker and makes timeout,
-//! cancellation, and provider-contract tests deterministic.
+//! The application supplies a [`TokenCenter`] and a [`Transport`]. The
+//! [`HttpTransport`] is an optional production adapter; injected transports
+//! keep provider-contract tests deterministic.
+
+mod http_transport;
+pub use http_transport::HttpTransport;
 
 use std::fmt;
 use std::sync::{
@@ -21,7 +23,7 @@ use url::Url;
 
 const MAX_MODEL_LENGTH: usize = 256;
 const MAX_MESSAGE_LENGTH: usize = 1_000_000;
-const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Which observation surface a request belongs to.
 ///
@@ -162,8 +164,8 @@ impl fmt::Debug for TransportRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TransportRequest")
-            .field("url", &self.url)
-            .field("body", &self.body)
+            .field("url", &"***")
+            .field("body", &"***")
             .field("token", &"***")
             .finish()
     }
@@ -458,7 +460,7 @@ where
         if !(200..300).contains(&response.status) {
             return Err(ProviderError::Http {
                 status: response.status,
-                message: error_message(&response.body),
+                message: "provider returned an error".into(),
             }
             .redact());
         }
@@ -470,19 +472,6 @@ async fn wait_for_cancellation(control: RequestControl) {
     while !control.is_cancelled() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-}
-
-fn error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "provider returned an error".into())
 }
 
 pub fn normalize_response(
@@ -578,13 +567,15 @@ fn parse_citations(value: Value) -> Result<Vec<Citation>, ProviderError> {
             let nested = entry.get("url_citation").ok_or_else(|| {
                 ProviderError::InvalidResponse("url citation is missing details".into())
             })?;
-            citations.push(serde_json::from_value(nested.clone()).map_err(|error| {
-                ProviderError::InvalidResponse(format!("invalid URL citation: {error}"))
-            })?);
+            citations.push(
+                serde_json::from_value(nested.clone())
+                    .map_err(|_| ProviderError::InvalidResponse("invalid URL citation".into()))?,
+            );
         } else {
-            citations.push(serde_json::from_value(entry.clone()).map_err(|error| {
-                ProviderError::InvalidResponse(format!("invalid citation: {error}"))
-            })?);
+            citations.push(
+                serde_json::from_value(entry.clone())
+                    .map_err(|_| ProviderError::InvalidResponse("invalid citation".into()))?,
+            );
         }
     }
     Ok(citations)

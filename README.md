@@ -73,20 +73,21 @@ restore it into the local Cargo cache:
 
 ```powershell
 $commit = git rev-parse HEAD
-$runs = gh run list --workflow ci.yml --commit $commit --status completed --limit 20 --json databaseId,headSha,status,conclusion
+$repository = "memeloop-online/Memeloop-GEO-Master"
+$runs = gh run list --repo $repository --workflow ci.yml --commit $commit --status completed --limit 20 --json databaseId,headSha,status,conclusion
 $run = $runs |
   ConvertFrom-Json |
-  Where-Object { $_.conclusion -eq "success" } |
   Select-Object -First 1
 if (-not $run) {
-  throw "No successful CI run found for commit $commit."
+  throw "No completed CI run found for commit $commit."
 }
 if ($run.headSha -ne $commit) {
   throw "The selected CI run does not match commit $commit."
 }
 $artifact = "rusty-v8-msvc-$($run.headSha)"
 $download = Join-Path (Get-Location) ".artifacts\$artifact"
-gh run download $run.databaseId --name $artifact --dir $download
+gh run download $run.databaseId --repo $repository --name $artifact --dir $download
+if ($LASTEXITCODE -ne 0) { throw "The verified Windows artifact is unavailable." }
 pwsh ./scripts/fetch-v8-artifact.ps1 -ArtifactDirectory $download
 cargo check --workspace
 ```
@@ -95,6 +96,8 @@ The restore script verifies every archive against `rusty_v8.sha256`, requires
 `x86_64-pc-windows-msvc`, and copies only verified `.lib.gz` files to
 `$env:CARGO_HOME\.rusty_v8` (or the default Cargo home). Linux bundle artifacts
 are deliberately rejected and must never be used as a Windows V8 cache.
+The artifact is uploaded only after download and restore verification succeed;
+it remains usable when a separate Linux check or subsequent test fails.
 
 Stop local dependencies with `docker compose down`. Named volumes retain local
 data; remove them only when an intentional clean reset is required:

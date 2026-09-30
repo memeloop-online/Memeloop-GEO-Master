@@ -23,8 +23,8 @@ use geo_domain::{
 use geo_worker::{
     HOST_LOOP_JS, HOST_MAIN_MODULE, HOST_OPS_JS, HOST_OPS_VERSION, HostOp, HostOpBudgets,
     HostOpError, HostOpErrorCode, HostOps, KnowledgeSearchResult, ManifestKind, ManifestPage,
-    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest,
+    ManifestReadRequest, MeasureRequest, MeasureSample, MeasurementSurface, ModelCompletion,
+    ModelCompletionRequest, PublishReceipt, PublishRequest,
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -639,20 +639,25 @@ async fn unimplemented_host_ops_report_capability_missing_rather_than_a_result()
         max_output_tokens: None,
     };
     let manifest = ManifestReadRequest {
+        manifest_id: None,
         kind: ManifestKind::Document,
         revision: None,
         cursor: None,
         limit: None,
     };
     let publish = PublishRequest {
+        publication_intent_id: uuid::Uuid::new_v4(),
         document_revision_id: uuid::Uuid::new_v4(),
         platform_target_id: uuid::Uuid::new_v4(),
+        payload_sha256: geo_domain::sha256_hex(b"the warranty runs for twenty-four months"),
         body: "the warranty runs for twenty-four months".to_owned(),
     };
     let measure = MeasureRequest {
         measurement_protocol_id: uuid::Uuid::new_v4(),
+        scheduled_sample_id: uuid::Uuid::new_v4(),
         question: "how long is the warranty?".to_owned(),
         channel: "chatgpt".to_owned(),
+        surface: MeasurementSurface::ConsumerWeb,
     };
 
     let failures = [

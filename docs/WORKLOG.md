@@ -2,6 +2,12 @@
 
 ## 2026-10-01
 
+- Actions `36744486610` 的 Windows 构建、测试和 artifact 上传成功；Linux 普通检查通过，旧提交真实 bundle 探针失败。已通过 `gh run download` 下载 Windows artifact，SHA-256 校验后恢复至独立 Cargo 缓存，以 `RUSTY_V8_ARCHIVE` 显式指向恢复的 archive 执行 `cargo check -p geo-worker --locked --offline` 成功；本机使用已有 Rust crates 缓存，并非全新 Rust 环境。
+- 修复嵌入式运行时 UTF-8 编解码和 AbortController 能力，真实 MemeLoop 单回合在 64 MiB V8 下通过。仅暴露所需能力，流式 TextDecoder 明确拒绝；未开放任意浏览器网络或文件 API，也不代表工具循环/多回合恢复已完成。
+- 整合后 workspace all-targets 测试通过，数据库条件测试与默认忽略的 bundle 探针除外；bundle 探针另行通过。workspace Clippy `-D warnings`、Rust format 与 diff 检查通过；Windows 链接保留 LNK4098 警告。
+- Provider 增加真实 HTTP transport（rustls、禁止重定向、16 MiB 流式响应上限、截止/取消和固定错误信息），12 项含本地 HTTP 服务器测试通过；API bridge 支持 Rust scope 路由和模型白名单。应用仍未装配真实租户 Token Center，不能宣称端到端真实 AI 已上线。
+- SSE 增加严格 Last-Event-ID/after 解析、持久仓储定期追赶及广播缺口恢复，回放和发送前重验 session/成员关系；撤销与游标测试通过。启动对账仅在显式单进程模式运行，默认关闭；中途 checkpoint/外部副作用账本仍未完成。
+- 知识规划 API 绑定 W02 冻结配置，封存项目级文档清单、稳定键和公开来源版本依赖，保留 blocked 分母并限制 10,000 分支。新增迁移 0008；实库测试尚未执行，产品/事实提取、精确局部失效、后续 revision 与 P07 界面仍缺失。
 - 审核 CI archive 收集逻辑发现旧版依赖 `.rusty_v8/*.lib.gz`，而上游默认缓存名是 URL 转义路径，干净 runner 也不会自动留下原名压缩包。改为按 `Cargo.lock` 精确版本下载官方 Windows/MSVC archive、完整解压校验、生成哈希与元数据，再恢复缓存供 CI 构建；artifact 上传独立于后续测试结果，但要求下载与恢复成功。
 - 本机恢复脚本 fixture 通过，覆盖 URL 缓存名、内容一致、Linux target、哈希篡改和路径穿越拒绝。GitHub 最新已完成 run 仍属于此前 main，尚无本轮 artifact；不将本机已有 archive 的成功构建算作 CI 下载链路验收。
 - 在生产同样的 64 MiB V8 堆上限下执行真实 MemeLoop bundle 探针，发现 `TextEncoder is not defined`，Node smoke 无法覆盖该差异。保留失败测试作为运行时兼容缺口证据，真实 bundle 尚未跑通。
