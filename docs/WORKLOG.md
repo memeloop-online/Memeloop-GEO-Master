@@ -2,6 +2,7 @@
 
 ## 2026-10-01
 
+- `a24aca2` 的 Actions `36769809922`：Windows 成功；Linux 其余检查通过，PostgreSQL 15/16 通过。启动重放和重启对账回归已修复；新增附件测试发现初次结果的纳秒时间与数据库微秒时间不一致，完成操作改为返回已持久化对象，确保重放完全一致，等待复验。
 - 第二批功能集成：MemeLoop 原生 function-tool 循环已接知识检索；Provider/worker/bridge 保留工具定义、assistant tool calls 和 tool-result messages，不把纯工具响应的空正文当作最终答案。Node 4 项、真实 V8 bundle 2 项、本地应用 bundle 装配 1 项通过。
 - 文档 `manifest_read` 已接 scoped sealed snapshot、版本/游标分页与全量覆盖统计，规划 ID 与可空正文版本分开。4 项 API host 回归和 30 项 worker host 测试通过；对话 registry 目前仅注册知识检索，文档正文尚未生成。
 - P00 多附件上传纵切完成：逐项状态与重试、附件-only 提交、已成功引用保留、专用原始字节 API、作用域/摘要/元数据核验。附件存储与知识导入分离，UI 明示模型当前未读取附件。修复 PostgreSQL 上传 LEFT JOIN 的锁定目标为 `FOR UPDATE OF session`，新增附件/普通知识上传实库回归待 CI 执行。

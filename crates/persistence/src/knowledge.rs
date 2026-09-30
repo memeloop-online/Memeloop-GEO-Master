@@ -1055,7 +1055,12 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         .map_err(database_error)?;
         let filename: String = row.get("filename");
         transaction.commit().await.map_err(database_error)?;
-        Ok((object, filename))
+        // Return the persisted representation, including PostgreSQL's
+        // microsecond timestamp precision, so first completion and replay agree.
+        self.get_attachment_object(scope, object.object_id)
+            .await?
+            .filter(|(_, stored_filename)| *stored_filename == filename)
+            .ok_or_else(|| AppError::not_found("committed attachment object not found"))
     }
 
     async fn get_attachment_object(

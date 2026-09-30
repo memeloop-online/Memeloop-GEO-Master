@@ -79,7 +79,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 安全 Host Ops
 
-- 封闭且带版本的 op 面（`geo.hostops.v1`）：只有 `model.complete.v1`、`knowledge.search.v1`、`manifest.read.v1`、`publish.submit.v1`、`measure.sample.v1` 五项；不在枚举里的名字没有 op，也就没有 Rust 实现体。JS 无法取得 SQL、任意网络、文件、进程或环境变量。
+- 封闭且带版本的 op 面（`geo.hostops.v2`）：只有 `model.complete.v1`、`knowledge.search.v1`、`manifest.read.v2`、`publish.submit.v2`、`measure.sample.v2` 五项；不在枚举里的名字没有 op，也就没有 Rust 实现体。JS 无法取得 SQL、任意网络、文件、进程或环境变量。
 - 边界方向为 `geo-api → geo-worker`，worker 从不反向依赖 API。请求 DTO 全部 `#[serde(deny_unknown_fields)]` 且不携带 tenant/project 选择器，作用域只能来自 Rust 侧 bridge。预算、单次调用截止与取消统一在 `HostBridge::invoke` 施加。
 - `RepositoryHostOps` 已实现 `knowledge_search`、文档 `manifest_read` 和可注入的 `model_complete`；本地开发模型装配见第 5 节。清单读取保留规划状态、阻断原因及覆盖分母，不把规划项 ID 冒充正文版本；分发清单、发布和测量仍缺失。
 
