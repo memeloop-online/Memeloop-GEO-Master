@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 use url::Url;
 
 const MAX_MODEL_LENGTH: usize = 256;
@@ -418,9 +418,11 @@ where
         if control.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
+        // Credential resolution and HTTP share one budget, not one each.
+        let expires_at = Instant::now() + control.timeout();
         let resolve = self.token_center.resolve(&self.secret_ref);
         tokio::pin!(resolve);
-        let deadline = timeout(control.timeout(), &mut resolve);
+        let deadline = timeout_at(expires_at, &mut resolve);
         tokio::pin!(deadline);
         let token = tokio::select! {
             biased;
@@ -430,6 +432,9 @@ where
         .map_err(ProviderError::redact)?;
         if control.is_cancelled() {
             return Err(ProviderError::Cancelled);
+        }
+        if Instant::now() >= expires_at {
+            return Err(ProviderError::Timeout);
         }
         let url = self.base_url.join("chat/completions").map_err(|_| {
             ProviderError::InvalidRequest("base URL cannot address completions".into())
@@ -441,7 +446,7 @@ where
         };
         let sent = self.transport.send(transport_request, control.clone());
         tokio::pin!(sent);
-        let deadline = timeout(control.timeout(), &mut sent);
+        let deadline = timeout_at(expires_at, &mut sent);
         tokio::pin!(deadline);
         let response = tokio::select! {
             biased;
@@ -698,6 +703,58 @@ mod tests {
     }
 
     struct SlowTransport;
+
+    struct DelayedTokenCenter;
+
+    #[async_trait]
+    impl TokenCenter for DelayedTokenCenter {
+        async fn resolve(&self, _: &SecretRef) -> Result<ResolvedToken, ProviderError> {
+            sleep(Duration::from_millis(150)).await;
+            ResolvedToken::new("local-test-value".into())
+        }
+    }
+
+    struct DelayedSuccessTransport;
+
+    #[async_trait]
+    impl Transport for DelayedSuccessTransport {
+        async fn send(
+            &self,
+            _: TransportRequest,
+            _: RequestControl,
+        ) -> Result<TransportResponse, ProviderError> {
+            sleep(Duration::from_millis(150)).await;
+            Ok(TransportResponse {
+                status: 200,
+                body: json!({
+                    "id": "combined-budget",
+                    "model": "configured-model",
+                    "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_and_transport_share_one_request_deadline() {
+        let client = ProviderClient::new(
+            "https://provider.invalid/v1/",
+            SecretRef::new("test-reference").unwrap(),
+            Arc::new(DelayedSuccessTransport),
+            Arc::new(DelayedTokenCenter),
+        )
+        .unwrap();
+        let error = client
+            .complete(
+                request(),
+                RequestControl::new(Duration::from_millis(250)).unwrap(),
+            )
+            .await
+            .expect_err("two 150ms stages must not get separate 250ms budgets");
+        assert_eq!(error, ProviderError::Timeout);
+    }
 
     #[async_trait]
     impl Transport for SlowTransport {

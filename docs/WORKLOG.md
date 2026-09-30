@@ -2,6 +2,8 @@
 
 ## 2026-10-01
 
+- 集成提交 `f484d40` 的 Actions `36748375621` 已确认 Linux 与 Windows 两个 job 全部成功，包含 Linux 真实 MemeLoop bundle/V8 探针；这是此前单平台成功后的完整 CI 复验。
+- 修复 Provider 总截止时间：凭据解析与 HTTP 不再分别获得完整超时额度，共享单一绝对截止；新增两段各 150ms、总预算 250ms 的回归。`cargo test -p geo-provider` 13 项通过，Provider Clippy `-D warnings` 通过。
 - Actions `36744486610` 的 Windows 构建、测试和 artifact 上传成功；Linux 普通检查通过，旧提交真实 bundle 探针失败。已通过 `gh run download` 下载 Windows artifact，SHA-256 校验后恢复至独立 Cargo 缓存，以 `RUSTY_V8_ARCHIVE` 显式指向恢复的 archive 执行 `cargo check -p geo-worker --locked --offline` 成功；本机使用已有 Rust crates 缓存，并非全新 Rust 环境。
 - 修复嵌入式运行时 UTF-8 编解码和 AbortController 能力，真实 MemeLoop 单回合在 64 MiB V8 下通过。仅暴露所需能力，流式 TextDecoder 明确拒绝；未开放任意浏览器网络或文件 API，也不代表工具循环/多回合恢复已完成。
 - 整合后 workspace all-targets 测试通过，数据库条件测试与默认忽略的 bundle 探针除外；bundle 探针另行通过。workspace Clippy `-D warnings`、Rust format 与 diff 检查通过；Windows 链接保留 LNK4098 警告。
