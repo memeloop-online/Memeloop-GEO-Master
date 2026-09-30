@@ -152,22 +152,28 @@ function estimateValue(
   return null;
 }
 
-function unknownEstimateLabel(reason: string | null) {
-  const normalized = reason?.toLocaleLowerCase() ?? "";
-  if (normalized.includes("capability") || normalized.includes("能力")) {
-    return "待能力快照";
-  }
-  if (normalized.includes("measurement") || normalized.includes("测量")) {
-    return "待测量协议";
-  }
-  if (
-    normalized.includes("component") ||
-    normalized.includes("pricing") ||
-    normalized.includes("cost")
-  ) {
-    return "待分项估算";
-  }
-  return "待知识规划";
+/**
+ * Which blocker makes an estimate row unknown is decided by the blocker's
+ * stable `code`, matched on the row's own `scope`. The prose `reason` is never
+ * parsed: a single row can list several missing inputs, so its wording and the
+ * order of that wording are not a contract — a distribution cost row that also
+ * mentions a capability snapshot is still a pricing gap.
+ */
+const UNKNOWN_ESTIMATE_LABELS: Record<string, string> = {
+  knowledge_release_unavailable: "待知识规划",
+  capability_snapshot_unavailable: "待能力快照",
+  measurement_protocol_unavailable: "待测量协议",
+  pricing_snapshot_unavailable: "待分项估算",
+};
+
+/** With no blocker for the row, the cause is unknown — say only that. */
+const UNCONFIRMED_ESTIMATE_LABEL = "待确认";
+
+function blockerForScope(
+  blockers: { code: string; scope: string; reason: string }[],
+  scope: string,
+) {
+  return blockers.find((blocker) => blocker.scope === scope) ?? null;
 }
 
 function estimateBlockerText(code: string, fallback: string) {
@@ -245,10 +251,15 @@ function defaultTimezone() {
 
 function EstimateItem({
   label,
+  scope,
+  blockers,
   estimate,
   currency,
+  className,
 }: {
   label: string;
+  scope: string;
+  blockers: { code: string; scope: string; reason: string }[];
   estimate: {
     state: "unknown" | "estimated" | "frozen";
     reason: string | null;
@@ -265,6 +276,7 @@ function EstimateItem({
       }
   );
   currency?: string;
+  className?: string;
 }) {
   const amount =
     "value_minor" in estimate
@@ -280,18 +292,25 @@ function EstimateItem({
       ? (amount) => formatMinor(currency, amount)
       : (amount) => String(amount),
   );
+  const unknown = estimate.state === "unknown" || display === null;
+  const blocker = unknown ? blockerForScope(blockers, scope) : null;
+  // An unknown row shows why it is unknown. The blocker's own wording is the
+  // translated explanation; without one, fall back to the server's raw reason
+  // rather than inventing a cause.
+  const explanation = blocker
+    ? estimateBlockerText(blocker.code, blocker.reason)
+    : estimate.reason;
 
   return (
-    <div>
+    <div className={className}>
       <span>{label}</span>
       <strong>
-        {estimate.state === "unknown" || display === null
-          ? unknownEstimateLabel(estimate.reason)
+        {unknown
+          ? (blocker && UNKNOWN_ESTIMATE_LABELS[blocker.code]) ||
+            UNCONFIRMED_ESTIMATE_LABEL
           : display}
       </strong>
-      {estimate.reason && estimate.state !== "unknown" && (
-        <small>{estimate.reason}</small>
-      )}
+      {explanation && <small>{explanation}</small>}
     </div>
   );
 }
@@ -327,30 +346,44 @@ function EstimatePanel({ estimate }: { estimate: ProjectEstimate }) {
         </div>
         <EstimateItem
           label="第一阶段文档成本"
+          scope="costs"
+          blockers={estimate.blockers}
           estimate={estimate.costs.phase_one_documents}
           currency={estimate.budget.currency}
         />
         <EstimateItem
           label="第二阶段分发成本"
+          scope="costs"
+          blockers={estimate.blockers}
           estimate={estimate.costs.phase_two_distribution}
           currency={estimate.budget.currency}
         />
         <EstimateItem
           label="测量成本"
+          scope="costs"
+          blockers={estimate.blockers}
           estimate={estimate.costs.measurement}
           currency={estimate.budget.currency}
         />
         <EstimateItem
           label="预计总成本"
+          scope="costs"
+          blockers={estimate.blockers}
           estimate={estimate.costs.total}
           currency={estimate.budget.currency}
+          className="estimate-total"
         />
       </div>
       <dl className="estimate-coverage">
         <div>
           <dt>文档</dt>
           <dd>
-            <EstimateItem label="" estimate={estimate.coverage.documents} />
+            <EstimateItem
+              label=""
+              scope="documents"
+              blockers={estimate.blockers}
+              estimate={estimate.coverage.documents}
+            />
           </dd>
         </div>
         <div>
@@ -358,6 +391,8 @@ function EstimatePanel({ estimate }: { estimate: ProjectEstimate }) {
           <dd>
             <EstimateItem
               label=""
+              scope="document_platform_targets"
+              blockers={estimate.blockers}
               estimate={estimate.coverage.document_platform_targets}
             />
           </dd>
@@ -367,6 +402,8 @@ function EstimatePanel({ estimate }: { estimate: ProjectEstimate }) {
           <dd>
             <EstimateItem
               label=""
+              scope="measurement_samples"
+              blockers={estimate.blockers}
               estimate={estimate.coverage.measurement_samples}
             />
           </dd>

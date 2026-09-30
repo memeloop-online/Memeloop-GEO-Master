@@ -36,6 +36,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 6,
         description: "knowledge import",
     },
+    MigrationMetadata {
+        version: 7,
+        description: "agent state",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

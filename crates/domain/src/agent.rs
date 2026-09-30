@@ -77,6 +77,8 @@ agent_id!(TurnId);
 agent_id!(RunId);
 agent_id!(ConversationEventId);
 agent_id!(AttachmentId);
+agent_id!(CheckpointId);
+agent_id!(ToolCallLedgerId);
 
 /// A durable object reference.  The object store is intentionally outside the
 /// conversation repository; only immutable references are carried in messages.
@@ -314,6 +316,258 @@ impl ConversationEvent {
     }
 }
 
+/// A permission or budget verdict recorded before a tool call is attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallDecision {
+    Allowed,
+    Denied,
+}
+
+/// Durable lifecycle of one tool call.  `unknown` is a first-class outcome: a
+/// crash after an external send and before the receipt must never be retried
+/// blindly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallOutcome {
+    Intent,
+    Attempted,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+/// A durable run checkpoint.  `(run_id, checkpoint_scope, step_key)` is unique
+/// and the checkpoint may only be reused while its input digest still matches.
+/// This is host state owned by Rust, never a JavaScript heap snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct AgentCheckpoint {
+    pub id: CheckpointId,
+    pub run_id: RunId,
+    pub conversation_id: ConversationId,
+    pub operator_id: OperatorId,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub checkpoint_scope: String,
+    pub step_key: String,
+    pub input_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<ObjectRef>,
+    pub version: u64,
+    pub state: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AgentCheckpoint {
+    pub fn scope(&self) -> TenantScope {
+        TenantScope::new(self.operator_id, self.tenant_id, Some(self.project_id))
+    }
+}
+
+/// Request payload for storing or refreshing a run checkpoint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct StoreCheckpoint {
+    pub checkpoint_scope: String,
+    pub step_key: String,
+    pub input_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<ObjectRef>,
+    pub state: Value,
+}
+
+/// One append-only tool-call ledger entry.  Conversation and turn ownership are
+/// derived from the run rather than trusted from the caller.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ToolCallLedgerEntry {
+    pub id: ToolCallLedgerId,
+    pub run_id: RunId,
+    pub turn_id: TurnId,
+    pub conversation_id: ConversationId,
+    pub operator_id: OperatorId,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments_hash: String,
+    pub idempotency_key_hash: String,
+    pub permission: ToolCallDecision,
+    pub budget: ToolCallDecision,
+    pub intent: Value,
+    pub attempt_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<ObjectRef>,
+    pub outcome: ToolCallOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_minor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ToolCallLedgerEntry {
+    pub fn scope(&self) -> TenantScope {
+        TenantScope::new(self.operator_id, self.tenant_id, Some(self.project_id))
+    }
+}
+
+/// Request payload for appending one tool-call ledger entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct RecordToolCall {
+    pub run_id: RunId,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments_hash: String,
+    pub idempotency_key_hash: String,
+    pub permission: ToolCallDecision,
+    pub budget: ToolCallDecision,
+    #[serde(default)]
+    pub intent: Value,
+    #[serde(default)]
+    pub attempt_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<ObjectRef>,
+    pub outcome: ToolCallOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_minor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
+/// Bounded identifier for a checkpoint scope, step or tool call.
+fn validate_agent_key(field: &str, value: &str) -> Result<(), AppError> {
+    if value.trim().is_empty() || value.chars().count() > 200 {
+        return Err(AppError::invalid_request(format!(
+            "{field} must be between 1 and 200 characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Opaque digest of an input, argument list, idempotency key or serialized
+/// request.  The repository never inspects the digest, only its stability.
+fn validate_agent_digest(field: &str, value: &str) -> Result<(), AppError> {
+    if value.trim().is_empty() || value.chars().count() > 512 {
+        return Err(AppError::invalid_request(format!(
+            "{field} must be between 1 and 512 characters"
+        )));
+    }
+    Ok(())
+}
+
+/// The longest message body either repository will persist.  Named once so the
+/// user and assistant paths cannot disagree about it.
+pub const MAX_MESSAGE_CHARS: usize = 100_000;
+
+/// Shared validation for a user message submission.  Both the in-memory and the
+/// PostgreSQL repository call this so their rejections cannot drift apart.
+/// Returns the trimmed content that must be persisted.
+pub fn validate_append_message(input: &AppendMessage) -> Result<String, AppError> {
+    let content = input.content.trim().to_owned();
+    if content.is_empty() && input.attachments.is_empty() {
+        return Err(AppError::invalid_request(
+            "message content or at least one attachment is required",
+        ));
+    }
+    if content.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(AppError::invalid_request(format!(
+            "message content must be at most {MAX_MESSAGE_CHARS} characters"
+        )));
+    }
+    if input.attachments.len() > 100 {
+        return Err(AppError::invalid_request(
+            "a message may contain at most 100 attachments",
+        ));
+    }
+    for attachment in &input.attachments {
+        if attachment.object_id.trim().is_empty() || attachment.object_id.chars().count() > 500 {
+            return Err(AppError::invalid_request(
+                "attachment object_id must be between 1 and 500 characters",
+            ));
+        }
+        if attachment.filename.trim().is_empty() || attachment.filename.chars().count() > 512 {
+            return Err(AppError::invalid_request(
+                "attachment filename must be between 1 and 512 characters",
+            ));
+        }
+        if attachment
+            .size_bytes
+            .is_some_and(|size| size > 100 * 1024 * 1024)
+        {
+            return Err(AppError::invalid_request(
+                "attachment size_bytes must be at most 100 MiB",
+            ));
+        }
+    }
+    Ok(content)
+}
+
+/// Shared validation for a persisted message body that has no attachment
+/// escape hatch.  A user message may be attachment-only; an answer may not,
+/// because an assistant message with nothing in it is indistinguishable from a
+/// fabricated one.  Both repositories call this so their rejections cannot
+/// drift apart.  Returns the trimmed content that must be persisted.
+pub fn validate_message_content(content: &str) -> Result<String, AppError> {
+    let content = content.trim().to_owned();
+    if content.is_empty() {
+        return Err(AppError::invalid_request(
+            "message content must not be empty",
+        ));
+    }
+    if content.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(AppError::invalid_request(format!(
+            "message content must be at most {MAX_MESSAGE_CHARS} characters"
+        )));
+    }
+    Ok(content)
+}
+
+/// Shared validation for a checkpoint write.  Both the in-memory and the
+/// PostgreSQL repository call this so their rejections cannot drift apart.
+pub fn validate_checkpoint_write(input: &StoreCheckpoint) -> Result<(), AppError> {
+    validate_agent_key("checkpoint_scope", &input.checkpoint_scope)?;
+    validate_agent_key("step_key", &input.step_key)?;
+    validate_agent_digest("input_hash", &input.input_hash)?;
+    validate_object_ref(input.result_ref.as_ref())?;
+    Ok(())
+}
+
+/// Shared validation for a tool-call ledger append.
+pub fn validate_tool_call_write(input: &RecordToolCall) -> Result<(), AppError> {
+    validate_agent_key("tool_call_id", &input.tool_call_id)?;
+    validate_agent_key("tool_name", &input.tool_name)?;
+    validate_agent_digest("arguments_hash", &input.arguments_hash)?;
+    validate_agent_digest("idempotency_key_hash", &input.idempotency_key_hash)?;
+    validate_object_ref(input.result_ref.as_ref())?;
+    if input.currency.as_ref().is_some_and(|currency| {
+        currency.chars().count() != 3
+            || !currency
+                .chars()
+                .all(|character| character.is_ascii_uppercase())
+    }) {
+        return Err(AppError::invalid_request(
+            "currency must be a three letter uppercase code",
+        ));
+    }
+    if input.cost_minor.is_some_and(|cost| cost < 0) {
+        return Err(AppError::invalid_request("cost_minor must not be negative"));
+    }
+    Ok(())
+}
+
+fn validate_object_ref(object_ref: Option<&ObjectRef>) -> Result<(), AppError> {
+    let Some(object_ref) = object_ref else {
+        return Ok(());
+    };
+    if object_ref.object_id.trim().is_empty() || object_ref.object_id.chars().count() > 500 {
+        return Err(AppError::invalid_request(
+            "object_id must be between 1 and 500 characters",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
 pub struct CreateConversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,20 +600,86 @@ pub struct ConversationDetail {
     pub runs: Vec<Run>,
 }
 
+/// What one turn needs in order to run.
+///
+/// Assembled by the executor from the run the repository actually claimed, not
+/// from the request: a runtime is never told an identifier or a scope the store
+/// did not accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TurnInput {
+    pub conversation_id: ConversationId,
+    pub turn_id: TurnId,
+    pub run_id: RunId,
+    pub prompt: String,
+}
+
+/// What a runtime reports back for a turn that ran.
+///
+/// The content is not optional: there is no "succeeded with nothing to show"
+/// shape, because a run that produced no answer is indistinguishable from a
+/// fabricated one once it is persisted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct TurnReport {
+    pub content: String,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+/// The terminal outcome of one run.
+///
+/// Deliberately has no "succeeded without an answer" variant, so an answer and
+/// a success cannot be recorded separately from each other.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunCompletion {
+    Succeeded { content: String, metadata: Value },
+    Failed { error: AppError },
+}
+
+/// Everything one terminal transition wrote, so a caller can report what
+/// happened without re-reading the store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunTransition {
+    pub run: Run,
+    pub turn: Turn,
+    pub message: Option<Message>,
+}
+
 /// The boundary for a Rust-hosted runtime worker.  The API never fabricates a
 /// model answer: when the capability is missing it records a failed run.
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
     async fn capability(&self) -> RuntimeCapability;
+
+    /// Runs exactly one turn and reports what it produced.
+    ///
+    /// This lives on the runtime rather than beside it so that a configuration
+    /// cannot report `available` without also being the thing that runs a turn.
+    /// An assembly with no executor reports `capability_missing`, and the
+    /// repository then refuses the work up front instead of accepting runs
+    /// nothing will ever drive.
+    async fn run_turn(&self, scope: &TenantScope, input: TurnInput)
+    -> Result<TurnReport, AppError>;
 }
 
 #[derive(Debug, Default)]
 pub struct MissingAgentRuntime;
 
+/// The one reason an unconfigured assembly gives, whether it is refusing work at
+/// acceptance time or reporting why a turn could not run.
+pub const RUNTIME_NOT_CONFIGURED: &str = "embedded JavaScript runtime is not configured";
+
 #[async_trait]
 impl AgentRuntime for MissingAgentRuntime {
     async fn capability(&self) -> RuntimeCapability {
-        RuntimeCapability::missing("embedded JavaScript runtime is not configured")
+        RuntimeCapability::missing(RUNTIME_NOT_CONFIGURED)
+    }
+
+    async fn run_turn(
+        &self,
+        _scope: &TenantScope,
+        _input: TurnInput,
+    ) -> Result<TurnReport, AppError> {
+        Err(AppError::capability_missing(RUNTIME_NOT_CONFIGURED))
     }
 }
 
@@ -387,12 +707,65 @@ pub trait AgentRepository: Send + Sync {
         capability: RuntimeCapability,
     ) -> Result<SubmitAcceptance, AppError>;
     async fn cancel_turn(&self, scope: &TenantScope, turn_id: TurnId) -> Result<Run, AppError>;
+    /// Claims a queued run for execution.
+    ///
+    /// `Queued → Running` is one guarded transition, so claiming is atomic:
+    /// `None` means the run was never this caller's to run — already claimed,
+    /// already terminal, or cancelled between acceptance and dispatch.  This
+    /// transition, not a status check in the caller, is the guard, because a
+    /// replayed Idempotency-Key returns the *stored* acceptance whose
+    /// `run.status` still reads `queued` long after the run finished.
+    async fn begin_run(&self, scope: &TenantScope, run_id: RunId) -> Result<Option<Run>, AppError>;
+    /// Records a run's terminal outcome, its assistant message and the turn's
+    /// terminal status together.
+    ///
+    /// `None` means the run was already terminal — a concurrent `cancel_turn`
+    /// won — and nothing at all was written.  Success carries its answer by
+    /// construction, so a `succeeded` run with no message and an answer
+    /// attached to a still-`running` run are both unrepresentable.  An answer
+    /// that fails validation produces a failed run with a typed error and no
+    /// message, never a silently truncated one.
+    async fn finish_run(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+        completion: RunCompletion,
+    ) -> Result<Option<RunTransition>, AppError>;
     async fn replay_events(
         &self,
         scope: &TenantScope,
         conversation_id: ConversationId,
         after: Option<u64>,
     ) -> Result<Vec<ConversationEvent>, AppError>;
+    /// Stores or refreshes one step checkpoint.  Reusing a checkpoint whose
+    /// `input_hash` changed is a conflict, never a silent overwrite.
+    async fn store_checkpoint(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+        checkpoint: StoreCheckpoint,
+    ) -> Result<AgentCheckpoint, AppError>;
+    /// Loads one checkpoint so a restarted worker can resume without replaying
+    /// already completed steps.
+    async fn load_checkpoint(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+        checkpoint_scope: &str,
+        step_key: &str,
+    ) -> Result<Option<AgentCheckpoint>, AppError>;
+    /// Appends one tool-call ledger entry.  The same `tool_call_id` may be
+    /// replayed with the same digests but never with different arguments.
+    async fn append_tool_call(
+        &self,
+        scope: &TenantScope,
+        input: RecordToolCall,
+    ) -> Result<ToolCallLedgerEntry, AppError>;
+    async fn list_tool_calls(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+    ) -> Result<Vec<ToolCallLedgerEntry>, AppError>;
     fn subscribe_events(&self) -> broadcast::Receiver<ConversationEvent>;
 }
 
@@ -406,6 +779,8 @@ struct AgentState {
     next_message_sequence: HashMap<ConversationId, u64>,
     next_event_sequence: HashMap<ConversationId, u64>,
     idempotent_submissions: HashMap<(String, ConversationId), (String, SubmitAcceptance)>,
+    checkpoints: HashMap<(RunId, String, String), AgentCheckpoint>,
+    tool_calls: HashMap<(RunId, String), ToolCallLedgerEntry>,
 }
 
 /// Development-only in-memory agent repository.  It is intentionally
@@ -480,6 +855,21 @@ impl MemoryAgentRepository {
 
     fn visible(conversation: &Conversation, scope: &TenantScope) -> bool {
         scope.contains(&conversation.scope())
+    }
+
+    /// Resolves the run that owns a checkpoint or ledger entry, enforcing the
+    /// same tenant/project boundary as every other read.
+    fn visible_run(
+        state: &AgentState,
+        scope: &TenantScope,
+        run_id: RunId,
+    ) -> Result<Run, AppError> {
+        state
+            .runs
+            .get(&run_id)
+            .filter(|run| scope.contains(&run.scope()))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("run not found"))
     }
 }
 
@@ -606,43 +996,7 @@ impl AgentRepository for MemoryAgentRepository {
         request_hash: String,
         capability: RuntimeCapability,
     ) -> Result<SubmitAcceptance, AppError> {
-        let content = input.content.trim().to_owned();
-        if content.is_empty() && input.attachments.is_empty() {
-            return Err(AppError::invalid_request(
-                "message content or at least one attachment is required",
-            ));
-        }
-        if content.chars().count() > 100_000 {
-            return Err(AppError::invalid_request(
-                "message content must be at most 100000 characters",
-            ));
-        }
-        if input.attachments.len() > 100 {
-            return Err(AppError::invalid_request(
-                "a message may contain at most 100 attachments",
-            ));
-        }
-        for attachment in &input.attachments {
-            if attachment.object_id.trim().is_empty() || attachment.object_id.chars().count() > 500
-            {
-                return Err(AppError::invalid_request(
-                    "attachment object_id must be between 1 and 500 characters",
-                ));
-            }
-            if attachment.filename.trim().is_empty() || attachment.filename.chars().count() > 512 {
-                return Err(AppError::invalid_request(
-                    "attachment filename must be between 1 and 512 characters",
-                ));
-            }
-            if attachment
-                .size_bytes
-                .is_some_and(|size| size > 100 * 1024 * 1024)
-            {
-                return Err(AppError::invalid_request(
-                    "attachment size_bytes must be at most 100 MiB",
-                ));
-            }
-        }
+        let content = validate_append_message(&input)?;
         let mut state = self.state.write().await;
         let conversation = state
             .conversations
@@ -849,6 +1203,175 @@ impl AgentRepository for MemoryAgentRepository {
         Ok(cancelled_run)
     }
 
+    async fn begin_run(&self, scope: &TenantScope, run_id: RunId) -> Result<Option<Run>, AppError> {
+        let mut state = self.state.write().await;
+        let Some(run) = state
+            .runs
+            .get(&run_id)
+            .filter(|run| scope.contains(&run.scope()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if run.status != RunStatus::Queued {
+            return Ok(None);
+        }
+        let conversation = state
+            .conversations
+            .get(&run.conversation_id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("conversation not found"))?;
+        let now = Utc::now();
+        let mut claimed = run;
+        claimed.status = RunStatus::Running;
+        claimed.updated_at = now;
+        state.runs.insert(claimed.id, claimed.clone());
+        if let Some(turn) = state.turns.get_mut(&claimed.turn_id)
+            && turn.status == TurnStatus::Queued
+        {
+            turn.status = TurnStatus::Running;
+            turn.updated_at = now;
+        }
+        self.emit(
+            &mut state,
+            &conversation,
+            "run.running",
+            Some(claimed.turn_id),
+            Some(claimed.id),
+            json!({"run_id": claimed.id, "status": claimed.status}),
+        )
+        .await;
+        Ok(Some(claimed))
+    }
+
+    async fn finish_run(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+        completion: RunCompletion,
+    ) -> Result<Option<RunTransition>, AppError> {
+        let mut state = self.state.write().await;
+        let Some(run) = state
+            .runs
+            .get(&run_id)
+            .filter(|run| scope.contains(&run.scope()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        // Re-read under the write lock: a `cancel_turn` that landed while the
+        // turn was executing has already made this run terminal, and its
+        // verdict outranks ours.
+        if run.status != RunStatus::Running {
+            return Ok(None);
+        }
+        let conversation = state
+            .conversations
+            .get(&run.conversation_id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("conversation not found"))?;
+        let mut turn = state
+            .turns
+            .get(&run.turn_id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("turn not found"))?;
+
+        // An answer that cannot be stored is a failed run, never a truncated
+        // one, and never a success with nothing to show.
+        let outcome = match completion {
+            RunCompletion::Succeeded { content, metadata } => {
+                validate_message_content(&content).map(|content| (content, metadata))
+            }
+            RunCompletion::Failed { error } => Err(error),
+        };
+        let now = Utc::now();
+        let (status, message, error) = match outcome {
+            Ok((content, metadata)) => {
+                let sequence = {
+                    let next = state
+                        .next_message_sequence
+                        .entry(conversation.id)
+                        .and_modify(|sequence| *sequence += 1)
+                        .or_insert(1);
+                    *next
+                };
+                let message = Message {
+                    id: MessageId::from(Uuid::new_v4()),
+                    conversation_id: conversation.id,
+                    operator_id: conversation.operator_id,
+                    tenant_id: conversation.tenant_id,
+                    project_id: conversation.project_id,
+                    turn_id: Some(run.turn_id),
+                    role: MessageRole::Assistant,
+                    content,
+                    attachments: Vec::new(),
+                    metadata,
+                    sequence,
+                    created_at: now,
+                };
+                (RunStatus::Succeeded, Some(message), None)
+            }
+            Err(error) => (RunStatus::Failed, None, Some(error)),
+        };
+
+        let mut finished = run;
+        finished.status = status;
+        finished.error = error;
+        finished.updated_at = now;
+        turn.status = match status {
+            RunStatus::Succeeded => TurnStatus::Succeeded,
+            _ => TurnStatus::Failed,
+        };
+        turn.updated_at = now;
+
+        let mut updated_conversation = conversation;
+        updated_conversation.revision += 1;
+        updated_conversation.updated_at = now;
+
+        state.runs.insert(finished.id, finished.clone());
+        state.turns.insert(turn.id, turn.clone());
+        state
+            .conversations
+            .insert(updated_conversation.id, updated_conversation.clone());
+        if let Some(message) = &message {
+            state.messages.insert(message.id, message.clone());
+            self.emit(
+                &mut state,
+                &updated_conversation,
+                "message.created",
+                Some(turn.id),
+                Some(finished.id),
+                json!({"message": message}),
+            )
+            .await;
+        }
+        let (event_type, payload) = match &finished.error {
+            Some(error) => (
+                "run.failed",
+                json!({"run_id": finished.id, "status": finished.status, "error": error}),
+            ),
+            None => (
+                "run.succeeded",
+                json!({"run_id": finished.id, "status": finished.status}),
+            ),
+        };
+        self.emit(
+            &mut state,
+            &updated_conversation,
+            event_type,
+            Some(turn.id),
+            Some(finished.id),
+            payload,
+        )
+        .await;
+
+        Ok(Some(RunTransition {
+            run: finished,
+            turn,
+            message,
+        }))
+    }
+
     async fn replay_events(
         &self,
         scope: &TenantScope,
@@ -870,6 +1393,139 @@ impl AgentRepository for MemoryAgentRepository {
             .filter(|event| event.sequence > after)
             .cloned()
             .collect())
+    }
+
+    async fn store_checkpoint(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+        checkpoint: StoreCheckpoint,
+    ) -> Result<AgentCheckpoint, AppError> {
+        validate_checkpoint_write(&checkpoint)?;
+        let mut state = self.state.write().await;
+        let run = Self::visible_run(&state, scope, run_id)?;
+        let key = (
+            run.id,
+            checkpoint.checkpoint_scope.clone(),
+            checkpoint.step_key.clone(),
+        );
+        let now = Utc::now();
+        let existing = state.checkpoints.get(&key).cloned();
+        let stored = match existing {
+            Some(existing) if existing.input_hash == checkpoint.input_hash => AgentCheckpoint {
+                result_ref: checkpoint.result_ref,
+                state: checkpoint.state,
+                version: existing.version + 1,
+                updated_at: now,
+                ..existing
+            },
+            Some(_) => {
+                return Err(AppError::conflict(
+                    "checkpoint was already stored for a different input",
+                ));
+            }
+            None => AgentCheckpoint {
+                id: CheckpointId::from(Uuid::new_v4()),
+                run_id: run.id,
+                conversation_id: run.conversation_id,
+                operator_id: run.operator_id,
+                tenant_id: run.tenant_id,
+                project_id: run.project_id,
+                checkpoint_scope: checkpoint.checkpoint_scope,
+                step_key: checkpoint.step_key,
+                input_hash: checkpoint.input_hash,
+                result_ref: checkpoint.result_ref,
+                version: 1,
+                state: checkpoint.state,
+                created_at: now,
+                updated_at: now,
+            },
+        };
+        state.checkpoints.insert(key, stored.clone());
+        Ok(stored)
+    }
+
+    async fn load_checkpoint(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+        checkpoint_scope: &str,
+        step_key: &str,
+    ) -> Result<Option<AgentCheckpoint>, AppError> {
+        let state = self.state.read().await;
+        Self::visible_run(&state, scope, run_id)?;
+        Ok(state
+            .checkpoints
+            .get(&(run_id, checkpoint_scope.to_owned(), step_key.to_owned()))
+            .cloned())
+    }
+
+    async fn append_tool_call(
+        &self,
+        scope: &TenantScope,
+        input: RecordToolCall,
+    ) -> Result<ToolCallLedgerEntry, AppError> {
+        validate_tool_call_write(&input)?;
+        let mut state = self.state.write().await;
+        let run = Self::visible_run(&state, scope, input.run_id)?;
+        let key = (run.id, input.tool_call_id.clone());
+        if let Some(existing) = state.tool_calls.get(&key) {
+            if existing.arguments_hash != input.arguments_hash
+                || existing.idempotency_key_hash != input.idempotency_key_hash
+            {
+                return Err(AppError::conflict(
+                    "tool call was already recorded with different arguments",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        let now = Utc::now();
+        let entry = ToolCallLedgerEntry {
+            id: ToolCallLedgerId::from(Uuid::new_v4()),
+            run_id: run.id,
+            turn_id: run.turn_id,
+            conversation_id: run.conversation_id,
+            operator_id: run.operator_id,
+            tenant_id: run.tenant_id,
+            project_id: run.project_id,
+            tool_call_id: input.tool_call_id,
+            tool_name: input.tool_name,
+            arguments_hash: input.arguments_hash,
+            idempotency_key_hash: input.idempotency_key_hash,
+            permission: input.permission,
+            budget: input.budget,
+            intent: input.intent,
+            attempt_count: input.attempt_count,
+            result_ref: input.result_ref,
+            outcome: input.outcome,
+            cost_minor: input.cost_minor,
+            currency: input.currency,
+            created_at: now,
+            updated_at: now,
+        };
+        state.tool_calls.insert(key, entry.clone());
+        Ok(entry)
+    }
+
+    async fn list_tool_calls(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+    ) -> Result<Vec<ToolCallLedgerEntry>, AppError> {
+        let state = self.state.read().await;
+        Self::visible_run(&state, scope, run_id)?;
+        let mut result = state
+            .tool_calls
+            .values()
+            .filter(|entry| entry.run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+        Ok(result)
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<ConversationEvent> {
@@ -1017,6 +1673,117 @@ mod tests {
         );
     }
 
+    async fn accepted_run(repository: &MemoryAgentRepository, scope: &TenantScope) -> Run {
+        let conversation = repository
+            .create_conversation(scope, None, CreateConversation::default())
+            .await
+            .expect("create");
+        repository
+            .append_message(
+                scope,
+                conversation.id,
+                message("hello"),
+                "accepted-key".to_owned(),
+                "accepted-body".to_owned(),
+                RuntimeCapability::available("test", Some("1".to_owned())),
+            )
+            .await
+            .expect("append")
+            .run
+    }
+
+    #[tokio::test]
+    async fn checkpoints_are_restorable_and_reject_a_changed_input() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        let checkpoint = |input_hash: &str, cursor: i64| StoreCheckpoint {
+            checkpoint_scope: "loop".to_owned(),
+            step_key: "collect".to_owned(),
+            input_hash: input_hash.to_owned(),
+            result_ref: None,
+            state: json!({"cursor": cursor}),
+        };
+        let stored = repository
+            .store_checkpoint(&scope, run.id, checkpoint("digest-a", 3))
+            .await
+            .expect("store");
+        assert_eq!(stored.version, 1);
+        let loaded = repository
+            .load_checkpoint(&scope, run.id, "loop", "collect")
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded, stored);
+        let refreshed = repository
+            .store_checkpoint(&scope, run.id, checkpoint("digest-a", 4))
+            .await
+            .expect("refresh");
+        assert_eq!(refreshed.version, 2);
+        assert_eq!(refreshed.id, stored.id);
+        assert_eq!(refreshed.state, json!({"cursor": 4}));
+        let conflict = repository
+            .store_checkpoint(&scope, run.id, checkpoint("digest-b", 5))
+            .await
+            .expect_err("changed input");
+        assert_eq!(conflict.code, crate::ErrorCode::Conflict);
+        let other_project = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        let cross_project = repository
+            .load_checkpoint(&other_project, run.id, "loop", "collect")
+            .await
+            .expect_err("cross-project checkpoint");
+        assert_eq!(cross_project.code, crate::ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn tool_call_ledger_is_idempotent_per_tool_call_id() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        let record = |tool_call_id: &str, arguments_hash: &str| RecordToolCall {
+            run_id: run.id,
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: "geo.publish".to_owned(),
+            arguments_hash: arguments_hash.to_owned(),
+            idempotency_key_hash: "ledger-key".to_owned(),
+            permission: ToolCallDecision::Allowed,
+            budget: ToolCallDecision::Allowed,
+            intent: json!({"document_id": "doc-1"}),
+            attempt_count: 0,
+            result_ref: None,
+            outcome: ToolCallOutcome::Intent,
+            cost_minor: Some(12),
+            currency: Some("CNY".to_owned()),
+        };
+        let appended = repository
+            .append_tool_call(&scope, record("call-1", "args-a"))
+            .await
+            .expect("append");
+        assert_eq!(appended.turn_id, run.turn_id);
+        assert_eq!(
+            repository
+                .append_tool_call(&scope, record("call-1", "args-a"))
+                .await
+                .expect("replay"),
+            appended
+        );
+        let conflict = repository
+            .append_tool_call(&scope, record("call-1", "args-b"))
+            .await
+            .expect_err("different arguments");
+        assert_eq!(conflict.code, crate::ErrorCode::Conflict);
+        let listed = repository
+            .list_tool_calls(&scope, run.id)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].outcome, ToolCallOutcome::Intent);
+    }
+
     #[tokio::test]
     async fn available_runtime_can_be_cancelled_and_replayed() {
         let repository = MemoryAgentRepository::new();
@@ -1050,5 +1817,303 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "run.cancelled")
         );
+    }
+
+    /// Claims a queued run exactly once: a second claim, or a claim after the
+    /// turn was cancelled, is not this caller's work to do.
+    #[tokio::test]
+    async fn a_queued_run_is_claimed_exactly_once() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        assert_eq!(run.status, RunStatus::Queued);
+
+        let claimed = repository
+            .begin_run(&scope, run.id)
+            .await
+            .expect("begin")
+            .expect("a queued run is claimable");
+        assert_eq!(claimed.status, RunStatus::Running);
+        assert!(
+            repository
+                .begin_run(&scope, run.id)
+                .await
+                .expect("begin")
+                .is_none(),
+            "a run already claimed must not be claimable twice"
+        );
+
+        let second = accepted_run(&repository, &scope).await;
+        repository
+            .cancel_turn(&scope, second.turn_id)
+            .await
+            .expect("cancel");
+        assert!(
+            repository
+                .begin_run(&scope, second.id)
+                .await
+                .expect("begin")
+                .is_none(),
+            "a cancelled run must not be claimable"
+        );
+    }
+
+    /// A run is not claimable through another project's scope, so the executor
+    /// cannot be pointed at a conversation it does not own.
+    #[tokio::test]
+    async fn a_run_is_not_claimable_outside_its_scope() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        let other = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        assert!(
+            repository
+                .begin_run(&other, run.id)
+                .await
+                .expect("begin")
+                .is_none()
+        );
+        assert!(
+            repository
+                .finish_run(
+                    &other,
+                    run.id,
+                    RunCompletion::Succeeded {
+                        content: "answer".to_owned(),
+                        metadata: Value::Null,
+                    },
+                )
+                .await
+                .expect("finish")
+                .is_none()
+        );
+    }
+
+    /// A successful turn writes exactly one assistant message, terminalises the
+    /// turn and the run together, and reports all of it through the event log.
+    #[tokio::test]
+    async fn finishing_a_run_records_the_answer_once() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        repository
+            .begin_run(&scope, run.id)
+            .await
+            .expect("begin")
+            .expect("claim");
+
+        let transition = repository
+            .finish_run(
+                &scope,
+                run.id,
+                RunCompletion::Succeeded {
+                    content: "  bridge:hello  ".to_owned(),
+                    metadata: json!({"model": "test"}),
+                },
+            )
+            .await
+            .expect("finish")
+            .expect("a running run is finishable");
+
+        assert_eq!(transition.run.status, RunStatus::Succeeded);
+        assert!(transition.run.error.is_none());
+        assert_eq!(transition.turn.status, TurnStatus::Succeeded);
+        let message = transition.message.expect("a success carries its answer");
+        assert_eq!(message.role, MessageRole::Assistant);
+        assert_eq!(message.content, "bridge:hello", "the answer is trimmed");
+        assert_eq!(message.turn_id, Some(run.turn_id));
+        assert_eq!(message.sequence, 2, "it follows the user's message");
+
+        let detail = repository
+            .get_conversation(&scope, run.conversation_id)
+            .await
+            .expect("detail")
+            .expect("the conversation exists");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|message| message.role == MessageRole::Assistant)
+                .count(),
+            1
+        );
+
+        let events = repository
+            .replay_events(&scope, run.conversation_id, Some(0))
+            .await
+            .expect("events");
+        let types = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                "conversation.created",
+                "message.created",
+                "turn.accepted",
+                "run.running",
+                "message.created",
+                "run.succeeded"
+            ],
+            "a turn must be observable from acceptance to terminal state"
+        );
+        assert!(
+            repository
+                .finish_run(
+                    &scope,
+                    run.id,
+                    RunCompletion::Succeeded {
+                        content: "second".to_owned(),
+                        metadata: Value::Null,
+                    },
+                )
+                .await
+                .expect("finish")
+                .is_none(),
+            "a terminal run must not be finishable again"
+        );
+        let detail = repository
+            .get_conversation(&scope, run.conversation_id)
+            .await
+            .expect("detail")
+            .expect("the conversation exists");
+        assert_eq!(
+            detail.messages.len(),
+            2,
+            "a rejected second finish must not append a second answer"
+        );
+    }
+
+    /// A failed turn records the typed error and no answer at all: an empty
+    /// assistant message would be indistinguishable from a fabricated one.
+    #[tokio::test]
+    async fn a_failed_run_records_no_answer() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        repository
+            .begin_run(&scope, run.id)
+            .await
+            .expect("begin")
+            .expect("claim");
+
+        let transition = repository
+            .finish_run(
+                &scope,
+                run.id,
+                RunCompletion::Failed {
+                    error: AppError::capability_missing("no model provider"),
+                },
+            )
+            .await
+            .expect("finish")
+            .expect("a running run is finishable");
+
+        assert_eq!(transition.run.status, RunStatus::Failed);
+        assert_eq!(
+            transition.run.error.as_ref().map(|error| error.code),
+            Some(crate::ErrorCode::CapabilityMissing)
+        );
+        assert_eq!(transition.turn.status, TurnStatus::Failed);
+        assert!(transition.message.is_none());
+        let detail = repository
+            .get_conversation(&scope, run.conversation_id)
+            .await
+            .expect("detail")
+            .expect("the conversation exists");
+        assert_eq!(
+            detail.messages.len(),
+            1,
+            "a failed turn must not leave an assistant message behind"
+        );
+    }
+
+    /// An answer that cannot be stored fails the run with a typed error instead
+    /// of being truncated, and writes no message.
+    #[tokio::test]
+    async fn an_unstorable_answer_fails_the_run_without_storing_it() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        for content in ["   ".to_owned(), "x".repeat(MAX_MESSAGE_CHARS + 1)] {
+            let run = accepted_run(&repository, &scope).await;
+            repository
+                .begin_run(&scope, run.id)
+                .await
+                .expect("begin")
+                .expect("claim");
+            let transition = repository
+                .finish_run(
+                    &scope,
+                    run.id,
+                    RunCompletion::Succeeded {
+                        content,
+                        metadata: Value::Null,
+                    },
+                )
+                .await
+                .expect("finish")
+                .expect("a running run is finishable");
+            assert_eq!(transition.run.status, RunStatus::Failed);
+            assert_eq!(
+                transition.run.error.as_ref().map(|error| error.code),
+                Some(crate::ErrorCode::InvalidRequest)
+            );
+            assert!(transition.message.is_none());
+            let detail = repository
+                .get_conversation(&scope, run.conversation_id)
+                .await
+                .expect("detail")
+                .expect("the conversation exists");
+            assert_eq!(detail.messages.len(), 1);
+        }
+    }
+
+    /// Cancellation outranks completion: a run cancelled while the turn was
+    /// executing keeps the cancellation, and the answer is dropped rather than
+    /// attached to a cancelled run.
+    #[tokio::test]
+    async fn cancellation_outranks_a_late_completion() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        repository
+            .begin_run(&scope, run.id)
+            .await
+            .expect("begin")
+            .expect("claim");
+        repository
+            .cancel_turn(&scope, run.turn_id)
+            .await
+            .expect("cancel");
+
+        assert!(
+            repository
+                .finish_run(
+                    &scope,
+                    run.id,
+                    RunCompletion::Succeeded {
+                        content: "too late".to_owned(),
+                        metadata: Value::Null,
+                    },
+                )
+                .await
+                .expect("finish")
+                .is_none(),
+            "a cancelled run is already terminal"
+        );
+        let detail = repository
+            .get_conversation(&scope, run.conversation_id)
+            .await
+            .expect("detail")
+            .expect("the conversation exists");
+        assert_eq!(detail.runs[0].status, RunStatus::Cancelled);
+        assert_eq!(detail.turns[0].status, TurnStatus::Cancelled);
+        assert_eq!(detail.messages.len(), 1);
     }
 }

@@ -14,11 +14,15 @@ mod project;
 mod tenancy;
 
 pub use agent::{
-    AgentRepository, AgentRuntime, AppendMessage, AttachmentId, AttachmentReference, Conversation,
-    ConversationDetail, ConversationEvent, ConversationEventId, ConversationId, ConversationStatus,
-    CreateConversation, MemoryAgentRepository, Message, MessageId, MessageRole,
-    MissingAgentRuntime, ObjectRef, Run, RunId, RunStatus, RuntimeCapability,
-    RuntimeCapabilityStatus, SharedAgentRepository, SubmitAcceptance, Turn, TurnId, TurnStatus,
+    AgentCheckpoint, AgentRepository, AgentRuntime, AppendMessage, AttachmentId,
+    AttachmentReference, CheckpointId, Conversation, ConversationDetail, ConversationEvent,
+    ConversationEventId, ConversationId, ConversationStatus, CreateConversation, MAX_MESSAGE_CHARS,
+    MemoryAgentRepository, Message, MessageId, MessageRole, MissingAgentRuntime, ObjectRef,
+    RUNTIME_NOT_CONFIGURED, RecordToolCall, Run, RunCompletion, RunId, RunStatus, RunTransition,
+    RuntimeCapability, RuntimeCapabilityStatus, SharedAgentRepository, StoreCheckpoint,
+    SubmitAcceptance, ToolCallDecision, ToolCallLedgerEntry, ToolCallLedgerId, ToolCallOutcome,
+    Turn, TurnId, TurnInput, TurnReport, TurnStatus, validate_append_message,
+    validate_checkpoint_write, validate_message_content, validate_tool_call_write,
 };
 pub use auth::{
     AuthRepository, DEFAULT_SESSION_TTL_SECS, DEVELOPMENT_USER_EMAIL, LoginIdentity, Membership,
