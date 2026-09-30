@@ -5,6 +5,7 @@
 
 ## 当前：W00 AI 工作台与 Agent Runtime
 
+- [ ] 在 Windows 本地开发文档中验证从 GitHub Actions 下载 `rusty-v8-msvc-<sha>` artifact、执行哈希校验恢复脚本后，`cargo check --workspace` 不再触发 V8 网络下载。
 - [ ] 在 current-thread 运行时验证模块求值和 `main` 死循环的独立墙钟终止；实现已改为 OS 线程守卫，测试必须在 V8 构建可用后执行，不能依赖被 JS 阻塞的 Tokio 定时器。
 - [ ] 增加启动期重启对账：进程内没有任何优雅关闭，退出时在飞的 run 会永久停在 `running`。需要启动扫描发现遗留 run 并落终态；该做法在单进程下成立、多副本下错误，落地时必须把这个假设显式写进代码而非留给读者推断。
 - [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。

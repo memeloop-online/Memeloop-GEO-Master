@@ -4,6 +4,7 @@ members = [
     "crates/api",
     "crates/app",
     "crates/persistence",
+    "crates/provider",
     "crates/worker",
 ]
 resolver = "2"
@@ -39,3 +40,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"

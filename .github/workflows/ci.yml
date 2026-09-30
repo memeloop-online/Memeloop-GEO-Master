@@ -1,4 +1,4 @@
-name: CI
+name: CI (5-minute milestone)
 
 on:
   push:
@@ -12,78 +12,194 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  frontend:
-    name: Frontend checks
+  linux:
+    name: Linux Rust/V8 + frontend (5-minute milestone)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Detect frontend workspace
-        id: workspace
-        shell: bash
-        run: |
-          present=false
-          for directory in apps packages; do
-            if [[ -d "$directory" ]] && find "$directory" -name package.json -print -quit | grep -q .; then
-              present=true
-              break
-            fi
-          done
-          echo "present=$present" >> "$GITHUB_OUTPUT"
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+          run_install: false
 
       - name: Set up Node
-        if: steps.workspace.outputs.present == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install frontend dependencies
-        if: steps.workspace.outputs.present == 'true'
-        shell: bash
-        run: |
-          corepack enable
-          if [[ -f pnpm-lock.yaml ]]; then
-            pnpm install --frozen-lockfile
-          else
-            pnpm install --no-frozen-lockfile
-          fi
-
-      - name: Check frontend format, types, and tests
-        if: steps.workspace.outputs.present == 'true'
-        run: |
-          pnpm run format:check
-          pnpm run typecheck
-          pnpm run test
-          pnpm run build
-
-      - name: Report deferred frontend setup
-        if: steps.workspace.outputs.present != 'true'
-        run: echo "No frontend workspace yet; checks will run when apps/ or packages/ contains package.json."
-
-  backend:
-    name: Backend checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Detect Rust workspace
-        id: workspace
-        shell: bash
-        run: echo "present=$([[ -f Cargo.toml ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Set up Rust
-        if: steps.workspace.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Check backend format, lint, and tests
-        if: steps.workspace.outputs.present == 'true'
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace --all-targets
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-      - name: Report deferred backend setup
-        if: steps.workspace.outputs.present != 'true'
-        run: echo "No Cargo.toml yet; checks will run when the Rust workspace is added."
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build generated MemeLoop bundle
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          pnpm agent:bundle 2>&1 | tee logs/pnpm-agent-bundle.log
+
+      - name: Check frontend format, types, tests, and build
+        shell: bash
+        run: |
+          set -o pipefail
+          pnpm format:check 2>&1 | tee logs/pnpm-format.log
+          pnpm typecheck 2>&1 | tee logs/pnpm-typecheck.log
+          pnpm test 2>&1 | tee logs/pnpm-test.log
+          pnpm build 2>&1 | tee logs/pnpm-build.log
+
+      - name: Check Rust format, lint, and tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          cargo fmt --all -- --check 2>&1 | tee logs/cargo-fmt.log
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee logs/cargo-clippy.log
+          cargo test --workspace --all-targets 2>&1 | tee logs/cargo-test.log
+
+      - name: Run generated bundle Rust/V8 compatibility test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p geo-worker --test memeloop_bundle -- --ignored 2>&1 | tee logs/cargo-memeloop-bundle.log
+
+      - name: Write 5-minute milestone summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## 5-minute milestone"
+            echo
+            echo "- Linux frontend checks, Rust/V8 checks, and generated bundle verification are configured in this job."
+            echo "- The Linux-generated JavaScript bundle is uploaded with third-party notices; it is not a Windows/MSVC rusty_v8 cache."
+            echo "- Test logs are uploaded separately for failed-run diagnosis."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload generated MemeLoop bundle and notices
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memeloop-bundle-linux-${{ github.sha }}
+          if-no-files-found: warn
+          path: |
+            packages/agent-runtime/dist/memeloop-agent-loop.bundle.mjs
+            packages/agent-runtime/THIRD_PARTY_NOTICES.md
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-logs-${{ github.sha }}
+          if-no-files-found: warn
+          path: logs/
+
+  windows-msvc:
+    name: Windows MSVC Rust/V8 (5-minute milestone)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache Cargo and rusty_v8
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/.rusty_v8
+            target
+          key: ${{ runner.os }}-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msvc-cargo-
+
+      - name: Build Rust workspace
+        shell: pwsh
+        run: cargo build --workspace --target x86_64-pc-windows-msvc
+
+      - name: Test Rust workspace
+        shell: pwsh
+        run: cargo test --workspace --all-targets --target x86_64-pc-windows-msvc
+
+      - name: Collect rusty_v8 archive and metadata
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $cacheDirectory = Join-Path $cargoHome ".rusty_v8"
+          $artifactDirectory = Join-Path $env:GITHUB_WORKSPACE "artifacts\rusty-v8-msvc"
+          New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
+
+          $archives = @(Get-ChildItem -LiteralPath $cacheDirectory -File -Filter "*.lib.gz" -ErrorAction SilentlyContinue)
+          if ($archives.Count -eq 0) {
+            throw "No rusty_v8 .lib.gz archive was found in $cacheDirectory."
+          }
+          foreach ($archive in $archives) {
+            Copy-Item -LiteralPath $archive.FullName -Destination (Join-Path $artifactDirectory $archive.Name)
+          }
+          $archives |
+            ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } |
+            Set-Content (Join-Path $artifactDirectory "rusty_v8.sha256")
+
+          $rustcVersion = rustc -vV
+          $rustcVersion | Set-Content (Join-Path $artifactDirectory "rustc.txt")
+          "x86_64-pc-windows-msvc" | Set-Content (Join-Path $artifactDirectory "target.txt")
+          $lockfile = Get-Content (Join-Path $env:GITHUB_WORKSPACE "Cargo.lock") -Raw
+          if ($lockfile -match '(?ms)name = "v8"\s+version = "([^"]+)"') {
+            $Matches[1] | Set-Content (Join-Path $artifactDirectory "v8-version.txt")
+          } else {
+            "unknown" | Set-Content (Join-Path $artifactDirectory "v8-version.txt")
+          }
+          Get-ChildItem -LiteralPath $cacheDirectory -File |
+            Select-Object Name, Length, LastWriteTimeUtc |
+            Format-Table -AutoSize |
+            Out-String |
+            Set-Content (Join-Path $artifactDirectory "rusty_v8-cache-inventory.txt")
+
+      - name: Write 5-minute milestone summary
+        if: always()
+        shell: pwsh
+        run: |
+          @"
+          ## 5-minute milestone
+
+          - Windows MSVC Rust/V8 build and tests run against the native target.
+          - The exact `rusty_v8` archive, SHA-256, rustc, target, and V8 metadata are uploaded below.
+          - This artifact is Windows/MSVC-only and is not a Linux or local cross-platform bundle.
+          "@ | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows rusty_v8 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusty-v8-msvc-${{ github.sha }}
+          if-no-files-found: warn
+          path: artifacts/rusty-v8-msvc/

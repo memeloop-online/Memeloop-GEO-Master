@@ -318,7 +318,7 @@ mod tests {
     deno_core::extension!(geo_host_output_budget_test, ops = [op_host_emit],);
 
     fn runtime(state: HostState) -> JsRuntime {
-        let mut runtime = JsRuntime::new(RuntimeOptions {
+        let runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![geo_host_output_budget_test::init()],
             ..Default::default()
         });

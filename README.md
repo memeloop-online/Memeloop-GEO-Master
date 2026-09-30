@@ -62,6 +62,29 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 ```
 
+### Windows V8 CI artifact
+
+The Windows/MSVC CI job uploads the exact prebuilt `rusty_v8` archives needed by
+the locked Rust dependency version. This is intended for local development: it
+avoids rebuilding V8 or downloading it again during every Cargo invocation.
+
+After a successful Windows CI run, download the artifact with GitHub CLI and
+restore it into the local Cargo cache:
+
+```powershell
+$run = gh run list --workflow ci.yml --branch integration/w00-pr-stack --limit 1 --json databaseId,headSha,status,conclusion | ConvertFrom-Json | Select-Object -First 1
+$artifact = "rusty-v8-msvc-$($run.headSha)"
+$download = Join-Path (Get-Location) ".artifacts\$artifact"
+gh run download $run.databaseId --name $artifact --dir $download
+pwsh ./scripts/fetch-v8-artifact.ps1 -ArtifactDirectory $download
+cargo check --workspace
+```
+
+The restore script verifies every archive against `rusty_v8.sha256`, requires
+`x86_64-pc-windows-msvc`, and copies only verified `.lib.gz` files to
+`$env:CARGO_HOME\.rusty_v8` (or the default Cargo home). Linux bundle artifacts
+are deliberately rejected and must never be used as a Windows V8 cache.
+
 Stop local dependencies with `docker compose down`. Named volumes retain local
 data; remove them only when an intentional clean reset is required:
 `docker compose down --volumes`.

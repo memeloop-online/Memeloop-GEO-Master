@@ -129,3 +129,8 @@
 - **clippy 收口**：`crates/domain/src/agent.rs` 的 `collapsible_if` 已用 let-chain 修掉（`if let Some(turn) = … && turn.status == …`，语义等价）。该 warning **由本轮引入**（base 为 0 条），而 CI 对每个 PR 跑 `cargo clippy -- -D warnings`，不修则本轮全部 PR 的 CI 必然为红。`crates/api` 内的同类 warning 同轮修掉；`cargo fmt --all -- --check` 同时暴露了 `crates/persistence/tests/postgres.rs` 的 3 处换行漂移（同样是本轮引入，base 为 0），已用 `cargo fmt --all` 修正。二者现已全部通过。
 - **更正本文件 2026-09-21 的本地环境结论**：该条称加 `--end-of-line crlf` 后 prettier 对 `apps/web` 41 个文件全部通过、故"47 个报错文件中无一存在真实风格问题"——**这个结论是错的**。首个 PR 的 CI 以 `prettier --check` 在 `apps/web/src/pages/SetupPage.test.tsx` 失败：两处超长 `reason` 字面量未按 prettier 期望在键后换行。CRLF 噪声恰好掩盖了这一处真实问题：本机 `format:check` 对**每一个**检出文件都报错，等于该信号已失效，不能由"本机全红"推断"没有真实缺陷"。可复现 CI 的做法是取出**提交后**的（LF）内容再检查：`git show <rev>:<path> > /tmp/x.tsx && prettier --check /tmp/x.tsx`。修复已作为独立提交进入各分支。
 - 已知限制（已同步进 `TODO.md`）：**重启对账缺失**——进程内没有任何优雅关闭，退出时在飞的 run 会永久停在 `running`，且修法只在单进程假设下成立、多副本下错误；取消不触达隔离体（`cancel_turn` 语义正确，`finish_run` 不会覆盖 `Cancelled`，但 turn 仍跑到 deadline）；**无堆上限**（`start` 传 `None`，`install_heap_limit_guard` 目前是死代码）；checkpoint 与 tool-call ledger 已有持久化实现但运行路径尚未写入。
+# 2026-09-30
+
+- CI 新增 Windows/MSVC 专用 `rusty-v8-msvc-<commit>` artifact：包含精确 `.lib.gz`、SHA-256 清单、target、rustc 与 V8 版本元数据；Linux bundle 单独上传，不能充当 Windows V8 缓存。
+- 新增 `scripts/fetch-v8-artifact.ps1`：校验 target 与每个 archive 的 SHA-256 后，仅复制到 `CARGO_HOME\.rusty_v8`。README 已记录 `gh run download` → 校验恢复 → `cargo check` 的本地开发流程。
+- 本机已验证当前锁定 `v8 150.4.0` 的 Windows archive 已落在 `I:\cargo\.rusty_v8`（约 39 MB）；本地 Cargo 可直接复用该缓存。完整 CI artifact 下载链路待下一次 GitHub Actions 成功运行后复核。
