@@ -1117,30 +1117,104 @@ async fn a_main_awaiting_an_unresolvable_promise_fails_promptly() {
     );
 }
 
-/// An unbounded turn is terminated at the deadline instead of pinning its
-/// worker thread forever.  Multi-threaded because the deadline fires from a
-/// separate task, and a spinning isolate owns its thread.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unbounded_turn_is_terminated_at_the_deadline() {
-    let mut runtime = runtime(
-        "export function main() { for(;;) {} }",
-        bridge(Arc::new(FakeHostOps::new())),
-    );
+/// An external guard bounds this regression test even if a watchdog regression
+/// leaves the child process spinning forever.  The child builds the same
+/// current-thread runtime used by the production executor.
+const CURRENT_THREAD_WATCHDOG_CHILD: &str = "GEO_WORKER_CURRENT_THREAD_WATCHDOG_CHILD";
+const CURRENT_THREAD_WATCHDOG_GUARD: Duration = Duration::from_secs(10);
 
+fn run_current_thread_watchdog_case(script: &'static str, call_main: bool) {
+    let current_thread = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the current-thread executor must be constructible");
+
+    current_thread.block_on(async {
+        let mut runtime = runtime(script, bridge(Arc::new(FakeHostOps::new())));
+        let started = Instant::now();
+        let error = if call_main {
+            runtime
+                .call_main(SCENARIO_MODULE, "{}", SHORT_DEADLINE)
+                .await
+                .expect_err("an unbounded turn must be terminated")
+        } else {
+            runtime
+                .evaluate_module(SCENARIO_MODULE, SHORT_DEADLINE)
+                .await
+                .expect_err("an unbounded module evaluation must be terminated")
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < CURRENT_THREAD_WATCHDOG_GUARD,
+            "the deadline must actually stop execution, took {elapsed:?}"
+        );
+        assert!(
+            error.message.contains("terminated"),
+            "unexpected error: {error:?}"
+        );
+        if call_main {
+            assert_eq!(error.stage, "call", "unexpected error: {error:?}");
+        }
+    });
+}
+
+fn run_current_thread_watchdog_child(test_name: &str) {
+    let test_binary = std::env::current_exe().expect("the test binary path must be available");
+    let mut child = std::process::Command::new(test_binary)
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CURRENT_THREAD_WATCHDOG_CHILD, "1")
+        .spawn()
+        .expect("the watchdog regression child must start");
     let started = Instant::now();
-    let error = runtime
-        .call_main(SCENARIO_MODULE, "{}", SHORT_DEADLINE)
-        .await
-        .expect_err("an unbounded turn must be terminated");
-    let elapsed = started.elapsed();
 
-    assert_eq!(error.stage, "call", "unexpected error: {error:?}");
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "the deadline must actually stop execution, took {elapsed:?}"
-    );
-    assert!(
-        error.message.contains("terminated"),
-        "unexpected error: {error:?}"
-    );
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("the watchdog regression child must remain observable")
+        {
+            assert!(
+                status.success(),
+                "the watchdog regression child failed: {status}"
+            );
+            return;
+        }
+        if started.elapsed() >= CURRENT_THREAD_WATCHDOG_GUARD {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the current-thread watchdog regression child exceeded its guard");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Exercises a synchronously spinning `main` on an explicit current-thread
+/// runtime.  It is only run by the parent guard below so a broken watchdog
+/// cannot hang the whole test suite.
+#[test]
+fn current_thread_main_spin_watchdog_child() {
+    if std::env::var_os(CURRENT_THREAD_WATCHDOG_CHILD).is_some() {
+        run_current_thread_watchdog_case("export function main() { for (;;) {} }", true);
+    }
+}
+
+/// Exercises top-level synchronous JavaScript as well: module evaluation can
+/// block the current-thread runtime before it ever reaches a future yield.
+#[test]
+fn current_thread_module_spin_watchdog_child() {
+    if std::env::var_os(CURRENT_THREAD_WATCHDOG_CHILD).is_some() {
+        run_current_thread_watchdog_case("for (;;) {} export function main() {}", false);
+    }
+}
+
+/// Both `call_main` and module evaluation must be interrupted even when V8
+/// monopolises the thread that owns the Tokio current-thread runtime.
+#[test]
+fn current_thread_watchdog_terminates_synchronous_javascript() {
+    for test_name in [
+        "current_thread_main_spin_watchdog_child",
+        "current_thread_module_spin_watchdog_child",
+    ] {
+        run_current_thread_watchdog_child(test_name);
+    }
 }

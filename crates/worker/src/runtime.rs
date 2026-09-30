@@ -12,9 +12,9 @@
 //! `terminate_execution`, `test_heap_limits`) rather than from memory.
 
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use deno_core::{
     Extension, JsRuntime, ModuleId, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions,
@@ -40,33 +40,51 @@ deno_core::extension!(
 /// Terminates the isolate if the stage it guards has not finished by its
 /// deadline.
 ///
-/// A Tokio task rather than a thread: module evaluation and host calls are
-/// driven through the async event loop, so the timer can run concurrently with
-/// the isolate instead of being blocked behind it.
+/// The watchdog runs on an OS thread.  The worker deliberately drives V8 on a
+/// current-thread Tokio runtime, and a synchronous JavaScript loop prevents
+/// that runtime from polling a Tokio timer until after the loop has already
+/// finished.  `IsolateHandle` is thread-safe, so a dedicated waiting thread
+/// can interrupt V8 even while its owner thread is blocked in JavaScript.
 struct DeadlineWatchdog {
-    finished: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    disarm: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DeadlineWatchdog {
     fn start(runtime: &mut JsRuntime, deadline: Duration) -> Self {
-        let finished = Arc::new(AtomicBool::new(false));
         let handle = runtime.v8_isolate().thread_safe_handle();
-        let watchdog_finished = Arc::clone(&finished);
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(deadline).await;
-            if !watchdog_finished.load(Ordering::SeqCst) {
+        let started = Instant::now();
+        let (disarm, receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            if matches!(
+                receiver.recv_timeout(deadline.saturating_sub(started.elapsed())),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
                 handle.terminate_execution();
             }
         });
-        Self { finished, task }
+        Self {
+            disarm: Some(disarm),
+            thread: Some(thread),
+        }
     }
 
-    /// Disarms the watchdog.  Called on every path out of the guarded stage so
-    /// a slow caller cannot terminate an isolate that is already idle.
-    fn disarm(self) {
-        self.finished.store(true, Ordering::SeqCst);
-        self.task.abort();
+    /// Disarms the watchdog and waits for it to exit.  Joining makes the
+    /// boundary synchronous: after this returns no delayed watchdog can
+    /// terminate an isolate that has moved on to another stage.
+    fn disarm(&mut self) {
+        if let Some(disarm) = self.disarm.take() {
+            let _ = disarm.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for DeadlineWatchdog {
+    fn drop(&mut self) {
+        self.disarm();
     }
 }
 
@@ -144,7 +162,7 @@ impl EmbeddedIsolate {
         specifier: &str,
         deadline: Duration,
     ) -> Result<(), WorkerError> {
-        let watchdog = DeadlineWatchdog::start(&mut self.runtime, deadline);
+        let mut watchdog = DeadlineWatchdog::start(&mut self.runtime, deadline);
         let evaluated = self.load_and_evaluate(specifier).await;
         watchdog.disarm();
         evaluated.map(|_| ())
@@ -172,7 +190,7 @@ impl EmbeddedIsolate {
         argument_json: &str,
         deadline: Duration,
     ) -> Result<(), WorkerError> {
-        let watchdog = DeadlineWatchdog::start(&mut self.runtime, deadline);
+        let mut watchdog = DeadlineWatchdog::start(&mut self.runtime, deadline);
         let called = self.evaluate_and_call_main(specifier, argument_json).await;
         watchdog.disarm();
         called
