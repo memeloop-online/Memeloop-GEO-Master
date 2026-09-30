@@ -2,6 +2,7 @@
 
 ## 2026-10-01
 
+- 本批代码提交 `791215a` 的 Actions `36771176608`：Linux、Windows 全部成功，PostgreSQL 16 项实库测试全部通过（不含 non-bypass FORCE RLS），真实 V8 工具循环/应用装配和前端检查通过，Windows artifact 已上传。工作树代码已推送集成分支，未合并 main；附件显式导入下一纵切写入独立接缝文档，不修改产品规格。
 - `a24aca2` 的 Actions `36769809922`：Windows 成功；Linux 其余检查通过，PostgreSQL 15/16 通过。启动重放和重启对账回归已修复；新增附件测试发现初次结果的纳秒时间与数据库微秒时间不一致，完成操作改为返回已持久化对象，确保重放完全一致，等待复验。
 - 第二批功能集成：MemeLoop 原生 function-tool 循环已接知识检索；Provider/worker/bridge 保留工具定义、assistant tool calls 和 tool-result messages，不把纯工具响应的空正文当作最终答案。Node 4 项、真实 V8 bundle 2 项、本地应用 bundle 装配 1 项通过。
 - 文档 `manifest_read` 已接 scoped sealed snapshot、版本/游标分页与全量覆盖统计，规划 ID 与可空正文版本分开。4 项 API host 回归和 30 项 worker host 测试通过；对话 registry 目前仅注册知识检索，文档正文尚未生成。

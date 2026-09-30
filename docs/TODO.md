@@ -12,7 +12,7 @@
 
 ## 当前：W00 AI 工作台与 Agent Runtime
 
-- [ ] 验收启动期重启对账：已实现显式 `GEO_SINGLE_PROCESS_EXECUTOR=true` 下 running → failed；CI 实库测试隔离修复待复验，多副本租约与 queued 恢复仍未实现。默认关闭，滚动部署或多副本不得开启。
+- [ ] 实现多副本租约与 queued 恢复；当前单进程启动对账已通过 CI 实库测试，默认关闭，滚动部署或多副本不得开启。
 - [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
 - [ ] 驱动中途 checkpoint 恢复与 Rust-owned tool-call ledger：executor 已接完成结果存档，但它不是中途恢复；工具 intent/attempt/outcome 必须由 Rust 实际调用前后写入，不能信任 JS 自报。
 - [ ] 真实 MemeLoop 知识检索工具循环与本地应用装配已通过；补持久会话历史、附件读取/显式知识导入、中途恢复及其他业务工具。P00 多附件上传已接，上传不等于解析。
@@ -20,11 +20,14 @@
 - [ ] 扩展 GEO 工具桥接：文档 `manifest_read` 已接；补分发清单、`publish_submit`、`measure_sample`，并注册相应 MemeLoop 业务工具。
 - [ ] 跑通“附件入库 → 带来源回答 → 两个文档分支 fan-out → 恢复 → 结果汇总”首个纵切。
 
+下一步的文件接缝与验收见 [`p00-attachment-import-slice.md`](p00-attachment-import-slice.md)；
+首先实现 Object 导入与回合附件绑定，不把上传成功当作模型已读取。
+
 ## 排队：W03 企业知识库
 
 - [ ] 接入持久对象存储与 URL、PDF、DOCX、XLSX、CSV、OCR 解析器；补齐来源替换、重试、停用和版本生命周期。
 - [ ] 建立产品/结构化事实提取、冲突判定、用途边界与可追溯证据；接入向量检索和可选 LLM 回答。
-- [ ] 文档清单已支持项目级有限规划、封存及 P07 只读快照；补产品/事实级规划、精确增量依赖、后续 revision，并实库验收迁移 0008。
+- [ ] 文档清单已支持项目级有限规划、封存及 P07 只读快照；补产品/事实级规划、精确增量依赖、后续 revision。
 
 ## W04/W09 外部 AI 渠道与竞品验证
 

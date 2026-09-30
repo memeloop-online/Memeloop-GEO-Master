@@ -106,7 +106,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 ## 4. 仍未实现，禁止误判为完成
 
 - 真实 MemeLoop bundle 单回合及知识检索工具循环已通过嵌入式 V8 测试；剩余为其他业务工具、附件和会话历史、持久恢复及分支编排。构建入口 `pnpm agent:bundle`，产物不提交。
-- **重启对账**：已接 `GEO_SINGLE_PROCESS_EXECUTOR=true` 启动扫描，只适用于整个数据库严格单执行进程，默认关闭。滚动部署、多副本不得启用；queued 恢复、租约和优雅关闭仍未实现，PostgreSQL 对账测试待实库验收。
+- **重启对账**：已接 `GEO_SINGLE_PROCESS_EXECUTOR=true` 启动扫描，只适用于整个数据库严格单执行进程，默认关闭。滚动部署、多副本不得启用；queued 恢复、租约和优雅关闭仍未实现。PostgreSQL 对账测试已由 CI 独立 schema 验收。
 - **回合进行中的实时取消**：`cancel_turn` 语义正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
 - **隔离体基础保护**：64 MiB V8 堆、near-heap 终止、独立墙钟和 Rust 输出预算均已回归通过。不设固定隔离体并发准入门槛；高吞吐调度和进程资源观测仍需真实容量验收。
 - **checkpoint 与 tool-call ledger**：executor 已写完成结果存档，中途恢复及 Rust 调用侧 intent/attempt/outcome 尚未接通。
@@ -205,6 +205,9 @@ cargo test -p geo-persistence --test postgres -- --ignored
 3. **扩展真实 bundle 工具循环**：模型工具协议及知识检索已通，下一步接入附件读取/显式导入、文档规划和生成；产物不入库，分发携带第三方许可。
 4. **模型 Provider 与 GEO 工具桥接**：把上述四项 `capability_missing` 逐一变成真实实现。
 5. **首个完整纵切**：上传附件并形成对象引用，给出带来源回答，生成两个文档分支，中断后从 checkpoint 恢复，再 reduce 为结果摘要。
+
+当前附件导入的具体接缝、文件责任和验收见
+[`p00-attachment-import-slice.md`](p00-attachment-import-slice.md)。
 
 每个提交都必须：
 
