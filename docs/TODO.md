@@ -14,7 +14,7 @@
 
 - [ ] 验收启动期重启对账：已实现显式 `GEO_SINGLE_PROCESS_EXECUTOR=true` 下 running → failed；需实库回归、部署文档和多副本租约方案。默认关闭，滚动部署或多副本不得开启；queued 恢复仍未实现。
 - [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
-- [ ] 限制 worker 进程总内存与并发；64 MiB V8 堆、超内存终止和宿主输出预算回归已通过，但不覆盖进程总资源。
+- [ ] 限制 worker 进程总内存与跨实例容量；每 runtime 默认最多 2 个隔离体、满载立即拒绝，直接 start 与后台 run 共用名额，取消等待不提前释放。已通过资源回归，但不覆盖整个进程。
 - [ ] 驱动中途 checkpoint 恢复与 Rust-owned tool-call ledger：executor 已接完成结果存档，但它不是中途恢复；工具 intent/attempt/outcome 必须由 Rust 实际调用前后写入，不能信任 JS 自报。
 - [ ] 真实 MemeLoop 单回合已通过 64 MiB V8 探针；接下来接应用启动、工具循环、消息/附件契约、持久恢复与产物摘要。生成文件不入库，分发时携带第三方许可。
 - [ ] 接应用 Provider 与租户 Token Center：HTTP transport、scope 路由和模型白名单已有测试；真实凭据解析、费用与应用装配未接，默认仍 capability_missing。

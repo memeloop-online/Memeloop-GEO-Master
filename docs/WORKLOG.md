@@ -2,6 +2,8 @@
 
 ## 2026-10-01
 
+- 新增每 runtime 隔离体并发上限，默认 2，支持显式有限配置；直接 start 和后台 run 共用 admission，名额由隔离体生命周期持有而非等待它的调用方持有。4 项竞争、失败释放和取消等待回归通过，既有 runtime 13 项测试通过。此限制不等于跨实例调度、总进程内存或发布吞吐验收。
+- 上游 Token Center 协议已核对并记录于 `token-center-integration.md`，明确内部服务令牌与推理 key 区别、租户/主体映射、轮换和可复制凭据边界。当前尚未实现正式租户适配器。
 - 集成提交 `f484d40` 的 Actions `36748375621` 已确认 Linux 与 Windows 两个 job 全部成功，包含 Linux 真实 MemeLoop bundle/V8 探针；这是此前单平台成功后的完整 CI 复验。
 - 修复 Provider 总截止时间：凭据解析与 HTTP 不再分别获得完整超时额度，共享单一绝对截止；新增两段各 150ms、总预算 250ms 的回归。`cargo test -p geo-provider` 13 项通过，Provider Clippy `-D warnings` 通过。
 - 官方 API client 拒绝将 API 答案标注为 consumer-surface 观测，消费端网页/移动观测需独立连接器，防止污染测量分母。新增拒绝路径回归后 Provider 14 项测试与 Clippy 通过。
