@@ -119,6 +119,26 @@ PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍
 
 ## 5. 本地启动
 
+### 可选：启用本地 P00 模型单回合
+
+仅允许未配置 `DATABASE_URL` 且监听 loopback 的本地内存模式。
+正式租户 Token Center 接入另见 `token-center-integration.md`，不能使用此模式代替。
+
+先运行 `pnpm agent:bundle`，再同时提供全部五项服务端环境变量：
+`GEO_AI_BASE_URL`、`GEO_AI_API_KEY`、`GEO_AI_MODEL`、
+`GEO_AGENT_BUNDLE_PATH`、`GEO_AGENT_BUNDLE_SHA256`。
+密钥通过运行环境或密钥管理器注入，不写入命令日志、Git 或 VITE 变量。
+产物路径为 `packages/agent-runtime/dist/memeloop-agent-loop.bundle.mjs`；
+摘要可用 `Get-FileHash -Algorithm SHA256` 计算。重新构建后需更新摘要。
+
+全部缺省时保持未配置；只提供部分配置、摘要错误、文件超过 8 MiB 或尝试用于数据库模式均拒绝启动。
+模型路由固定为配置模型；该阶段仅证明真实 MemeLoop 单回合模型路径，
+不代表附件、多回合恢复、发布和测量工具已接通。不设置固定两回合并发门禁，优先跑通应用功能。
+
+无需真实凭据的装配验证：
+`cargo test -p geo-app generated_bundle_runs_one_turn_through_assembled_provider -- --ignored`。
+它使用真实生成 bundle 与测试 transport，不会调用外部 AI。
+
 ### 最快的内存开发模式
 
 内存模式适合 UI/API 开发；重启进程会丢失数据。不要设置 `DATABASE_URL`。

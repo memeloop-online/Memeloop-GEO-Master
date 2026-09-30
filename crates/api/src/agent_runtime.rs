@@ -22,12 +22,9 @@
 //!   channel is the bundle's own completion event; a turn that returned without
 //!   reporting one is an error, never an empty answer.
 
+use std::fmt;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
-use std::{
-    fmt,
-    ops::{Deref, DerefMut},
-};
 
 use async_trait::async_trait;
 use geo_domain::{
@@ -41,7 +38,6 @@ use geo_worker::{
     PublishRequest, TURN_COMPLETION_TOPIC, WorkerError,
 };
 use serde_json::{Value, json};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::provider_bridge::SharedModelProvider;
 
@@ -56,36 +52,6 @@ struct Configured {
     entry: &'static str,
     capabilities: Arc<dyn HostOps>,
     v8_heap_limit_bytes: usize,
-    admission: Arc<Semaphore>,
-}
-
-/// A directly driven isolate that owns its admission slot until the isolate
-/// has been dropped. It remains `!Send`, like the underlying `HostRuntime`.
-pub struct AdmittedHostRuntime {
-    runtime: HostRuntime,
-    _admission: OwnedSemaphorePermit,
-}
-
-impl fmt::Debug for AdmittedHostRuntime {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AdmittedHostRuntime")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Deref for AdmittedHostRuntime {
-    type Target = HostRuntime;
-
-    fn deref(&self) -> &HostRuntime {
-        &self.runtime
-    }
-}
-
-impl DerefMut for AdmittedHostRuntime {
-    fn deref_mut(&mut self) -> &mut HostRuntime {
-        &mut self.runtime
-    }
 }
 
 /// The wall-clock ceiling for one turn.
@@ -107,9 +73,6 @@ pub struct EmbeddedAgentRuntime {
 }
 
 impl EmbeddedAgentRuntime {
-    /// Maximum simultaneous isolates per configured runtime by default.
-    /// This does not bound non-V8 process memory or aggregate across processes.
-    pub const DEFAULT_MAX_CONCURRENT_RUNS: usize = 2;
     /// The default hard V8 heap cap for one isolated turn.
     ///
     /// This is deliberately well below a typical process memory limit: each
@@ -189,44 +152,13 @@ impl EmbeddedAgentRuntime {
         capabilities: Arc<dyn HostOps>,
         v8_heap_limit_bytes: usize,
     ) -> Result<Self, WorkerError> {
-        Self::with_bundle_and_limits(
+        Self::validate_v8_heap_limit(v8_heap_limit_bytes)?;
+        Ok(Self::with_bundle_with_validated_heap_limit(
             bundle,
             entry,
             capabilities,
             v8_heap_limit_bytes,
-            Self::DEFAULT_MAX_CONCURRENT_RUNS,
-        )
-    }
-
-    /// Configures both the per-isolate V8 heap bound and the maximum number
-    /// of simultaneous isolates. Zero is rejected rather than disabling
-    /// admission control.
-    pub fn with_bundle_and_limits(
-        bundle: &'static [(&'static str, &'static str)],
-        entry: &'static str,
-        capabilities: Arc<dyn HostOps>,
-        v8_heap_limit_bytes: usize,
-        max_concurrent_runs: usize,
-    ) -> Result<Self, WorkerError> {
-        Self::validate_v8_heap_limit(v8_heap_limit_bytes)?;
-        if max_concurrent_runs == 0 || max_concurrent_runs > Semaphore::MAX_PERMITS {
-            return Err(WorkerError::new(
-                "configuration",
-                format!(
-                    "maximum concurrent runs must be between 1 and {}",
-                    Semaphore::MAX_PERMITS
-                ),
-            ));
-        }
-        Ok(Self {
-            configured: Some(Configured {
-                bundle,
-                entry,
-                capabilities,
-                v8_heap_limit_bytes,
-                admission: Arc::new(Semaphore::new(max_concurrent_runs)),
-            }),
-        })
+        ))
     }
 
     fn with_bundle_with_validated_heap_limit(
@@ -235,14 +167,14 @@ impl EmbeddedAgentRuntime {
         capabilities: Arc<dyn HostOps>,
         v8_heap_limit_bytes: usize,
     ) -> Self {
-        Self::with_bundle_and_limits(
-            bundle,
-            entry,
-            capabilities,
-            v8_heap_limit_bytes,
-            Self::DEFAULT_MAX_CONCURRENT_RUNS,
-        )
-        .expect("built-in runtime limits must be valid")
+        Self {
+            configured: Some(Configured {
+                bundle,
+                entry,
+                capabilities,
+                v8_heap_limit_bytes,
+            }),
+        }
     }
 
     fn validate_v8_heap_limit(v8_heap_limit_bytes: usize) -> Result<(), WorkerError> {
@@ -270,8 +202,7 @@ impl EmbeddedAgentRuntime {
 
     /// Starts one isolated run authorised for `scope`, driven by the caller.
     ///
-    /// Refuses an unconfigured runtime or exhausted admission capacity before
-    /// creating an isolate; it does not queue callers.
+    /// Refuses an unconfigured runtime before creating an isolate.
     ///
     /// The returned isolate is `!Send` and is meant to be driven on the
     /// current-thread runtime the caller is already inside, so capability work
@@ -282,27 +213,17 @@ impl EmbeddedAgentRuntime {
         &self,
         scope: &TenantScope,
         budgets: HostOpBudgets,
-    ) -> Result<AdmittedHostRuntime, WorkerError> {
+    ) -> Result<HostRuntime, WorkerError> {
         let Some(configured) = self.configured.as_ref() else {
             return Err(WorkerError::new("runtime", RUNTIME_NOT_CONFIGURED));
         };
-        let admission = configured
-            .admission
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| WorkerError::new("capacity", "isolate capacity is exhausted"))?;
         let bridge = HostBridge::new(
             Arc::clone(&configured.capabilities),
             scope.clone(),
             tokio::runtime::Handle::current(),
         )
         .with_budgets(budgets);
-        let runtime =
-            Self::new_host_runtime(configured.bundle, bridge, configured.v8_heap_limit_bytes)?;
-        Ok(AdmittedHostRuntime {
-            runtime,
-            _admission: admission,
-        })
+        Self::new_host_runtime(configured.bundle, bridge, configured.v8_heap_limit_bytes)
     }
 
     /// Builds a V8-capped production isolate and installs its guard before the
@@ -346,18 +267,6 @@ impl EmbeddedAgentRuntime {
         let Some(configured) = self.configured.as_ref() else {
             return Err(AppError::capability_missing(RUNTIME_NOT_CONFIGURED));
         };
-        // Acquire before spawn_blocking, so saturation creates neither an
-        // unbounded blocking-pool queue nor another expensive isolate.
-        let admission = configured
-            .admission
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                AppError::new(
-                    ErrorCode::DependencyUnavailable,
-                    "isolate capacity is exhausted",
-                )
-            })?;
         let argument = turn_argument(&input);
         let bundle = configured.bundle;
         let entry = configured.entry;
@@ -372,9 +281,6 @@ impl EmbeddedAgentRuntime {
         // [`HostBridge::new`] for why both halves are load-bearing.
         let application = tokio::runtime::Handle::current();
         let finished = tokio::task::spawn_blocking(move || {
-            // This permit belongs to the blocking closure, not the awaiting
-            // caller: cancellation of the caller cannot release a live slot.
-            let _admission = admission;
             let engine = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
