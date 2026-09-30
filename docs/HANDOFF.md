@@ -1,8 +1,10 @@
 # Memeloop GEO 工程交接说明
 
-更新时间：2026-09-19  
-适用分支：`main`  
-当前实现基线：`e0c5fe7 feat: add P00 AI workbench foundation`
+更新时间：2026-09-30
+
+适用分支：`integration/w00-pr-stack`（本地集成，尚未合并到 `main`）
+
+当前实现基线：W00 PR 栈与独立线程墙钟守卫；验证进度见 `WORKLOG.md`
 
 本文是脱离历史对话后的工程入口。接手者不需要读取 Codex、聊天记录或本地代理上下文；产品范围、当前状态、未完成任务和验证方式均以仓库内容为准。
 
@@ -60,8 +62,8 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 兼容探针（引擎腿）
 
-- 新增隔离 crate `crates/worker`（包名 `geo-worker`），基于 `deno_core 0.412.0` 内嵌 V8，**尚未接入** `geo-api`/`geo-app`。
-- 7 项探针测试覆盖 ESM 跨模块加载、Promise 与顶层 await、host op、墙钟超时、外部取消、堆上限可恢复终止和 checkpoint 序列化；`cargo test -p geo-worker` 全通过。
+- 新增隔离 crate `crates/worker`（包名 `geo-worker`），基于 `deno_core 0.412.0` 内嵌 V8；`geo-api` 已接入运行时边界，应用仍装配 `unconfigured()`。
+- 7 项原始探针覆盖 ESM 跨模块加载、Promise 与顶层 await、host op、墙钟超时、外部取消、堆上限可恢复终止和 checkpoint 序列化。原 PR 验证记录见工作日志；当前集成修改必须单独复验，不能沿用旧测试结果。
 - 隔离边界：JS 只能经 4 个窄 host op 触达 Rust；模块仅限 Rust 注入的内存 allow-list，无文件系统、网络或包 registry 解析；checkpoint 是 Rust 拥有的宿主状态序列化，不是 V8 堆快照。
 - 回退路径不需要第二套运行时：`deno_core` 自带 `quickjs` feature，可在同一 API 上切换引擎。
 
@@ -104,7 +106,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - 真实 MemeLoop bundle 在嵌入式引擎中的加载（引擎契约本身已由 `crates/worker` 验证）。`memeloop/loop-api` 的传递闭包不含任何 `node:` 内建导入，外部依赖只有 `zod`/`acorn`/`json5`/`semver` 四个纯 JS 包；剩余工作是把它们经既有内存加载器注入，并从 `createAgentToolLoopRunner` 这个可移植入口进入。详见 `WORKLOG.md` 中 2026-09-21 的更正记录。
 - **重启对账**：run executor 已在进程内驱动真实 turn，但进程内**没有任何优雅关闭**，因此退出时在飞的 run 会永久停在 `running`。需要启动期扫描。注意该做法在单进程下成立、**多副本下错误**，落地时必须把这个假设显式写进代码。
 - **回合进行中的实时取消**：`cancel_turn` 语义正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
-- **隔离体堆上限**：`EmbeddedAgentRuntime::start` 传入 `None`，`install_heap_limit_guard` 目前是**死代码**，失控循环只受 turn deadline 约束。
+- **隔离体资源限制验证**：`start` 和 `run_turn` 已共用默认 64 MiB V8 堆限制及 near-heap 终止守卫，新增回归仍待本轮执行。这不限制 Rust 宿主事件、ArrayBuffer 等堆外资源或进程总内存，仍需输出预算、并发控制与进程隔离。
 - **checkpoint 与 tool-call ledger** 已有持久化实现，但运行路径尚未写入。
 - 模型 Provider、Token Center 真实调用、流式模型事件和模型费用记账；`model_complete` 目前如实返回 `capability_missing`。
 - GEO 工具桥接实现；`manifest_read`、`publish_submit`、`measure_sample` 目前如实返回 `capability_missing`。
@@ -113,7 +115,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - 独立 AI 渠道测量、证据 reduce、不可变周报和自动进入下一轮。
 - PostgreSQL 全仓库事务级 tenant scope、FORCE RLS 和非 bypass 角色验收。
 
-PostgreSQL 模式下 `PgAgentRepository` 当前故意 fail closed；不要用内存回退掩盖迁移或持久化缺失。复制 `.env.example` 也不会自动把变量载入 Rust 进程，PowerShell 中需要显式设置环境变量。
+PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍 fail closed，不能回退内存。Agent 运行路径尚未使用持久 checkpoint 和 tool-call ledger。复制 `.env.example` 不会自动把变量载入 Rust 进程，PowerShell 中需要显式设置环境变量。
 
 ## 5. 本地启动
 
@@ -145,7 +147,7 @@ $env:DATABASE_URL = "postgres://memeloop:change-me-local-only@localhost:5432/mem
 cargo run -p geo-app
 ```
 
-启动会自动执行 `migrations/`。数据库迁移不创建演示用户、Operator Host 或 Membership；在补齐正式引导/种子流程前，PostgreSQL 模式主要用于迁移和 repository 集成测试，而且 P00 Agent API 会因持久化尚未实现而返回依赖不可用。
+启动会自动执行 `migrations/`。数据库迁移不创建演示用户、Operator Host 或 Membership；在补齐正式引导/种子流程前，PostgreSQL 模式主要用于迁移和 repository 集成测试。P00 的持久会话已实现，但应用运行时仍未配置，提交消息会记录明确的 `capability_missing`，不会生成 AI 回答。
 
 完整基础设施定义见 `compose.yaml`，示例变量见 `.env.example`。任何模型、Token Center、客户、账号或代理凭据都只能由本地环境或秘密管理器注入，禁止写入仓库、前端变量、测试快照和日志。
 
@@ -176,8 +178,8 @@ cargo test -p geo-persistence --test postgres -- --ignored
 
 当前最高优先级是 `TODO.md` 中的 W00，不要先扩展次要页面。建议按以下可独立提交的顺序推进：
 
-1. **兼容探针（引擎腿已完成，bundle 腿已解锁）**：`crates/worker` 已在 `deno_core 0.412.0` 上通过 ESM、Promise、host op、超时、取消、内存上限与 checkpoint 七项测试，尚未接入 `geo-api`/`geo-app`。真实 bundle 腿的实际阻碍不是 Node 内建——`memeloop/loop-api` 不含任何 `node:` 导入，只需注入 `zod`/`acorn`/`json5`/`semver` 四个纯 JS 依赖，并从 `createAgentToolLoopRunner` 进入。回退到 QuickJS 不需要维护第二套运行时——`deno_core` 自带 `quickjs` feature。
-2. **run executor**：安全 Host Ops 与 Agent 持久化均已完成，但两者之间还缺驱动者——有桥、有库、没有进程跑真实 turn。入口是 `EmbeddedAgentRuntime::start(scope, budgets)`；隔离体非 `Send`，需在 run 自己的线程上构建 `HostRuntime`。
+1. **执行安全验证**：复验 current-thread 下模块求值及 `main` 死循环的独立线程墙钟终止、堆上限与取消；测试进程必须有外部截止保护。
+2. **run executor 恢复**：驱动链已存在，剩余工作是租约/重启对账、实时取消及持久 checkpoint/tool-call ledger。不得通过扫描并结束所有 running run 的方式干扰其他副本。
 3. **落地真实 bundle 加载**：打包配方已实证（见 `WORKLOG.md` 2026-09-21），但 1.5 MB 自包含产物的存放方式与第三方许可声明策略需先定夺，再决定是构建时生成还是分发各依赖 ESM。
 4. **模型 Provider 与 GEO 工具桥接**：把上述四项 `capability_missing` 逐一变成真实实现。
 5. **首个完整纵切**：上传附件并形成对象引用，给出带来源回答，生成两个文档分支，中断后从 checkpoint 恢复，再 reduce 为结果摘要。

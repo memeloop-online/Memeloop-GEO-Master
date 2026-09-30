@@ -31,6 +31,9 @@ use tower::ServiceExt;
 
 const GENEROUS_DEADLINE: Duration = Duration::from_secs(30);
 const SCENARIO_MODULE: &str = "memeloop://bundle/scenario.js";
+const HEAP_RUNAWAY_MODULE: &str = "memeloop://bundle/heap-runaway.js";
+const HEAP_RUNAWAY_CHILD_ENV: &str = "GEO_TEST_HEAP_RUNAWAY_CHILD";
+const TEST_V8_HEAP_LIMIT_BYTES: usize = EmbeddedAgentRuntime::MIN_V8_HEAP_LIMIT_BYTES;
 
 /// How long a recorder holds a turn in flight when a test needs to observe the
 /// run while it is still executing.
@@ -57,6 +60,21 @@ static SCENARIO_BUNDLE: &[(&str, &str)] = &[
     ("memeloop://bundle/host-loop.js", HOST_LOOP_JS),
     (SCENARIO_MODULE, SCENARIO_JS),
 ];
+
+/// Deliberately retains every allocation, so V8 cannot reclaim its way out of
+/// the pressure.  This is only executed in a child process below: if a future
+/// engine regression turns a near-heap callback into a process abort, the test
+/// runner that launched it remains alive to report the failure.
+const HEAP_RUNAWAY_JS: &str = r#"
+export async function main() {
+  const held = [];
+  while (true) {
+    held.push("x".repeat(1024));
+  }
+}
+"#;
+
+static HEAP_RUNAWAY_BUNDLE: &[(&str, &str)] = &[(HEAP_RUNAWAY_MODULE, HEAP_RUNAWAY_JS)];
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -448,6 +466,24 @@ async fn a_configured_runtime_reports_the_surface_it_registers() {
     );
 }
 
+/// A deployment can choose a stricter isolate cap, but it cannot accidentally
+/// configure a value that is too small for the approved runtime bootstrap.
+#[test]
+fn configured_runtime_rejects_an_unusable_v8_heap_limit() {
+    let error = EmbeddedAgentRuntime::configured_with_heap_limit(
+        Arc::new(Recorder::new()),
+        EmbeddedAgentRuntime::MIN_V8_HEAP_LIMIT_BYTES - 1,
+    )
+    .expect_err("a V8 cap below the supported floor must be rejected");
+    assert_eq!(error.stage, "configuration");
+    assert!(
+        error
+            .message
+            .contains(&EmbeddedAgentRuntime::MIN_V8_HEAP_LIMIT_BYTES.to_string()),
+        "the validation failure must name the supported floor: {error}"
+    );
+}
+
 /// A run started from the seam carries the run's scope and reaches the injected
 /// capability: the model answer the UI is shown comes from the bridge, not from
 /// anything the script could have synthesised.
@@ -489,6 +525,103 @@ async fn a_started_run_reaches_the_injected_capability_under_the_run_scope() {
         "the answer shown must be the one the bridge produced: {completed}"
     );
     assert_eq!(completed["model"], "recorder");
+}
+
+/// A bounded isolate remains suitable for an ordinary reference turn.  This
+/// covers the direct `start` seam, where callers drive the isolate themselves.
+#[tokio::test]
+async fn a_heap_capped_started_run_still_completes_normally() {
+    let recorder = Arc::new(Recorder::new());
+    let runtime = EmbeddedAgentRuntime::with_bundle_and_heap_limit(
+        SCENARIO_BUNDLE,
+        HOST_MAIN_MODULE,
+        recorder,
+        TEST_V8_HEAP_LIMIT_BYTES,
+    )
+    .expect("the supported minimum must build an isolate");
+    let mut run = runtime
+        .start(&scope(), HostOpBudgets::default())
+        .expect("a heap-capped runtime must start");
+
+    run.evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("an ordinary turn must complete below the heap cap");
+    assert!(
+        run.host_state()
+            .events
+            .iter()
+            .any(|event| event.topic == "loop.completed"),
+        "the capped turn must report normal completion"
+    );
+}
+
+/// The child half of the crash-regression test.  It is a no-op in the ordinary
+/// test run and is invoked by
+/// [`heap_runaway_returns_a_failure_without_terminating_the_test_runner`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heap_runaway_child_returns_a_recoverable_failure() {
+    if std::env::var_os(HEAP_RUNAWAY_CHILD_ENV).is_none() {
+        return;
+    }
+
+    let runtime = EmbeddedAgentRuntime::with_bundle_and_heap_limit(
+        HEAP_RUNAWAY_BUNDLE,
+        HEAP_RUNAWAY_MODULE,
+        Arc::new(Recorder::new()),
+        TEST_V8_HEAP_LIMIT_BYTES,
+    )
+    .expect("the supported minimum must build an isolate");
+    let error = runtime
+        .run_turn(
+            &scope(),
+            geo_domain::TurnInput {
+                conversation_id: uuid::Uuid::new_v4().into(),
+                turn_id: uuid::Uuid::new_v4().into(),
+                run_id: uuid::Uuid::new_v4().into(),
+                prompt: "allocate until V8 stops this turn".to_owned(),
+            },
+        )
+        .await
+        .expect_err("heap exhaustion must fail the turn");
+    assert!(
+        error.message.contains("terminated"),
+        "V8 must unwind the heap limit as a recoverable termination: {error}"
+    );
+}
+
+/// A heap runaway executes in a separately launched test process.  The parent
+/// holds a wall-clock deadline and kills only that exact child if it hangs; a
+/// V8 abort therefore becomes a normal test failure instead of killing the
+/// broader test runner.
+#[test]
+fn heap_runaway_returns_a_failure_without_terminating_the_test_runner() {
+    let executable = std::env::current_exe().expect("the integration test executable");
+    let mut child = std::process::Command::new(executable)
+        .args([
+            "--exact",
+            "heap_runaway_child_returns_a_recoverable_failure",
+            "--nocapture",
+        ])
+        .env(HEAP_RUNAWAY_CHILD_ENV, "1")
+        .spawn()
+        .expect("the heap regression child must start");
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    loop {
+        if let Some(status) = child.try_wait().expect("the heap child status") {
+            assert!(
+                status.success(),
+                "the heap child must report a recoverable turn failure, not abort: {status}"
+            );
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the heap child did not return a recoverable failure before {deadline:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// The four ops this process cannot yet honour report a typed

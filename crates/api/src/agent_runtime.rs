@@ -23,7 +23,7 @@
 //!   reporting one is an error, never an empty answer.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -49,6 +49,7 @@ struct Configured {
     bundle: &'static [(&'static str, &'static str)],
     entry: &'static str,
     capabilities: Arc<dyn HostOps>,
+    v8_heap_limit_bytes: usize,
 }
 
 /// The wall-clock ceiling for one turn.
@@ -70,6 +71,17 @@ pub struct EmbeddedAgentRuntime {
 }
 
 impl EmbeddedAgentRuntime {
+    /// The default hard V8 heap cap for one isolated turn.
+    ///
+    /// This is deliberately well below a typical process memory limit: each
+    /// active run owns an isolate, and host work is budgeted independently.
+    pub const DEFAULT_V8_HEAP_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+    /// The smallest heap that has room for the approved runtime bootstrap and
+    /// a useful turn.  Smaller values risk turning configuration errors into
+    /// startup failures before user code can run.
+    pub const MIN_V8_HEAP_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
     /// The explicit absence of a runtime.
     ///
     /// This is what the application assembles until an approved bundle and a
@@ -93,19 +105,87 @@ impl EmbeddedAgentRuntime {
         Self::with_bundle(HOST_BUNDLE, HOST_MAIN_MODULE, capabilities)
     }
 
+    /// A reference-bundle runtime with an explicit, validated V8 heap cap.
+    ///
+    /// Use this at application assembly when a deployment needs a tighter
+    /// per-turn envelope than [`Self::DEFAULT_V8_HEAP_LIMIT_BYTES`].  The cap
+    /// is finite for every configured runtime; `0` and values too small to
+    /// initialise the approved runtime are rejected rather than silently
+    /// disabling the bound.
+    pub fn configured_with_heap_limit(
+        capabilities: Arc<dyn HostOps>,
+        v8_heap_limit_bytes: usize,
+    ) -> Result<Self, WorkerError> {
+        Self::with_bundle_and_heap_limit(
+            HOST_BUNDLE,
+            HOST_MAIN_MODULE,
+            capabilities,
+            v8_heap_limit_bytes,
+        )
+    }
+
     /// A runtime over an explicit, approved bundle and its entry module.
     pub fn with_bundle(
         bundle: &'static [(&'static str, &'static str)],
         entry: &'static str,
         capabilities: Arc<dyn HostOps>,
     ) -> Self {
+        Self::with_bundle_with_validated_heap_limit(
+            bundle,
+            entry,
+            capabilities,
+            Self::DEFAULT_V8_HEAP_LIMIT_BYTES,
+        )
+    }
+
+    /// A runtime over an explicit, approved bundle and a validated V8 heap
+    /// cap.
+    ///
+    /// The near-heap guard is installed for every run this constructor creates,
+    /// so approaching the cap terminates the isolate and reports a recoverable
+    /// failure instead of aborting the API process.
+    pub fn with_bundle_and_heap_limit(
+        bundle: &'static [(&'static str, &'static str)],
+        entry: &'static str,
+        capabilities: Arc<dyn HostOps>,
+        v8_heap_limit_bytes: usize,
+    ) -> Result<Self, WorkerError> {
+        Self::validate_v8_heap_limit(v8_heap_limit_bytes)?;
+        Ok(Self::with_bundle_with_validated_heap_limit(
+            bundle,
+            entry,
+            capabilities,
+            v8_heap_limit_bytes,
+        ))
+    }
+
+    fn with_bundle_with_validated_heap_limit(
+        bundle: &'static [(&'static str, &'static str)],
+        entry: &'static str,
+        capabilities: Arc<dyn HostOps>,
+        v8_heap_limit_bytes: usize,
+    ) -> Self {
         Self {
             configured: Some(Configured {
                 bundle,
                 entry,
                 capabilities,
+                v8_heap_limit_bytes,
             }),
         }
+    }
+
+    fn validate_v8_heap_limit(v8_heap_limit_bytes: usize) -> Result<(), WorkerError> {
+        if v8_heap_limit_bytes < Self::MIN_V8_HEAP_LIMIT_BYTES {
+            return Err(WorkerError::new(
+                "configuration",
+                format!(
+                    "V8 heap limit must be at least {} bytes",
+                    Self::MIN_V8_HEAP_LIMIT_BYTES
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub fn is_configured(&self) -> bool {
@@ -142,7 +222,25 @@ impl EmbeddedAgentRuntime {
             tokio::runtime::Handle::current(),
         )
         .with_budgets(budgets);
-        HostRuntime::new(configured.bundle, bridge, None)
+        Self::new_host_runtime(configured.bundle, bridge, configured.v8_heap_limit_bytes)
+    }
+
+    /// Builds a V8-capped production isolate and installs its guard before the
+    /// approved bundle can evaluate or call `main`.
+    ///
+    /// `HostRuntime::new` only evaluates its fixed Rust-owned error bootstrap;
+    /// no approved bundle module or tenant-controlled turn data has executed
+    /// until this returns.  Keeping creation and guard installation in one
+    /// helper prevents the direct [`Self::start`] seam and the threaded
+    /// production path from drifting apart.
+    fn new_host_runtime(
+        bundle: &[(&str, &str)],
+        bridge: HostBridge,
+        v8_heap_limit_bytes: usize,
+    ) -> Result<HostRuntime, WorkerError> {
+        let mut runtime = HostRuntime::new(bundle, bridge, Some(v8_heap_limit_bytes))?;
+        runtime.install_heap_limit_guard(Arc::new(AtomicBool::new(false)));
+        Ok(runtime)
     }
 }
 
@@ -172,6 +270,7 @@ impl EmbeddedAgentRuntime {
         let bundle = configured.bundle;
         let entry = configured.entry;
         let capabilities = Arc::clone(&configured.capabilities);
+        let v8_heap_limit_bytes = configured.v8_heap_limit_bytes;
         let run_scope = scope.clone();
         // The isolate is `!Send`, so it is built, driven and dropped inside one
         // blocking task — and on a current-thread runtime of its own, because
@@ -190,7 +289,7 @@ impl EmbeddedAgentRuntime {
             engine.block_on(async {
                 let bridge = HostBridge::new(capabilities, run_scope, application)
                     .with_budgets(HostOpBudgets::default());
-                let mut runtime = HostRuntime::new(bundle, bridge, None)?;
+                let mut runtime = Self::new_host_runtime(bundle, bridge, v8_heap_limit_bytes)?;
                 runtime.call_main(entry, &argument, TURN_DEADLINE).await?;
                 Ok::<_, WorkerError>(runtime.host_state())
             })
