@@ -5,10 +5,11 @@
 
 ## 当前：W00 AI 工作台与 Agent Runtime
 
-- [ ] 在 current-thread 运行时验证模块求值和 `main` 死循环的独立墙钟终止；测试必须有进程外截止保护，不能依赖被 JS 阻塞的 Tokio 定时器。
+- [ ] 在 current-thread 运行时验证模块求值和 `main` 死循环的独立墙钟终止；实现已改为 OS 线程守卫，测试必须在 V8 构建可用后执行，不能依赖被 JS 阻塞的 Tokio 定时器。
 - [ ] 增加启动期重启对账：进程内没有任何优雅关闭，退出时在飞的 run 会永久停在 `running`。需要启动扫描发现遗留 run 并落终态；该做法在单进程下成立、多副本下错误，落地时必须把这个假设显式写进代码而非留给读者推断。
 - [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
-- [ ] 验证隔离体堆上限：`start` 与 `run_turn` 已共用默认 64 MiB V8 堆限制及 near-heap 终止守卫，正常执行和超内存子进程回归待运行；另需限制宿主输出字节、进程总内存和并发，V8 堆限制不覆盖这些资源。
+- [ ] 验证隔离体堆上限：`start` 与 `run_turn` 已共用默认 64 MiB V8 堆限制及 near-heap 终止守卫，正常执行和超内存子进程回归待运行；另需限制进程总内存和并发，V8 堆限制不覆盖这些资源。
+- [ ] 在 V8 构建可用后运行宿主输出预算测试；`op_host_emit` 已限制单事件 64 KiB、累计 1 MiB 和 1,024 事件，恢复 checkpoint 不会提高限制。
 - [ ] 驱动 checkpoint 与 tool-call ledger：两者已有持久化实现，但运行路径尚未写入。
 - [ ] 落地真实 MemeLoop bundle 加载：打包配方已实证（见 `WORKLOG.md` 2026-09-21），但**产物存放与第三方许可策略需先定夺**——自包含 ESM 为 1.5 MB，内含 zod/acorn/json5/semver 代码，合并入仓库须保留相应许可声明。
 - [ ] 实现模型 Provider 与 Token Center 真实调用；`model_complete` 目前如实返回 `capability_missing`。

@@ -5,6 +5,7 @@
 - 后续验证进展：本次命令临时使用公共 Cargo 镜像并保持 `--locked`，成功下载依赖；领域与持久化测试执行成功，14 项需要独立 PostgreSQL 的测试跳过，本机 Docker Engine 不可用。V8 预编译库的默认下载仍失败，正在通过官方 Release 下载，未在仓库记录任何私有下载地址。
 - 领域与持久化 `clippy --all-targets -- -D warnings` 通过，`cargo fmt --all -- --check` 与 `git diff --check` 通过；不将这些检查扩称为尚未编译运行的 API/Worker 验证。
 - 补齐 `EmbeddedAgentRuntime::start` 与 `run_turn` 的 V8 堆限制和 near-heap 终止守卫，默认 64 MiB、可显式配置且拒绝低于 16 MiB 的值；新增正常执行、参数校验和带父进程截止的超内存回归，待 V8 下载完成执行。V8 堆限制不等于进程内存隔离，宿主输出与总内存限制仍未完成。
+- 新增 Rust-owned `op_host_emit` 输出预算：单事件、累计 UTF-8 字节数和事件条数分别限制，拒绝不改变状态；checkpoint 保持原有持久形状，恢复后的已用输出仍计入默认限制。worker 格式检查通过，运行测试待 V8 构建可用。
 - 修正交接文档中的过期基线、未接入执行器及持久化缺失描述，区分本地集成状态与公共主线，不修改产品规格。
 - 本地集成分支汇总 W00 PR 栈，保留原有提交父链；尚未合并到公共主线。新增 `AGENTS.md` 明确公开仓库不得保存用户提供的私有调研对象、账号和运营上下文。
 - 审查发现 `DeadlineWatchdog` 的 Tokio 定时任务与 V8 同处 current-thread 运行时，同步 JS 死循环会阻塞该定时任务；原回归采用 multi-thread，未覆盖生产执行条件。
