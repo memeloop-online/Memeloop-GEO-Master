@@ -1150,6 +1150,141 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         Ok(result)
     }
 
+    async fn get_document_manifest(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+    ) -> Result<Option<DocumentManifest>, AppError> {
+        let project_id = Self::project_id(scope)?;
+        let mut transaction = self.transaction(scope).await?;
+        let row = sqlx::query(
+            "SELECT revision,state,sealed,expected_count,scope_hash,input_refs
+             FROM document_manifests
+             WHERE manifest_id=$1 AND operator_id=$2 AND tenant_id=$3 AND project_id=$4",
+        )
+        .bind(id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let Some(row) = row else {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(None);
+        };
+        // The start-created skeleton has no release reference and cannot be
+        // represented by DocumentManifest. Only sealed snapshots are readable.
+        if !row.get::<bool, _>("sealed") {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(None);
+        }
+        let input_refs: Value = row.get("input_refs");
+        let release_id: Uuid = serde_json::from_value(input_refs["knowledge_release_id"].clone())
+            .map_err(serialization_error)?;
+        let planner_version = input_refs["planner_version"]
+            .as_str()
+            .ok_or_else(|| {
+                AppError::new(
+                    geo_domain::ErrorCode::Internal,
+                    "sealed document manifest has no planner version",
+                )
+            })?
+            .to_owned();
+        let state = match row.get::<String, _>("state").as_str() {
+            "ready" => DocumentManifestState::Ready,
+            "closed" => DocumentManifestState::Closed,
+            _ => {
+                return Err(AppError::new(
+                    geo_domain::ErrorCode::Internal,
+                    "invalid sealed document manifest state",
+                ));
+            }
+        };
+        let item_rows = sqlx::query(
+            "SELECT document_manifest_item_id,knowledge_release_id,document_key,
+                    content_type,product_id,market,language,state,block_reason,dependency_hash,
+                    source_version_refs
+             FROM document_manifest_items
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND manifest_id=$4
+             ORDER BY document_key",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let items = item_rows
+            .iter()
+            .map(|item| {
+                Ok(DocumentManifestItem {
+                    document_manifest_item_id: item.get("document_manifest_item_id"),
+                    manifest_id: id,
+                    knowledge_release_id: item.get("knowledge_release_id"),
+                    document_key: item.get("document_key"),
+                    content_type: item.get("content_type"),
+                    product_id: item.get("product_id"),
+                    market: item.get("market"),
+                    language: item.get("language"),
+                    state: match item.get::<String, _>("state").as_str() {
+                        "planned" => DocumentManifestItemState::Planned,
+                        "blocked" => DocumentManifestItemState::Blocked,
+                        "deferred" => DocumentManifestItemState::Deferred,
+                        "not_applicable" => DocumentManifestItemState::NotApplicable,
+                        _ => {
+                            return Err(AppError::new(
+                                geo_domain::ErrorCode::Internal,
+                                "invalid document item state",
+                            ));
+                        }
+                    },
+                    block_reason: item.get("block_reason"),
+                    dependency_hash: item.get("dependency_hash"),
+                    source_version_refs: serde_json::from_value(item.get("source_version_refs"))
+                        .map_err(serialization_error)?,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let mut coverage = DocumentManifestCoverage {
+            total: items.len() as u64,
+            ..DocumentManifestCoverage::default()
+        };
+        for item in &items {
+            match item.state {
+                DocumentManifestItemState::Planned => coverage.planned += 1,
+                DocumentManifestItemState::Blocked => coverage.blocked += 1,
+                DocumentManifestItemState::Deferred => coverage.deferred += 1,
+                DocumentManifestItemState::NotApplicable => coverage.not_applicable += 1,
+            }
+        }
+        let expected_count: Option<i64> = row.get("expected_count");
+        if expected_count != Some(items.len() as i64) {
+            return Err(AppError::new(
+                geo_domain::ErrorCode::Internal,
+                "sealed document manifest count does not match persisted items",
+            ));
+        }
+        let manifest = DocumentManifest {
+            manifest_id: id,
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id,
+            revision: row.get("revision"),
+            knowledge_release_id: release_id,
+            planner_version,
+            state,
+            sealed: true,
+            expected_count,
+            scope_hash: row.get("scope_hash"),
+            items,
+            coverage,
+        };
+        transaction.commit().await.map_err(database_error)?;
+        Ok(Some(manifest))
+    }
+
     async fn plan_document_manifest(
         &self,
         scope: &TenantScope,
@@ -1205,90 +1340,11 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                     "document manifest is sealed with different planning input",
                 ));
             }
-            let item_rows = sqlx::query(
-                "SELECT document_manifest_item_id,knowledge_release_id,document_key,
-                        content_type,product_id,market,language,state,block_reason,dependency_hash,
-                        source_version_refs
-                 FROM document_manifest_items
-                 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND manifest_id=$4
-                 ORDER BY document_key",
-            )
-            .bind(scope.operator_id.as_uuid())
-            .bind(scope.tenant_id.as_uuid())
-            .bind(project_id.as_uuid())
-            .bind(request.manifest_id)
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            let items = item_rows
-                .iter()
-                .map(|item| {
-                    Ok(DocumentManifestItem {
-                        document_manifest_item_id: item.get("document_manifest_item_id"),
-                        manifest_id: request.manifest_id,
-                        knowledge_release_id: item.get("knowledge_release_id"),
-                        document_key: item.get("document_key"),
-                        content_type: item.get("content_type"),
-                        product_id: item.get("product_id"),
-                        market: item.get("market"),
-                        language: item.get("language"),
-                        state: match item.get::<String, _>("state").as_str() {
-                            "planned" => DocumentManifestItemState::Planned,
-                            "blocked" => DocumentManifestItemState::Blocked,
-                            "deferred" => DocumentManifestItemState::Deferred,
-                            "not_applicable" => DocumentManifestItemState::NotApplicable,
-                            _ => {
-                                return Err(AppError::new(
-                                    geo_domain::ErrorCode::Internal,
-                                    "invalid document item state",
-                                ));
-                            }
-                        },
-                        block_reason: item.get("block_reason"),
-                        dependency_hash: item.get("dependency_hash"),
-                        source_version_refs: serde_json::from_value(
-                            item.get("source_version_refs"),
-                        )
-                        .map_err(serialization_error)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, AppError>>()?;
-            let mut coverage = DocumentManifestCoverage {
-                total: items.len() as u64,
-                ..DocumentManifestCoverage::default()
-            };
-            for item in &items {
-                match item.state {
-                    DocumentManifestItemState::Planned => coverage.planned += 1,
-                    DocumentManifestItemState::Blocked => coverage.blocked += 1,
-                    DocumentManifestItemState::Deferred => coverage.deferred += 1,
-                    DocumentManifestItemState::NotApplicable => coverage.not_applicable += 1,
-                }
-            }
-            let expected_count: Option<i64> = row.get("expected_count");
-            if expected_count != Some(items.len() as i64) {
-                return Err(AppError::new(
-                    geo_domain::ErrorCode::Internal,
-                    "sealed document manifest count does not match persisted items",
-                ));
-            }
-            let manifest = DocumentManifest {
-                manifest_id: request.manifest_id,
-                operator_id: scope.operator_id,
-                tenant_id: scope.tenant_id,
-                project_id,
-                revision: row.get("revision"),
-                knowledge_release_id: request.knowledge_release_id,
-                planner_version: geo_domain::DOCUMENT_PLANNER_VERSION.to_owned(),
-                state: DocumentManifestState::Ready,
-                sealed: true,
-                expected_count,
-                scope_hash,
-                items,
-                coverage,
-            };
             transaction.commit().await.map_err(database_error)?;
-            return Ok(manifest);
+            return self
+                .get_document_manifest(scope, request.manifest_id)
+                .await?
+                .ok_or_else(|| AppError::not_found("document manifest not found"));
         }
         let public_refs = sqlx::query_scalar::<_, Uuid>(
             "SELECT link.source_version_id

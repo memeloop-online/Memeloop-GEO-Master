@@ -77,7 +77,7 @@ const navItems: NavItem[] = [
     icon: <LightbulbRegular />,
   },
   {
-    to: "campaigns/demo-plan",
+    to: "campaigns/current",
     label: "计划与动作",
     code: "P07",
     icon: <CalendarLtrRegular />,

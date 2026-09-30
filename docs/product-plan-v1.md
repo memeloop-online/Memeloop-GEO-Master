@@ -221,7 +221,7 @@ geo.run.pause_project
 
 ### 0.10 模型 Provider、Token Center 与秘密
 
-- OpenAI-compatible endpoint 由服务端环境或 Secret Manager 注入，开发/内网默认可配置 `GEO_AI_BASE_URL=https://token.k3s.onetwo.website/v1`。
+- OpenAI-compatible endpoint 由服务端环境或 Secret Manager 注入，开发环境通过 `GEO_AI_BASE_URL` 配置；部署地址不写入公开仓库。
 - 密钥只通过 `GEO_AI_API_KEY` 或 Secret Manager 注入；不能写入 Git、前端 `VITE_*`、消息、附件、checkpoint、脚本、错误详情或日志。
 - `GEO_AI_DEFAULT_MODEL` 只保存模型路由标识。对话、附件和租户输入不能覆盖 provider host 或注入新的外部 URL。
 - JS 中的 MemeLoop `ILLMProvider` 通过 Rust host op 调用模型；Rust 执行 HTTP/SSE、超时、取消、429 backoff、用量记录和脱敏。

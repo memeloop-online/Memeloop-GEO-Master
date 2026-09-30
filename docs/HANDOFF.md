@@ -4,7 +4,7 @@
 
 适用分支：`integration/w00-pr-stack`（本地集成，尚未合并到 `main`）
 
-当前实现基线：W00 运行时兼容、Provider HTTP/路由、SSE 重验与项目级文档清单；精确验证进度见 `WORKLOG.md`，应用默认 AI 装配仍未开启。
+当前实现基线：W00 运行时兼容、Provider HTTP/路由、本地 P00 模型装配、SSE 重验与 P07 项目级文档清单；精确验证进度见 `WORKLOG.md`。不配置模型时 AI 保持未开启，生产租户凭据适配尚未完成。
 
 本文是脱离历史对话后的工程入口。接手者不需要读取 Codex、聊天记录或本地代理上下文；产品范围、当前状态、未完成任务和验证方式均以仓库内容为准。
 
@@ -62,7 +62,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 兼容探针（引擎腿）
 
-- 新增隔离 crate `crates/worker`（包名 `geo-worker`），基于 `deno_core 0.412.0` 内嵌 V8；`geo-api` 已接入运行时边界，应用仍装配 `unconfigured()`。
+- 新增隔离 crate `crates/worker`（包名 `geo-worker`），基于 `deno_core 0.412.0` 内嵌 V8；`geo-api` 已接入运行时边界，应用在显式本地模型配置下装配真实 bundle，否则为 `unconfigured()`。
 - 7 项原始探针覆盖 ESM 跨模块加载、Promise 与顶层 await、host op、墙钟超时、外部取消、堆上限可恢复终止和 checkpoint 序列化。原 PR 验证记录见工作日志；当前集成修改必须单独复验，不能沿用旧测试结果。
 - 隔离边界：JS 只能经 4 个窄 host op 触达 Rust；模块仅限 Rust 注入的内存 allow-list，无文件系统、网络或包 registry 解析；checkpoint 是 Rust 拥有的宿主状态序列化，不是 V8 堆快照。
 - 回退路径不需要第二套运行时：`deno_core` 自带 `quickjs` feature，可在同一 API 上切换引擎。
@@ -79,13 +79,13 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 - 封闭且带版本的 op 面（`geo.hostops.v1`）：只有 `model.complete.v1`、`knowledge.search.v1`、`manifest.read.v1`、`publish.submit.v1`、`measure.sample.v1` 五项；不在枚举里的名字没有 op，也就没有 Rust 实现体。JS 无法取得 SQL、任意网络、文件、进程或环境变量。
 - 边界方向为 `geo-api → geo-worker`，worker 从不反向依赖 API。请求 DTO 全部 `#[serde(deny_unknown_fields)]` 且不携带 tenant/project 选择器，作用域只能来自 Rust 侧 bridge。预算、单次调用截止与取消统一在 `HostBridge::invoke` 施加。
-- 应用当前装配 `unconfigured()`，四个尚未实现的能力如实返回 `capability_missing`；`RepositoryHostOps` 只实现 `knowledge_search`。**没有用空结果冒充成功。**
+- `RepositoryHostOps` 已实现 `knowledge_search` 和可注入的 `model_complete`；本地开发模型装配见第 5 节。未配置或未实现的能力返回 `capability_missing`，不以空结果冒充成功。
 
 ### W00 Run Executor
 
 - `append_message` 提交**之后**由 handler 调用 `run_executor::dispatch`：`begin_run`（原子 `UPDATE … WHERE status='queued' RETURNING`）→ `run_turn` → `finish_run`（**单事务**写 run 状态、错误、assistant 消息、turn 终态与事件）。HTTP 响应只陈述**受理**，永不乐观地写成 `running`。
 - **运行时 flavor 是本模块的硬约束，改任何一处都会静默出错**：`deno_core` 的 op driver 用 `deno_unsync::tokio::spawn` 派生首次轮询未完成的 op future，该函数断言 `runtime_flavor() == CurrentThread` 并据此把非 `Send` future 伪装为 `Send`。因此**隔离体必须在自己的 current-thread 运行时上驱动**（且在同一个 `spawn_blocking` 任务内构建与销毁，因为隔离体非 `Send`），而**能力调用必须投递回应用运行时**（tokio I/O 资源绑定创建它的运行时，连接池不能跨 turn 迁移）。在多线程运行时上驱动隔离体在 debug 下中止进程、在 release 下是未定义行为。理由写在 `HostBridge::new` 的文档注释里。
-- 未配置装配下成功路径**无法演示**（`main.rs` 故意没有能打开部分配置运行时的开关）；成功路径由使用参考 bundle + 桩桥的 API 测试覆盖：`crates/api/tests/agent_runtime.rs`、`crates/worker/tests/host_ops.rs`。
+- 未配置装配下提交消息会产生能力缺失；配置后真实 bundle 单回合已由应用装配测试覆盖，测试使用注入 transport，不代表已调用真实外部模型。参考 bundle + 桩桥测试仍见 `crates/api/tests/agent_runtime.rs`、`crates/worker/tests/host_ops.rs`。
 
 ### W00 Agent PostgreSQL 持久化
 
@@ -103,15 +103,15 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ## 4. 仍未实现，禁止误判为完成
 
-- 真实 MemeLoop bundle 单回合已通过嵌入式 V8 探针；剩余为应用启动装配、工具循环、附件和会话历史、持久恢复及分支编排。构建入口 `pnpm agent:bundle`，产物不提交。
+- 真实 MemeLoop bundle 单回合已通过嵌入式 V8 及本地应用装配测试；剩余为工具循环、附件和会话历史、持久恢复及分支编排。构建入口 `pnpm agent:bundle`，产物不提交。
 - **重启对账**：已接 `GEO_SINGLE_PROCESS_EXECUTOR=true` 启动扫描，只适用于整个数据库严格单执行进程，默认关闭。滚动部署、多副本不得启用；queued 恢复、租约和优雅关闭仍未实现，PostgreSQL 对账测试待实库验收。
 - **回合进行中的实时取消**：`cancel_turn` 语义正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
-- **隔离体资源限制**：64 MiB V8 堆、near-heap 终止、独立墙钟和 Rust 输出预算均已回归通过；并发控制、堆外资源和进程总内存限制仍需实现。
+- **隔离体基础保护**：64 MiB V8 堆、near-heap 终止、独立墙钟和 Rust 输出预算均已回归通过。不设固定隔离体并发准入门槛；高吞吐调度和进程资源观测仍需真实容量验收。
 - **checkpoint 与 tool-call ledger**：executor 已写完成结果存档，中途恢复及 Rust 调用侧 intent/attempt/outcome 尚未接通。
-- 模型 Provider、Token Center 真实调用、流式模型事件和模型费用记账；`model_complete` 目前如实返回 `capability_missing`。
+- 正式租户 Token Center 真实调用、流式模型事件和模型费用记账尚未接通；本地单模型 HTTP 调用已装配，需环境注入凭据。
 - GEO 工具桥接实现；`manifest_read`、`publish_submit`、`measure_sample` 目前如实返回 `capability_missing`。
 - P00 文件选择到对象存储引用的完整上传适配。
-- 项目级知识文档清单已支持规划与封存；产品级细化、正文生成、文档 × 平台矩阵、真实连接器/账号池/出口池仍待实现。
+- 项目级知识文档清单已支持规划、封存和只读 GET，P07 显示真实覆盖项及来源依赖。刷新封存清单不重新规划，知识当前版本改变也不覆盖历史清单。产品级细化、正文生成、文档 × 平台矩阵、真实连接器/账号池/出口池仍待实现。
 - 独立 AI 渠道测量、证据 reduce、不可变周报和自动进入下一轮。
 - PostgreSQL 全仓库事务级 tenant scope、FORCE RLS 和非 bypass 角色验收。
 
@@ -200,7 +200,7 @@ cargo test -p geo-persistence --test postgres -- --ignored
 
 1. **执行安全验证**：复验 current-thread 下模块求值及 `main` 死循环的独立线程墙钟终止、堆上限与取消；测试进程必须有外部截止保护。
 2. **run executor 恢复**：驱动链已存在，剩余工作是租约/重启对账、实时取消及持久 checkpoint/tool-call ledger。不得通过扫描并结束所有 running run 的方式干扰其他副本。
-3. **落地真实 bundle 加载**：打包配方已实证（见 `WORKLOG.md` 2026-09-21），但 1.5 MB 自包含产物的存放方式与第三方许可声明策略需先定夺，再决定是构建时生成还是分发各依赖 ESM。
+3. **继续真实 bundle 工具循环**：本地启动已按摘要加载构建生成的 ESM，下一步接通模型工具协议与业务工具；产物不入库，分发携带第三方许可。
 4. **模型 Provider 与 GEO 工具桥接**：把上述四项 `capability_missing` 逐一变成真实实现。
 5. **首个完整纵切**：上传附件并形成对象引用，给出带来源回答，生成两个文档分支，中断后从 checkpoint 恢复，再 reduce 为结果摘要。
 
@@ -213,7 +213,7 @@ cargo test -p geo-persistence --test postgres -- --ignored
 
 ## 8. 已知风险与设计边界
 
-- 上游 MemeLoop 官方 server worker 是 Node 实现；Rust 托管兼容性已由 `crates/worker` 的探针证实引擎契约可用，但真实 bundle 尚未在内嵌引擎中实际跑通，所以 bundle 腿仍是必须完成的第一步。
+- 上游 MemeLoop 官方 server worker 是 Node 实现；真实 bundle 已在 Rust/V8 单回合运行，但不代表所有 Node 功能、完整工具循环及多回合恢复均已兼容。
 - `@memeloop/react-ui` 使用 MUI/assistant-ui；只能在 P00 局部 ThemeProvider 中使用，不能污染 Fluent 全局主题。
 - 当前前端生产构建存在大 chunk 警告，尚不阻塞功能，但后续应按路由拆分 P00 依赖。
 - `migrations/0004_tenant_rls.sql` 仍是安全 no-op，不能对外宣称 FORCE RLS 已完成。

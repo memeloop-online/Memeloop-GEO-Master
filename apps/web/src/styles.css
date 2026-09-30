@@ -854,6 +854,38 @@ input {
   grid-template-columns: minmax(0, 1.6fr) minmax(280px, 0.75fr);
   gap: 16px;
 }
+.document-manifest-page {
+  display: grid;
+  gap: 16px;
+}
+.manifest-items ul {
+  display: grid;
+  gap: 12px;
+  padding: 0;
+  list-style: none;
+}
+.manifest-items h2 {
+  margin: 0 0 12px;
+}
+.manifest-item-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.manifest-item-heading h3 {
+  margin: 0;
+}
+.manifest-items dl {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) minmax(0, 1fr);
+  gap: 6px 12px;
+  overflow-wrap: anywhere;
+}
+.manifest-items dd {
+  margin: 0;
+}
 .primary-workbench {
   min-height: 370px;
 }

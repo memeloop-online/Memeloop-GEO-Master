@@ -539,6 +539,37 @@ pub(crate) async fn current_release(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/document-manifests/{manifest_id}",
+    security(("sessionCookie" = [])),
+    params(("manifest_id" = Uuid, Path), ("project_id" = ProjectId, Query)),
+    responses((status = 200, body = DocumentManifest), (status = 404, body = ErrorResponse))
+)]
+pub(crate) async fn get_document_manifest(
+    State(state): State<AppState>,
+    Path(manifest_id): Path<Uuid>,
+    Query(query): Query<KnowledgeProjectQuery>,
+    Extension(tenant_scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<DocumentManifest>, ApiError> {
+    let scope = knowledge_scope(&state, &tenant_scope, query.project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    state
+        .knowledge_repository()
+        .get_document_manifest(&scope, manifest_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .map(Json)
+        .ok_or_else(|| {
+            api_error(
+                AppError::not_found("document manifest not found"),
+                context.request_id,
+            )
+        })
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/knowledge/document-manifests/plan",
     security(("sessionCookie" = [])),
@@ -687,6 +718,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route(
             "/knowledge/document-manifests/plan",
             post(plan_document_manifest),
+        )
+        .route(
+            "/knowledge/document-manifests/{manifest_id}",
+            get(get_document_manifest),
         )
         .route("/knowledge/search", post(search))
         .route("/knowledge/ask", post(ask))

@@ -68,8 +68,37 @@ async fn login_as(app: &Router, login_name: &str, password: &str) -> (String, St
 
 #[tokio::test]
 async fn knowledge_release_plans_a_scoped_sealed_document_manifest() {
-    let app = router(AppState::development_with_password("test-password"));
+    let auth = Arc::new(MemoryAuthRepository::development_with_password(
+        "test-password",
+    ));
+    let viewer = User::new(
+        Uuid::new_v4().into(),
+        DEVELOPMENT_OPERATOR_ID,
+        "manifest-viewer@localhost",
+        "Viewer",
+        "viewer-password",
+    )
+    .unwrap();
+    auth.insert_user(viewer.clone()).await.unwrap();
+    auth.insert_membership(Membership::new(
+        viewer.id,
+        DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Role::CustomerReadOnly,
+    ))
+    .await
+    .unwrap();
+    let app = router(AppState::with_stores_and_auth_and_projects(
+        Arc::new(geo_api::MemoryOperationStore::default()),
+        Arc::new(MemoryIdempotencyStore::default()),
+        auth,
+        Arc::new(geo_domain::MemoryProjectRepository::default()),
+        EventBus::default(),
+        false,
+    ));
     let (cookie, csrf, _) = login(&app).await;
+    let (viewer_cookie, _, _) =
+        login_as(&app, "manifest-viewer@localhost", "viewer-password").await;
     let tenant_id = DEVELOPMENT_TENANT_ID.to_string();
     let created = app
         .clone()
@@ -121,6 +150,14 @@ async fn knowledge_release_plans_a_scoped_sealed_document_manifest() {
     let start: Value =
         serde_json::from_slice(&to_bytes(start.into_body(), 64 * 1024).await.unwrap()).unwrap();
     let selector = format!("tenant_id={tenant_id}&project_id={project_id}");
+    let manifest_id = start["document_manifest"]["manifest_id"].as_str().unwrap();
+    let read_uri = format!("/api/v1/knowledge/document-manifests/{manifest_id}?{selector}");
+    let pending = app
+        .clone()
+        .oneshot(authenticated_request("GET", &read_uri, &cookie, None))
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::NOT_FOUND);
     let imported = app
         .clone()
         .oneshot(authenticated_json_request(
@@ -169,6 +206,95 @@ async fn knowledge_release_plans_a_scoped_sealed_document_manifest() {
             .iter()
             .all(|item| { item["source_version_refs"].as_array().unwrap().len() == 1 })
     );
+    let read = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &read_uri,
+            &viewer_cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let read: Value =
+        serde_json::from_slice(&to_bytes(read.into_body(), 128 * 1024).await.unwrap()).unwrap();
+    assert_eq!(read, planned);
+    let missing = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!(
+                "/api/v1/knowledge/document-manifests/{}?{selector}",
+                Uuid::new_v4()
+            ),
+            &viewer_cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let wrong_project = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!(
+                "/api/v1/knowledge/document-manifests/{manifest_id}?tenant_id={tenant_id}&project_id={}",
+                Uuid::new_v4()
+            ),
+            &viewer_cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_project.status(), StatusCode::NOT_FOUND);
+    let wrong_tenant = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/knowledge/document-manifests/{manifest_id}?tenant_id={}&project_id={project_id}", Uuid::new_v4()),
+            &viewer_cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        wrong_tenant.status(),
+        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    ));
+    let newer = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            &format!("/api/v1/knowledge/imports?{selector}"),
+            &cookie,
+            Some(&csrf),
+            Some("manifest-newer-release"),
+            &json!({"items":[{"client_item_id":"newer","kind":"text","name":"Updated knowledge",
+                "purpose":"public","text":"A newer public description"}]})
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(newer.status(), StatusCode::ACCEPTED);
+    let after_release = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &read_uri,
+            &viewer_cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after_release.status(), StatusCode::OK);
+    let after_release: Value = serde_json::from_slice(
+        &to_bytes(after_release.into_body(), 128 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after_release, planned);
     let replay = app
         .clone()
         .oneshot(authenticated_json_request(

@@ -1,4 +1,5 @@
 mod config;
+mod runtime;
 
 use axum::Router;
 use config::AppConfig;
@@ -13,25 +14,16 @@ use tracing::info;
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
     let config = AppConfig::from_env()?;
-    // The JavaScript runtime is assembled here, once, for the whole process.
-    //
-    // A configured runtime is `EmbeddedAgentRuntime::configured(capabilities)`
-    // over an approved bundle — the API process holds the seam and each run
-    // builds its own isolate on its own thread.  No such bundle or provider
-    // bridge exists yet, so the process assembles the explicit absence of a
-    // runtime instead: every accepted run then fails durably with
-    // `capability_missing`.  There is deliberately no environment switch that
-    // could turn on a partially configured runtime, because a runtime whose
-    // capabilities are not all reachable must not accept the run.
-    let runtime = Arc::new(EmbeddedAgentRuntime::unconfigured());
-    let (state, durable_storage) = if AppConfig::database_url_configured() {
+    let durable_storage = AppConfig::database_url_configured();
+    config.validate_ai_mode(durable_storage)?;
+    let (state, durable_storage) = if durable_storage {
         // A configured database is authoritative.  Connection or migration
         // failures terminate startup; the process never falls back to memory
         // authentication or idempotency state.
         let database = Database::connect_and_migrate_from_env().await?;
-        let state = AppState::from_database(&database)
-            .with_allowed_origins(config.allowed_origins.clone())
-            .with_agent_runtime(runtime);
+        let state =
+            AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone());
+        let state = state.with_agent_runtime(Arc::new(EmbeddedAgentRuntime::unconfigured()));
         if config.single_process_executor {
             let reconciled = state.reconcile_running_runs().await?;
             info!(
@@ -44,8 +36,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         let password = config.validate_for_memory_mode()?;
         let state = AppState::development_with_password(password)
-            .with_allowed_origins(config.allowed_origins.clone())
-            .with_agent_runtime(runtime);
+            .with_allowed_origins(config.allowed_origins.clone());
+        let runtime = runtime::assemble(&state, config.development_ai.as_ref())?;
+        let state = state.with_agent_runtime(runtime);
         if config.single_process_executor {
             let reconciled = state.reconcile_running_runs().await?;
             info!(

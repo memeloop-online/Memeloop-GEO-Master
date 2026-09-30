@@ -872,6 +872,11 @@ pub trait KnowledgeRepository: Send + Sync {
         scope: &TenantScope,
         id: Uuid,
     ) -> Result<Option<KnowledgeRelease>, AppError>;
+    async fn get_document_manifest(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+    ) -> Result<Option<DocumentManifest>, AppError>;
     async fn plan_document_manifest(
         &self,
         scope: &TenantScope,
@@ -1761,6 +1766,26 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             .releases
             .get(&id)
             .filter(|release| Self::in_scope(scope, *release))
+            .cloned())
+    }
+
+    async fn get_document_manifest(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+    ) -> Result<Option<DocumentManifest>, AppError> {
+        Self::require_project(scope)?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .document_manifests
+            .get(&id)
+            .filter(|manifest| {
+                manifest.operator_id == scope.operator_id
+                    && manifest.tenant_id == scope.tenant_id
+                    && Some(manifest.project_id) == scope.project_id
+            })
             .cloned())
     }
 

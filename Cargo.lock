@@ -911,13 +911,20 @@ dependencies = [
 name = "geo-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "geo-api",
+ "geo-domain",
  "geo-persistence",
+ "geo-provider",
+ "geo-worker",
+ "hex",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

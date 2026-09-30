@@ -145,6 +145,13 @@ async fn atomic_start_and_scope_visibility_hold_when_postgres_is_configured() {
     assert_eq!(acceptance.distribution_manifest.state, "awaiting_documents");
     let project_scope = TenantScope::new(scope.operator_id, scope.tenant_id, Some(project.id));
     let knowledge = PgKnowledgeRepository::from_database(&database);
+    assert_eq!(
+        knowledge
+            .get_document_manifest(&project_scope, acceptance.document_manifest.manifest_id)
+            .await
+            .expect("unsealed skeleton is not a readable snapshot"),
+        None
+    );
     let imported = knowledge
         .import_batch(
             &project_scope,
@@ -179,6 +186,53 @@ async fn atomic_start_and_scope_visibility_hold_when_postgres_is_configured() {
     assert_eq!(manifest.expected_count, Some(1));
     assert_eq!(manifest.coverage.planned, 1);
     assert_eq!(manifest.items[0].source_version_refs.len(), 1);
+    assert_eq!(
+        knowledge
+            .get_document_manifest(&project_scope, request.manifest_id)
+            .await
+            .expect("read stored manifest"),
+        Some(manifest.clone())
+    );
+    assert_eq!(
+        knowledge
+            .get_document_manifest(&project_scope, Uuid::new_v4())
+            .await
+            .expect("missing manifest"),
+        None
+    );
+    assert_eq!(
+        knowledge
+            .get_document_manifest(
+                &TenantScope::new(scope.operator_id, other_tenant_id.into(), Some(project.id)),
+                request.manifest_id
+            )
+            .await
+            .expect("tenant-scoped manifest"),
+        None
+    );
+    knowledge
+        .import_batch(
+            &project_scope,
+            vec![ImportItem {
+                client_item_id: format!("manifest-later-{tenant_id}"),
+                kind: SourceKind::Text,
+                name: "Later public source".to_owned(),
+                purpose: KnowledgePurpose::Public,
+                text: Some("A later public description".to_owned()),
+                url: None,
+                object_id: None,
+                knowledge_release_id: None,
+            }],
+        )
+        .await
+        .expect("newer release");
+    assert_eq!(
+        knowledge
+            .get_document_manifest(&project_scope, request.manifest_id)
+            .await
+            .expect("historical manifest"),
+        Some(manifest.clone())
+    );
     assert_eq!(
         manifest,
         knowledge

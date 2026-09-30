@@ -11,6 +11,7 @@ import { SetupEntry } from "./pages/SetupEntry";
 import { SetupPage } from "./pages/SetupPage";
 import { SourceDetailPage } from "./pages/SourceDetailPage";
 import { WorkbenchPage } from "./pages/WorkbenchPage";
+import { DocumentManifestPage } from "./pages/DocumentManifestPage";
 import { WorkspacePage } from "./pages/WorkspacePage";
 
 export function AppRoutes() {
@@ -45,10 +46,7 @@ export function AppRoutes() {
               path="campaigns"
               element={<WorkbenchPage page="campaigns" />}
             />
-            <Route
-              path="campaigns/:id"
-              element={<WorkbenchPage page="campaign" />}
-            />
+            <Route path="campaigns/:id" element={<DocumentManifestPage />} />
             <Route path="content" element={<WorkbenchPage page="content" />} />
             <Route
               path="content/:id"

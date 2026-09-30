@@ -1409,6 +1409,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         knowledge::list_products,
         knowledge::list_facts,
         knowledge::current_release,
+        knowledge::get_document_manifest,
         knowledge::plan_document_manifest,
         knowledge::search,
         knowledge::ask,
