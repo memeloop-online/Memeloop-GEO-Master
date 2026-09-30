@@ -137,6 +137,82 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-msvc-cargo-
 
+      - name: Download pinned rusty_v8 archive and metadata
+        id: collect-v8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          $artifactDirectory = Join-Path $env:GITHUB_WORKSPACE "artifacts\rusty-v8-msvc"
+          $lockfile = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.lock") -Raw
+          $versions = [regex]::Matches($lockfile, '(?m)^\[\[package\]\]\r?\nname = "v8"\r?\nversion = "(\d+\.\d+\.\d+)"\r?$')
+          if ($versions.Count -ne 1) {
+            throw "Expected exactly one pinned v8 package in Cargo.lock; found $($versions.Count)."
+          }
+          $v8Version = $versions[0].Groups[1].Value
+          $target = "x86_64-pc-windows-msvc"
+          $archiveName = "rusty_v8_simdutf_release_$target.lib.gz"
+          $releaseUrl = "https://github.com/denoland/rusty_v8/releases/download/v$v8Version/$archiveName"
+          New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
+          $archivePath = Join-Path $artifactDirectory $archiveName
+          $temporaryPath = "$archivePath.download"
+          try {
+            Invoke-WebRequest -Uri $releaseUrl -OutFile $temporaryPath -MaximumRedirection 5
+            if ((Get-Item -LiteralPath $temporaryPath).Length -le 0) {
+              throw "The rusty_v8 release archive is empty: $releaseUrl"
+            }
+            $inputStream = [System.IO.File]::OpenRead($temporaryPath)
+            try {
+              $gzip = [System.IO.Compression.GzipStream]::new($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+              try {
+                $buffer = [byte[]]::new(65536)
+                $expandedBytes = 0L
+                while (($bytesRead = $gzip.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                  $expandedBytes += $bytesRead
+                }
+                if ($expandedBytes -eq 0) {
+                  throw "The rusty_v8 release archive has no decompressed content: $releaseUrl"
+                }
+              } finally {
+                $gzip.Dispose()
+              }
+            } finally {
+              $inputStream.Dispose()
+            }
+            Move-Item -LiteralPath $temporaryPath -Destination $archivePath
+          } finally {
+            if (Test-Path -LiteralPath $temporaryPath) {
+              Remove-Item -LiteralPath $temporaryPath
+            }
+          }
+          $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archiveName" | Set-Content (Join-Path $artifactDirectory "rusty_v8.sha256")
+          rustc -vV | Set-Content (Join-Path $artifactDirectory "rustc.txt")
+          $target | Set-Content (Join-Path $artifactDirectory "target.txt")
+          $v8Version | Set-Content (Join-Path $artifactDirectory "v8-version.txt")
+          $releaseUrl | Set-Content (Join-Path $artifactDirectory "source-url.txt")
+
+      - name: Verify collected artifact restores into a clean Cargo cache
+        id: verify-v8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cleanCargoHome = Join-Path $env:RUNNER_TEMP "geo-v8-restore-cargo"
+          if (Test-Path -LiteralPath $cleanCargoHome) {
+            Remove-Item -LiteralPath $cleanCargoHome -Recurse -Force
+          }
+          & ./scripts/fetch-v8-artifact.ps1 `
+            -ArtifactDirectory "$env:GITHUB_WORKSPACE\artifacts\rusty-v8-msvc" `
+            -CargoHome $cleanCargoHome
+          $restored = @(Get-ChildItem -LiteralPath (Join-Path $cleanCargoHome ".rusty_v8") -File)
+          if ($restored.Count -eq 0) {
+            throw "The collected artifact did not restore any Cargo V8 archive."
+          }
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          & ./scripts/fetch-v8-artifact.ps1 `
+            -ArtifactDirectory "$env:GITHUB_WORKSPACE\artifacts\rusty-v8-msvc" `
+            -CargoHome $cargoHome
+
       - name: Build Rust workspace
         shell: pwsh
         run: cargo build --workspace --target x86_64-pc-windows-msvc
@@ -144,45 +220,6 @@ jobs:
       - name: Test Rust workspace
         shell: pwsh
         run: cargo test --workspace --all-targets --target x86_64-pc-windows-msvc
-
-      - name: Collect rusty_v8 archive and metadata
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
-          $cacheDirectory = Join-Path $cargoHome ".rusty_v8"
-          $artifactDirectory = Join-Path $env:GITHUB_WORKSPACE "artifacts\rusty-v8-msvc"
-          New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
-
-          $archives = @(Get-ChildItem -LiteralPath $cacheDirectory -File -Filter "*.lib.gz" -ErrorAction SilentlyContinue)
-          if ($archives.Count -eq 0) {
-            throw "No rusty_v8 .lib.gz archive was found in $cacheDirectory."
-          }
-          foreach ($archive in $archives) {
-            Copy-Item -LiteralPath $archive.FullName -Destination (Join-Path $artifactDirectory $archive.Name)
-          }
-          $archives |
-            ForEach-Object {
-              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-              "$hash  $($_.Name)"
-            } |
-            Set-Content (Join-Path $artifactDirectory "rusty_v8.sha256")
-
-          $rustcVersion = rustc -vV
-          $rustcVersion | Set-Content (Join-Path $artifactDirectory "rustc.txt")
-          "x86_64-pc-windows-msvc" | Set-Content (Join-Path $artifactDirectory "target.txt")
-          $lockfile = Get-Content (Join-Path $env:GITHUB_WORKSPACE "Cargo.lock") -Raw
-          if ($lockfile -match '(?ms)name = "v8"\s+version = "([^"]+)"') {
-            $Matches[1] | Set-Content (Join-Path $artifactDirectory "v8-version.txt")
-          } else {
-            "unknown" | Set-Content (Join-Path $artifactDirectory "v8-version.txt")
-          }
-          Get-ChildItem -LiteralPath $cacheDirectory -File |
-            Select-Object Name, Length, LastWriteTimeUtc |
-            Format-Table -AutoSize |
-            Out-String |
-            Set-Content (Join-Path $artifactDirectory "rusty_v8-cache-inventory.txt")
 
       - name: Write 5-minute milestone summary
         if: always()
@@ -197,9 +234,9 @@ jobs:
           "@ | Add-Content $env:GITHUB_STEP_SUMMARY
 
       - name: Upload Windows rusty_v8 artifact
-        if: always()
+        if: ${{ always() && steps.collect-v8.outcome == 'success' && steps.verify-v8.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: rusty-v8-msvc-${{ github.sha }}
-          if-no-files-found: warn
+          if-no-files-found: error
           path: artifacts/rusty-v8-msvc/

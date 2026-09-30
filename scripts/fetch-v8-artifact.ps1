@@ -22,11 +22,22 @@ $artifactPath = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $checksumPath = Join-Path $artifactPath "rusty_v8.sha256"
 $targetPath = Join-Path $artifactPath "target.txt"
 $versionPath = Join-Path $artifactPath "v8-version.txt"
+$rustcPath = Join-Path $artifactPath "rustc.txt"
 if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
     throw "Missing rusty_v8.sha256. Download the rusty-v8-msvc artifact, not the Linux bundle."
 }
+if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
+    throw "Missing target.txt metadata."
+}
 if ((Get-Content -LiteralPath $targetPath -Raw).Trim() -ne "x86_64-pc-windows-msvc") {
     throw "The artifact is not the supported Windows/MSVC rusty_v8 cache."
+}
+if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) {
+    throw "Missing v8-version.txt metadata."
+}
+if (-not (Test-Path -LiteralPath $rustcPath -PathType Leaf) -or
+    [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $rustcPath -Raw))) {
+    throw "Missing rustc.txt metadata."
 }
 $v8Version = (Get-Content -LiteralPath $versionPath -Raw).Trim()
 if ($v8Version -notmatch '^\d+\.\d+\.\d+$') {
@@ -34,12 +45,22 @@ if ($v8Version -notmatch '^\d+\.\d+\.\d+$') {
 }
 
 $archives = [System.Collections.Generic.List[string]]::new()
+$archiveNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($line in Get-Content -LiteralPath $checksumPath) {
     if ($line -notmatch '^(?<hash>[0-9a-fA-F]{64})\s+\*?(?<name>.+)$') {
         throw "Invalid rusty_v8.sha256 entry: $line"
     }
     $expectedHash = $Matches.hash
     $archiveName = $Matches.name.Trim()
+    if ($archiveName -notmatch '^rusty_v8_.+_x86_64-pc-windows-msvc\.lib\.gz$') {
+        throw "Unexpected Windows/MSVC rusty_v8 archive name: $archiveName"
+    }
+    if ($archiveName.Contains("/") -or $archiveName.Contains("\")) {
+        throw "Archive names must not contain path separators: $archiveName"
+    }
+    if (-not $archiveNames.Add($archiveName)) {
+        throw "Duplicate archive in rusty_v8.sha256: $archiveName"
+    }
     $archivePath = Join-Path $artifactPath $archiveName
     if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
         throw "The archive named by rusty_v8.sha256 was not found: $archiveName"
@@ -50,14 +71,14 @@ foreach ($line in Get-Content -LiteralPath $checksumPath) {
     }
     $archives.Add($archivePath)
 }
+if ($archives.Count -eq 0) {
+    throw "rusty_v8.sha256 contains no archive entries."
+}
 
 $cachePath = Join-Path $CargoHome ".rusty_v8"
 New-Item -ItemType Directory -Force -Path $cachePath | Out-Null
 foreach ($archivePath in $archives) {
     $archiveName = Split-Path $archivePath -Leaf
-    if ($archiveName -notmatch '^rusty_v8_.+_x86_64-pc-windows-msvc\.lib\.gz$') {
-        throw "Unexpected Windows/MSVC rusty_v8 archive name: $archiveName"
-    }
     $releaseUrl = "https://github.com/denoland/rusty_v8/releases/download/v$v8Version/$archiveName"
     $cargoCacheName = $releaseUrl -replace '[^A-Za-z0-9]', '_'
     Copy-Item -LiteralPath $archivePath -Destination (Join-Path $cachePath $cargoCacheName) -Force

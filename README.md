@@ -72,7 +72,18 @@ After a successful Windows CI run, download the artifact with GitHub CLI and
 restore it into the local Cargo cache:
 
 ```powershell
-$run = gh run list --workflow ci.yml --branch integration/w00-pr-stack --limit 1 --json databaseId,headSha,status,conclusion | ConvertFrom-Json | Select-Object -First 1
+$commit = git rev-parse HEAD
+$runs = gh run list --workflow ci.yml --commit $commit --status completed --limit 20 --json databaseId,headSha,status,conclusion
+$run = $runs |
+  ConvertFrom-Json |
+  Where-Object { $_.conclusion -eq "success" } |
+  Select-Object -First 1
+if (-not $run) {
+  throw "No successful CI run found for commit $commit."
+}
+if ($run.headSha -ne $commit) {
+  throw "The selected CI run does not match commit $commit."
+}
 $artifact = "rusty-v8-msvc-$($run.headSha)"
 $download = Join-Path (Get-Location) ".artifacts\$artifact"
 gh run download $run.databaseId --name $artifact --dir $download
