@@ -387,8 +387,15 @@ impl EmbeddedIsolate {
 
     /// Restores a previously serialised host state into this isolate.
     pub fn restore_checkpoint(&mut self, checkpoint: &str) -> Result<(), WorkerError> {
-        let state: HostState = serde_json::from_str(checkpoint)
-            .map_err(|error| WorkerError::new("restore", error.to_string()))?;
+        let state = {
+            let op_state = self.runtime.op_state();
+            let borrowed = op_state.borrow();
+            let current = borrowed
+                .try_borrow::<HostState>()
+                .ok_or_else(|| WorkerError::new("restore", "host state is not installed"))?;
+            HostState::restore_checkpoint(checkpoint, current)
+                .map_err(|error| WorkerError::new("restore", error.to_string()))?
+        };
         self.runtime.op_state().borrow_mut().put(state);
         Ok(())
     }
@@ -519,5 +526,63 @@ fn exception_message(error: &deno_core::error::JsError) -> String {
         error.to_string()
     } else {
         error.exception_message.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bundle::PROBE_BUNDLE;
+    use crate::ops::HostState;
+
+    use super::{EmbeddedIsolate, geo_probe};
+
+    #[test]
+    fn checkpoint_restore_keeps_the_installed_policy_and_is_atomic() {
+        let mut isolate = EmbeddedIsolate::new(vec![geo_probe::init()], PROBE_BUNDLE, None);
+        isolate.install(HostState::with_output_limits(8, 9, 2));
+
+        isolate
+            .restore_checkpoint(
+                r#"{
+                    "model_calls": 3,
+                    "events": [{"topic": "a", "payload": "😀"}]
+                }"#,
+            )
+            .expect("a valid legacy checkpoint must restore");
+
+        let error = isolate
+            .execute_script(
+                "preserved-output-policy.js",
+                r#"Deno.core.ops.op_host_emit("b", "1234");"#,
+            )
+            .expect_err("the restored state must retain the stricter installed total limit");
+        assert!(
+            error.message.contains("total event output"),
+            "unexpected error: {error:?}"
+        );
+
+        let before = isolate.host_state();
+        let error = isolate
+            .restore_checkpoint(
+                r#"{
+                    "model_calls": 4,
+                    "events": [
+                        {"topic": "", "payload": ""},
+                        {"topic": "", "payload": ""},
+                        {"topic": "", "payload": ""}
+                    ]
+                }"#,
+            )
+            .expect_err("an over-budget checkpoint must be rejected");
+        assert_eq!(error.stage, "restore");
+        assert!(
+            error.message.contains("event count"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            isolate.host_state(),
+            before,
+            "a rejected restore must leave the installed state unchanged"
+        );
     }
 }
