@@ -415,6 +415,13 @@ where
         control: RequestControl,
     ) -> Result<NormalizedCompletion, ProviderError> {
         request.validate()?;
+        // This adapter observes a provider API, never its consumer UI. A
+        // caller-supplied label must not merge measurement denominators.
+        if request.surface != ProviderSurface::OfficialApi {
+            return Err(ProviderError::InvalidRequest(
+                "consumer observations require a dedicated consumer-surface connector".into(),
+            ));
+        }
         if control.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
@@ -785,6 +792,26 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, ProviderError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn api_client_cannot_label_an_api_answer_as_a_consumer_observation() {
+        let client = ProviderClient::new(
+            "https://provider.invalid/v1/",
+            SecretRef::new("test-reference").unwrap(),
+            Arc::new(SlowTransport),
+            Arc::new(FakeTokenCenter),
+        )
+        .unwrap();
+        let mut input = request();
+        input.surface = ProviderSurface::ConsumerSurface;
+        input.search_mode = SearchMode::Disabled;
+        input.include_citations = false;
+        let error = client
+            .complete(input, RequestControl::new(Duration::from_secs(1)).unwrap())
+            .await
+            .expect_err("API transport must reject consumer-surface attribution");
+        assert!(matches!(error, ProviderError::InvalidRequest(_)));
     }
 
     #[tokio::test]
