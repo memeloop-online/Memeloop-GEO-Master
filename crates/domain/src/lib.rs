@@ -11,6 +11,7 @@ mod idempotency;
 mod knowledge;
 mod operation;
 mod project;
+mod report;
 mod tenancy;
 
 pub use agent::{
@@ -47,14 +48,21 @@ pub use knowledge::{
 };
 pub use operation::{Operation, OperationStatus};
 pub use project::{
-    CreateProject, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_PROJECT_ID, DEVELOPMENT_TENANT_ID,
-    DistributionManifestAcceptance, DistributionScope, DistributionScopeMode,
-    DocumentManifestAcceptance, DocumentScope, InitialSource, InitialSourceKind,
-    InitialSourceVisibility, MemoryProjectRepository, Operator, OverviewKnowledgeStatus,
-    PeriodPolicy, Project, ProjectCreate, ProjectOverview, ProjectPage, ProjectPatch,
-    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
+    CreateProject, CycleReportView, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_PROJECT_ID,
+    DEVELOPMENT_TENANT_ID, DistributionManifestAcceptance, DistributionScope,
+    DistributionScopeMode, DocumentManifestAcceptance, DocumentScope, InitialSource,
+    InitialSourceKind, InitialSourceVisibility, MemoryProjectRepository, Operator,
+    OverviewKnowledgeStatus, PeriodPolicy, Project, ProjectCreate, ProjectOverview, ProjectPage,
+    ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
     ProjectStartView, ProjectStatus, QuestionClusterScope, QuestionClusterState, ReplicationPolicy,
     ReportSchedule, ReportWeekday, ResourceMode, StartAcceptanceStatus, Tenant, UpdateProject,
     hash_idempotency_key, previous_calendar_week_window, settings_hash, start_request_hash,
+};
+pub use report::{
+    MemoryReportRepository, REPORT_REDUCER_VERSION, ReportAvailability, ReportCoverage,
+    ReportEvidenceReference, ReportFinding, ReportManifestKind, ReportManifestRef,
+    ReportMeasurementGroup, ReportMeasurementStatus, ReportMeasurementTarget,
+    ReportPublicationGroup, ReportPublicationStatus, ReportPublicationTarget, ReportReduceInput,
+    ReportRepository, ReportSnapshot, ReportStatus, reduce_report, validate_correction,
 };
 pub use tenancy::{OperatorId, ProjectId, TenantId, TenantScope, TenantScopeId};

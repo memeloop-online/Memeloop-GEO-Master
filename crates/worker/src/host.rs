@@ -28,14 +28,14 @@ use uuid::Uuid;
 // The canonical domain vocabulary the surface speaks.  Re-exported so an
 // implementation of [`HostOps`] needs one import path, and so the worker never
 // grows a parallel set of types for the same concepts.
-use geo_domain::{AppError, AttachmentReference, ImportStatus, KnowledgePurpose};
+use geo_domain::{AppError, AttachmentReference, ImportStatus, KnowledgePurpose, ReportSnapshot};
 pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
 
 /// The version of the host-op surface this crate registers.
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v2";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v3";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -77,11 +77,15 @@ pub enum HostOp {
     Publish,
     /// Take one independent AI channel measurement sample.
     Measure,
+    /// Read an immutable scoped report snapshot.
+    ReportGet,
+    /// Reduce a due cycle from server-owned evidence.
+    ReportReduce,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 8;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -91,6 +95,8 @@ impl HostOp {
         Self::ManifestRead,
         Self::Publish,
         Self::Measure,
+        Self::ReportGet,
+        Self::ReportReduce,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -102,6 +108,8 @@ impl HostOp {
             Self::ManifestRead => "manifest.read.v2",
             Self::Publish => "publish.submit.v2",
             Self::Measure => "measure.sample.v2",
+            Self::ReportGet => "report.get.v1",
+            Self::ReportReduce => "report.reduce.v1",
         }
     }
 
@@ -114,6 +122,8 @@ impl HostOp {
             Self::ManifestRead => "op_host_manifest_read_v2",
             Self::Publish => "op_host_publish_submit_v2",
             Self::Measure => "op_host_measure_sample_v2",
+            Self::ReportGet => "op_host_report_get_v1",
+            Self::ReportReduce => "op_host_report_reduce_v1",
         }
     }
 
@@ -163,6 +173,8 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(60_000, 16),
                 HostOpLimits::new(120_000, 32),
+                HostOpLimits::new(15_000, 32),
+                HostOpLimits::new(120_000, 4),
             ],
         }
     }
@@ -435,6 +447,45 @@ pub trait HostOps: Send + Sync {
         scope: &TenantScope,
         request: MeasureRequest,
     ) -> Result<MeasureSample, HostOpError>;
+
+    async fn report_get(
+        &self,
+        _scope: &TenantScope,
+        _request: ReportGetRequest,
+    ) -> Result<ReportSnapshot, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ReportGet,
+            "report reads are not configured",
+        ))
+    }
+
+    async fn report_reduce(
+        &self,
+        _scope: &TenantScope,
+        _request: ReportReduceRequest,
+    ) -> Result<ReportSnapshot, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ReportReduce,
+            "report reduction is not configured",
+        ))
+    }
+}
+
+/// Scope is supplied by the Rust bridge, never by JavaScript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportGetRequest {
+    #[serde(default)]
+    pub report_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportReduceRequest {
+    #[serde(default)]
+    pub cycle_id: Option<Uuid>,
+    #[serde(default)]
+    pub correction_of: Option<Uuid>,
 }
 
 /// A model completion request.

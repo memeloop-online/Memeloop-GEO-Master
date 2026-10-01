@@ -44,6 +44,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 8,
         description: "document manifest dependencies",
     },
+    MigrationMetadata {
+        version: 9,
+        description: "report snapshots",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

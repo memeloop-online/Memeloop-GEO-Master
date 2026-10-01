@@ -24,7 +24,7 @@ use serde::de::DeserializeOwned;
 use crate::host::{
     HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
     KnowledgeSearchRequest, KnowledgeSearchResult, ManifestReadRequest, MeasureRequest,
-    ModelCompletionRequest, PublishRequest,
+    ModelCompletionRequest, PublishRequest, ReportGetRequest, ReportReduceRequest,
 };
 
 /// Converts a structured failure into the JS error the script sees.
@@ -252,6 +252,62 @@ pub async fn op_host_measure_sample_v2(
     Ok(encode(op, &sample)?)
 }
 
+/// Returns only a report in the Rust-bound project scope.
+#[op2]
+#[string]
+pub async fn op_host_report_get_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ReportGet;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ReportGetRequest>(op, &request)?;
+    if request.report_id.is_some_and(|id| id.is_nil()) {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "report ID must be non-zero",
+        )));
+    }
+    let report = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .report_get(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &report)?)
+}
+
+/// Builds a report from server-owned evidence after the frozen cutoff.
+#[op2]
+#[string]
+pub async fn op_host_report_reduce_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ReportReduce;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ReportReduceRequest>(op, &request)?;
+    if request.cycle_id.is_some_and(|id| id.is_nil())
+        || request.correction_of.is_some_and(|id| id.is_nil())
+    {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "report IDs must be non-zero",
+        )));
+    }
+    let report = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .report_reduce(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &report)?)
+}
+
 /// The capabilities the production extension registers, as the isolate sees
 /// them.  Exported so the crate (and its tests) can assert the surface without
 /// enumerating registered ops from JavaScript.
@@ -262,6 +318,8 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ManifestRead.op_name(),
     HostOp::Publish.op_name(),
     HostOp::Measure.op_name(),
+    HostOp::ReportGet.op_name(),
+    HostOp::ReportReduce.op_name(),
     // Rust-owned run state: the loop's emit contract and the checkpoint probe.
     "op_host_emit",
     "op_host_checkpoint",

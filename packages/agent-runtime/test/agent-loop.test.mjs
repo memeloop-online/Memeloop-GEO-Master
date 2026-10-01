@@ -126,6 +126,87 @@ test("native model call executes knowledge.search through the MemeLoop registry 
   }
 });
 
+test("report reduction and immutable read are exposed as separate scoped host tools", async () => {
+  const cycleId = "00000000-0000-4000-8000-000000000031";
+  const reportId = "00000000-0000-4000-8000-000000000032";
+  const requests = [];
+  const reductions = [];
+  const reads = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async reportReduce(request) {
+      reductions.push(request);
+      return { report_id: reportId, cycle_id: cycleId, status: "partial" };
+    },
+    async reportGet(request) {
+      reads.push(request);
+      return {
+        report_id: reportId,
+        project_id: "00000000-0000-4000-8000-000000000033",
+        evidence: [{ evidence_id: "00000000-0000-4000-8000-000000000034" }],
+      };
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      const calls = [
+        {
+          name: "report_reduce",
+          arguments: "{}",
+        },
+        {
+          name: "report_get",
+          arguments: "{}",
+        },
+      ];
+      return requests.length <= calls.length
+        ? {
+            text: "",
+            tool_calls: [
+              {
+                id: `call-${requests.length}`,
+                type: "function",
+                function: calls[requests.length - 1],
+              },
+            ],
+            model: "stub-model",
+            prompt_tokens: 7,
+            completion_tokens: 4,
+            finish_reason: "tool_calls",
+          }
+        : {
+            text: "Report available with a coverage gap.",
+            model: "stub-model",
+            prompt_tokens: 9,
+            completion_tokens: 8,
+            finish_reason: "stop",
+          };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?report=${Date.now()}`);
+    const result = await main({
+      conversation_id: "conversation-report-smoke",
+      prompt: "Reduce the due cycle and read the report",
+      run_id: "run-report-smoke",
+      turn_id: "turn-report-smoke",
+    });
+    assert.equal(result.answer, "Report available with a coverage gap.");
+    assert.deepEqual(reductions, [{}]);
+    assert.deepEqual(reads, [{}]);
+    assert.deepEqual(
+      requests[0].tools.map((tool) => tool.function.name),
+      ["knowledge_search", "report_get", "report_reduce"],
+    );
+    assert.match(requests[1].messages.at(-1).content, /"status":"partial"/u);
+    assert.match(requests[2].messages.at(-1).content, /"evidence_id"/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
 test("attachment-only turn imports bound items, searches its release, and answers from evidence", async () => {
   const textId = "00000000-0000-4000-8000-000000000001";
   const otherId = "00000000-0000-4000-8000-000000000002";
@@ -237,7 +318,12 @@ test("attachment-only turn imports bound items, searches its release, and answer
     assert.equal(modelRequests.length, 3);
     assert.deepEqual(
       modelRequests[0].tools.map((tool) => tool.function.name),
-      ["knowledge_import_attachments", "knowledge_search"],
+      [
+        "knowledge_import_attachments",
+        "knowledge_search",
+        "report_get",
+        "report_reduce",
+      ],
     );
     const importSchema = modelRequests[0].tools[0].function.parameters;
     assert.deepEqual(

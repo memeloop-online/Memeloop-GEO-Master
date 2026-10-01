@@ -14,6 +14,7 @@ mod idempotency;
 mod knowledge;
 mod migrations;
 mod projects;
+mod report;
 mod scope;
 
 pub use agent::PgAgentRepository;
@@ -25,4 +26,5 @@ pub use idempotency::PgIdempotencyStore;
 pub use knowledge::PgKnowledgeRepository;
 pub use migrations::{MIGRATOR, MigrationMetadata, embedded_migrations, migration_metadata};
 pub use projects::PgProjectRepository;
+pub use report::PgReportRepository;
 pub use scope::set_local_scope;

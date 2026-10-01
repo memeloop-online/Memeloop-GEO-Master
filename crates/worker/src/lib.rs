@@ -45,7 +45,7 @@ pub use host::{
     ManifestPlanningState, ManifestReadRequest, MeasureRequest, MeasureSample, MeasurementSurface,
     ModelCompletion, ModelCompletionRequest, ModelMessage, ModelToolCall, ModelToolDefinition,
     ModelToolFunctionCall, ModelToolFunctionDefinition, PublishReceipt, PublishRequest,
-    PublishState, TenantScope, redact_secrets,
+    PublishState, ReportGetRequest, ReportReduceRequest, TenantScope, redact_secrets,
 };
 pub use host_runtime::HostRuntime;
 pub use loader::InMemoryModuleLoader;

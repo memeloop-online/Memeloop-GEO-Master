@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 geo-api = { path = "../api" }
 geo-persistence = { path = "../persistence" }
 geo-provider = { path = "../provider" }

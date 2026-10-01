@@ -7,6 +7,31 @@ const LOCAL_NODE_ID = "geo-embedded-worker";
 // itself remains the versioned knowledge.search.v1 op.
 const KNOWLEDGE_SEARCH = "knowledge_search";
 const KNOWLEDGE_IMPORT_ATTACHMENTS = "knowledge_import_attachments";
+const REPORT_GET = "report_get";
+const REPORT_REDUCE = "report_reduce";
+const REPORT_GET_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    report_id: {
+      type: "string",
+      format: "uuid",
+      description: "Omit to read the latest report in the current project.",
+    },
+  },
+};
+const REPORT_REDUCE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    cycle_id: {
+      type: "string",
+      format: "uuid",
+      description: "Omit to reduce the current project cycle after its cutoff.",
+    },
+    correction_of: { type: "string", format: "uuid" },
+  },
+};
 const KNOWLEDGE_SEARCH_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -51,8 +76,13 @@ export async function main(input) {
   const provider = createHostProvider(host, modelId, toolFailures);
   const toolNames =
     turn.attachments.length > 0
-      ? [KNOWLEDGE_IMPORT_ATTACHMENTS, KNOWLEDGE_SEARCH]
-      : [KNOWLEDGE_SEARCH];
+      ? [
+          KNOWLEDGE_IMPORT_ATTACHMENTS,
+          KNOWLEDGE_SEARCH,
+          REPORT_GET,
+          REPORT_REDUCE,
+        ]
+      : [KNOWLEDGE_SEARCH, REPORT_GET, REPORT_REDUCE];
   const definition = createDefinition(modelId, toolNames);
   const context = createContext({
     session,
@@ -214,6 +244,8 @@ function createContext({ session, definition, modelId, provider, tools }) {
         rules: [
           { pattern: KNOWLEDGE_SEARCH, action: "allow" },
           { pattern: KNOWLEDGE_IMPORT_ATTACHMENTS, action: "allow" },
+          { pattern: REPORT_GET, action: "allow" },
+          { pattern: REPORT_REDUCE, action: "allow" },
         ],
       },
     },
@@ -459,6 +491,8 @@ function resolveHost(requireImport) {
     !denoOps ||
     typeof denoOps.op_host_model_complete_v1 !== "function" ||
     typeof denoOps.op_host_knowledge_search_v1 !== "function" ||
+    typeof denoOps.op_host_report_get_v1 !== "function" ||
+    typeof denoOps.op_host_report_reduce_v1 !== "function" ||
     (requireImport &&
       typeof denoOps.op_host_knowledge_import_attachments_v1 !== "function") ||
     typeof denoOps.op_host_emit !== "function"
@@ -487,6 +521,16 @@ function resolveHost(requireImport) {
         await denoOps.op_host_knowledge_import_attachments_v1(
           JSON.stringify(request),
         ),
+      );
+    },
+    async reportGet(request) {
+      return JSON.parse(
+        await denoOps.op_host_report_get_v1(JSON.stringify(request)),
+      );
+    },
+    async reportReduce(request) {
+      return JSON.parse(
+        await denoOps.op_host_report_reduce_v1(JSON.stringify(request)),
       );
     },
   };
@@ -621,6 +665,19 @@ function createHostTools(host, failures, attachments) {
       throw error;
     }
   };
+  const reportTool = (name, method) => async (parameters) => {
+    try {
+      if (!isRecord(parameters)) {
+        throw new TypeError(`${name} requires an object.`);
+      }
+      return { result: await host[method](parameters) };
+    } catch (error) {
+      failures.push(error);
+      throw error;
+    }
+  };
+  const reportGet = reportTool(REPORT_GET, "reportGet");
+  const reportReduce = reportTool(REPORT_REDUCE, "reportReduce");
   const importSchema = {
     type: "object",
     additionalProperties: false,
@@ -657,17 +714,30 @@ function createHostTools(host, failures, attachments) {
         ? search
         : id === KNOWLEDGE_IMPORT_ATTACHMENTS && attachments.length > 0
           ? importAttachments
-          : undefined,
+          : id === REPORT_GET
+            ? reportGet
+            : id === REPORT_REDUCE
+              ? reportReduce
+              : undefined,
     listTools: () =>
       attachments.length > 0
-        ? [KNOWLEDGE_IMPORT_ATTACHMENTS, KNOWLEDGE_SEARCH]
-        : [KNOWLEDGE_SEARCH],
+        ? [
+            KNOWLEDGE_IMPORT_ATTACHMENTS,
+            KNOWLEDGE_SEARCH,
+            REPORT_GET,
+            REPORT_REDUCE,
+          ]
+        : [KNOWLEDGE_SEARCH, REPORT_GET, REPORT_REDUCE],
     getToolParameterSchema: (id) =>
       id === KNOWLEDGE_SEARCH
         ? KNOWLEDGE_SEARCH_SCHEMA
         : id === KNOWLEDGE_IMPORT_ATTACHMENTS && attachments.length > 0
           ? importSchema
-          : undefined,
+          : id === REPORT_GET
+            ? REPORT_GET_SCHEMA
+            : id === REPORT_REDUCE
+              ? REPORT_REDUCE_SCHEMA
+              : undefined,
     registerTool: () => {
       throw new Error("The embedded loop cannot register tools.");
     },

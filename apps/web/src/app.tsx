@@ -13,6 +13,7 @@ import { SourceDetailPage } from "./pages/SourceDetailPage";
 import { WorkbenchPage } from "./pages/WorkbenchPage";
 import { DocumentManifestPage } from "./pages/DocumentManifestPage";
 import { WorkspacePage } from "./pages/WorkspacePage";
+import { ReportsPage } from "./pages/ReportsPage";
 
 export function AppRoutes() {
   return (
@@ -68,7 +69,8 @@ export function AppRoutes() {
               path="measurement"
               element={<WorkbenchPage page="measurement" />}
             />
-            <Route path="reports" element={<WorkbenchPage page="reports" />} />
+            <Route path="reports" element={<ReportsPage />} />
+            <Route path="reports/:id" element={<ReportsPage />} />
             <Route path="billing" element={<WorkbenchPage page="billing" />} />
             <Route
               path="settings"

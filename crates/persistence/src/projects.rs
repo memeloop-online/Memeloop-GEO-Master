@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, InitialSource, Project, ProjectCreate, ProjectId, ProjectPatch, ProjectRepository,
-    ProjectSettings, ProjectStartAcceptance, ProjectStartCommand, ProjectStartView, ProjectStatus,
-    ResourceMode, StartAcceptanceStatus, TenantScope, UpdateProject, previous_calendar_week_window,
-    settings_hash, start_request_hash,
+    AppError, CycleReportView, InitialSource, Project, ProjectCreate, ProjectId, ProjectPatch,
+    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
+    ProjectStartView, ProjectStatus, ResourceMode, StartAcceptanceStatus, TenantScope,
+    UpdateProject, previous_calendar_week_window, settings_hash, start_request_hash,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -619,8 +619,8 @@ impl ProjectRepository for PgProjectRepository {
             transaction.commit().await.map_err(map_database_error)?;
             return Ok(None);
         };
-        let row = sqlx::query_as::<_, (i64, String, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)>(
-            "SELECT config.project_revision, config.settings_hash, cycle.report_window_start_at,
+        let row = sqlx::query_as::<_, (i64, String, String, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)>(
+            "SELECT config.project_revision, config.settings_hash, cycle.report_timezone, cycle.report_window_start_at,
                     cycle.report_window_end_at, cycle.cutoff_at
              FROM project_start_records record
              JOIN project_config_revisions config ON config.config_revision_id = record.config_revision_id
@@ -639,9 +639,102 @@ impl ProjectRepository for PgProjectRepository {
             acceptance,
             requested_revision: row.0,
             settings_hash: row.1,
-            report_window_start_at: row.2,
-            report_window_end_at: row.3,
-            cutoff_at: row.4,
+            report_timezone: row.2,
+            report_window_start_at: row.3,
+            report_window_end_at: row.4,
+            cutoff_at: row.5,
+        }))
+    }
+
+    async fn get_report_cycle(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        cycle_id: Uuid,
+    ) -> Result<Option<CycleReportView>, AppError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            report_timezone: String,
+            report_window_start_at: DateTime<Utc>,
+            report_window_end_at: DateTime<Utc>,
+            cutoff_at: DateTime<Utc>,
+            document_manifest_id: Option<Uuid>,
+            document_revision: Option<i32>,
+            document_state: Option<String>,
+            document_sealed: Option<bool>,
+            document_expected_count: Option<i64>,
+            distribution_manifest_id: Option<Uuid>,
+            distribution_revision: Option<i32>,
+            distribution_state: Option<String>,
+            distribution_sealed: Option<bool>,
+            distribution_expected_count: Option<i64>,
+        }
+        let mut transaction = self.pool.begin().await.map_err(map_database_error)?;
+        crate::scope::set_local_scope(&mut transaction, scope)
+            .await
+            .map_err(map_database_error)?;
+        let row = sqlx::query_as::<_, Row>(
+            r#"SELECT cycle.report_timezone, cycle.report_window_start_at,
+                      cycle.report_window_end_at, cycle.cutoff_at,
+                      document.manifest_id AS document_manifest_id,
+                      document.revision AS document_revision,
+                      document.state AS document_state,
+                      document.sealed AS document_sealed,
+                      document.expected_count AS document_expected_count,
+                      distribution.manifest_id AS distribution_manifest_id,
+                      distribution.revision AS distribution_revision,
+                      distribution.state AS distribution_state,
+                      distribution.sealed AS distribution_sealed,
+                      distribution.expected_count AS distribution_expected_count
+               FROM optimization_cycles cycle
+               LEFT JOIN LATERAL (
+                   SELECT * FROM document_manifests
+                   WHERE operator_id=cycle.operator_id AND tenant_id=cycle.tenant_id
+                     AND project_id=cycle.project_id AND cycle_id=cycle.cycle_id
+                   ORDER BY revision DESC LIMIT 1
+               ) document ON true
+               LEFT JOIN LATERAL (
+                   SELECT * FROM distribution_manifests
+                   WHERE operator_id=cycle.operator_id AND tenant_id=cycle.tenant_id
+                     AND project_id=cycle.project_id AND cycle_id=cycle.cycle_id
+                   ORDER BY revision DESC LIMIT 1
+               ) distribution ON true
+               WHERE cycle.operator_id=$1 AND cycle.tenant_id=$2
+                 AND cycle.project_id=$3 AND cycle.cycle_id=$4"#,
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(cycle_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_database_error)?;
+        transaction.commit().await.map_err(map_database_error)?;
+        Ok(row.map(|row| CycleReportView {
+            project_id,
+            cycle_id,
+            report_timezone: row.report_timezone,
+            report_window_start_at: row.report_window_start_at,
+            report_window_end_at: row.report_window_end_at,
+            cutoff_at: row.cutoff_at,
+            document_manifest: row.document_manifest_id.map(|manifest_id| {
+                geo_domain::DocumentManifestAcceptance {
+                    manifest_id,
+                    revision: row.document_revision.unwrap_or_default(),
+                    state: row.document_state.unwrap_or_default(),
+                    sealed: row.document_sealed.unwrap_or(false),
+                    expected_count: row.document_expected_count,
+                }
+            }),
+            distribution_manifest: row.distribution_manifest_id.map(|manifest_id| {
+                geo_domain::DistributionManifestAcceptance {
+                    manifest_id,
+                    revision: row.distribution_revision.unwrap_or_default(),
+                    state: row.distribution_state.unwrap_or_default(),
+                    sealed: row.distribution_sealed.unwrap_or(false),
+                    expected_count: row.distribution_expected_count,
+                }
+            }),
         }))
     }
 }

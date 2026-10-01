@@ -15,7 +15,7 @@ use crate::host::{HOST_OP_ERROR_BOOTSTRAP, HOST_OPS_VERSION, HostBridge, HostOp,
 use crate::host_ops::{
     PRODUCTION_OP_NAMES, op_host_knowledge_import_attachments_v1, op_host_knowledge_search_v1,
     op_host_manifest_read_v2, op_host_measure_sample_v2, op_host_model_complete_v1,
-    op_host_publish_submit_v2,
+    op_host_publish_submit_v2, op_host_report_get_v1, op_host_report_reduce_v1,
 };
 use crate::ops::{HostState, op_host_checkpoint, op_host_emit};
 use crate::runtime::{EmbeddedIsolate, WorkerError};
@@ -29,6 +29,8 @@ deno_core::extension!(
         op_host_manifest_read_v2,
         op_host_publish_submit_v2,
         op_host_measure_sample_v2,
+        op_host_report_get_v1,
+        op_host_report_reduce_v1,
         op_host_emit,
         op_host_checkpoint
     ],

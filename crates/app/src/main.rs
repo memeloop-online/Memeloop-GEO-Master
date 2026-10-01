@@ -3,12 +3,12 @@ mod runtime;
 
 use axum::Router;
 use config::AppConfig;
-use geo_api::{AppState, EmbeddedAgentRuntime, router};
-use geo_persistence::Database;
+use geo_api::{AppState, EmbeddedAgentRuntime, reduce_cycle_report, router};
+use geo_persistence::{Database, PgReportRepository};
 use std::error::Error;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // failures terminate startup; the process never falls back to memory
         // authentication or idempotency state.
         let database = Database::connect_and_migrate_from_env().await?;
+        let report_scanner = PgReportRepository::from_database(&database);
         let state =
             AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone());
         let state = state.with_agent_runtime(Arc::new(EmbeddedAgentRuntime::unconfigured()));
@@ -32,6 +33,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
         }
         state.set_ready(true);
+        spawn_due_report_scanner(state.clone(), report_scanner);
         (state, true)
     } else {
         let password = config.validate_for_memory_mode()?;
@@ -60,4 +62,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// PostgreSQL is authoritative for due-cycle enumeration. Each candidate is
+/// reduced through the same scoped service as HTTP and agent tools; concurrent
+/// replicas race safely at the repository's immutable report key.
+fn spawn_due_report_scanner(state: AppState, scanner: PgReportRepository) {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticks.tick().await;
+            let now = chrono::Utc::now();
+            let mut cursor = None;
+            // A failed old cycle must not monopolize the bounded first page.
+            // Keep moving through this due set, then begin at the oldest
+            // again on the next tick to retry transient failures.
+            loop {
+                match scanner.due_scopes_after(now, cursor).await {
+                    Ok(candidates) => {
+                        let count = candidates.len();
+                        for (cutoff, scope, cycle_id) in candidates {
+                            cursor = Some((cutoff, cycle_id));
+                            if let Err(error) =
+                                reduce_cycle_report(&state, &scope, cycle_id, None, now).await
+                            {
+                                // No account identity, source content, or other
+                                // private operational context enters logs.
+                                warn!(code = ?error.code, "due report reduction failed");
+                            }
+                        }
+                        if count < 100 {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(code = ?error.code, "due report scan failed");
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }

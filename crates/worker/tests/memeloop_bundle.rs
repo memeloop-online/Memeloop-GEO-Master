@@ -19,7 +19,7 @@ use geo_worker::{
     HostBridge, HostOp, HostOpError, HostOps, HostRuntime, KnowledgeImportAttachmentResultItem,
     KnowledgeImportAttachmentsRequest, KnowledgeImportAttachmentsResult, ManifestPage,
     ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest,
+    PublishReceipt, PublishRequest, ReportGetRequest, ReportReduceRequest,
 };
 
 const BUNDLE_SPECIFIER: &str = "memeloop://bundle/memeloop-agent-loop.bundle.mjs";
@@ -30,8 +30,10 @@ struct RecordingHostOps {
     model_calls: Mutex<Vec<(String, ModelCompletionRequest)>>,
     search_calls: Mutex<Vec<(String, KnowledgeSearchRequest)>>,
     import_calls: Mutex<Vec<(String, KnowledgeImportAttachmentsRequest)>>,
+    report_calls: Mutex<Vec<(String, String)>>,
     tool_turn: bool,
     import_turn: bool,
+    report_turn: bool,
 }
 
 impl RecordingHostOps {
@@ -69,6 +71,25 @@ impl HostOps for RecordingHostOps {
             .lock()
             .expect("model call recorder must not be poisoned");
         calls.push((scope.storage_key(), request));
+        if self.report_turn && calls.len() <= 2 {
+            let first = calls.len() == 1;
+            return Ok(serde_json::from_value(serde_json::json!({
+                "text": "",
+                "tool_calls": [{
+                    "id": if first { "report-reduce-1" } else { "report-get-2" },
+                    "type": "function",
+                    "function": {
+                        "name": if first { "report_reduce" } else { "report_get" },
+                        "arguments": "{}"
+                    }
+                }],
+                "model": "probe-model",
+                "prompt_tokens": 7,
+                "completion_tokens": 4,
+                "finish_reason": "tool_calls"
+            }))
+            .expect("report completion fixture must match the host DTO"));
+        }
         if self.import_turn && calls.len() <= 2 {
             let first = calls.len() == 1;
             return Ok(serde_json::from_value(serde_json::json!({
@@ -120,7 +141,9 @@ impl HostOps for RecordingHostOps {
             .expect("tool completion fixture must match the host DTO"));
         }
         Ok(ModelCompletion {
-            text: if self.tool_turn || self.import_turn {
+            text: if self.report_turn {
+                "Report available with a coverage gap.".to_owned()
+            } else if self.tool_turn || self.import_turn {
                 "The warranty lasts two years (Manual).".to_owned()
             } else {
                 "The warranty lasts two years.".to_owned()
@@ -223,6 +246,131 @@ impl HostOps for RecordingHostOps {
     ) -> Result<MeasureSample, HostOpError> {
         Err(Self::unavailable(HostOp::Measure))
     }
+
+    async fn report_reduce(
+        &self,
+        scope: &TenantScope,
+        request: ReportReduceRequest,
+    ) -> Result<geo_domain::ReportSnapshot, HostOpError> {
+        self.report_calls.lock().unwrap().push((
+            scope.storage_key(),
+            format!("reduce:{:?}", request.cycle_id),
+        ));
+        assert_eq!(request.correction_of, None);
+        Ok(report_fixture())
+    }
+
+    async fn report_get(
+        &self,
+        scope: &TenantScope,
+        request: ReportGetRequest,
+    ) -> Result<geo_domain::ReportSnapshot, HostOpError> {
+        self.report_calls
+            .lock()
+            .unwrap()
+            .push((scope.storage_key(), format!("get:{:?}", request.report_id)));
+        Ok(report_fixture())
+    }
+}
+
+fn report_fixture() -> geo_domain::ReportSnapshot {
+    let unavailable = serde_json::json!({
+        "availability": "unavailable", "expected_count": null,
+        "observed_count": 0, "counts": {}, "reason": "no frozen source"
+    });
+    serde_json::from_value(serde_json::json!({
+        "report_id": uuid::Uuid::from_u128(32),
+        "project_id": uuid::Uuid::from_u128(3),
+        "cycle_id": uuid::Uuid::from_u128(31),
+        "revision": 1,
+        "correction_of": null,
+        "report_window_start_at": "2026-09-01T00:00:00Z",
+        "report_window_end_at": "2026-09-08T00:00:00Z",
+        "report_timezone": "UTC",
+        "cutoff_at": "2026-09-08T00:00:00Z",
+        "evidence_as_of": "2026-09-08T00:00:00Z",
+        "generated_at": "2026-09-08T00:00:00Z",
+        "reducer_version": "test",
+        "input_hash": "test-hash",
+        "status": "partial",
+        "input_manifest_versions": [],
+        "documents": unavailable,
+        "publications": unavailable,
+        "measurements": unavailable,
+        "publication_groups": [],
+        "measurement_groups": [],
+        "findings": [],
+        "evidence": []
+    }))
+    .expect("report fixture must match the domain DTO")
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires `pnpm agent:bundle`; run with `cargo test -p geo-worker --test memeloop_bundle -- --ignored`"]
+async fn generated_memeloop_bundle_reduces_and_reads_a_report_through_rust() {
+    let source = generated_bundle();
+    let bundle = [(BUNDLE_SPECIFIER, source.as_str())];
+    let provider = Arc::new(RecordingHostOps {
+        report_turn: true,
+        ..Default::default()
+    });
+    let scope = test_scope();
+    let expected_scope = scope.storage_key();
+    let bridge = HostBridge::new(
+        Arc::clone(&provider) as Arc<dyn HostOps>,
+        scope,
+        tokio::runtime::Handle::current(),
+    );
+    let mut runtime = HostRuntime::new(&bundle, bridge, Some(64 * 1024 * 1024)).unwrap();
+    runtime.install_heap_limit_guard(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    runtime
+        .call_main(
+            BUNDLE_SPECIFIER,
+            &serde_json::json!({
+                "conversation_id": "conversation-report-probe",
+                "prompt": "Reduce the due cycle and read its report",
+                "run_id": "run-report-probe",
+                "turn_id": "turn-report-probe"
+            })
+            .to_string(),
+            TURN_DEADLINE,
+        )
+        .await
+        .expect("native MemeLoop must call both scoped report host ops");
+    let calls = provider.report_calls.lock().unwrap();
+    assert_eq!(
+        calls.as_slice(),
+        &[
+            (expected_scope.clone(), "reduce:None".to_owned()),
+            (expected_scope, "get:None".to_owned()),
+        ]
+    );
+    assert_eq!(runtime.op_calls(HostOp::ReportReduce), 1);
+    assert_eq!(runtime.op_calls(HostOp::ReportGet), 1);
+    let models = provider.model_calls();
+    assert_eq!(models.len(), 3);
+    assert!(
+        models[2]
+            .1
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("\"report_id\"")
+    );
+    let completion = runtime
+        .host_state()
+        .events
+        .into_iter()
+        .find(|event| event.topic == "loop.completed")
+        .unwrap();
+    assert!(
+        completion
+            .payload
+            .contains("Report available with a coverage gap")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -263,7 +411,7 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
     let calls = provider.model_calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].0, expected_scope);
-    assert_eq!(calls[0].1.tools.len(), 1);
+    assert_eq!(calls[0].1.tools.len(), 3);
     assert_eq!(calls[0].1.tools[0].function.name, "knowledge_search");
     assert_eq!(calls[1].1.messages.last().unwrap().role, "tool");
     assert_eq!(
@@ -360,7 +508,7 @@ async fn generated_memeloop_bundle_imports_bound_attachments_then_searches_and_a
     let calls = provider.model_calls();
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[0].0, expected_scope);
-    assert_eq!(calls[0].1.tools.len(), 2);
+    assert_eq!(calls[0].1.tools.len(), 4);
     assert_eq!(
         calls[0].1.tools[0].function.name,
         "knowledge_import_attachments"

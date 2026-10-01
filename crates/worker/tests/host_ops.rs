@@ -897,6 +897,10 @@ async fn undeclared_request_fields_are_refused() {
           query: "warranty",
           tenant_id: "00000000-0000-4000-8000-00000000000f",
         }));
+        await attempt("report-foreign-scope", () => hostOps.reportReduce({
+          cycle_id: "00000000-0000-4000-8000-000000000001",
+          project_id: "00000000-0000-4000-8000-000000000002",
+        }));
         "#,
         bridge(Arc::clone(&ops)),
     );
@@ -915,6 +919,11 @@ async fn undeclared_request_fields_are_refused() {
         "invalid_request",
         "knowledge_search",
     );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "report-foreign-scope"),
+        "invalid_request",
+        "report_reduce",
+    );
     // Neither request reached the bridge, so no destination was ever dialled
     // and no foreign scope was ever addressed.
     assert!(
@@ -922,6 +931,46 @@ async fn undeclared_request_fields_are_refused() {
         "the bridge must not be called: {:?}",
         ops.seen()
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn report_ops_without_an_adapter_fail_closed_after_scope_validation() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("read", () => hostOps.reportGet({
+          report_id: "00000000-0000-4000-8000-000000000001",
+        }));
+        await attempt("reduce", () => hostOps.reportReduce({
+          cycle_id: "00000000-0000-4000-8000-000000000002",
+        }));
+        await attempt("nil", () => hostOps.reportReduce({
+          cycle_id: "00000000-0000-0000-0000-000000000000",
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "read"),
+        "capability_missing",
+        "report_get",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "reduce"),
+        "capability_missing",
+        "report_reduce",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "nil"),
+        "invalid_request",
+        "report_reduce",
+    );
+    assert!(ops.seen().is_empty());
 }
 
 /// A request that is well-shaped but out of the declared range is refused the

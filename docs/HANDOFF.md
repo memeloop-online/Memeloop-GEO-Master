@@ -1,6 +1,6 @@
 # Memeloop GEO 工程交接说明
 
-更新时间：2026-10-01
+更新时间：2026-10-02
 
 适用分支：`integration/w00-pr-stack`（本地集成，尚未合并到 `main`）
 
@@ -79,7 +79,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 安全 Host Ops
 
-- 封闭且带版本的 op 面（`geo.hostops.v2`）：`model.complete.v1`、`knowledge.search.v1`、`knowledge.import_attachments.v1`、`manifest.read.v2`、`publish.submit.v2`、`measure.sample.v2` 六项。附件导入只接受 Rust 已绑定到当前回合的对象；JS 无法取得 SQL、任意网络、文件、进程或环境变量。
+- 封闭且带版本的 op 面（`geo.hostops.v3`）：`model.complete.v1`、`knowledge.search.v1`、`knowledge.import_attachments.v1`、`manifest.read.v2`、`publish.submit.v2`、`measure.sample.v2`、`report.get.v1`、`report.reduce.v1` 八项。附件导入只接受 Rust 已绑定到当前回合的对象；JS 无法取得 SQL、任意网络、文件、进程或环境变量。
 - 边界方向为 `geo-api → geo-worker`，worker 从不反向依赖 API。请求 DTO 全部 `#[serde(deny_unknown_fields)]` 且不携带 tenant/project 选择器，作用域只能来自 Rust 侧 bridge。预算、单次调用截止与取消统一在 `HostBridge::invoke` 施加。
 - `RepositoryHostOps` 已实现 `knowledge_search`、文档 `manifest_read` 和可注入的 `model_complete`；本地开发模型装配见第 5 节。清单读取保留规划状态、阻断原因及覆盖分母，不把规划项 ID 冒充正文版本；分发清单、发布和测量仍缺失。
 
@@ -103,6 +103,15 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - Agent 持久化：`migrations/0007_agent_state.sql`、`crates/persistence/src/agent.rs`
 - 实库测试：`crates/persistence/tests/postgres.rs`
 
+### W09 报告 fan-in 首批实现
+
+- `crates/domain/src/report.rs`：冻结分母、逐文档/发布/独立测量状态汇聚、证据归属/时间校验、缺口结论与不可变更正；缺测不算未提及，未知发布不算失败。
+- `crates/persistence/src/report.rs` 与迁移 `0009_report_snapshots.sql`：租户作用域下保存快照，重复生成复用结果；更正创建关联的新版本。
+- `crates/api/src/reports.rs`：列表、详情、证据与周期 reduce 服务。应用的 PostgreSQL 模式定时扫描已持久化的到期周期，以游标分页避免旧失败项挡住后续周期；这不等于已经实现下一周周期创建。
+- P14 已接列表、详情、证据、项目时区及 CSV；P00 注册 `report_get`/`report_reduce`，省略 ID 时在 Rust 中解析当前项目周期或最新快照。
+- 目前应用输入只接已有文档规划及周期清单；发布/测量来源尚未实现，显示不可用或未封存。纯汇聚器已支持并测试这些输入类型，不代表生产已采到真实渠道数据。文档状态无截止时间证明时明确保留时间依据缺口，不回填伪时间。
+- 正式周报遵循冻结截止；随时生成的临时预览、PDF、下一周期动作及真实跨平台效果报告仍未完成。准确测试和 CI 提交对应关系见 `WORKLOG.md`。
+
 ## 4. 仍未实现，禁止误判为完成
 
 - 真实 MemeLoop bundle 单回合、附件导入及知识检索工具循环已通过嵌入式 V8 测试；剩余为其他业务工具、跨回合历史、持久恢复及分支编排。构建入口 `pnpm agent:bundle`，产物不提交。
@@ -114,7 +123,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - GEO 分发、发布和测量工具，以及文档读取工具在对话 registry 的注册尚待补齐。
 - P00 非 TXT/Markdown 解析、媒体/表格与跨回合附件使用；当前存储为内存或 PostgreSQL blob，非正式对象存储服务。回合输入可由持久 Message 重建，但这不等于完整自动恢复执行。
 - 项目级知识文档清单已支持规划、封存和只读 GET，P07 显示真实覆盖项及来源依赖。刷新封存清单不重新规划，知识当前版本改变也不覆盖历史清单。产品级细化、正文生成、文档 × 平台矩阵、真实连接器/账号池/出口池仍待实现。
-- 独立 AI 渠道测量、证据 reduce、不可变周报和自动进入下一轮。
+- 独立 AI 渠道采样与真实发布证据接入、丰富效果归纳及自动进入下一轮；已有报告快照/汇聚器和到期周期扫描，不代表整个周闭环完成。
 - PostgreSQL 全仓库事务级 tenant scope、FORCE RLS 和非 bypass 角色验收。
 
 PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍 fail closed，不能回退内存。完成结果存档不代表中途恢复或工具副作用账本。复制 `.env.example` 不会自动把变量载入 Rust 进程，PowerShell 中需要显式设置环境变量。

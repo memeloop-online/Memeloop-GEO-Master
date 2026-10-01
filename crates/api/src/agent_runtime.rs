@@ -27,21 +27,23 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use geo_domain::{
     AgentRuntime, AppError, AttachmentReference, DocumentManifestItemState, DocumentManifestState,
     ErrorCode, ImportItem, ImportStatus, KnowledgeRepository, RUNTIME_NOT_CONFIGURED,
-    RuntimeCapability, SourceKind, TenantScope, TurnInput, TurnReport,
+    ReportSnapshot, RuntimeCapability, SourceKind, TenantScope, TurnInput, TurnReport,
 };
 use geo_worker::{
     HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
     HostOpError, HostOpErrorCode, HostOps, HostRuntime, ManifestCoverage, ManifestItem,
     ManifestKind, ManifestPage, ManifestPlanningState, ManifestReadRequest, MeasureRequest,
     MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt, PublishRequest,
-    TURN_COMPLETION_TOPIC, WorkerError,
+    ReportGetRequest, ReportReduceRequest, TURN_COMPLETION_TOPIC, WorkerError,
 };
 use serde_json::{Value, json};
 
 use crate::provider_bridge::SharedModelProvider;
+use crate::{AppState, reduce_cycle_report};
 
 /// The bundle and capabilities one production runtime is assembled from.
 ///
@@ -449,6 +451,67 @@ fn error_code_for_host_op(code: HostOpErrorCode) -> ErrorCode {
 pub struct RepositoryHostOps {
     knowledge: Arc<dyn KnowledgeRepository>,
     model_provider: Option<SharedModelProvider>,
+    report_service: Option<Arc<dyn ReportService>>,
+}
+
+#[async_trait]
+trait ReportService: Send + Sync {
+    async fn get(
+        &self,
+        scope: &TenantScope,
+        request: ReportGetRequest,
+    ) -> Result<ReportSnapshot, AppError>;
+    async fn reduce(
+        &self,
+        scope: &TenantScope,
+        request: ReportReduceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<ReportSnapshot, AppError>;
+}
+
+#[async_trait]
+impl ReportService for AppState {
+    async fn get(
+        &self,
+        scope: &TenantScope,
+        request: ReportGetRequest,
+    ) -> Result<ReportSnapshot, AppError> {
+        if let Some(id) = request.report_id {
+            self.report_repository().get(scope, id).await
+        } else {
+            let project_id = scope
+                .project_id
+                .ok_or_else(|| AppError::forbidden("project scope required"))?;
+            self.report_repository()
+                .list(scope, project_id)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::not_found("no report exists for this project"))
+        }
+    }
+
+    async fn reduce(
+        &self,
+        scope: &TenantScope,
+        request: ReportReduceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<ReportSnapshot, AppError> {
+        let cycle_id = if let Some(id) = request.cycle_id {
+            id
+        } else {
+            let project_id = scope
+                .project_id
+                .ok_or_else(|| AppError::forbidden("project scope required"))?;
+            self.project_repository()
+                .get(scope, project_id)
+                .await?
+                .ok_or_else(|| AppError::not_found("project not found"))?
+                .current_cycle_id
+                .ok_or_else(|| AppError::not_found("current cycle not found"))?
+        };
+        reduce_cycle_report(self, scope, cycle_id, request.correction_of, now).await
+    }
 }
 
 impl RepositoryHostOps {
@@ -458,6 +521,7 @@ impl RepositoryHostOps {
         Self {
             knowledge,
             model_provider: None,
+            report_service: None,
         }
     }
 
@@ -465,6 +529,13 @@ impl RepositoryHostOps {
     /// implementation outside worker requests and persisted state.
     pub fn with_model_provider(mut self, provider: SharedModelProvider) -> Self {
         self.model_provider = Some(provider);
+        self
+    }
+
+    /// Grants report reads/reduction through the same scoped API service as
+    /// HTTP. A runtime without this adapter returns `capability_missing`.
+    pub fn with_report_state(mut self, state: AppState) -> Self {
+        self.report_service = Some(Arc::new(state));
         self
     }
 }
@@ -491,6 +562,37 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
 
 #[async_trait]
 impl HostOps for RepositoryHostOps {
+    async fn report_get(
+        &self,
+        scope: &TenantScope,
+        request: ReportGetRequest,
+    ) -> Result<ReportSnapshot, HostOpError> {
+        let service = self.report_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(HostOp::ReportGet, "report service is not configured")
+        })?;
+        service
+            .get(scope, request)
+            .await
+            .map_err(|error| worker_error(HostOp::ReportGet, error))
+    }
+
+    async fn report_reduce(
+        &self,
+        scope: &TenantScope,
+        request: ReportReduceRequest,
+    ) -> Result<ReportSnapshot, HostOpError> {
+        let service = self.report_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(
+                HostOp::ReportReduce,
+                "report service is not configured",
+            )
+        })?;
+        service
+            .reduce(scope, request, Utc::now())
+            .await
+            .map_err(|error| worker_error(HostOp::ReportReduce, error))
+    }
+
     async fn knowledge_import_attachments(
         &self,
         scope: &TenantScope,

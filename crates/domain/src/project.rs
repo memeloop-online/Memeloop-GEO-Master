@@ -714,9 +714,25 @@ pub struct ProjectStartView {
     pub acceptance: ProjectStartAcceptance,
     pub requested_revision: i64,
     pub settings_hash: String,
+    pub report_timezone: String,
     pub report_window_start_at: DateTime<Utc>,
     pub report_window_end_at: DateTime<Utc>,
     pub cutoff_at: DateTime<Utc>,
+}
+
+/// Frozen cycle metadata and versioned manifest selectors for report fan-in.
+/// Unlike the start acceptance, this also describes subsequent cycles that
+/// were not created by a project-start operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CycleReportView {
+    pub project_id: ProjectId,
+    pub cycle_id: Uuid,
+    pub report_timezone: String,
+    pub report_window_start_at: DateTime<Utc>,
+    pub report_window_end_at: DateTime<Utc>,
+    pub cutoff_at: DateTime<Utc>,
+    pub document_manifest: Option<DocumentManifestAcceptance>,
+    pub distribution_manifest: Option<DistributionManifestAcceptance>,
 }
 
 pub fn settings_hash(settings: &ProjectSettings) -> Result<String, AppError> {
@@ -970,6 +986,26 @@ pub trait ProjectRepository: Send + Sync {
         _id: ProjectId,
     ) -> Result<Option<ProjectStartView>, AppError> {
         Ok(None)
+    }
+
+    async fn get_report_cycle(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        cycle_id: Uuid,
+    ) -> Result<Option<CycleReportView>, AppError> {
+        Ok(self.get_start(scope, project_id).await?.and_then(|start| {
+            (start.acceptance.cycle_id == cycle_id).then_some(CycleReportView {
+                project_id,
+                cycle_id,
+                report_timezone: start.report_timezone,
+                report_window_start_at: start.report_window_start_at,
+                report_window_end_at: start.report_window_end_at,
+                cutoff_at: start.cutoff_at,
+                document_manifest: Some(start.acceptance.document_manifest),
+                distribution_manifest: Some(start.acceptance.distribution_manifest),
+            })
+        }))
     }
 }
 
@@ -1225,6 +1261,7 @@ impl ProjectRepository for MemoryProjectRepository {
             acceptance: acceptance.clone(),
             requested_revision: command.expected_revision,
             settings_hash: computed_settings_hash,
+            report_timezone: settings.report_timezone,
             report_window_start_at,
             report_window_end_at,
             cutoff_at,

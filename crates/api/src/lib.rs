@@ -7,6 +7,7 @@ mod error;
 mod idempotency;
 mod knowledge;
 mod provider_bridge;
+mod reports;
 mod run_executor;
 mod storage;
 
@@ -29,11 +30,12 @@ use geo_domain::{
     MemoryAgentRepository, MemoryAuthRepository, MemoryKnowledgeRepository, MissingAgentRuntime,
     Operation, Operator, Project, ProjectCreate, ProjectId, ProjectOverview, ProjectPage,
     ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
-    ReportSchedule, ResourceMode, Role, TenantId, TenantScope, User, hash_idempotency_key,
-    settings_hash, start_request_hash,
+    ReportRepository, ReportSchedule, ResourceMode, Role, TenantId, TenantScope, User,
+    hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{
     Database, PgAuthRepository, PgIdempotencyStore, PgKnowledgeRepository, PgProjectRepository,
+    PgReportRepository,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,6 +78,7 @@ pub use provider_bridge::{
     ModelProviderBridge, ProviderClientBridge, ProviderRoute, ProviderRouteResolver,
     RoutedProviderClientBridge, SharedModelProvider,
 };
+pub use reports::reduce_cycle_report;
 pub use storage::{EventBus, MemoryOperationStore, OperationStore, PgOperationStore};
 
 #[derive(Clone)]
@@ -87,6 +90,7 @@ pub struct AppState {
     auth_repository: SharedAuthRepository,
     project_repository: Arc<dyn ProjectRepository>,
     knowledge_repository: Arc<dyn KnowledgeRepository>,
+    report_repository: Arc<dyn ReportRepository>,
     events: EventBus,
     ready: Arc<AtomicBool>,
     durable_storage: bool,
@@ -111,6 +115,7 @@ impl AppState {
             auth_repository: Arc::new(MemoryAuthRepository::development_with_password(password)),
             project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
             knowledge_repository: Arc::new(MemoryKnowledgeRepository::default()),
+            report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
             events: EventBus::default(),
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage: false,
@@ -189,6 +194,7 @@ impl AppState {
             auth_repository,
             project_repository,
             knowledge_repository,
+            report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
             events,
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage,
@@ -228,9 +234,10 @@ impl AppState {
             EventBus::default(),
             true,
         )
-        .with_agent_repository(Arc::new(
-            geo_persistence::PgAgentRepository::from_database(database),
-        ))
+        .with_agent_repository(Arc::new(geo_persistence::PgAgentRepository::from_database(
+            database,
+        )))
+        .with_report_repository(Arc::new(PgReportRepository::from_database(database)))
     }
 
     pub fn operation_store(&self) -> Arc<dyn OperationStore> {
@@ -269,6 +276,15 @@ impl AppState {
 
     pub fn knowledge_repository(&self) -> Arc<dyn KnowledgeRepository> {
         Arc::clone(&self.knowledge_repository)
+    }
+
+    pub fn report_repository(&self) -> Arc<dyn ReportRepository> {
+        Arc::clone(&self.report_repository)
+    }
+
+    pub fn with_report_repository(mut self, repository: Arc<dyn ReportRepository>) -> Self {
+        self.report_repository = repository;
+        self
     }
 
     pub fn durable_storage(&self) -> bool {
@@ -1397,6 +1413,10 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         estimate_project_handler,
         start_project,
         get_project_start,
+        reports::list_reports,
+        reports::get_report,
+        reports::get_report_evidence,
+        reports::create_reduction,
         knowledge::capabilities,
         knowledge::create_upload_session,
         knowledge::put_upload_content,
@@ -1451,6 +1471,20 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         ProjectEstimateResponse,
         ProjectStartRequest,
         ProjectStartAcceptance,
+        reports::ReportProjectQuery,
+        reports::ReduceRequest,
+        reports::ReportList,
+        reports::ReportEvidenceList,
+        geo_domain::ReportSnapshot,
+        geo_domain::ReportStatus,
+        geo_domain::ReportAvailability,
+        geo_domain::ReportCoverage,
+        geo_domain::ReportManifestKind,
+        geo_domain::ReportManifestRef,
+        geo_domain::ReportEvidenceReference,
+        geo_domain::ReportFinding,
+        geo_domain::ReportPublicationGroup,
+        geo_domain::ReportMeasurementGroup,
         knowledge::KnowledgeProjectQuery,
         knowledge::ImportBatchRequest,
         geo_domain::KnowledgeCapability,
@@ -1613,6 +1647,16 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(auth_scope_from_request));
 
+    // The repository enforces immutable revision/replay semantics. The
+    // generic JSON idempotency cache is deliberately not the report authority.
+    let report_routes: Router<AppState> = Router::new()
+        .route("/projects/{id}/reports", get(reports::list_reports))
+        .route("/reports/{id}", get(reports::get_report))
+        .route("/reports/{id}/evidence", get(reports::get_report_evidence))
+        .route("/cycles/{id}/reductions", post(reports::create_reduction))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
     // Estimation only validates and computes a range. It intentionally stays
     // outside the idempotency middleware because it has no external side
     // effect or durable reservation to protect.
@@ -1649,6 +1693,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(auth_routes)
                 .merge(estimate_routes)
                 .merge(start_routes)
+                .merge(report_routes)
                 .merge(knowledge_routes)
                 .merge(agent_attachment_bytes)
                 .merge(agent_routes)
