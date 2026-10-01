@@ -220,6 +220,9 @@ pub(crate) async fn create_attachment_upload(
                 declared_media_type: input.declared_media_type,
                 expected_size: input.expected_size,
                 expected_sha256: input.expected_sha256,
+                // Raw chat uploads are private staging objects, not classified
+                // knowledge sources. The explicit import tool assigns the
+                // source purpose; uploading alone must never publish knowledge.
                 purpose: KnowledgePurpose::Internal,
             },
         )

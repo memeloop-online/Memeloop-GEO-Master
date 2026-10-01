@@ -239,9 +239,11 @@ mod tests {
                 ),
                 TurnInput {
                     conversation_id: uuid::Uuid::new_v4().into(),
+                    message_id: uuid::Uuid::new_v4().into(),
                     turn_id: uuid::Uuid::new_v4().into(),
                     run_id: uuid::Uuid::new_v4().into(),
                     prompt: "question".into(),
+                    attachments: Vec::new(),
                 },
             )
             .await

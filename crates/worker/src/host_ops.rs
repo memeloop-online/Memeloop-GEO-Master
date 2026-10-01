@@ -22,9 +22,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::host::{
-    HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeSearchRequest,
-    KnowledgeSearchResult, ManifestReadRequest, MeasureRequest, ModelCompletionRequest,
-    PublishRequest,
+    HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
+    KnowledgeSearchRequest, KnowledgeSearchResult, ManifestReadRequest, MeasureRequest,
+    ModelCompletionRequest, PublishRequest,
 };
 
 /// Converts a structured failure into the JS error the script sees.
@@ -93,6 +93,30 @@ pub async fn op_host_model_complete_v1(
         })
         .await?;
     Ok(encode(op, &completion)?)
+}
+
+/// Imports only attachment IDs already bound to this run. The capability
+/// receives the original Rust references; JavaScript cannot supply object
+/// identity, version, filename, or raw bytes.
+#[op2]
+#[string]
+pub async fn op_host_knowledge_import_attachments_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::KnowledgeImportAttachments;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<KnowledgeImportAttachmentsRequest>(op, &request)?;
+    request.validate(bridge.attachments())?;
+    let result = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .knowledge_import_attachments(bridge.scope(), request, bridge.attachments())
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
 }
 
 /// Evidence retrieval restricted to the run's frozen knowledge release.
@@ -234,6 +258,7 @@ pub async fn op_host_measure_sample_v2(
 pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ModelComplete.op_name(),
     HostOp::KnowledgeSearch.op_name(),
+    HostOp::KnowledgeImportAttachments.op_name(),
     HostOp::ManifestRead.op_name(),
     HostOp::Publish.op_name(),
     HostOp::Measure.op_name(),

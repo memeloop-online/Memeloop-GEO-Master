@@ -480,7 +480,13 @@ pub fn validate_append_message(input: &AppendMessage) -> Result<String, AppError
             "a message may contain at most 100 attachments",
         ));
     }
+    let mut attachment_ids = std::collections::HashSet::new();
     for attachment in &input.attachments {
+        if !attachment_ids.insert(attachment.attachment_id) {
+            return Err(AppError::invalid_request(
+                "attachment IDs must be unique within a message",
+            ));
+        }
         if attachment.object_id.trim().is_empty() || attachment.object_id.chars().count() > 500 {
             return Err(AppError::invalid_request(
                 "attachment object_id must be between 1 and 500 characters",
@@ -608,9 +614,47 @@ pub struct ConversationDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TurnInput {
     pub conversation_id: ConversationId,
+    pub message_id: MessageId,
     pub turn_id: TurnId,
     pub run_id: RunId,
     pub prompt: String,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentReference>,
+}
+
+impl ConversationDetail {
+    /// Rebuild the exact accepted input from scoped durable records. This is
+    /// input reconstruction, not permission to re-execute a terminal run.
+    pub fn turn_input(&self, run_id: RunId) -> Result<TurnInput, AppError> {
+        let run = self
+            .runs
+            .iter()
+            .find(|run| run.id == run_id && run.conversation_id == self.conversation.id)
+            .ok_or_else(|| AppError::not_found("run not found in conversation"))?;
+        let turn = self
+            .turns
+            .iter()
+            .find(|turn| turn.id == run.turn_id && turn.run_id == Some(run.id))
+            .ok_or_else(|| AppError::not_found("run turn not found"))?;
+        let message = self
+            .messages
+            .iter()
+            .find(|message| {
+                message.id == turn.root_message_id
+                    && message.conversation_id == self.conversation.id
+                    && message.turn_id == Some(turn.id)
+                    && message.role == MessageRole::User
+            })
+            .ok_or_else(|| AppError::not_found("run input message not found"))?;
+        Ok(TurnInput {
+            conversation_id: self.conversation.id,
+            message_id: message.id,
+            turn_id: turn.id,
+            run_id: run.id,
+            prompt: message.content.clone(),
+            attachments: message.attachments.clone(),
+        })
+    }
 }
 
 /// What a runtime reports back for a turn that ran.

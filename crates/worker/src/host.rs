@@ -14,6 +14,7 @@
 //! dependency runs the other way, which keeps the isolate boundary a real seam
 //! instead of a naming convention.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -27,6 +28,7 @@ use uuid::Uuid;
 // The canonical domain vocabulary the surface speaks.  Re-exported so an
 // implementation of [`HostOps`] needs one import path, and so the worker never
 // grows a parallel set of types for the same concepts.
+use geo_domain::{AppError, AttachmentReference, ImportStatus, KnowledgePurpose};
 pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
 
 /// The version of the host-op surface this crate registers.
@@ -67,6 +69,8 @@ pub enum HostOp {
     ModelComplete,
     /// Evidence retrieval restricted to the run's frozen knowledge release.
     KnowledgeSearch,
+    /// Explicitly import attachments bound to this run into project knowledge.
+    KnowledgeImportAttachments,
     /// Read a page of a frozen document or distribution manifest.
     ManifestRead,
     /// Submit one document revision to one platform target.
@@ -77,12 +81,13 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::ModelComplete,
         Self::KnowledgeSearch,
+        Self::KnowledgeImportAttachments,
         Self::ManifestRead,
         Self::Publish,
         Self::Measure,
@@ -93,6 +98,7 @@ impl HostOp {
         match self {
             Self::ModelComplete => "model.complete.v1",
             Self::KnowledgeSearch => "knowledge.search.v1",
+            Self::KnowledgeImportAttachments => "knowledge.import_attachments.v1",
             Self::ManifestRead => "manifest.read.v2",
             Self::Publish => "publish.submit.v2",
             Self::Measure => "measure.sample.v2",
@@ -104,6 +110,7 @@ impl HostOp {
         match self {
             Self::ModelComplete => "op_host_model_complete_v1",
             Self::KnowledgeSearch => "op_host_knowledge_search_v1",
+            Self::KnowledgeImportAttachments => "op_host_knowledge_import_attachments_v1",
             Self::ManifestRead => "op_host_manifest_read_v2",
             Self::Publish => "op_host_publish_submit_v2",
             Self::Measure => "op_host_measure_sample_v2",
@@ -152,6 +159,7 @@ impl Default for HostOpBudgets {
             limits: [
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 64),
+                HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(60_000, 16),
                 HostOpLimits::new(120_000, 32),
@@ -398,6 +406,18 @@ pub trait HostOps: Send + Sync {
         request: KnowledgeSearchRequest,
     ) -> Result<KnowledgeSearchResult, HostOpError>;
 
+    async fn knowledge_import_attachments(
+        &self,
+        _scope: &TenantScope,
+        _request: KnowledgeImportAttachmentsRequest,
+        _attachments: &[AttachmentReference],
+    ) -> Result<KnowledgeImportAttachmentsResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::KnowledgeImportAttachments,
+            "attachment knowledge import is not configured",
+        ))
+    }
+
     async fn manifest_read(
         &self,
         scope: &TenantScope,
@@ -496,6 +516,74 @@ pub struct ModelCompletion {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub finish_reason: String,
+}
+
+/// Model-selectable IDs and purpose only. Object metadata and business keys
+/// come exclusively from the Rust-owned run binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeImportAttachmentsRequest {
+    pub items: Vec<KnowledgeImportAttachmentItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeImportAttachmentItem {
+    pub attachment_id: Uuid,
+    pub purpose: KnowledgePurpose,
+}
+
+impl KnowledgeImportAttachmentsRequest {
+    pub fn validate(&self, attachments: &[AttachmentReference]) -> Result<(), HostOpError> {
+        let op = HostOp::KnowledgeImportAttachments;
+        if self.items.is_empty() || self.items.len() > 100 {
+            return Err(HostOpError::invalid_request(
+                op,
+                "items must contain 1 to 100 attachments",
+            ));
+        }
+        let bound: HashSet<_> = attachments
+            .iter()
+            .map(|item| item.attachment_id.as_uuid())
+            .collect();
+        let mut requested = HashSet::with_capacity(self.items.len());
+        for item in &self.items {
+            if item.attachment_id.is_nil() || !requested.insert(item.attachment_id) {
+                return Err(HostOpError::invalid_request(
+                    op,
+                    "attachment IDs must be non-nil and unique",
+                ));
+            }
+            if !bound.contains(&item.attachment_id) {
+                return Err(HostOpError::denied(
+                    op,
+                    "attachment is not bound to this run",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeImportAttachmentsResult {
+    pub items: Vec<KnowledgeImportAttachmentResultItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeImportAttachmentResultItem {
+    pub attachment_id: Uuid,
+    pub status: ImportStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_release_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AppError>,
 }
 
 #[cfg(test)]
@@ -920,6 +1008,7 @@ impl HostOpMeter {
 pub struct HostBridge {
     capabilities: Arc<dyn HostOps>,
     scope: TenantScope,
+    attachments: Arc<[AttachmentReference]>,
     budgets: HostOpBudgets,
     meter: Arc<HostOpMeter>,
     cancellation: Arc<AtomicBool>,
@@ -953,6 +1042,7 @@ impl HostBridge {
         Self {
             capabilities,
             scope,
+            attachments: Arc::from(Vec::<AttachmentReference>::new()),
             budgets: HostOpBudgets::default(),
             meter: Arc::new(HostOpMeter::default()),
             cancellation: Arc::new(AtomicBool::new(false)),
@@ -963,6 +1053,16 @@ impl HostBridge {
     pub fn with_budgets(mut self, budgets: HostOpBudgets) -> Self {
         self.budgets = budgets;
         self
+    }
+
+    /// Immutable attachment references accepted with this run's root message.
+    pub fn with_attachments(mut self, attachments: Vec<AttachmentReference>) -> Self {
+        self.attachments = Arc::from(attachments);
+        self
+    }
+
+    pub fn attachments(&self) -> &[AttachmentReference] {
+        &self.attachments
     }
 
     /// Shares the run's cancellation flag.  Raising it stops later ops before

@@ -49,7 +49,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - 局部集成 `@memeloop/react-ui` 的 `AgentChatView`，外围应用壳继续使用 Fluent UI。
 - 已定义并实现内存版 Conversation、Message、Turn、Run、AttachmentReference、RuntimeCapability 和递增 ConversationEvent。
 - 已有会话创建/列表/详情、消息提交、Turn 取消和 SSE 重放 API；支持幂等提交、同键异请求冲突、附件-only 消息、跨项目隔离、`after`/`Last-Event-ID` 恢复。
-- P00 已接多附件选择/拖拽/粘贴、逐项上传及失败重试；专用附件 API 核验字节与摘要，提交消息时核对作用域和已提交对象元数据。附件暂不自动导入知识库，也尚未进入模型上下文。
+- P00 已接多附件选择/拖拽/粘贴、逐项上传及失败重试；专用附件 API 核验字节与摘要，提交消息时核对作用域和已提交对象元数据。TXT/Markdown 可经模型显式导入工具形成知识版本，再检索并引用回答；上传本身不直接入库，原始大文件不塞入模型上下文。
 - 真实 MemeLoop 已执行模型 → `knowledge_search` → Rust 检索 → 模型回答；JSON function-tool 协议可用，尚无流式工具分片、多回合历史或中途恢复。
 - Rust JS Runtime 未接入时明确返回 `capability_missing`，界面不会伪造 AI 回复。
 
@@ -79,7 +79,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 安全 Host Ops
 
-- 封闭且带版本的 op 面（`geo.hostops.v2`）：只有 `model.complete.v1`、`knowledge.search.v1`、`manifest.read.v2`、`publish.submit.v2`、`measure.sample.v2` 五项；不在枚举里的名字没有 op，也就没有 Rust 实现体。JS 无法取得 SQL、任意网络、文件、进程或环境变量。
+- 封闭且带版本的 op 面（`geo.hostops.v2`）：`model.complete.v1`、`knowledge.search.v1`、`knowledge.import_attachments.v1`、`manifest.read.v2`、`publish.submit.v2`、`measure.sample.v2` 六项。附件导入只接受 Rust 已绑定到当前回合的对象；JS 无法取得 SQL、任意网络、文件、进程或环境变量。
 - 边界方向为 `geo-api → geo-worker`，worker 从不反向依赖 API。请求 DTO 全部 `#[serde(deny_unknown_fields)]` 且不携带 tenant/project 选择器，作用域只能来自 Rust 侧 bridge。预算、单次调用截止与取消统一在 `HostBridge::invoke` 施加。
 - `RepositoryHostOps` 已实现 `knowledge_search`、文档 `manifest_read` 和可注入的 `model_complete`；本地开发模型装配见第 5 节。清单读取保留规划状态、阻断原因及覆盖分母，不把规划项 ID 冒充正文版本；分发清单、发布和测量仍缺失。
 
@@ -105,14 +105,14 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ## 4. 仍未实现，禁止误判为完成
 
-- 真实 MemeLoop bundle 单回合及知识检索工具循环已通过嵌入式 V8 测试；剩余为其他业务工具、附件和会话历史、持久恢复及分支编排。构建入口 `pnpm agent:bundle`，产物不提交。
+- 真实 MemeLoop bundle 单回合、附件导入及知识检索工具循环已通过嵌入式 V8 测试；剩余为其他业务工具、跨回合历史、持久恢复及分支编排。构建入口 `pnpm agent:bundle`，产物不提交。
 - **重启对账**：已接 `GEO_SINGLE_PROCESS_EXECUTOR=true` 启动扫描，只适用于整个数据库严格单执行进程，默认关闭。滚动部署、多副本不得启用；queued 恢复、租约和优雅关闭仍未实现。PostgreSQL 对账测试已由 CI 独立 schema 验收。
 - **回合进行中的实时取消**：`cancel_turn` 语义正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
 - **隔离体基础保护**：64 MiB V8 堆、near-heap 终止、独立墙钟和 Rust 输出预算均已回归通过。不设固定隔离体并发准入门槛；高吞吐调度和进程资源观测仍需真实容量验收。
 - **checkpoint 与 tool-call ledger**：executor 已写完成结果存档，中途恢复及 Rust 调用侧 intent/attempt/outcome 尚未接通。
 - Token Center HTTP 适配已通过本地契约测试，但正式租户映射/应用装配、流式模型事件和模型费用记账尚未接通；本地单模型 HTTP 调用已装配，需环境注入凭据。
 - GEO 分发、发布和测量工具，以及文档读取工具在对话 registry 的注册尚待补齐。
-- P00 附件模型读取、解析与显式知识导入；当前存储为内存或 PostgreSQL blob，非正式对象存储服务。
+- P00 非 TXT/Markdown 解析、媒体/表格与跨回合附件使用；当前存储为内存或 PostgreSQL blob，非正式对象存储服务。回合输入可由持久 Message 重建，但这不等于完整自动恢复执行。
 - 项目级知识文档清单已支持规划、封存和只读 GET，P07 显示真实覆盖项及来源依赖。刷新封存清单不重新规划，知识当前版本改变也不覆盖历史清单。产品级细化、正文生成、文档 × 平台矩阵、真实连接器/账号池/出口池仍待实现。
 - 独立 AI 渠道测量、证据 reduce、不可变周报和自动进入下一轮。
 - PostgreSQL 全仓库事务级 tenant scope、FORCE RLS 和非 bypass 角色验收。
@@ -135,7 +135,7 @@ PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍
 
 全部缺省时保持未配置；只提供部分配置、摘要错误、文件超过 8 MiB 或尝试用于数据库模式均拒绝启动。
 模型路由固定为配置模型；该阶段仅证明真实 MemeLoop 单回合模型路径，
-已支持知识检索工具循环，但不代表附件读取、多回合恢复、发布和测量工具已接通。不设置固定两回合并发门禁，优先跑通应用功能。
+已支持 TXT/Markdown 附件导入及知识检索工具循环，但不代表多回合恢复、发布和测量工具已接通。不设置固定两回合并发门禁，优先跑通应用功能。
 
 无需真实凭据的装配验证：
 `cargo test -p geo-app generated_bundle_runs_one_turn_through_assembled_provider -- --ignored`。
@@ -202,7 +202,7 @@ cargo test -p geo-persistence --test postgres -- --ignored
 
 1. **执行安全验证**：复验 current-thread 下模块求值及 `main` 死循环的独立线程墙钟终止、堆上限与取消；测试进程必须有外部截止保护。
 2. **run executor 恢复**：驱动链已存在，剩余工作是租约/重启对账、实时取消及持久 checkpoint/tool-call ledger。不得通过扫描并结束所有 running run 的方式干扰其他副本。
-3. **扩展真实 bundle 工具循环**：模型工具协议及知识检索已通，下一步接入附件读取/显式导入、文档规划和生成；产物不入库，分发携带第三方许可。
+3. **扩展真实 bundle 工具循环**：模型工具协议、附件显式导入及知识检索已通，下一步接入文档规划和生成；产物不入库，分发携带第三方许可。
 4. **模型 Provider 与 GEO 工具桥接**：把上述四项 `capability_missing` 逐一变成真实实现。
 5. **首个完整纵切**：上传附件并形成对象引用，给出带来源回答，生成两个文档分支，中断后从 checkpoint 恢复，再 reduce 为结果摘要。
 

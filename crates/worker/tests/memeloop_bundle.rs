@@ -11,11 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
+use geo_domain::{
+    AppError, AttachmentId, AttachmentReference, ImportStatus, KnowledgeSearchRequest,
+    KnowledgeSearchResult, TenantScope,
+};
 use geo_worker::{
-    HostBridge, HostOp, HostOpError, HostOps, HostRuntime, ManifestPage, ManifestReadRequest,
-    MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
-    PublishRequest,
+    HostBridge, HostOp, HostOpError, HostOps, HostRuntime, KnowledgeImportAttachmentResultItem,
+    KnowledgeImportAttachmentsRequest, KnowledgeImportAttachmentsResult, ManifestPage,
+    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
+    PublishReceipt, PublishRequest,
 };
 
 const BUNDLE_SPECIFIER: &str = "memeloop://bundle/memeloop-agent-loop.bundle.mjs";
@@ -25,7 +29,9 @@ const TURN_DEADLINE: Duration = Duration::from_secs(30);
 struct RecordingHostOps {
     model_calls: Mutex<Vec<(String, ModelCompletionRequest)>>,
     search_calls: Mutex<Vec<(String, KnowledgeSearchRequest)>>,
+    import_calls: Mutex<Vec<(String, KnowledgeImportAttachmentsRequest)>>,
     tool_turn: bool,
+    import_turn: bool,
 }
 
 impl RecordingHostOps {
@@ -63,6 +69,38 @@ impl HostOps for RecordingHostOps {
             .lock()
             .expect("model call recorder must not be poisoned");
         calls.push((scope.storage_key(), request));
+        if self.import_turn && calls.len() <= 2 {
+            let first = calls.len() == 1;
+            return Ok(serde_json::from_value(serde_json::json!({
+                "text": "",
+                "tool_calls": [{
+                    "id": if first { "import-call-1" } else { "search-call-2" },
+                    "type": "function",
+                    "function": if first {
+                        serde_json::json!({
+                            "name": "knowledge_import_attachments",
+                            "arguments": format!(
+                                "{{\"items\":[{{\"attachment_id\":\"{}\",\"purpose\":\"internal\"}},{{\"attachment_id\":\"{}\",\"purpose\":\"internal\"}}]}}",
+                                uuid::Uuid::from_u128(40), uuid::Uuid::from_u128(41)
+                            )
+                        })
+                    } else {
+                        serde_json::json!({
+                            "name": "knowledge_search",
+                            "arguments": format!(
+                                "{{\"query\":\"warranty\",\"knowledge_release_id\":\"{}\"}}",
+                                uuid::Uuid::from_u128(50)
+                            )
+                        })
+                    }
+                }],
+                "model": "probe-model",
+                "prompt_tokens": 7,
+                "completion_tokens": 4,
+                "finish_reason": "tool_calls"
+            }))
+            .expect("import completion fixture must match the host DTO"));
+        }
         if self.tool_turn && calls.len() == 1 {
             return Ok(serde_json::from_value(serde_json::json!({
                 "text": "",
@@ -82,7 +120,7 @@ impl HostOps for RecordingHostOps {
             .expect("tool completion fixture must match the host DTO"));
         }
         Ok(ModelCompletion {
-            text: if self.tool_turn {
+            text: if self.tool_turn || self.import_turn {
                 "The warranty lasts two years (Manual).".to_owned()
             } else {
                 "The warranty lasts two years.".to_owned()
@@ -100,7 +138,7 @@ impl HostOps for RecordingHostOps {
         scope: &TenantScope,
         request: KnowledgeSearchRequest,
     ) -> Result<KnowledgeSearchResult, HostOpError> {
-        if !self.tool_turn {
+        if !self.tool_turn && !self.import_turn {
             return Err(Self::unavailable(HostOp::KnowledgeSearch));
         }
         self.search_calls
@@ -128,6 +166,38 @@ impl HostOps for RecordingHostOps {
             "capability_missing": null
         }))
         .expect("evidence fixture must match the domain DTO"))
+    }
+
+    async fn knowledge_import_attachments(
+        &self,
+        scope: &TenantScope,
+        request: KnowledgeImportAttachmentsRequest,
+        attachments: &[AttachmentReference],
+    ) -> Result<KnowledgeImportAttachmentsResult, HostOpError> {
+        assert_eq!(attachments.len(), 2);
+        self.import_calls
+            .lock()
+            .expect("import call recorder must not be poisoned")
+            .push((scope.storage_key(), request.clone()));
+        Ok(KnowledgeImportAttachmentsResult {
+            items: request
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| KnowledgeImportAttachmentResultItem {
+                    attachment_id: item.attachment_id,
+                    status: if index == 0 {
+                        ImportStatus::Succeeded
+                    } else {
+                        ImportStatus::Failed
+                    },
+                    source_id: (index == 0).then_some(uuid::Uuid::from_u128(48)),
+                    source_version_id: (index == 0).then_some(uuid::Uuid::from_u128(49)),
+                    knowledge_release_id: (index == 0).then_some(uuid::Uuid::from_u128(50)),
+                    error: (index == 1).then(|| AppError::capability_missing("parser unavailable")),
+                })
+                .collect(),
+        })
     }
 
     async fn manifest_read(
@@ -223,6 +293,137 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
         .find(|event| event.topic == "loop.completed")
         .unwrap();
     let completion: serde_json::Value = serde_json::from_str(&completed.payload).unwrap();
+    assert_eq!(
+        completion["answer"],
+        "The warranty lasts two years (Manual)."
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires `pnpm agent:bundle`; run with `cargo test -p geo-worker --test memeloop_bundle -- --ignored`"]
+async fn generated_memeloop_bundle_imports_bound_attachments_then_searches_and_answers() {
+    let source = generated_bundle();
+    let bundle = [(BUNDLE_SPECIFIER, source.as_str())];
+    let provider = Arc::new(RecordingHostOps {
+        import_turn: true,
+        ..Default::default()
+    });
+    let scope = test_scope();
+    let expected_scope = scope.storage_key();
+    let attachments = vec![
+        AttachmentReference {
+            attachment_id: AttachmentId::from(uuid::Uuid::from_u128(40)),
+            object_id: "object-40".to_owned(),
+            filename: "Guide.txt".to_owned(),
+            media_type: Some("text/plain".to_owned()),
+            size_bytes: Some(9),
+            sha256: Some("a".repeat(64)),
+            object_version: Some("version-1".to_owned()),
+        },
+        AttachmentReference {
+            attachment_id: AttachmentId::from(uuid::Uuid::from_u128(41)),
+            object_id: "object-41".to_owned(),
+            filename: "Data.pdf".to_owned(),
+            media_type: Some("application/pdf".to_owned()),
+            size_bytes: Some(11),
+            sha256: Some("b".repeat(64)),
+            object_version: Some("version-2".to_owned()),
+        },
+    ];
+    let bridge = HostBridge::new(
+        Arc::clone(&provider) as Arc<dyn HostOps>,
+        scope,
+        tokio::runtime::Handle::current(),
+    )
+    .with_attachments(attachments.clone());
+    let mut runtime = HostRuntime::new(&bundle, bridge, Some(64 * 1024 * 1024))
+        .expect("the generated bundle must construct");
+    runtime.install_heap_limit_guard(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    runtime
+        .call_main(
+            BUNDLE_SPECIFIER,
+            &serde_json::json!({
+                "conversation_id": "conversation-import-probe-0001",
+                "message_id": "message-import-probe-0001",
+                "prompt": "",
+                "run_id": "run-import-probe-0001",
+                "turn_id": "turn-import-probe-0001",
+                "timestamp": 1_700_000_000_000_u64,
+                "attachments": attachments,
+            })
+            .to_string(),
+            TURN_DEADLINE,
+        )
+        .await
+        .expect("MemeLoop must perform import → search → answer through Rust host ops");
+
+    let calls = provider.model_calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].0, expected_scope);
+    assert_eq!(calls[0].1.tools.len(), 2);
+    assert_eq!(
+        calls[0].1.tools[0].function.name,
+        "knowledge_import_attachments"
+    );
+    let schema = &calls[0].1.tools[0].function.parameters;
+    assert_eq!(
+        schema["properties"]["items"]["items"]["properties"]["attachment_id"]["enum"][0],
+        uuid::Uuid::from_u128(40).to_string()
+    );
+    assert!(
+        schema["properties"]["items"]["items"]["properties"]["attachment_id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Guide.txt")
+    );
+    assert_eq!(
+        calls[0].1.messages.last().unwrap().content.as_deref(),
+        Some("")
+    );
+    let import_calls = provider
+        .import_calls
+        .lock()
+        .expect("import call recorder must not be poisoned");
+    assert_eq!(import_calls.len(), 1);
+    assert_eq!(import_calls[0].0, expected_scope);
+    assert_eq!(import_calls[0].1.items.len(), 2);
+    assert!(
+        calls[1]
+            .1
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("capability_missing")
+    );
+    let searches = provider.search_calls();
+    assert_eq!(searches.len(), 1);
+    assert_eq!(
+        searches[0].1.knowledge_release_id.unwrap(),
+        uuid::Uuid::from_u128(50)
+    );
+    assert_eq!(calls[2].1.messages.last().unwrap().role, "tool");
+    assert!(
+        calls[2]
+            .1
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("Two years")
+    );
+    let state = runtime.host_state();
+    let completed = state
+        .events
+        .iter()
+        .find(|event| event.topic == "loop.completed")
+        .unwrap();
+    let completion: serde_json::Value = serde_json::from_str(&completed.payload).unwrap();
+    assert_eq!(completion["turn_id"], "turn-import-probe-0001");
     assert_eq!(
         completion["answer"],
         "The warranty lasts two years (Manual)."

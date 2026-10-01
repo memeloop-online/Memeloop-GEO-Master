@@ -6,6 +6,7 @@ const LOCAL_NODE_ID = "geo-embedded-worker";
 // OpenAI-compatible function names do not permit dots; the host capability
 // itself remains the versioned knowledge.search.v1 op.
 const KNOWLEDGE_SEARCH = "knowledge_search";
+const KNOWLEDGE_IMPORT_ATTACHMENTS = "knowledge_import_attachments";
 const KNOWLEDGE_SEARCH_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -43,18 +44,22 @@ if (typeof globalThis.structuredClone !== "function") {
  */
 export async function main(input) {
   const turn = normalizeTurnInput(input);
-  const host = resolveHost();
+  const host = resolveHost(turn.attachments.length > 0);
   const session = getSession(turn.conversationId);
   const modelId = turn.model ?? DEFAULT_MODEL_ID;
   const toolFailures = [];
   const provider = createHostProvider(host, modelId, toolFailures);
-  const definition = createDefinition(modelId);
+  const toolNames =
+    turn.attachments.length > 0
+      ? [KNOWLEDGE_IMPORT_ATTACHMENTS, KNOWLEDGE_SEARCH]
+      : [KNOWLEDGE_SEARCH];
+  const definition = createDefinition(modelId, toolNames);
   const context = createContext({
     session,
     definition,
     provider,
     modelId,
-    tools: createHostTools(host, toolFailures),
+    tools: createHostTools(host, toolFailures, turn.attachments),
   });
   const runner = createAgentToolLoopRunner(context);
 
@@ -65,8 +70,24 @@ export async function main(input) {
     runId: turn.runId,
     userMessage: {
       content: turn.prompt,
-      messageId: turn.turnId,
-      turnId: turn.turnId,
+      messageId: turn.messageId,
+      // The upstream canonical user turn is keyed by messageId. GEO retains
+      // its separate persisted turnId for the enclosing Run and completion.
+      ...(turn.attachments.length > 0
+        ? {
+            metadata: {
+              attachmentReferences: turn.attachments.map((attachment) =>
+                withoutUndefined({
+                  attachmentId: attachment.attachmentId,
+                  filename: attachment.filename,
+                  mimeType: attachment.mimeType,
+                  size: attachment.size,
+                  contentHash: attachment.contentHash,
+                }),
+              ),
+            },
+          }
+        : {}),
       timestamp: turn.timestamp,
     },
   })) {
@@ -83,7 +104,7 @@ export async function main(input) {
   if (exhausted) {
     throw new Error("MemeLoop exhausted its model-to-tool iteration budget.");
   }
-  const assistant = session.latestAssistant(turn.turnId);
+  const assistant = session.latestAssistant(turn.messageId);
   if (
     !assistant ||
     assistant.toolCalls?.length > 0 ||
@@ -113,9 +134,20 @@ function normalizeTurnInput(input) {
     input.conversation_id,
     "conversation_id",
   );
-  const prompt = requiredString(input.prompt, "prompt");
+  if (typeof input.prompt !== "string") {
+    throw new TypeError("prompt must be a string.");
+  }
+  const prompt = input.prompt;
   const turnId = requiredString(input.turn_id, "turn_id");
+  const messageId =
+    input.message_id === undefined
+      ? turnId
+      : requiredString(input.message_id, "message_id");
   const runId = requiredString(input.run_id, "run_id");
+  const attachments = normalizeAttachments(input.attachments ?? []);
+  if (prompt.trim().length === 0 && attachments.length === 0) {
+    throw new TypeError("A turn requires a prompt or an attachment.");
+  }
   const model =
     input.model === undefined
       ? undefined
@@ -125,7 +157,50 @@ function normalizeTurnInput(input) {
       ? Date.now()
       : requiredPositiveSafeInteger(input.timestamp, "timestamp");
 
-  return { conversationId, model, prompt, runId, timestamp, turnId };
+  return {
+    attachments,
+    conversationId,
+    messageId,
+    model,
+    prompt,
+    runId,
+    timestamp,
+    turnId,
+  };
+}
+
+function normalizeAttachments(value) {
+  if (!Array.isArray(value)) {
+    throw new TypeError("attachments must be an array.");
+  }
+  const ids = new Set();
+  return value.map((attachment) => {
+    if (!isRecord(attachment)) {
+      throw new TypeError("Each attachment must be an object.");
+    }
+    const attachmentId = requiredString(
+      attachment.attachment_id,
+      "attachment_id",
+    );
+    if (ids.has(attachmentId)) {
+      throw new TypeError("Duplicate attachment_id in turn input.");
+    }
+    ids.add(attachmentId);
+    const filename = requiredString(attachment.filename, "filename");
+    const mimeType =
+      attachment.media_type == null
+        ? "application/octet-stream"
+        : requiredString(attachment.media_type, "media_type");
+    const size =
+      attachment.size_bytes == null
+        ? undefined
+        : requiredPositiveSafeInteger(attachment.size_bytes, "size_bytes");
+    const contentHash =
+      attachment.sha256 == null
+        ? undefined
+        : `sha256:${requiredString(attachment.sha256, "sha256").replace(/^sha256:/u, "")}`;
+    return { attachmentId, filename, mimeType, size, contentHash };
+  });
 }
 
 function createContext({ session, definition, modelId, provider, tools }) {
@@ -136,7 +211,10 @@ function createContext({ session, definition, modelId, provider, tools }) {
       textToolCallProtocolEnabled: false,
       toolPermissions: {
         default: "deny",
-        rules: [{ pattern: KNOWLEDGE_SEARCH, action: "allow" }],
+        rules: [
+          { pattern: KNOWLEDGE_SEARCH, action: "allow" },
+          { pattern: KNOWLEDGE_IMPORT_ATTACHMENTS, action: "allow" },
+        ],
       },
     },
     defaultModelConfig: definition.modelConfig,
@@ -175,7 +253,7 @@ function createContext({ session, definition, modelId, provider, tools }) {
   };
 }
 
-function createDefinition(modelId) {
+function createDefinition(modelId, toolNames = [KNOWLEDGE_SEARCH]) {
   return {
     description: "Rust-hosted MemeLoop agent turn",
     id: "geo-embedded-agent",
@@ -185,7 +263,7 @@ function createDefinition(modelId) {
     },
     name: "GEO embedded agent",
     systemPrompt: "",
-    tools: [KNOWLEDGE_SEARCH],
+    tools: toolNames,
     version: "1",
   };
 }
@@ -215,7 +293,10 @@ function createHostProvider(host, configuredModel, toolFailures) {
           },
         })),
       });
-      assertModelCompletion(response);
+      assertModelCompletion(
+        response,
+        new Set((request.tools ?? []).map((tool) => tool.name)),
+      );
       provider.lastModel = response.model;
 
       if (response.text.length > 0) {
@@ -337,7 +418,7 @@ function messageContent(content) {
     .join("\n");
 }
 
-function assertModelCompletion(value) {
+function assertModelCompletion(value, allowedTools) {
   if (
     !isRecord(value) ||
     typeof value.text !== "string" ||
@@ -353,7 +434,7 @@ function assertModelCompletion(value) {
             typeof call.id !== "string" ||
             call.type !== "function" ||
             !isRecord(call.function) ||
-            call.function.name !== KNOWLEDGE_SEARCH ||
+            !allowedTools.has(call.function.name) ||
             typeof call.function.arguments !== "string",
         )))
   ) {
@@ -363,9 +444,13 @@ function assertModelCompletion(value) {
   }
 }
 
-function resolveHost() {
+function resolveHost(requireImport) {
   const testHost = globalThis.__GEO_AGENT_TEST_HOST__;
-  if (isHost(testHost)) {
+  if (
+    isHost(testHost) &&
+    (!requireImport ||
+      typeof testHost.knowledgeImportAttachments === "function")
+  ) {
     return testHost;
   }
 
@@ -374,6 +459,8 @@ function resolveHost() {
     !denoOps ||
     typeof denoOps.op_host_model_complete_v1 !== "function" ||
     typeof denoOps.op_host_knowledge_search_v1 !== "function" ||
+    (requireImport &&
+      typeof denoOps.op_host_knowledge_import_attachments_v1 !== "function") ||
     typeof denoOps.op_host_emit !== "function"
   ) {
     throw new Error("The approved Rust host-op surface is not available.");
@@ -393,6 +480,13 @@ function resolveHost() {
     async knowledgeSearch(request) {
       return JSON.parse(
         await denoOps.op_host_knowledge_search_v1(JSON.stringify(request)),
+      );
+    },
+    async knowledgeImportAttachments(request) {
+      return JSON.parse(
+        await denoOps.op_host_knowledge_import_attachments_v1(
+          JSON.stringify(request),
+        ),
       );
     },
   };
@@ -504,7 +598,7 @@ function createSession(conversationId) {
   };
 }
 
-function createHostTools(host, failures) {
+function createHostTools(host, failures, attachments) {
   const search = async (parameters) => {
     try {
       if (!isRecord(parameters)) {
@@ -516,11 +610,64 @@ function createHostTools(host, failures) {
       throw error;
     }
   };
+  const importAttachments = async (parameters) => {
+    try {
+      if (!isRecord(parameters) || !Array.isArray(parameters.items)) {
+        throw new TypeError("knowledge.import_attachments requires items.");
+      }
+      return { result: await host.knowledgeImportAttachments(parameters) };
+    } catch (error) {
+      failures.push(error);
+      throw error;
+    }
+  };
+  const importSchema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["items"],
+    properties: {
+      items: {
+        type: "array",
+        minItems: 1,
+        maxItems: attachments.length,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["attachment_id", "purpose"],
+          properties: {
+            attachment_id: {
+              type: "string",
+              enum: attachments.map(({ attachmentId }) => attachmentId),
+              description: `Current message attachments: ${attachments
+                .map(
+                  ({ attachmentId, filename, mimeType }) =>
+                    `${attachmentId} (${filename}, ${mimeType})`,
+                )
+                .join("; ")}`,
+            },
+            purpose: { type: "string", enum: ["public", "internal"] },
+          },
+        },
+      },
+    },
+  };
   return {
-    getTool: (id) => (id === KNOWLEDGE_SEARCH ? search : undefined),
-    listTools: () => [KNOWLEDGE_SEARCH],
+    getTool: (id) =>
+      id === KNOWLEDGE_SEARCH
+        ? search
+        : id === KNOWLEDGE_IMPORT_ATTACHMENTS && attachments.length > 0
+          ? importAttachments
+          : undefined,
+    listTools: () =>
+      attachments.length > 0
+        ? [KNOWLEDGE_IMPORT_ATTACHMENTS, KNOWLEDGE_SEARCH]
+        : [KNOWLEDGE_SEARCH],
     getToolParameterSchema: (id) =>
-      id === KNOWLEDGE_SEARCH ? KNOWLEDGE_SEARCH_SCHEMA : undefined,
+      id === KNOWLEDGE_SEARCH
+        ? KNOWLEDGE_SEARCH_SCHEMA
+        : id === KNOWLEDGE_IMPORT_ATTACHMENTS && attachments.length > 0
+          ? importSchema
+          : undefined,
     registerTool: () => {
       throw new Error("The embedded loop cannot register tools.");
     },

@@ -442,6 +442,127 @@ async fn attachment_upload_commits_object_without_knowledge_import_and_ordinary_
             .is_empty(),
         "attaching must not create a knowledge source"
     );
+    let item = ImportItem {
+        client_item_id: format!("agent-attachment:{}", object.object_id),
+        kind: SourceKind::Object,
+        name: "notes.txt".to_owned(),
+        purpose: KnowledgePurpose::Internal,
+        text: None,
+        url: None,
+        object_id: Some(object.object_id),
+        knowledge_release_id: None,
+    };
+    let cross_scope = repository
+        .import_batch(&sibling, vec![item.clone()])
+        .await
+        .expect("cross-project import is an item failure");
+    assert_eq!(
+        cross_scope.items[0]
+            .error
+            .as_ref()
+            .expect("scoped error")
+            .code,
+        ErrorCode::NotFound
+    );
+    let (first, replay) = tokio::join!(
+        repository.import_batch(&scope, vec![item.clone()]),
+        repository.import_batch(&scope, vec![item.clone()])
+    );
+    let first = first.expect("first import").items.remove(0);
+    assert_eq!(first, replay.expect("concurrent replay").items.remove(0));
+    let version = first
+        .source_version
+        .as_ref()
+        .expect("object source version");
+    assert_eq!(version.object_id, Some(object.object_id));
+    assert_eq!(version.object_version, Some(object.object_version));
+    assert_eq!(version.content_sha256, object.sha256);
+    assert_eq!(
+        first.source.as_ref().expect("object source").locator["object_id"],
+        object.object_id.to_string()
+    );
+    assert_eq!(
+        repository
+            .list_sources(&scope)
+            .await
+            .expect("one source")
+            .len(),
+        1
+    );
+    let changed = ImportItem {
+        purpose: KnowledgePurpose::Public,
+        ..item.clone()
+    };
+    assert_eq!(
+        repository
+            .import_batch(&scope, vec![changed])
+            .await
+            .expect("purpose conflict")
+            .items[0]
+            .error
+            .as_ref()
+            .expect("conflict")
+            .code,
+        ErrorCode::Conflict
+    );
+    let unsupported_bytes = b"opaque bytes";
+    let unsupported_session = repository
+        .create_upload_session(
+            &scope,
+            UploadSessionCommand {
+                filename: "unsupported.pdf".to_owned(),
+                declared_media_type: "application/pdf".to_owned(),
+                expected_size: unsupported_bytes.len() as u64,
+                expected_sha256: sha256_hex(unsupported_bytes),
+                purpose: KnowledgePurpose::Internal,
+            },
+        )
+        .await
+        .expect("unsupported upload session");
+    repository
+        .put_upload_content(
+            &scope,
+            unsupported_session.upload_session_id,
+            unsupported_bytes.to_vec(),
+        )
+        .await
+        .expect("unsupported upload bytes");
+    let (unsupported_object, _) = repository
+        .complete_attachment_upload(&scope, unsupported_session.upload_session_id, "unsupported")
+        .await
+        .expect("unsupported bytes still stored");
+    let partial = repository
+        .import_batch(
+            &scope,
+            vec![
+                item.clone(),
+                ImportItem {
+                    client_item_id: format!("agent-attachment:{}", unsupported_object.object_id),
+                    kind: SourceKind::Object,
+                    name: "unsupported.pdf".to_owned(),
+                    purpose: KnowledgePurpose::Internal,
+                    text: None,
+                    url: None,
+                    object_id: Some(unsupported_object.object_id),
+                    knowledge_release_id: None,
+                },
+            ],
+        )
+        .await
+        .expect("per-item import result");
+    assert_eq!(partial.items[0], first);
+    assert_eq!(
+        partial.items[1].error.as_ref().expect("adapter error").code,
+        ErrorCode::CapabilityMissing
+    );
+    assert_eq!(
+        repository
+            .list_sources(&scope)
+            .await
+            .expect("no failed source")
+            .len(),
+        1
+    );
 
     // The existing knowledge completion path has the same nullable-blob join;
     // exercise its row lock too and verify that it still imports normally.
@@ -486,7 +607,7 @@ async fn attachment_upload_commits_object_without_knowledge_import_and_ordinary_
             .await
             .expect("sources after import")
             .len(),
-        1
+        2
     );
     let imported_object_id = imported
         .source_version

@@ -28,9 +28,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use geo_domain::{
-    AgentRuntime, AppError, DocumentManifestItemState, DocumentManifestState, ErrorCode,
-    KnowledgeRepository, RUNTIME_NOT_CONFIGURED, RuntimeCapability, TenantScope, TurnInput,
-    TurnReport,
+    AgentRuntime, AppError, AttachmentReference, DocumentManifestItemState, DocumentManifestState,
+    ErrorCode, ImportItem, ImportStatus, KnowledgeRepository, RUNTIME_NOT_CONFIGURED,
+    RuntimeCapability, SourceKind, TenantScope, TurnInput, TurnReport,
 };
 use geo_worker::{
     HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
@@ -275,6 +275,7 @@ impl EmbeddedAgentRuntime {
         let capabilities = Arc::clone(&configured.capabilities);
         let v8_heap_limit_bytes = configured.v8_heap_limit_bytes;
         let run_scope = scope.clone();
+        let attachments = input.attachments.clone();
         // The isolate is `!Send`, so it is built, driven and dropped inside one
         // blocking task — and on a current-thread runtime of its own, because
         // that is the only flavor the engine's op driver can be driven on.  The
@@ -291,6 +292,7 @@ impl EmbeddedAgentRuntime {
                 })?;
             engine.block_on(async {
                 let bridge = HostBridge::new(capabilities, run_scope, application)
+                    .with_attachments(attachments)
                     .with_budgets(HostOpBudgets::default());
                 let mut runtime = Self::new_host_runtime(bundle, bridge, v8_heap_limit_bytes)?;
                 runtime.call_main(entry, &argument, TURN_DEADLINE).await?;
@@ -374,6 +376,8 @@ fn turn_argument(input: &TurnInput) -> String {
         "run_id": input.run_id,
         "turn_id": input.turn_id,
         "conversation_id": input.conversation_id,
+        "message_id": input.message_id,
+        "attachments": input.attachments,
     })
     .to_string()
 }
@@ -487,6 +491,87 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
 
 #[async_trait]
 impl HostOps for RepositoryHostOps {
+    async fn knowledge_import_attachments(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::KnowledgeImportAttachmentsRequest,
+        attachments: &[AttachmentReference],
+    ) -> Result<geo_worker::KnowledgeImportAttachmentsResult, HostOpError> {
+        let mut items = Vec::with_capacity(request.items.len());
+        for requested in request.items {
+            let result = async {
+                let bound = attachments
+                    .iter()
+                    .find(|attachment| {
+                        attachment.attachment_id.as_uuid() == requested.attachment_id
+                    })
+                    .ok_or_else(|| {
+                        AppError::new(ErrorCode::Forbidden, "attachment is not bound to this turn")
+                    })?;
+                let (object, filename) = self
+                    .knowledge
+                    .get_attachment_object(scope, requested.attachment_id)
+                    .await?
+                    .ok_or_else(|| AppError::not_found("attachment not found"))?;
+                if bound.object_id != object.object_id.to_string()
+                    || bound.filename != filename
+                    || bound.object_version.as_deref()
+                        != Some(object.object_version.to_string().as_str())
+                    || bound.sha256.as_deref() != Some(object.sha256.as_str())
+                    || bound.size_bytes != Some(object.actual_size)
+                    || bound.media_type.as_deref() != Some(object.detected_media_type.as_str())
+                {
+                    return Err(AppError::conflict(
+                        "attachment binding no longer matches the committed object",
+                    ));
+                }
+                let response = self
+                    .knowledge
+                    .import_batch(
+                        scope,
+                        vec![ImportItem {
+                            client_item_id: format!("agent-attachment:{}", requested.attachment_id),
+                            kind: SourceKind::Object,
+                            name: filename,
+                            purpose: requested.purpose,
+                            text: None,
+                            url: None,
+                            object_id: Some(object.object_id),
+                            knowledge_release_id: None,
+                        }],
+                    )
+                    .await?;
+                response.items.into_iter().next().ok_or_else(|| {
+                    AppError::new(ErrorCode::Internal, "attachment import produced no receipt")
+                })
+            }
+            .await;
+            let mut item = geo_worker::KnowledgeImportAttachmentResultItem {
+                attachment_id: requested.attachment_id,
+                status: ImportStatus::Failed,
+                source_id: None,
+                source_version_id: None,
+                knowledge_release_id: None,
+                error: None,
+            };
+            match result {
+                Ok(receipt) => {
+                    item.status = receipt.status;
+                    item.source_id = receipt.source.map(|source| source.source_id);
+                    item.source_version_id = receipt
+                        .source_version
+                        .map(|version| version.source_version_id);
+                    item.knowledge_release_id =
+                        receipt.release.map(|release| release.knowledge_release_id);
+                    item.error = receipt.error;
+                }
+                Err(error) => item.error = Some(error),
+            }
+            items.push(item);
+        }
+        Ok(geo_worker::KnowledgeImportAttachmentsResult { items })
+    }
+
     async fn model_complete(
         &self,
         scope: &TenantScope,
@@ -858,9 +943,11 @@ mod tests {
     fn turn_input() -> TurnInput {
         TurnInput {
             conversation_id: geo_domain::ConversationId::from(uuid::Uuid::new_v4()),
+            message_id: geo_domain::MessageId::from(uuid::Uuid::new_v4()),
             turn_id: geo_domain::TurnId::from(uuid::Uuid::new_v4()),
             run_id: geo_domain::RunId::from(uuid::Uuid::new_v4()),
             prompt: "how long is the warranty?".to_owned(),
+            attachments: Vec::new(),
         }
     }
 }

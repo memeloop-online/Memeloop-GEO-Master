@@ -126,6 +126,152 @@ test("native model call executes knowledge.search through the MemeLoop registry 
   }
 });
 
+test("attachment-only turn imports bound items, searches its release, and answers from evidence", async () => {
+  const textId = "00000000-0000-4000-8000-000000000001";
+  const otherId = "00000000-0000-4000-8000-000000000002";
+  const releaseId = "00000000-0000-4000-8000-000000000003";
+  const modelRequests = [];
+  const imports = [];
+  const searches = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeImportAttachments(request) {
+      imports.push(request);
+      return {
+        items: [
+          {
+            attachment_id: textId,
+            status: "succeeded",
+            source_id: "00000000-0000-4000-8000-000000000004",
+            source_version_id: "00000000-0000-4000-8000-000000000005",
+            knowledge_release_id: releaseId,
+          },
+          {
+            attachment_id: otherId,
+            status: "failed",
+            error: "capability_missing: parser unavailable",
+          },
+        ],
+      };
+    },
+    async knowledgeSearch(request) {
+      searches.push(request);
+      return {
+        knowledge_release_id: releaseId,
+        evidence: [{ source_name: "Guide", quote: "Two years" }],
+      };
+    },
+    async modelComplete(request) {
+      modelRequests.push(request);
+      const index = modelRequests.length;
+      if (index === 3) {
+        return {
+          text: "The warranty is two years (Guide). The other file could not be imported.",
+          model: "stub-model",
+          prompt_tokens: 9,
+          completion_tokens: 8,
+          finish_reason: "stop",
+        };
+      }
+      return {
+        text: "",
+        tool_calls: [
+          {
+            id: `call-${index}`,
+            type: "function",
+            function:
+              index === 1
+                ? {
+                    name: "knowledge_import_attachments",
+                    arguments: JSON.stringify({
+                      items: [
+                        { attachment_id: textId, purpose: "internal" },
+                        { attachment_id: otherId, purpose: "internal" },
+                      ],
+                    }),
+                  }
+                : {
+                    name: "knowledge_search",
+                    arguments: JSON.stringify({
+                      query: "warranty",
+                      knowledge_release_id: releaseId,
+                    }),
+                  },
+          },
+        ],
+        model: "stub-model",
+        prompt_tokens: 7,
+        completion_tokens: 4,
+        finish_reason: "tool_calls",
+      };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?import=${Date.now()}`);
+    const completion = await main({
+      conversation_id: "conversation-import-0001",
+      message_id: "message-import-0001",
+      prompt: "",
+      run_id: "run-import-0001",
+      turn_id: "turn-import-0001",
+      attachments: [
+        {
+          attachment_id: textId,
+          object_id: "object-1",
+          filename: "Guide.txt",
+          media_type: "text/plain",
+          size_bytes: 9,
+          sha256: "a".repeat(64),
+          object_version: "version-1",
+        },
+        {
+          attachment_id: otherId,
+          object_id: "object-2",
+          filename: "Data.pdf",
+          media_type: "application/pdf",
+          size_bytes: 11,
+          sha256: "b".repeat(64),
+        },
+      ],
+    });
+    assert.equal(modelRequests.length, 3);
+    assert.deepEqual(
+      modelRequests[0].tools.map((tool) => tool.function.name),
+      ["knowledge_import_attachments", "knowledge_search"],
+    );
+    const importSchema = modelRequests[0].tools[0].function.parameters;
+    assert.deepEqual(
+      importSchema.properties.items.items.properties.attachment_id.enum,
+      [textId, otherId],
+    );
+    assert.match(
+      importSchema.properties.items.items.properties.attachment_id.description,
+      /Guide\.txt, text\/plain/u,
+    );
+    assert.deepEqual(imports, [
+      {
+        items: [
+          { attachment_id: textId, purpose: "internal" },
+          { attachment_id: otherId, purpose: "internal" },
+        ],
+      },
+    ]);
+    assert.deepEqual(searches, [
+      { query: "warranty", knowledge_release_id: releaseId },
+    ]);
+    assert.equal(modelRequests[0].messages.at(-1).content, "");
+    assert.match(
+      modelRequests[1].messages.at(-1).content,
+      /capability_missing/u,
+    );
+    assert.match(modelRequests[2].messages.at(-1).content, /Two years/u);
+    assert.equal(completion.turn_id, "turn-import-0001");
+    assert.match(completion.answer, /Guide/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
 test("a missing knowledge capability fails without a success completion", async () => {
   const emitted = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {

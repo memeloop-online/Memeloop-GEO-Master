@@ -15,13 +15,13 @@
 - [ ] 实现多副本租约与 queued 恢复；当前单进程启动对账已通过 CI 实库测试，默认关闭，滚动部署或多副本不得开启。
 - [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
 - [ ] 驱动中途 checkpoint 恢复与 Rust-owned tool-call ledger：executor 已接完成结果存档，但它不是中途恢复；工具 intent/attempt/outcome 必须由 Rust 实际调用前后写入，不能信任 JS 自报。
-- [ ] 真实 MemeLoop 知识检索工具循环与本地应用装配已通过；补持久会话历史、附件读取/显式知识导入、中途恢复及其他业务工具。P00 多附件上传已接，上传不等于解析。
+- [ ] TXT/Markdown 附件显式导入 → 检索 → 引用回答已接真实 MemeLoop；补持久会话历史、中途恢复、文档规划/生成及其他业务工具。
 - [ ] 接正式租户 Token Center 应用装配：HTTP 凭据适配已有契约测试；补可信租户映射的持久配置、秘密注入、权益/路由及费用。
 - [ ] 扩展 GEO 工具桥接：文档 `manifest_read` 已接；补分发清单、`publish_submit`、`measure_sample`，并注册相应 MemeLoop 业务工具。
 - [ ] 跑通“附件入库 → 带来源回答 → 两个文档分支 fan-out → 恢复 → 结果汇总”首个纵切。
 
-下一步的文件接缝与验收见 [`p00-attachment-import-slice.md`](p00-attachment-import-slice.md)；
-首先实现 Object 导入与回合附件绑定，不把上传成功当作模型已读取。
+附件纵切的实现边界见 [`p00-attachment-import-slice.md`](p00-attachment-import-slice.md)；
+下一步连接文档规划和正文生成，上传仍不直接触发知识入库。
 
 ## 排队：W03 企业知识库
 

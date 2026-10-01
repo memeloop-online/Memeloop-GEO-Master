@@ -128,7 +128,7 @@ const uploadLabels: Record<PendingAttachment["status"], string> = {
   creating_session: "创建上传会话",
   uploading: "上传字节中",
   completing: "核验中",
-  uploaded: "对象已核验；尚未解析或导入知识库",
+  uploaded: "对象已核验；等待对话中的导入操作",
   failed: "上传失败",
 };
 
@@ -381,7 +381,7 @@ function AgentChat({
           );
           if (references.length) {
             setRuntimeNotice(
-              "附件引用已提交；当前 AI 运行时尚未接入附件解析与读取，不能视为已阅读附件。",
+              "附件已提交。可在对话中要求导入 TXT / Markdown 并依据原文回答；上传不代表已阅读。",
             );
           }
           if (acceptance.error?.code === "capability_missing") {
@@ -466,7 +466,8 @@ function AgentChat({
       {attachments.length > 0 && (
         <div className="agent-file-reference-notice" aria-label="待发送附件">
           <p>
-            附件上传只核验对象；不会自动导入知识库，当前 AI 尚不能读取附件。
+            上传不直接加入知识库。可在对话中要求 AI 导入 TXT / Markdown
+            并引用原文回答。
           </p>
           {attachments.map((item) => (
             <div key={item.id}>

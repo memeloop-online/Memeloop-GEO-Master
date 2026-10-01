@@ -96,6 +96,7 @@ jobs:
           set -o pipefail
           cargo test -p geo-worker --test memeloop_bundle -- --ignored 2>&1 | tee logs/cargo-memeloop-bundle.log
           cargo test -p geo-app generated_bundle_runs_one_turn_through_assembled_provider -- --ignored 2>&1 | tee logs/cargo-app-bundle.log
+          cargo test -p geo-api --test attachment_import_runtime -- --ignored 2>&1 | tee logs/cargo-attachment-import-runtime.log
 
       - name: Test repositories against disposable PostgreSQL
         env:

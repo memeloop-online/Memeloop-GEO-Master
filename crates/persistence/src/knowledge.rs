@@ -255,12 +255,84 @@ impl PgKnowledgeRepository {
         Ok(release)
     }
 
+    async fn import_existing_object_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        scope: &TenantScope,
+        item: &ImportItem,
+    ) -> Result<ImportAcceptance, AppError> {
+        let project_id = Self::project_id(scope)?;
+        let object_id = item
+            .object_id
+            .ok_or_else(|| AppError::invalid_request("object imports require object_id"))?;
+        let row = sqlx::query(
+            "SELECT object.object_version,object.backend,object.opaque_key,
+                    object.actual_size,object.detected_media_type,object.sha256,object.created_at,
+                    session.filename,blob.content,blob.actual_size AS blob_size,blob.sha256 AS blob_hash
+             FROM knowledge_stored_objects object
+             JOIN knowledge_upload_sessions session
+               ON session.committed_object_id=object.object_id
+              AND session.operator_id=object.operator_id AND session.tenant_id=object.tenant_id
+              AND session.project_id=object.project_id
+             JOIN knowledge_upload_blobs blob ON blob.upload_session_id=session.upload_session_id
+             WHERE object.object_id=$1 AND object.operator_id=$2 AND object.tenant_id=$3
+               AND object.project_id=$4 AND object.state='committed'
+               AND session.state='committed' AND session.staging_object_ref='agent-attachment'",
+        )
+        .bind(object_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| AppError::not_found("committed attachment object not found"))?;
+        let filename: String = row.get("filename");
+        if item.name != filename {
+            return Err(AppError::invalid_request(
+                "object name does not match uploaded filename",
+            ));
+        }
+        let object = StoredObject {
+            object_id,
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id,
+            object_version: row.get("object_version"),
+            backend: row.get("backend"),
+            opaque_key: row.get("opaque_key"),
+            actual_size: row.get::<i64, _>("actual_size") as u64,
+            detected_media_type: row.get("detected_media_type"),
+            sha256: row.get("sha256"),
+            state: StoredObjectState::Committed,
+            created_at: row.get("created_at"),
+        };
+        let bytes: Vec<u8> = row.get("content");
+        if bytes.len() as u64 != object.actual_size
+            || row.get::<i64, _>("blob_size") as u64 != object.actual_size
+            || row.get::<String, _>("blob_hash") != object.sha256
+            || sha256_hex(&bytes) != object.sha256
+        {
+            return Err(AppError::conflict(
+                "committed attachment bytes do not match object metadata",
+            ));
+        }
+        if !is_text(&object.detected_media_type) {
+            return Err(AppError::capability_missing(
+                "document_parser is not configured",
+            ));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| AppError::invalid_request("text upload bytes must be valid UTF-8"))?;
+        Self::import_text_in_transaction(transaction, scope, item, Some(object), text, false).await
+    }
+
     async fn import_text_in_transaction(
         transaction: &mut Transaction<'_, Postgres>,
         scope: &TenantScope,
         item: &ImportItem,
         object: Option<StoredObject>,
         text: String,
+        create_object: bool,
     ) -> Result<ImportAcceptance, AppError> {
         if text.trim().is_empty() {
             return Err(AppError::invalid_request("text must not be empty"));
@@ -272,7 +344,9 @@ impl PgKnowledgeRepository {
         let operation_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
         let content_hash = sha256_hex(text.as_bytes());
-        if let Some(object) = &object {
+        if let Some(object) = &object
+            && create_object
+        {
             sqlx::query(
                 "INSERT INTO knowledge_stored_objects
                  (object_id,operator_id,tenant_id,project_id,object_version,backend,opaque_key,actual_size,detected_media_type,sha256,state,created_at)
@@ -293,6 +367,10 @@ impl PgKnowledgeRepository {
             .await
             .map_err(database_error)?;
         }
+        let locator = object
+            .as_ref()
+            .map(|object| json!({"kind":"object","object_id":object.object_id,"object_version":object.object_version}))
+            .unwrap_or_else(|| json!({"kind":"inline_text"}));
         sqlx::query(
             "INSERT INTO knowledge_sources
              (source_id,operator_id,tenant_id,project_id,revision,kind,name,purpose,state,locator,current_version_id,sync_enabled)
@@ -305,7 +383,7 @@ impl PgKnowledgeRepository {
         .bind(source_kind(item.kind))
         .bind(item.name.trim())
         .bind(purpose(item.purpose))
-        .bind(json!({"kind":"inline_text"}))
+        .bind(&locator)
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
@@ -373,7 +451,7 @@ impl PgKnowledgeRepository {
             name: item.name.trim().to_owned(),
             purpose: item.purpose,
             state: SourceState::Active,
-            locator: json!({"kind":"inline_text"}),
+            locator,
             current_version_id: Some(source_version_id),
             sync_enabled: false,
             next_sync_at: None,
@@ -903,8 +981,15 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                     ));
                 }
             };
-            Self::import_text_in_transaction(&mut transaction, scope, &item, Some(object), text)
-                .await?
+            Self::import_text_in_transaction(
+                &mut transaction,
+                scope,
+                &item,
+                Some(object),
+                text,
+                true,
+            )
+            .await?
         };
         sqlx::query(
             "UPDATE knowledge_upload_sessions
@@ -1126,8 +1211,34 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         }
         let mut output = Vec::with_capacity(items.len());
         for item in items {
+            if item.client_item_id.trim().is_empty() || item.client_item_id.trim().len() > 200 {
+                output.push(ImportAcceptance {
+                    client_item_id: item.client_item_id,
+                    status: ImportStatus::Failed,
+                    source: None,
+                    source_version: None,
+                    import_job: None,
+                    operation: None,
+                    release: None,
+                    error: Some(AppError::invalid_request(
+                        "client_item_id is required and at most 200 characters",
+                    )),
+                });
+                continue;
+            }
             let input_hash = sha256_hex(&serde_json::to_vec(&item).map_err(serialization_error)?);
             let mut transaction = self.transaction(scope).await?;
+            // Serialize a project's receipt key before reading it, including
+            // when no receipt exists yet. A row lock cannot protect that gap.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!(
+                    "knowledge-import:{}:{}",
+                    scope.storage_key(),
+                    item.client_item_id.trim()
+                ))
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
             if let Some(receipt) = sqlx::query(
                 "SELECT request_hash,acceptance FROM knowledge_import_receipts
                  WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3
@@ -1165,8 +1276,15 @@ impl KnowledgeRepository for PgKnowledgeRepository {
             let acceptance = if item.kind == SourceKind::Text {
                 match item.text.clone() {
                     Some(text) if text.len() <= MAX_INLINE_TEXT_BYTES => {
-                        Self::import_text_in_transaction(&mut transaction, scope, &item, None, text)
-                            .await
+                        Self::import_text_in_transaction(
+                            &mut transaction,
+                            scope,
+                            &item,
+                            None,
+                            text,
+                            false,
+                        )
+                        .await
                     }
                     Some(_) => Err(AppError::invalid_request(
                         "text exceeds inline limit; use an upload session",
@@ -1175,6 +1293,8 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                         "text imports require the text field",
                     )),
                 }
+            } else if item.kind == SourceKind::Object {
+                Self::import_existing_object_in_transaction(&mut transaction, scope, &item).await
             } else if item.kind == SourceKind::Url {
                 Err(AppError::capability_missing("url_fetch is not configured"))
             } else {

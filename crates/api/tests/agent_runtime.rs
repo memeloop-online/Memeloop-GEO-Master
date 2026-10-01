@@ -577,9 +577,11 @@ async fn heap_runaway_child_returns_a_recoverable_failure() {
             &scope(),
             geo_domain::TurnInput {
                 conversation_id: uuid::Uuid::new_v4().into(),
+                message_id: uuid::Uuid::new_v4().into(),
                 turn_id: uuid::Uuid::new_v4().into(),
                 run_id: uuid::Uuid::new_v4().into(),
                 prompt: "allocate until V8 stops this turn".to_owned(),
+                attachments: Vec::new(),
             },
         )
         .await

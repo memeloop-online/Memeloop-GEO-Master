@@ -1021,7 +1021,7 @@ impl MemoryKnowledgeRepository {
         text: String,
         object: Option<StoredObject>,
     ) -> Result<ImportAcceptance, AppError> {
-        if text.len() > MAX_INLINE_TEXT_BYTES {
+        if object.is_none() && text.len() > MAX_INLINE_TEXT_BYTES {
             return Err(AppError::invalid_request(
                 "text exceeds inline limit; use an upload session",
             ));
@@ -1035,7 +1035,10 @@ impl MemoryKnowledgeRepository {
             item.kind,
             item.name.clone(),
             item.purpose,
-            json!({"kind":"inline_text"}),
+            object
+                .as_ref()
+                .map(|object| json!({"kind":"object","object_id":object.object_id,"object_version":object.object_version}))
+                .unwrap_or_else(|| json!({"kind":"inline_text"})),
             object.as_ref(),
             hash.clone(),
         );
@@ -1684,19 +1687,71 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                         Self::failed_missing_adapter(scope, &item, "url_fetch")
                     }
                 }
-                SourceKind::Object => ImportAcceptance {
-                    client_item_id: item.client_item_id.clone(),
-                    status: ImportStatus::Failed,
-                    source: None,
-                    source_version: None,
-                    import_job: None,
-                    operation: None,
-                    release: None,
-                    error: Some(AppError::new(
-                        ErrorCode::CapabilityMissing,
-                        "object import adapter is not implemented",
-                    )),
-                },
+                SourceKind::Object => {
+                    let result = (|| {
+                        let id = item.object_id.ok_or_else(|| {
+                            AppError::invalid_request("object imports require object_id")
+                        })?;
+                        let object = state
+                            .stored_objects
+                            .get(&id)
+                            .filter(|object| {
+                                object.state == StoredObjectState::Committed
+                                    && Self::in_scope(scope, *object)
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                AppError::not_found("committed attachment object not found")
+                            })?;
+                        let session = state
+                            .upload_sessions
+                            .values()
+                            .find(|session| {
+                                session.committed_object_id == Some(id)
+                                    && state
+                                        .attachment_completions
+                                        .contains_key(&session.upload_session_id)
+                                    && Self::in_scope(scope, *session)
+                            })
+                            .ok_or_else(|| {
+                                AppError::not_found("committed attachment object not found")
+                            })?;
+                        if item.name != session.filename {
+                            return Err(AppError::invalid_request(
+                                "object name does not match uploaded filename",
+                            ));
+                        }
+                        let bytes = state.object_bytes.get(&id).ok_or_else(|| {
+                            AppError::not_found("committed attachment bytes not found")
+                        })?;
+                        if bytes.len() as u64 != object.actual_size
+                            || sha256_hex(bytes) != object.sha256
+                        {
+                            return Err(AppError::conflict(
+                                "committed attachment bytes do not match object metadata",
+                            ));
+                        }
+                        if !is_text_media_type(&object.detected_media_type) {
+                            return Err(AppError::capability_missing(
+                                "document_parser is not configured",
+                            ));
+                        }
+                        let text = String::from_utf8(bytes.clone()).map_err(|_| {
+                            AppError::invalid_request("text upload bytes must be valid UTF-8")
+                        })?;
+                        Self::import_text_locked(&mut state, scope, &item, text, Some(object))
+                    })();
+                    result.unwrap_or_else(|error| ImportAcceptance {
+                        client_item_id: item.client_item_id.clone(),
+                        status: ImportStatus::Failed,
+                        source: None,
+                        source_version: None,
+                        import_job: None,
+                        operation: None,
+                        release: None,
+                        error: Some(error),
+                    })
+                }
                 SourceKind::KnowledgeCollection => ImportAcceptance {
                     client_item_id: item.client_item_id.clone(),
                     status: ImportStatus::Failed,
@@ -2371,6 +2426,140 @@ mod tests {
             first.release.unwrap().knowledge_release_id,
             replay.release.unwrap().knowledge_release_id
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_import_reuses_verified_object_and_receipt() {
+        let repository = MemoryKnowledgeRepository::default();
+        let scope = scope();
+        let text = "x".repeat(super::MAX_INLINE_TEXT_BYTES + 1);
+        assert!(text.len() > super::MAX_INLINE_TEXT_BYTES);
+        let bytes = text.into_bytes();
+        let session = repository
+            .create_upload_session(
+                &scope,
+                UploadSessionCommand {
+                    filename: "notes.md".to_owned(),
+                    declared_media_type: "text/markdown".to_owned(),
+                    expected_size: bytes.len() as u64,
+                    expected_sha256: sha256_hex(&bytes),
+                    purpose: KnowledgePurpose::Internal,
+                },
+            )
+            .await
+            .unwrap();
+        repository
+            .put_upload_content(&scope, session.upload_session_id, bytes.clone())
+            .await
+            .unwrap();
+        let (object, filename) = repository
+            .complete_attachment_upload(&scope, session.upload_session_id, "attachment")
+            .await
+            .unwrap();
+        assert!(repository.list_sources(&scope).await.unwrap().is_empty());
+        let item = ImportItem {
+            client_item_id: format!("agent-attachment:{}", object.object_id),
+            kind: SourceKind::Object,
+            name: filename,
+            purpose: KnowledgePurpose::Internal,
+            text: None,
+            url: None,
+            object_id: Some(object.object_id),
+            knowledge_release_id: None,
+        };
+        let other = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        let denied = repository
+            .import_batch(&other, vec![item.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.items[0].error.as_ref().unwrap().code,
+            crate::ErrorCode::NotFound
+        );
+        let (first, replay) = tokio::join!(
+            repository.import_batch(&scope, vec![item.clone()]),
+            repository.import_batch(&scope, vec![item.clone()])
+        );
+        let first = first.unwrap().items.remove(0);
+        assert_eq!(first, replay.unwrap().items.remove(0));
+        assert_eq!(repository.list_sources(&scope).await.unwrap().len(), 1);
+        let version = first.source_version.unwrap();
+        assert_eq!(version.object_id, Some(object.object_id));
+        assert_eq!(version.object_version, Some(object.object_version));
+        assert_eq!(version.content_sha256, object.sha256);
+        assert_eq!(
+            first.source.unwrap().locator["object_id"],
+            object.object_id.to_string()
+        );
+        let mut changed = item;
+        changed.purpose = KnowledgePurpose::Public;
+        let conflict = repository
+            .import_batch(&scope, vec![changed])
+            .await
+            .unwrap();
+        assert_eq!(
+            conflict.items[0].error.as_ref().unwrap().code,
+            crate::ErrorCode::Conflict
+        );
+        assert_eq!(repository.list_sources(&scope).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attachment_import_preserves_partial_result_for_unparsed_file() {
+        let repository = MemoryKnowledgeRepository::default();
+        let scope = scope();
+        let mut items = Vec::new();
+        for (filename, media, bytes) in [
+            ("valid.txt", "text/plain", b"Verified evidence".as_slice()),
+            (
+                "unsupported.pdf",
+                "application/pdf",
+                b"opaque bytes".as_slice(),
+            ),
+        ] {
+            let session = repository
+                .create_upload_session(
+                    &scope,
+                    UploadSessionCommand {
+                        filename: filename.to_owned(),
+                        declared_media_type: media.to_owned(),
+                        expected_size: bytes.len() as u64,
+                        expected_sha256: sha256_hex(bytes),
+                        purpose: KnowledgePurpose::Internal,
+                    },
+                )
+                .await
+                .unwrap();
+            repository
+                .put_upload_content(&scope, session.upload_session_id, bytes.to_vec())
+                .await
+                .unwrap();
+            let (object, name) = repository
+                .complete_attachment_upload(&scope, session.upload_session_id, filename)
+                .await
+                .unwrap();
+            items.push(ImportItem {
+                client_item_id: format!("agent-attachment:{}", object.object_id),
+                kind: SourceKind::Object,
+                name,
+                purpose: KnowledgePurpose::Internal,
+                text: None,
+                url: None,
+                object_id: Some(object.object_id),
+                knowledge_release_id: None,
+            });
+        }
+        let result = repository.import_batch(&scope, items).await.unwrap();
+        assert!(result.items[0].release.is_some());
+        assert_eq!(
+            result.items[1].error.as_ref().unwrap().code,
+            crate::ErrorCode::CapabilityMissing
+        );
+        assert_eq!(repository.list_sources(&scope).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

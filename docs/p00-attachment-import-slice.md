@@ -2,13 +2,14 @@
 
 依据 `product-plan-v1.md` 0.3、0.9、0.12；这是下一开发纵切的实施说明，不改变冻结规格。
 
-## 当前缺口
+## 当前状态
 
-已完成上传、核验、对象引用提交和原生知识检索工具循环。`TurnInput` 仍仅携带 prompt；
-`SourceKind::Object` 在内存及 PostgreSQL 的 `import_batch` 中尚未实现。
-所以附件上传成功不代表模型读取过附件，也不代表已加入企业知识库。
+上传、核验、对象引用、回合绑定、Object 导入和原生导入/检索工具循环已实现。
+`TurnInput` 携带真实 message ID 与附件引用，executor 从持久消息重建输入；
+内存及 PostgreSQL 按稳定收据键重放导入。新增实库分支等待本次 CI 复验。
+上传成功仍不代表已入库；只有导入收据和检索证据证明对应步骤完成。
 
-## 下一纵切
+## 已实现纵切及边界
 
 持久消息附件 → 模型选择显式导入工具 → Rust 解析已提交对象 →
 形成 SourceVersion/KnowledgeRelease → 模型调用知识检索 → 引用证据回答。
@@ -58,8 +59,12 @@
 文件名和 MIME，模型按用户入库意图调用。保留 `knowledge_search`，用导入返回的 release 检索。
 允许仅附件消息；使用真实 message ID，不继续以 turn ID 代替。
 
-上游 canonical 附件仅含 contentHash/filename/mimeType/size，不含 GEO 对象标识；
-权威对象绑定保留在 Rust，通用不透明附件标识需求可另向上游提出，不复制聊天框架。
+上游 canonical 附件仅含 contentHash/filename/mimeType/size，且模型请求会强制通过
+`readAttachmentData` 装入原始字节。本适配在 canonical message metadata 与动态工具 schema
+中传递附件元数据，权威对象绑定留在 Rust，不提供整份文件读取器。
+上游还要求 canonical user turn ID 等于 message ID：适配使用真实 message ID，
+GEO 独立 turn ID 留在运行与完成记录中。通用不透明附件/外部 turn 映射可向上游提出，
+不复制聊天框架。
 
 ## 必须验收
 

@@ -13,13 +13,16 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use geo_domain::{
-    ChunkLocator, KnowledgeEvidence, KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope,
+    AttachmentId, AttachmentReference, ChunkLocator, ImportStatus, KnowledgeEvidence,
+    KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope,
 };
 use geo_worker::{
     HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
-    HostOpError, HostOpErrorCode, HostOpLimits, HostOps, HostRuntime, HostState, ManifestItem,
-    ManifestPage, ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion,
-    ModelCompletionRequest, PublishReceipt, PublishRequest, PublishState,
+    HostOpError, HostOpErrorCode, HostOpLimits, HostOps, HostRuntime, HostState,
+    KnowledgeImportAttachmentResultItem, KnowledgeImportAttachmentsRequest,
+    KnowledgeImportAttachmentsResult, ManifestItem, ManifestPage, ManifestReadRequest,
+    MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
+    PublishRequest, PublishState,
 };
 use serde_json::Value;
 
@@ -51,6 +54,7 @@ struct FakeHostOps {
     behaviour: Behaviour,
     seen: Arc<Mutex<Vec<HostOp>>>,
     scopes: Arc<Mutex<Vec<String>>>,
+    imported_bindings: Arc<Mutex<Vec<Vec<uuid::Uuid>>>>,
 }
 
 impl FakeHostOps {
@@ -71,6 +75,10 @@ impl FakeHostOps {
 
     fn scopes(&self) -> Vec<String> {
         self.scopes.lock().expect("scope lock").clone()
+    }
+
+    fn imported_bindings(&self) -> Vec<Vec<uuid::Uuid>> {
+        self.imported_bindings.lock().expect("binding lock").clone()
     }
 
     async fn answer<T>(&self, op: HostOp, scope: &TenantScope, value: T) -> Result<T, HostOpError> {
@@ -145,6 +153,39 @@ impl HostOps for FakeHostOps {
                 knowledge_release_id: Some(uuid::Uuid::new_v4()),
                 evidence: vec![evidence],
                 capability_missing: None,
+            },
+        )
+        .await
+    }
+
+    async fn knowledge_import_attachments(
+        &self,
+        scope: &TenantScope,
+        request: KnowledgeImportAttachmentsRequest,
+        attachments: &[AttachmentReference],
+    ) -> Result<KnowledgeImportAttachmentsResult, HostOpError> {
+        self.imported_bindings.lock().expect("binding lock").push(
+            attachments
+                .iter()
+                .map(|attachment| attachment.attachment_id.as_uuid())
+                .collect(),
+        );
+        self.answer(
+            HostOp::KnowledgeImportAttachments,
+            scope,
+            KnowledgeImportAttachmentsResult {
+                items: request
+                    .items
+                    .into_iter()
+                    .map(|item| KnowledgeImportAttachmentResultItem {
+                        attachment_id: item.attachment_id,
+                        status: ImportStatus::Succeeded,
+                        source_id: Some(uuid::Uuid::new_v4()),
+                        source_version_id: Some(uuid::Uuid::new_v4()),
+                        knowledge_release_id: Some(uuid::Uuid::new_v4()),
+                        error: None,
+                    })
+                    .collect(),
             },
         )
         .await
@@ -447,6 +488,145 @@ async fn the_reference_bundle_declares_the_surface_it_expects() {
 // ---------------------------------------------------------------------------
 // Success and failure paths, one op at a time
 // ---------------------------------------------------------------------------
+
+const BOUND_ATTACHMENT: &str = "9e95e603-544c-4778-9f59-0b2b54b7db31";
+const OTHER_ATTACHMENT: &str = "dbbd6700-c410-4264-84a6-01806cc9a207";
+
+fn attachment(id: &str) -> AttachmentReference {
+    AttachmentReference {
+        attachment_id: AttachmentId::new(id.parse().expect("test UUID")),
+        object_id: "opaque-object".to_owned(),
+        filename: "notes.txt".to_owned(),
+        media_type: Some("text/plain".to_owned()),
+        size_bytes: Some(12),
+        sha256: None,
+        object_version: Some("1".to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn attachment_import_receives_only_the_current_runs_rust_bindings() {
+    let ops = Arc::new(FakeHostOps::new());
+    let scope = scope();
+    let bridge = HostBridge::new(
+        Arc::clone(&ops) as Arc<dyn HostOps>,
+        scope.clone(),
+        tokio::runtime::Handle::current(),
+    )
+    .with_attachments(vec![attachment(BOUND_ATTACHMENT)]);
+    let mut runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        await attempt("import", async () => JSON.parse(await Deno.core.ops.op_host_knowledge_import_attachments_v1(
+          JSON.stringify({items:[{attachment_id:"9e95e603-544c-4778-9f59-0b2b54b7db31",purpose:"internal"}]})
+        )));
+        "#,
+        bridge,
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+
+    let result = assert_success(&outcome(&runtime.host_state(), "import"));
+    assert_eq!(result["items"][0]["attachment_id"], BOUND_ATTACHMENT);
+    assert_eq!(result["items"][0]["status"], "succeeded");
+    assert!(result["items"][0]["source_version_id"].is_string());
+    assert!(result["items"][0]["knowledge_release_id"].is_string());
+    assert_eq!(ops.scopes(), vec![scope.storage_key()]);
+    assert_eq!(
+        ops.imported_bindings(),
+        vec![vec![BOUND_ATTACHMENT.parse::<uuid::Uuid>().unwrap()]]
+    );
+}
+
+#[tokio::test]
+async fn attachment_import_rejects_unbound_and_cross_run_ids_before_capability() {
+    let ops = Arc::new(FakeHostOps::new());
+    let run_scope = scope();
+    let mut first_runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        await attempt("unbound", async () => JSON.parse(await Deno.core.ops.op_host_knowledge_import_attachments_v1(
+          JSON.stringify({items:[{attachment_id:"dbbd6700-c410-4264-84a6-01806cc9a207",purpose:"internal"}]})
+        )));
+        "#,
+        HostBridge::new(
+            Arc::clone(&ops) as Arc<dyn HostOps>,
+            run_scope.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_attachments(vec![attachment(BOUND_ATTACHMENT)]),
+    );
+    first_runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_typed_error(
+        &outcome(&first_runtime.host_state(), "unbound"),
+        "denied",
+        "knowledge_import_attachments",
+    );
+
+    // The same ID is valid in another run's bridge, but that does not widen
+    // this run's immutable binding, even under the same tenant scope.
+    assert!(ops.seen().is_empty());
+    let mut other_runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        await attempt("bound-here", async () => JSON.parse(await Deno.core.ops.op_host_knowledge_import_attachments_v1(
+          JSON.stringify({items:[{attachment_id:"dbbd6700-c410-4264-84a6-01806cc9a207",purpose:"internal"}]})
+        )));
+        "#,
+        HostBridge::new(
+            Arc::clone(&ops) as Arc<dyn HostOps>,
+            run_scope,
+            tokio::runtime::Handle::current(),
+        )
+        .with_attachments(vec![attachment(OTHER_ATTACHMENT)]),
+    );
+    other_runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_success(&outcome(&other_runtime.host_state(), "bound-here"));
+    assert_eq!(ops.seen(), vec![HostOp::KnowledgeImportAttachments]);
+    assert_eq!(
+        ops.imported_bindings(),
+        vec![vec![OTHER_ATTACHMENT.parse::<uuid::Uuid>().unwrap()]]
+    );
+}
+
+#[tokio::test]
+async fn attachment_import_refuses_malformed_batches_and_model_supplied_metadata() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        const id = "9e95e603-544c-4778-9f59-0b2b54b7db31";
+        const call = async (payload) => JSON.parse(await Deno.core.ops.op_host_knowledge_import_attachments_v1(JSON.stringify(payload)));
+        await attempt("empty", () => call({items:[]}));
+        await attempt("nil", () => call({items:[{attachment_id:"00000000-0000-0000-0000-000000000000",purpose:"internal"}]}));
+        await attempt("duplicate", () => call({items:[{attachment_id:id,purpose:"internal"},{attachment_id:id,purpose:"public"}]}));
+        await attempt("too-many", () => call({items:Array.from({length:101}, () => ({attachment_id:id,purpose:"internal"}))}));
+        await attempt("metadata", () => call({items:[{attachment_id:id,purpose:"internal",object_id:"forged"}]}));
+        await attempt("scope", () => call({items:[{attachment_id:id,purpose:"internal"}],tenant_id:"forged"}));
+        "#,
+        bridge(Arc::clone(&ops)).with_attachments(vec![attachment(BOUND_ATTACHMENT)]),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for topic in ["empty", "nil", "duplicate", "too-many", "metadata", "scope"] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "invalid_request",
+            "knowledge_import_attachments",
+        );
+    }
+    assert!(ops.seen().is_empty());
+}
 
 #[tokio::test]
 async fn model_completion_delegates_to_the_rust_bridge() {

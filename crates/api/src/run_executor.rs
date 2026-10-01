@@ -43,9 +43,11 @@ pub fn dispatch(
     }
     let input = TurnInput {
         conversation_id: acceptance.conversation.id,
+        message_id: acceptance.message.id,
         turn_id: acceptance.turn.id,
         run_id: acceptance.run.id,
         prompt: acceptance.message.content.clone(),
+        attachments: acceptance.message.attachments.clone(),
     };
     tokio::spawn(async move {
         execute(runtime, repository, scope, input).await;
@@ -79,14 +81,28 @@ async fn execute(
         }
     }
 
-    let completion = match runtime.run_turn(&scope, input.clone()).await {
-        Ok(report) => match persist_runtime_state(&*repository, &scope, &input, &report).await {
-            Ok(()) => RunCompletion::Succeeded {
-                content: report.content,
-                metadata: report.metadata,
-            },
-            Err(error) => RunCompletion::Failed { error },
-        },
+    // The accepted message is the durable input authority, including its
+    // attachment bindings. Reconstruct exactly the same input on reentry.
+    let execution = async {
+        let detail = repository
+            .get_conversation(&scope, input.conversation_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("run conversation not found"))?;
+        let restored = detail.turn_input(run_id)?;
+        let report = runtime.run_turn(&scope, restored.clone()).await?;
+        Ok::<_, AppError>((restored, report))
+    }
+    .await;
+    let completion = match execution {
+        Ok((restored, report)) => {
+            match persist_runtime_state(&*repository, &scope, &restored, &report).await {
+                Ok(()) => RunCompletion::Succeeded {
+                    content: report.content,
+                    metadata: report.metadata,
+                },
+                Err(error) => RunCompletion::Failed { error },
+            }
+        }
         Err(error) => RunCompletion::Failed { error },
     };
     // `None` here means a cancellation won the race and already made the run

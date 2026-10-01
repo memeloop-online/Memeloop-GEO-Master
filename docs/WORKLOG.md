@@ -2,6 +2,12 @@
 
 ## 2026-10-01
 
+- 附件审查修正：消息受理阶段统一拒绝重复附件 ID，避免已入队后才被 JS 适配器拒绝，新增回归通过。专用聊天上传的 internal 是原始对象暂存默认值；知识用途在显式导入时建立，不表示把已有内部知识来源改为公开，普通知识上传对象不能走此附件导入路径。
+- 附件纵切收口复验：`cargo fmt --all -- --check`、`pnpm format:check` 与生成 bundle 的应用装配测试再次通过。前端 typecheck、39 项测试、Node 5 项及生产构建通过；保留大 chunk 与 Windows LNK4098 警告。本批新增 PostgreSQL 对象导入断言仍待推送后的 CI 实库验证，不能沿用上一提交的绿色结果。
+- P00 附件显式导入纵切：内存/Pg Object 导入保留原文件 ID、版本、摘要与 locator；Pg 用事务级收据键串行判定重复调用，已有对象不重复 INSERT。Rust HostBridge 保存每回合不可变附件绑定，模型只能导入已受理的对象。上传不自动建库，TXT/Markdown 成功与不支持格式失败保留逐项结果。
+- `TurnInput` 增加真实 message ID 与附件引用，executor 从持久 Message/Turn/Run 重建输入；完成结果 hash 包含附件版本，不代表中途 checkpoint 恢复。新增重建测试通过。
+- 真实生成 MemeLoop bundle 的 import → search → answer 应用测试通过：实际上传对象、实际知识仓储、注入测试模型，断言来源溯源与两次调用同收据。不是外部真实模型验收。Node 5 项、worker 生成 bundle 3 项、API 生成 bundle 1 项通过；本地 workspace all-targets 与 Clippy 通过，16 项 PostgreSQL 测试仍由 CI 显式执行。
+- 上游 0.3.3 canonical 附件会加载整份字节，canonical user turn ID 必须等于 message ID；用元数据/工具 schema 暴露附件、使用真实 message ID 并保留 GEO turn ID 完成记录，未另写 Agent 循环。Kimi 文案调用失败，主代理仅修正了过时附件提示。
 - 本批代码提交 `791215a` 的 Actions `36771176608`：Linux、Windows 全部成功，PostgreSQL 16 项实库测试全部通过（不含 non-bypass FORCE RLS），真实 V8 工具循环/应用装配和前端检查通过，Windows artifact 已上传。工作树代码已推送集成分支，未合并 main；附件显式导入下一纵切写入独立接缝文档，不修改产品规格。
 - `a24aca2` 的 Actions `36769809922`：Windows 成功；Linux 其余检查通过，PostgreSQL 15/16 通过。启动重放和重启对账回归已修复；新增附件测试发现初次结果的纳秒时间与数据库微秒时间不一致，完成操作改为返回已持久化对象，确保重放完全一致，等待复验。
 - 第二批功能集成：MemeLoop 原生 function-tool 循环已接知识检索；Provider/worker/bridge 保留工具定义、assistant tool calls 和 tool-result messages，不把纯工具响应的空正文当作最终答案。Node 4 项、真实 V8 bundle 2 项、本地应用 bundle 装配 1 项通过。
