@@ -6,6 +6,7 @@ mod browser_bridge;
 mod channel_jobs;
 mod channels;
 mod context;
+mod cycles;
 mod error;
 mod idempotency;
 mod knowledge;
@@ -1688,6 +1689,8 @@ pub fn router(state: AppState) -> Router {
     // The repository enforces immutable revision/replay semantics. The
     // generic JSON idempotency cache is deliberately not the report authority.
     let report_routes: Router<AppState> = Router::new()
+        .route("/projects/{id}/cycles/current", get(cycles::current))
+        .route("/projects/{id}/cycles", post(cycles::schedule_successor))
         .route("/projects/{id}/reports", get(reports::list_reports))
         .route("/reports/{id}", get(reports::get_report))
         .route("/reports/{id}/evidence", get(reports::get_report_evidence))

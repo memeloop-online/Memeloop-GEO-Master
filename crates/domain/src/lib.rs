@@ -56,11 +56,12 @@ pub use project::{
     DEVELOPMENT_TENANT_ID, DistributionManifestAcceptance, DistributionScope,
     DistributionScopeMode, DocumentManifestAcceptance, DocumentScope, InitialSource,
     InitialSourceKind, InitialSourceVisibility, MemoryProjectRepository, Operator,
-    OverviewKnowledgeStatus, PeriodPolicy, Project, ProjectCreate, ProjectOverview, ProjectPage,
-    ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
-    ProjectStartView, ProjectStatus, QuestionClusterScope, QuestionClusterState, ReplicationPolicy,
-    ReportSchedule, ReportWeekday, ResourceMode, StartAcceptanceStatus, Tenant, UpdateProject,
-    hash_idempotency_key, previous_calendar_week_window, settings_hash, start_request_hash,
+    OverviewKnowledgeStatus, PendingSuccessorCycle, PeriodPolicy, Project, ProjectCreate,
+    ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
+    ProjectStartAcceptance, ProjectStartCommand, ProjectStartView, ProjectStatus,
+    QuestionClusterScope, QuestionClusterState, ReplicationPolicy, ReportSchedule, ReportWeekday,
+    ResourceMode, StartAcceptanceStatus, Tenant, UpdateProject, hash_idempotency_key,
+    next_calendar_week_window, previous_calendar_week_window, settings_hash, start_request_hash,
 };
 pub use report::{
     MemoryReportRepository, REPORT_REDUCER_VERSION, ReportAvailability, ReportCoverage,

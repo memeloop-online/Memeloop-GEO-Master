@@ -53,6 +53,17 @@ export interface ChannelPlan {
   targets: ChannelTarget[];
 }
 
+export interface CurrentCycle {
+  project_id: string;
+  cycle_id: string;
+  report_timezone: string;
+  report_window_start_at: string;
+  report_window_end_at: string;
+  cutoff_at: string;
+  document_manifest?: unknown | null;
+  distribution_manifest?: unknown | null;
+}
+
 export interface ChannelOutcome {
   status: ChannelOutcomeStatus;
   detail: string | null;
@@ -96,6 +107,22 @@ const scope = (tenantId: string, projectId: string) => ({
   tenantId,
   projectId,
 });
+
+/** A project may not yet have a cycle; this is not a loading failure. */
+export async function getCurrentCycle(
+  tenantId: string,
+  projectId: string,
+): Promise<CurrentCycle | null> {
+  try {
+    return await apiFetch<CurrentCycle>(
+      `/projects/${encoded(projectId)}/cycles/current`,
+      scope(tenantId, projectId),
+    );
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
 
 /** A missing plan is a normal state before the cycle is sealed. */
 export async function getChannelPlan(

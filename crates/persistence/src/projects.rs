@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, CycleReportView, InitialSource, Project, ProjectCreate, ProjectId, ProjectPatch,
-    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
-    ProjectStartView, ProjectStatus, ResourceMode, StartAcceptanceStatus, TenantScope,
-    UpdateProject, previous_calendar_week_window, settings_hash, start_request_hash,
+    AppError, CycleReportView, InitialSource, PendingSuccessorCycle, Project, ProjectCreate,
+    ProjectId, ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartAcceptance,
+    ProjectStartCommand, ProjectStartView, ProjectStatus, ResourceMode, StartAcceptanceStatus,
+    TenantScope, UpdateProject, next_calendar_week_window, previous_calendar_week_window,
+    settings_hash, start_request_hash,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -27,6 +28,54 @@ impl PgProjectRepository {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Trusted, bounded crash-recovery selector. Call schedule_next_cycle
+    /// with each returned scope and predecessor; the project row serializes
+    /// concurrent scanners, and the predecessor unique key deduplicates.
+    pub async fn list_pending_successor_cycles_after(
+        &self,
+        limit: i64,
+        after: Option<Uuid>,
+    ) -> Result<Vec<PendingSuccessorCycle>, AppError> {
+        if !(1..=100).contains(&limit) {
+            return Err(AppError::invalid_request("limit must be between 1 and 100"));
+        }
+        let rows: Vec<(Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "SELECT c.operator_id, c.tenant_id, c.project_id, c.cycle_id
+             FROM optimization_cycles c
+             JOIN projects p ON p.operator_id=c.operator_id AND p.tenant_id=c.tenant_id
+               AND p.project_id=c.project_id AND p.current_cycle_id=c.cycle_id
+             WHERE p.status='active'
+               AND ($1::uuid IS NULL OR c.cycle_id > $1)
+               AND EXISTS (
+                   SELECT 1 FROM report_snapshots r
+                   WHERE r.operator_id=c.operator_id AND r.tenant_id=c.tenant_id
+                     AND r.project_id=c.project_id AND r.cycle_id=c.cycle_id
+                     AND r.revision=1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM optimization_cycles next
+                   WHERE next.operator_id=c.operator_id AND next.tenant_id=c.tenant_id
+                     AND next.project_id=c.project_id AND next.previous_cycle_id=c.cycle_id
+               )
+             ORDER BY c.cycle_id
+             LIMIT $2",
+        )
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_database_error)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(operator, tenant, project, predecessor_cycle_id)| PendingSuccessorCycle {
+                    scope: TenantScope::new(operator.into(), tenant.into(), Some(project.into())),
+                    predecessor_cycle_id,
+                },
+            )
+            .collect())
     }
 
     async fn insert_project(
@@ -644,6 +693,195 @@ impl ProjectRepository for PgProjectRepository {
             report_window_end_at: row.4,
             cutoff_at: row.5,
         }))
+    }
+
+    async fn schedule_next_cycle(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        predecessor_cycle_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<CycleReportView, AppError> {
+        if scope.project_id.is_some_and(|id| id != project_id) {
+            return Err(AppError::not_found("project not found"));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_database_error)?;
+        crate::scope::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(map_database_error)?;
+        let project: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT status, current_cycle_id FROM projects
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+        let (status, current_id) =
+            project.ok_or_else(|| AppError::not_found("project not found"))?;
+        let predecessor: Option<(String, DateTime<Utc>, DateTime<Utc>, Uuid, Value, String)> =
+            sqlx::query_as(
+                "SELECT cycle.report_timezone, cycle.report_window_end_at, cycle.cutoff_at,
+                    cycle.config_revision_id, config.settings, config.settings_hash
+             FROM optimization_cycles cycle
+             JOIN project_config_revisions config
+               ON config.operator_id=cycle.operator_id AND config.tenant_id=cycle.tenant_id
+              AND config.project_id=cycle.project_id
+              AND config.config_revision_id=cycle.config_revision_id
+             WHERE cycle.operator_id=$1 AND cycle.tenant_id=$2
+               AND cycle.project_id=$3 AND cycle.cycle_id=$4",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project_id.as_uuid())
+            .bind(predecessor_cycle_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_database_error)?;
+        let (
+            timezone,
+            predecessor_end,
+            predecessor_cutoff,
+            config_id,
+            settings_value,
+            settings_hash,
+        ) = predecessor.ok_or_else(|| AppError::not_found("predecessor cycle not found"))?;
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT cycle_id FROM optimization_cycles
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND previous_cycle_id=$4",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(predecessor_cycle_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+        if let Some(cycle_id) = existing {
+            tx.commit().await.map_err(map_database_error)?;
+            return self
+                .get_report_cycle(scope, project_id, cycle_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::new(
+                        geo_domain::ErrorCode::Internal,
+                        "successor cycle disappeared",
+                    )
+                });
+        }
+        if status != "active" {
+            return Err(AppError::conflict(
+                "only active projects can advance cycles",
+            ));
+        }
+        if current_id != Some(predecessor_cycle_id) {
+            return Err(AppError::conflict("predecessor is not the current cycle"));
+        }
+        if now < predecessor_cutoff {
+            return Err(AppError::conflict(
+                "predecessor report cutoff has not passed",
+            ));
+        }
+        let settings: ProjectSettings =
+            serde_json::from_value(settings_value).map_err(serialization_error)?;
+        let (start, end, cutoff) =
+            next_calendar_week_window(&timezone, &settings.report_schedule, predecessor_end)?;
+        let cycle_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let distribution_id = Uuid::new_v4();
+        let keys = (
+            scope.operator_id.as_uuid(),
+            scope.tenant_id.as_uuid(),
+            project_id.as_uuid(),
+        );
+        sqlx::query(
+            "INSERT INTO optimization_cycles
+             (cycle_id,operator_id,tenant_id,project_id,config_revision_id,previous_cycle_id,
+              state,report_timezone,report_window_start_at,report_window_end_at,cutoff_at)
+             VALUES ($1,$2,$3,$4,$5,$6,'awaiting_knowledge',$7,$8,$9,$10)",
+        )
+        .bind(cycle_id)
+        .bind(keys.0)
+        .bind(keys.1)
+        .bind(keys.2)
+        .bind(config_id)
+        .bind(predecessor_cycle_id)
+        .bind(&timezone)
+        .bind(start)
+        .bind(end)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+        sqlx::query(
+            "INSERT INTO document_manifests
+             (manifest_id,operator_id,tenant_id,project_id,cycle_id,revision,state,sealed,
+              expected_count,scope_hash,input_refs)
+             VALUES ($1,$2,$3,$4,$5,1,'awaiting_knowledge',false,NULL,$6,$7)",
+        )
+        .bind(document_id)
+        .bind(keys.0)
+        .bind(keys.1)
+        .bind(keys.2)
+        .bind(cycle_id)
+        .bind(&settings_hash)
+        .bind(
+            json!({"config_revision_id":config_id,"source_refs":settings.initial_sources,
+                     "document_scope":settings.document_scope}),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+        sqlx::query(
+            "INSERT INTO distribution_manifests
+             (manifest_id,operator_id,tenant_id,project_id,cycle_id,document_manifest_id,
+              revision,state,sealed,expected_count,scope_hash,input_refs)
+             VALUES ($1,$2,$3,$4,$5,$6,1,'awaiting_documents',false,NULL,$7,$8)",
+        )
+        .bind(distribution_id).bind(keys.0).bind(keys.1).bind(keys.2)
+        .bind(cycle_id).bind(document_id).bind(&settings_hash)
+        .bind(json!({"document_manifest_id":document_id,"distribution_scope":settings.distribution_scope}))
+        .execute(&mut *tx).await.map_err(map_database_error)?;
+        sqlx::query(
+            "UPDATE projects SET current_cycle_id=$1,current_config_revision_id=$2,
+                    revision=revision+1,updated_at=$3
+             WHERE operator_id=$4 AND tenant_id=$5 AND project_id=$6 AND current_cycle_id=$7",
+        )
+        .bind(cycle_id)
+        .bind(config_id)
+        .bind(now)
+        .bind(keys.0)
+        .bind(keys.1)
+        .bind(keys.2)
+        .bind(predecessor_cycle_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+        tx.commit().await.map_err(map_database_error)?;
+        self.get_report_cycle(scope, project_id, cycle_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::new(
+                    geo_domain::ErrorCode::Internal,
+                    "successor cycle disappeared",
+                )
+            })
+    }
+
+    async fn get_current_cycle(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+    ) -> Result<Option<CycleReportView>, AppError> {
+        let Some(project) = self.get(scope, project_id).await? else {
+            return Ok(None);
+        };
+        match project.current_cycle_id {
+            Some(cycle_id) => self.get_report_cycle(scope, project_id, cycle_id).await,
+            None => Ok(None),
+        }
     }
 
     async fn get_report_cycle(

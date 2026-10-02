@@ -56,6 +56,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 11,
         description: "channel jobs",
     },
+    MigrationMetadata {
+        version: 12,
+        description: "successor cycles",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

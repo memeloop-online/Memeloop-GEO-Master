@@ -230,7 +230,7 @@ async fn due_report_replays_immutable_snapshot_and_keeps_absent_sources_unavaila
             .report_reduce(
                 &scope,
                 ReportReduceRequest {
-                    cycle_id: None,
+                    cycle_id: Some(cycle_id),
                     correction_of: None,
                 }
             )
@@ -238,6 +238,21 @@ async fn due_report_replays_immutable_snapshot_and_keeps_absent_sources_unavaila
             .unwrap()
             .report_id,
         first.report_id
+    );
+    // Persisting the first snapshot now advances the project to its next
+    // cycle. An implicit reduction targets that cycle and must not pretend
+    // its future cutoff has arrived or silently return an old period.
+    assert!(
+        tools
+            .report_reduce(
+                &scope,
+                ReportReduceRequest {
+                    cycle_id: None,
+                    correction_of: None,
+                },
+            )
+            .await
+            .is_err()
     );
     let other_scope = TenantScope::new(
         geo_domain::DEVELOPMENT_OPERATOR_ID,

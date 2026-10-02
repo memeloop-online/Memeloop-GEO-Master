@@ -109,6 +109,7 @@ pub async fn reduce_cycle_report(
         parent.revision + 1
     } else {
         if let Some(replay) = revisions.iter().find(|r| r.revision == 1) {
+            schedule_successor_after_report(state, scope, replay, now).await;
             return Ok((*replay).clone());
         }
         1
@@ -198,7 +199,30 @@ pub async fn reduce_cycle_report(
         measurement_targets: channel_inputs.measurements,
     };
     let snapshot = reduce_report(scope, &input, revision, correction_of, now)?;
-    state.report_repository().create(scope, snapshot).await
+    let snapshot = state.report_repository().create(scope, snapshot).await?;
+    schedule_successor_after_report(state, scope, &snapshot, now).await;
+    Ok(snapshot)
+}
+
+async fn schedule_successor_after_report(
+    state: &AppState,
+    scope: &TenantScope,
+    report: &ReportSnapshot,
+    now: DateTime<Utc>,
+) {
+    if report.revision != 1 {
+        return;
+    }
+    // Saving the report and scheduling are separate durable operations.
+    // The database recovery scanner also finds reports without a successor.
+    // Scheduling failure must never hide a successfully persisted report.
+    if let Err(error) = state
+        .project_repository()
+        .schedule_next_cycle(scope, report.project_id, report.cycle_id, now)
+        .await
+    {
+        tracing::warn!(code = ?error.code, "report successor not scheduled");
+    }
 }
 
 #[utoipa::path(

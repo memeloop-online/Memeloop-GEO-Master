@@ -5,7 +5,7 @@ mod runtime;
 use axum::Router;
 use config::AppConfig;
 use geo_api::{AppState, EmbeddedAgentRuntime, reduce_cycle_report, router};
-use geo_persistence::{Database, PgReportRepository};
+use geo_persistence::{Database, PgProjectRepository, PgReportRepository};
 use std::error::Error;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // authentication or idempotency state.
         let database = Database::connect_and_migrate_from_env().await?;
         let report_scanner = PgReportRepository::from_database(&database);
+        let cycle_scanner = PgProjectRepository::from_database(&database);
         let state = channels::configure(
             AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone()),
         )?;
@@ -35,7 +36,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
         }
         state.set_ready(true);
-        spawn_due_report_scanner(state.clone(), report_scanner);
+        spawn_due_report_scanner(state.clone(), report_scanner, cycle_scanner);
         (state, true)
     } else {
         let password = config.validate_for_memory_mode()?;
@@ -71,7 +72,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// PostgreSQL is authoritative for due-cycle enumeration. Each candidate is
 /// reduced through the same scoped service as HTTP and agent tools; concurrent
 /// replicas race safely at the repository's immutable report key.
-fn spawn_due_report_scanner(state: AppState, scanner: PgReportRepository) {
+fn spawn_due_report_scanner(
+    state: AppState,
+    scanner: PgReportRepository,
+    cycle_scanner: PgProjectRepository,
+) {
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -101,6 +106,45 @@ fn spawn_due_report_scanner(state: AppState, scanner: PgReportRepository) {
                     }
                     Err(error) => {
                         warn!(code = ?error.code, "due report scan failed");
+                        break;
+                    }
+                }
+            }
+            // A crash after saving a report must not lose its successor.
+            // Keyset progress skips failed candidates rather than letting
+            // an old page permanently starve later customer projects.
+            let mut after = None;
+            loop {
+                match cycle_scanner
+                    .list_pending_successor_cycles_after(100, after)
+                    .await
+                {
+                    Ok(candidates) => {
+                        let count = candidates.len();
+                        for candidate in candidates {
+                            after = Some(candidate.predecessor_cycle_id);
+                            let Some(project_id) = candidate.scope.project_id else {
+                                continue;
+                            };
+                            if let Err(error) = state
+                                .project_repository()
+                                .schedule_next_cycle(
+                                    &candidate.scope,
+                                    project_id,
+                                    candidate.predecessor_cycle_id,
+                                    now,
+                                )
+                                .await
+                            {
+                                warn!(code = ?error.code, "report successor recovery failed");
+                            }
+                        }
+                        if count < 100 {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(code = ?error.code, "report successor scan failed");
                         break;
                     }
                 }

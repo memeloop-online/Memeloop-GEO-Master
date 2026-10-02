@@ -72,6 +72,7 @@ function mockApi({
   outcome,
   executeError = false,
   role = "tenant_admin",
+  currentCycleId = cycleId,
 }: {
   accounts?: unknown[];
   sources?: unknown[];
@@ -79,6 +80,7 @@ function mockApi({
   outcome?: "unknown" | "unsupported" | "login_required";
   executeError?: boolean;
   role?: string;
+  currentCycleId?: string | null;
 } = {}) {
   let plan = initialPlan;
   let detail: ChannelTargetView = { target, attempts: [] };
@@ -121,15 +123,22 @@ function mockApi({
             csrf_token: "csrf-test",
           }),
         );
-      if (path.endsWith("/projects/project-1/start"))
+      if (path.endsWith("/projects/project-1/cycles/current"))
         return Promise.resolve(
-          response({
-            operation_id: "operation-1",
-            cycle_id: cycleId,
-            status: "accepted",
-          }),
+          currentCycleId
+            ? response({
+                project_id: "project-1",
+                cycle_id: currentCycleId,
+                report_timezone: "Asia/Shanghai",
+                report_window_start_at: "2026-10-01T00:00:00Z",
+                report_window_end_at: "2026-10-08T00:00:00Z",
+                cutoff_at: "2026-10-09T00:00:00Z",
+                document_manifest: null,
+                distribution_manifest: null,
+              })
+            : response({ code: "not_found", message: "no cycle" }, 404),
         );
-      if (path.endsWith("/cycles/cycle-1/channel-plan")) {
+      if (path.endsWith(`/cycles/${currentCycleId}/channel-plan`)) {
         if (method === "POST") {
           plan = frozenPlan;
           return Promise.resolve(response(plan));
@@ -297,9 +306,46 @@ describe("P12 channel jobs", () => {
     });
     expect(request?.url.searchParams.get("tenant_id")).toBe("tenant-1");
     expect(request?.url.searchParams.get("project_id")).toBe("project-1");
+    const current = requests.find((item) =>
+      item.path.endsWith("/projects/project-1/cycles/current"),
+    );
+    expect(current?.url.searchParams.get("tenant_id")).toBe("tenant-1");
+    expect(current?.url.searchParams.get("project_id")).toBe("project-1");
     expect(
       screen.queryByRole("button", { name: "加入目标" }),
     ).not.toBeInTheDocument();
+    expect(
+      requests.some((item) => item.path.endsWith("/projects/project-1/start")),
+    ).toBe(false);
+  });
+
+  it("follows an advanced current cycle instead of the original start cycle", async () => {
+    const requests = mockApi({ currentCycleId: "cycle-2" });
+    renderPage();
+    expect(await screen.findByText("当前周期：cycle-2")).toBeInTheDocument();
+    await screen.findByRole("button", { name: "封存本轮计划" });
+    expect(
+      requests.some((item) =>
+        item.path.endsWith("/cycles/cycle-2/channel-plan"),
+      ),
+    ).toBe(true);
+    expect(
+      requests.some((item) =>
+        item.path.endsWith("/cycles/cycle-1/channel-plan"),
+      ),
+    ).toBe(false);
+    expect(
+      requests.some((item) => item.path.endsWith("/projects/project-1/start")),
+    ).toBe(false);
+  });
+
+  it("shows the unstarted state when no current cycle exists", async () => {
+    const requests = mockApi({ currentCycleId: null });
+    renderPage();
+    expect(await screen.findByText("项目尚未启动")).toBeInTheDocument();
+    expect(requests.some((item) => item.path.includes("/channel-plan"))).toBe(
+      false,
+    );
   });
 
   it("does not seal without a source or account and explains the missing resource", async () => {

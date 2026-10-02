@@ -111,6 +111,7 @@ jobs:
           cargo test -p geo-persistence --test reports -- --ignored 2>&1 | tee logs/cargo-report-postgres.log
           cargo test -p geo-persistence --test channels -- --ignored 2>&1 | tee logs/cargo-channel-postgres.log
           cargo test -p geo-persistence --test channel_identity -- --ignored 2>&1 | tee logs/cargo-channel-identity-postgres.log
+          cargo test -p geo-persistence --test successor_cycles -- --ignored 2>&1 | tee logs/cargo-successor-postgres.log
 
       - name: Write 5-minute milestone summary
         if: always()

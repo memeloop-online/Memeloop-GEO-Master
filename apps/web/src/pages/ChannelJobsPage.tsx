@@ -18,6 +18,7 @@ import {
   executeChannelTarget,
   getChannelPlan,
   getChannelTarget,
+  getCurrentCycle,
   submitChannelPlan,
   type ChannelPlan,
   type ChannelTarget,
@@ -26,7 +27,6 @@ import {
 } from "../api/channelJobs";
 import { useChannelData } from "../api/channels";
 import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
-import { useProjectStartQuery } from "../api/projects";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import "./ChannelJobsPage.css";
 
@@ -287,12 +287,23 @@ export function ChannelJobsPage() {
   const canWrite = Boolean(
     membership && ["tenant_admin", "member"].includes(membership.role),
   );
-  const start = useProjectStartQuery(tenantId, projectId);
-  const cycleId = start.data?.cycle_id;
   const scope =
     session && tenantId && projectId
       ? queryScopeFor(session, tenantId, projectId)
       : undefined;
+  const currentCycle = useQuery({
+    queryKey: [
+      "current-channel-cycle",
+      scope?.userId,
+      scope?.operatorId,
+      tenantId,
+      projectId,
+    ],
+    queryFn: () => getCurrentCycle(tenantId!, projectId!),
+    enabled: Boolean(scope),
+    retry: false,
+  });
+  const cycleId = currentCycle.data?.cycle_id;
   const planKey = [
     "channel-plan",
     scope?.userId,
@@ -386,13 +397,13 @@ export function ChannelJobsPage() {
         </div>
         <Link to={`/app/${tenantId}/${projectId}/channels`}>管理渠道账号</Link>
       </section>
-      {start.isPending ? (
+      {currentCycle.isPending ? (
         <LoadingState label="正在读取当前项目周期" />
-      ) : start.isError ? (
+      ) : currentCycle.isError ? (
         <ErrorState
           title="无法读取当前项目周期"
-          detail={errorText(start.error)}
-          onRetry={() => void start.refetch()}
+          detail={errorText(currentCycle.error)}
+          onRetry={() => void currentCycle.refetch()}
         />
       ) : !cycleId ? (
         <EmptyState
