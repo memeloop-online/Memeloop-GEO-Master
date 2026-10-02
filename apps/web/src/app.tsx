@@ -12,8 +12,13 @@ import { SetupPage } from "./pages/SetupPage";
 import { SourceDetailPage } from "./pages/SourceDetailPage";
 import { WorkbenchPage } from "./pages/WorkbenchPage";
 import { DocumentManifestPage } from "./pages/DocumentManifestPage";
+import {
+  ChannelAccountsPage,
+  OperatorAccountsPage,
+} from "./pages/ChannelAccountsPage";
 import { WorkspacePage } from "./pages/WorkspacePage";
 import { ReportsPage } from "./pages/ReportsPage";
+import { ChannelJobsPage } from "./pages/ChannelJobsPage";
 
 export function AppRoutes() {
   return (
@@ -22,6 +27,7 @@ export function AppRoutes() {
       <Route element={<RequireSession />}>
         <Route path="/" element={<Navigate replace to="/workspaces" />} />
         <Route path="/workspaces" element={<WorkspacePage />} />
+        <Route path="/ops/channels" element={<OperatorAccountsPage />} />
         <Route path="/setup" element={<SetupEntry />} />
         <Route element={<RequireMembership />}>
           <Route path="/app/:tenantId/:projectId" element={<AppShell />}>
@@ -55,16 +61,13 @@ export function AppRoutes() {
             />
             <Route
               path="channels"
-              element={<WorkbenchPage page="channels" />}
+              element={<ChannelAccountsPage view="channels" />}
             />
             <Route
               path="channels/connect"
-              element={<WorkbenchPage page="connect" />}
+              element={<ChannelAccountsPage view="connect" />}
             />
-            <Route
-              path="publications"
-              element={<WorkbenchPage page="publications" />}
-            />
+            <Route path="publications" element={<ChannelJobsPage />} />
             <Route
               path="measurement"
               element={<WorkbenchPage page="measurement" />}
@@ -74,7 +77,7 @@ export function AppRoutes() {
             <Route path="billing" element={<WorkbenchPage page="billing" />} />
             <Route
               path="settings"
-              element={<WorkbenchPage page="settings" />}
+              element={<ChannelAccountsPage view="settings" />}
             />
           </Route>
         </Route>

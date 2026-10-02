@@ -1,0 +1,63 @@
+.channel-jobs-page {
+  display: grid;
+  gap: 20px;
+}
+
+.channel-jobs-section,
+.channel-jobs-list {
+  display: grid;
+  gap: 16px;
+}
+
+.channel-jobs-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 14px;
+  align-items: end;
+}
+
+.channel-job-target {
+  min-width: 0;
+}
+
+.channel-job-target-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.channel-job-target-heading h3 {
+  margin: 0;
+}
+
+.channel-job-ids {
+  overflow-wrap: anywhere;
+  color: var(--colorNeutralForeground3);
+}
+
+.channel-job-attempt {
+  border-top: 1px solid var(--colorNeutralStroke2);
+  overflow-wrap: anywhere;
+}
+
+.channel-job-attempt pre {
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.channel-jobs-draft {
+  display: grid;
+  gap: 8px;
+  padding-inline-start: 24px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .channel-jobs-form {
+    grid-template-columns: 1fr;
+  }
+}

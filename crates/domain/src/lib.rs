@@ -5,6 +5,10 @@
 
 mod agent;
 mod auth;
+mod channel_jobs;
+pub use channel_jobs::*;
+mod channels;
+pub use channels::*;
 mod error;
 mod event;
 mod idempotency;

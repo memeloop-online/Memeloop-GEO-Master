@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 geo-domain = { path = "../domain" }

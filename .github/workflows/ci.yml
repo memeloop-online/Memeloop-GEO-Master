@@ -65,6 +65,9 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install pinned browser for isolated connector tests
+        run: pnpm --filter @memeloop-geo/browser-runner exec playwright install --with-deps chromium
+
       - name: Build generated MemeLoop bundle
         shell: bash
         run: |
@@ -106,6 +109,8 @@ jobs:
           set -o pipefail
           cargo test -p geo-persistence --test postgres -- --ignored 2>&1 | tee logs/cargo-postgres.log
           cargo test -p geo-persistence --test reports -- --ignored 2>&1 | tee logs/cargo-report-postgres.log
+          cargo test -p geo-persistence --test channels -- --ignored 2>&1 | tee logs/cargo-channel-postgres.log
+          cargo test -p geo-persistence --test channel_identity -- --ignored 2>&1 | tee logs/cargo-channel-identity-postgres.log
 
       - name: Write 5-minute milestone summary
         if: always()

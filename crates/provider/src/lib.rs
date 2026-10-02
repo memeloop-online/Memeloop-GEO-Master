@@ -5,7 +5,9 @@
 //! keep provider-contract tests deterministic.
 
 mod http_transport;
+mod secret_envelope;
 pub use http_transport::HttpTransport;
+pub use secret_envelope::SecretEnvelope;
 mod token_center;
 pub use token_center::{HttpTokenCenter, TokenCenterKeyMapping};
 

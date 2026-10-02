@@ -2,6 +2,9 @@
 
 mod agent;
 mod agent_runtime;
+mod browser_bridge;
+mod channel_jobs;
+mod channels;
 mod context;
 mod error;
 mod idempotency;
@@ -52,6 +55,8 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 pub use agent_runtime::{EmbeddedAgentRuntime, RepositoryHostOps};
+pub use browser_bridge::BrowserBridge;
+pub use channels::ChannelService;
 pub use context::{
     AuthContext, AuthMiddlewareState, CORRELATION_ID_HEADER, CSRF_HEADER, DEV_SESSION_COOKIE_NAME,
     OPERATOR_ID_HEADER, OriginConfig, PROJECT_ID_HEADER, REQUEST_ID_HEADER, RequestContext,
@@ -91,6 +96,8 @@ pub struct AppState {
     project_repository: Arc<dyn ProjectRepository>,
     knowledge_repository: Arc<dyn KnowledgeRepository>,
     report_repository: Arc<dyn ReportRepository>,
+    channel_service: ChannelService,
+    channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
     events: EventBus,
     ready: Arc<AtomicBool>,
     durable_storage: bool,
@@ -116,6 +123,8 @@ impl AppState {
             project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
             knowledge_repository: Arc::new(MemoryKnowledgeRepository::default()),
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
+            channel_service: ChannelService::development(),
+            channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             events: EventBus::default(),
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage: false,
@@ -195,6 +204,8 @@ impl AppState {
             project_repository,
             knowledge_repository,
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
+            channel_service: ChannelService::development(),
+            channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             events,
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage,
@@ -238,6 +249,12 @@ impl AppState {
             database,
         )))
         .with_report_repository(Arc::new(PgReportRepository::from_database(database)))
+        .with_channel_job_repository(Arc::new(
+            geo_persistence::PgChannelJobRepository::from_database(database),
+        ))
+        .with_channel_service(ChannelService::unconfigured(Arc::new(
+            geo_persistence::PgChannelRepository::from_database(database),
+        )))
     }
 
     pub fn operation_store(&self) -> Arc<dyn OperationStore> {
@@ -289,6 +306,27 @@ impl AppState {
 
     pub fn durable_storage(&self) -> bool {
         self.durable_storage
+    }
+
+    pub fn channel_service(&self) -> &ChannelService {
+        &self.channel_service
+    }
+
+    pub fn channel_job_repository(&self) -> Arc<dyn geo_domain::ChannelJobRepository> {
+        Arc::clone(&self.channel_job_repository)
+    }
+
+    pub fn with_channel_job_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ChannelJobRepository>,
+    ) -> Self {
+        self.channel_job_repository = repository;
+        self
+    }
+
+    pub fn with_channel_service(mut self, service: ChannelService) -> Self {
+        self.channel_service = service;
+        self
     }
 
     pub fn origin_scheme(&self) -> &str {
@@ -1657,6 +1695,32 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(auth_scope_from_request));
 
+    // Login actions can contain transient credentials. Never put these
+    // requests through the generic idempotency cache.
+    let channel_routes = channels::customer_routes()
+        .route(
+            "/projects/{project_id}/cycles/{cycle_id}/channel-plan",
+            get(channel_jobs::get_plan).post(channel_jobs::submit_plan),
+        )
+        .route(
+            "/projects/{project_id}/channel-targets/{target_id}",
+            get(channel_jobs::get_target),
+        )
+        .route(
+            "/projects/{project_id}/channel-targets/{target_id}/execute",
+            post(channel_jobs::execute_target),
+        )
+        .layer(middleware::from_fn(no_store_middleware))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // Operator pool scope comes from deployment configuration plus trusted
+    // membership, not a customer tenant selector. The catalogue is session-only.
+    let operator_channel_routes = channels::operator_routes()
+        .layer(middleware::from_fn(no_store_middleware))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(session_auth_from_request));
+
     // Estimation only validates and computes a range. It intentionally stays
     // outside the idempotency middleware because it has no external side
     // effect or durable reservation to protect.
@@ -1694,6 +1758,8 @@ pub fn router(state: AppState) -> Router {
                 .merge(estimate_routes)
                 .merge(start_routes)
                 .merge(report_routes)
+                .merge(channel_routes)
+                .merge(operator_channel_routes)
                 .merge(knowledge_routes)
                 .merge(agent_attachment_bytes)
                 .merge(agent_routes)

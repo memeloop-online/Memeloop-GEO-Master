@@ -1,3 +1,4 @@
+mod channels;
 mod config;
 mod runtime;
 
@@ -22,8 +23,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // authentication or idempotency state.
         let database = Database::connect_and_migrate_from_env().await?;
         let report_scanner = PgReportRepository::from_database(&database);
-        let state =
-            AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone());
+        let state = channels::configure(
+            AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone()),
+        )?;
         let state = state.with_agent_runtime(Arc::new(EmbeddedAgentRuntime::unconfigured()));
         if config.single_process_executor {
             let reconciled = state.reconcile_running_runs().await?;
@@ -37,8 +39,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         (state, true)
     } else {
         let password = config.validate_for_memory_mode()?;
-        let state = AppState::development_with_password(password)
-            .with_allowed_origins(config.allowed_origins.clone());
+        let state = channels::configure(
+            AppState::development_with_password(password)
+                .with_allowed_origins(config.allowed_origins.clone()),
+        )?;
         let runtime = runtime::assemble(&state, config.development_ai.as_ref())?;
         let state = state.with_agent_runtime(runtime);
         if config.single_process_executor {

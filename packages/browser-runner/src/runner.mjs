@@ -1,0 +1,484 @@
+import { createHash } from "node:crypto";
+import { chromium } from "playwright";
+import { adapters as defaultAdapters } from "./adapters.mjs";
+
+const ID = /^[a-zA-Z0-9_-]{1,128}$/;
+const VIEWPORT = Object.freeze({ width: 1280, height: 800 });
+const KEYS = new Set([
+  "Enter",
+  "Tab",
+  "Escape",
+  "Backspace",
+  "Delete",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+  "ControlOrMeta+A",
+]);
+const OPERATIONS = new Set(["publish", "measure", "lookup"]);
+const STATUSES = new Set([
+  "unsupported",
+  "login_required",
+  "challenge",
+  "unknown",
+  "completed",
+]);
+
+export class RunnerError extends Error {
+  constructor(status, code) {
+    super(code);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function object(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function fields(value, permitted) {
+  return (
+    object(value) &&
+    Object.keys(value).every((field) => permitted.includes(field))
+  );
+}
+
+function validId(value) {
+  return typeof value === "string" && ID.test(value);
+}
+
+function parseProxy(proxy) {
+  if (proxy === undefined) return undefined;
+  if (
+    !fields(proxy, ["server", "username", "password"]) ||
+    typeof proxy.server !== "string" ||
+    !/^(https?:\/\/|socks5:\/\/)[^\s]+$/.test(proxy.server) ||
+    (proxy.username !== undefined && typeof proxy.username !== "string") ||
+    (proxy.password !== undefined && typeof proxy.password !== "string")
+  ) {
+    throw new RunnerError(400, "invalid_proxy");
+  }
+  return proxy;
+}
+
+function parseState(state) {
+  if (state === undefined) return undefined;
+  // Playwright accepts a JSON object here. Never accept a filename/URL from callers.
+  if (
+    !fields(state, ["cookies", "origins"]) ||
+    !Array.isArray(state.cookies) ||
+    !Array.isArray(state.origins)
+  ) {
+    throw new RunnerError(400, "invalid_storage_state");
+  }
+  return state;
+}
+
+function validateIdentity(identity) {
+  return (
+    fields(identity, ["platform_account_id", "display_name", "avatar_url"]) &&
+    typeof identity.platform_account_id === "string" &&
+    identity.platform_account_id.length > 0 &&
+    typeof identity.display_name === "string" &&
+    identity.display_name.length > 0 &&
+    (identity.avatar_url === undefined ||
+      typeof identity.avatar_url === "string")
+  );
+}
+
+function isChallenge(page) {
+  // Only use a conservative signal. Do not automate challenge solving.
+  return /\/(captcha|challenge|verify)(\/|[?#]|$)/i.test(
+    new URL(page.url()).pathname,
+  );
+}
+
+export function createRunner({
+  browserType = chromium,
+  platformAdapters = defaultAdapters,
+  sessionIdleMs = 15 * 60_000,
+  executionRetentionMs = 5 * 60_000,
+  executionTimeoutMs = 120_000,
+  maintenanceIntervalMs = 30_000,
+  clock = () => Date.now(),
+} = {}) {
+  if (
+    ![
+      sessionIdleMs,
+      executionRetentionMs,
+      executionTimeoutMs,
+      maintenanceIntervalMs,
+    ].every((value) => Number.isFinite(value) && value > 0)
+  ) {
+    throw new Error("invalid_runner_retention");
+  }
+  const sessions = new Map();
+  const pendingSessions = new Set();
+  const executions = new Map();
+  let browserPromise;
+  let reapingPromise;
+
+  async function browser() {
+    if (!browserPromise) {
+      browserPromise = browserType.launch({ headless: true }).catch((error) => {
+        browserPromise = undefined;
+        throw error;
+      });
+    }
+    return browserPromise;
+  }
+
+  function session(id) {
+    const found = sessions.get(id);
+    if (!found) throw new RunnerError(404, "session_not_found");
+    if (!found.busy && clock() - found.lastTouched >= sessionIdleMs) {
+      sessions.delete(id);
+      void found.context.close().catch(() => {});
+      throw new RunnerError(404, "session_not_found");
+    }
+    found.lastTouched = clock();
+    return found;
+  }
+
+  async function reap() {
+    if (reapingPromise) return reapingPromise;
+    reapingPromise = (async () => {
+      const now = clock();
+      const expired = [];
+      for (const [id, record] of sessions) {
+        if (!record.busy && now - record.lastTouched >= sessionIdleMs) {
+          sessions.delete(id);
+          expired.push(record.context.close());
+        }
+      }
+      for (const [id, entry] of executions) {
+        if (
+          entry.settledAt !== null &&
+          now - entry.settledAt >= executionRetentionMs
+        ) {
+          executions.delete(id);
+        }
+      }
+      await Promise.allSettled(expired);
+    })();
+    try {
+      await reapingPromise;
+    } finally {
+      reapingPromise = undefined;
+    }
+  }
+  const maintenance = setInterval(() => {
+    void reap().catch(() => {});
+  }, maintenanceIntervalMs);
+  maintenance.unref?.();
+
+  async function phase(record) {
+    if (isChallenge(record.page)) return "challenge";
+    if (!record.identity) {
+      let identity;
+      try {
+        identity = await record.adapter.identify(record.page);
+      } catch {
+        // An identity probe failure never proves account connection.
+        return "login_required";
+      }
+      if (validateIdentity(identity)) record.identity = identity;
+    }
+    return record.identity
+      ? record.completed
+        ? "connected"
+        : "ready_to_complete"
+      : "login_required";
+  }
+
+  async function snapshot(id) {
+    const record = session(id);
+    const screenshot = await record.page.screenshot({
+      type: "png",
+      animations: "disabled",
+    });
+    const size = record.page.viewportSize() ?? VIEWPORT;
+    return {
+      phase: await phase(record),
+      url: record.page.url(),
+      width: size.width,
+      height: size.height,
+      screenshot_base64: screenshot.toString("base64"),
+      ...(record.identity ? { identity: record.identity } : {}),
+    };
+  }
+
+  async function create(input) {
+    if (
+      !fields(input, ["session_id", "platform", "storage_state", "proxy"]) ||
+      !validId(input.session_id) ||
+      typeof input.platform !== "string"
+    ) {
+      throw new RunnerError(400, "invalid_session");
+    }
+    const adapter = platformAdapters[input.platform];
+    if (!adapter) throw new RunnerError(400, "unsupported_platform");
+    if (
+      sessions.has(input.session_id) ||
+      pendingSessions.has(input.session_id)
+    ) {
+      throw new RunnerError(409, "session_exists");
+    }
+    const proxy = parseProxy(input.proxy);
+    const storageState = parseState(input.storage_state);
+    pendingSessions.add(input.session_id);
+    let context;
+    try {
+      context = await (
+        await browser()
+      ).newContext({
+        viewport: VIEWPORT,
+        ...(proxy ? { proxy } : {}),
+        ...(storageState ? { storageState } : {}),
+      });
+      const page = await context.newPage();
+      // The caller cannot provide navigation targets. OAuth redirects, if any,
+      // are handled by the platform's own UI in this isolated context.
+      await page.goto(adapter.entry, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+      const record = {
+        adapter,
+        context,
+        page,
+        proxy,
+        identity: null,
+        completed: false,
+        busy: false,
+        lastTouched: clock(),
+      };
+      sessions.set(input.session_id, record);
+      return { session_id: input.session_id, phase: await phase(record) };
+    } catch (error) {
+      if (context) await context.close();
+      throw error;
+    } finally {
+      pendingSessions.delete(input.session_id);
+    }
+  }
+
+  async function action(id, input) {
+    const record = session(id);
+    if (record.completed) throw new RunnerError(409, "connection_completed");
+    // Once identity is established, only typed executions may change page state.
+    if ((await phase(record)) === "ready_to_complete") {
+      throw new RunnerError(409, "connection_ready");
+    }
+    if (!record.adapter.allowLoginControl(new URL(record.page.url()))) {
+      throw new RunnerError(409, "connection_unverified");
+    }
+    if (!object(input) || typeof input.kind !== "string") {
+      throw new RunnerError(400, "invalid_action");
+    }
+    const page = record.page;
+    switch (input.kind) {
+      case "click":
+        if (
+          !fields(input, ["kind", "x", "y"]) ||
+          !Number.isInteger(input.x) ||
+          !Number.isInteger(input.y) ||
+          input.x < 0 ||
+          input.y < 0 ||
+          input.x >= VIEWPORT.width ||
+          input.y >= VIEWPORT.height
+        ) {
+          throw new RunnerError(400, "invalid_action");
+        }
+        await page.mouse.click(input.x, input.y);
+        break;
+      case "type":
+        if (
+          !fields(input, ["kind", "text"]) ||
+          typeof input.text !== "string" ||
+          input.text.length > 4096
+        ) {
+          throw new RunnerError(400, "invalid_action");
+        }
+        await page.keyboard.insertText(input.text);
+        break;
+      case "key":
+        if (!fields(input, ["kind", "key"]) || !KEYS.has(input.key)) {
+          throw new RunnerError(400, "invalid_action");
+        }
+        await page.keyboard.press(input.key);
+        break;
+      case "scroll":
+        if (
+          !fields(input, ["kind", "delta_y"]) ||
+          !Number.isFinite(input.delta_y) ||
+          Math.abs(input.delta_y) > 2000
+        ) {
+          throw new RunnerError(400, "invalid_action");
+        }
+        await page.mouse.wheel(0, input.delta_y);
+        break;
+      default:
+        throw new RunnerError(400, "invalid_action");
+    }
+    return snapshot(id);
+  }
+
+  async function complete(id) {
+    const record = session(id);
+    if (record.busy) throw new RunnerError(409, "session_busy");
+    if (isChallenge(record.page)) throw new RunnerError(409, "challenge");
+    const identity = await record.adapter.identify(record.page);
+    if (!validateIdentity(identity))
+      throw new RunnerError(409, "login_required");
+    if (
+      record.identity &&
+      record.identity.platform_account_id !== identity.platform_account_id
+    ) {
+      throw new RunnerError(409, "account_mismatch");
+    }
+    record.identity = identity;
+    record.completed = true;
+    return { identity, storage_state: await record.context.storageState() };
+  }
+
+  async function execute(input) {
+    if (
+      !fields(input, ["execution_id", "session_id", "operation", "payload"]) ||
+      !validId(input.execution_id) ||
+      !validId(input.session_id) ||
+      !OPERATIONS.has(input.operation) ||
+      !object(input.payload)
+    ) {
+      throw new RunnerError(400, "invalid_execution");
+    }
+    // Do not retain plaintext content in the in-process duplicate cache.
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify(input))
+      .digest("hex");
+    const previous = executions.get(input.execution_id);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint)
+        throw new RunnerError(409, "execution_conflict");
+      return previous.promise;
+    }
+    const record = session(input.session_id);
+    if (!record.completed) throw new RunnerError(409, "login_required");
+    if (!record.adapter.operations?.includes(input.operation)) {
+      return {
+        execution_id: input.execution_id,
+        status: "unsupported",
+        reason: "operation_not_supported",
+        evidence: [],
+      };
+    }
+    if (record.busy) throw new RunnerError(409, "session_busy");
+    if (isChallenge(record.page)) {
+      return {
+        execution_id: input.execution_id,
+        status: "challenge",
+        evidence: [],
+      };
+    }
+    // Reserve this context before the asynchronous identity probe; otherwise
+    // two different execution IDs can both pass the busy check and submit.
+    record.busy = true;
+    const entry = { fingerprint, promise: null, settledAt: null };
+    const promise = (async () => {
+      const deadline = Symbol("execution_deadline");
+      let timer;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(deadline), executionTimeoutMs);
+      });
+      function timedOut() {
+        // The external side effect may have happened. Closing this browser
+        // context prevents a stalled adapter from issuing later actions;
+        // Rust must reconcile before any new attempt.
+        if (sessions.get(input.session_id) === record) {
+          sessions.delete(input.session_id);
+        }
+        void record.context.close().catch(() => {});
+        return {
+          execution_id: input.execution_id,
+          status: "unknown",
+          reason: "execution_deadline",
+          evidence: [],
+        };
+      }
+      try {
+        const currentIdentity = await Promise.race([
+          record.adapter.identify(record.page).catch(() => null),
+          timeout,
+        ]);
+        if (currentIdentity === deadline) return timedOut();
+        if (
+          !validateIdentity(currentIdentity) ||
+          currentIdentity.platform_account_id !==
+            record.identity.platform_account_id
+        ) {
+          return {
+            execution_id: input.execution_id,
+            status: "login_required",
+            reason: "account_identity_unverified",
+            evidence: [],
+          };
+        }
+        // Adapters own fixed, typed platform actions; user payload is never script
+        // or navigation, and adapter evidence must not be inferred from click success.
+        const outcome = await Promise.race([
+          record.adapter.execute(record.page, input.operation, input.payload, {
+            proxy: record.proxy,
+            expectedAccountId: record.identity.platform_account_id,
+          }),
+          timeout,
+        ]);
+        if (outcome === deadline) return timedOut();
+        if (
+          !object(outcome) ||
+          !STATUSES.has(outcome.status) ||
+          !Array.isArray(outcome.evidence)
+        ) {
+          throw new Error("invalid_adapter_outcome");
+        }
+        return { execution_id: input.execution_id, ...outcome };
+      } catch {
+        // A timeout or crash after submit can be an external success. Rust must
+        // reconcile an unknown result; this service cannot safely retry it.
+        return {
+          execution_id: input.execution_id,
+          status: "unknown",
+          evidence: [],
+        };
+      } finally {
+        clearTimeout(timer);
+        record.busy = false;
+        record.lastTouched = clock();
+        entry.settledAt = clock();
+      }
+    })();
+    entry.promise = promise;
+    executions.set(input.execution_id, entry);
+    return promise;
+  }
+
+  async function close(id) {
+    const record = session(id);
+    if (record.busy) throw new RunnerError(409, "session_busy");
+    sessions.delete(id);
+    await record.context.close();
+  }
+
+  async function shutdown() {
+    clearInterval(maintenance);
+    const contexts = [...sessions.values()].map((record) => record.context);
+    sessions.clear();
+    executions.clear();
+    await Promise.allSettled(contexts.map((context) => context.close()));
+    if (browserPromise) await (await browserPromise).close();
+  }
+
+  return { create, snapshot, action, complete, execute, close, shutdown, reap };
+}

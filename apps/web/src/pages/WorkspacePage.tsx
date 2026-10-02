@@ -20,6 +20,7 @@ function setupHref(tenantId: string, returnTo: string | null) {
 
 export function WorkspacePage() {
   const { session } = useAuth();
+  const navigate = useNavigate();
   const location = useLocation();
   const returnTo = new URLSearchParams(location.search).get("returnTo");
   const memberships = session?.memberships ?? [];
@@ -43,6 +44,13 @@ export function WorkspacePage() {
           <h1>选择客户工作区</h1>
           <p>工作区决定项目、资料、费用和测量数据的租户边界。</p>
         </div>
+        {memberships.some((membership) =>
+          ["operator_admin", "resource_admin"].includes(membership.role),
+        ) && (
+          <Button onClick={() => navigate("/ops/channels")}>
+            管理运营账号池
+          </Button>
+        )}
       </section>
       <section className="workspace-grid" aria-label="已授权工作区">
         {memberships.map((membership) => (

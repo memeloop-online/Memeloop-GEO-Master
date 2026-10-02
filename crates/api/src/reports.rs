@@ -140,6 +140,24 @@ pub async fn reduce_cycle_report(
             "document manifest does not match the frozen start revision",
         ));
     }
+    // Ordinary snapshots use the frozen cutoff; explicit corrections may
+    // include evidence received since then without rewriting the old report.
+    let channel_inputs = state
+        .channel_job_repository()
+        .cycle_inputs(
+            scope,
+            cycle_id,
+            if correction_of.is_some() {
+                now
+            } else {
+                cycle.cutoff_at
+            },
+        )
+        .await?;
+    let has_distribution = channel_inputs
+        .manifests
+        .iter()
+        .any(|reference| reference.kind == ReportManifestKind::Distribution);
     let input = ReportReduceInput {
         project_id,
         cycle_id,
@@ -164,6 +182,7 @@ pub async fn reduce_cycle_report(
                 cycle
                     .distribution_manifest
                     .iter()
+                    .filter(|_| !has_distribution)
                     .map(|reference| ReportManifestRef {
                         kind: ReportManifestKind::Distribution,
                         manifest_id: reference.manifest_id,
@@ -172,10 +191,11 @@ pub async fn reduce_cycle_report(
                         expected_count: reference.expected_count.and_then(|n| n.try_into().ok()),
                     }),
             )
+            .chain(channel_inputs.manifests)
             .collect(),
         document_manifest,
-        publication_targets: None,
-        measurement_targets: None,
+        publication_targets: channel_inputs.publications,
+        measurement_targets: channel_inputs.measurements,
     };
     let snapshot = reduce_report(scope, &input, revision, correction_of, now)?;
     state.report_repository().create(scope, snapshot).await

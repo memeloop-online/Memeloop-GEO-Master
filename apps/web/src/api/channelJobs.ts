@@ -1,0 +1,149 @@
+import { ApiError, apiFetch } from "./client";
+
+export type ChannelOutcomeStatus =
+  | "published"
+  | "verified"
+  | "unknown"
+  | "failed"
+  | "login_required"
+  | "unsupported"
+  | "observed"
+  | "refused"
+  | "missing";
+
+export type ChannelTargetInput =
+  | {
+      kind: "publish";
+      source_id: string;
+      source_version_id: string;
+      platform: string;
+      account_id: string;
+      title: string;
+      body: string;
+      body_sha256: string;
+    }
+  | {
+      kind: "measure";
+      account_id: string;
+      provider: string;
+      model: string;
+      surface: string;
+      search_mode: string;
+      protocol_version: string;
+      question_set_version: string;
+      question: string;
+      market: string;
+      language: string;
+      scheduled_at: string;
+      sample_ordinal: number;
+    };
+
+export interface ChannelTarget {
+  target_id: string;
+  input: ChannelTargetInput;
+}
+
+export interface ChannelPlan {
+  plan_id: string;
+  project_id: string;
+  cycle_id: string;
+  input_hash: string;
+  revision: number;
+  created_at: string;
+  targets: ChannelTarget[];
+}
+
+export interface ChannelOutcome {
+  status: ChannelOutcomeStatus;
+  detail: string | null;
+  occurred_at: string;
+  raw_answer: string | null;
+  citations: string[];
+  public_url: string | null;
+  screenshot_ref: string | null;
+  connector_version: string | null;
+  runner_evidence: unknown[];
+  fixture: boolean;
+}
+
+export interface ChannelAttempt {
+  attempt_id: string;
+  target_id: string;
+  claimed_at: string;
+  outcome: ChannelOutcome | null;
+  received_at: string | null;
+}
+
+export interface ChannelTargetView {
+  target: ChannelTarget;
+  attempts: ChannelAttempt[];
+}
+
+export interface PublicationRequest {
+  source_id: string;
+  source_version_id: string;
+  platform: string;
+  account_id: string;
+}
+
+export interface ChannelPlanRequest {
+  publications: PublicationRequest[];
+  measurements: [];
+}
+
+const encoded = (value: string) => encodeURIComponent(value);
+const scope = (tenantId: string, projectId: string) => ({
+  tenantId,
+  projectId,
+});
+
+/** A missing plan is a normal state before the cycle is sealed. */
+export async function getChannelPlan(
+  tenantId: string,
+  projectId: string,
+  cycleId: string,
+): Promise<ChannelPlan | null> {
+  try {
+    return await apiFetch<ChannelPlan>(
+      `/projects/${encoded(projectId)}/cycles/${encoded(cycleId)}/channel-plan`,
+      scope(tenantId, projectId),
+    );
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+export function submitChannelPlan(
+  tenantId: string,
+  projectId: string,
+  cycleId: string,
+  input: ChannelPlanRequest,
+) {
+  return apiFetch<ChannelPlan>(
+    `/projects/${encoded(projectId)}/cycles/${encoded(cycleId)}/channel-plan`,
+    { ...scope(tenantId, projectId), method: "POST", body: input },
+  );
+}
+
+export function getChannelTarget(
+  tenantId: string,
+  projectId: string,
+  targetId: string,
+) {
+  return apiFetch<ChannelTargetView>(
+    `/projects/${encoded(projectId)}/channel-targets/${encoded(targetId)}`,
+    scope(tenantId, projectId),
+  );
+}
+
+export function executeChannelTarget(
+  tenantId: string,
+  projectId: string,
+  targetId: string,
+) {
+  return apiFetch<ChannelTargetView>(
+    `/projects/${encoded(projectId)}/channel-targets/${encoded(targetId)}/execute`,
+    { ...scope(tenantId, projectId), method: "POST", body: {} },
+  );
+}

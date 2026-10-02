@@ -16,6 +16,7 @@ license = "Apache-2.0"
 rust-version = "1.96"
 
 [workspace.dependencies]
+ring = "0.17.14"
 async-trait = "0.1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["macros"] }

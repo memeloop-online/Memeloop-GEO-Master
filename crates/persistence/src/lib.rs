@@ -7,6 +7,10 @@
 
 mod agent;
 mod auth;
+mod channel_jobs;
+mod channels;
+pub use channel_jobs::PgChannelJobRepository;
+pub use channels::PgChannelRepository;
 mod config;
 mod database;
 mod error;

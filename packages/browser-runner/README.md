@@ -1,0 +1,20 @@
+# Browser runner (internal service)
+
+Server-side Chromium runner for fixed creator platforms and the Kimi consumer-web measurement surface. Rust owns account authorization, durable attempts, leases, budgets, encryption at rest, and reconciliation. This process keeps browser contexts in memory and does not persist credentials.
+
+Set `GEO_BROWSER_RUNNER_TOKEN` through a secret manager, then run `pnpm --dir packages/browser-runner start`. It binds `127.0.0.1:38080` by default. For container deployments, set `GEO_BROWSER_RUNNER_HOST=0.0.0.0` only inside a private network with ingress authentication/TLS and egress policy. Do not expose it publicly. A missing bearer token rejects startup. Proxy settings apply to the browser context itself; a failed specified proxy never falls back to direct traffic. Cookies and local storage are returned only by connection completion, to Rust for encryption.
+
+All routes require `Authorization: Bearer <internal token>`. JSON contract:
+
+- `POST /v1/sessions`: `{session_id,platform,storage_state?,proxy?}` → `{session_id,phase}`. Platform is one of `zhihu`, `baidu_creator`, `xiaohongshu`, `kimi`; proxy is `{server,username?,password?}`. Storage state is a Playwright JSON object, never a file path.
+- `GET /v1/sessions/:id/snapshot`: `{phase,url,width,height,screenshot_base64,identity?}` (PNG). Screenshots can contain private account content and must be scoped to the owner in Rust.
+- `POST /v1/sessions/:id/actions`: pixel `click` `{kind,x,y}`, focused-field `type` `{kind,text}`, allowlisted `key` `{kind,key}`, or `scroll` `{kind,delta_y}` → a fresh snapshot. This is only a user-controlled login surface, not a publication endpoint.
+- `POST /v1/sessions/:id/complete`: `{identity:{platform_account_id,display_name,avatar_url?},storage_state}` only after adapter identity proof. Until then `409 login_required`; challenge pages give `409 challenge`. Completion disables user control while retaining the context for execution.
+- `DELETE /v1/sessions/:id`: closes the in-memory browser context; this does not remove a persisted account.
+- `POST /v1/executions`: `{execution_id,session_id,operation,payload}` with `operation` one of `publish`, `measure`, `lookup`. Returns `{execution_id,status,evidence,...}`. Results are `unsupported`, `login_required`, `challenge`, `unknown`, or `completed`. The same ID is deduplicated in-process, but Rust must keep the durable attempt ledger and reconcile unknowns before retry.
+
+Idle sessions close after 15 minutes; completed execution cache entries expire after 5 minutes. Active executions are not reaped, and `DELETE` refuses an active session. Every execution has a 2-minute wall-clock deadline; expiry closes its context and returns `unknown`, never a retryable failure or success. These are memory-lifecycle limits, not durable idempotency guarantees: Rust must retain the execution ledger and explicitly close contexts when tasks end or accounts are revoked.
+
+The current connector version is `live_unverified.source_derived.v1`. Own-account probes support the two API-backed creator identities through temporary pages in the same proxied browser context, and a third creator identity uses only its own dashboard control. These selectors are source-derived, not credential-smoke-tested. The first editor flow accepts `{title,body}` and returns `completed` only after an exact public title/body readback and an own-account article-list match; other outcomes are `unknown`. The moderated editor flow can submit the same typed payload but always returns `unknown` until public readback is independently verified. Other publication and consumer-web measurement operations remain `unsupported`. A click, draft save, platform toast, or pending moderation state is never proof of publication. There is no arbitrary URL, selector, script, or anti-challenge API. Tests use local fixture pages; they do not publish to real accounts.
+
+Run tests with `npm test` after `npx playwright install chromium`. In an environment with a preinstalled Chromium headless-shell, `GEO_TEST_CHROMIUM_PATH` can point tests to that binary. The container image already includes the matching browser.
