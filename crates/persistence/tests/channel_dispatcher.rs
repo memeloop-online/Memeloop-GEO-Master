@@ -29,14 +29,16 @@ async fn pending_scan_keyset_scope_due_and_project_state() {
         .execute(database.pool())
         .await
         .unwrap();
-    sqlx::query("INSERT INTO tenants (tenant_id,operator_id,slug,display_name) VALUES ($1,$2,$3,$4)")
-        .bind(tenant)
-        .bind(operator)
-        .bind(format!("dispatcher-{tenant}"))
-        .bind("Tenant")
-        .execute(database.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (tenant_id,operator_id,slug,display_name) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(tenant)
+    .bind(operator)
+    .bind(format!("dispatcher-{tenant}"))
+    .bind("Tenant")
+    .execute(database.pool())
+    .await
+    .unwrap();
     let projects = PgProjectRepository::from_database(&database);
     let repo = PgChannelJobRepository::from_database(&database);
     let tenant_scope = TenantScope::new(operator.into(), tenant.into(), None);
