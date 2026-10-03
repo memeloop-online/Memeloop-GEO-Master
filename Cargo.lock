@@ -921,6 +921,7 @@ dependencies = [
  "geo-provider",
  "geo-worker",
  "hex",
+ "serde_json",
  "sha2",
  "thiserror",
  "tokio",

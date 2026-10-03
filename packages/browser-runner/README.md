@@ -4,6 +4,8 @@ Server-side Chromium runner for fixed creator platforms and the Kimi consumer-we
 
 Set `GEO_BROWSER_RUNNER_TOKEN` through a secret manager, then run `pnpm --dir packages/browser-runner start`. It binds `127.0.0.1:38080` by default. For container deployments, set `GEO_BROWSER_RUNNER_HOST=0.0.0.0` only inside a private network with ingress authentication/TLS and egress policy. Do not expose it publicly. A missing bearer token rejects startup. Proxy settings apply to the browser context itself; a failed specified proxy never falls back to direct traffic. Cookies and local storage are returned only by connection completion, to Rust for encryption.
 
+The trusted deployment may set `GEO_BROWSER_CHANNEL` to `chromium`, `chrome`, or `msedge`. If it is absent, the runner uses Playwright's bundled Chromium pinned by this package's exact Playwright and lockfile versions; CI should leave the variable unset to retain that reproducible default. An explicit value is passed only as the matching allowlisted Playwright channel. `chrome` and `msedge` therefore select a browser installed and managed by the deployment; pin and roll out that installed browser version with the deployment image or host configuration because it is outside the npm lockfile. Invalid values reject runner construction before it can serve requests. Browser channel and executable path are never request fields, and arbitrary executable paths are not supported.
+
 All routes require `Authorization: Bearer <internal token>`. JSON contract:
 
 - `POST /v1/sessions`: `{session_id,platform,storage_state?,proxy?}` → `{session_id,phase}`. Platform is one of `zhihu`, `baidu_creator`, `xiaohongshu`, `kimi`; proxy is `{server,username?,password?}`. Storage state is a Playwright JSON object, never a file path.

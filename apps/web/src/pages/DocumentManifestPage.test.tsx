@@ -201,7 +201,15 @@ describe("P07 document planning", () => {
     expect(await screen.findByText("source-version-1")).toBeInTheDocument();
     expect(screen.getByText("无公开来源版本")).toBeInTheDocument();
     expect(screen.getByText(/待生成 1 · 阻断 1/)).toBeInTheDocument();
-    expect(screen.getAllByText(/正文：尚未生成/)).toHaveLength(2);
+    expect(
+      screen.getAllByText(/此规划项不包含内容版本或发布结果/),
+    ).toHaveLength(2);
+    expect(
+      screen.getByRole("link", { name: "查看本轮内容资产与执行" }),
+    ).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/content?cycle_id=cycle-1",
+    );
     expect(
       screen.getByText("knowledge_release_has_no_public_sources"),
     ).toBeInTheDocument();

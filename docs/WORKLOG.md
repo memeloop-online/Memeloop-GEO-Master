@@ -2,6 +2,10 @@
 
 ## 2026-10-03
 
+- 当前工作区第一层内容与生产装配本地复验：`cargo fmt --all -- --check`、离线 `cargo clippy --workspace --all-targets -- -D warnings`、离线 `cargo test --workspace --all-targets` 均通过；默认忽略的生成 bundle 与 PostgreSQL 条件测试不计入普通 workspace 结果。前端 `pnpm format:check`、`pnpm typecheck`、79/79 项测试及 `pnpm build` 通过。重新运行 `pnpm agent:bundle` 后显式执行被忽略的 worker 原生对话 bundle 4 项、内容工作流 1 项，app 装配 2 项，以及 API 附件导入和渠道工具各 1 项，均通过。Node agent-runtime 11/11、browser-runner 14/14 在本地浏览器覆盖配置下通过；固定版本 Chromium 仍待新 CI 复验。保留非阻断的 MSVC 链接警告及前端大 chunk/Zod 警告；新 CI、PostgreSQL 实库、真实模型、真实浏览器账号和渠道验收仍待取得，不能把本地结果视为完整交付。
+- 当前工作区的第一层生成与既有渠道发送仍是两条独立路径：原生内容分支可产生带证据/检查的正文版本，渠道冻结计划仍使用公开来源版本，未从生成内容自动构造文档×平台分发矩阵。持久身份初始化和租户/项目模型路由已装配；使用部署者显式配置且不代表费用权益或真实部署通过。
+- `c4a9947` 的 Actions `37082133868` 未通过：Linux 显式生成 bundle 回归中两项旧工具数量断言未随注册表扩展更新，后续 PostgreSQL 步骤尚未执行。断言已在当前工作区修复并通过本地显式 bundle 回归；新增原生内容工作流及应用级集成回归后，仍须等待新 CI，不把该提交标为全绿。
+- 第一层内容 fan-out 正在集成：独立于冻结规划清单的执行/租约、正文与证据版本、独立检查和交接快照；原生 MemeLoop `agent-agent-loop` 分页执行；P08/P09 接入内容列表与版本编辑。另新增部署者显式数据库账号初始化、租户级模型路由及浏览器受控 channel 配置。本批仍在工作区，局部测试不代替全仓、实库或真实平台验收。
 - 后继周期提交 `40b6b1d` 的 Actions `37068471764` 已成功，包含 Linux/Windows 与新增后继周期 PostgreSQL 回归；该结果不覆盖后续渠道工具/dispatcher 改动。
 - 账号双来源继续接入自动执行：新增到期目标游标扫描、配置 runner 后自动启动的 5 秒调度、账号级持久预检预约及带令牌 claim（迁移 `0013`）。登录/配置未就绪保持 pending；已尝试或未知目标不盲目重发，未知执行保留预约至到期。没有新增逐条审批或全局并发门槛。
 - P00 新增四项只传引用的渠道工具及真实 Rust 装配，聚合协议升级 `geo.hostops.v4`，原有八项 op 保持兼容。发现结果不向模型泄露 session、出口、账号外部身份或原始正文；计划和后台调度使用同一服务。真实生成 MemeLoop/V8 + 注入模型渠道循环测试通过，Node 测试 10/10；不是外部真实模型/发布验收。

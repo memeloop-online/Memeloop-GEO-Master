@@ -14,7 +14,9 @@ use std::time::Duration;
 use crate::host::{HOST_OP_ERROR_BOOTSTRAP, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets};
 use crate::host_ops::{
     PRODUCTION_OP_NAMES, op_host_channel_discover_v1, op_host_channel_manifest_read_v1,
-    op_host_channel_plan_v1, op_host_channel_target_execute_v1,
+    op_host_channel_plan_v1, op_host_channel_target_execute_v1, op_host_content_check_v1,
+    op_host_content_close_v1, op_host_content_execution_read_v1, op_host_content_generate_v1,
+    op_host_content_items_read_v1, op_host_content_prepare_v1, op_host_content_start_v1,
     op_host_knowledge_import_attachments_v1, op_host_knowledge_search_v1, op_host_manifest_read_v2,
     op_host_measure_sample_v2, op_host_model_complete_v1, op_host_publish_submit_v2,
     op_host_report_get_v1, op_host_report_reduce_v1,
@@ -37,6 +39,13 @@ deno_core::extension!(
         op_host_channel_plan_v1,
         op_host_channel_manifest_read_v1,
         op_host_channel_target_execute_v1,
+        op_host_content_items_read_v1,
+        op_host_content_prepare_v1,
+        op_host_content_generate_v1,
+        op_host_content_check_v1,
+        op_host_content_close_v1,
+        op_host_content_start_v1,
+        op_host_content_execution_read_v1,
         op_host_emit,
         op_host_checkpoint
     ],

@@ -8,7 +8,7 @@ import {
   Spinner,
 } from "@fluentui/react-components";
 import { ArrowSyncRegular } from "@fluentui/react-icons";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { ApiError } from "../api/client";
 import {
   type DocumentManifestItem,
@@ -211,9 +211,16 @@ function PlanContent({
             <MessageBarBody>
               清单修订 {result.revision} · {result.sealed ? "已封存" : "未封存"}{" "}
               · 规划器 {result.planner_version}
-              。这只是分支规划，正文生成尚未接入。
+              。这是冻结的分支规划；正文执行状态在内容资产页单独记录。
             </MessageBarBody>
           </MessageBar>
+          <p>
+            <Link
+              to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/content?cycle_id=${encodeURIComponent(start.data.cycle_id)}`}
+            >
+              查看本轮内容资产与执行
+            </Link>
+          </p>
           <Card className="panel-card">
             <CardHeader
               header={<h2>覆盖账目</h2>}
@@ -273,7 +280,9 @@ function PlanContent({
                           </>
                         )}
                       </dl>
-                      <p>正文：尚未生成；此清单不包含内容版本或发布结果。</p>
+                      <p>
+                        此规划项不包含内容版本或发布结果；请到内容资产查看执行与正文。
+                      </p>
                     </Card>
                   </li>
                 ))}

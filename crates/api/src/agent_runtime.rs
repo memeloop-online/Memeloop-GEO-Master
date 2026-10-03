@@ -456,6 +456,7 @@ pub struct RepositoryHostOps {
     model_provider: Option<SharedModelProvider>,
     report_service: Option<Arc<dyn ReportService>>,
     channel_service: Option<Arc<dyn ChannelToolService>>,
+    content_state: Option<AppState>,
 }
 
 #[async_trait]
@@ -527,6 +528,7 @@ impl RepositoryHostOps {
             model_provider: None,
             report_service: None,
             channel_service: None,
+            content_state: None,
         }
     }
 
@@ -549,6 +551,17 @@ impl RepositoryHostOps {
     pub fn with_channels(mut self, state: AppState) -> Self {
         self.channel_service = Some(Arc::new(state));
         self
+    }
+
+    pub fn with_content(mut self, state: AppState) -> Self {
+        self.content_state = Some(state);
+        self
+    }
+
+    fn content_state(&self, op: HostOp) -> Result<&AppState, HostOpError> {
+        self.content_state.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(op, "content capabilities are not configured")
+        })
     }
 }
 
@@ -574,6 +587,82 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
 
 #[async_trait]
 impl HostOps for RepositoryHostOps {
+    async fn content_start(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentStartRequest,
+    ) -> Result<geo_worker::ContentExecutionRef, HostOpError> {
+        let op = HostOp::ContentStart;
+        crate::content_tools::start(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_execution_read(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentExecutionReadRequest,
+    ) -> Result<geo_worker::ContentExecutionRef, HostOpError> {
+        let op = HostOp::ContentExecutionRead;
+        crate::content_tools::read(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_items_read(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentItemsReadRequest,
+    ) -> Result<geo_worker::ContentItemsPage, HostOpError> {
+        let op = HostOp::ContentItemsRead;
+        crate::content_tools::items(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_prepare(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentStepRequest,
+    ) -> Result<geo_worker::ContentItemRef, HostOpError> {
+        let op = HostOp::ContentPrepare;
+        crate::content_tools::prepare(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_generate(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentStepRequest,
+    ) -> Result<geo_worker::ContentItemRef, HostOpError> {
+        let op = HostOp::ContentGenerate;
+        crate::content_tools::generate(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_check(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentStepRequest,
+    ) -> Result<geo_worker::ContentItemRef, HostOpError> {
+        let op = HostOp::ContentCheck;
+        crate::content_tools::check(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_close(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentCloseRequest,
+    ) -> Result<geo_worker::ContentHandoffRef, HostOpError> {
+        let op = HostOp::ContentClose;
+        crate::content_tools::close(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
     async fn channel_discover(
         &self,
         scope: &TenantScope,

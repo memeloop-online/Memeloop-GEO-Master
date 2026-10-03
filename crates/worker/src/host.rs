@@ -28,14 +28,17 @@ use uuid::Uuid;
 // The canonical domain vocabulary the surface speaks.  Re-exported so an
 // implementation of [`HostOps`] needs one import path, and so the worker never
 // grows a parallel set of types for the same concepts.
-use geo_domain::{AppError, AttachmentReference, ImportStatus, KnowledgePurpose, ReportSnapshot};
+use geo_domain::{
+    AppError, AttachmentReference, ContentCoverage, ContentExecutionStatus, ContentItemStatus,
+    ImportStatus, KnowledgePurpose, ReportSnapshot,
+};
 pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
 
 /// The version of the host-op surface this crate registers.
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v4";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v5";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -85,11 +88,18 @@ pub enum HostOp {
     ChannelPlan,
     ChannelManifestRead,
     ChannelTargetExecute,
+    ContentItemsRead,
+    ContentPrepare,
+    ContentGenerate,
+    ContentCheck,
+    ContentClose,
+    ContentStart,
+    ContentExecutionRead,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 19;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -105,6 +115,13 @@ impl HostOp {
         Self::ChannelPlan,
         Self::ChannelManifestRead,
         Self::ChannelTargetExecute,
+        Self::ContentItemsRead,
+        Self::ContentPrepare,
+        Self::ContentGenerate,
+        Self::ContentCheck,
+        Self::ContentClose,
+        Self::ContentStart,
+        Self::ContentExecutionRead,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -122,6 +139,13 @@ impl HostOp {
             Self::ChannelPlan => "channel.plan.v1",
             Self::ChannelManifestRead => "channel.manifest.read.v1",
             Self::ChannelTargetExecute => "channel.target.execute.v1",
+            Self::ContentItemsRead => "content.items.read.v1",
+            Self::ContentPrepare => "content.prepare.v1",
+            Self::ContentGenerate => "content.generate.v1",
+            Self::ContentCheck => "content.check.v1",
+            Self::ContentClose => "content.close.v1",
+            Self::ContentStart => "content.start.v1",
+            Self::ContentExecutionRead => "content.execution.read.v1",
         }
     }
 
@@ -140,6 +164,13 @@ impl HostOp {
             Self::ChannelPlan => "op_host_channel_plan_v1",
             Self::ChannelManifestRead => "op_host_channel_manifest_read_v1",
             Self::ChannelTargetExecute => "op_host_channel_target_execute_v1",
+            Self::ContentItemsRead => "op_host_content_items_read_v1",
+            Self::ContentPrepare => "op_host_content_prepare_v1",
+            Self::ContentGenerate => "op_host_content_generate_v1",
+            Self::ContentCheck => "op_host_content_check_v1",
+            Self::ContentClose => "op_host_content_close_v1",
+            Self::ContentStart => "op_host_content_start_v1",
+            Self::ContentExecutionRead => "op_host_content_execution_read_v1",
         }
     }
 
@@ -195,6 +226,13 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(60_000, 16),
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(120_000, 32),
+                HostOpLimits::new(15_000, 128), // paged content reads
+                HostOpLimits::new(120_000, 2_048), // prepare
+                HostOpLimits::new(120_000, 2_048), // generate
+                HostOpLimits::new(120_000, 2_048), // check
+                HostOpLimits::new(30_000, 4),   // close
+                HostOpLimits::new(30_000, 4),   // start
+                HostOpLimits::new(15_000, 32),  // execution read
             ],
         }
     }
@@ -535,6 +573,154 @@ pub trait HostOps: Send + Sync {
             "channel target execution is not configured",
         ))
     }
+
+    async fn content_items_read(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentItemsReadRequest,
+    ) -> Result<ContentItemsPage, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentItemsRead,
+            "content execution is not configured",
+        ))
+    }
+
+    async fn content_prepare(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentStepRequest,
+    ) -> Result<ContentItemRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentPrepare,
+            "content execution is not configured",
+        ))
+    }
+
+    async fn content_generate(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentStepRequest,
+    ) -> Result<ContentItemRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentGenerate,
+            "content execution is not configured",
+        ))
+    }
+
+    async fn content_check(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentStepRequest,
+    ) -> Result<ContentItemRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentCheck,
+            "content execution is not configured",
+        ))
+    }
+
+    async fn content_close(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentCloseRequest,
+    ) -> Result<ContentHandoffRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentClose,
+            "content handoff is not configured",
+        ))
+    }
+
+    async fn content_start(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentStartRequest,
+    ) -> Result<ContentExecutionRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentStart,
+            "content workflow dispatch is not configured",
+        ))
+    }
+
+    async fn content_execution_read(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentExecutionReadRequest,
+    ) -> Result<ContentExecutionRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentExecutionRead,
+            "content execution is not configured",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentStartRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentExecutionReadRequest {
+    pub execution_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentExecutionRef {
+    pub execution_id: Uuid,
+    pub status: ContentExecutionStatus,
+    pub coverage: ContentCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentCloseRequest {
+    pub execution_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentHandoffRef {
+    pub execution_id: Uuid,
+    pub handoff_id: Uuid,
+    pub total: u64,
+}
+
+/// Only durable references and state cross the workflow boundary. Briefs,
+/// evidence, document bodies, and model prompts remain inside Rust services.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentItemsReadRequest {
+    pub execution_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentStepRequest {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentItemRef {
+    pub item_id: Uuid,
+    pub branch_key: String,
+    pub status: ContentItemStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentItemsPage {
+    pub execution_id: Uuid,
+    pub total: u64,
+    pub items: Vec<ContentItemRef>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1690,6 +1876,10 @@ mod tests {
             budgets.limits(HostOp::ModelComplete),
             HostOpBudgets::default().limits(HostOp::ModelComplete)
         );
+        assert_eq!(budgets.limits(HostOp::ContentGenerate).max_calls, 2_048);
+        assert_eq!(budgets.limits(HostOp::ContentCheck).max_calls, 2_048);
+        assert_eq!(budgets.limits(HostOp::ContentClose).max_calls, 4);
+        assert_eq!(budgets.limits(HostOp::ContentStart).max_calls, 4);
     }
 
     #[test]

@@ -19,6 +19,7 @@ import {
 import { WorkspacePage } from "./pages/WorkspacePage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { ChannelJobsPage } from "./pages/ChannelJobsPage";
+import { ContentAssetPage, ContentAssetsPage } from "./pages/ContentPages";
 
 export function AppRoutes() {
   return (
@@ -54,11 +55,8 @@ export function AppRoutes() {
               element={<WorkbenchPage page="campaigns" />}
             />
             <Route path="campaigns/:id" element={<DocumentManifestPage />} />
-            <Route path="content" element={<WorkbenchPage page="content" />} />
-            <Route
-              path="content/:id"
-              element={<WorkbenchPage page="contentDetail" />}
-            />
+            <Route path="content" element={<ContentAssetsPage />} />
+            <Route path="content/:id" element={<ContentAssetPage />} />
             <Route
               path="channels"
               element={<ChannelAccountsPage view="channels" />}

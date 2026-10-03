@@ -7,16 +7,21 @@
 
 mod agent;
 mod auth;
+pub mod bootstrap;
 mod channel_jobs;
 mod channels;
 pub use channel_jobs::PgChannelJobRepository;
 pub use channels::PgChannelRepository;
 mod config;
+mod content;
+pub use content::PgContentRepository;
 mod database;
 mod error;
 mod idempotency;
 mod knowledge;
 mod migrations;
+mod model_routes;
+pub use model_routes::PgModelRouteRepository;
 mod projects;
 mod report;
 mod scope;

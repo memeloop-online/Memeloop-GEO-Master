@@ -23,11 +23,163 @@ use serde::de::DeserializeOwned;
 
 use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
-    ChannelTargetExecuteRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
-    KnowledgeImportAttachmentsRequest, KnowledgeSearchRequest, KnowledgeSearchResult,
-    ManifestReadRequest, MeasureRequest, ModelCompletionRequest, PublishRequest, ReportGetRequest,
-    ReportReduceRequest,
+    ChannelTargetExecuteRequest, ContentCloseRequest, ContentExecutionReadRequest,
+    ContentItemsReadRequest, ContentStartRequest, ContentStepRequest, HOST_OP_ERROR_NAME,
+    HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest, KnowledgeSearchRequest,
+    KnowledgeSearchResult, ManifestReadRequest, MeasureRequest, ModelCompletionRequest,
+    PublishRequest, ReportGetRequest, ReportReduceRequest,
 };
+
+#[op2]
+#[string]
+pub async fn op_host_content_items_read_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentItemsRead;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentItemsReadRequest>(op, &request)?;
+    if request.execution_id.is_nil()
+        || request.limit.is_some_and(|n| n == 0 || n > 100)
+        || request
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 256)
+    {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "invalid execution, cursor or page size",
+        )));
+    }
+    let result = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .content_items_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+macro_rules! content_step_op {
+    ($name:ident, $variant:ident, $method:ident) => {
+        #[op2]
+        #[string]
+        pub async fn $name(
+            state: Rc<RefCell<OpState>>,
+            #[string] request: String,
+        ) -> Result<String, JsErrorBox> {
+            let op = HostOp::$variant;
+            let bridge = bridge(&state.borrow())?;
+            let request = parse_request::<ContentStepRequest>(op, &request)?;
+            if request.execution_id.is_nil() || request.item_id.is_nil() {
+                return Err(js_error(HostOpError::invalid_request(
+                    op,
+                    "execution and item references must be non-zero",
+                )));
+            }
+            let requested_item = request.item_id;
+            let result = bridge
+                .invoke(op, |bridge| async move {
+                    bridge.capabilities().$method(bridge.scope(), request).await
+                })
+                .await?;
+            if result.item_id != requested_item || result.branch_key.is_empty() {
+                return Err(js_error(HostOpError::internal(
+                    op,
+                    "step returned an unrelated item",
+                )));
+            }
+            Ok(encode(op, &result)?)
+        }
+    };
+}
+content_step_op!(op_host_content_prepare_v1, ContentPrepare, content_prepare);
+content_step_op!(
+    op_host_content_generate_v1,
+    ContentGenerate,
+    content_generate
+);
+content_step_op!(op_host_content_check_v1, ContentCheck, content_check);
+
+#[op2]
+#[string]
+pub async fn op_host_content_close_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentClose;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentCloseRequest>(op, &request)?;
+    if request.execution_id.is_nil() {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "execution reference must be non-zero",
+        )));
+    }
+    let result = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .content_close(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_content_start_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentStart;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentStartRequest>(op, &request)?;
+    if request.cycle_id.is_some_and(|id| id.is_nil()) {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "cycle reference must be non-zero",
+        )));
+    }
+    let result = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .content_start(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_content_execution_read_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentExecutionRead;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentExecutionReadRequest>(op, &request)?;
+    if request.execution_id.is_nil() {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "execution reference must be non-zero",
+        )));
+    }
+    let result = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .content_execution_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
 
 #[op2]
 #[string]
@@ -432,6 +584,13 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ChannelPlan.op_name(),
     HostOp::ChannelManifestRead.op_name(),
     HostOp::ChannelTargetExecute.op_name(),
+    HostOp::ContentItemsRead.op_name(),
+    HostOp::ContentPrepare.op_name(),
+    HostOp::ContentGenerate.op_name(),
+    HostOp::ContentCheck.op_name(),
+    HostOp::ContentClose.op_name(),
+    HostOp::ContentStart.op_name(),
+    HostOp::ContentExecutionRead.op_name(),
     // Rust-owned run state: the loop's emit contract and the checkpoint probe.
     "op_host_emit",
     "op_host_checkpoint",

@@ -97,3 +97,40 @@ await esbuild.build({
   target: ["es2022"],
   treeShaking: true,
 });
+
+// A separate approved entry keeps the interactive turn and the native
+// agent-agent-loop workflow independently callable by EmbeddedIsolate's `main`
+// contract. Both resolve the exact same pinned upstream package and neither
+// grants a runtime filesystem/module loader to tenant JavaScript.
+await esbuild.build({
+  absWorkingDir: repositoryRoot,
+  banner: {
+    js: `/*! Generated from memeloop@0.3.3. Apache-2.0 GEO source; upstream notices: packages/agent-runtime/THIRD_PARTY_NOTICES.md */`,
+  },
+  bundle: true,
+  charset: "utf8",
+  conditions: ["browser", "import", "default"],
+  entryPoints: [
+    resolve(repositoryRoot, "packages/agent-runtime/src/content-entry.mjs"),
+  ],
+  format: "esm",
+  legalComments: "inline",
+  logLevel: "info",
+  mainFields: ["module", "main"],
+  minify: false,
+  outfile: resolve(outputDirectory, "memeloop-content-workflow.bundle.mjs"),
+  platform: "neutral",
+  plugins: [
+    {
+      name: "resolve-pinned-memeloop-loop-api",
+      setup(build) {
+        build.onResolve({ filter: /^memeloop\/loop-api$/ }, () => ({
+          path: loopApiEsmPath,
+        }));
+      },
+    },
+  ],
+  sourcemap: false,
+  target: ["es2022"],
+  treeShaking: true,
+});

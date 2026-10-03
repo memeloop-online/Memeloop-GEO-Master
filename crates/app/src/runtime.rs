@@ -4,7 +4,9 @@
 use std::{fmt, io::Read, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use geo_api::{AppState, EmbeddedAgentRuntime, ProviderClientBridge, RepositoryHostOps};
+use geo_api::{
+    AppState, EmbeddedAgentRuntime, ProviderClientBridge, RepositoryHostOps, SharedModelProvider,
+};
 use geo_provider::{
     HttpTransport, ProviderClient, ProviderError, ResolvedToken, SecretRef, TokenCenter, Transport,
 };
@@ -29,6 +31,8 @@ pub enum AssemblyError {
     BundleDigest,
     #[error("development AI provider configuration is invalid")]
     ProviderConfiguration,
+    #[error("content workflow requires a model and both approved bundle path and SHA-256")]
+    ContentConfiguration,
 }
 
 struct LocalTokenCenter {
@@ -72,8 +76,13 @@ fn assemble_with_transport<T: Transport + 'static>(
     ai: &DevelopmentAiConfig,
     transport: Arc<T>,
 ) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
+    let bridge = provider_bridge(ai, transport)?;
+    assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, Arc::new(bridge))
+}
+
+pub(crate) fn load_verified_bundle(path: &str, sha256: &str) -> Result<String, AssemblyError> {
     // Verify a bounded byte stream before allocating the static module table.
-    let mut file = std::fs::File::open(&ai.bundle_path).map_err(|_| AssemblyError::BundleRead)?;
+    let mut file = std::fs::File::open(path).map_err(|_| AssemblyError::BundleRead)?;
     let mut bytes = Vec::new();
     file.by_ref()
         .take(MAX_BUNDLE_BYTES + 1)
@@ -83,16 +92,26 @@ fn assemble_with_transport<T: Transport + 'static>(
         return Err(AssemblyError::BundleTooLarge);
     }
     let digest = Sha256::digest(&bytes);
-    let expected = hex::decode(&ai.bundle_sha256).map_err(|_| AssemblyError::BundleDigest)?;
+    let expected = hex::decode(sha256).map_err(|_| AssemblyError::BundleDigest)?;
     if digest.as_slice() != expected {
         return Err(AssemblyError::BundleDigest);
     }
-    let source = String::from_utf8(bytes).map_err(|_| AssemblyError::BundleEncoding)?;
-    let bridge = provider_bridge(ai, transport)?;
+    String::from_utf8(bytes).map_err(|_| AssemblyError::BundleEncoding)
+}
+
+pub(crate) fn assemble_with_provider(
+    state: &AppState,
+    bundle_path: &str,
+    bundle_sha256: &str,
+    provider: SharedModelProvider,
+) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
+    let source = load_verified_bundle(bundle_path, bundle_sha256)?;
+    state.configure_content_model(Arc::clone(&provider));
     let capabilities = RepositoryHostOps::new(state.knowledge_repository())
-        .with_model_provider(Arc::new(bridge))
+        .with_model_provider(provider)
         .with_report_state(state.clone())
-        .with_channels(state.clone());
+        .with_channels(state.clone())
+        .with_content(state.clone());
     // This API currently takes a static allow-list. One startup allocation is
     // intentional for the digest-approved bundle; no unapproved imports exist.
     let source: &'static str = Box::leak(source.into_boxed_str());
@@ -103,6 +122,42 @@ fn assemble_with_transport<T: Transport + 'static>(
         BUNDLE_SPECIFIER,
         Arc::new(capabilities),
     )))
+}
+
+pub(crate) fn configure_content_workflow(state: &AppState) -> Result<(), AssemblyError> {
+    let path = std::env::var("GEO_CONTENT_BUNDLE_PATH");
+    let digest = std::env::var("GEO_CONTENT_BUNDLE_SHA256");
+    if matches!(path, Err(std::env::VarError::NotPresent))
+        && matches!(digest, Err(std::env::VarError::NotPresent))
+    {
+        return Ok(());
+    }
+    let (Ok(path), Ok(digest)) = (path, digest) else {
+        return Err(AssemblyError::ContentConfiguration);
+    };
+    if !state.content_model_available() {
+        return Err(AssemblyError::ContentConfiguration);
+    }
+    assemble_content_workflow(state, &path, &digest)
+}
+
+pub(crate) fn assemble_content_workflow(
+    state: &AppState,
+    path: &str,
+    digest: &str,
+) -> Result<(), AssemblyError> {
+    use geo_api::content_runtime::{CONTENT_WORKFLOW_ENTRY, EmbeddedContentWorkflowExecutor};
+    let source: &'static str = Box::leak(load_verified_bundle(path, digest)?.into_boxed_str());
+    let bundle: &'static [(&'static str, &'static str)] =
+        Box::leak(Box::new([(CONTENT_WORKFLOW_ENTRY, source)]));
+    let capabilities =
+        RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone());
+    state.configure_content_executor(Arc::new(EmbeddedContentWorkflowExecutor::with_bundle(
+        bundle,
+        CONTENT_WORKFLOW_ENTRY,
+        Arc::new(capabilities),
+    )));
+    Ok(())
 }
 
 fn provider_bridge<T: Transport + 'static>(

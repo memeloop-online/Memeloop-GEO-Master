@@ -66,7 +66,7 @@ pub const MAIN_MODULE: &str = "memeloop://bundle/geo-loop.js";
 /// are parsed once, so call sites never see a raw JSON string, and every
 /// failure is the structured `GeoHostOpError` the Rust side produced.
 pub const HOST_OPS_JS: &str = r#"
-export const HOST_OPS_VERSION = "geo.hostops.v4";
+export const HOST_OPS_VERSION = "geo.hostops.v5";
 
 const OPS = {
   modelComplete: "op_host_model_complete_v1",
@@ -80,6 +80,13 @@ const OPS = {
   channelPlan: "op_host_channel_plan_v1",
   channelManifestRead: "op_host_channel_manifest_read_v1",
   channelTargetExecute: "op_host_channel_target_execute_v1",
+  contentItemsRead: "op_host_content_items_read_v1",
+  contentPrepare: "op_host_content_prepare_v1",
+  contentGenerate: "op_host_content_generate_v1",
+  contentCheck: "op_host_content_check_v1",
+  contentClose: "op_host_content_close_v1",
+  contentStart: "op_host_content_start_v1",
+  contentExecutionRead: "op_host_content_execution_read_v1",
 };
 
 async function callOp(opName, payload) {
@@ -103,6 +110,13 @@ export const hostOps = {
   channelPlan: (request) => callOp(OPS.channelPlan, request),
   channelManifestRead: (request) => callOp(OPS.channelManifestRead, request),
   channelTargetExecute: (request) => callOp(OPS.channelTargetExecute, request),
+  contentItemsRead: (request) => callOp(OPS.contentItemsRead, request),
+  contentPrepare: (request) => callOp(OPS.contentPrepare, request),
+  contentGenerate: (request) => callOp(OPS.contentGenerate, request),
+  contentCheck: (request) => callOp(OPS.contentCheck, request),
+  contentClose: (request) => callOp(OPS.contentClose, request),
+  contentStart: (request) => callOp(OPS.contentStart, request),
+  contentExecutionRead: (request) => callOp(OPS.contentExecutionRead, request),
 };
 
 // Reports one op outcome through the Rust-owned event op, so the host can

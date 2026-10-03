@@ -19,6 +19,7 @@ const KEYS = new Set([
   "ControlOrMeta+A",
 ]);
 const OPERATIONS = new Set(["publish", "measure", "lookup"]);
+const BROWSER_CHANNELS = new Set(["chromium", "chrome", "msedge"]);
 const STATUSES = new Set([
   "unsupported",
   "login_required",
@@ -48,6 +49,14 @@ function fields(value, permitted) {
 
 function validId(value) {
   return typeof value === "string" && ID.test(value);
+}
+
+function parseBrowserChannel(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !BROWSER_CHANNELS.has(value)) {
+    throw new Error("invalid_browser_channel");
+  }
+  return value;
 }
 
 function parseProxy(proxy) {
@@ -98,6 +107,7 @@ function isChallenge(page) {
 
 export function createRunner({
   browserType = chromium,
+  browserChannel = process.env.GEO_BROWSER_CHANNEL,
   platformAdapters = defaultAdapters,
   sessionIdleMs = 15 * 60_000,
   executionRetentionMs = 5 * 60_000,
@@ -105,6 +115,7 @@ export function createRunner({
   maintenanceIntervalMs = 30_000,
   clock = () => Date.now(),
 } = {}) {
+  const selectedBrowserChannel = parseBrowserChannel(browserChannel);
   if (
     ![
       sessionIdleMs,
@@ -123,10 +134,17 @@ export function createRunner({
 
   async function browser() {
     if (!browserPromise) {
-      browserPromise = browserType.launch({ headless: true }).catch((error) => {
-        browserPromise = undefined;
-        throw error;
-      });
+      browserPromise = browserType
+        .launch({
+          headless: true,
+          ...(selectedBrowserChannel
+            ? { channel: selectedBrowserChannel }
+            : {}),
+        })
+        .catch((error) => {
+          browserPromise = undefined;
+          throw error;
+        });
     }
     return browserPromise;
   }

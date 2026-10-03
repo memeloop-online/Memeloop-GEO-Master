@@ -101,6 +101,8 @@ jobs:
           cargo test -p geo-app generated_bundle_runs_one_turn_through_assembled_provider -- --ignored 2>&1 | tee logs/cargo-app-bundle.log
           cargo test -p geo-api --test attachment_import_runtime -- --ignored 2>&1 | tee logs/cargo-attachment-import-runtime.log
           cargo test -p geo-api --test channel_tools_runtime -- --ignored 2>&1 | tee logs/cargo-channel-tools-runtime.log
+          cargo test -p geo-worker --test content_workflow -- --ignored 2>&1 | tee logs/cargo-content-workflow.log
+          cargo test -p geo-app content_runtime_tests -- --ignored 2>&1 | tee logs/cargo-content-app-runtime.log
 
       - name: Test repositories against disposable PostgreSQL
         env:
@@ -114,6 +116,9 @@ jobs:
           cargo test -p geo-persistence --test channel_identity -- --ignored 2>&1 | tee logs/cargo-channel-identity-postgres.log
           cargo test -p geo-persistence --test successor_cycles -- --ignored 2>&1 | tee logs/cargo-successor-postgres.log
           cargo test -p geo-persistence --test channel_dispatcher -- --ignored 2>&1 | tee logs/cargo-channel-dispatcher-postgres.log
+          cargo test -p geo-persistence --test bootstrap -- --ignored 2>&1 | tee logs/cargo-bootstrap-postgres.log
+          cargo test -p geo-persistence --test model_routes -- --ignored 2>&1 | tee logs/cargo-model-routes-postgres.log
+          cargo test -p geo-persistence --test content -- --ignored 2>&1 | tee logs/cargo-content-postgres.log
 
       - name: Write 5-minute milestone summary
         if: always()
@@ -136,6 +141,7 @@ jobs:
           if-no-files-found: warn
           path: |
             packages/agent-runtime/dist/memeloop-agent-loop.bundle.mjs
+            packages/agent-runtime/dist/memeloop-content-workflow.bundle.mjs
             packages/agent-runtime/THIRD_PARTY_NOTICES.md
 
       - name: Upload test logs

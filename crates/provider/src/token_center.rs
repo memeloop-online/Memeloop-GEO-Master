@@ -23,6 +23,7 @@ pub struct TokenCenterKeyMapping {
     tenant_external_id: String,
     principal_external_id: String,
     key_id: String,
+    expected_generation: Option<i64>,
 }
 
 impl fmt::Debug for TokenCenterKeyMapping {
@@ -54,7 +55,20 @@ impl TokenCenterKeyMapping {
             tenant_external_id,
             principal_external_id,
             key_id,
+            expected_generation: None,
         })
+    }
+
+    /// Pins a deployment-approved generation. Rotation fails closed until
+    /// trusted provisioning updates the durable mapping.
+    pub fn with_generation(mut self, generation: i64) -> Result<Self, ProviderError> {
+        if generation < 1 {
+            return Err(ProviderError::InvalidRequest(
+                "invalid Token Center credential generation".into(),
+            ));
+        }
+        self.expected_generation = Some(generation);
+        Ok(self)
     }
 }
 
@@ -233,6 +247,9 @@ impl TokenCenter for HttpTokenCenter {
             || metadata.principal_external_id != mapping.principal_external_id
             || metadata.status != "active"
             || metadata.credential_generation < 1
+            || mapping
+                .expected_generation
+                .is_some_and(|generation| metadata.credential_generation != generation)
             || !metadata.credential_copy_available
         {
             return Err(unavailable());

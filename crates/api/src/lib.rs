@@ -6,6 +6,10 @@ mod browser_bridge;
 mod channel_jobs;
 mod channel_tools;
 mod channels;
+mod content;
+pub mod content_runtime;
+mod content_tools;
+pub use content::ContentService;
 mod context;
 mod cycles;
 mod error;
@@ -104,6 +108,10 @@ pub struct AppState {
     report_repository: Arc<dyn ReportRepository>,
     channel_service: ChannelService,
     channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
+    content_repository: Arc<dyn geo_domain::ContentRepository>,
+    content_model: Arc<std::sync::RwLock<Option<SharedModelProvider>>>,
+    content_executor:
+        Arc<std::sync::RwLock<Option<Arc<dyn content_runtime::ContentWorkflowExecutor>>>>,
     events: EventBus,
     ready: Arc<AtomicBool>,
     durable_storage: bool,
@@ -131,6 +139,9 @@ impl AppState {
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
             channel_service: ChannelService::development(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+            content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
+            content_model: Arc::new(std::sync::RwLock::new(None)),
+            content_executor: Arc::new(std::sync::RwLock::new(None)),
             events: EventBus::default(),
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage: false,
@@ -212,6 +223,9 @@ impl AppState {
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
             channel_service: ChannelService::development(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+            content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
+            content_model: Arc::new(std::sync::RwLock::new(None)),
+            content_executor: Arc::new(std::sync::RwLock::new(None)),
             events,
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage,
@@ -255,6 +269,9 @@ impl AppState {
             database,
         )))
         .with_report_repository(Arc::new(PgReportRepository::from_database(database)))
+        .with_content_repository(Arc::new(
+            geo_persistence::PgContentRepository::from_database(database),
+        ))
         .with_channel_job_repository(Arc::new(
             geo_persistence::PgChannelJobRepository::from_database(database),
         ))
@@ -316,6 +333,76 @@ impl AppState {
 
     pub fn channel_service(&self) -> &ChannelService {
         &self.channel_service
+    }
+
+    pub fn content_service(&self) -> ContentService {
+        let service = ContentService::new(
+            Arc::clone(&self.content_repository),
+            self.knowledge_repository(),
+            self.project_repository(),
+        );
+        match self
+            .content_model
+            .read()
+            .expect("content model lock")
+            .clone()
+        {
+            Some(provider) => service.with_model_provider(provider),
+            None => service,
+        }
+    }
+
+    pub fn with_content_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ContentRepository>,
+    ) -> Self {
+        self.content_repository = repository;
+        self
+    }
+
+    /// Startup-only assembly; shared with the already constructed host bridge.
+    pub fn configure_content_model(&self, provider: SharedModelProvider) {
+        *self.content_model.write().expect("content model lock") = Some(provider);
+    }
+
+    pub fn content_model_available(&self) -> bool {
+        self.content_model
+            .read()
+            .expect("content model lock")
+            .is_some()
+    }
+
+    pub fn configure_content_executor(
+        &self,
+        executor: Arc<dyn content_runtime::ContentWorkflowExecutor>,
+    ) {
+        *self
+            .content_executor
+            .write()
+            .expect("content executor lock") = Some(executor);
+    }
+
+    pub fn content_executor_available(&self) -> bool {
+        self.content_executor
+            .read()
+            .expect("content executor lock")
+            .is_some()
+    }
+
+    pub fn dispatch_content_execution(
+        &self,
+        scope: TenantScope,
+        execution_id: Uuid,
+    ) -> Result<(), AppError> {
+        let executor = self
+            .content_executor
+            .read()
+            .expect("content executor lock")
+            .clone()
+            .ok_or_else(|| {
+                AppError::capability_missing("content workflow engine is not configured")
+            })?;
+        executor.dispatch(scope, execution_id)
     }
 
     pub fn channel_job_repository(&self) -> Arc<dyn geo_domain::ChannelJobRepository> {
@@ -1729,6 +1816,37 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(session_auth_from_request));
 
+    let content_routes: Router<AppState> = Router::new()
+        .route(
+            "/projects/{id}/cycles/{cycle_id}/document-executions",
+            get(content::executions).post(content::start),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}",
+            get(content::execution),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}/items",
+            get(content::items),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}/resume",
+            post(content::resume),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}/cancel",
+            post(content::cancel),
+        )
+        .route("/projects/{id}/contents", get(content::contents))
+        .route("/projects/{id}/contents/{asset_id}", get(content::asset))
+        .route(
+            "/projects/{id}/contents/{asset_id}/revisions",
+            get(content::revisions).post(content::edit),
+        )
+        .layer(middleware::from_fn(no_store_middleware))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
     // Estimation only validates and computes a range. It intentionally stays
     // outside the idempotency middleware because it has no external side
     // effect or durable reservation to protect.
@@ -1767,6 +1885,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(start_routes)
                 .merge(report_routes)
                 .merge(channel_routes)
+                .merge(content_routes)
                 .merge(operator_channel_routes)
                 .merge(knowledge_routes)
                 .merge(agent_attachment_bytes)

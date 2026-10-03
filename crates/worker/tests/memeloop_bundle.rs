@@ -411,8 +411,25 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
     let calls = provider.model_calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].0, expected_scope);
-    assert_eq!(calls[0].1.tools.len(), 3);
-    assert_eq!(calls[0].1.tools[0].function.name, "knowledge_search");
+    let tools = &calls[0].1.tools;
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.function.name == "knowledge_search"
+                && tool.function.parameters["required"][0] == "query")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.function.name == "content_start"
+                && tool.function.parameters["additionalProperties"] == false)
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.function.name == "content_execution_read"
+                && tool.function.parameters["required"][0] == "execution_id")
+    );
     assert_eq!(calls[1].1.messages.last().unwrap().role, "tool");
     assert_eq!(
         calls[1].1.messages.last().unwrap().tool_call_id.as_deref(),
@@ -508,12 +525,22 @@ async fn generated_memeloop_bundle_imports_bound_attachments_then_searches_and_a
     let calls = provider.model_calls();
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[0].0, expected_scope);
-    assert_eq!(calls[0].1.tools.len(), 4);
-    assert_eq!(
-        calls[0].1.tools[0].function.name,
-        "knowledge_import_attachments"
+    let tools = &calls[0].1.tools;
+    let import_tool = tools
+        .iter()
+        .find(|tool| tool.function.name == "knowledge_import_attachments")
+        .expect("bound attachment import tool must be offered");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.function.name == "knowledge_search")
     );
-    let schema = &calls[0].1.tools[0].function.parameters;
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.function.name == "content_start")
+    );
+    let schema = &import_tool.function.parameters;
     assert_eq!(
         schema["properties"]["items"]["items"]["properties"]["attachment_id"]["enum"][0],
         uuid::Uuid::from_u128(40).to_string()

@@ -1,6 +1,10 @@
+mod bootstrap;
 mod channels;
 mod config;
+#[cfg(test)]
+mod content_runtime_tests;
 mod dispatch;
+mod production_runtime;
 mod runtime;
 
 use axum::Router;
@@ -15,9 +19,21 @@ use tracing::{info, warn};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args == [std::ffi::OsString::from("--bootstrap")] {
+        bootstrap::run_from_env().await?;
+        return Ok(());
+    }
+    if !args.is_empty() {
+        return Err("unsupported command; use --bootstrap or no arguments".into());
+    }
     let config = AppConfig::from_env()?;
     let durable_storage = AppConfig::database_url_configured();
     config.validate_ai_mode(durable_storage)?;
+    let production_ai = production_runtime::ProductionAiConfig::from_env()?;
+    if production_ai.is_some() && !durable_storage {
+        return Err("production model configuration requires PostgreSQL".into());
+    }
     let (state, durable_storage) = if durable_storage {
         // A configured database is authoritative.  Connection or migration
         // failures terminate startup; the process never falls back to memory
@@ -28,7 +44,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let state = channels::configure(
             AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone()),
         )?;
-        let state = state.with_agent_runtime(Arc::new(EmbeddedAgentRuntime::unconfigured()));
+        let runtime = if let Some(ai) = production_ai.as_ref() {
+            let provider = production_runtime::build_model_provider(&database, ai)?;
+            runtime::assemble_with_provider(&state, &ai.bundle_path, &ai.bundle_sha256, provider)?
+        } else {
+            Arc::new(EmbeddedAgentRuntime::unconfigured())
+        };
+        let state = state.with_agent_runtime(runtime);
         if config.single_process_executor {
             let reconciled = state.reconcile_running_runs().await?;
             info!(
@@ -59,6 +81,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         (state, false)
     };
+    runtime::configure_content_workflow(&state)?;
     dispatch::spawn(state.clone());
     let app: Router = router(state);
     let listener = TcpListener::bind(config.bind_addr).await?;

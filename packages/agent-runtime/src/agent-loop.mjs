@@ -13,6 +13,9 @@ const CHANNEL_DISCOVER = "channel_discover";
 const CHANNEL_PLAN = "channel_plan";
 const CHANNEL_MANIFEST_READ = "channel_manifest_read";
 const CHANNEL_TARGET_EXECUTE = "channel_target_execute";
+const CONTENT_START = "content_start";
+const CONTENT_EXECUTION_READ = "content_execution_read";
+const CONTENT_TOOLS = [CONTENT_START, CONTENT_EXECUTION_READ];
 const CHANNEL_TOOLS = [
   CHANNEL_DISCOVER,
   CHANNEL_PLAN,
@@ -20,6 +23,10 @@ const CHANNEL_TOOLS = [
   CHANNEL_TARGET_EXECUTE,
 ];
 const TOOL_DESCRIPTIONS = {
+  [CONTENT_START]:
+    "Start the approved native first-stage document workflow for the current project cycle (or a scoped cycle_id). Rust freezes an execution reference, then automatically dispatches the MemeLoop fan-out; do not call per-item steps yourself.",
+  [CONTENT_EXECUTION_READ]:
+    "Read the durable coverage and status for one content execution_id. Blocked and deferred items remain in the denominator.",
   [CHANNEL_DISCOVER]:
     "Discover current-project public source versions or available publishing/measurement accounts. Use returned IDs as references in channel_plan.",
   [CHANNEL_PLAN]:
@@ -28,6 +35,17 @@ const TOOL_DESCRIPTIONS = {
     "Read a page of the frozen channel target manifest and its actual statuses. A completed target is not necessarily a successful publication: inspect outcome_status and fixture. Deferred is a normal result.",
   [CHANNEL_TARGET_EXECUTE]:
     "Optional diagnostic/idempotent query or execution for one frozen target_id. Backend dispatch is automatic; do not loop over targets. Unknown_result must be reconciled, never blindly resent. A completed result is not necessarily successful: inspect outcome_status and fixture.",
+};
+const CONTENT_START_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: { cycle_id: { type: "string", format: "uuid" } },
+};
+const CONTENT_EXECUTION_READ_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["execution_id"],
+  properties: { execution_id: { type: "string", format: "uuid" } },
 };
 const CHANNEL_DISCOVER_SCHEMA = {
   type: "object",
@@ -189,8 +207,15 @@ export async function main(input) {
           REPORT_GET,
           REPORT_REDUCE,
           ...CHANNEL_TOOLS,
+          ...CONTENT_TOOLS,
         ]
-      : [KNOWLEDGE_SEARCH, REPORT_GET, REPORT_REDUCE, ...CHANNEL_TOOLS];
+      : [
+          KNOWLEDGE_SEARCH,
+          REPORT_GET,
+          REPORT_REDUCE,
+          ...CHANNEL_TOOLS,
+          ...CONTENT_TOOLS,
+        ];
   const definition = createDefinition(modelId, toolNames);
   const context = createContext({
     session,
@@ -355,6 +380,7 @@ function createContext({ session, definition, modelId, provider, tools }) {
           { pattern: REPORT_GET, action: "allow" },
           { pattern: REPORT_REDUCE, action: "allow" },
           ...CHANNEL_TOOLS.map((pattern) => ({ pattern, action: "allow" })),
+          ...CONTENT_TOOLS.map((pattern) => ({ pattern, action: "allow" })),
         ],
       },
     },
@@ -606,6 +632,8 @@ function resolveHost(requireImport) {
     typeof denoOps.op_host_channel_plan_v1 !== "function" ||
     typeof denoOps.op_host_channel_manifest_read_v1 !== "function" ||
     typeof denoOps.op_host_channel_target_execute_v1 !== "function" ||
+    typeof denoOps.op_host_content_start_v1 !== "function" ||
+    typeof denoOps.op_host_content_execution_read_v1 !== "function" ||
     (requireImport &&
       typeof denoOps.op_host_knowledge_import_attachments_v1 !== "function") ||
     typeof denoOps.op_host_emit !== "function"
@@ -664,6 +692,18 @@ function resolveHost(requireImport) {
     async channelTargetExecute(request) {
       return JSON.parse(
         await denoOps.op_host_channel_target_execute_v1(
+          JSON.stringify(request),
+        ),
+      );
+    },
+    async contentStart(request) {
+      return JSON.parse(
+        await denoOps.op_host_content_start_v1(JSON.stringify(request)),
+      );
+    },
+    async contentExecutionRead(request) {
+      return JSON.parse(
+        await denoOps.op_host_content_execution_read_v1(
           JSON.stringify(request),
         ),
       );
@@ -823,6 +863,11 @@ function createHostTools(host, failures, attachments) {
     CHANNEL_TARGET_EXECUTE,
     "channelTargetExecute",
   );
+  const contentStart = reportTool(CONTENT_START, "contentStart");
+  const contentExecutionRead = reportTool(
+    CONTENT_EXECUTION_READ,
+    "contentExecutionRead",
+  );
   const importSchema = {
     type: "object",
     additionalProperties: false,
@@ -871,7 +916,11 @@ function createHostTools(host, failures, attachments) {
                     ? channelManifestRead
                     : id === CHANNEL_TARGET_EXECUTE
                       ? channelTargetExecute
-                      : undefined,
+                      : id === CONTENT_START
+                        ? contentStart
+                        : id === CONTENT_EXECUTION_READ
+                          ? contentExecutionRead
+                          : undefined,
     listTools: () =>
       attachments.length > 0
         ? [
@@ -880,8 +929,15 @@ function createHostTools(host, failures, attachments) {
             REPORT_GET,
             REPORT_REDUCE,
             ...CHANNEL_TOOLS,
+            ...CONTENT_TOOLS,
           ]
-        : [KNOWLEDGE_SEARCH, REPORT_GET, REPORT_REDUCE, ...CHANNEL_TOOLS],
+        : [
+            KNOWLEDGE_SEARCH,
+            REPORT_GET,
+            REPORT_REDUCE,
+            ...CHANNEL_TOOLS,
+            ...CONTENT_TOOLS,
+          ],
     getToolParameterSchema: (id) =>
       id === KNOWLEDGE_SEARCH
         ? KNOWLEDGE_SEARCH_SCHEMA
@@ -899,7 +955,11 @@ function createHostTools(host, failures, attachments) {
                     ? CHANNEL_MANIFEST_READ_SCHEMA
                     : id === CHANNEL_TARGET_EXECUTE
                       ? CHANNEL_TARGET_EXECUTE_SCHEMA
-                      : undefined,
+                      : id === CONTENT_START
+                        ? CONTENT_START_SCHEMA
+                        : id === CONTENT_EXECUTION_READ
+                          ? CONTENT_EXECUTION_READ_SCHEMA
+                          : undefined,
     registerTool: () => {
       throw new Error("The embedded loop cannot register tools.");
     },

@@ -64,6 +64,14 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 13,
         description: "channel preflight reservations",
     },
+    MigrationMetadata {
+        version: 14,
+        description: "document content",
+    },
+    MigrationMetadata {
+        version: 15,
+        description: "tenant model routes",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

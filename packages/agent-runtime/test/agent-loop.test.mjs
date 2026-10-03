@@ -206,6 +206,8 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "channel_plan",
         "channel_manifest_read",
         "channel_target_execute",
+        "content_start",
+        "content_execution_read",
       ],
     );
     assert.match(requests[1].messages.at(-1).content, /"status":"partial"/u);
@@ -335,6 +337,8 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "channel_plan",
         "channel_manifest_read",
         "channel_target_execute",
+        "content_start",
+        "content_execution_read",
       ],
     );
     const importSchema = modelRequests[0].tools[0].function.parameters;
@@ -555,6 +559,111 @@ test("channel tools discover references, freeze a plan, read the manifest, and p
     );
     assert.match(requests[4].messages.at(-1).content, /"deferred"/u);
     assert.match(requests[5].messages.at(-1).content, /"account_unavailable"/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("content start accepts a reference-only current cycle and reads durable coverage", async () => {
+  const executionId = "00000000-0000-4000-8000-000000000301";
+  const calls = [];
+  let modelCall = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("unexpected search");
+    },
+    async contentStart(request) {
+      calls.push(["start", request]);
+      return {
+        execution_id: executionId,
+        status: "running",
+        coverage: {
+          total: 2,
+          ready: 0,
+          blocked: 0,
+          deferred: 0,
+          not_applicable: 0,
+          cancelled: 0,
+          incomplete: 2,
+        },
+      };
+    },
+    async contentExecutionRead(request) {
+      calls.push(["read", request]);
+      return {
+        execution_id: executionId,
+        status: "closed",
+        coverage: {
+          total: 2,
+          ready: 1,
+          blocked: 1,
+          deferred: 0,
+          not_applicable: 0,
+          cancelled: 0,
+          incomplete: 0,
+        },
+      };
+    },
+    async modelComplete(request) {
+      const next = modelCall++;
+      if (next === 0) {
+        const definitions = Object.fromEntries(
+          request.tools.map((tool) => [
+            tool.function.name,
+            tool.function.parameters,
+          ]),
+        );
+        assert.deepEqual(
+          definitions.content_start.properties.cycle_id.format,
+          "uuid",
+        );
+        assert.deepEqual(definitions.content_execution_read.required, [
+          "execution_id",
+        ]);
+      }
+      return next < 2
+        ? {
+            text: "",
+            tool_calls: [
+              {
+                id: `content-${next}`,
+                type: "function",
+                function: {
+                  name: next === 0 ? "content_start" : "content_execution_read",
+                  arguments: JSON.stringify(
+                    next === 0 ? {} : { execution_id: executionId },
+                  ),
+                },
+              },
+            ],
+            model: "stub-model",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "tool_calls",
+          }
+        : {
+            text: "One ready and one blocked of two planned documents.",
+            model: "stub-model",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "stop",
+          };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?content=${Date.now()}`);
+    const result = await main({
+      conversation_id: "conversation-content",
+      prompt: "Start document generation",
+      run_id: "run-content",
+      turn_id: "turn-content",
+    });
+    assert.match(result.answer, /one blocked/u);
+    assert.deepEqual(calls, [
+      ["start", {}],
+      ["read", { execution_id: executionId }],
+    ]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

@@ -106,11 +106,14 @@ where
         scope: &TenantScope,
         request: &ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
-        let route = self
-            .routes
-            .resolve(scope, request.model.as_deref())
-            .await
-            .map_err(|error| map_provider_error(error, self.timeout))?;
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let route = tokio::time::timeout_at(
+            deadline,
+            self.routes.resolve(scope, request.model.as_deref()),
+        )
+        .await
+        .map_err(|_| map_provider_error(ProviderError::Timeout, self.timeout))?
+        .map_err(|error| map_provider_error(error, self.timeout))?;
         let client = ProviderClient::new(
             route.base_url,
             route.secret_ref,
@@ -127,7 +130,11 @@ where
             route.model
         };
         let provider_request = provider_request(model, request);
-        let control = RequestControl::new(self.timeout)
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(map_provider_error(ProviderError::Timeout, self.timeout));
+        }
+        let control = RequestControl::new(remaining)
             .map_err(|error| map_provider_error(error, self.timeout))?;
         client
             .complete(provider_request, control)
@@ -399,6 +406,54 @@ mod tests {
 
     fn scope() -> TenantScope {
         TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), None)
+    }
+
+    struct HangingRoute;
+
+    #[async_trait]
+    impl ProviderRouteResolver for HangingRoute {
+        async fn resolve(
+            &self,
+            _: &TenantScope,
+            _: Option<&str>,
+        ) -> Result<ProviderRoute, ProviderError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_lookup_is_inside_provider_deadline() {
+        let transport = Arc::new(TransportStub {
+            requests: Mutex::new(Vec::new()),
+        });
+        let bridge = RoutedProviderClientBridge::new(
+            Arc::clone(&transport),
+            Arc::new(Token),
+            Arc::new(HangingRoute),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            bridge.complete(
+                &scope(),
+                &ModelCompletionRequest {
+                    prompt: "question".into(),
+                    system: None,
+                    model: None,
+                    max_output_tokens: None,
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                },
+            ),
+        )
+        .await
+        .expect("route lookup must not hang outside the provider deadline");
+        assert_eq!(
+            result.unwrap_err().code,
+            geo_worker::HostOpErrorCode::DeadlineExceeded
+        );
+        assert!(transport.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

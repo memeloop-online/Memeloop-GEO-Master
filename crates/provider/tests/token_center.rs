@@ -220,6 +220,20 @@ async fn rotation_between_metadata_and_copy_fails_closed() {
 }
 
 #[tokio::test]
+async fn provisioned_generation_mismatch_does_not_copy_credential() {
+    let (endpoint, server) = serve(vec![(200, metadata("tenant-a", true))]).await;
+    let mapping = binding("tenant-a").with_generation(1).unwrap();
+    let center = HttpTokenCenter::new(endpoint, SERVICE, [mapping]).unwrap();
+    assert!(matches!(
+        center
+            .resolve(&SecretRef::new("trusted-tenant-reference").unwrap())
+            .await,
+        Err(ProviderError::TokenUnavailable(_))
+    ));
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn revoked_metadata_does_not_copy_credential() {
     let revoked = json!([{
         "key_id": KEY_ID,
