@@ -884,6 +884,41 @@ impl ProjectRepository for PgProjectRepository {
         }
     }
 
+    async fn get_cycle_settings(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        cycle_id: Uuid,
+    ) -> Result<Option<ProjectSettings>, AppError> {
+        if scope.project_id.is_some_and(|id| id != project_id) {
+            return Ok(None);
+        }
+        let mut transaction = self.pool.begin().await.map_err(map_database_error)?;
+        crate::scope::set_local_scope(&mut transaction, scope)
+            .await
+            .map_err(map_database_error)?;
+        let settings: Option<Value> = sqlx::query_scalar(
+            "SELECT config.settings FROM optimization_cycles cycle
+             JOIN project_config_revisions config
+               ON config.operator_id=cycle.operator_id AND config.tenant_id=cycle.tenant_id
+              AND config.project_id=cycle.project_id
+              AND config.config_revision_id=cycle.config_revision_id
+             WHERE cycle.operator_id=$1 AND cycle.tenant_id=$2
+               AND cycle.project_id=$3 AND cycle.cycle_id=$4",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(cycle_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_database_error)?;
+        transaction.commit().await.map_err(map_database_error)?;
+        settings
+            .map(|value| serde_json::from_value(value).map_err(serialization_error))
+            .transpose()
+    }
+
     async fn get_report_cycle(
         &self,
         scope: &TenantScope,

@@ -72,6 +72,14 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 15,
         description: "tenant model routes",
     },
+    MigrationMetadata {
+        version: 16,
+        description: "content recovery",
+    },
+    MigrationMetadata {
+        version: 17,
+        description: "distribution execution",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

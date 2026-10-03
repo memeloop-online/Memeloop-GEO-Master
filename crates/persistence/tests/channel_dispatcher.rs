@@ -6,20 +6,32 @@ use geo_domain::{
     InitialSourceKind, InitialSourceVisibility, ProjectCreate, ProjectRepository, ProjectSettings,
     ProjectStartCommand, TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
 };
-use geo_persistence::{Database, DatabaseConfig, PgChannelJobRepository, PgProjectRepository};
+use geo_persistence::{Database, PgChannelJobRepository, PgProjectRepository};
 use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
 async fn pending_scan_keyset_scope_due_and_project_state() {
-    let database = Database::connect_and_migrate(
-        &DatabaseConfig::from_url(
-            std::env::var("GEO_TEST_DATABASE_URL").expect("disposable test database URL required"),
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+    // The dispatcher intentionally scans all tenants. Its expected global
+    // result set must not include fixtures left by other repository suites.
+    let url =
+        std::env::var("GEO_TEST_DATABASE_URL").expect("disposable test database URL required");
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("dispatcher_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .unwrap()
+        .options([("search_path", schema.as_str())]);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    let database = Database::from_pool(pool);
+    database.migrate().await.unwrap();
     let operator = Uuid::new_v4();
     let tenant = Uuid::new_v4();
     sqlx::query("INSERT INTO operators (operator_id,slug,display_name) VALUES ($1,$2,$3)")
@@ -232,4 +244,10 @@ async fn pending_scan_keyset_scope_due_and_project_state() {
         .await
         .is_err()
     );
+    database.pool().close().await;
+    // Only this test's freshly generated schema is removed.
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

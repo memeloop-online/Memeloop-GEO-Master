@@ -9,6 +9,7 @@ mod channels;
 mod content;
 pub mod content_runtime;
 mod content_tools;
+pub mod distribution;
 pub use content::ContentService;
 mod context;
 mod cycles;
@@ -109,6 +110,8 @@ pub struct AppState {
     channel_service: ChannelService,
     channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
+    distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
+    content_dispatch_repository: Option<geo_persistence::PgContentRepository>,
     content_model: Arc<std::sync::RwLock<Option<SharedModelProvider>>>,
     content_executor:
         Arc<std::sync::RwLock<Option<Arc<dyn content_runtime::ContentWorkflowExecutor>>>>,
@@ -140,6 +143,8 @@ impl AppState {
             channel_service: ChannelService::development(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
+            distribution_repository: Arc::new(geo_domain::MemoryDistributionRepository::default()),
+            content_dispatch_repository: None,
             content_model: Arc::new(std::sync::RwLock::new(None)),
             content_executor: Arc::new(std::sync::RwLock::new(None)),
             events: EventBus::default(),
@@ -224,6 +229,8 @@ impl AppState {
             channel_service: ChannelService::development(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
+            distribution_repository: Arc::new(geo_domain::MemoryDistributionRepository::default()),
+            content_dispatch_repository: None,
             content_model: Arc::new(std::sync::RwLock::new(None)),
             content_executor: Arc::new(std::sync::RwLock::new(None)),
             events,
@@ -271,6 +278,12 @@ impl AppState {
         .with_report_repository(Arc::new(PgReportRepository::from_database(database)))
         .with_content_repository(Arc::new(
             geo_persistence::PgContentRepository::from_database(database),
+        ))
+        .with_distribution_repository(Arc::new(
+            geo_persistence::PgDistributionRepository::from_database(database),
+        ))
+        .with_content_dispatch_repository(geo_persistence::PgContentRepository::from_database(
+            database,
         ))
         .with_channel_job_repository(Arc::new(
             geo_persistence::PgChannelJobRepository::from_database(database),
@@ -352,11 +365,37 @@ impl AppState {
         }
     }
 
+    pub fn distribution_service(&self) -> distribution::DistributionService {
+        distribution::DistributionService::new(
+            Arc::clone(&self.distribution_repository),
+            Arc::clone(&self.content_repository),
+            self.knowledge_repository(),
+            self.project_repository(),
+            Arc::clone(&self.channel_service.repository),
+        )
+    }
+
+    pub fn with_distribution_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::DistributionRepository>,
+    ) -> Self {
+        self.distribution_repository = repository;
+        self
+    }
+
     pub fn with_content_repository(
         mut self,
         repository: Arc<dyn geo_domain::ContentRepository>,
     ) -> Self {
         self.content_repository = repository;
+        self
+    }
+
+    fn with_content_dispatch_repository(
+        mut self,
+        repository: geo_persistence::PgContentRepository,
+    ) -> Self {
+        self.content_dispatch_repository = Some(repository);
         self
     }
 
@@ -402,7 +441,63 @@ impl AppState {
             .ok_or_else(|| {
                 AppError::capability_missing("content workflow engine is not configured")
             })?;
-        executor.dispatch(scope, execution_id)
+        let Some(repository) = self.content_dispatch_repository.clone() else {
+            return executor.dispatch(scope, execution_id);
+        };
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| AppError::capability_missing("content workflow requires an application runtime"))?
+            .spawn(async move {
+                let now = chrono::Utc::now();
+                let lease = match repository
+                    .try_claim_dispatch(&scope, execution_id, now, chrono::Duration::seconds(90))
+                    .await
+                {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(code = ?error.code, "content dispatch claim failed");
+                        return;
+                    }
+                };
+                let cancellation = Arc::new(AtomicBool::new(false));
+                let mut run = Box::pin(executor.run_supervised(scope, execution_id, Arc::clone(&cancellation)));
+                let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // The engine may be in a non-cancellable provider operation if
+                // renewal fails. Never claim exactly-once external calls:
+                // persisted step tokens fence late result writes instead.
+                let outcome = loop {
+                    tokio::select! {
+                        result = &mut run => break Some(result),
+                        _ = heartbeat.tick() => {
+                            match repository.renew_dispatch(&lease, chrono::Utc::now(), chrono::Duration::seconds(90)).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    cancellation.store(true, Ordering::SeqCst);
+                                    tracing::warn!("content dispatch lease lost; waiting for engine to finish");
+                                    break None;
+                                }
+                                Err(error) => {
+                                    cancellation.store(true, Ordering::SeqCst);
+                                    tracing::warn!(code = ?error.code, "content dispatch heartbeat failed");
+                                    break None;
+                                }
+                            }
+                        }
+                    }
+                };
+                if outcome.is_none() {
+                    let _ = run.await;
+                }
+                if let Some(Err(error)) = &outcome {
+                    tracing::warn!(code = ?error.code, "content workflow interrupted; durable item state remains resumable");
+                }
+                let backoff = if matches!(outcome, Some(Ok(()))) { 0 } else { 30 };
+                if let Err(error) = repository.release_dispatch(&lease, chrono::Utc::now(), chrono::Duration::seconds(backoff)).await {
+                    tracing::warn!(code = ?error.code, "content dispatch release failed");
+                }
+            });
+        Ok(())
     }
 
     pub fn channel_job_repository(&self) -> Arc<dyn geo_domain::ChannelJobRepository> {
@@ -1817,6 +1912,26 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(session_auth_from_request));
 
     let content_routes: Router<AppState> = Router::new()
+        .route(
+            "/projects/{id}/cycles/{cycle_id}/distribution-manifest",
+            get(distribution::cycle_manifest).post(distribution::freeze),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}",
+            get(distribution::manifest),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}/targets",
+            get(distribution::targets),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}/targets/{target_id}",
+            get(distribution::target),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}/resume",
+            post(distribution::resume),
+        )
         .route(
             "/projects/{id}/cycles/{cycle_id}/document-executions",
             get(content::executions).post(content::start),

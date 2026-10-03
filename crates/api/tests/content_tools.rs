@@ -9,12 +9,11 @@ use geo_api::{
     RepositoryHostOps, content_runtime::ContentWorkflowExecutor,
 };
 use geo_domain::{
-    ContentItemStatus, DocumentManifestPlanRequest, DocumentScope, ImportItem, InitialSource,
-    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository,
-    MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
-    MemoryProjectRepository, ProjectCreate, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    ContentItemStatus, DocumentScope, ImportItem, InitialSource, InitialSourceKind,
+    InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, MemoryAuthRepository,
+    MemoryContentRepository, MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate,
+    ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartCommand, SourceKind, TenantScope,
+    hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_worker::{
     ContentCloseRequest, ContentExecutionReadRequest, ContentItemsReadRequest, ContentStartRequest,
@@ -140,21 +139,27 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         )
         .await
         .unwrap();
-    knowledge
-        .plan_document_manifest(
+    assert!(imported.items[0].release.is_some());
+    let latest_project = projects.get(&scope, project.id).await.unwrap().unwrap();
+    projects
+        .update(
             &scope,
-            DocumentManifestPlanRequest {
-                manifest_id: started.document_manifest.manifest_id,
-                knowledge_release_id: imported.items[0]
-                    .release
-                    .as_ref()
-                    .unwrap()
-                    .knowledge_release_id,
+            project.id,
+            latest_project.revision,
+            ProjectPatch {
+                document_scope: Some(DocumentScope::default()),
+                ..Default::default()
             },
-            project.settings.document_scope.clone(),
         )
         .await
         .unwrap();
+    assert!(
+        knowledge
+            .get_document_manifest(&scope, started.document_manifest.manifest_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let executor = Arc::new(AcceptedExecutor(AtomicUsize::new(0)));
     let model = Arc::new(GroundedModel(AtomicUsize::new(0)));
     let state = AppState::with_stores_and_auth_and_projects_and_knowledge(
@@ -167,7 +172,6 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         false,
     )
     .with_content_repository(Arc::new(MemoryContentRepository::default()));
-    state.configure_content_executor(executor.clone());
     let host = RepositoryHostOps::new(knowledge).with_content(state.clone());
     assert_eq!(
         host.content_start(
@@ -181,18 +185,122 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .code,
         HostOpErrorCode::CapabilityMissing
     );
+    assert!(
+        state
+            .knowledge_repository()
+            .get_document_manifest(&scope, started.document_manifest.manifest_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "missing model must fail before planning changes state"
+    );
     state.configure_content_model(model.clone());
-    let started_ref = host
-        .content_start(
+    assert_eq!(
+        host.content_start(&scope, ContentStartRequest { cycle_id: None })
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::CapabilityMissing
+    );
+    assert!(
+        state
+            .knowledge_repository()
+            .get_document_manifest(&scope, started.document_manifest.manifest_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "missing executor must fail before planning changes state"
+    );
+    state.configure_content_executor(executor.clone());
+    let wrong_cycle = Uuid::new_v4();
+    assert_eq!(
+        host.content_start(
             &scope,
             ContentStartRequest {
-                cycle_id: Some(started.cycle_id),
-            },
+                cycle_id: Some(wrong_cycle),
+            }
         )
+        .await
+        .unwrap_err()
+        .code,
+        HostOpErrorCode::NotFound
+    );
+    let foreign = TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id);
+    assert_eq!(
+        host.content_start(
+            &foreign,
+            ContentStartRequest {
+                cycle_id: Some(started.cycle_id),
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        HostOpErrorCode::NotFound
+    );
+    let started_ref = host
+        .content_start(&scope, ContentStartRequest { cycle_id: None })
         .await
         .unwrap();
     assert_eq!(started_ref.coverage.total, 2);
     assert_eq!(executor.0.load(Ordering::SeqCst), 1);
+    let sealed = state
+        .knowledge_repository()
+        .get_document_manifest(&scope, started.document_manifest.manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sealed.sealed);
+    assert_eq!(sealed.expected_count, Some(2));
+    let release_id = sealed.knowledge_release_id;
+    let newer = state
+        .knowledge_repository()
+        .import_batch(
+            &scope,
+            vec![ImportItem {
+                client_item_id: "newer".into(),
+                kind: SourceKind::Text,
+                name: "newer".into(),
+                purpose: KnowledgePurpose::Public,
+                text: Some("Newer public description".into()),
+                url: None,
+                object_id: None,
+                knowledge_release_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        newer.items[0]
+            .release
+            .as_ref()
+            .unwrap()
+            .knowledge_release_id,
+        release_id
+    );
+    assert_eq!(
+        host.content_start(
+            &scope,
+            ContentStartRequest {
+                cycle_id: Some(started.cycle_id),
+            }
+        )
+        .await
+        .unwrap(),
+        started_ref,
+        "sealed replay must retain the execution"
+    );
+    assert_eq!(
+        state
+            .knowledge_repository()
+            .get_document_manifest(&scope, started.document_manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .knowledge_release_id,
+        release_id,
+        "newer knowledge must not overwrite the sealed cycle"
+    );
     let read = host
         .content_execution_read(
             &scope,
@@ -251,7 +359,6 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .code,
         HostOpErrorCode::InvalidRequest
     );
-    let foreign = TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id);
     assert_eq!(
         host.content_items_read(
             &foreign,
@@ -328,4 +435,55 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .await
         .unwrap();
     assert_eq!(handoff.total, 2);
+    let first_cycle = state
+        .project_repository()
+        .get_current_cycle(&scope, project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let next = state
+        .project_repository()
+        .schedule_next_cycle(
+            &scope,
+            project.id,
+            started.cycle_id,
+            first_cycle.cutoff_at + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        host.content_start(
+            &scope,
+            ContentStartRequest {
+                cycle_id: Some(started.cycle_id),
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        HostOpErrorCode::Failed,
+        "an older cycle cannot be started or replanned"
+    );
+    let next_ref = host
+        .content_start(
+            &scope,
+            ContentStartRequest {
+                cycle_id: Some(next.cycle_id),
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(next_ref.execution_id, started_ref.execution_id);
+    assert_eq!(next_ref.coverage.total, 2);
+    assert_eq!(
+        state
+            .knowledge_repository()
+            .get_document_manifest(&scope, next.document_manifest.as_ref().unwrap().manifest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .expected_count,
+        Some(2),
+        "successor planning uses frozen config, not the edited project draft"
+    );
 }

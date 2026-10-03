@@ -14,14 +14,16 @@ use geo_api::{
     AppState, EventBus, MemoryIdempotencyStore, MemoryOperationStore, ModelProviderBridge,
 };
 use geo_domain::{
-    ContentExecutionStatus, ContentItemStatus, DocumentManifestPlanRequest, DocumentScope,
-    ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
-    KnowledgeRepository, MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
+    ContentExecutionStatus, ContentItemStatus, DocumentScope, ImportItem, InitialSource,
+    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository,
+    MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
     MemoryProjectRepository, ProjectCreate, ProjectRepository, ProjectSettings,
     ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
     start_request_hash,
 };
-use geo_worker::{HostOpError, ModelCompletion, ModelCompletionRequest};
+use geo_worker::{
+    ContentStartRequest, HostOpError, HostOps, ModelCompletion, ModelCompletionRequest,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -167,7 +169,6 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
         .unwrap();
     let scope = TenantScope::new(base.operator_id, base.tenant_id, Some(project.id));
     let frozen_settings = project.settings.clone().validate_start().unwrap();
-    let planned_scope = frozen_settings.document_scope.clone();
     let frozen_hash = settings_hash(&frozen_settings).unwrap();
     let started = projects
         .start(
@@ -199,29 +200,40 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
         )
         .await
         .unwrap();
-    let release = imported.items[0].release.as_ref().unwrap();
-    let manifest = knowledge
-        .plan_document_manifest(
+    assert!(imported.items[0].release.is_some());
+    assert!(
+        knowledge
+            .get_document_manifest(&scope, started.document_manifest.manifest_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "native P00 start must not require a manually planned manifest"
+    );
+    let host = geo_api::RepositoryHostOps::new(knowledge.clone()).with_content(state.clone());
+    let started_ref = host
+        .content_start(
             &scope,
-            DocumentManifestPlanRequest {
-                manifest_id: started.document_manifest.manifest_id,
-                knowledge_release_id: release.knowledge_release_id,
+            ContentStartRequest {
+                cycle_id: Some(started.cycle_id),
             },
-            planned_scope,
         )
         .await
-        .unwrap();
+        .expect("P00 starts planning and native dispatch together");
+    let manifest = knowledge
+        .get_document_manifest(&scope, started.document_manifest.manifest_id)
+        .await
+        .unwrap()
+        .expect("P00 planned the current cycle");
     assert!(manifest.sealed);
     assert_eq!(manifest.expected_count, Some(2));
     let execution = state
         .content_service()
-        .start(&scope, started.cycle_id)
+        .repository()
+        .get_execution(&scope, started_ref.execution_id)
         .await
-        .expect("cycle-linked sealed knowledge manifest starts through service");
+        .unwrap()
+        .expect("P00 execution persisted");
     assert_eq!(execution.expected_count, 2);
-    state
-        .dispatch_content_execution(scope.clone(), execution.execution_id)
-        .expect("AppState schedules the native workflow");
     let repository = state.content_service().repository();
     let closed = tokio::time::timeout(Duration::from_secs(45), async {
         loop {

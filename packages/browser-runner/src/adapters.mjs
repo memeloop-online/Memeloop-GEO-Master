@@ -9,6 +9,11 @@ const BAIDU_SELF = "https://baijiahao.baidu.com/builder/app/appinfo";
 const ZHIHU_EDITOR = "https://zhuanlan.zhihu.com/write";
 const BAIDU_EDITOR = "https://baijiahao.baidu.com/builder/rc/edit?type=news";
 const ZHIHU_POST_ORIGIN = "https://zhuanlan.zhihu.com";
+const KIMI_ORIGIN = "https://www.kimi.com";
+// Public Kimi client bundle (2026-09-29) invokes
+// kimi.gateway.account.v1.UserService/GetCurrentUser via Connect JSON.
+// The authenticated response has not been observed with a real account.
+const KIMI_SELF = "/apiv2/kimi.gateway.account.v1.UserService/GetCurrentUser";
 
 function unsupported(reason) {
   return {
@@ -90,6 +95,124 @@ export function zhihuIdentity(data) {
 export function baiduIdentity(data) {
   const user = data?.data?.user;
   return ownIdentity(user?.userid, user?.name, user?.avatar);
+}
+
+export function kimiIdentity(data) {
+  return ownIdentity(data?.user?.id, data?.user?.nickname);
+}
+
+export async function probeKimiAccount(
+  page,
+  { trustedOrigin = KIMI_ORIGIN } = {},
+) {
+  const probe = await page.context().newPage();
+  try {
+    const response = await probe.goto(`${trustedOrigin}/`, {
+      waitUntil: "domcontentloaded",
+      timeout: 12_000,
+    });
+    if (
+      response?.status() !== 200 ||
+      new URL(probe.url()).origin !== trustedOrigin
+    ) {
+      return null;
+    }
+    // Fixed, same-origin Connect request. Token never leaves the browser page
+    // and is never returned to Node, logs, the HTTP caller or another origin.
+    // This mirrors the public client's getToken()/getCurrentUser() path.
+    const data = await probe.evaluate(async (selfPath) => {
+      const accessToken = localStorage.getItem("access_token");
+      const refreshToken = localStorage.getItem("refresh_token");
+      if (!accessToken || !refreshToken) return null;
+      const response = await fetch(selfPath, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "Connect-Protocol-Version": "1",
+          "x-msh-platform": "web",
+        },
+        body: "{}",
+        redirect: "error",
+      });
+      if (
+        !response.ok ||
+        !/application\/json/i.test(response.headers.get("content-type") ?? "")
+      ) {
+        return null;
+      }
+      const text = await response.text();
+      return text.length <= 128_000 ? JSON.parse(text) : null;
+    }, KIMI_SELF);
+    return kimiIdentity(data);
+  } catch {
+    return null;
+  } finally {
+    await probe.close();
+  }
+}
+
+// This parses a candidate *observation*, not proof that Kimi ran its official
+// search. An authenticated account, search-mode selection and an actual search
+// event must be established independently before a caller can mark it complete.
+// In particular, a plausible answer with links is not search evidence.
+export function extractKimiCandidateObservation(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    typeof value.raw_answer !== "string" ||
+    !value.raw_answer.trim() ||
+    value.raw_answer.length > 100_000 ||
+    !Array.isArray(value.citations) ||
+    value.citations.length > 50 ||
+    (value.request_id !== undefined &&
+      (typeof value.request_id !== "string" ||
+        !/^[\w-]{1,128}$/u.test(value.request_id)))
+  ) {
+    return null;
+  }
+  const citations = [];
+  for (const citation of value.citations) {
+    if (
+      citation === null ||
+      typeof citation !== "object" ||
+      Array.isArray(citation) ||
+      typeof citation.url !== "string" ||
+      citation.url.length > 2048 ||
+      (citation.title !== undefined &&
+        (typeof citation.title !== "string" || citation.title.length > 500))
+    ) {
+      return null;
+    }
+    let url;
+    try {
+      url = new URL(citation.url);
+    } catch {
+      return null;
+    }
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      !url.hostname ||
+      url.hostname === "localhost" ||
+      url.hostname.endsWith(".localhost")
+    ) {
+      return null;
+    }
+    citations.push({
+      url: url.href,
+      ...(citation.title ? { title: citation.title } : {}),
+    });
+  }
+  return {
+    raw_answer: value.raw_answer,
+    citations,
+    ...(value.request_id ? { request_id: value.request_id } : {}),
+    search_verified: false,
+  };
 }
 
 export async function xiaohongshuIdentity(
@@ -492,11 +615,13 @@ export const adapters = Object.freeze({
     allowLoginControl(url) {
       return url.hostname === "www.kimi.com" && url.pathname === "/";
     },
-    async identify() {
-      return null;
+    identify(page) {
+      return probeKimiAccount(page);
     },
     async execute() {
-      return unsupported("platform_adapter_unverified");
+      // A generated answer, OAuth login, or candidate citations alone do not
+      // establish an authenticated official web-search measurement.
+      return unsupported("official_web_search_unverified");
     },
   }),
 });

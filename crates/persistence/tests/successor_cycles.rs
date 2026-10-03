@@ -98,7 +98,20 @@ async fn successor_is_atomic_scoped_frozen_and_recoverable() {
     )
     .await
     .unwrap();
+    let frozen = project.settings.clone().validate_start().unwrap();
+    assert_eq!(
+        repo.get_cycle_settings(&scope, project.id, accepted.cycle_id)
+            .await
+            .unwrap(),
+        Some(frozen.clone())
+    );
     let foreign_scope = TenantScope::new(operator.into(), other_tenant.into(), None);
+    assert!(
+        repo.get_cycle_settings(&foreign_scope, project.id, accepted.cycle_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         repo.schedule_next_cycle(
             &foreign_scope,
@@ -178,6 +191,13 @@ async fn successor_is_atomic_scoped_frozen_and_recoverable() {
     assert!(successor.cutoff_at < now);
     assert!(!successor.document_manifest.as_ref().unwrap().sealed);
     assert!(!successor.distribution_manifest.as_ref().unwrap().sealed);
+    assert_eq!(
+        repo.get_cycle_settings(&scope, project.id, successor.cycle_id)
+            .await
+            .unwrap(),
+        Some(frozen),
+        "new cycle carries its predecessor's frozen configuration"
+    );
     assert_eq!(
         repo.get_current_cycle(&scope, project.id).await.unwrap(),
         Some(successor.clone())

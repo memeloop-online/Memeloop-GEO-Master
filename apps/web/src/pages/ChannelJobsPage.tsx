@@ -28,6 +28,7 @@ import {
 import { useChannelData } from "../api/channels";
 import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
+import { DistributionPanel } from "./DistributionPanel";
 import "./ChannelJobsPage.css";
 
 const statusLabels: Record<string, string> = {
@@ -254,7 +255,7 @@ function FrozenPlan({
 }) {
   return (
     <section className="channel-jobs-section">
-      <h2>本轮冻结计划</h2>
+      <h2>来源版本渠道计划（旧链路）</h2>
       <p>
         版本 {plan.revision} · {dateTime(plan.created_at)} ·{" "}
         {plan.targets.length}
@@ -413,6 +414,12 @@ export function ChannelJobsPage() {
       ) : (
         <>
           <p className="channel-job-ids">当前周期：{cycleId}</p>
+          <DistributionPanel
+            tenantId={tenantId}
+            projectId={projectId}
+            cycleId={cycleId}
+            canWrite={canWrite}
+          />
           {plan.isPending ? (
             <LoadingState label="正在读取冻结计划" />
           ) : plan.isError ? (
@@ -430,7 +437,7 @@ export function ChannelJobsPage() {
             />
           ) : (
             <section className="channel-jobs-section">
-              <h2>建立本轮发布计划</h2>
+              <h2>建立来源版本渠道计划（旧链路）</h2>
               <MessageBar intent="warning">
                 <MessageBarBody>
                   提交将一次性封存本轮所有发布目标，之后不能追加、替换来源版本或账号。

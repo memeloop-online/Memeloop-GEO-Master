@@ -5,8 +5,21 @@ use geo_domain::{
     ContentItem, ContentItemStatus, ContentRepository, ContentRevision, ContentState, ContentStep,
     DocumentManifest, ErrorCode, StepLease, StructuredDocument, TenantScope, start_content_state,
 };
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub struct ContentDispatchCandidate {
+    pub scope: TenantScope,
+    pub execution_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentDispatchLease {
+    pub scope: TenantScope,
+    pub execution_id: Uuid,
+    pub token: Uuid,
+}
 
 #[derive(Clone)]
 pub struct PgContentRepository {
@@ -18,6 +31,189 @@ impl PgContentRepository {
     }
     pub fn from_database(database: &crate::Database) -> Self {
         Self::new(database.pool().clone())
+    }
+    /// Keyset enumeration is independent of dispatch claims so one failed
+    /// execution cannot starve later executions in the same scan.
+    pub async fn scan_running_after(
+        &self,
+        after: Option<Uuid>,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ContentDispatchCandidate>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid content scan page size"));
+        }
+        let rows = sqlx::query(
+            "SELECT c.operator_id,c.tenant_id,c.project_id,c.execution_id \
+             FROM content_executions c JOIN projects p \
+               ON p.operator_id=c.operator_id AND p.tenant_id=c.tenant_id AND p.project_id=c.project_id \
+             WHERE ($1::uuid IS NULL OR c.execution_id>$1) \
+               AND c.state->'execution'->>'status'='running' AND p.status='active' \
+               AND (c.dispatch_expires_at IS NULL OR c.dispatch_expires_at<=$2) \
+               AND (c.dispatch_retry_after IS NULL OR c.dispatch_retry_after<=$2) \
+             ORDER BY c.execution_id LIMIT $3",
+        )
+        .bind(after)
+        .bind(now)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ContentDispatchCandidate {
+                scope: TenantScope::new(
+                    row.get::<Uuid, _>("operator_id").into(),
+                    row.get::<Uuid, _>("tenant_id").into(),
+                    Some(row.get::<Uuid, _>("project_id").into()),
+                ),
+                execution_id: row.get("execution_id"),
+            })
+            .collect())
+    }
+    /// Serializes with content step transitions and status changes on the
+    /// execution row. A live old step lease delays takeover until it expires.
+    pub async fn try_claim_dispatch(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<Option<ContentDispatchLease>, AppError> {
+        if ttl <= chrono::Duration::zero() {
+            return Err(AppError::invalid_request(
+                "dispatch lease lifetime must be positive",
+            ));
+        }
+        let Some(project) = scope.project_id else {
+            return Err(AppError::invalid_request("project scope required"));
+        };
+        let mut tx = self.transaction(scope).await?;
+        let row = sqlx::query(
+            "SELECT c.state,c.dispatch_expires_at,c.dispatch_retry_after FROM content_executions c \
+             JOIN projects p ON p.operator_id=c.operator_id AND p.tenant_id=c.tenant_id AND p.project_id=c.project_id \
+             WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 AND c.execution_id=$4 \
+               AND p.status='active' FOR UPDATE OF c",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some(row) = row else { return Ok(None) };
+        let state = decode(row.get("state"))?;
+        if state.execution.status != geo_domain::ContentExecutionStatus::Running
+            || row
+                .get::<Option<DateTime<Utc>>, _>("dispatch_expires_at")
+                .is_some_and(|t| t > now)
+            || row
+                .get::<Option<DateTime<Utc>>, _>("dispatch_retry_after")
+                .is_some_and(|t| t > now)
+        {
+            return Ok(None);
+        }
+        if let Some(until) = state
+            .items
+            .iter()
+            .flat_map(|item| &item.steps)
+            .filter(|step| step.expires_at > now)
+            .map(|step| step.expires_at)
+            .max()
+        {
+            sqlx::query(
+                "UPDATE content_executions SET dispatch_retry_after=$1 WHERE execution_id=$2",
+            )
+            .bind(until)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+            tx.commit().await.map_err(db)?;
+            return Ok(None);
+        }
+        let token = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE content_executions SET dispatch_token=$1,dispatch_expires_at=$2,dispatch_retry_after=NULL WHERE execution_id=$3",
+        )
+        .bind(token)
+        .bind(now + ttl)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(Some(ContentDispatchLease {
+            scope: scope.clone(),
+            execution_id: id,
+            token,
+        }))
+    }
+    pub async fn renew_dispatch(
+        &self,
+        lease: &ContentDispatchLease,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<bool, AppError> {
+        if ttl <= chrono::Duration::zero() {
+            return Err(AppError::invalid_request(
+                "dispatch lease lifetime must be positive",
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE content_executions SET dispatch_expires_at=$1 \
+             WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 AND execution_id=$5 \
+               AND dispatch_token=$6 AND dispatch_expires_at>$7 \
+               AND state->'execution'->>'status'='running' \
+               AND EXISTS (SELECT 1 FROM projects p WHERE p.operator_id=$2 AND p.tenant_id=$3 \
+                   AND p.project_id=$4 AND p.status='active')",
+        )
+        .bind(now + ttl)
+        .bind(lease.scope.operator_id.as_uuid())
+        .bind(lease.scope.tenant_id.as_uuid())
+        .bind(
+            lease
+                .scope
+                .project_id
+                .ok_or_else(|| AppError::invalid_request("project scope required"))?
+                .as_uuid(),
+        )
+        .bind(lease.execution_id)
+        .bind(lease.token)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(updated.rows_affected() == 1)
+    }
+    pub async fn release_dispatch(
+        &self,
+        lease: &ContentDispatchLease,
+        now: DateTime<Utc>,
+        backoff: chrono::Duration,
+    ) -> Result<bool, AppError> {
+        let updated = sqlx::query(
+            "UPDATE content_executions SET dispatch_token=NULL, dispatch_expires_at=NULL, \
+             dispatch_retry_after=$1 WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 \
+             AND execution_id=$5 AND dispatch_token=$6",
+        )
+        .bind(now + backoff)
+        .bind(lease.scope.operator_id.as_uuid())
+        .bind(lease.scope.tenant_id.as_uuid())
+        .bind(
+            lease
+                .scope
+                .project_id
+                .ok_or_else(|| AppError::invalid_request("project scope required"))?
+                .as_uuid(),
+        )
+        .bind(lease.execution_id)
+        .bind(lease.token)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(updated.rows_affected() == 1)
     }
     async fn transaction<'a>(
         &'a self,

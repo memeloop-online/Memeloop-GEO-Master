@@ -17,8 +17,9 @@ use geo_domain::{
     AppError, ContentAsset, ContentBlock, ContentBlockKind, ContentBrief, ContentEvidence,
     ContentExecution, ContentFinding, ContentHandoff, ContentItem, ContentItemStatus,
     ContentRepository, ContentRevision, ContentStep, DocumentManifest, DocumentManifestItemState,
-    ErrorCode, EvidenceRef, KnowledgeEvidence, KnowledgePurpose, KnowledgeRepository, ProjectId,
-    ProjectRepository, ProjectStatus, SourceState, StructuredDocument, TenantScope,
+    DocumentManifestPlanRequest, ErrorCode, EvidenceRef, KnowledgeEvidence, KnowledgePurpose,
+    KnowledgeRepository, ProjectId, ProjectRepository, ProjectStatus, SourceState,
+    StructuredDocument, TenantScope,
 };
 use geo_worker::ModelCompletionRequest;
 use serde::Deserialize;
@@ -152,6 +153,16 @@ impl ContentService {
         let project_id = scope
             .project_id
             .ok_or_else(|| AppError::invalid_request("project scope required"))?;
+        let current_cycle = self
+            .projects
+            .get_current_cycle(scope, project_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("current cycle not found"))?;
+        if current_cycle.cycle_id != cycle_id {
+            return Err(AppError::conflict(
+                "content start requires the current cycle",
+            ));
+        }
         let cycle = self
             .projects
             .get_report_cycle(scope, project_id, cycle_id)
@@ -160,11 +171,47 @@ impl ContentService {
         let planned = cycle
             .document_manifest
             .ok_or_else(|| AppError::conflict("cycle has no document manifest"))?;
-        let manifest = self
+        let existing = self
             .knowledge
             .get_document_manifest(scope, planned.manifest_id)
-            .await?
-            .ok_or_else(|| AppError::conflict("sealed document manifest is unavailable"))?;
+            .await?;
+        let manifest = if let Some(manifest) = existing {
+            // A sealed cycle snapshot is immutable even if knowledge has
+            // since advanced. Never invoke the planner on historical inputs.
+            manifest
+        } else {
+            if planned.sealed {
+                return Err(AppError::conflict(
+                    "sealed document manifest is unavailable",
+                ));
+            }
+            let frozen = self
+                .projects
+                .get_cycle_settings(scope, project_id, cycle_id)
+                .await?
+                .ok_or_else(|| AppError::conflict("frozen cycle configuration is unavailable"))?;
+            let release_id = self
+                .knowledge
+                .current_release(scope)
+                .await?
+                .knowledge_release_id
+                .ok_or_else(|| {
+                    AppError::conflict("no knowledge release is available for planning")
+                })?;
+            let mut document_scope = frozen.document_scope.clone();
+            document_scope.markets = frozen.effective_markets();
+            document_scope.languages = frozen.effective_languages();
+            self.knowledge
+                .plan_document_manifest(
+                    scope,
+                    DocumentManifestPlanRequest {
+                        manifest_id: planned.manifest_id,
+                        knowledge_release_id: release_id,
+                    },
+                    document_scope,
+                )
+                .await?
+        };
         // The cycle acceptance is an initial skeleton and is not updated by
         // knowledge planning. Its manifest identity/revision are the binding;
         // the scoped knowledge repository is authoritative for sealing/count.
@@ -1166,6 +1213,61 @@ mod tests {
             TenantScope::new(tenant.operator_id, tenant.tenant_id, Some(project.id)),
             projects,
         )
+    }
+
+    #[tokio::test]
+    async fn auto_planning_preserves_blocked_items_when_only_internal_knowledge_exists() {
+        let (scope, projects) = active_project().await;
+        let cycle_id = projects
+            .get_current_cycle(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id;
+        let knowledge = Arc::new(MemoryKnowledgeRepository::default());
+        let repository = Arc::new(MemoryContentRepository::default());
+        let service = ContentService::new(repository.clone(), knowledge.clone(), projects);
+        assert_eq!(
+            service.start(&scope, cycle_id).await.unwrap_err().code,
+            ErrorCode::Conflict,
+            "no release cannot be represented as generated content"
+        );
+        let imported = knowledge
+            .import_batch(
+                &scope,
+                vec![ImportItem {
+                    client_item_id: "internal".into(),
+                    kind: SourceKind::Text,
+                    name: "internal".into(),
+                    purpose: KnowledgePurpose::Internal,
+                    text: Some("Restricted description".into()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(imported.items[0].release.is_some());
+        let execution = service.start(&scope, cycle_id).await.unwrap();
+        assert_eq!(execution.coverage.total, 1);
+        assert_eq!(execution.coverage.ready, 0);
+        assert_eq!(execution.coverage.blocked, 1);
+        let items = repository
+            .list_items(&scope, execution.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, ContentItemStatus::Blocked);
+        assert!(items[0].current_revision_id.is_none());
+        assert!(
+            repository
+                .list_assets(&scope, execution.execution_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "blocked planning does not pretend to have generated a revision"
+        );
     }
 
     #[tokio::test]

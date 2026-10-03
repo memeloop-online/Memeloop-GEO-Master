@@ -1,6 +1,7 @@
 mod bootstrap;
 mod channels;
 mod config;
+mod content_dispatch;
 #[cfg(test)]
 mod content_runtime_tests;
 mod dispatch;
@@ -34,12 +35,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if production_ai.is_some() && !durable_storage {
         return Err("production model configuration requires PostgreSQL".into());
     }
-    let (state, durable_storage) = if durable_storage {
+    let (state, durable_storage, content_scanner) = if durable_storage {
         // A configured database is authoritative.  Connection or migration
         // failures terminate startup; the process never falls back to memory
         // authentication or idempotency state.
         let database = Database::connect_and_migrate_from_env().await?;
         let report_scanner = PgReportRepository::from_database(&database);
+        let content_scanner = geo_persistence::PgContentRepository::from_database(&database);
         let cycle_scanner = PgProjectRepository::from_database(&database);
         let state = channels::configure(
             AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone()),
@@ -60,7 +62,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         state.set_ready(true);
         spawn_due_report_scanner(state.clone(), report_scanner, cycle_scanner);
-        (state, true)
+        (state, true, Some(content_scanner))
     } else {
         let password = config.validate_for_memory_mode()?;
         let state = channels::configure(
@@ -79,9 +81,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if config.ready_on_start {
             state.set_ready(true);
         }
-        (state, false)
+        (state, false, None)
     };
     runtime::configure_content_workflow(&state)?;
+    if let Some(scanner) = content_scanner {
+        content_dispatch::spawn(state.clone(), scanner);
+    }
     dispatch::spawn(state.clone());
     let app: Router = router(state);
     let listener = TcpListener::bind(config.bind_addr).await?;

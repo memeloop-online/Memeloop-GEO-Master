@@ -11,6 +11,8 @@ mod channels;
 pub use channels::*;
 mod content;
 pub use content::*;
+mod distribution;
+pub use distribution::*;
 mod error;
 mod event;
 mod idempotency;

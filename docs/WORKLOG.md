@@ -2,10 +2,16 @@
 
 ## 2026-10-03
 
+- 整合补充回归发现：同一发布意图从来源延后恢复时，旧 `Unknown` 会被标成 `Ready`。内存与 PostgreSQL 状态投影统一优先保留已验证/结果未知状态；恢复不创建第二条发送命令。新增先普通恢复、再未知恢复的测试已通过；这不代表外部结果查回已实现。
+
+- 当前工作区新增内容执行跨副本恢复（迁移 `0016`）：运行中执行分页扫描、独立分发 claim/心跳续租/失租中止和延后重领，与已有步骤租约分离；当前周期未封存时从冻结设置规划并封存文档清单，已有清单不重写。属于内容工作流的恢复，不改变 P00 回合 queued/取消/checkpoint 的既有限制。
+- 第二层首次建立正式分发执行清单（迁移 `0017`）：封存已检查的主正文版本与平台覆盖范围，分页物化逐格状态、确定性渠道变体、逻辑发布意图和持久命令 outbox；同一逻辑意图的延后目标可恢复，未知旧意图不换号重发。P12 可查冻结分母和逐格状态。outbox 尚无正式消费者、发送前 attempt、真实发布/公开读回、P00 工具或报告接线；现有来源版本渠道账本保持独立。
+- `ef43aa2` 的 Actions `37111621707` 未全绿：渠道扫描测试的全局数据夹具受到同 job 其他套件数据影响；其余 PostgreSQL 套件（包含内容、身份初始化和模型路由）通过，不能因此称整个 CI 成功。夹具在当前工作区改用隔离 schema，须等新 CI 复验。当前工作区本地离线 Rust 格式、workspace all-targets Clippy `-D warnings` 与 all-targets 测试通过；前端格式、类型及 88/88 项测试、生产构建（重新生成双 bundle）、browser-runner 18/18（本地浏览器覆盖配置）通过。显式应用级原生内容工作流 V8 测试通过；其他被忽略的显式 bundle、新分发/恢复 PostgreSQL 实库测试、固定浏览器版本和最新代码的完整 CI 仍待复验。
+- 浏览器适配器增加基于已知来源行为的登录态自检与候选回答引用结构提取，测试数据不得标为已验证搜索；没有独立确认官方搜索执行和真实引用，尚未完成真实网页渠道测量。
 - `b5c6125` 已推送；Actions `37108684267` 的 Linux 前端、固定 Chromium、Rust 与显式 V8 bundle 步骤通过，实库步骤发现 `channel_dispatcher` 测试夹具的 INSERT 有四列但只有三个占位符，尚未运行到新增 bootstrap/model_routes/content 实库回归。本次修正占位符；CI 改为逐套执行全部实库测试后汇总失败，避免首个失败遮蔽后续证据。修正后的实库结果等待新 CI，不标记通过。
 
 - 当前工作区第一层内容与生产装配本地复验：`cargo fmt --all -- --check`、离线 `cargo clippy --workspace --all-targets -- -D warnings`、离线 `cargo test --workspace --all-targets` 均通过；默认忽略的生成 bundle 与 PostgreSQL 条件测试不计入普通 workspace 结果。前端 `pnpm format:check`、`pnpm typecheck`、79/79 项测试及 `pnpm build` 通过。重新运行 `pnpm agent:bundle` 后显式执行被忽略的 worker 原生对话 bundle 4 项、内容工作流 1 项，app 装配 2 项，以及 API 附件导入和渠道工具各 1 项，均通过。Node agent-runtime 11/11、browser-runner 14/14 在本地浏览器覆盖配置下通过；固定版本 Chromium 仍待新 CI 复验。保留非阻断的 MSVC 链接警告及前端大 chunk/Zod 警告；新 CI、PostgreSQL 实库、真实模型、真实浏览器账号和渠道验收仍待取得，不能把本地结果视为完整交付。
-- 当前工作区的第一层生成与既有渠道发送仍是两条独立路径：原生内容分支可产生带证据/检查的正文版本，渠道冻结计划仍使用公开来源版本，未从生成内容自动构造文档×平台分发矩阵。持久身份初始化和租户/项目模型路由已装配；使用部署者显式配置且不代表费用权益或真实部署通过。
+- 上一阶段第一层生成与既有渠道发送是两条独立路径：原生内容分支可产生带证据/检查的正文版本，渠道冻结计划使用公开来源版本；随后新增的正式分发清单也尚未接到既有发送器。持久身份初始化和租户/项目模型路由已装配；使用部署者显式配置且不代表费用权益或真实部署通过。
 - `c4a9947` 的 Actions `37082133868` 未通过：Linux 显式生成 bundle 回归中两项旧工具数量断言未随注册表扩展更新，后续 PostgreSQL 步骤尚未执行。断言已在当前工作区修复并通过本地显式 bundle 回归；新增原生内容工作流及应用级集成回归后，仍须等待新 CI，不把该提交标为全绿。
 - 第一层内容 fan-out 正在集成：独立于冻结规划清单的执行/租约、正文与证据版本、独立检查和交接快照；原生 MemeLoop `agent-agent-loop` 分页执行；P08/P09 接入内容列表与版本编辑。另新增部署者显式数据库账号初始化、租户级模型路由及浏览器受控 channel 配置。本批仍在工作区，局部测试不代替全仓、实库或真实平台验收。
 - 后继周期提交 `40b6b1d` 的 Actions `37068471764` 已成功，包含 Linux/Windows 与新增后继周期 PostgreSQL 回归；该结果不覆盖后续渠道工具/dispatcher 改动。
@@ -43,7 +49,7 @@
 - P00 附件显式导入纵切：内存/Pg Object 导入保留原文件 ID、版本、摘要与 locator；Pg 用事务级收据键串行判定重复调用，已有对象不重复 INSERT。Rust HostBridge 保存每回合不可变附件绑定，模型只能导入已受理的对象。上传不自动建库，TXT/Markdown 成功与不支持格式失败保留逐项结果。
 - `TurnInput` 增加真实 message ID 与附件引用，executor 从持久 Message/Turn/Run 重建输入；完成结果 hash 包含附件版本，不代表中途 checkpoint 恢复。新增重建测试通过。
 - 真实生成 MemeLoop bundle 的 import → search → answer 应用测试通过：实际上传对象、实际知识仓储、注入测试模型，断言来源溯源与两次调用同收据。不是外部真实模型验收。Node 5 项、worker 生成 bundle 3 项、API 生成 bundle 1 项通过；本地 workspace all-targets 与 Clippy 通过，16 项 PostgreSQL 测试仍由 CI 显式执行。
-- 上游 0.3.3 canonical 附件会加载整份字节，canonical user turn ID 必须等于 message ID；用元数据/工具 schema 暴露附件、使用真实 message ID 并保留 GEO turn ID 完成记录，未另写 Agent 循环。Kimi 文案调用失败，主代理仅修正了过时附件提示。
+- 上游 0.3.3 canonical 附件会加载整份字节，canonical user turn ID 必须等于 message ID；用元数据/工具 schema 暴露附件、使用真实 message ID 并保留 GEO turn ID 完成记录，未另写 Agent 循环。外部文案调用失败，主代理仅修正了过时附件提示。
 - 本批代码提交 `791215a` 的 Actions `36771176608`：Linux、Windows 全部成功，PostgreSQL 16 项实库测试全部通过（不含 non-bypass FORCE RLS），真实 V8 工具循环/应用装配和前端检查通过，Windows artifact 已上传。工作树代码已推送集成分支，未合并 main；附件显式导入下一纵切写入独立接缝文档，不修改产品规格。
 - `a24aca2` 的 Actions `36769809922`：Windows 成功；Linux 其余检查通过，PostgreSQL 15/16 通过。启动重放和重启对账回归已修复；新增附件测试发现初次结果的纳秒时间与数据库微秒时间不一致，完成操作改为返回已持久化对象，确保重放完全一致，等待复验。
 - 第二批功能集成：MemeLoop 原生 function-tool 循环已接知识检索；Provider/worker/bridge 保留工具定义、assistant tool calls 和 tool-result messages，不把纯工具响应的空正文当作最终答案。Node 4 项、真实 V8 bundle 2 项、本地应用 bundle 装配 1 项通过。

@@ -146,6 +146,145 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             .unwrap()
     );
     assert_eq!(first.expected_count, manifest.items.len() as u64);
+    // Two independent repository instances contend on the durable execution
+    // claim. A simulated crashed worker can be recovered after expiry, and
+    // stale owners cannot renew or release the replacement owner's token.
+    let tick = Utc::now();
+    let page = restarted.scan_running_after(None, tick, 100).await.unwrap();
+    assert!(
+        page.iter()
+            .any(|candidate| candidate.execution_id == first.execution_id)
+    );
+    let lease = repository
+        .try_claim_dispatch(
+            &scope,
+            first.execution_id,
+            tick,
+            chrono::Duration::seconds(90),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        restarted
+            .try_claim_dispatch(
+                &scope,
+                first.execution_id,
+                tick,
+                chrono::Duration::seconds(90)
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !restarted
+            .scan_running_after(None, tick, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id)
+    );
+    let raced = repository
+        .start(
+            &scope,
+            accepted.cycle_id,
+            manifest.clone(),
+            "test-policy-race",
+        )
+        .await
+        .unwrap();
+    let (left, right) = tokio::join!(
+        repository.try_claim_dispatch(
+            &scope,
+            raced.execution_id,
+            tick,
+            chrono::Duration::seconds(90)
+        ),
+        restarted.try_claim_dispatch(
+            &scope,
+            raced.execution_id,
+            tick,
+            chrono::Duration::seconds(90)
+        ),
+    );
+    let wins = usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some());
+    assert_eq!(wins, 1, "at most one replica can own a workflow");
+    repository.cancel(&scope, raced.execution_id).await.unwrap();
+    let takeover = tick + chrono::Duration::seconds(91);
+    assert!(
+        restarted
+            .scan_running_after(None, takeover, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id)
+    );
+    let replacement = restarted
+        .try_claim_dispatch(
+            &scope,
+            first.execution_id,
+            takeover,
+            chrono::Duration::seconds(90),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(lease.token, replacement.token);
+    assert!(
+        !repository
+            .renew_dispatch(&lease, takeover, chrono::Duration::seconds(90))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .release_dispatch(&lease, takeover, chrono::Duration::zero())
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE projects SET status='paused' WHERE project_id=$1")
+        .bind(project.id.as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        !repository
+            .renew_dispatch(&replacement, takeover, chrono::Duration::seconds(90))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !restarted
+            .scan_running_after(None, takeover, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id)
+    );
+    assert!(
+        repository
+            .try_claim_dispatch(
+                &scope,
+                first.execution_id,
+                takeover + chrono::Duration::seconds(91),
+                chrono::Duration::seconds(90)
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE projects SET status='active' WHERE project_id=$1")
+        .bind(project.id.as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .release_dispatch(&replacement, tick, chrono::Duration::zero())
+            .await
+            .unwrap()
+    );
     let item = manifest.items[0].document_manifest_item_id;
     let wrong = TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id);
     assert!(
@@ -167,6 +306,28 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         )
         .await
         .unwrap();
+    // An abandoned provider step is not safe to re-enter until its own lease
+    // expires, even if no workflow dispatch lease remains.
+    assert!(
+        repository
+            .try_claim_dispatch(
+                &scope,
+                first.execution_id,
+                Utc::now(),
+                chrono::Duration::seconds(90)
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !repository
+            .scan_running_after(None, Utc::now(), 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id)
+    );
     assert_eq!(
         repository
             .claim(
@@ -388,6 +549,26 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .await
         .unwrap();
     let successor = repository.close(&scope, first.execution_id).await.unwrap();
+    assert!(
+        !repository
+            .scan_running_after(None, Utc::now(), 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id)
+    );
+    assert!(
+        repository
+            .try_claim_dispatch(
+                &scope,
+                first.execution_id,
+                Utc::now(),
+                chrono::Duration::seconds(90)
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(successor.revision, 2);
     assert_eq!(successor.supersedes_handoff_id, Some(handoff.handoff_id));
     assert_eq!(successor.items[0].revision_id, Some(post_close.revision_id));
@@ -444,6 +625,14 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .cancel(&scope, cancelled.execution_id)
         .await
         .unwrap();
+    assert!(
+        !repository
+            .scan_running_after(None, Utc::now(), 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == cancelled.execution_id)
+    );
     assert_eq!(
         repository
             .release_step(&scope, &late)

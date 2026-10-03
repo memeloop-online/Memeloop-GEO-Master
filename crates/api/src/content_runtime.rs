@@ -5,6 +5,7 @@
 //! the approved script re-reads Rust-owned item states on every entry.
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
+use std::{future::Future, pin::Pin};
 
 use geo_domain::{AppError, ErrorCode, TenantScope};
 use geo_worker::{
@@ -55,6 +56,48 @@ mod budget_tests {
 /// states arbitrate completed work rather than JS memory.
 pub trait ContentWorkflowExecutor: Send + Sync {
     fn dispatch(&self, scope: TenantScope, execution_id: Uuid) -> Result<(), AppError>;
+
+    /// Durable dispatch requires an awaited run. A fire-and-forget executor
+    /// must explicitly implement this method before it can hold a DB lease.
+    fn run_supervised(
+        &self,
+        _scope: TenantScope,
+        _execution_id: Uuid,
+        _cancellation: Arc<AtomicBool>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        Box::pin(async {
+            Err(AppError::capability_missing(
+                "supervised content workflow unavailable",
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DispatchOnly(AtomicUsize);
+
+    impl ContentWorkflowExecutor for DispatchOnly {
+        fn dispatch(&self, _scope: TenantScope, _id: Uuid) -> Result<(), AppError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupervised_executor_cannot_falsely_hold_a_durable_lease() {
+        let executor = DispatchOnly(AtomicUsize::new(0));
+        let scope = TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), None);
+        let error = executor
+            .run_supervised(scope, Uuid::new_v4(), Arc::new(AtomicBool::new(false)))
+            .await
+            .expect_err("fire-and-forget dispatch must not report supervised success");
+        assert_eq!(error.code, ErrorCode::CapabilityMissing);
+        assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[derive(Clone)]
@@ -82,6 +125,16 @@ impl EmbeddedContentWorkflowExecutor {
     /// Wait for a dispatched run; useful for a supervised recovery worker and
     /// integration tests. The HTTP dispatch path schedules the same operation.
     pub async fn run(&self, scope: TenantScope, execution_id: Uuid) -> Result<(), AppError> {
+        self.run_with_cancellation(scope, execution_id, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    async fn run_with_cancellation(
+        &self,
+        scope: TenantScope,
+        execution_id: Uuid,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<(), AppError> {
         let bundle = self.bundle;
         let entry = self.entry;
         let capabilities = Arc::clone(&self.capabilities);
@@ -93,6 +146,7 @@ impl EmbeddedContentWorkflowExecutor {
                 .map_err(|error| runtime_error(format!("isolate runtime unavailable: {error}")))?;
             engine.block_on(async move {
                 let bridge = HostBridge::new(capabilities, scope, application)
+                    .with_cancellation(cancellation)
                     .with_budgets(workflow_budgets());
                 let mut runtime =
                     HostRuntime::new(bundle, bridge, Some(V8_HEAP_LIMIT)).map_err(worker_error)?;
@@ -132,6 +186,14 @@ impl EmbeddedContentWorkflowExecutor {
 }
 
 impl ContentWorkflowExecutor for EmbeddedContentWorkflowExecutor {
+    fn run_supervised(
+        &self,
+        scope: TenantScope,
+        execution_id: Uuid,
+        cancellation: Arc<AtomicBool>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        Box::pin(self.run_with_cancellation(scope, execution_id, cancellation))
+    }
     fn dispatch(&self, scope: TenantScope, execution_id: Uuid) -> Result<(), AppError> {
         let runtime = self.clone();
         tokio::runtime::Handle::try_current()

@@ -1067,6 +1067,20 @@ pub trait ProjectRepository: Send + Sync {
         }
     }
 
+    /// The configuration revision bound to this cycle, not the mutable
+    /// project draft. Planning must not drift after a project edit.
+    async fn get_cycle_settings(
+        &self,
+        _scope: &TenantScope,
+        _project_id: ProjectId,
+        _cycle_id: Uuid,
+    ) -> Result<Option<ProjectSettings>, AppError> {
+        Err(AppError::new(
+            crate::ErrorCode::DependencyUnavailable,
+            "project repository does not support frozen cycle settings",
+        ))
+    }
+
     async fn get_report_cycle(
         &self,
         scope: &TenantScope,
@@ -1518,6 +1532,29 @@ impl ProjectRepository for MemoryProjectRepository {
                     .get(&cycle_id)
                     .filter(|cycle| cycle.project_id == project_id)
                     .map(|cycle| cycle.view.clone())
+            })
+            .flatten())
+    }
+
+    async fn get_cycle_settings(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        cycle_id: Uuid,
+    ) -> Result<Option<ProjectSettings>, AppError> {
+        let state = self.state.read().await;
+        let authorized = state.projects.get(&project_id).is_some_and(|project| {
+            project.operator_id == scope.operator_id
+                && project.tenant_id == scope.tenant_id
+                && scope.project_id.is_none_or(|id| id == project_id)
+        });
+        Ok(authorized
+            .then(|| {
+                state
+                    .cycles
+                    .get(&cycle_id)
+                    .filter(|cycle| cycle.project_id == project_id)
+                    .map(|cycle| cycle.settings.clone())
             })
             .flatten())
     }
