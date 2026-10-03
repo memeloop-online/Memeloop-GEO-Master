@@ -1,0 +1,346 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{Method, StatusCode, Uri},
+    routing::any,
+};
+use chrono::{Duration, Utc};
+use geo_api::{
+    AppState, BrowserBridge, ChannelDispatchDeferred, ChannelDispatchResult, ChannelService,
+    EventBus, MemoryIdempotencyStore, MemoryOperationStore, execute_channel_target,
+};
+use geo_domain::{
+    ChannelAccount, ChannelAccountRecord, ChannelJobRepository, ChannelOwnerKind, ChannelPlan,
+    ChannelSecret, ChannelStatus, ChannelTarget, ChannelTargetInput, DEVELOPMENT_OPERATOR_ID,
+    DEVELOPMENT_TENANT_ID, MemoryAuthRepository, MemoryChannelRepository, MemoryProjectRepository,
+    ProjectCreate, ProjectRepository, ProjectSettings, ProjectStatus, TenantScope,
+};
+use geo_provider::SecretEnvelope;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+#[derive(Clone)]
+struct Runner(Arc<AtomicUsize>);
+
+async fn mock_runner(
+    State(runner): State<Runner>,
+    method: Method,
+    uri: Uri,
+    payload: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    match (method.as_str(), uri.path()) {
+        ("POST", "/v1/sessions") => (
+            StatusCode::OK,
+            Json(json!({
+                "session_id":payload.unwrap().0["session_id"]
+            })),
+        ),
+        ("POST", "/v1/executions") => {
+            runner.0.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "execution_id":payload.unwrap().0["execution_id"],
+                    "status":"unknown","evidence":[]
+                })),
+            )
+        }
+        ("POST", path) if path.ends_with("/complete") => (
+            StatusCode::OK,
+            Json(json!({
+                "identity":{"platform_account_id":"verified","display_name":"Verified"},
+                "storage_state":{"cookies":[],"origins":[]}
+            })),
+        ),
+        // Model a runner still busy after its ambiguous execution response.
+        // The account reservation must survive this failed cleanup.
+        ("DELETE", _) => (StatusCode::CONFLICT, Json(json!({"error":"busy"}))),
+        _ => (StatusCode::OK, Json(json!({"closed":true}))),
+    }
+}
+
+async fn fixture() -> (
+    AppState,
+    TenantScope,
+    Uuid,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+    Arc<MemoryProjectRepository>,
+) {
+    let sends = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let runner = Runner(sends.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(any(mock_runner)).with_state(runner),
+        )
+        .await
+        .unwrap()
+    });
+    let bridge = BrowserBridge::new(format!("http://{address}"), "fixture-token".into()).unwrap();
+    let channels = Arc::new(MemoryChannelRepository::default());
+    let key = "a5".repeat(32);
+    let service = ChannelService::persistent(channels, &key, Some(bridge)).unwrap();
+    let projects = Arc::new(MemoryProjectRepository::default());
+    let state = AppState::with_stores_and_auth_and_projects(
+        Arc::new(MemoryOperationStore::default()),
+        Arc::new(MemoryIdempotencyStore::default()),
+        Arc::new(MemoryAuthRepository::development_with_password(
+            "dispatcher-fixture",
+        )),
+        projects.clone(),
+        EventBus::default(),
+        false,
+    )
+    .with_channel_service(service);
+    let tenant = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
+    let project = state
+        .project_repository()
+        .create(
+            &tenant,
+            ProjectCreate {
+                slug: None,
+                display_name: "Dispatcher fixture".into(),
+                settings: ProjectSettings::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let scope = TenantScope::new(
+        DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project.id),
+    );
+    let account_id = Uuid::new_v4();
+    let aad = format!(
+        "geo-channel-v1:{}:{}:{}:{}:session",
+        scope.operator_id, scope.tenant_id, project.id, account_id
+    );
+    let encrypted = SecretEnvelope::from_hex_key(&key)
+        .unwrap()
+        .seal(aad.as_bytes(), br#"{"cookies":[],"origins":[]}"#)
+        .unwrap();
+    state
+        .channel_service()
+        .repository
+        .save_account(
+            &scope,
+            ChannelAccountRecord {
+                account: ChannelAccount {
+                    account_id,
+                    project_id: project.id,
+                    owner_kind: ChannelOwnerKind::Customer,
+                    platform: "kimi".into(),
+                    group_id: None,
+                    status: ChannelStatus::Ready,
+                    display_name: None,
+                    platform_account_id: Some("verified".into()),
+                    avatar_url: None,
+                    enabled: true,
+                    proxy_configured: false,
+                    proxy_server: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                session: Some(ChannelSecret::new(encrypted)),
+                proxy: None,
+            },
+        )
+        .await
+        .unwrap();
+    (state, scope, account_id, sends, server, projects)
+}
+
+async fn plan_measure(
+    repository: Arc<dyn ChannelJobRepository>,
+    scope: &TenantScope,
+    account_id: Uuid,
+    scheduled_at: chrono::DateTime<Utc>,
+) -> Uuid {
+    let target_id = Uuid::new_v4();
+    repository
+        .create_plan(
+            scope,
+            ChannelPlan {
+                plan_id: Uuid::new_v4(),
+                project_id: scope.project_id.unwrap(),
+                cycle_id: Uuid::new_v4(),
+                input_hash: target_id.to_string(),
+                revision: 1,
+                created_at: Utc::now(),
+                targets: vec![ChannelTarget {
+                    target_id,
+                    input: ChannelTargetInput::Measure {
+                        account_id,
+                        provider: "kimi".into(),
+                        model: "fixture-model".into(),
+                        surface: "consumer_web".into(),
+                        search_mode: "web_search".into(),
+                        protocol_version: "v1".into(),
+                        question_set_version: "v1".into(),
+                        question: "Fixture question".into(),
+                        market: "CN".into(),
+                        language: "en".into(),
+                        scheduled_at,
+                        sample_ordinal: 0,
+                    },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    target_id
+}
+
+#[tokio::test]
+async fn duplicated_dispatch_sends_once_and_unknown_is_never_retried() {
+    let (state, scope, account, sends, server, _) = fixture().await;
+    let repo = state.channel_job_repository();
+    let target = plan_measure(
+        repo.clone(),
+        &scope,
+        account,
+        Utc::now() - Duration::seconds(1),
+    )
+    .await;
+    let (a, b) = tokio::join!(
+        execute_channel_target(&state, &scope, target),
+        execute_channel_target(&state, &scope, target)
+    );
+    assert_eq!(
+        usize::from(matches!(a, Ok(ChannelDispatchResult::Executed(_))))
+            + usize::from(matches!(b, Ok(ChannelDispatchResult::Executed(_)))),
+        1
+    );
+    let view = repo.get_target(&scope, target).await.unwrap();
+    assert_eq!(view.attempts.len(), 1);
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+    // Unknown may mean the remote request outlived our response; retain the
+    // account reservation for its bounded deadline, without retrying target.
+    let now = Utc::now();
+    assert!(
+        repo.reserve_account(
+            &scope,
+            account,
+            Uuid::new_v4(),
+            now,
+            now + Duration::minutes(5)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        execute_channel_target(&state, &scope, target)
+            .await
+            .is_err()
+    );
+    assert!(
+        repo.scan_pending(None, Utc::now(), 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn account_and_schedule_deferrals_leave_target_unattempted() {
+    let (state, scope, account, sends, server, _) = fixture().await;
+    let repo = state.channel_job_repository();
+    let future = plan_measure(
+        repo.clone(),
+        &scope,
+        account,
+        Utc::now() + Duration::days(1),
+    )
+    .await;
+    assert!(matches!(
+        execute_channel_target(&state, &scope, future)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ScheduledForLater)
+    ));
+    assert!(
+        repo.get_target(&scope, future)
+            .await
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    let due = plan_measure(
+        repo.clone(),
+        &scope,
+        account,
+        Utc::now() - Duration::seconds(1),
+    )
+    .await;
+    let mut record = state
+        .channel_service()
+        .repository
+        .get_account(&scope, account)
+        .await
+        .unwrap();
+    record.account.status = ChannelStatus::NeedsLogin;
+    state
+        .channel_service()
+        .repository
+        .save_account(&scope, record)
+        .await
+        .unwrap();
+    assert!(matches!(
+        execute_channel_target(&state, &scope, due).await.unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::AccountUnavailable)
+    ));
+    assert!(
+        repo.get_target(&scope, due)
+            .await
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn paused_project_is_not_dispatched() {
+    let (state, scope, account, sends, server, projects) = fixture().await;
+    let target = plan_measure(
+        state.channel_job_repository(),
+        &scope,
+        account,
+        Utc::now() - Duration::seconds(1),
+    )
+    .await;
+    let mut project = projects
+        .get(&scope, scope.project_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    project.status = ProjectStatus::Paused;
+    projects.insert(project).await.unwrap();
+    assert!(matches!(
+        execute_channel_target(&state, &scope, target)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ProjectInactive)
+    ));
+    assert!(
+        state
+            .channel_job_repository()
+            .get_target(&scope, target)
+            .await
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    server.abort();
+}

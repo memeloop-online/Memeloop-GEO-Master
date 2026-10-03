@@ -4,6 +4,7 @@ mod agent;
 mod agent_runtime;
 mod browser_bridge;
 mod channel_jobs;
+mod channel_tools;
 mod channels;
 mod context;
 mod cycles;
@@ -57,6 +58,10 @@ use uuid::Uuid;
 
 pub use agent_runtime::{EmbeddedAgentRuntime, RepositoryHostOps};
 pub use browser_bridge::BrowserBridge;
+pub use channel_jobs::{
+    ChannelDispatchDeferred, ChannelDispatchResult, MeasurementRequest, PlanRequest,
+    PublicationRequest, create_channel_plan, execute_channel_target,
+};
 pub use channels::ChannelService;
 pub use context::{
     AuthContext, AuthMiddlewareState, CORRELATION_ID_HEADER, CSRF_HEADER, DEV_SESSION_COOKIE_NAME,

@@ -7,9 +7,9 @@ use axum::{
 };
 use chrono::Utc;
 use geo_domain::{
-    AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelTarget, ChannelTargetInput,
-    ChannelTargetView, ErrorCode, KnowledgePurpose, ProjectId, SourceState, TenantScope,
-    sha256_hex,
+    AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelStatus, ChannelTarget,
+    ChannelTargetInput, ChannelTargetView, ErrorCode, KnowledgePurpose, ProjectId, ProjectStatus,
+    SourceState, TenantScope, sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -54,6 +54,22 @@ pub struct MeasurementRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecuteRequest {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelDispatchDeferred {
+    ProjectInactive,
+    ScheduledForLater,
+    AccountUnavailable,
+    RunnerUnavailable,
+    AccountBusy,
+    SourceUnavailable,
+}
+
+#[derive(Debug)]
+pub enum ChannelDispatchResult {
+    Executed(Box<ChannelTargetView>),
+    Deferred(ChannelDispatchDeferred),
+}
 
 fn error(error: AppError, context: RequestContext) -> ApiError {
     api_error(error, context.request_id)
@@ -308,62 +324,69 @@ pub async fn submit_plan(
     let scope = scope(&state, &tenant, project_id)
         .await
         .map_err(|e| error(e, context))?;
+    create_channel_plan(&state, &scope, cycle_id, request)
+        .await
+        .map(Json)
+        .map_err(|e| error(e, context))
+}
+
+/// Shared Rust-owned plan construction for the HTTP and Agent tool paths.
+/// The caller supplies an already-authorized project scope; the plan is
+/// idempotently frozen by the repository.
+pub async fn create_channel_plan(
+    state: &AppState,
+    scope: &TenantScope,
+    cycle_id: Uuid,
+    request: PlanRequest,
+) -> Result<ChannelPlan, AppError> {
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::forbidden("project scope required"))?;
     if state
         .project_repository()
-        .get_report_cycle(&scope, project_id, cycle_id)
-        .await
-        .map_err(|e| error(e, context))?
+        .get_report_cycle(scope, project_id, cycle_id)
+        .await?
         .is_none()
     {
-        return Err(error(AppError::not_found("cycle not found"), context));
+        return Err(AppError::not_found("cycle not found"));
     }
     if request.publications.len() + request.measurements.len() > 100 {
-        return Err(error(
-            AppError::invalid_request("channel plan exceeds 100 targets"),
-            context,
+        return Err(AppError::invalid_request(
+            "channel plan exceeds 100 targets",
         ));
     }
     let mut targets = Vec::new();
     for publish in request.publications {
-        let input = publication_input(&state, &scope, publish)
-            .await
-            .map_err(|e| error(e, context))?;
+        let input = publication_input(state, scope, publish).await?;
         targets.push(ChannelTarget {
-            target_id: target_id(cycle_id, &input).map_err(|e| error(e, context))?,
+            target_id: target_id(cycle_id, &input)?,
             input,
         });
     }
     for measure in request.measurements {
-        let input = measurement_input(&state, &scope, measure)
-            .await
-            .map_err(|e| error(e, context))?;
+        let input = measurement_input(state, scope, measure).await?;
         targets.push(ChannelTarget {
-            target_id: target_id(cycle_id, &input).map_err(|e| error(e, context))?,
+            target_id: target_id(cycle_id, &input)?,
             input,
         });
     }
     let mut ids = std::collections::HashSet::new();
     if !targets.iter().all(|target| ids.insert(target.target_id)) {
-        return Err(error(
-            AppError::invalid_request("duplicate channel target"),
-            context,
-        ));
+        return Err(AppError::invalid_request("duplicate channel target"));
     }
     let plan = ChannelPlan {
         plan_id: Uuid::new_v4(),
         project_id,
         cycle_id,
-        input_hash: request_hash(&targets).map_err(|e| error(e, context))?,
+        input_hash: request_hash(&targets)?,
         revision: 1,
         created_at: Utc::now(),
         targets,
     };
-    let saved = state
+    state
         .channel_job_repository()
-        .create_plan(&scope, plan)
+        .create_plan(scope, plan)
         .await
-        .map_err(|e| error(e, context))?;
-    Ok(Json(saved))
 }
 
 pub async fn get_plan(
@@ -413,23 +436,225 @@ pub async fn execute_target(
     let scope = scope(&state, &tenant, project_id)
         .await
         .map_err(|e| error(e, context))?;
-    let repo = state.channel_job_repository();
-    let planned = repo
-        .get_target(&scope, target_id)
+    match execute_channel_target(&state, &scope, target_id)
         .await
-        .map_err(|e| error(e, context))?;
+        .map_err(|e| error(e, context))?
+    {
+        ChannelDispatchResult::Executed(view) => Ok(Json(*view)),
+        ChannelDispatchResult::Deferred(reason) => Err(error(
+            AppError::conflict(format!("channel target deferred: {reason:?}")),
+            context,
+        )),
+    }
+}
+
+/// Accepts only a trusted project scope (from authorization or repository
+/// discovery), never an untrusted project selector from a queued payload.
+/// Inexpensive and reversible preflight happens before the one-shot claim.
+/// Once claimed, a crash leaves the target unknown for reconciliation.
+pub async fn execute_channel_target(
+    state: &AppState,
+    scope: &TenantScope,
+    target_id: Uuid,
+) -> Result<ChannelDispatchResult, AppError> {
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::forbidden("project scope required"))?;
+    let project = state
+        .project_repository()
+        .get(scope, project_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("project not found"))?;
+    if matches!(
+        project.status,
+        ProjectStatus::Paused | ProjectStatus::Archived
+    ) {
+        return Ok(ChannelDispatchResult::Deferred(
+            ChannelDispatchDeferred::ProjectInactive,
+        ));
+    }
+    let repo = state.channel_job_repository();
+    let planned = repo.get_target(scope, target_id).await?;
+    if !planned.attempts.is_empty() {
+        return Err(AppError::conflict(
+            "target already attempted; inspect or reconcile existing outcome",
+        ));
+    }
     if let ChannelTargetInput::Measure { scheduled_at, .. } = &planned.target.input
         && *scheduled_at > Utc::now()
     {
-        return Err(error(
-            AppError::conflict("scheduled measurement window has not begun"),
-            context,
+        return Ok(ChannelDispatchResult::Deferred(
+            ChannelDispatchDeferred::ScheduledForLater,
         ));
     }
-    let (target, attempt) = repo
-        .claim(&scope, target_id, Uuid::new_v4(), Utc::now())
+    let service = state.channel_service();
+    let Some(bridge) = service.browser.as_ref() else {
+        return Ok(ChannelDispatchResult::Deferred(
+            ChannelDispatchDeferred::RunnerUnavailable,
+        ));
+    };
+    let account_id = planned.target.input.account_id();
+    let reservation_id = Uuid::new_v4();
+    let now = Utc::now();
+    match repo
+        .reserve_account(
+            scope,
+            account_id,
+            reservation_id,
+            now,
+            now + chrono::Duration::minutes(5),
+        )
         .await
-        .map_err(|e| error(e, context))?;
+    {
+        Ok(()) => {}
+        Err(error) if error.code == ErrorCode::Conflict => {
+            return Ok(ChannelDispatchResult::Deferred(
+                ChannelDispatchDeferred::AccountBusy,
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    let result =
+        execute_reserved_channel_target(state, scope, target_id, planned, reservation_id, bridge)
+            .await;
+    // A claimed unknown (including a lost runner response) may still be in
+    // flight remotely. Keep the reservation until expiry so another target
+    // cannot start the same account while the runner's deadline elapses.
+    let release = match &result {
+        Ok(ChannelDispatchResult::Executed(view)) => view
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.outcome.as_ref())
+            .is_some_and(|outcome| outcome.status != ChannelOutcomeStatus::Unknown),
+        _ => repo
+            .get_target(scope, target_id)
+            .await
+            .is_ok_and(|view| view.attempts.is_empty()),
+    };
+    if release
+        && repo
+            .release_account(scope, account_id, reservation_id)
+            .await
+            .is_err()
+    {
+        tracing::warn!("channel account preflight reservation release failed");
+    }
+    result
+}
+
+async fn execute_reserved_channel_target(
+    state: &AppState,
+    scope: &TenantScope,
+    target_id: Uuid,
+    planned: ChannelTargetView,
+    reservation_id: Uuid,
+    bridge: &crate::browser_bridge::BrowserBridge,
+) -> Result<ChannelDispatchResult, AppError> {
+    let repo = state.channel_job_repository();
+    let service = state.channel_service();
+    // Another trigger may have claimed while this task waited for the account
+    // preflight. It must not open a second remote context for that target.
+    if !repo.get_target(scope, target_id).await?.attempts.is_empty() {
+        return Err(AppError::conflict(
+            "target already attempted; inspect or reconcile existing outcome",
+        ));
+    }
+    let account = match service
+        .resolve_available_account(scope, planned.target.input.account_id())
+        .await
+    {
+        Ok(account) => account,
+        Err(error) if matches!(error.code, ErrorCode::NotFound | ErrorCode::Conflict) => {
+            return Ok(ChannelDispatchResult::Deferred(
+                ChannelDispatchDeferred::AccountUnavailable,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let expected = match &planned.target.input {
+        ChannelTargetInput::Publish { platform, .. } => platform.as_str(),
+        ChannelTargetInput::Measure { .. } => "kimi",
+    };
+    if account.platform != expected
+        || !account.enabled
+        || account.status != ChannelStatus::Ready
+        || account.platform_account_id.is_none()
+    {
+        return Ok(ChannelDispatchResult::Deferred(
+            ChannelDispatchDeferred::AccountUnavailable,
+        ));
+    }
+    if let ChannelTargetInput::Publish {
+        source_id,
+        source_version_id,
+        ..
+    } = &planned.target.input
+    {
+        let source = state
+            .knowledge_repository()
+            .get_source(scope, *source_id)
+            .await?;
+        if !source.is_some_and(|source| {
+            source.purpose == KnowledgePurpose::Public && source.state == SourceState::Active
+        }) || state
+            .knowledge_repository()
+            .get_source_version(scope, *source_id, *source_version_id)
+            .await?
+            .is_none()
+        {
+            return Ok(ChannelDispatchResult::Deferred(
+                ChannelDispatchDeferred::SourceUnavailable,
+            ));
+        }
+    }
+    // Opening and verifying an ephemeral browser context is reversible; no
+    // publication or measurement is sent before the durable claim. This also
+    // checks runner/cipher/session availability without consuming the attempt.
+    let session = match service
+        .resume_available_browser(scope, account.account_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(error)
+            if matches!(
+                error.code,
+                ErrorCode::Conflict
+                    | ErrorCode::CapabilityMissing
+                    | ErrorCode::NotFound
+                    | ErrorCode::DependencyUnavailable
+            ) =>
+        {
+            return Ok(ChannelDispatchResult::Deferred(
+                ChannelDispatchDeferred::AccountUnavailable,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let identity = bridge.complete(session).await;
+    let verified = matches!(
+        identity,
+        Ok(ref result) if Some(result.identity.platform_account_id.as_str()) == account.platform_account_id.as_deref()
+    );
+    if !verified {
+        if bridge.close(session).await.is_err() {
+            tracing::warn!("browser preflight session cleanup failed");
+        }
+        return Ok(ChannelDispatchResult::Deferred(
+            ChannelDispatchDeferred::AccountUnavailable,
+        ));
+    }
+    let (target, attempt) = match repo
+        .claim_reserved(scope, target_id, Uuid::new_v4(), reservation_id, Utc::now())
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            if bridge.close(session).await.is_err() {
+                tracing::warn!("browser preflight session cleanup failed");
+            }
+            return Err(error);
+        }
+    };
     let (operation, payload) = match &target.input {
         ChannelTargetInput::Publish { title, body, .. } => {
             ("publish", json!({"title":title,"body":body}))
@@ -453,71 +678,47 @@ pub async fn execute_target(
         ),
     };
     let now = Utc::now();
-    let account = state
-        .channel_service()
-        .resolve_available_account(&scope, target.input.account_id())
-        .await;
-    let resolved = match account {
-        Ok(record) => {
-            let expected = match &target.input {
-                ChannelTargetInput::Publish { platform, .. } => platform.as_str(),
-                ChannelTargetInput::Measure { .. } => "kimi",
-            };
-            if record.platform != expected || !record.enabled {
-                Err(AppError::conflict("account no longer matches target"))
-            } else {
-                // Account state remains encrypted and server-only. Completion
-                // reidentifies the actual platform user on this fresh context.
-                async {
-                    let service = state.channel_service();
-                    if let ChannelTargetInput::Publish {
-                        source_id,
-                        source_version_id,
-                        ..
-                    } = &target.input
-                    {
-                        let source = state
-                            .knowledge_repository()
-                            .get_source(&scope, *source_id)
-                            .await?
-                            .ok_or_else(|| AppError::conflict("source withdrawn"))?;
-                        if source.purpose != KnowledgePurpose::Public
-                            || source.state != SourceState::Active
-                        {
-                            return Err(AppError::conflict("source no longer public"));
-                        }
-                        state
-                            .knowledge_repository()
-                            .get_source_version(&scope, *source_id, *source_version_id)
-                            .await?
-                            .ok_or_else(|| {
-                                AppError::conflict("source version no longer available")
-                            })?;
-                    }
-                    let session = service
-                        .resume_available_browser(&scope, record.account_id)
-                        .await?;
-                    // resume_available_browser requires a configured bridge;
-                    // keep cleanup even if configuration somehow changed.
-                    let bridge = service
-                        .browser
-                        .as_ref()
-                        .expect("successful browser resume requires bridge");
-                    execute_and_close(
-                        bridge,
-                        session,
-                        record.platform_account_id.as_deref(),
-                        attempt.attempt_id,
-                        operation,
-                        &payload,
-                    )
-                    .await
-                }
-                .await
+    // Recheck mutable eligibility after the claim. Even a withdrawal at this
+    // point must leave an honest attempted outcome, not release the one-shot.
+    let resolved = async {
+        if let ChannelTargetInput::Publish {
+            source_id,
+            source_version_id,
+            ..
+        } = &target.input
+        {
+            let source = state
+                .knowledge_repository()
+                .get_source(scope, *source_id)
+                .await?
+                .ok_or_else(|| AppError::conflict("source withdrawn"))?;
+            if source.purpose != KnowledgePurpose::Public || source.state != SourceState::Active {
+                return Err(AppError::conflict("source no longer public"));
             }
+            state
+                .knowledge_repository()
+                .get_source_version(scope, *source_id, *source_version_id)
+                .await?
+                .ok_or_else(|| AppError::conflict("source version no longer available"))?;
         }
-        Err(error) => Err(error),
-    };
+        execute_and_close(
+            bridge,
+            session,
+            account.platform_account_id.as_deref(),
+            attempt.attempt_id,
+            operation,
+            &payload,
+        )
+        .await
+    }
+    .await;
+    if resolved
+        .as_ref()
+        .is_err_and(|error| error.message.starts_with("source "))
+        && bridge.close(session).await.is_err()
+    {
+        tracing::warn!("browser execution session cleanup failed");
+    }
     let outcome = match resolved {
         Ok(result) => {
             let matched = result.execution_id == attempt.attempt_id;
@@ -573,10 +774,9 @@ pub async fn execute_target(
             fixture: false,
         },
     };
-    repo.finish(&scope, target_id, attempt.attempt_id, outcome, Utc::now())
+    repo.finish(scope, target_id, attempt.attempt_id, outcome, Utc::now())
         .await
-        .map(Json)
-        .map_err(|e| error(e, context))
+        .map(|view| ChannelDispatchResult::Executed(Box::new(view)))
 }
 
 #[cfg(test)]

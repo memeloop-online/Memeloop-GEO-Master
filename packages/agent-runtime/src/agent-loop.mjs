@@ -9,6 +9,113 @@ const KNOWLEDGE_SEARCH = "knowledge_search";
 const KNOWLEDGE_IMPORT_ATTACHMENTS = "knowledge_import_attachments";
 const REPORT_GET = "report_get";
 const REPORT_REDUCE = "report_reduce";
+const CHANNEL_DISCOVER = "channel_discover";
+const CHANNEL_PLAN = "channel_plan";
+const CHANNEL_MANIFEST_READ = "channel_manifest_read";
+const CHANNEL_TARGET_EXECUTE = "channel_target_execute";
+const CHANNEL_TOOLS = [
+  CHANNEL_DISCOVER,
+  CHANNEL_PLAN,
+  CHANNEL_MANIFEST_READ,
+  CHANNEL_TARGET_EXECUTE,
+];
+const TOOL_DESCRIPTIONS = {
+  [CHANNEL_DISCOVER]:
+    "Discover current-project public source versions or available publishing/measurement accounts. Use returned IDs as references in channel_plan.",
+  [CHANNEL_PLAN]:
+    "Freeze a finite publication/measurement target plan from discovered references. The backend queues and dispatches executable targets automatically; no manual approval or per-target execution loop is needed.",
+  [CHANNEL_MANIFEST_READ]:
+    "Read a page of the frozen channel target manifest and its actual statuses. A completed target is not necessarily a successful publication: inspect outcome_status and fixture. Deferred is a normal result.",
+  [CHANNEL_TARGET_EXECUTE]:
+    "Optional diagnostic/idempotent query or execution for one frozen target_id. Backend dispatch is automatic; do not loop over targets. Unknown_result must be reconciled, never blindly resent. A completed result is not necessarily successful: inspect outcome_status and fixture.",
+};
+const CHANNEL_DISCOVER_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["kind"],
+  properties: {
+    kind: { type: "string", enum: ["public_sources", "accounts"] },
+    cursor: { type: "string" },
+    limit: { type: "integer", minimum: 1, maximum: 100 },
+  },
+};
+const CHANNEL_PLAN_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  description:
+    "Provide at least one and at most 100 total publication plus measurement targets, referencing discovered IDs. Do not include text bodies, hashes, or scope selectors.",
+  required: ["publications", "measurements"],
+  properties: {
+    cycle_id: { type: "string", format: "uuid" },
+    publications: {
+      type: "array",
+      maxItems: 100,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["source_id", "source_version_id", "platform", "account_id"],
+        properties: {
+          source_id: { type: "string", format: "uuid" },
+          source_version_id: { type: "string", format: "uuid" },
+          platform: { type: "string" },
+          account_id: { type: "string", format: "uuid" },
+        },
+      },
+    },
+    measurements: {
+      type: "array",
+      maxItems: 100,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "account_id",
+          "provider",
+          "model",
+          "surface",
+          "search_mode",
+          "protocol_version",
+          "question_set_version",
+          "question",
+          "market",
+          "language",
+          "scheduled_at",
+          "sample_ordinal",
+        ],
+        properties: {
+          account_id: { type: "string", format: "uuid" },
+          provider: { type: "string" },
+          model: { type: "string" },
+          surface: { type: "string" },
+          search_mode: { type: "string" },
+          protocol_version: { type: "string" },
+          question_set_version: { type: "string" },
+          question: { type: "string" },
+          market: { type: "string" },
+          language: { type: "string" },
+          scheduled_at: { type: "string", format: "date-time" },
+          sample_ordinal: { type: "integer", minimum: 0 },
+        },
+      },
+    },
+  },
+};
+const CHANNEL_MANIFEST_READ_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    cycle_id: { type: "string", format: "uuid" },
+    revision: { type: "integer", minimum: 1 },
+    cursor: { type: "string" },
+    limit: { type: "integer", minimum: 1, maximum: 100 },
+  },
+};
+const CHANNEL_TARGET_EXECUTE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["target_id"],
+  properties: { target_id: { type: "string", format: "uuid" } },
+};
 const REPORT_GET_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -81,8 +188,9 @@ export async function main(input) {
           KNOWLEDGE_SEARCH,
           REPORT_GET,
           REPORT_REDUCE,
+          ...CHANNEL_TOOLS,
         ]
-      : [KNOWLEDGE_SEARCH, REPORT_GET, REPORT_REDUCE];
+      : [KNOWLEDGE_SEARCH, REPORT_GET, REPORT_REDUCE, ...CHANNEL_TOOLS];
   const definition = createDefinition(modelId, toolNames);
   const context = createContext({
     session,
@@ -237,7 +345,7 @@ function createContext({ session, definition, modelId, provider, tools }) {
   return {
     agentToolLoop: {
       enableToolLoop: true,
-      maxIterations: 4,
+      maxIterations: 8,
       textToolCallProtocolEnabled: false,
       toolPermissions: {
         default: "deny",
@@ -246,6 +354,7 @@ function createContext({ session, definition, modelId, provider, tools }) {
           { pattern: KNOWLEDGE_IMPORT_ATTACHMENTS, action: "allow" },
           { pattern: REPORT_GET, action: "allow" },
           { pattern: REPORT_REDUCE, action: "allow" },
+          ...CHANNEL_TOOLS.map((pattern) => ({ pattern, action: "allow" })),
         ],
       },
     },
@@ -320,7 +429,7 @@ function createHostProvider(host, configuredModel, toolFailures) {
           type: "function",
           function: {
             name: tool.name,
-            description: tool.description ?? "",
+            description: tool.description ?? TOOL_DESCRIPTIONS[tool.name] ?? "",
             parameters: tool.inputSchema,
           },
         })),
@@ -493,6 +602,10 @@ function resolveHost(requireImport) {
     typeof denoOps.op_host_knowledge_search_v1 !== "function" ||
     typeof denoOps.op_host_report_get_v1 !== "function" ||
     typeof denoOps.op_host_report_reduce_v1 !== "function" ||
+    typeof denoOps.op_host_channel_discover_v1 !== "function" ||
+    typeof denoOps.op_host_channel_plan_v1 !== "function" ||
+    typeof denoOps.op_host_channel_manifest_read_v1 !== "function" ||
+    typeof denoOps.op_host_channel_target_execute_v1 !== "function" ||
     (requireImport &&
       typeof denoOps.op_host_knowledge_import_attachments_v1 !== "function") ||
     typeof denoOps.op_host_emit !== "function"
@@ -531,6 +644,28 @@ function resolveHost(requireImport) {
     async reportReduce(request) {
       return JSON.parse(
         await denoOps.op_host_report_reduce_v1(JSON.stringify(request)),
+      );
+    },
+    async channelDiscover(request) {
+      return JSON.parse(
+        await denoOps.op_host_channel_discover_v1(JSON.stringify(request)),
+      );
+    },
+    async channelPlan(request) {
+      return JSON.parse(
+        await denoOps.op_host_channel_plan_v1(JSON.stringify(request)),
+      );
+    },
+    async channelManifestRead(request) {
+      return JSON.parse(
+        await denoOps.op_host_channel_manifest_read_v1(JSON.stringify(request)),
+      );
+    },
+    async channelTargetExecute(request) {
+      return JSON.parse(
+        await denoOps.op_host_channel_target_execute_v1(
+          JSON.stringify(request),
+        ),
       );
     },
   };
@@ -678,6 +813,16 @@ function createHostTools(host, failures, attachments) {
   };
   const reportGet = reportTool(REPORT_GET, "reportGet");
   const reportReduce = reportTool(REPORT_REDUCE, "reportReduce");
+  const channelDiscover = reportTool(CHANNEL_DISCOVER, "channelDiscover");
+  const channelPlan = reportTool(CHANNEL_PLAN, "channelPlan");
+  const channelManifestRead = reportTool(
+    CHANNEL_MANIFEST_READ,
+    "channelManifestRead",
+  );
+  const channelTargetExecute = reportTool(
+    CHANNEL_TARGET_EXECUTE,
+    "channelTargetExecute",
+  );
   const importSchema = {
     type: "object",
     additionalProperties: false,
@@ -718,7 +863,15 @@ function createHostTools(host, failures, attachments) {
             ? reportGet
             : id === REPORT_REDUCE
               ? reportReduce
-              : undefined,
+              : id === CHANNEL_DISCOVER
+                ? channelDiscover
+                : id === CHANNEL_PLAN
+                  ? channelPlan
+                  : id === CHANNEL_MANIFEST_READ
+                    ? channelManifestRead
+                    : id === CHANNEL_TARGET_EXECUTE
+                      ? channelTargetExecute
+                      : undefined,
     listTools: () =>
       attachments.length > 0
         ? [
@@ -726,8 +879,9 @@ function createHostTools(host, failures, attachments) {
             KNOWLEDGE_SEARCH,
             REPORT_GET,
             REPORT_REDUCE,
+            ...CHANNEL_TOOLS,
           ]
-        : [KNOWLEDGE_SEARCH, REPORT_GET, REPORT_REDUCE],
+        : [KNOWLEDGE_SEARCH, REPORT_GET, REPORT_REDUCE, ...CHANNEL_TOOLS],
     getToolParameterSchema: (id) =>
       id === KNOWLEDGE_SEARCH
         ? KNOWLEDGE_SEARCH_SCHEMA
@@ -737,7 +891,15 @@ function createHostTools(host, failures, attachments) {
             ? REPORT_GET_SCHEMA
             : id === REPORT_REDUCE
               ? REPORT_REDUCE_SCHEMA
-              : undefined,
+              : id === CHANNEL_DISCOVER
+                ? CHANNEL_DISCOVER_SCHEMA
+                : id === CHANNEL_PLAN
+                  ? CHANNEL_PLAN_SCHEMA
+                  : id === CHANNEL_MANIFEST_READ
+                    ? CHANNEL_MANIFEST_READ_SCHEMA
+                    : id === CHANNEL_TARGET_EXECUTE
+                      ? CHANNEL_TARGET_EXECUTE_SCHEMA
+                      : undefined,
     registerTool: () => {
       throw new Error("The embedded loop cannot register tools.");
     },

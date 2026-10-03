@@ -35,7 +35,7 @@ pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope}
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v3";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v4";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -81,11 +81,15 @@ pub enum HostOp {
     ReportGet,
     /// Reduce a due cycle from server-owned evidence.
     ReportReduce,
+    ChannelDiscover,
+    ChannelPlan,
+    ChannelManifestRead,
+    ChannelTargetExecute,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 12;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -97,6 +101,10 @@ impl HostOp {
         Self::Measure,
         Self::ReportGet,
         Self::ReportReduce,
+        Self::ChannelDiscover,
+        Self::ChannelPlan,
+        Self::ChannelManifestRead,
+        Self::ChannelTargetExecute,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -110,6 +118,10 @@ impl HostOp {
             Self::Measure => "measure.sample.v2",
             Self::ReportGet => "report.get.v1",
             Self::ReportReduce => "report.reduce.v1",
+            Self::ChannelDiscover => "channel.discover.v1",
+            Self::ChannelPlan => "channel.plan.v1",
+            Self::ChannelManifestRead => "channel.manifest.read.v1",
+            Self::ChannelTargetExecute => "channel.target.execute.v1",
         }
     }
 
@@ -124,6 +136,10 @@ impl HostOp {
             Self::Measure => "op_host_measure_sample_v2",
             Self::ReportGet => "op_host_report_get_v1",
             Self::ReportReduce => "op_host_report_reduce_v1",
+            Self::ChannelDiscover => "op_host_channel_discover_v1",
+            Self::ChannelPlan => "op_host_channel_plan_v1",
+            Self::ChannelManifestRead => "op_host_channel_manifest_read_v1",
+            Self::ChannelTargetExecute => "op_host_channel_target_execute_v1",
         }
     }
 
@@ -175,6 +191,10 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 32),
                 HostOpLimits::new(120_000, 4),
+                HostOpLimits::new(15_000, 64),
+                HostOpLimits::new(60_000, 16),
+                HostOpLimits::new(15_000, 64),
+                HostOpLimits::new(120_000, 32),
             ],
         }
     }
@@ -253,11 +273,13 @@ impl HostOpError {
             code,
             message: message.into(),
             retryable: code.retryable()
-                && !(matches!(op, HostOp::Publish | HostOp::Measure)
-                    && matches!(
-                        code,
-                        HostOpErrorCode::DeadlineExceeded | HostOpErrorCode::Failed
-                    )),
+                && !(matches!(
+                    op,
+                    HostOp::Publish | HostOp::Measure | HostOp::ChannelTargetExecute
+                ) && matches!(
+                    code,
+                    HostOpErrorCode::DeadlineExceeded | HostOpErrorCode::Failed
+                )),
         }
     }
 
@@ -468,6 +490,407 @@ pub trait HostOps: Send + Sync {
             HostOp::ReportReduce,
             "report reduction is not configured",
         ))
+    }
+
+    async fn channel_discover(
+        &self,
+        _scope: &TenantScope,
+        _request: ChannelDiscoverRequest,
+    ) -> Result<ChannelDiscoveryPage, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ChannelDiscover,
+            "channel discovery is not configured",
+        ))
+    }
+
+    async fn channel_plan(
+        &self,
+        _scope: &TenantScope,
+        _request: ChannelPlanRequest,
+    ) -> Result<ChannelPlanReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ChannelPlan,
+            "channel planning is not configured",
+        ))
+    }
+
+    async fn channel_manifest_read(
+        &self,
+        _scope: &TenantScope,
+        _request: ChannelManifestReadRequest,
+    ) -> Result<ChannelManifestPage, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ChannelManifestRead,
+            "channel manifest reading is not configured",
+        ))
+    }
+
+    async fn channel_target_execute(
+        &self,
+        _scope: &TenantScope,
+        _request: ChannelTargetExecuteRequest,
+    ) -> Result<ChannelExecutionResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ChannelTargetExecute,
+            "channel target execution is not configured",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelDiscoveryKind {
+    PublicSources,
+    Accounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelDiscoverRequest {
+    pub kind: ChannelDiscoveryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChannelDiscoveryItem {
+    PublicSource {
+        source_id: Uuid,
+        source_version_id: Uuid,
+        name: String,
+        media_type: String,
+    },
+    Account {
+        account_id: Uuid,
+        platform: String,
+        display_name: Option<String>,
+        status: String,
+        enabled: bool,
+        owner_kind: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelDiscoveryPage {
+    pub kind: ChannelDiscoveryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_cycle_id: Option<Uuid>,
+    pub items: Vec<ChannelDiscoveryItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPublicationPlanItem {
+    pub source_id: Uuid,
+    pub source_version_id: Uuid,
+    pub platform: String,
+    pub account_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelMeasurementPlanItem {
+    pub account_id: Uuid,
+    pub provider: String,
+    pub model: String,
+    pub surface: String,
+    pub search_mode: String,
+    pub protocol_version: String,
+    pub question_set_version: String,
+    pub question: String,
+    pub market: String,
+    pub language: String,
+    pub scheduled_at: DateTime<Utc>,
+    pub sample_ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPlanRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<Uuid>,
+    pub publications: Vec<ChannelPublicationPlanItem>,
+    pub measurements: Vec<ChannelMeasurementPlanItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPlanReceipt {
+    pub plan_id: Uuid,
+    pub cycle_id: Uuid,
+    pub revision: i32,
+    pub expected_count: u64,
+    pub dispatch_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelManifestReadRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelTargetKind {
+    Publish,
+    Measure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelExecutionState {
+    Pending,
+    Deferred,
+    UnknownResult,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelExecutionResult {
+    pub target_id: Uuid,
+    pub state: ChannelExecutionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelTargetSummary {
+    pub target_id: Uuid,
+    pub kind: ChannelTargetKind,
+    pub account_id: Uuid,
+    pub platform_or_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_at: Option<DateTime<Utc>>,
+    pub execution: ChannelExecutionResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelManifestPage {
+    pub plan_id: Uuid,
+    pub cycle_id: Uuid,
+    pub revision: i32,
+    pub sealed: bool,
+    pub expected_count: u64,
+    pub items: Vec<ChannelTargetSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelTargetExecuteRequest {
+    pub target_id: Uuid,
+}
+
+fn channel_cursor_valid(cursor: &Option<String>) -> bool {
+    cursor
+        .as_ref()
+        .is_none_or(|value| !value.is_empty() && value.len() <= 512)
+}
+
+fn channel_label_valid(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 512
+}
+
+impl ChannelDiscoverRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if !channel_cursor_valid(&self.cursor)
+            || self.limit.is_some_and(|limit| limit == 0 || limit > 100)
+        {
+            return Err("channel discovery cursor or limit is invalid".into());
+        }
+        Ok(())
+    }
+}
+impl ChannelDiscoveryPage {
+    pub fn validate_for(&self, request: &ChannelDiscoverRequest) -> Result<(), String> {
+        if self.kind != request.kind
+            || self.current_cycle_id.is_some_and(|id| id.is_nil())
+            || self.items.len() > request.limit.unwrap_or(25) as usize
+            || !channel_cursor_valid(&self.next_cursor)
+            || self.items.iter().any(|item| match item {
+                ChannelDiscoveryItem::PublicSource {
+                    source_id,
+                    source_version_id,
+                    name,
+                    media_type,
+                } => {
+                    request.kind != ChannelDiscoveryKind::PublicSources
+                        || source_id.is_nil()
+                        || source_version_id.is_nil()
+                        || !channel_label_valid(name)
+                        || !channel_label_valid(media_type)
+                }
+                ChannelDiscoveryItem::Account {
+                    account_id,
+                    platform,
+                    display_name,
+                    status,
+                    owner_kind,
+                    ..
+                } => {
+                    request.kind != ChannelDiscoveryKind::Accounts
+                        || account_id.is_nil()
+                        || !channel_label_valid(platform)
+                        || display_name
+                            .as_ref()
+                            .is_some_and(|value| !channel_label_valid(value))
+                        || !channel_label_valid(status)
+                        || !channel_label_valid(owner_kind)
+                }
+            })
+        {
+            return Err("channel discovery page does not match the request".into());
+        }
+        Ok(())
+    }
+}
+impl ChannelPlanRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cycle_id.is_some_and(|id| id.is_nil())
+            || self.publications.len() + self.measurements.len() == 0
+            || self.publications.len() + self.measurements.len() > 100
+            || self.publications.iter().any(|item| {
+                item.source_id.is_nil()
+                    || item.source_version_id.is_nil()
+                    || item.account_id.is_nil()
+                    || !channel_label_valid(&item.platform)
+            })
+            || self.measurements.iter().any(|item| {
+                item.account_id.is_nil()
+                    || [
+                        &item.provider,
+                        &item.model,
+                        &item.surface,
+                        &item.search_mode,
+                        &item.protocol_version,
+                        &item.question_set_version,
+                        &item.market,
+                        &item.language,
+                    ]
+                    .iter()
+                    .any(|value| !channel_label_valid(value))
+                    || item.question.trim().is_empty()
+                    || item.question.len() > MAX_MEASUREMENT_QUESTION_BYTES
+            })
+        {
+            return Err("channel plan contains invalid or excess targets".into());
+        }
+        Ok(())
+    }
+}
+impl ChannelPlanReceipt {
+    pub fn validate_for(&self, request: &ChannelPlanRequest) -> Result<(), String> {
+        if self.plan_id.is_nil()
+            || self.cycle_id.is_nil()
+            || self.revision <= 0
+            || request.cycle_id.is_some_and(|id| id != self.cycle_id)
+            || self.expected_count
+                != (request.publications.len() + request.measurements.len()) as u64
+            || self.dispatch_state != "pending"
+        {
+            return Err("channel plan receipt does not match the request".into());
+        }
+        Ok(())
+    }
+}
+impl ChannelManifestReadRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cycle_id.is_some_and(|id| id.is_nil())
+            || self.revision.is_some_and(|revision| revision <= 0)
+            || !channel_cursor_valid(&self.cursor)
+            || self.limit.is_some_and(|limit| limit == 0 || limit > 100)
+        {
+            return Err("channel manifest cursor, revision or limit is invalid".into());
+        }
+        Ok(())
+    }
+}
+impl ChannelExecutionResult {
+    pub fn validate_for(&self, target_id: Uuid) -> Result<(), String> {
+        if target_id.is_nil()
+            || self.target_id != target_id
+            || self.attempt_id.is_some_and(|id| id.is_nil())
+            || self.evidence_ref.is_some_and(|id| id.is_nil())
+            || [
+                &self.outcome_status,
+                &self.deferred_reason,
+                &self.public_url,
+            ]
+            .iter()
+            .any(|value| value.as_ref().is_some_and(|value| value.len() > 2048))
+        {
+            return Err("channel execution does not match the target".into());
+        }
+        Ok(())
+    }
+}
+impl ChannelManifestPage {
+    pub fn validate_for(&self, request: &ChannelManifestReadRequest) -> Result<(), String> {
+        if self.plan_id.is_nil()
+            || self.cycle_id.is_nil()
+            || self.revision <= 0
+            || request.cycle_id.is_some_and(|id| id != self.cycle_id)
+            || request
+                .revision
+                .is_some_and(|revision| revision != self.revision)
+            || self.items.len() > request.limit.unwrap_or(25) as usize
+            || !channel_cursor_valid(&self.next_cursor)
+            || self.items.iter().any(|item| {
+                item.target_id.is_nil()
+                    || item.account_id.is_nil()
+                    || !channel_label_valid(&item.platform_or_provider)
+                    || item.source_id.is_some_and(|id| id.is_nil())
+                    || item.source_version_id.is_some_and(|id| id.is_nil())
+                    || item.execution.validate_for(item.target_id).is_err()
+                    || match item.kind {
+                        ChannelTargetKind::Publish => {
+                            item.source_id.is_none() || item.source_version_id.is_none()
+                        }
+                        ChannelTargetKind::Measure => {
+                            item.source_id.is_some()
+                                || item.source_version_id.is_some()
+                                || item.scheduled_at.is_none()
+                        }
+                    }
+            })
+        {
+            return Err("channel manifest page does not match the request".into());
+        }
+        Ok(())
+    }
+}
+impl ChannelTargetExecuteRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.target_id.is_nil() {
+            return Err("target ID must be non-zero".into());
+        }
+        Ok(())
     }
 }
 
@@ -1197,14 +1620,14 @@ where
         biased;
         result = &mut work => result,
         () = &mut cancellation => {
-            if matches!(op, HostOp::Publish | HostOp::Measure) {
+            if matches!(op, HostOp::Publish | HostOp::Measure | HostOp::ChannelTargetExecute) {
                 Err(HostOpError::unknown_result(op, "in-flight external result must be reconciled after cancellation"))
             } else {
                 Err(HostOpError::cancelled(op))
             }
         },
         () = &mut deadline => {
-            if matches!(op, HostOp::Publish | HostOp::Measure) {
+            if matches!(op, HostOp::Publish | HostOp::Measure | HostOp::ChannelTargetExecute) {
                 Err(HostOpError::unknown_result(op, "in-flight external result must be reconciled after deadline"))
             } else {
                 Err(HostOpError::deadline_exceeded(op, limits.timeout_ms))
@@ -1428,7 +1851,11 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_effect_timeout_and_cancellation_require_reconciliation() {
-        for op in [HostOp::Publish, HostOp::Measure] {
+        for op in [
+            HostOp::Publish,
+            HostOp::Measure,
+            HostOp::ChannelTargetExecute,
+        ] {
             let cancelled = Arc::new(AtomicBool::new(true));
             let error = under_budget(
                 op,

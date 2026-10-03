@@ -1,5 +1,6 @@
 mod channels;
 mod config;
+mod dispatch;
 mod runtime;
 
 use axum::Router;
@@ -58,6 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         (state, false)
     };
+    dispatch::spawn(state.clone());
     let app: Router = router(state);
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(

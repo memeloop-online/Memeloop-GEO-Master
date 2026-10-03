@@ -60,6 +60,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 12,
         description: "successor cycles",
     },
+    MigrationMetadata {
+        version: 13,
+        description: "channel preflight reservations",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {
@@ -80,7 +84,14 @@ mod tests {
         let embedded = embedded_migrations().iter().collect::<Vec<_>>();
 
         assert_eq!(metadata.len(), embedded.len());
-        assert_eq!(metadata[0].version, embedded[0].version);
-        assert_eq!(metadata[0].description, embedded[0].description);
+        for (metadata, embedded) in metadata.iter().zip(embedded) {
+            assert_eq!(metadata.version, embedded.version);
+            // Metadata may add operational caveats after the SQL filename.
+            assert!(
+                metadata
+                    .description
+                    .starts_with(embedded.description.as_ref())
+            );
+        }
     }
 }

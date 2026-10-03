@@ -239,9 +239,15 @@ async fn api_freezes_source_bytes_rejects_uploaded_receipt_and_preserves_report_
         ))
         .await
         .unwrap();
-    assert_eq!(execution.status(), StatusCode::OK);
-    let execution = content(execution).await;
-    assert_eq!(execution["attempts"][0]["outcome"]["status"], "unsupported");
+    assert_eq!(execution.status(), StatusCode::CONFLICT);
+    // Missing runner/login capability is a reversible preflight deferral,
+    // never a consumed one-shot attempt or a fabricated outcome.
+    let view = state
+        .channel_job_repository()
+        .get_target(&scope, Uuid::parse_str(target).unwrap())
+        .await
+        .unwrap();
+    assert!(view.attempts.is_empty());
     let duplicate = app
         .oneshot(request(
             "POST",
@@ -269,10 +275,7 @@ async fn api_freezes_source_bytes_rejects_uploaded_receipt_and_preserves_report_
         .unwrap();
     assert_eq!(ledger.manifests[0].expected_count, Some(1));
     assert_eq!(ledger.manifests[1].expected_count, Some(1));
-    assert_eq!(
-        ledger.publications.as_ref().unwrap()[0].reason.as_deref(),
-        Some("execution unavailable: CapabilityMissing")
-    );
+    assert!(ledger.publications.as_ref().unwrap()[0].reason.is_none());
     let input = ReportReduceInput {
         project_id: project.id,
         cycle_id: start.cycle_id,
@@ -303,7 +306,7 @@ async fn api_freezes_source_bytes_rejects_uploaded_receipt_and_preserves_report_
         ReportAvailability::Available
     );
     assert_eq!(report.publications.expected_count, Some(1));
-    assert_eq!(report.publications.counts["deferred"], 1);
+    assert_eq!(report.publications.counts["pending"], 1);
     assert_eq!(report.measurements.expected_count, Some(1));
     assert_eq!(report.measurements.counts["pending"], 1);
     assert!(!report.measurements.counts.contains_key("not_mentioned"));

@@ -198,7 +198,15 @@ test("report reduction and immutable read are exposed as separate scoped host to
     assert.deepEqual(reads, [{}]);
     assert.deepEqual(
       requests[0].tools.map((tool) => tool.function.name),
-      ["knowledge_search", "report_get", "report_reduce"],
+      [
+        "knowledge_search",
+        "report_get",
+        "report_reduce",
+        "channel_discover",
+        "channel_plan",
+        "channel_manifest_read",
+        "channel_target_execute",
+      ],
     );
     assert.match(requests[1].messages.at(-1).content, /"status":"partial"/u);
     assert.match(requests[2].messages.at(-1).content, /"evidence_id"/u);
@@ -323,6 +331,10 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "knowledge_search",
         "report_get",
         "report_reduce",
+        "channel_discover",
+        "channel_plan",
+        "channel_manifest_read",
+        "channel_target_execute",
       ],
     );
     const importSchema = modelRequests[0].tools[0].function.parameters;
@@ -353,6 +365,401 @@ test("attachment-only turn imports bound items, searches its release, and answer
     assert.match(modelRequests[2].messages.at(-1).content, /Two years/u);
     assert.equal(completion.turn_id, "turn-import-0001");
     assert.match(completion.answer, /Guide/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("channel tools discover references, freeze a plan, read the manifest, and preserve deferred outcomes", async () => {
+  const ids = {
+    source: "00000000-0000-4000-8000-000000000101",
+    version: "00000000-0000-4000-8000-000000000102",
+    account: "00000000-0000-4000-8000-000000000103",
+    cycle: "00000000-0000-4000-8000-000000000104",
+    target: "00000000-0000-4000-8000-000000000105",
+  };
+  const calls = [];
+  const requests = [];
+  const plan = {
+    cycle_id: ids.cycle,
+    publications: [
+      {
+        source_id: ids.source,
+        source_version_id: ids.version,
+        platform: "public-platform",
+        account_id: ids.account,
+      },
+    ],
+    measurements: [
+      {
+        account_id: ids.account,
+        provider: "provider",
+        model: "search-model",
+        surface: "web",
+        search_mode: "official_search",
+        protocol_version: "v1",
+        question_set_version: "set-v1",
+        question: "What is available?",
+        market: "global",
+        language: "en",
+        scheduled_at: "2026-10-03T08:00:00Z",
+        sample_ordinal: 0,
+      },
+    ],
+  };
+  const steps = [
+    ["channel_discover", { kind: "public_sources", limit: 5 }],
+    ["channel_discover", { kind: "accounts" }],
+    ["channel_plan", plan],
+    ["channel_manifest_read", { cycle_id: ids.cycle, revision: 1, limit: 10 }],
+    ["channel_target_execute", { target_id: ids.target }],
+  ];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected knowledge search");
+    },
+    async channelDiscover(request) {
+      calls.push(["discover", request]);
+      return request.kind === "public_sources"
+        ? {
+            kind: "public_sources",
+            current_cycle_id: ids.cycle,
+            items: [
+              {
+                kind: "public_source",
+                source_id: ids.source,
+                source_version_id: ids.version,
+                name: "Public guide",
+                media_type: "text/plain",
+              },
+            ],
+          }
+        : {
+            kind: "accounts",
+            current_cycle_id: ids.cycle,
+            items: [
+              {
+                kind: "account",
+                account_id: ids.account,
+                platform: "public-platform",
+                status: "ready",
+                enabled: true,
+                owner_kind: "project",
+              },
+            ],
+          };
+    },
+    async channelPlan(request) {
+      calls.push(["plan", request]);
+      return {
+        plan_id: "00000000-0000-4000-8000-000000000106",
+        cycle_id: ids.cycle,
+        revision: 1,
+        expected_count: 2,
+        dispatch_state: "pending",
+      };
+    },
+    async channelManifestRead(request) {
+      calls.push(["manifest", request]);
+      return {
+        revision: 1,
+        targets: [{ target_id: ids.target, execution_state: "deferred" }],
+      };
+    },
+    async channelTargetExecute(request) {
+      calls.push(["execute", request]);
+      return {
+        target_id: ids.target,
+        state: "deferred",
+        deferred_reason: "account_unavailable",
+      };
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      const index = requests.length - 1;
+      return index < steps.length
+        ? {
+            text: "",
+            tool_calls: [
+              {
+                id: `channel-${index}`,
+                type: "function",
+                function: {
+                  name: steps[index][0],
+                  arguments: JSON.stringify(steps[index][1]),
+                },
+              },
+            ],
+            model: "stub-model",
+            prompt_tokens: 7,
+            completion_tokens: 4,
+            finish_reason: "tool_calls",
+          }
+        : {
+            text: "The frozen plan is queued; one target is deferred, not published.",
+            model: "stub-model",
+            prompt_tokens: 9,
+            completion_tokens: 8,
+            finish_reason: "stop",
+          };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?channels=${Date.now()}`);
+    const result = await main({
+      conversation_id: "conversation-channel-plan",
+      prompt: "Plan current public channels and inspect the target",
+      run_id: "run-channel-plan",
+      turn_id: "turn-channel-plan",
+    });
+    assert.match(result.answer, /deferred, not published/u);
+    assert.equal(requests.length, 6); // Four-to-eight iteration budget permits the five-tool flow.
+    assert.deepEqual(calls, [
+      ["discover", { kind: "public_sources", limit: 5 }],
+      ["discover", { kind: "accounts" }],
+      ["plan", plan],
+      ["manifest", { cycle_id: ids.cycle, revision: 1, limit: 10 }],
+      ["execute", { target_id: ids.target }],
+    ]);
+    const definitions = Object.fromEntries(
+      requests[0].tools.map(({ function: definition }) => [
+        definition.name,
+        definition,
+      ]),
+    );
+    for (const name of steps.map(([name]) => name)) {
+      assert.equal(definitions[name].parameters.additionalProperties, false);
+    }
+    assert.deepEqual(definitions.channel_plan.parameters.required, [
+      "publications",
+      "measurements",
+    ]);
+    assert.equal(
+      definitions.channel_plan.parameters.properties.publications.items
+        .additionalProperties,
+      false,
+    );
+    assert.equal(
+      definitions.channel_plan.parameters.properties.measurements.items
+        .additionalProperties,
+      false,
+    );
+    assert.deepEqual(definitions.channel_target_execute.parameters.required, [
+      "target_id",
+    ]);
+    assert.match(definitions.channel_plan.description, /automatically/u);
+    assert.match(
+      definitions.channel_target_execute.description,
+      /never blindly resent/u,
+    );
+    assert.match(requests[4].messages.at(-1).content, /"deferred"/u);
+    assert.match(requests[5].messages.at(-1).content, /"account_unavailable"/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("unknown execution is returned without retry or invented publication success", async () => {
+  const targetId = "00000000-0000-4000-8000-000000000111";
+  let executions = 0;
+  let modelCalls = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async channelTargetExecute(request) {
+      executions++;
+      assert.deepEqual(request, { target_id: targetId });
+      return { target_id: targetId, state: "unknown_result" };
+    },
+    async modelComplete(request) {
+      modelCalls++;
+      if (modelCalls === 1) {
+        return {
+          text: "",
+          tool_calls: [
+            {
+              id: "unknown-1",
+              type: "function",
+              function: {
+                name: "channel_target_execute",
+                arguments: JSON.stringify({ target_id: targetId }),
+              },
+            },
+          ],
+          model: "stub-model",
+          prompt_tokens: 7,
+          completion_tokens: 4,
+          finish_reason: "tool_calls",
+        };
+      }
+      assert.match(request.messages.at(-1).content, /unknown_result/u);
+      return {
+        text: "The result is unknown and needs reconciliation; do not resend.",
+        model: "stub-model",
+        prompt_tokens: 7,
+        completion_tokens: 4,
+        finish_reason: "stop",
+      };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?unknown=${Date.now()}`);
+    const result = await main({
+      conversation_id: "conversation-channel-unknown",
+      prompt: "Check this target",
+      run_id: "run-channel-unknown",
+      turn_id: "turn-channel-unknown",
+    });
+    assert.equal(executions, 1);
+    assert.match(result.answer, /unknown and needs reconciliation/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("replayed plan returns the same frozen receipt and completed fixture remains explicitly a fixture", async () => {
+  const targetId = "00000000-0000-4000-8000-000000000121";
+  const accountId = "00000000-0000-4000-8000-000000000122";
+  const plan = {
+    publications: [
+      {
+        source_id: "00000000-0000-4000-8000-000000000123",
+        source_version_id: "00000000-0000-4000-8000-000000000124",
+        platform: "public-platform",
+        account_id: accountId,
+      },
+    ],
+    measurements: [],
+  };
+  const receipt = {
+    plan_id: "00000000-0000-4000-8000-000000000125",
+    cycle_id: "00000000-0000-4000-8000-000000000126",
+    revision: 1,
+    expected_count: 1,
+    dispatch_state: "pending",
+  };
+  const plans = [];
+  const messages = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async channelPlan(request) {
+      plans.push(request);
+      return receipt;
+    },
+    async channelTargetExecute(request) {
+      assert.deepEqual(request, { target_id: targetId });
+      return {
+        target_id: targetId,
+        state: "completed",
+        outcome_status: "failed",
+        fixture: true,
+      };
+    },
+    async modelComplete(request) {
+      const index = messages.length;
+      messages.push(request.messages);
+      const calls = [
+        ["channel_plan", plan],
+        ["channel_plan", plan],
+        ["channel_target_execute", { target_id: targetId }],
+      ];
+      return index < calls.length
+        ? {
+            text: "",
+            tool_calls: [
+              {
+                id: `replay-${index}`,
+                type: "function",
+                function: {
+                  name: calls[index][0],
+                  arguments: JSON.stringify(calls[index][1]),
+                },
+              },
+            ],
+            model: "stub-model",
+            prompt_tokens: 7,
+            completion_tokens: 4,
+            finish_reason: "tool_calls",
+          }
+        : {
+            text: "The plan was already frozen; the completed fixture records a failed outcome, not a successful publication.",
+            model: "stub-model",
+            prompt_tokens: 7,
+            completion_tokens: 4,
+            finish_reason: "stop",
+          };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?replay=${Date.now()}`);
+    const result = await main({
+      conversation_id: "conversation-channel-replay",
+      prompt: "Recheck the plan and target outcome",
+      run_id: "run-channel-replay",
+      turn_id: "turn-channel-replay",
+    });
+    assert.deepEqual(plans, [plan, plan]);
+    assert.match(messages[2].at(-1).content, /"dispatch_state":"pending"/u);
+    assert.match(messages[3].at(-1).content, /"outcome_status":"failed"/u);
+    assert.match(messages[3].at(-1).content, /"fixture":true/u);
+    assert.match(result.answer, /not a successful publication/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("a channel capability failure aborts the loop without a completion event", async () => {
+  const emitted = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(topic, payload) {
+      emitted.push({ topic, payload });
+    },
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async channelPlan() {
+      throw new Error("capability_missing: channel planner unavailable");
+    },
+    async modelComplete() {
+      return {
+        text: "",
+        tool_calls: [
+          {
+            id: "channel-error",
+            type: "function",
+            function: {
+              name: "channel_plan",
+              arguments: '{"publications":[],"measurements":[]}',
+            },
+          },
+        ],
+        model: "stub-model",
+        prompt_tokens: 7,
+        completion_tokens: 4,
+        finish_reason: "tool_calls",
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?channelError=${Date.now()}`
+    );
+    await assert.rejects(
+      main({
+        conversation_id: "conversation-channel-error",
+        prompt: "Plan the channel",
+        run_id: "run-channel-error",
+        turn_id: "turn-channel-error",
+      }),
+      /capability_missing/u,
+    );
+    assert.equal(emitted.length, 0);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

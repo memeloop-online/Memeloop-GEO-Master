@@ -66,7 +66,7 @@ pub const MAIN_MODULE: &str = "memeloop://bundle/geo-loop.js";
 /// are parsed once, so call sites never see a raw JSON string, and every
 /// failure is the structured `GeoHostOpError` the Rust side produced.
 pub const HOST_OPS_JS: &str = r#"
-export const HOST_OPS_VERSION = "geo.hostops.v3";
+export const HOST_OPS_VERSION = "geo.hostops.v4";
 
 const OPS = {
   modelComplete: "op_host_model_complete_v1",
@@ -76,6 +76,10 @@ const OPS = {
   measureSample: "op_host_measure_sample_v2",
   reportGet: "op_host_report_get_v1",
   reportReduce: "op_host_report_reduce_v1",
+  channelDiscover: "op_host_channel_discover_v1",
+  channelPlan: "op_host_channel_plan_v1",
+  channelManifestRead: "op_host_channel_manifest_read_v1",
+  channelTargetExecute: "op_host_channel_target_execute_v1",
 };
 
 async function callOp(opName, payload) {
@@ -95,6 +99,10 @@ export const hostOps = {
   measureSample: (request) => callOp(OPS.measureSample, request),
   reportGet: (request) => callOp(OPS.reportGet, request),
   reportReduce: (request) => callOp(OPS.reportReduce, request),
+  channelDiscover: (request) => callOp(OPS.channelDiscover, request),
+  channelPlan: (request) => callOp(OPS.channelPlan, request),
+  channelManifestRead: (request) => callOp(OPS.channelManifestRead, request),
+  channelTargetExecute: (request) => callOp(OPS.channelTargetExecute, request),
 };
 
 // Reports one op outcome through the Rust-owned event op, so the host can

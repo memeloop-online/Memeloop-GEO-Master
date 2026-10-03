@@ -1,6 +1,6 @@
 # Memeloop GEO 工程交接说明
 
-更新时间：2026-10-02
+更新时间：2026-10-03
 
 适用分支：`integration/w00-pr-stack`（本地集成，尚未合并到 `main`）
 
@@ -79,9 +79,9 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 安全 Host Ops
 
-- 封闭且带版本的 op 面（`geo.hostops.v3`）：`model.complete.v1`、`knowledge.search.v1`、`knowledge.import_attachments.v1`、`manifest.read.v2`、`publish.submit.v2`、`measure.sample.v2`、`report.get.v1`、`report.reduce.v1` 八项。附件导入只接受 Rust 已绑定到当前回合的对象；JS 无法取得 SQL、任意网络、文件、进程或环境变量。
+- 封闭且带版本的 op 面（`geo.hostops.v4`）：原有八项名称/协议保留，新增 `channel.discover.v1`、`channel.plan.v1`、`channel.manifest.read.v1`、`channel.target.execute.v1`。附件导入只接受 Rust 已绑定到当前回合的对象；渠道工具只传公开来源版本、账号与目标引用，JS 无法取得 session、代理凭据、SQL、任意网络、文件、进程或环境变量。
 - 边界方向为 `geo-api → geo-worker`，worker 从不反向依赖 API。请求 DTO 全部 `#[serde(deny_unknown_fields)]` 且不携带 tenant/project 选择器，作用域只能来自 Rust 侧 bridge。预算、单次调用截止与取消统一在 `HostBridge::invoke` 施加。
-- `RepositoryHostOps` 已实现 `knowledge_search`、文档 `manifest_read` 和可注入的 `model_complete`；本地开发模型装配见第 5 节。清单读取保留规划状态、阻断原因及覆盖分母，不把规划项 ID 冒充正文版本；分发清单、发布和测量仍缺失。
+- `RepositoryHostOps` 已实现知识检索/附件导入、文档清单读取、报告及渠道工具和可注入的模型调用；本地开发模型装配见第 5 节。清单读取保留规划状态、阻断原因及覆盖分母，不把规划项 ID 冒充正文版本；正式文档×平台展开、真实发布与测量验收仍缺失。
 
 ### W00 Run Executor
 
@@ -114,6 +114,9 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ## 当前账号与发布纵切
 
+- 两类接入共用后台能力：运营人员在 `/ops/channels` 登录账号、分组并分配到项目；用户在项目 `/channels` 登录自己的账号。持久 session 在服务端加密存储，不存入前端 localStorage，不向客户返回运营池凭据。只需必要的首次登录/失效重连，没有逐篇发布审批。
+- 新增后台 dispatcher：配置 runner 时，每 5 秒分页发现到期且从未尝试的目标；账号缺失、项目暂停、来源不可公开或 runner 不可用时延后，不消耗发布尝试。账号间并行；同一运营商账号通过持久预检租约及原子 claim 防止多进程争抢。迁移 `0013`，未知发送保留租约至到期且不会重发；自动外部查回仍未实现。尚无每秒百次真实发布容量验证。
+- P00 已注册渠道发现、冻结计划、分页查状态及单目标执行工具，应用装配复用 HTTP 的 Rust 业务服务；正常排期由 dispatcher 执行，不要求模型逐条调用。`ChannelPlan` 不冒充完整文档×平台领域清单，正文生成和自动展开仍未完成。生成 bundle 测试使用注入模型，不代表真实平台发布。
 - 首个发布验收使用外部创作者平台账号，不要求客户部署 CMS/站群。冻结规格未改写；当前优先级以 `TODO.md` 为准。
 - 项目账号入口为 `/app/:tenantId/:projectId/channels`；运营账号池入口为 `/ops/channels`。两者共用远程网页登录及加密 session，池账号通过项目分配供客户后台使用，不向客户返回池凭据。
 - 新模块为 `channels`（domain/persistence/api）、`channel_jobs`（冻结目标、发送前尝试账本及报告输入）和 `packages/browser-runner`（隔离 Chromium）。迁移为 `0010`、`0011`；提交 `3f1ddb5` 已通过 Linux/Windows、固定 Chromium 夹具及新增 PostgreSQL 回归，真实平台账号验收仍未完成。
@@ -130,7 +133,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - **隔离体基础保护**：64 MiB V8 堆、near-heap 终止、独立墙钟和 Rust 输出预算均已回归通过。不设固定隔离体并发准入门槛；高吞吐调度和进程资源观测仍需真实容量验收。
 - **checkpoint 与 tool-call ledger**：executor 已写完成结果存档，中途恢复及 Rust 调用侧 intent/attempt/outcome 尚未接通。
 - Token Center HTTP 适配已通过本地契约测试，但正式租户映射/应用装配、流式模型事件和模型费用记账尚未接通；本地单模型 HTTP 调用已装配，需环境注入凭据。
-- GEO 分发、发布和测量工具，以及文档读取工具在对话 registry 的注册尚待补齐。
+- 对话 registry 已注册渠道计划/执行工具；正式文档生成、分发清单编排和真实搜索测量尚待补齐，不能用当前渠道计划替代完整产品领域模型。
 - P00 非 TXT/Markdown 解析、媒体/表格与跨回合附件使用；当前存储为内存或 PostgreSQL blob，非正式对象存储服务。回合输入可由持久 Message 重建，但这不等于完整自动恢复执行。
 - 项目级知识文档清单已支持规划、封存和只读 GET，P07 显示真实覆盖项及来源依赖。刷新封存清单不重新规划，知识当前版本改变也不覆盖历史清单。产品级细化、正文生成、文档 × 平台矩阵、真实连接器/账号池/出口池仍待实现。
 - 独立 AI 渠道采样与真实发布证据接入、丰富效果归纳及自动进入下一轮；已有报告快照/汇聚器和到期周期扫描，不代表整个周闭环完成。

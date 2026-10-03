@@ -100,6 +100,7 @@ jobs:
           cargo test -p geo-worker --test memeloop_bundle -- --ignored 2>&1 | tee logs/cargo-memeloop-bundle.log
           cargo test -p geo-app generated_bundle_runs_one_turn_through_assembled_provider -- --ignored 2>&1 | tee logs/cargo-app-bundle.log
           cargo test -p geo-api --test attachment_import_runtime -- --ignored 2>&1 | tee logs/cargo-attachment-import-runtime.log
+          cargo test -p geo-api --test channel_tools_runtime -- --ignored 2>&1 | tee logs/cargo-channel-tools-runtime.log
 
       - name: Test repositories against disposable PostgreSQL
         env:
@@ -112,6 +113,7 @@ jobs:
           cargo test -p geo-persistence --test channels -- --ignored 2>&1 | tee logs/cargo-channel-postgres.log
           cargo test -p geo-persistence --test channel_identity -- --ignored 2>&1 | tee logs/cargo-channel-identity-postgres.log
           cargo test -p geo-persistence --test successor_cycles -- --ignored 2>&1 | tee logs/cargo-successor-postgres.log
+          cargo test -p geo-persistence --test channel_dispatcher -- --ignored 2>&1 | tee logs/cargo-channel-dispatcher-postgres.log
 
       - name: Write 5-minute milestone summary
         if: always()

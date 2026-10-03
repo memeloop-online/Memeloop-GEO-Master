@@ -34,14 +34,17 @@ use geo_domain::{
     ReportSnapshot, RuntimeCapability, SourceKind, TenantScope, TurnInput, TurnReport,
 };
 use geo_worker::{
-    HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
-    HostOpError, HostOpErrorCode, HostOps, HostRuntime, ManifestCoverage, ManifestItem,
-    ManifestKind, ManifestPage, ManifestPlanningState, ManifestReadRequest, MeasureRequest,
-    MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt, PublishRequest,
-    ReportGetRequest, ReportReduceRequest, TURN_COMPLETION_TOPIC, WorkerError,
+    ChannelDiscoverRequest, ChannelDiscoveryPage, ChannelExecutionResult, ChannelManifestPage,
+    ChannelManifestReadRequest, ChannelPlanReceipt, ChannelPlanRequest,
+    ChannelTargetExecuteRequest, HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge,
+    HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOps, HostRuntime, ManifestCoverage,
+    ManifestItem, ManifestKind, ManifestPage, ManifestPlanningState, ManifestReadRequest,
+    MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
+    PublishRequest, ReportGetRequest, ReportReduceRequest, TURN_COMPLETION_TOPIC, WorkerError,
 };
 use serde_json::{Value, json};
 
+use crate::channel_tools::ChannelToolService;
 use crate::provider_bridge::SharedModelProvider;
 use crate::{AppState, reduce_cycle_report};
 
@@ -452,6 +455,7 @@ pub struct RepositoryHostOps {
     knowledge: Arc<dyn KnowledgeRepository>,
     model_provider: Option<SharedModelProvider>,
     report_service: Option<Arc<dyn ReportService>>,
+    channel_service: Option<Arc<dyn ChannelToolService>>,
 }
 
 #[async_trait]
@@ -522,6 +526,7 @@ impl RepositoryHostOps {
             knowledge,
             model_provider: None,
             report_service: None,
+            channel_service: None,
         }
     }
 
@@ -536,6 +541,13 @@ impl RepositoryHostOps {
     /// HTTP. A runtime without this adapter returns `capability_missing`.
     pub fn with_report_state(mut self, state: AppState) -> Self {
         self.report_service = Some(Arc::new(state));
+        self
+    }
+
+    /// Attaches project-scoped channel discovery, planning, frozen reads and
+    /// one-shot target execution. The absent adapter fails explicitly.
+    pub fn with_channels(mut self, state: AppState) -> Self {
+        self.channel_service = Some(Arc::new(state));
         self
     }
 }
@@ -562,6 +574,94 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
 
 #[async_trait]
 impl HostOps for RepositoryHostOps {
+    async fn channel_discover(
+        &self,
+        scope: &TenantScope,
+        request: ChannelDiscoverRequest,
+    ) -> Result<ChannelDiscoveryPage, HostOpError> {
+        let op = HostOp::ChannelDiscover;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.channel_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(op, "channel service is not configured")
+        })?;
+        let result = service
+            .discover(scope, request.clone())
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        result
+            .validate_for(&request)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn channel_plan(
+        &self,
+        scope: &TenantScope,
+        request: ChannelPlanRequest,
+    ) -> Result<ChannelPlanReceipt, HostOpError> {
+        let op = HostOp::ChannelPlan;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.channel_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(op, "channel service is not configured")
+        })?;
+        let result = service
+            .plan(scope, request.clone())
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        result
+            .validate_for(&request)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn channel_manifest_read(
+        &self,
+        scope: &TenantScope,
+        request: ChannelManifestReadRequest,
+    ) -> Result<ChannelManifestPage, HostOpError> {
+        let op = HostOp::ChannelManifestRead;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.channel_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(op, "channel service is not configured")
+        })?;
+        let result = service
+            .manifest_read(scope, request.clone())
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        result
+            .validate_for(&request)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn channel_target_execute(
+        &self,
+        scope: &TenantScope,
+        request: ChannelTargetExecuteRequest,
+    ) -> Result<ChannelExecutionResult, HostOpError> {
+        let op = HostOp::ChannelTargetExecute;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.channel_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(op, "channel service is not configured")
+        })?;
+        let result = service
+            .target_execute(scope, request.clone())
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        result
+            .validate_for(request.target_id)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
     async fn report_get(
         &self,
         scope: &TenantScope,

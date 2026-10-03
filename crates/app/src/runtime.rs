@@ -91,7 +91,8 @@ fn assemble_with_transport<T: Transport + 'static>(
     let bridge = provider_bridge(ai, transport)?;
     let capabilities = RepositoryHostOps::new(state.knowledge_repository())
         .with_model_provider(Arc::new(bridge))
-        .with_report_state(state.clone());
+        .with_report_state(state.clone())
+        .with_channels(state.clone());
     // This API currently takes a static allow-list. One startup allocation is
     // intentional for the digest-approved bundle; no unapproved imports exist.
     let source: &'static str = Box::leak(source.into_boxed_str());

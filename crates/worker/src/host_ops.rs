@@ -22,10 +22,118 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::host::{
-    HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
-    KnowledgeSearchRequest, KnowledgeSearchResult, ManifestReadRequest, MeasureRequest,
-    ModelCompletionRequest, PublishRequest, ReportGetRequest, ReportReduceRequest,
+    ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
+    ChannelTargetExecuteRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
+    KnowledgeImportAttachmentsRequest, KnowledgeSearchRequest, KnowledgeSearchResult,
+    ManifestReadRequest, MeasureRequest, ModelCompletionRequest, PublishRequest, ReportGetRequest,
+    ReportReduceRequest,
 };
+
+#[op2]
+#[string]
+pub async fn op_host_channel_discover_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ChannelDiscover;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ChannelDiscoverRequest>(op, &request)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let requested = request.clone();
+    let page = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .channel_discover(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    page.validate_for(&requested)
+        .map_err(|reason| js_error(HostOpError::internal(op, reason)))?;
+    Ok(encode(op, &page)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_channel_plan_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ChannelPlan;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ChannelPlanRequest>(op, &request)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let requested = request.clone();
+    let receipt = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .channel_plan(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    receipt
+        .validate_for(&requested)
+        .map_err(|reason| js_error(HostOpError::internal(op, reason)))?;
+    Ok(encode(op, &receipt)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_channel_manifest_read_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ChannelManifestRead;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ChannelManifestReadRequest>(op, &request)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let requested = request.clone();
+    let page = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .channel_manifest_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    page.validate_for(&requested)
+        .map_err(|reason| js_error(HostOpError::internal(op, reason)))?;
+    Ok(encode(op, &page)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_channel_target_execute_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ChannelTargetExecute;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ChannelTargetExecuteRequest>(op, &request)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let target_id = request.target_id;
+    let result = bridge
+        .invoke(op, |bridge| async move {
+            bridge
+                .capabilities()
+                .channel_target_execute(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    result
+        .validate_for(target_id)
+        .map_err(|reason| js_error(HostOpError::unknown_result(op, reason)))?;
+    Ok(encode(op, &result)?)
+}
 
 /// Converts a structured failure into the JS error the script sees.
 ///
@@ -320,6 +428,10 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::Measure.op_name(),
     HostOp::ReportGet.op_name(),
     HostOp::ReportReduce.op_name(),
+    HostOp::ChannelDiscover.op_name(),
+    HostOp::ChannelPlan.op_name(),
+    HostOp::ChannelManifestRead.op_name(),
+    HostOp::ChannelTargetExecute.op_name(),
     // Rust-owned run state: the loop's emit contract and the checkpoint probe.
     "op_host_emit",
     "op_host_checkpoint",

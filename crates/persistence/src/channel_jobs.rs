@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ChannelAttempt, ChannelCycleInputs, ChannelJobRepository, ChannelOutcome,
-    ChannelPlan, ChannelTarget, ChannelTargetInput, ChannelTargetView, ErrorCode, TenantScope,
-    frozen_cycle_inputs,
+    AppError, ChannelAttempt, ChannelCycleInputs, ChannelDispatchCandidate, ChannelJobRepository,
+    ChannelOutcome, ChannelPlan, ChannelTarget, ChannelTargetInput, ChannelTargetView, ErrorCode,
+    OperatorId, ProjectId, TenantId, TenantScope, frozen_cycle_inputs,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -56,6 +56,157 @@ fn project(scope: &TenantScope) -> Result<Uuid, AppError> {
 
 #[async_trait]
 impl ChannelJobRepository for PgChannelJobRepository {
+    async fn reserve_account(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        project(scope)?;
+        if expires_at <= at || expires_at - at > chrono::Duration::minutes(5) {
+            return Err(AppError::invalid_request(
+                "invalid account reservation duration",
+            ));
+        }
+        let reserved = sqlx::query(
+            "INSERT INTO channel_account_preflight_reservations \
+             (operator_id,account_id,reservation_id,expires_at) VALUES ($1,$2,$3,$4) \
+             ON CONFLICT (operator_id,account_id) DO UPDATE \
+               SET reservation_id=EXCLUDED.reservation_id,expires_at=EXCLUDED.expires_at \
+             WHERE channel_account_preflight_reservations.expires_at <= $5",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(account_id)
+        .bind(reservation_id)
+        .bind(expires_at)
+        .bind(at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        if reserved.rows_affected() == 0 {
+            return Err(AppError::conflict("channel account preflight busy"));
+        }
+        Ok(())
+    }
+
+    async fn release_account(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<(), AppError> {
+        project(scope)?;
+        sqlx::query(
+            "DELETE FROM channel_account_preflight_reservations \
+             WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(account_id)
+        .bind(reservation_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn claim_reserved(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<(ChannelTarget, ChannelAttempt), AppError> {
+        let target = self.get_target(scope, target_id).await?.target;
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let lease: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT reservation_id,expires_at FROM channel_account_preflight_reservations \
+             WHERE operator_id=$1 AND account_id=$2 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(target.input.account_id())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if !lease.is_some_and(|(owner, expiry)| owner == reservation_id && expiry > at) {
+            return Err(AppError::conflict("account preflight reservation expired"));
+        }
+        let kind = match target.input {
+            ChannelTargetInput::Publish { .. } => "publish",
+            ChannelTargetInput::Measure { .. } => "measure",
+        };
+        sqlx::query(
+            "INSERT INTO channel_execution_attempts \
+             (attempt_id,operator_id,tenant_id,project_id,target_id,account_id,target_kind,claimed_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        )
+        .bind(attempt_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(target_id)
+        .bind(target.input.account_id())
+        .bind(kind)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok((
+            target,
+            ChannelAttempt {
+                attempt_id,
+                target_id,
+                claimed_at: at,
+                outcome: None,
+                received_at: None,
+            },
+        ))
+    }
+    async fn scan_pending(
+        &self,
+        after_target_id: Option<Uuid>,
+        as_of: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ChannelDispatchCandidate>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request(
+                "invalid channel dispatch page size",
+            ));
+        }
+        let rows = sqlx::query(
+            "SELECT targets.operator_id,targets.tenant_id,targets.project_id,targets.target_id \
+             FROM channel_execution_targets targets \
+             JOIN projects ON projects.operator_id=targets.operator_id \
+               AND projects.tenant_id=targets.tenant_id AND projects.project_id=targets.project_id \
+             WHERE ($1::uuid IS NULL OR targets.target_id > $1) \
+               AND projects.status NOT IN ('paused','archived') \
+               AND (targets.kind='publish' OR (targets.frozen_input->'input'->>'scheduled_at')::timestamptz <= $2) \
+               AND NOT EXISTS (SELECT 1 FROM channel_execution_attempts attempts \
+                 WHERE attempts.operator_id=targets.operator_id AND attempts.tenant_id=targets.tenant_id \
+                   AND attempts.project_id=targets.project_id AND attempts.target_id=targets.target_id) \
+             ORDER BY targets.target_id LIMIT $3",
+        )
+        .bind(after_target_id)
+        .bind(as_of)
+        .bind(i64::try_from(limit).map_err(|_| AppError::invalid_request("invalid page size"))?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChannelDispatchCandidate {
+                scope: TenantScope::new(
+                    OperatorId::new(row.get("operator_id")),
+                    TenantId::new(row.get("tenant_id")),
+                    Some(ProjectId::new(row.get("project_id"))),
+                ),
+                target_id: row.get("target_id"),
+            })
+            .collect())
+    }
     async fn create_plan(
         &self,
         scope: &TenantScope,

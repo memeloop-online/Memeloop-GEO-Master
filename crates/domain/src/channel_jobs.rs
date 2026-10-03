@@ -133,6 +133,13 @@ pub struct ChannelTargetView {
     pub attempts: Vec<ChannelAttempt>,
 }
 
+/// A repository-discovered, tenant-scoped target that has never been attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelDispatchCandidate {
+    pub scope: TenantScope,
+    pub target_id: Uuid,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelCycleInputs {
     pub manifests: Vec<ReportManifestRef>,
@@ -142,6 +149,41 @@ pub struct ChannelCycleInputs {
 
 #[async_trait]
 pub trait ChannelJobRepository: Send + Sync {
+    /// A reversible, operator-wide account reservation before browser startup.
+    /// Expiry must be bounded; a stale holder cannot claim after its expiry.
+    async fn reserve_account(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), AppError>;
+    async fn release_account(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<(), AppError>;
+    /// Atomically validates a live owned reservation and makes the irreversible
+    /// one-shot claim. Once claimed, timeout/crash is unknown, not retryable.
+    async fn claim_reserved(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<(ChannelTarget, ChannelAttempt), AppError>;
+    /// Keyset page of due, never-attempted targets. `after_target_id` is an
+    /// exclusive UUID cursor; callers must continue after the last returned ID
+    /// even when dispatch defers that target.
+    async fn scan_pending(
+        &self,
+        after_target_id: Option<Uuid>,
+        as_of: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ChannelDispatchCandidate>, AppError>;
     async fn create_plan(
         &self,
         scope: &TenantScope,
@@ -310,9 +352,14 @@ pub fn frozen_cycle_inputs(
 }
 
 #[derive(Default, Clone)]
-pub struct MemoryChannelJobRepository(Arc<Mutex<HashMap<ChannelScopeKey, MemoryCycle>>>);
+pub struct MemoryChannelJobRepository(
+    Arc<Mutex<HashMap<ChannelScopeKey, MemoryCycle>>>,
+    Arc<Mutex<HashMap<AccountReservationKey, AccountReservation>>>,
+);
 
 type ChannelScopeKey = (Uuid, Uuid, Uuid, Uuid);
+type AccountReservationKey = (Uuid, Uuid);
+type AccountReservation = (Uuid, DateTime<Utc>);
 
 #[derive(Default)]
 struct MemoryCycle {
@@ -322,6 +369,107 @@ struct MemoryCycle {
 
 #[async_trait]
 impl ChannelJobRepository for MemoryChannelJobRepository {
+    async fn reserve_account(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        scope_key(scope)?;
+        if expires_at <= at || expires_at - at > chrono::Duration::minutes(5) {
+            return Err(AppError::invalid_request(
+                "invalid account reservation duration",
+            ));
+        }
+        let mut reservations = self.1.lock().await;
+        let key = (scope.operator_id.as_uuid(), account_id);
+        if reservations
+            .get(&key)
+            .is_some_and(|(_, expiry)| *expiry > at)
+        {
+            return Err(AppError::conflict("channel account preflight busy"));
+        }
+        reservations.insert(key, (reservation_id, expires_at));
+        Ok(())
+    }
+
+    async fn release_account(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<(), AppError> {
+        scope_key(scope)?;
+        let mut reservations = self.1.lock().await;
+        let key = (scope.operator_id.as_uuid(), account_id);
+        if reservations
+            .get(&key)
+            .is_some_and(|(owner, _)| *owner == reservation_id)
+        {
+            reservations.remove(&key);
+        }
+        Ok(())
+    }
+
+    async fn claim_reserved(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<(ChannelTarget, ChannelAttempt), AppError> {
+        let reservations = self.1.lock().await;
+        let target = self.get_target(scope, target_id).await?.target;
+        if !reservations
+            .get(&(scope.operator_id.as_uuid(), target.input.account_id()))
+            .is_some_and(|(owner, expiry)| *owner == reservation_id && *expiry > at)
+        {
+            return Err(AppError::conflict("account preflight reservation expired"));
+        }
+        self.claim(scope, target_id, attempt_id, at).await
+    }
+    async fn scan_pending(
+        &self,
+        after_target_id: Option<Uuid>,
+        as_of: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ChannelDispatchCandidate>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request(
+                "invalid channel dispatch page size",
+            ));
+        }
+        let all = self.0.lock().await;
+        let mut candidates = all
+            .iter()
+            .flat_map(|(&(operator, tenant, project, _), cycle)| {
+                cycle.plan.iter().flat_map(move |plan| {
+                    plan.targets.iter().filter_map(move |target| {
+                        if after_target_id.is_some_and(|after| target.target_id <= after)
+                            || cycle.attempts.contains_key(&target.target_id)
+                            || matches!(&target.input, ChannelTargetInput::Measure { scheduled_at, .. } if *scheduled_at > as_of)
+                        {
+                            return None;
+                        }
+                        Some(ChannelDispatchCandidate {
+                            scope: TenantScope::new(
+                                crate::OperatorId::new(operator),
+                                crate::TenantId::new(tenant),
+                                Some(ProjectId::new(project)),
+                            ),
+                            target_id: target.target_id,
+                        })
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|candidate| candidate.target_id);
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
     async fn create_plan(
         &self,
         scope: &TenantScope,
@@ -892,6 +1040,97 @@ mod tests {
         .unwrap();
         assert!(
             repo.claim(&other_scope, target_ids[1], Uuid::new_v4(), Utc::now())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_reservation_is_account_wide_and_stale_owner_cannot_claim() {
+        let repo = MemoryChannelJobRepository::default();
+        let operator = OperatorId::new(Uuid::new_v4());
+        let account_id = Uuid::new_v4();
+        let scopes = [0, 1].map(|_| {
+            TenantScope::new(
+                operator,
+                TenantId::new(Uuid::new_v4()),
+                Some(ProjectId::new(Uuid::new_v4())),
+            )
+        });
+        let target = Uuid::new_v4();
+        repo.create_plan(
+            &scopes[0],
+            ChannelPlan {
+                plan_id: Uuid::new_v4(),
+                project_id: scopes[0].project_id.unwrap(),
+                cycle_id: Uuid::new_v4(),
+                input_hash: "fixture".into(),
+                revision: 1,
+                created_at: Utc::now(),
+                targets: vec![ChannelTarget {
+                    target_id: target,
+                    input: ChannelTargetInput::Measure {
+                        account_id,
+                        provider: "fixture".into(),
+                        model: "fixture".into(),
+                        surface: "consumer_web".into(),
+                        search_mode: "web_search".into(),
+                        protocol_version: "v1".into(),
+                        question_set_version: "v1".into(),
+                        question: "Question".into(),
+                        market: "US".into(),
+                        language: "en".into(),
+                        scheduled_at: Utc::now(),
+                        sample_ordinal: 0,
+                    },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let old = Uuid::new_v4();
+        repo.reserve_account(
+            &scopes[0],
+            account_id,
+            old,
+            now,
+            now + chrono::Duration::seconds(2),
+        )
+        .await
+        .unwrap();
+        assert!(
+            repo.reserve_account(
+                &scopes[1],
+                account_id,
+                Uuid::new_v4(),
+                now,
+                now + chrono::Duration::minutes(5)
+            )
+            .await
+            .is_err()
+        );
+        let later = now + chrono::Duration::seconds(3);
+        let fresh = Uuid::new_v4();
+        repo.reserve_account(
+            &scopes[1],
+            account_id,
+            fresh,
+            later,
+            later + chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            repo.claim_reserved(&scopes[0], target, Uuid::new_v4(), old, later)
+                .await
+                .is_err()
+        );
+        repo.release_account(&scopes[0], account_id, old)
+            .await
+            .unwrap();
+        assert!(
+            repo.claim_reserved(&scopes[0], target, Uuid::new_v4(), fresh, later)
                 .await
                 .is_ok()
         );
