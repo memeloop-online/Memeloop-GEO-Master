@@ -110,15 +110,13 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test -p geo-persistence --test postgres -- --ignored 2>&1 | tee logs/cargo-postgres.log
-          cargo test -p geo-persistence --test reports -- --ignored 2>&1 | tee logs/cargo-report-postgres.log
-          cargo test -p geo-persistence --test channels -- --ignored 2>&1 | tee logs/cargo-channel-postgres.log
-          cargo test -p geo-persistence --test channel_identity -- --ignored 2>&1 | tee logs/cargo-channel-identity-postgres.log
-          cargo test -p geo-persistence --test successor_cycles -- --ignored 2>&1 | tee logs/cargo-successor-postgres.log
-          cargo test -p geo-persistence --test channel_dispatcher -- --ignored 2>&1 | tee logs/cargo-channel-dispatcher-postgres.log
-          cargo test -p geo-persistence --test bootstrap -- --ignored 2>&1 | tee logs/cargo-bootstrap-postgres.log
-          cargo test -p geo-persistence --test model_routes -- --ignored 2>&1 | tee logs/cargo-model-routes-postgres.log
-          cargo test -p geo-persistence --test content -- --ignored 2>&1 | tee logs/cargo-content-postgres.log
+          failed=0
+          for suite in postgres reports channels channel_identity successor_cycles channel_dispatcher bootstrap model_routes content; do
+            if ! cargo test -p geo-persistence --test "$suite" -- --ignored 2>&1 | tee "logs/cargo-${suite}-postgres.log"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
 
       - name: Write 5-minute milestone summary
         if: always()

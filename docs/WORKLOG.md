@@ -2,6 +2,8 @@
 
 ## 2026-10-03
 
+- `b5c6125` 已推送；Actions `37108684267` 的 Linux 前端、固定 Chromium、Rust 与显式 V8 bundle 步骤通过，实库步骤发现 `channel_dispatcher` 测试夹具的 INSERT 有四列但只有三个占位符，尚未运行到新增 bootstrap/model_routes/content 实库回归。本次修正占位符；CI 改为逐套执行全部实库测试后汇总失败，避免首个失败遮蔽后续证据。修正后的实库结果等待新 CI，不标记通过。
+
 - 当前工作区第一层内容与生产装配本地复验：`cargo fmt --all -- --check`、离线 `cargo clippy --workspace --all-targets -- -D warnings`、离线 `cargo test --workspace --all-targets` 均通过；默认忽略的生成 bundle 与 PostgreSQL 条件测试不计入普通 workspace 结果。前端 `pnpm format:check`、`pnpm typecheck`、79/79 项测试及 `pnpm build` 通过。重新运行 `pnpm agent:bundle` 后显式执行被忽略的 worker 原生对话 bundle 4 项、内容工作流 1 项，app 装配 2 项，以及 API 附件导入和渠道工具各 1 项，均通过。Node agent-runtime 11/11、browser-runner 14/14 在本地浏览器覆盖配置下通过；固定版本 Chromium 仍待新 CI 复验。保留非阻断的 MSVC 链接警告及前端大 chunk/Zod 警告；新 CI、PostgreSQL 实库、真实模型、真实浏览器账号和渠道验收仍待取得，不能把本地结果视为完整交付。
 - 当前工作区的第一层生成与既有渠道发送仍是两条独立路径：原生内容分支可产生带证据/检查的正文版本，渠道冻结计划仍使用公开来源版本，未从生成内容自动构造文档×平台分发矩阵。持久身份初始化和租户/项目模型路由已装配；使用部署者显式配置且不代表费用权益或真实部署通过。
 - `c4a9947` 的 Actions `37082133868` 未通过：Linux 显式生成 bundle 回归中两项旧工具数量断言未随注册表扩展更新，后续 PostgreSQL 步骤尚未执行。断言已在当前工作区修复并通过本地显式 bundle 回归；新增原生内容工作流及应用级集成回归后，仍须等待新 CI，不把该提交标为全绿。
