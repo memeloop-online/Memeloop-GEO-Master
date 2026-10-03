@@ -14,7 +14,7 @@
 ## 当前：W00 AI 工作台与 Agent Runtime
 
 - [ ] 收口第一层内容 fan-out 的两轮自动修正、无需用户触发的跨周期自动运营与 PostgreSQL 故障注入；当前周期启动时按冻结配置自动规划、内容执行跨副本扫描/续租/失租中止已接，不缩减完整恢复要求。
-- [ ] 复验 `ef43aa2` 后续修复：该 CI 的渠道扫描夹具受其他测试数据干扰，其余 PostgreSQL 套件（含内容、身份初始化、模型路由）通过；当前工作区的夹具隔离修复、新迁移 `0016`/`0017`、固定版本浏览器和显式生成 bundle 仍待新 CI。不要把普通 workspace 测试当作被忽略的实库验收。
+- [ ] 验证下一批 outbox 消费、生成版本发送与正式分发报告接线；`5dc628b` 的渠道扫描隔离修复、迁移 `0016`/`0017` 实库、固定浏览器和显式 bundle 已通过 CI，但不覆盖后续工作区改动。
 - [ ] 实现多副本租约与 queued 恢复；当前单进程启动对账已通过 CI 实库测试，默认关闭，滚动部署或多副本不得开启。
 - [ ] 把取消接到隔离体：`cancel_turn` 语义已正确（`finish_run` 不会覆盖 `Cancelled`），但取消不触达隔离体，turn 仍跑到 deadline 才结束。`HostBridge::with_cancellation` 已备好接口。
 - [ ] 驱动中途 checkpoint 恢复与 Rust-owned tool-call ledger：executor 已接完成结果存档，但它不是中途恢复；工具 intent/attempt/outcome 必须由 Rust 实际调用前后写入，不能信任 JS 自报。
