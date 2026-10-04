@@ -63,6 +63,7 @@ pub enum ChannelDispatchDeferred {
     RunnerUnavailable,
     AccountBusy,
     SourceUnavailable,
+    FixtureOnly,
 }
 
 #[derive(Debug)]
@@ -123,14 +124,20 @@ fn publication_readback(
     result: &crate::browser_bridge::BrowserExecution,
     target: &ChannelTargetInput,
 ) -> bool {
-    let ChannelTargetInput::Publish {
-        platform,
-        title,
-        body,
-        ..
-    } = target
-    else {
-        return false;
+    let (platform, title, body) = match target {
+        ChannelTargetInput::Publish {
+            platform,
+            title,
+            body,
+            ..
+        }
+        | ChannelTargetInput::GeneratedPublish {
+            platform,
+            title,
+            body,
+            ..
+        } => (platform, title, body),
+        ChannelTargetInput::Measure { .. } => return false,
     };
     let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let expected_hash = sha256_hex(format!("{}\n{}", normalize(title), normalize(body)).as_bytes());
@@ -150,7 +157,7 @@ fn publication_readback(
         .unwrap_or_default()
         .trim_end_matches('/');
     if url.scheme() != "https"
-        || url.host_str() != Some("www.zhihu.com")
+        || !matches!(url.host_str(), Some("www.zhihu.com" | "zhuanlan.zhihu.com"))
         || platform != "zhihu"
         || post_id.is_empty()
         || !post_id.bytes().all(|byte| byte.is_ascii_digit())
@@ -168,6 +175,100 @@ fn publication_readback(
                 == proof.get("readback_sha256").and_then(|v| v.as_str())
             && proof.get("expected_sha256").and_then(|v| v.as_str()) == Some(expected_hash.as_str())
     })
+}
+
+/// The queued input is an index, never an authority for publishable bytes.
+/// Return only after matching the immutable distribution chain and checking
+/// every cited source's *current* publicly eligible version.
+async fn generated_publication_preflight(
+    state: &AppState,
+    scope: &TenantScope,
+    input: &ChannelTargetInput,
+) -> Result<bool, AppError> {
+    let ChannelTargetInput::GeneratedPublish {
+        content_revision_id,
+        variant_id,
+        publication_intent_id,
+        distribution_target_id,
+        platform,
+        account_id,
+        title,
+        body,
+        body_sha256,
+        evidence,
+        payload_hash,
+    } = input
+    else {
+        return Ok(false);
+    };
+    let bundle = state
+        .distribution_repository()
+        .get_publication_bundle(scope, *publication_intent_id)
+        .await?;
+    let variant = &bundle.variant;
+    let revision = &bundle.revision;
+    let intent = &bundle.intent;
+    let target = &bundle.target;
+    let command = &bundle.command;
+    if evidence.is_empty()
+        || *content_revision_id != revision.revision_id
+        || *variant_id != variant.variant_id
+        || *distribution_target_id != target.target_id
+        || intent.intent_id != *publication_intent_id
+        || intent.project_id != scope.project_id.expect("project scope checked")
+        || intent.channel_target_id != target.target_id
+        || intent.variant_id != variant.variant_id
+        || intent.content_revision_id != revision.revision_id
+        || intent.platform_id != *platform
+        || intent.account_id != *account_id
+        || target.content_revision_id != Some(revision.revision_id)
+        || target.variant_id != Some(variant.variant_id)
+        || target.publication_intent_id != Some(intent.intent_id)
+        || target.account_id != Some(*account_id)
+        || target.platform_id != *platform
+        || variant.platform_id != *platform
+        || variant.content_revision_id != revision.revision_id
+        || variant.title != *title
+        || variant.markdown != *body
+        || variant.evidence != *evidence
+        || revision.evidence != *evidence
+        || revision.document.title != *title
+        || revision.markdown != *body
+        || revision.markdown != revision.document.markdown()
+        || sha256_hex(body.as_bytes()) != *body_sha256
+        || variant.payload_hash != *payload_hash
+        || intent.payload_hash != *payload_hash
+        || command.payload_hash != *payload_hash
+        || command.intent_id != intent.intent_id
+        || command.target_id != target.target_id
+    {
+        return Err(AppError::conflict(
+            "generated publication differs from frozen distribution",
+        ));
+    }
+    if command.fixture {
+        return Ok(true);
+    }
+    let knowledge = state.knowledge_repository();
+    let sources = knowledge.list_sources(scope).await?;
+    for cited in evidence {
+        let source = sources.iter().find(|source| {
+            source.current_version_id == Some(cited.source_version_id)
+                && source.state == SourceState::Active
+                && source.purpose == KnowledgePurpose::Public
+        });
+        let Some(source) = source else {
+            return Err(AppError::conflict("source no longer publicly eligible"));
+        };
+        if knowledge
+            .get_source_version(scope, source.source_id, cited.source_version_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::conflict("source version no longer available"));
+        };
+    }
+    Ok(false)
 }
 
 /// Always release the fresh browser context after a resumed account has
@@ -480,6 +581,25 @@ pub async fn execute_channel_target(
             "target already attempted; inspect or reconcile existing outcome",
         ));
     }
+    if matches!(
+        &planned.target.input,
+        ChannelTargetInput::GeneratedPublish { .. }
+    ) {
+        match generated_publication_preflight(state, scope, &planned.target.input).await {
+            Ok(true) => {
+                return Ok(ChannelDispatchResult::Deferred(
+                    ChannelDispatchDeferred::FixtureOnly,
+                ));
+            }
+            Ok(false) => {}
+            Err(error) if error.message.starts_with("source ") => {
+                return Ok(ChannelDispatchResult::Deferred(
+                    ChannelDispatchDeferred::SourceUnavailable,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     if let ChannelTargetInput::Measure { scheduled_at, .. } = &planned.target.input
         && *scheduled_at > Utc::now()
     {
@@ -572,7 +692,8 @@ async fn execute_reserved_channel_target(
         Err(error) => return Err(error),
     };
     let expected = match &planned.target.input {
-        ChannelTargetInput::Publish { platform, .. } => platform.as_str(),
+        ChannelTargetInput::Publish { platform, .. }
+        | ChannelTargetInput::GeneratedPublish { platform, .. } => platform.as_str(),
         ChannelTargetInput::Measure { .. } => "kimi",
     };
     if account.platform != expected
@@ -605,6 +726,25 @@ async fn execute_reserved_channel_target(
             return Ok(ChannelDispatchResult::Deferred(
                 ChannelDispatchDeferred::SourceUnavailable,
             ));
+        }
+    }
+    if matches!(
+        &planned.target.input,
+        ChannelTargetInput::GeneratedPublish { .. }
+    ) {
+        match generated_publication_preflight(state, scope, &planned.target.input).await {
+            Ok(true) => {
+                return Ok(ChannelDispatchResult::Deferred(
+                    ChannelDispatchDeferred::FixtureOnly,
+                ));
+            }
+            Ok(false) => {}
+            Err(error) if error.message.starts_with("source ") => {
+                return Ok(ChannelDispatchResult::Deferred(
+                    ChannelDispatchDeferred::SourceUnavailable,
+                ));
+            }
+            Err(error) => return Err(error),
         }
     }
     // Opening and verifying an ephemeral browser context is reversible; no
@@ -659,6 +799,9 @@ async fn execute_reserved_channel_target(
         ChannelTargetInput::Publish { title, body, .. } => {
             ("publish", json!({"title":title,"body":body}))
         }
+        ChannelTargetInput::GeneratedPublish { title, body, .. } => {
+            ("publish", json!({"title":title,"body":body}))
+        }
         ChannelTargetInput::Measure {
             provider,
             model,
@@ -700,6 +843,11 @@ async fn execute_reserved_channel_target(
                 .get_source_version(scope, *source_id, *source_version_id)
                 .await?
                 .ok_or_else(|| AppError::conflict("source version no longer available"))?;
+        }
+        if matches!(&target.input, ChannelTargetInput::GeneratedPublish { .. })
+            && generated_publication_preflight(state, scope, &target.input).await?
+        {
+            return Err(AppError::conflict("source fixture cannot publish"));
         }
         execute_and_close(
             bridge,
@@ -752,7 +900,9 @@ async fn execute_reserved_channel_target(
             }
         }
         Err(failure) => ChannelOutcome {
-            status: if failure.message.starts_with("source ") {
+            status: if failure.message.starts_with("source ")
+                || failure.message.starts_with("generated publication ")
+            {
                 ChannelOutcomeStatus::Unsupported
             } else if matches!(failure.code, ErrorCode::Conflict) {
                 ChannelOutcomeStatus::LoginRequired
@@ -969,5 +1119,55 @@ mod tests {
             ..receipt
         };
         assert!(publication_readback(&receipt, &input));
+    }
+
+    #[test]
+    fn generated_readback_requires_exact_frozen_title_and_body() {
+        let input = ChannelTargetInput::GeneratedPublish {
+            content_revision_id: Uuid::new_v4(),
+            variant_id: Uuid::new_v4(),
+            publication_intent_id: Uuid::new_v4(),
+            distribution_target_id: Uuid::new_v4(),
+            platform: "zhihu".into(),
+            account_id: Uuid::new_v4(),
+            title: "Frozen title".into(),
+            body: "Frozen body".into(),
+            body_sha256: sha256_hex(b"Frozen body"),
+            payload_hash: "frozen".into(),
+            evidence: vec![],
+        };
+        let exact_hash = sha256_hex(b"Frozen title\nFrozen body");
+        let proof = |hash: &str| {
+            json!({
+                "kind":"public_readback",
+                "url":"https://zhuanlan.zhihu.com/p/321",
+                "content_matched":true,
+                "owned_by_account":true,
+                "expected_sha256":hash,
+                "readback_sha256":hash
+            })
+        };
+        let receipt = BrowserExecution {
+            execution_id: Uuid::new_v4(),
+            status: "completed".into(),
+            reason: None,
+            evidence: vec![proof(&exact_hash)],
+            public_url: Some("https://zhuanlan.zhihu.com/p/321".into()),
+            occurred_at: Some(Utc::now()),
+            connector_version: Some("test-runner".into()),
+            stage: Some("public_readback".into()),
+        };
+        assert!(publication_readback(&receipt, &input));
+        let wrong = BrowserExecution {
+            evidence: vec![proof(&sha256_hex(b"Later draft\nFrozen body"))],
+            ..receipt
+        };
+        assert!(!publication_readback(&wrong, &input));
+        let wrong = BrowserExecution {
+            evidence: vec![proof(&exact_hash)],
+            public_url: Some("https://untrusted.zhihu.com/p/321".into()),
+            ..wrong
+        };
+        assert!(!publication_readback(&wrong, &input));
     }
 }

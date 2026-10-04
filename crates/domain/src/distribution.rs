@@ -156,6 +156,16 @@ pub struct PublicationCommand {
     pub fixture: bool,
 }
 
+/// Trusted read of the immutable payload and its authoritative dependencies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationBundle {
+    pub revision: ContentRevision,
+    pub variant: ChannelVariant,
+    pub intent: PublicationIntent,
+    pub target: DistributionTarget,
+    pub command: PublicationCommand,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreezeDistribution {
     pub cycle_id: Uuid,
@@ -543,6 +553,11 @@ pub fn prepare_publication_intent(
 
 #[async_trait]
 pub trait DistributionRepository: Send + Sync {
+    async fn get_publication_bundle(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+    ) -> Result<PublicationBundle, AppError>;
     async fn freeze(
         &self,
         scope: &TenantScope,
@@ -670,6 +685,50 @@ fn recorded_at(history: &[DistributionTargetVersion]) -> DateTime<Utc> {
 
 #[async_trait]
 impl DistributionRepository for MemoryDistributionRepository {
+    async fn get_publication_bundle(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+    ) -> Result<PublicationBundle, AppError> {
+        let state = self.state.read().await;
+        let key = scope.storage_key();
+        let intent = state
+            .intents
+            .iter()
+            .find(|((owner, _), value)| owner == &key && value.intent_id == intent_id)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| AppError::not_found("publication intent not found"))?;
+        let variant = state
+            .variants
+            .get(&(key.clone(), intent.variant_id))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("publication variant not found"))?;
+        let revision = state
+            .revisions
+            .get(&(key.clone(), intent.content_revision_id))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("content revision not found"))?;
+        let command = state
+            .commands
+            .iter()
+            .find(|((owner, _), command)| owner == &key && command.intent_id == intent_id)
+            .map(|(_, command)| command.clone())
+            .ok_or_else(|| AppError::not_found("publication command not found"))?;
+        let target = state
+            .histories
+            .get(&(key, command.target_id))
+            .and_then(|history| history.last())
+            .map(|version| version.target.clone())
+            .ok_or_else(|| AppError::not_found("distribution target not found"))?;
+        Ok(PublicationBundle {
+            revision,
+            variant,
+            intent,
+            target,
+            command,
+        })
+    }
+
     async fn freeze(
         &self,
         scope: &TenantScope,

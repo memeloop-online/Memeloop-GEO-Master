@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    AppError, ProjectId, ReportEvidenceReference, ReportManifestKind, ReportManifestRef,
-    ReportMeasurementStatus, ReportMeasurementTarget, ReportPublicationStatus,
+    AppError, EvidenceRef, ProjectId, ReportEvidenceReference, ReportManifestKind,
+    ReportManifestRef, ReportMeasurementStatus, ReportMeasurementTarget, ReportPublicationStatus,
     ReportPublicationTarget, TenantScope,
 };
 
@@ -26,6 +26,20 @@ pub enum ChannelTargetInput {
         title: String,
         body: String,
         body_sha256: String,
+    },
+    /// Database-owned immutable distribution input; never accepted by public plan DTOs.
+    GeneratedPublish {
+        content_revision_id: Uuid,
+        variant_id: Uuid,
+        publication_intent_id: Uuid,
+        distribution_target_id: Uuid,
+        platform: String,
+        account_id: Uuid,
+        title: String,
+        body: String,
+        body_sha256: String,
+        payload_hash: String,
+        evidence: Vec<EvidenceRef>,
     },
     Measure {
         account_id: Uuid,
@@ -46,8 +60,14 @@ pub enum ChannelTargetInput {
 impl ChannelTargetInput {
     pub fn account_id(&self) -> Uuid {
         match self {
-            Self::Publish { account_id, .. } | Self::Measure { account_id, .. } => *account_id,
+            Self::Publish { account_id, .. }
+            | Self::GeneratedPublish { account_id, .. }
+            | Self::Measure { account_id, .. } => *account_id,
         }
+    }
+
+    pub fn is_publication(&self) -> bool {
+        matches!(self, Self::Publish { .. } | Self::GeneratedPublish { .. })
     }
 
     pub fn comparison_key(&self) -> Option<String> {
@@ -149,6 +169,21 @@ pub struct ChannelCycleInputs {
 
 #[async_trait]
 pub trait ChannelJobRepository: Send + Sync {
+    /// Atomically insert durable targets and mark their outbox commands materialized.
+    /// This does not reserve an account, claim an attempt, or send externally.
+    async fn materialize_pending_commands(
+        &self,
+        after_command_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ChannelDispatchCandidate>, AppError>;
+    /// Trusted in-memory equivalent; no cross-repository atomicity is implied.
+    async fn insert_generated_target(
+        &self,
+        scope: &TenantScope,
+        cycle_id: Uuid,
+        command_id: Uuid,
+        target: ChannelTarget,
+    ) -> Result<ChannelTarget, AppError>;
     /// A reversible, operator-wide account reservation before browser startup.
     /// Expiry must be bounded; a stale holder cannot claim after its expiry.
     async fn reserve_account(
@@ -286,7 +321,8 @@ pub fn frozen_cycle_inputs(
             .into_iter()
             .collect();
         match &target.input {
-            ChannelTargetInput::Publish { platform, .. } => {
+            ChannelTargetInput::Publish { platform, .. }
+            | ChannelTargetInput::GeneratedPublish { platform, .. } => {
                 publications.push(ReportPublicationTarget {
                     target_id: target.target_id,
                     platform_id: platform.clone(),
@@ -364,11 +400,73 @@ type AccountReservation = (Uuid, DateTime<Utc>);
 #[derive(Default)]
 struct MemoryCycle {
     plan: Option<ChannelPlan>,
+    generated: HashMap<Uuid, ChannelTarget>,
     attempts: HashMap<Uuid, Vec<ChannelAttempt>>,
+}
+
+impl MemoryCycle {
+    fn target(&self, id: Uuid) -> Option<&ChannelTarget> {
+        self.generated.get(&id).or_else(|| {
+            self.plan
+                .as_ref()
+                .and_then(|plan| plan.targets.iter().find(|target| target.target_id == id))
+        })
+    }
+
+    fn targets(&self) -> impl Iterator<Item = &ChannelTarget> {
+        self.generated
+            .values()
+            .chain(self.plan.iter().flat_map(|plan| plan.targets.iter()))
+    }
 }
 
 #[async_trait]
 impl ChannelJobRepository for MemoryChannelJobRepository {
+    async fn materialize_pending_commands(
+        &self,
+        _after_command_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ChannelDispatchCandidate>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid command page size"));
+        }
+        // Independent memory stores cannot implement a cross-repository transaction.
+        Ok(vec![])
+    }
+
+    async fn insert_generated_target(
+        &self,
+        scope: &TenantScope,
+        cycle_id: Uuid,
+        command_id: Uuid,
+        target: ChannelTarget,
+    ) -> Result<ChannelTarget, AppError> {
+        if target.target_id != command_id
+            || !matches!(target.input, ChannelTargetInput::GeneratedPublish { .. })
+        {
+            return Err(AppError::invalid_request(
+                "invalid generated command target",
+            ));
+        }
+        let (o, t, p) = scope_key(scope)?;
+        let mut all = self.0.lock().await;
+        if let Some(existing) = all.iter().find_map(|(&(eo, et, ep, _), cycle)| {
+            (eo == o && et == t && ep == p)
+                .then(|| cycle.target(command_id))
+                .flatten()
+        }) {
+            return if existing == &target {
+                Ok(existing.clone())
+            } else {
+                Err(AppError::conflict("generated command target differs"))
+            };
+        }
+        all.entry((o, t, p, cycle_id))
+            .or_default()
+            .generated
+            .insert(command_id, target.clone());
+        Ok(target)
+    }
     async fn reserve_account(
         &self,
         scope: &TenantScope,
@@ -446,8 +544,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         let mut candidates = all
             .iter()
             .flat_map(|(&(operator, tenant, project, _), cycle)| {
-                cycle.plan.iter().flat_map(move |plan| {
-                    plan.targets.iter().filter_map(move |target| {
+                cycle.targets().filter_map(move |target| {
                         if after_target_id.is_some_and(|after| target.target_id <= after)
                             || cycle.attempts.contains_key(&target.target_id)
                             || matches!(&target.input, ChannelTargetInput::Measure { scheduled_at, .. } if *scheduled_at > as_of)
@@ -463,7 +560,6 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
                             target_id: target.target_id,
                         })
                     })
-                })
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|candidate| candidate.target_id);
@@ -477,6 +573,15 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
     ) -> Result<ChannelPlan, AppError> {
         if scope.project_id != Some(plan.project_id) {
             return Err(AppError::forbidden("plan outside project"));
+        }
+        if plan
+            .targets
+            .iter()
+            .any(|target| matches!(target.input, ChannelTargetInput::GeneratedPublish { .. }))
+        {
+            return Err(AppError::invalid_request(
+                "generated publication cannot be frozen into a legacy plan",
+            ));
         }
         let mut all = self.0.lock().await;
         let cycle = all
@@ -523,28 +628,26 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         let pending_target = all
             .iter()
             .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
-            .flat_map(|(_, cycle)| cycle.plan.iter().flat_map(|plan| plan.targets.iter()))
+            .flat_map(|(_, cycle)| cycle.targets())
             .find(|target| target.target_id == target_id)
             .cloned()
             .ok_or_else(|| AppError::not_found("target not found"))?;
-        if matches!(pending_target.input, ChannelTargetInput::Publish { .. })
+        if pending_target.input.is_publication()
             && all
                 .iter()
                 // A pool account can serve several tenants/projects under one
                 // operator; its write lease is account-wide, not project-wide.
                 .filter(|((o, _, _, _), _)| *o == key.0)
                 .any(|(_, cycle)| {
-                    cycle.plan.as_ref().is_some_and(|plan| {
-                        plan.targets.iter().any(|target| {
-                            matches!(target.input, ChannelTargetInput::Publish { .. })
-                                && target.input.account_id() == pending_target.input.account_id()
-                                && cycle
-                                    .attempts
-                                    .get(&target.target_id)
-                                    .is_some_and(|attempts| {
-                                        attempts.iter().any(|attempt| attempt.received_at.is_none())
-                                    })
-                        })
+                    cycle.targets().any(|target| {
+                        target.input.is_publication()
+                            && target.input.account_id() == pending_target.input.account_id()
+                            && cycle
+                                .attempts
+                                .get(&target.target_id)
+                                .is_some_and(|attempts| {
+                                    attempts.iter().any(|attempt| attempt.received_at.is_none())
+                                })
                     })
                 })
         {
@@ -554,24 +657,11 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         }
         let cycle = all
             .iter_mut()
-            .find(|((o, t, p, _), cycle)| {
-                (*o, *t, *p) == key
-                    && cycle.plan.as_ref().is_some_and(|plan| {
-                        plan.targets
-                            .iter()
-                            .any(|target| target.target_id == target_id)
-                    })
-            })
+            .find(|((o, t, p, _), cycle)| (*o, *t, *p) == key && cycle.target(target_id).is_some())
             .map(|(_, cycle)| cycle)
             .ok_or_else(|| AppError::not_found("target not found"))?;
         let target = cycle
-            .plan
-            .as_ref()
-            .and_then(|plan| {
-                plan.targets
-                    .iter()
-                    .find(|target| target.target_id == target_id)
-            })
+            .target(target_id)
             .cloned()
             .ok_or_else(|| AppError::not_found("target not found"))?;
         let attempts = cycle.attempts.entry(target_id).or_default();
@@ -603,24 +693,11 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         let key = scope_key(scope)?;
         let cycle = all
             .iter_mut()
-            .find(|((o, t, p, _), cycle)| {
-                (*o, *t, *p) == key
-                    && cycle.plan.as_ref().is_some_and(|plan| {
-                        plan.targets
-                            .iter()
-                            .any(|target| target.target_id == target_id)
-                    })
-            })
+            .find(|((o, t, p, _), cycle)| (*o, *t, *p) == key && cycle.target(target_id).is_some())
             .map(|(_, cycle)| cycle)
             .ok_or_else(|| AppError::not_found("target not found"))?;
         let target = cycle
-            .plan
-            .as_ref()
-            .and_then(|plan| {
-                plan.targets
-                    .iter()
-                    .find(|target| target.target_id == target_id)
-            })
+            .target(target_id)
             .cloned()
             .ok_or_else(|| AppError::not_found("target not found"))?;
         let attempts = cycle
@@ -654,24 +731,11 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         let key = scope_key(scope)?;
         let cycle = all
             .iter()
-            .find(|((o, t, p, _), cycle)| {
-                (*o, *t, *p) == key
-                    && cycle.plan.as_ref().is_some_and(|plan| {
-                        plan.targets
-                            .iter()
-                            .any(|target| target.target_id == target_id)
-                    })
-            })
+            .find(|((o, t, p, _), cycle)| (*o, *t, *p) == key && cycle.target(target_id).is_some())
             .map(|(_, cycle)| cycle)
             .ok_or_else(|| AppError::not_found("target not found"))?;
         let target = cycle
-            .plan
-            .as_ref()
-            .and_then(|plan| {
-                plan.targets
-                    .iter()
-                    .find(|target| target.target_id == target_id)
-            })
+            .target(target_id)
             .cloned()
             .ok_or_else(|| AppError::not_found("target not found"))?;
         Ok(ChannelTargetView {
@@ -706,6 +770,86 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
 mod tests {
     use super::*;
     use crate::{OperatorId, TenantId};
+
+    #[tokio::test]
+    async fn generated_memory_target_is_idempotent_and_uses_publication_account_lease() {
+        let repo = MemoryChannelJobRepository::default();
+        let scope = TenantScope::new(
+            OperatorId::new(Uuid::new_v4()),
+            TenantId::new(Uuid::new_v4()),
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let cycle = Uuid::new_v4();
+        let account = Uuid::new_v4();
+        let command = Uuid::new_v4();
+        let target = ChannelTarget {
+            target_id: command,
+            input: ChannelTargetInput::GeneratedPublish {
+                content_revision_id: Uuid::new_v4(),
+                variant_id: Uuid::new_v4(),
+                publication_intent_id: Uuid::new_v4(),
+                distribution_target_id: Uuid::new_v4(),
+                platform: "zhihu".into(),
+                account_id: account,
+                title: "title".into(),
+                body: "body".into(),
+                body_sha256: "hash".into(),
+                payload_hash: "payload".into(),
+                evidence: vec![],
+            },
+        };
+        let measurement = ChannelPlan {
+            plan_id: Uuid::new_v4(),
+            project_id: scope.project_id.unwrap(),
+            cycle_id: cycle,
+            input_hash: "separate".into(),
+            revision: 1,
+            created_at: Utc::now(),
+            targets: vec![],
+        };
+        repo.create_plan(&scope, measurement.clone()).await.unwrap();
+        assert_eq!(
+            repo.insert_generated_target(&scope, cycle, command, target.clone())
+                .await
+                .unwrap(),
+            target
+        );
+        assert_eq!(
+            repo.insert_generated_target(&scope, cycle, command, target.clone())
+                .await
+                .unwrap(),
+            target
+        );
+        assert_eq!(
+            repo.get_plan(&scope, cycle).await.unwrap(),
+            Some(measurement)
+        );
+        assert_eq!(
+            repo.scan_pending(None, Utc::now(), 10).await.unwrap().len(),
+            1
+        );
+        let now = Utc::now();
+        let reservation = Uuid::new_v4();
+        repo.reserve_account(
+            &scope,
+            account,
+            reservation,
+            now,
+            now + chrono::Duration::seconds(30),
+        )
+        .await
+        .unwrap();
+        let attempt = Uuid::new_v4();
+        repo.claim_reserved(&scope, command, attempt, reservation, now)
+            .await
+            .unwrap();
+        assert!(repo.scan_pending(None, now, 10).await.unwrap().is_empty());
+        assert!(
+            repo.claim(&scope, command, Uuid::new_v4(), now)
+                .await
+                .is_err()
+        );
+    }
     #[tokio::test]
     async fn frozen_denominator_and_crash_unknown() {
         let scope = TenantScope::new(

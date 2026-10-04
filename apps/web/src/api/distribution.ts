@@ -135,9 +135,14 @@ export function resumeDistributionManifest(
   tenantId: string,
   projectId: string,
   manifestId: string,
+  afterOrdinal?: number,
 ) {
+  const query =
+    afterOrdinal === undefined
+      ? ""
+      : `?${new URLSearchParams({ after_ordinal: String(afterOrdinal) })}`;
   return apiFetch<DistributionManifest>(
-    `${base(projectId)}/distribution-manifests/${encoded(manifestId)}/resume`,
+    `${base(projectId)}/distribution-manifests/${encoded(manifestId)}/resume${query}`,
     { ...scope(tenantId, projectId), method: "POST" },
   );
 }

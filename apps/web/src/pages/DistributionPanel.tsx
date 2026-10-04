@@ -157,8 +157,8 @@ export function DistributionPanel({
     onError: refresh,
   });
   const resume = useMutation({
-    mutationFn: () =>
-      resumeDistributionManifest(tenantId, projectId, manifestId!),
+    mutationFn: (cursor?: number) =>
+      resumeDistributionManifest(tenantId, projectId, manifestId!, cursor),
     onSuccess: applyManifest,
     onError: refresh,
   });
@@ -243,9 +243,13 @@ export function DistributionPanel({
               {canWrite && !detail.isError ? (
                 <Button
                   disabled={resume.isPending}
-                  onClick={() => resume.mutate()}
+                  onClick={() => resume.mutate(afterOrdinal)}
                 >
-                  {resume.isPending ? "正在恢复…" : "继续展开／检查延后项"}
+                  {resume.isPending
+                    ? "正在恢复…"
+                    : pageIndex
+                      ? "继续展开／复查当前页起的延后项"
+                      : "继续展开／检查延后项"}
                 </Button>
               ) : !canWrite ? (
                 <p role="status">只读访问：无法恢复分发目标。</p>

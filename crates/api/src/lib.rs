@@ -365,6 +365,10 @@ impl AppState {
         }
     }
 
+    pub fn distribution_repository(&self) -> Arc<dyn geo_domain::DistributionRepository> {
+        Arc::clone(&self.distribution_repository)
+    }
+
     pub fn distribution_service(&self) -> distribution::DistributionService {
         distribution::DistributionService::new(
             Arc::clone(&self.distribution_repository),

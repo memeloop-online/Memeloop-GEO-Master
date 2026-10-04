@@ -80,6 +80,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 17,
         description: "distribution execution",
     },
+    MigrationMetadata {
+        version: 18,
+        description: "distribution jobs",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

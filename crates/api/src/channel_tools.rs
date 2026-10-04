@@ -146,6 +146,18 @@ fn summary(view: ChannelTargetView) -> ChannelTargetSummary {
                 Some(source_version_id),
                 None,
             ),
+            ChannelTargetInput::GeneratedPublish {
+                account_id,
+                platform,
+                ..
+            } => (
+                ChannelTargetKind::Publish,
+                account_id,
+                platform,
+                None,
+                None,
+                None,
+            ),
             ChannelTargetInput::Measure {
                 account_id,
                 provider,
@@ -186,6 +198,7 @@ fn deferred(target_id: Uuid, reason: ChannelDispatchDeferred) -> ChannelExecutio
                 ChannelDispatchDeferred::AccountBusy => "account_busy",
                 ChannelDispatchDeferred::RunnerUnavailable => "runner_unavailable",
                 ChannelDispatchDeferred::SourceUnavailable => "source_unavailable",
+                ChannelDispatchDeferred::FixtureOnly => "fixture_only",
             }
             .to_owned(),
         ),

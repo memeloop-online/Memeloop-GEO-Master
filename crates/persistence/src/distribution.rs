@@ -5,8 +5,9 @@ use geo_domain::{
     DistributionCycleInputs, DistributionExpansionPage, DistributionManifest,
     DistributionRepository, DistributionSnapshot, DistributionTarget, DistributionTargetPage,
     DistributionTargetStatus, ErrorCode, FreezeDistribution, IntentVerification,
-    MaterializedDistribution, PreparedDistribution, PublicationIntent, TenantScope,
-    distribution_cell, freeze_distribution, prepare_publication_intent, prepare_variant,
+    MaterializedDistribution, PreparedDistribution, PublicationBundle, PublicationCommand,
+    PublicationIntent, TenantScope, distribution_cell, freeze_distribution,
+    prepare_publication_intent, prepare_variant,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -137,6 +138,56 @@ async fn change_target(
 
 #[async_trait]
 impl DistributionRepository for PgDistributionRepository {
+    async fn get_publication_bundle(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+    ) -> Result<PublicationBundle, AppError> {
+        let mut tx = self.transaction(scope).await?;
+        let row = sqlx::query(
+            "SELECT i.body AS intent_body,i.verification,i.verification_evidence_id, \
+                    v.body AS variant_body,r.body AS revision_body, \
+                    t.current_body AS target_body,c.command_id,c.origin_target_id, \
+                    c.payload_hash,c.fixture \
+             FROM distribution_publication_intents i \
+             JOIN distribution_channel_variants v ON (v.operator_id,v.tenant_id,v.project_id,v.variant_id) = \
+                (i.operator_id,i.tenant_id,i.project_id,i.variant_id) \
+             JOIN content_revisions r ON (r.operator_id,r.tenant_id,r.project_id,r.revision_id) = \
+                (v.operator_id,v.tenant_id,v.project_id,v.content_revision_id) \
+             JOIN distribution_publication_commands c ON (c.operator_id,c.tenant_id,c.project_id,c.intent_id) = \
+                (i.operator_id,i.tenant_id,i.project_id,i.intent_id) \
+             JOIN distribution_execution_targets t ON (t.operator_id,t.tenant_id,t.project_id,t.target_id) = \
+                (c.operator_id,c.tenant_id,c.project_id,c.origin_target_id) \
+             WHERE i.operator_id=$1 AND i.tenant_id=$2 AND i.project_id=$3 AND i.intent_id=$4",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(intent_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        .ok_or_else(|| AppError::not_found("publication bundle not found"))?;
+        let mut intent: PublicationIntent = decode(row.get("intent_body"))?;
+        intent.verification = decode(serde_json::Value::String(row.get("verification")))?;
+        intent.verification_evidence_id = row.get("verification_evidence_id");
+        let bundle = PublicationBundle {
+            revision: decode(row.get("revision_body"))?,
+            variant: decode(row.get("variant_body"))?,
+            target: decode(row.get("target_body"))?,
+            command: PublicationCommand {
+                command_id: row.get("command_id"),
+                intent_id,
+                target_id: row.get("origin_target_id"),
+                payload_hash: row.get("payload_hash"),
+                fixture: row.get("fixture"),
+            },
+            intent,
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(bundle)
+    }
+
     async fn freeze(
         &self,
         scope: &TenantScope,

@@ -76,11 +76,13 @@ function mockApi({
   role = "member",
   manifestError = false,
   firstStatus = "deferred",
+  nextCursor = 0,
 }: {
   initialManifest?: DistributionManifest | null;
   role?: string;
   manifestError?: boolean;
   firstStatus?: DistributionTargetStatus;
+  nextCursor?: number;
 } = {}) {
   let current = initialManifest;
   const requests: Array<{
@@ -122,6 +124,10 @@ function mockApi({
             csrf_token: "csrf-test",
           }),
         );
+      if (path.endsWith("/cycles/cycle-2/distribution-manifest"))
+        return Promise.resolve(
+          response({ code: "not_found", message: "not frozen" }, 404),
+        );
       if (path.endsWith("/cycles/cycle-1/distribution-manifest")) {
         if (method === "POST") {
           current = { ...manifest, expansion_cursor: 1 };
@@ -139,7 +145,7 @@ function mockApi({
       }
       if (path.endsWith("/distribution-manifests/manifest-1/targets")) {
         const ordinal = url.searchParams.get("after_ordinal");
-        if (ordinal === "0")
+        if (ordinal === String(nextCursor))
           return Promise.resolve(
             response({
               manifest_id: manifest.manifest_id,
@@ -168,7 +174,8 @@ function mockApi({
                   },
                 ]
               : [],
-            next_ordinal: current && current.expansion_cursor > 1 ? 0 : null,
+            next_ordinal:
+              current && current.expansion_cursor > 1 ? nextCursor : null,
             expected_count: 3,
           }),
         );
@@ -191,29 +198,31 @@ function mockApi({
 }
 
 function renderPanel(canWrite = true, cycleId = "cycle-1") {
-  return render(
-    <QueryClientProvider
-      client={
-        new QueryClient({
-          defaultOptions: {
-            queries: { retry: false },
-            mutations: { retry: false },
-          },
-        })
-      }
-    >
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+  const panel = (currentCycleId: string) => (
+    <QueryClientProvider client={queryClient}>
       <FluentProvider theme={webLightTheme}>
         <AuthProvider>
           <DistributionPanel
             tenantId="tenant-1"
             projectId="project-1"
-            cycleId={cycleId}
+            cycleId={currentCycleId}
             canWrite={canWrite}
           />
         </AuthProvider>
       </FluentProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(panel(cycleId));
+  return {
+    ...result,
+    rerenderCycle: (nextCycleId: string) => result.rerender(panel(nextCycleId)),
+  };
 }
 
 afterEach(() => {
@@ -282,12 +291,55 @@ describe("formal distribution coverage", () => {
     ]);
     expect(posts.every((item) => item.body === undefined)).toBe(true);
     expect(
+      posts.every((item) => !item.url.searchParams.has("after_ordinal")),
+    ).toBe(true);
+    expect(
       posts.every(
         (item) =>
           item.url.searchParams.get("tenant_id") === "tenant-1" &&
           item.url.searchParams.get("project_id") === "project-1",
       ),
     ).toBe(true);
+  });
+
+  it("rescans the visible later page and resets its cursor when the cycle changes", async () => {
+    const requests = mockApi({ nextCursor: 256 });
+    const user = userEvent.setup();
+    const view = renderPanel();
+    await screen.findByText(/尚未展开 1 项/);
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByText(/复用既有未知结果，禁止重发/);
+    await user.click(
+      screen.getByRole("button", {
+        name: "继续展开／复查当前页起的延后项",
+      }),
+    );
+    await waitFor(() => {
+      const post = requests.find(
+        (item) =>
+          item.method === "POST" &&
+          item.path.endsWith("/distribution-manifests/manifest-1/resume"),
+      );
+      expect(post?.url.searchParams.get("after_ordinal")).toBe("256");
+      expect(post?.body).toBeUndefined();
+    });
+    view.rerenderCycle("cycle-2");
+    expect(await screen.findByText("尚未冻结正式分发清单")).toBeInTheDocument();
+    view.rerenderCycle("cycle-1");
+    await screen.findByText(/尚未展开 0 项/);
+    expect(screen.getByText("第 1 页")).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "继续展开／检查延后项" }),
+    );
+    await waitFor(() => {
+      const posts = requests.filter(
+        (item) =>
+          item.method === "POST" &&
+          item.path.endsWith("/distribution-manifests/manifest-1/resume"),
+      );
+      expect(posts).toHaveLength(2);
+      expect(posts[1].url.searchParams.has("after_ordinal")).toBe(false);
+    });
   });
 
   it("shows a missing manifest without offering write controls to a viewer", async () => {

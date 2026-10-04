@@ -50,8 +50,10 @@ pub enum ReportPublicationStatus {
     Verified,
     Unknown,
     Failed,
+    Blocked,
     Deferred,
     NotApplicable,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -580,8 +582,10 @@ pub fn reduce_report(
                     }
                     ReportPublicationStatus::Unknown => "unknown",
                     ReportPublicationStatus::Failed => "failed",
+                    ReportPublicationStatus::Blocked => "blocked",
                     ReportPublicationStatus::Deferred => "deferred",
                     ReportPublicationStatus::NotApplicable => "not_applicable",
+                    ReportPublicationStatus::Cancelled => "cancelled",
                     ReportPublicationStatus::Planned => "pending",
                 };
                 bump(&mut counts, status);
@@ -597,7 +601,10 @@ pub fn reduce_report(
                         summary: format!("Publication target: {status}"),
                     },
                 )?;
-                if matches!(status, "unknown" | "failed" | "deferred" | "pending") {
+                if matches!(
+                    status,
+                    "unknown" | "failed" | "blocked" | "deferred" | "cancelled" | "pending"
+                ) {
                     findings.push(ReportFinding {
                         finding_id: stable_uuid(&format!("{report_id}:publication:{}", target.target_id)),
                         kind: format!("publication_{status}"),
@@ -745,7 +752,9 @@ pub fn reduce_report(
         && !publications.counts.contains_key("unknown")
         && !publications.counts.contains_key("pending")
         && !publications.counts.contains_key("failed")
+        && !publications.counts.contains_key("blocked")
         && !publications.counts.contains_key("deferred")
+        && !publications.counts.contains_key("cancelled")
         && !measurements.counts.contains_key("missing")
         && !measurements.counts.contains_key("pending")
         && !measurements.counts.contains_key("refused");

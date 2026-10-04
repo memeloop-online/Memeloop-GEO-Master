@@ -1,6 +1,7 @@
 //! Run with GEO_TEST_DATABASE_URL against a disposable PostgreSQL database.
 use chrono::{Duration, Utc};
 use geo_domain::{
+    ChannelJobRepository, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelTargetInput,
     ContentBlock, ContentBlockKind, ContentCoverage, ContentExecution, ContentExecutionStatus,
     ContentHandoff, ContentHandoffItem, ContentItemStatus, ContentRevision, DistributionRepository,
     DistributionTargetStatus, DocumentManifest, DocumentManifestItemState, ErrorCode,
@@ -9,7 +10,9 @@ use geo_domain::{
     ProjectStartCommand, StructuredDocument, TenantScope, hash_idempotency_key, settings_hash,
     start_request_hash,
 };
-use geo_persistence::{Database, DatabaseConfig, PgDistributionRepository, PgProjectRepository};
+use geo_persistence::{
+    Database, DatabaseConfig, PgChannelJobRepository, PgDistributionRepository, PgProjectRepository,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -751,4 +754,285 @@ async fn next_cycle_reuses_unknown_intent_without_second_command() {
     .await
     .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL in GEO_TEST_DATABASE_URL"]
+async fn outbox_bridge_is_atomic_replay_safe_and_coexists_with_legacy_plan() {
+    let url = std::env::var("GEO_TEST_DATABASE_URL").unwrap();
+    // The global outbox scanner must not consume another test's pending work.
+    let admin = PgPool::connect(&url).await.unwrap();
+    let schema = format!("distribution_bridge_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .unwrap()
+        .options([("search_path", schema.as_str())]);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    let db = Database::from_pool(pool);
+    db.migrate().await.unwrap();
+    let first = fixture(db.pool()).await;
+    let distribution = PgDistributionRepository::from_database(&db);
+    let jobs = PgChannelJobRepository::from_database(&db);
+    let manifest = distribution
+        .freeze(&first.scope, freeze(&first))
+        .await
+        .unwrap();
+    let page = distribution
+        .expansion_page(&first.scope, manifest.manifest_id, 0, 6)
+        .await
+        .unwrap();
+    distribution
+        .commit_expansion_page(&first.scope, manifest.manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let targets = distribution
+        .list_targets(&first.scope, manifest.manifest_id, None, 2)
+        .await
+        .unwrap()
+        .rows;
+    let account_id = Uuid::new_v4();
+    let mut commands = Vec::new();
+    for target in targets {
+        let output = distribution
+            .materialize(
+                &first.scope,
+                PreparedDistribution {
+                    manifest_id: manifest.manifest_id,
+                    target_id: target.target_id,
+                    revision: Some(first.revision.clone()),
+                    account_id: Some(account_id),
+                    defer_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        commands.push(output.publication_commands[0].clone());
+    }
+    commands.sort_by_key(|command| command.command_id);
+    let plan_id = Uuid::new_v4();
+    let legacy = jobs
+        .create_plan(
+            &first.scope,
+            ChannelPlan {
+                plan_id,
+                project_id: first.scope.project_id.unwrap(),
+                cycle_id: first.cycle,
+                input_hash: "independent-measurement".into(),
+                revision: 1,
+                created_at: Utc::now(),
+                targets: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.get_plan(&first.scope, first.cycle).await.unwrap(),
+        Some(legacy)
+    );
+    assert_eq!(
+        jobs.materialize_pending_commands(None, 0)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+
+    // Make the later command invalid. A two-row bridge must roll back the
+    // earlier insert and its marker along with the invalid dependency.
+    sqlx::query(
+        "UPDATE distribution_publication_commands SET payload_hash='invalid' WHERE command_id=$1",
+    )
+    .bind(commands[1].command_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(jobs.materialize_pending_commands(None, 100).await.is_err());
+    let (target_count, marker_count): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM channel_execution_targets WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND publication_intent_id IS NOT NULL), \
+                (SELECT count(*) FROM distribution_publication_commands WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND materialized_target_id IS NOT NULL)"
+    ).bind(first.scope.operator_id.as_uuid()).bind(first.scope.tenant_id.as_uuid())
+        .bind(first.scope.project_id.unwrap().as_uuid()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!((target_count, marker_count), (0, 0));
+    sqlx::query("UPDATE distribution_publication_commands SET payload_hash=$1 WHERE command_id=$2")
+        .bind(&commands[1].payload_hash)
+        .bind(commands[1].command_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let (a, b) = tokio::join!(
+        jobs.materialize_pending_commands(None, 100),
+        jobs.materialize_pending_commands(None, 100)
+    );
+    let mut created = [a.unwrap(), b.unwrap()].concat();
+    created.sort_by_key(|row| row.target_id);
+    assert_eq!(created.len(), 2);
+    assert_eq!(
+        jobs.materialize_pending_commands(None, 100)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        jobs.materialize_pending_commands(Some(created[0].target_id), 100)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM channel_execution_attempts WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3"
+    ).bind(first.scope.operator_id.as_uuid()).bind(first.scope.tenant_id.as_uuid())
+        .bind(first.scope.project_id.unwrap().as_uuid()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(attempts, 0);
+    for row in &created {
+        let view = jobs.get_target(&row.scope, row.target_id).await.unwrap();
+        assert!(view.attempts.is_empty());
+        assert!(matches!(
+            view.target.input,
+            ChannelTargetInput::GeneratedPublish { .. }
+        ));
+        assert_eq!(row.scope, first.scope);
+    }
+    assert_eq!(
+        jobs.get_plan(&first.scope, first.cycle)
+            .await
+            .unwrap()
+            .unwrap()
+            .plan_id,
+        plan_id
+    );
+    let target_id = created[0].target_id;
+    let now = Utc::now();
+    let reservation = Uuid::new_v4();
+    jobs.reserve_account(
+        &first.scope,
+        account_id,
+        reservation,
+        now,
+        now + Duration::seconds(30),
+    )
+    .await
+    .unwrap();
+    let attempt = Uuid::new_v4();
+    jobs.claim_reserved(&first.scope, target_id, attempt, reservation, now)
+        .await
+        .unwrap();
+    let claimed: (String, String, i64) = sqlx::query_as(
+        "SELECT c.status,i.verification, \
+           (SELECT count(*) FROM distribution_publication_attempts a WHERE a.intent_id=i.intent_id) \
+         FROM distribution_publication_commands c \
+         JOIN distribution_publication_intents i ON i.intent_id=c.intent_id \
+         WHERE c.command_id=$1"
+    ).bind(target_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(claimed, ("claimed".into(), "unknown".into(), 1));
+    assert!(
+        jobs.claim(&first.scope, created[1].target_id, Uuid::new_v4(), now)
+            .await
+            .is_err()
+    );
+    jobs.finish(
+        &first.scope,
+        target_id,
+        attempt,
+        ChannelOutcome {
+            status: ChannelOutcomeStatus::Unknown,
+            detail: Some("unresolved".into()),
+            occurred_at: now,
+            raw_answer: None,
+            citations: vec![],
+            public_url: None,
+            screenshot_ref: None,
+            connector_version: None,
+            runner_evidence: vec![],
+            fixture: true,
+        },
+        now,
+    )
+    .await
+    .unwrap();
+    let bundle = distribution
+        .get_publication_bundle(
+            &first.scope,
+            commands
+                .iter()
+                .find(|command| command.command_id == target_id)
+                .unwrap()
+                .intent_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bundle.intent.verification,
+        geo_domain::IntentVerification::Unknown
+    );
+    assert_eq!(bundle.command.command_id, target_id);
+    jobs.claim_reserved(
+        &first.scope,
+        created[1].target_id,
+        Uuid::new_v4(),
+        reservation,
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        jobs.materialize_pending_commands(None, 100)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let successor = next_cycle(db.pool(), &first).await;
+    let next_manifest = distribution
+        .freeze(&successor.scope, freeze(&successor))
+        .await
+        .unwrap();
+    let page = distribution
+        .expansion_page(&successor.scope, next_manifest.manifest_id, 0, 6)
+        .await
+        .unwrap();
+    distribution
+        .commit_expansion_page(&successor.scope, next_manifest.manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let reused = distribution
+        .list_targets(&successor.scope, next_manifest.manifest_id, None, 1)
+        .await
+        .unwrap()
+        .rows
+        .remove(0);
+    let result = distribution
+        .materialize(
+            &successor.scope,
+            PreparedDistribution {
+                manifest_id: next_manifest.manifest_id,
+                target_id: reused.target_id,
+                revision: Some(successor.revision),
+                account_id: Some(account_id),
+                defer_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.target.status,
+        DistributionTargetStatus::ReusedUnknown
+    );
+    assert!(result.publication_commands.is_empty());
+    assert!(
+        jobs.materialize_pending_commands(None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

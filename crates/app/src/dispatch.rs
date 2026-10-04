@@ -13,6 +13,32 @@ pub fn spawn(state: AppState) {
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
+            // Persist each frozen distribution command as an ordinary channel
+            // target before scanning due work. Command IDs are the keyset;
+            // a restarted dispatcher safely revisits unmaterialized rows.
+            let mut command_after = None;
+            loop {
+                match state
+                    .channel_job_repository()
+                    .materialize_pending_commands(command_after, 100)
+                    .await
+                {
+                    Ok(commands) => {
+                        let count = commands.len();
+                        if let Some(last) = commands.last() {
+                            command_after = Some(last.target_id);
+                        }
+                        if count < 100 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => {
+                        warn!(code = ?error.code, "distribution command materialization failed");
+                        break;
+                    }
+                }
+            }
             let due_at = chrono::Utc::now();
             let mut after = None;
             loop {

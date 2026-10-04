@@ -7,8 +7,9 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ProjectId, ReportManifestKind, ReportManifestRef, ReportReduceInput, ReportSnapshot,
-    TenantScope, reduce_report,
+    AppError, DistributionTarget, DistributionTargetStatus, ErrorCode, ProjectId,
+    ReportManifestKind, ReportManifestRef, ReportPublicationStatus, ReportPublicationTarget,
+    ReportReduceInput, ReportSnapshot, TenantScope, reduce_report,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -44,6 +45,34 @@ pub struct ReportList {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReportEvidenceList {
     pub items: Vec<geo_domain::ReportEvidenceReference>,
+}
+
+fn formal_publication_target(target: DistributionTarget) -> ReportPublicationTarget {
+    let status = match target.status {
+        DistributionTargetStatus::Blocked => ReportPublicationStatus::Blocked,
+        DistributionTargetStatus::Deferred => ReportPublicationStatus::Deferred,
+        DistributionTargetStatus::NotApplicable => ReportPublicationStatus::NotApplicable,
+        DistributionTargetStatus::Cancelled => ReportPublicationStatus::Cancelled,
+        DistributionTargetStatus::ReusedUnknown => ReportPublicationStatus::Unknown,
+        // An intent marked verified is not target-associated public evidence.
+        // Until the actual receipt and read-back can be projected, do not
+        // claim the reused asset is verified in the report.
+        DistributionTargetStatus::ReusedVerified => ReportPublicationStatus::Unknown,
+        DistributionTargetStatus::Pending | DistributionTargetStatus::Ready => {
+            ReportPublicationStatus::Planned
+        }
+    };
+    ReportPublicationTarget {
+        target_id: target.target_id,
+        platform_id: target.platform_id,
+        status,
+        reason: target.reason.or_else(|| {
+            (target.status == DistributionTargetStatus::ReusedVerified).then(|| {
+                "Reused intent has no target-associated public verification evidence".to_owned()
+            })
+        }),
+        evidence: vec![],
+    }
 }
 
 async fn project_scope(
@@ -141,8 +170,67 @@ pub async fn reduce_cycle_report(
             "document manifest does not match the frozen start revision",
         ));
     }
-    // Ordinary snapshots use the frozen cutoff; explicit corrections may
-    // include evidence received since then without rewriting the old report.
+    // Manifest identity is always fixed at the original cutoff. Corrections
+    // can see later versions of those targets, not manifests frozen later or
+    // a newer manifest revision that would rewrite the original denominator.
+    let distribution_repository = state.distribution_repository();
+    let formal = if let Some(parent_id) = correction_of {
+        let parent = revisions
+            .iter()
+            .find(|report| report.report_id == parent_id)
+            .expect("correction parent checked above");
+        let reference = parent.input_manifest_versions.iter().find(|reference| {
+            reference.kind == ReportManifestKind::Distribution && reference.sealed
+        });
+        if let Some(reference) = reference {
+            match distribution_repository
+                .get(scope, reference.manifest_id)
+                .await
+            {
+                Ok(manifest)
+                    if manifest.revision == reference.revision
+                        && manifest.sealed_at <= cycle.cutoff_at =>
+                {
+                    let snapshot = distribution_repository
+                        .as_of(scope, manifest.manifest_id, now)
+                        .await?;
+                    Some((manifest, snapshot.targets))
+                }
+                Ok(_) => None,
+                Err(error) if error.code == ErrorCode::NotFound => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        }
+    } else {
+        let formal_at_cutoff = distribution_repository
+            .cycle_inputs(scope, cycle_id, cycle.cutoff_at)
+            .await?;
+        formal_at_cutoff
+            .manifest
+            .map(|manifest| (manifest, formal_at_cutoff.targets))
+    };
+    if let Some((manifest, targets)) = &formal
+        && (manifest.project_id != project_id
+            || manifest.cycle_id != cycle_id
+            || manifest.sealed_at > cycle.cutoff_at
+            || cycle.document_manifest.as_ref().is_some_and(|reference| {
+                manifest.document_manifest_id != reference.manifest_id
+                    || manifest.document_manifest_revision != reference.revision
+            })
+            || targets.len() as u64 > manifest.expected_count
+            || targets.iter().any(|target| {
+                target.manifest_id != manifest.manifest_id
+                    || target.ordinal >= manifest.expected_count
+            }))
+    {
+        return Err(AppError::conflict(
+            "distribution inputs do not match the frozen cycle and cutoff",
+        ));
+    }
+    // Legacy publication plans only fill a gap when no formal distribution
+    // manifest existed at cutoff. Independent measurement inputs remain.
     let channel_inputs = state
         .channel_job_repository()
         .cycle_inputs(
@@ -155,10 +243,20 @@ pub async fn reduce_cycle_report(
             },
         )
         .await?;
-    let has_distribution = channel_inputs
-        .manifests
-        .iter()
-        .any(|reference| reference.kind == ReportManifestKind::Distribution);
+    let has_distribution = formal.is_some()
+        || channel_inputs
+            .manifests
+            .iter()
+            .any(|reference| reference.kind == ReportManifestKind::Distribution);
+    let formal_reference = formal.as_ref().map(|(manifest, _)| ReportManifestRef {
+        kind: ReportManifestKind::Distribution,
+        manifest_id: manifest.manifest_id,
+        revision: manifest.revision,
+        sealed: true,
+        expected_count: Some(manifest.expected_count),
+    });
+    let formal_publications =
+        formal.map(|(_, targets)| targets.into_iter().map(formal_publication_target).collect());
     let input = ReportReduceInput {
         project_id,
         cycle_id,
@@ -192,10 +290,13 @@ pub async fn reduce_cycle_report(
                         expected_count: reference.expected_count.and_then(|n| n.try_into().ok()),
                     }),
             )
-            .chain(channel_inputs.manifests)
+            .chain(formal_reference)
+            .chain(channel_inputs.manifests.into_iter().filter(|reference| {
+                formal_publications.is_none() || reference.kind != ReportManifestKind::Distribution
+            }))
             .collect(),
         document_manifest,
-        publication_targets: channel_inputs.publications,
+        publication_targets: formal_publications.or(channel_inputs.publications),
         measurement_targets: channel_inputs.measurements,
     };
     let snapshot = reduce_report(scope, &input, revision, correction_of, now)?;

@@ -30,6 +30,7 @@ const coverageLabels: Record<string, string> = {
   planned: "已规划",
   blocked: "阻断",
   deferred: "延后",
+  cancelled: "已取消",
   not_applicable: "不适用",
   published: "已发布",
   verified: "已验证",

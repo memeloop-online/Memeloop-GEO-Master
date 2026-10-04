@@ -3,15 +3,21 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::SET_COOKIE},
 };
-use chrono::Duration;
+use chrono::{Duration, Utc};
 use geo_api::{
     AppState, CSRF_HEADER, EventBus, MemoryIdempotencyStore, MemoryOperationStore,
     RepositoryHostOps, reduce_cycle_report, router,
 };
 use geo_domain::{
-    DEVELOPMENT_TENANT_ID, DEVELOPMENT_USER_EMAIL, ErrorCode, Membership, MemoryAuthRepository,
-    ProjectCreate, ProjectSettings, ProjectStartCommand, ReportAvailability, Role, TenantScope,
-    User, hash_idempotency_key, settings_hash, start_request_hash,
+    ChannelPlan, ChannelTarget, ChannelTargetInput, ContentBlock, ContentBlockKind,
+    ContentCoverage, ContentExecution, ContentExecutionStatus, ContentHandoff, ContentHandoffItem,
+    ContentItemStatus, ContentRevision, DEVELOPMENT_TENANT_ID, DEVELOPMENT_USER_EMAIL,
+    DistributionRepository, DistributionTargetStatus, DocumentManifest, DocumentManifestCoverage,
+    DocumentManifestItem, DocumentManifestItemState, DocumentManifestState, ErrorCode,
+    FreezeDistribution, IntentVerification, Membership, MemoryAuthRepository, PlatformPlacement,
+    PreparedDistribution, ProjectCreate, ProjectSettings, ProjectStartCommand, ReportAvailability,
+    ReportManifestKind, Role, StructuredDocument, TenantScope, User, hash_idempotency_key,
+    settings_hash, start_request_hash,
 };
 use geo_worker::{HostOps, ReportGetRequest, ReportReduceRequest};
 use serde_json::{Value, json};
@@ -136,6 +142,489 @@ fn request(method: &str, uri: &str, cookie: &str, csrf: Option<&str>, body: &str
         req = req.header(CSRF_HEADER, csrf);
     }
     req.body(Body::from(body.to_owned())).unwrap()
+}
+
+async fn freeze_formal_coverage(
+    state: &AppState,
+    scope: &TenantScope,
+    cycle_id: Uuid,
+) -> (Arc<dyn DistributionRepository>, Uuid) {
+    let project_id = scope.project_id.unwrap();
+    let cycle = state
+        .project_repository()
+        .get_report_cycle(scope, project_id, cycle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let document_id = cycle.document_manifest.unwrap().manifest_id;
+    let release_id = Uuid::new_v4();
+    let items: Vec<_> = ["first", "second"]
+        .into_iter()
+        .map(|document_key| DocumentManifestItem {
+            document_manifest_item_id: Uuid::new_v4(),
+            manifest_id: document_id,
+            knowledge_release_id: release_id,
+            document_key: document_key.into(),
+            content_type: "article".into(),
+            product_id: None,
+            market: "global".into(),
+            language: "en".into(),
+            state: DocumentManifestItemState::Planned,
+            block_reason: None,
+            dependency_hash: document_key.into(),
+            source_version_refs: vec![],
+        })
+        .collect();
+    let manifest = DocumentManifest {
+        manifest_id: document_id,
+        operator_id: scope.operator_id,
+        tenant_id: scope.tenant_id,
+        project_id,
+        revision: 1,
+        knowledge_release_id: release_id,
+        planner_version: "report-fixture".into(),
+        state: DocumentManifestState::Ready,
+        sealed: true,
+        expected_count: Some(2),
+        scope_hash: "report-fixture".into(),
+        items: items.clone(),
+        coverage: DocumentManifestCoverage {
+            total: 2,
+            planned: 2,
+            ..Default::default()
+        },
+    };
+    let coverage = ContentCoverage {
+        total: 2,
+        ready: 1,
+        blocked: 1,
+        deferred: 0,
+        not_applicable: 0,
+        cancelled: 0,
+        incomplete: 0,
+    };
+    let execution_id = Uuid::new_v4();
+    let handoff_id = Uuid::new_v4();
+    let revision_id = Uuid::new_v4();
+    let repo = state.distribution_repository();
+    let frozen = repo
+        .freeze(
+            scope,
+            FreezeDistribution {
+                cycle_id,
+                revision: 1,
+                document_manifest: manifest,
+                content_execution: ContentExecution {
+                    execution_id,
+                    project_id,
+                    cycle_id,
+                    manifest_id: document_id,
+                    manifest_revision: 1,
+                    policy_version: "report-fixture".into(),
+                    input_hash: "report-fixture".into(),
+                    status: ContentExecutionStatus::Closed,
+                    expected_count: 2,
+                    coverage: coverage.clone(),
+                    handoff_id: Some(handoff_id),
+                },
+                content_handoff: ContentHandoff {
+                    handoff_id,
+                    execution_id,
+                    revision: 1,
+                    supersedes_handoff_id: None,
+                    coverage,
+                    items: items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| ContentHandoffItem {
+                            item_id: item.document_manifest_item_id,
+                            document_key: item.document_key.clone(),
+                            status: if index == 0 {
+                                ContentItemStatus::Ready
+                            } else {
+                                ContentItemStatus::Blocked
+                            },
+                            reason: (index == 1).then(|| "source_unavailable".into()),
+                            revision_id: (index == 0).then_some(revision_id),
+                        })
+                        .collect(),
+                    created_at: Utc::now(),
+                },
+                placements: ["alpha", "beta", "gamma"]
+                    .into_iter()
+                    .map(|platform_id| PlatformPlacement {
+                        platform_id: platform_id.into(),
+                        placement_slot: "primary".into(),
+                        capability_version: "report-fixture".into(),
+                        supported_formats: if platform_id == "gamma" {
+                            vec!["faq".into()]
+                        } else {
+                            vec!["article".into()]
+                        },
+                        unavailable_reason: (platform_id == "beta")
+                            .then(|| "account_unavailable".into()),
+                        fixture: true,
+                    })
+                    .collect(),
+                sealed_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    (repo, frozen.manifest_id)
+}
+
+async fn create_legacy_measurement_and_publication(
+    state: &AppState,
+    scope: &TenantScope,
+    cycle_id: Uuid,
+) -> Uuid {
+    let project_id = scope.project_id.unwrap();
+    let cycle = state
+        .project_repository()
+        .get_report_cycle(scope, project_id, cycle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let plan_id = Uuid::new_v4();
+    state
+        .channel_job_repository()
+        .create_plan(
+            scope,
+            ChannelPlan {
+                plan_id,
+                project_id,
+                cycle_id,
+                input_hash: format!("plan-{plan_id}"),
+                revision: 1,
+                created_at: Utc::now(),
+                targets: vec![
+                    ChannelTarget {
+                        target_id: Uuid::new_v4(),
+                        input: ChannelTargetInput::Publish {
+                            source_id: Uuid::new_v4(),
+                            source_version_id: Uuid::new_v4(),
+                            platform: "legacy".into(),
+                            account_id: Uuid::new_v4(),
+                            title: "Unsent".into(),
+                            body: "No public result".into(),
+                            body_sha256: "fixture".into(),
+                        },
+                    },
+                    ChannelTarget {
+                        target_id: Uuid::new_v4(),
+                        input: ChannelTargetInput::Measure {
+                            account_id: Uuid::new_v4(),
+                            provider: "provider".into(),
+                            model: "fixed".into(),
+                            surface: "web".into(),
+                            search_mode: "search".into(),
+                            protocol_version: "v1".into(),
+                            question_set_version: "v1".into(),
+                            question: "Unobserved question?".into(),
+                            market: "global".into(),
+                            language: "en".into(),
+                            scheduled_at: cycle.report_window_start_at + Duration::hours(1),
+                            sample_ordinal: 0,
+                        },
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    plan_id
+}
+
+#[tokio::test]
+async fn formal_distribution_uses_frozen_two_by_three_denominator_and_partial_pages() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let (repo, manifest_id) = freeze_formal_coverage(&state, &scope, cycle_id).await;
+    let frozen_at = repo.get(&scope, manifest_id).await.unwrap().sealed_at;
+    let before_freeze = repo
+        .cycle_inputs(&scope, cycle_id, frozen_at - Duration::nanoseconds(1))
+        .await
+        .unwrap();
+    assert!(before_freeze.manifest.is_none());
+    assert!(before_freeze.targets.is_empty());
+    let page = repo
+        .expansion_page(&scope, manifest_id, 0, 4)
+        .await
+        .unwrap();
+    repo.commit_expansion_page(&scope, manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let first = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        None,
+        cutoff + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    let reference = first
+        .input_manifest_versions
+        .iter()
+        .find(|reference| reference.kind == ReportManifestKind::Distribution)
+        .unwrap();
+    assert_eq!(reference.manifest_id, manifest_id);
+    assert_eq!(reference.expected_count, Some(6));
+    assert_eq!(first.publications.expected_count, Some(6));
+    assert_eq!(first.publications.observed_count, 4);
+    assert_eq!(first.publications.counts["pending"], 1);
+    assert_eq!(first.publications.counts["deferred"], 1);
+    assert_eq!(first.publications.counts["not_applicable"], 1);
+    assert_eq!(first.publications.counts["blocked"], 1);
+    assert_eq!(first.publications.counts["unmaterialized"], 2);
+    assert!(!first.publications.counts.contains_key("verified"));
+    assert_eq!(
+        first.measurements.availability,
+        ReportAvailability::Unavailable
+    );
+    let rest = repo
+        .expansion_page(&scope, manifest_id, 4, 2)
+        .await
+        .unwrap();
+    repo.commit_expansion_page(&scope, manifest_id, 4, rest.rows)
+        .await
+        .unwrap();
+    let replay = reduce_cycle_report(&state, &scope, cycle_id, None, cutoff + Duration::days(2))
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+    let corrected = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        Some(first.report_id),
+        cutoff + Duration::days(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(corrected.publications.expected_count, Some(6));
+    assert_eq!(corrected.publications.observed_count, 6);
+    assert_eq!(corrected.publications.counts["blocked"], 3);
+    assert!(!corrected.publications.counts.contains_key("verified"));
+    assert_eq!(
+        reduce_cycle_report(
+            &state,
+            &TenantScope::new(scope.operator_id, Uuid::new_v4().into(), Some(project_id)),
+            cycle_id,
+            None,
+            cutoff + Duration::days(2),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::NotFound
+    );
+}
+
+#[tokio::test]
+async fn formal_manifest_frozen_after_first_report_does_not_rewrite_replay_or_correction() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let first = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        None,
+        cutoff + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    freeze_formal_coverage(&state, &scope, cycle_id).await;
+    assert_eq!(
+        reduce_cycle_report(&state, &scope, cycle_id, None, cutoff + Duration::days(2),)
+            .await
+            .unwrap(),
+        first
+    );
+    let correction = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        Some(first.report_id),
+        cutoff + Duration::days(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        correction.input_manifest_versions,
+        first.input_manifest_versions
+    );
+    assert_eq!(
+        correction.publications.availability,
+        ReportAvailability::Unsealed
+    );
+}
+
+#[tokio::test]
+async fn formal_distribution_keeps_independent_measurement_without_legacy_publish_double_count() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let legacy_id = create_legacy_measurement_and_publication(&state, &scope, cycle_id).await;
+    let (_, formal_id) = freeze_formal_coverage(&state, &scope, cycle_id).await;
+    let report = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        None,
+        cutoff + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.publications.expected_count, Some(6));
+    assert_eq!(report.publications.observed_count, 0);
+    assert_eq!(report.publications.counts["unmaterialized"], 6);
+    assert_eq!(report.measurements.expected_count, Some(1));
+    assert_eq!(report.measurements.counts["pending"], 1);
+    assert_eq!(
+        report
+            .input_manifest_versions
+            .iter()
+            .filter(|reference| reference.kind == ReportManifestKind::Distribution)
+            .map(|reference| reference.manifest_id)
+            .collect::<Vec<_>>(),
+        vec![formal_id]
+    );
+    assert_eq!(
+        report
+            .input_manifest_versions
+            .iter()
+            .find(|reference| reference.kind == ReportManifestKind::Measurement)
+            .unwrap()
+            .manifest_id,
+        legacy_id
+    );
+}
+
+#[tokio::test]
+async fn ready_and_reused_verified_intents_without_target_receipts_are_not_reported_success() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let (repo, manifest_id) = freeze_formal_coverage(&state, &scope, cycle_id).await;
+    let page = repo
+        .expansion_page(&scope, manifest_id, 0, 6)
+        .await
+        .unwrap();
+    let pending = page.rows[0].clone();
+    repo.commit_expansion_page(&scope, manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let document = StructuredDocument {
+        title: "Example".into(),
+        blocks: vec![ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Paragraph,
+            text: "Public source-backed text".into(),
+            citation_ids: vec![],
+            items: vec![],
+        }],
+    };
+    let revision = ContentRevision {
+        revision_id: pending.content_revision_id.unwrap(),
+        asset_id: Uuid::new_v4(),
+        revision: 1,
+        base_revision_id: None,
+        markdown: document.markdown(),
+        document,
+        evidence: vec![],
+        quotes: vec![],
+        findings: vec![],
+        created_at: Utc::now(),
+    };
+    let prepared = PreparedDistribution {
+        manifest_id,
+        target_id: pending.target_id,
+        revision: Some(revision),
+        account_id: Some(Uuid::new_v4()),
+        defer_reason: None,
+    };
+    let ready = repo.materialize(&scope, prepared.clone()).await.unwrap();
+    assert_eq!(ready.target.status, DistributionTargetStatus::Ready);
+    let intent = ready.intent.unwrap();
+    repo.record_intent_verification(
+        &scope,
+        intent.intent_id,
+        IntentVerification::Verified,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    let reused = repo.materialize(&scope, prepared).await.unwrap();
+    assert_eq!(
+        reused.target.status,
+        DistributionTargetStatus::ReusedVerified
+    );
+    let report = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        None,
+        cutoff + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.publications.counts["unknown"], 1);
+    assert!(!report.publications.counts.contains_key("verified"));
+    assert!(report.findings.iter().any(|finding| {
+        finding.kind == "publication_unknown"
+            && finding
+                .insufficient_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("target-associated"))
+    }));
+}
+
+#[tokio::test]
+async fn legacy_publications_are_used_only_when_formal_distribution_is_absent() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let legacy_id = create_legacy_measurement_and_publication(&state, &scope, cycle_id).await;
+    let report = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        None,
+        cutoff + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.publications.expected_count, Some(1));
+    assert_eq!(report.publications.counts["pending"], 1);
+    assert_eq!(report.measurements.expected_count, Some(1));
+    assert_eq!(
+        report
+            .input_manifest_versions
+            .iter()
+            .find(|reference| reference.kind == ReportManifestKind::Distribution)
+            .unwrap()
+            .manifest_id,
+        legacy_id
+    );
 }
 
 #[tokio::test]
