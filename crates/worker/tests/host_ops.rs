@@ -477,6 +477,10 @@ async fn the_reference_bundle_declares_the_surface_it_expects() {
         "manifestRead",
         "publishSubmit",
         "measureSample",
+        "distributionStart",
+        "distributionRead",
+        "distributionResume",
+        "distributionTargetsRead",
     ] {
         assert!(
             declared.iter().any(|entry| entry == capability),

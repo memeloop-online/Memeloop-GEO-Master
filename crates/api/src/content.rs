@@ -1574,6 +1574,28 @@ mod tests {
             .generate(&scope, execution.execution_id, item_id)
             .await
             .unwrap();
+        model.fail_first.store(true, Ordering::SeqCst);
+        let error = service
+            .check(&scope, execution.execution_id, item_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::DependencyUnavailable);
+        let unchecked = repository
+            .get_item(&scope, execution.execution_id, item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchecked.status, ContentItemStatus::Drafted);
+        assert!(unchecked.steps.is_empty());
+        assert_eq!(
+            service
+                .close(&scope, execution.execution_id)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict,
+            "a transient checker outage cannot seal an unchecked draft"
+        );
         assert_eq!(
             service
                 .check(&scope, execution.execution_id, item_id)
@@ -1582,7 +1604,16 @@ mod tests {
                 .status,
             ContentItemStatus::Ready
         );
-        assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            service
+                .close(&scope, execution.execution_id)
+                .await
+                .unwrap()
+                .coverage
+                .ready,
+            1
+        );
     }
 
     #[tokio::test]
@@ -1840,6 +1871,17 @@ mod tests {
                 "citation_ids":[citation],"detail":"Quote entails the claim"}]})
         .to_string();
         assert!(!parse_checks(&supported, &revision).unwrap()[0].blocking);
+        let unsupported_title = serde_json::json!({"checks":[
+            {"block_id":title_id,"verdict":"unsupported",
+                "citation_ids":[],"detail":"Title is not supported by the source quote"},
+            {"block_id":block_id,"verdict":"supported",
+                "citation_ids":[citation],"detail":"Quote entails the body claim"}]})
+        .to_string();
+        let findings = parse_checks(&unsupported_title, &revision).unwrap();
+        assert!(findings[0].blocking);
+        assert_eq!(findings[0].code, "title_unsupported");
+        assert!(findings[0].block_id.is_none());
+        assert!(!findings[1].blocking);
         let uncertain = supported.replace("supported", "uncertain");
         assert!(
             parse_checks(&uncertain, &revision)

@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ChannelVariant, ContentExecution, ContentHandoff, ContentRevision,
-    DistributionCycleInputs, DistributionExpansionPage, DistributionManifest,
-    DistributionRepository, DistributionSnapshot, DistributionTarget, DistributionTargetPage,
-    DistributionTargetStatus, ErrorCode, FreezeDistribution, IntentVerification,
-    MaterializedDistribution, PreparedDistribution, PublicationBundle, PublicationCommand,
-    PublicationIntent, TenantScope, distribution_cell, freeze_distribution,
-    prepare_publication_intent, prepare_variant,
+    AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelVariant, ContentExecution,
+    ContentHandoff, ContentRevision, DistributionCycleInputs, DistributionExpansionPage,
+    DistributionManifest, DistributionPublicationResult, DistributionRepository,
+    DistributionSnapshot, DistributionTarget, DistributionTargetPage, DistributionTargetStatus,
+    ErrorCode, FreezeDistribution, IntentVerification, MaterializedDistribution,
+    PreparedDistribution, PublicationBundle, PublicationCommand, PublicationIntent,
+    ReportPublicationStatus, TenantScope, distribution_cell, freeze_distribution,
+    prepare_publication_intent, prepare_variant, target_publication_evidence,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -138,6 +139,199 @@ async fn change_target(
 
 #[async_trait]
 impl DistributionRepository for PgDistributionRepository {
+    async fn publication_results(
+        &self,
+        scope: &TenantScope,
+        targets: &[DistributionTarget],
+        at: DateTime<Utc>,
+    ) -> Result<Vec<DistributionPublicationResult>, AppError> {
+        let intent_ids: Vec<Uuid> = targets
+            .iter()
+            .filter_map(|target| target.publication_intent_id)
+            .collect();
+        if intent_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut tx = self.transaction(scope).await?;
+        // The historical target binding is supplied by as_of. The query never
+        // reads the mutable current target body or current intent verification,
+        // both of which can change after a report's original cutoff.
+        let rows = sqlx::query(
+            "SELECT i.intent_id,c.fixture AS command_fixture,a.claimed_at, \
+                    e.evidence_id,e.result,e.fixture AS evidence_fixture,e.observed_at, \
+                    e.external_receipt,e.public_readback,ca.attempt_id AS channel_attempt_id, \
+                    ca.outcome,ca.received_at \
+             FROM distribution_publication_intents i \
+             JOIN distribution_publication_commands c ON \
+               (c.operator_id,c.tenant_id,c.project_id,c.intent_id) = \
+               (i.operator_id,i.tenant_id,i.project_id,i.intent_id) \
+             LEFT JOIN distribution_publication_attempts a ON \
+               (a.operator_id,a.tenant_id,a.project_id,a.intent_id) = \
+               (i.operator_id,i.tenant_id,i.project_id,i.intent_id) AND a.claimed_at<=$5 \
+             LEFT JOIN distribution_intent_evidence e ON \
+               (e.operator_id,e.tenant_id,e.project_id,e.intent_id,e.attempt_id) = \
+               (a.operator_id,a.tenant_id,a.project_id,a.intent_id,a.attempt_id) \
+               AND e.observed_at<=$5 \
+             LEFT JOIN channel_execution_attempts ca ON \
+               (ca.operator_id,ca.tenant_id,ca.project_id,ca.attempt_id) = \
+               (a.operator_id,a.tenant_id,a.project_id,a.attempt_id) \
+               AND ca.target_id=c.materialized_target_id \
+             WHERE i.operator_id=$1 AND i.tenant_id=$2 AND i.project_id=$3 \
+               AND i.intent_id = ANY($4) \
+             ORDER BY i.intent_id,e.observed_at,e.evidence_id",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(&intent_ids)
+        .bind(at)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+
+        let mut by_intent = std::collections::HashMap::<
+            Uuid,
+            (
+                ReportPublicationStatus,
+                Option<Uuid>,
+                Option<DateTime<Utc>>,
+                Option<DateTime<Utc>>,
+                Option<&'static str>,
+            ),
+        >::new();
+        for row in rows {
+            let intent_id: Uuid = row.get("intent_id");
+            let Some(claimed_at) = row.get::<Option<DateTime<Utc>>, _>("claimed_at") else {
+                continue;
+            };
+            let mut status = ReportPublicationStatus::Unknown;
+            let mut receipt = None;
+            let mut receipt_kind = None;
+            let outcome_value: Option<serde_json::Value> = row.get("outcome");
+            let received: Option<DateTime<Utc>> = row.get("received_at");
+            let known = received.is_some_and(|time| time >= claimed_at && time <= at);
+            let outcome: Option<ChannelOutcome> = if known {
+                outcome_value.map(decode).transpose()?
+            } else {
+                None
+            };
+            let observed: Option<DateTime<Utc>> = row.get("observed_at");
+            let evidence_id: Option<Uuid> = row.get("evidence_id");
+            let valid_time = observed.is_some_and(|time| {
+                time >= claimed_at && time <= at && received.is_some_and(|end| time <= end)
+            });
+            if let Some(outcome) = &outcome {
+                let real = !row.get::<bool, _>("command_fixture") && !outcome.fixture;
+                let outcome_time_valid = outcome.occurred_at >= claimed_at
+                    && outcome.occurred_at <= at
+                    && received.is_some_and(|end| outcome.occurred_at <= end);
+                if real && outcome_time_valid {
+                    status = match outcome.status {
+                        ChannelOutcomeStatus::Failed => ReportPublicationStatus::Failed,
+                        ChannelOutcomeStatus::LoginRequired | ChannelOutcomeStatus::Unsupported => {
+                            ReportPublicationStatus::Deferred
+                        }
+                        _ => ReportPublicationStatus::Unknown,
+                    };
+                }
+                let external: Option<serde_json::Value> = row.get("external_receipt");
+                let readback: Option<serde_json::Value> = row.get("public_readback");
+                if real
+                    && outcome_time_valid
+                    && valid_time
+                    && observed == Some(outcome.occurred_at)
+                    && row.get::<Option<String>, _>("result").as_deref() == Some("verified")
+                    && !row
+                        .get::<Option<bool>, _>("evidence_fixture")
+                        .unwrap_or(true)
+                    && outcome.status == ChannelOutcomeStatus::Verified
+                    && external
+                        .as_ref()
+                        .and_then(|v| v.get("external_receipt_id"))
+                        .and_then(|v| v.as_str())
+                        .is_some()
+                    && readback
+                        .as_ref()
+                        .and_then(|v| v.get("verified"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                    && readback
+                        .as_ref()
+                        .and_then(|v| v.get("public_url"))
+                        .and_then(|v| v.as_str())
+                        == outcome.public_url.as_deref()
+                    && outcome.public_url.is_some()
+                {
+                    status = ReportPublicationStatus::Verified;
+                    receipt = evidence_id;
+                    receipt_kind = Some("public_verification");
+                } else if real
+                    && outcome_time_valid
+                    && outcome.status == ChannelOutcomeStatus::Published
+                    && outcome
+                        .public_url
+                        .as_deref()
+                        .is_some_and(|url| !url.is_empty())
+                    && row.get::<Option<Uuid>, _>("channel_attempt_id").is_some()
+                {
+                    status = ReportPublicationStatus::Published;
+                    receipt = row.get("channel_attempt_id");
+                    receipt_kind = Some("publication_receipt");
+                }
+            }
+            let candidate = (
+                status,
+                receipt,
+                if status == ReportPublicationStatus::Published {
+                    outcome.as_ref().map(|outcome| outcome.occurred_at)
+                } else {
+                    observed
+                },
+                received,
+                receipt_kind,
+            );
+            let prior = by_intent.entry(intent_id).or_insert(candidate);
+            // A valid verified readback wins over the earlier pre-send unknown.
+            // A completed non-verified result wins over that initial unknown.
+            if matches!(
+                status,
+                ReportPublicationStatus::Verified | ReportPublicationStatus::Published
+            ) || (prior.0 == ReportPublicationStatus::Unknown
+                && matches!(
+                    status,
+                    ReportPublicationStatus::Failed | ReportPublicationStatus::Deferred
+                ))
+            {
+                *prior = candidate;
+            }
+        }
+        Ok(targets
+            .iter()
+            .filter_map(|target| {
+                let intent_id = target.publication_intent_id?;
+                let (status, receipt, observed, received, kind) = by_intent.get(&intent_id)?;
+                Some(DistributionPublicationResult {
+                    target_id: target.target_id,
+                    status: *status,
+                    reason: None,
+                    evidence: match (receipt, observed, received, kind) {
+                        (Some(id), Some(occurred), Some(received), Some(kind)) => {
+                            vec![target_publication_evidence(
+                                target.target_id,
+                                intent_id,
+                                *id,
+                                kind,
+                                *occurred,
+                                *received,
+                            )]
+                        }
+                        _ => vec![],
+                    },
+                })
+            })
+            .collect())
+    }
     async fn get_publication_bundle(
         &self,
         scope: &TenantScope,

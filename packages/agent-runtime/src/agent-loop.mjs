@@ -16,6 +16,16 @@ const CHANNEL_TARGET_EXECUTE = "channel_target_execute";
 const CONTENT_START = "content_start";
 const CONTENT_EXECUTION_READ = "content_execution_read";
 const CONTENT_TOOLS = [CONTENT_START, CONTENT_EXECUTION_READ];
+const DISTRIBUTION_START = "distribution_start";
+const DISTRIBUTION_READ = "distribution_read";
+const DISTRIBUTION_RESUME = "distribution_resume";
+const DISTRIBUTION_TARGETS_READ = "distribution_targets_read";
+const DISTRIBUTION_TOOLS = [
+  DISTRIBUTION_START,
+  DISTRIBUTION_READ,
+  DISTRIBUTION_RESUME,
+  DISTRIBUTION_TARGETS_READ,
+];
 const CHANNEL_TOOLS = [
   CHANNEL_DISCOVER,
   CHANNEL_PLAN,
@@ -27,6 +37,14 @@ const TOOL_DESCRIPTIONS = {
     "Start the approved native first-stage document workflow for the current project cycle (or a scoped cycle_id). Rust freezes an execution reference, then automatically dispatches the MemeLoop fan-out; do not call per-item steps yourself.",
   [CONTENT_EXECUTION_READ]:
     "Read the durable coverage and status for one content execution_id. Blocked and deferred items remain in the denominator.",
+  [DISTRIBUTION_START]:
+    "Freeze and start formal second-stage distribution for the current project cycle (or scoped cycle_id) after content handoff is closed. Rust selects the frozen documents and verified connector capabilities; a returned manifest is queued coverage, not publication success.",
+  [DISTRIBUTION_READ]:
+    "Read a frozen distribution manifest by manifest_id, cycle_id, or current cycle. Return only durable references and coverage progress.",
+  [DISTRIBUTION_RESUME]:
+    "Advance at most four durable pages of a frozen distribution manifest and revisit eligible pending/deferred targets. This does not directly send or claim successful publication.",
+  [DISTRIBUTION_TARGETS_READ]:
+    "Read one bounded page of the formal document-by-platform coverage matrix with target states and opaque references. Do not interpret ready as published.",
   [CHANNEL_DISCOVER]:
     "Discover current-project public source versions or available publishing/measurement accounts. Use returned IDs as references in channel_plan.",
   [CHANNEL_PLAN]:
@@ -46,6 +64,40 @@ const CONTENT_EXECUTION_READ_SCHEMA = {
   additionalProperties: false,
   required: ["execution_id"],
   properties: { execution_id: { type: "string", format: "uuid" } },
+};
+const DISTRIBUTION_START_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: { cycle_id: { type: "string", format: "uuid" } },
+};
+const DISTRIBUTION_READ_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  description:
+    "Provide at most one of cycle_id and manifest_id; omit both for the current cycle.",
+  properties: {
+    cycle_id: { type: "string", format: "uuid" },
+    manifest_id: { type: "string", format: "uuid" },
+  },
+};
+const DISTRIBUTION_RESUME_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["manifest_id"],
+  properties: {
+    manifest_id: { type: "string", format: "uuid" },
+    after_ordinal: { type: "integer", minimum: 0 },
+  },
+};
+const DISTRIBUTION_TARGETS_READ_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["manifest_id"],
+  properties: {
+    manifest_id: { type: "string", format: "uuid" },
+    after_ordinal: { type: "integer", minimum: 0 },
+    limit: { type: "integer", minimum: 1, maximum: 100 },
+  },
 };
 const CHANNEL_DISCOVER_SCHEMA = {
   type: "object",
@@ -208,6 +260,7 @@ export async function main(input) {
           REPORT_REDUCE,
           ...CHANNEL_TOOLS,
           ...CONTENT_TOOLS,
+          ...DISTRIBUTION_TOOLS,
         ]
       : [
           KNOWLEDGE_SEARCH,
@@ -215,6 +268,7 @@ export async function main(input) {
           REPORT_REDUCE,
           ...CHANNEL_TOOLS,
           ...CONTENT_TOOLS,
+          ...DISTRIBUTION_TOOLS,
         ];
   const definition = createDefinition(modelId, toolNames);
   const context = createContext({
@@ -381,6 +435,10 @@ function createContext({ session, definition, modelId, provider, tools }) {
           { pattern: REPORT_REDUCE, action: "allow" },
           ...CHANNEL_TOOLS.map((pattern) => ({ pattern, action: "allow" })),
           ...CONTENT_TOOLS.map((pattern) => ({ pattern, action: "allow" })),
+          ...DISTRIBUTION_TOOLS.map((pattern) => ({
+            pattern,
+            action: "allow",
+          })),
         ],
       },
     },
@@ -634,6 +692,10 @@ function resolveHost(requireImport) {
     typeof denoOps.op_host_channel_target_execute_v1 !== "function" ||
     typeof denoOps.op_host_content_start_v1 !== "function" ||
     typeof denoOps.op_host_content_execution_read_v1 !== "function" ||
+    typeof denoOps.op_host_distribution_start_v1 !== "function" ||
+    typeof denoOps.op_host_distribution_read_v1 !== "function" ||
+    typeof denoOps.op_host_distribution_resume_v1 !== "function" ||
+    typeof denoOps.op_host_distribution_targets_read_v1 !== "function" ||
     (requireImport &&
       typeof denoOps.op_host_knowledge_import_attachments_v1 !== "function") ||
     typeof denoOps.op_host_emit !== "function"
@@ -704,6 +766,28 @@ function resolveHost(requireImport) {
     async contentExecutionRead(request) {
       return JSON.parse(
         await denoOps.op_host_content_execution_read_v1(
+          JSON.stringify(request),
+        ),
+      );
+    },
+    async distributionStart(request) {
+      return JSON.parse(
+        await denoOps.op_host_distribution_start_v1(JSON.stringify(request)),
+      );
+    },
+    async distributionRead(request) {
+      return JSON.parse(
+        await denoOps.op_host_distribution_read_v1(JSON.stringify(request)),
+      );
+    },
+    async distributionResume(request) {
+      return JSON.parse(
+        await denoOps.op_host_distribution_resume_v1(JSON.stringify(request)),
+      );
+    },
+    async distributionTargetsRead(request) {
+      return JSON.parse(
+        await denoOps.op_host_distribution_targets_read_v1(
           JSON.stringify(request),
         ),
       );
@@ -868,6 +952,16 @@ function createHostTools(host, failures, attachments) {
     CONTENT_EXECUTION_READ,
     "contentExecutionRead",
   );
+  const distributionStart = reportTool(DISTRIBUTION_START, "distributionStart");
+  const distributionRead = reportTool(DISTRIBUTION_READ, "distributionRead");
+  const distributionResume = reportTool(
+    DISTRIBUTION_RESUME,
+    "distributionResume",
+  );
+  const distributionTargetsRead = reportTool(
+    DISTRIBUTION_TARGETS_READ,
+    "distributionTargetsRead",
+  );
   const importSchema = {
     type: "object",
     additionalProperties: false,
@@ -920,7 +1014,15 @@ function createHostTools(host, failures, attachments) {
                         ? contentStart
                         : id === CONTENT_EXECUTION_READ
                           ? contentExecutionRead
-                          : undefined,
+                          : id === DISTRIBUTION_START
+                            ? distributionStart
+                            : id === DISTRIBUTION_READ
+                              ? distributionRead
+                              : id === DISTRIBUTION_RESUME
+                                ? distributionResume
+                                : id === DISTRIBUTION_TARGETS_READ
+                                  ? distributionTargetsRead
+                                  : undefined,
     listTools: () =>
       attachments.length > 0
         ? [
@@ -930,6 +1032,7 @@ function createHostTools(host, failures, attachments) {
             REPORT_REDUCE,
             ...CHANNEL_TOOLS,
             ...CONTENT_TOOLS,
+            ...DISTRIBUTION_TOOLS,
           ]
         : [
             KNOWLEDGE_SEARCH,
@@ -937,6 +1040,7 @@ function createHostTools(host, failures, attachments) {
             REPORT_REDUCE,
             ...CHANNEL_TOOLS,
             ...CONTENT_TOOLS,
+            ...DISTRIBUTION_TOOLS,
           ],
     getToolParameterSchema: (id) =>
       id === KNOWLEDGE_SEARCH
@@ -959,7 +1063,15 @@ function createHostTools(host, failures, attachments) {
                         ? CONTENT_START_SCHEMA
                         : id === CONTENT_EXECUTION_READ
                           ? CONTENT_EXECUTION_READ_SCHEMA
-                          : undefined,
+                          : id === DISTRIBUTION_START
+                            ? DISTRIBUTION_START_SCHEMA
+                            : id === DISTRIBUTION_READ
+                              ? DISTRIBUTION_READ_SCHEMA
+                              : id === DISTRIBUTION_RESUME
+                                ? DISTRIBUTION_RESUME_SCHEMA
+                                : id === DISTRIBUTION_TARGETS_READ
+                                  ? DISTRIBUTION_TARGETS_READ_SCHEMA
+                                  : undefined,
     registerTool: () => {
       throw new Error("The embedded loop cannot register tools.");
     },

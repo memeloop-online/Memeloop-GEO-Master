@@ -30,7 +30,7 @@ use uuid::Uuid;
 // grows a parallel set of types for the same concepts.
 use geo_domain::{
     AppError, AttachmentReference, ContentCoverage, ContentExecutionStatus, ContentItemStatus,
-    ImportStatus, KnowledgePurpose, ReportSnapshot,
+    DistributionTargetStatus, ImportStatus, KnowledgePurpose, ReportSnapshot,
 };
 pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
 
@@ -38,7 +38,7 @@ pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope}
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v5";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v6";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -95,11 +95,15 @@ pub enum HostOp {
     ContentClose,
     ContentStart,
     ContentExecutionRead,
+    DistributionStart,
+    DistributionRead,
+    DistributionResume,
+    DistributionTargetsRead,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 23;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -122,6 +126,10 @@ impl HostOp {
         Self::ContentClose,
         Self::ContentStart,
         Self::ContentExecutionRead,
+        Self::DistributionStart,
+        Self::DistributionRead,
+        Self::DistributionResume,
+        Self::DistributionTargetsRead,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -146,6 +154,10 @@ impl HostOp {
             Self::ContentClose => "content.close.v1",
             Self::ContentStart => "content.start.v1",
             Self::ContentExecutionRead => "content.execution.read.v1",
+            Self::DistributionStart => "distribution.start.v1",
+            Self::DistributionRead => "distribution.read.v1",
+            Self::DistributionResume => "distribution.resume.v1",
+            Self::DistributionTargetsRead => "distribution.targets.read.v1",
         }
     }
 
@@ -171,6 +183,10 @@ impl HostOp {
             Self::ContentClose => "op_host_content_close_v1",
             Self::ContentStart => "op_host_content_start_v1",
             Self::ContentExecutionRead => "op_host_content_execution_read_v1",
+            Self::DistributionStart => "op_host_distribution_start_v1",
+            Self::DistributionRead => "op_host_distribution_read_v1",
+            Self::DistributionResume => "op_host_distribution_resume_v1",
+            Self::DistributionTargetsRead => "op_host_distribution_targets_read_v1",
         }
     }
 
@@ -233,6 +249,10 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(30_000, 4),   // close
                 HostOpLimits::new(30_000, 4),   // start
                 HostOpLimits::new(15_000, 32),  // execution read
+                HostOpLimits::new(120_000, 4),  // freeze and advance one page
+                HostOpLimits::new(15_000, 64),  // manifest state
+                HostOpLimits::new(120_000, 32), // bounded expansion/revisit
+                HostOpLimits::new(15_000, 128), // paged target reads
             ],
         }
     }
@@ -650,6 +670,120 @@ pub trait HostOps: Send + Sync {
             "content execution is not configured",
         ))
     }
+
+    async fn distribution_start(
+        &self,
+        _scope: &TenantScope,
+        _request: DistributionStartRequest,
+    ) -> Result<DistributionManifestRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::DistributionStart,
+            "distribution is not configured",
+        ))
+    }
+
+    async fn distribution_read(
+        &self,
+        _scope: &TenantScope,
+        _request: DistributionReadRequest,
+    ) -> Result<DistributionManifestRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::DistributionRead,
+            "distribution is not configured",
+        ))
+    }
+
+    async fn distribution_resume(
+        &self,
+        _scope: &TenantScope,
+        _request: DistributionResumeRequest,
+    ) -> Result<DistributionManifestRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::DistributionResume,
+            "distribution is not configured",
+        ))
+    }
+
+    async fn distribution_targets_read(
+        &self,
+        _scope: &TenantScope,
+        _request: DistributionTargetsReadRequest,
+    ) -> Result<DistributionTargetsPage, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::DistributionTargetsRead,
+            "distribution is not configured",
+        ))
+    }
+}
+
+/// Selectors only: the trusted service freezes handoff, platform capabilities
+/// and content versions. None of these requests contains publishable material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistributionStartRequest {
+    #[serde(default)]
+    pub cycle_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistributionReadRequest {
+    #[serde(default)]
+    pub cycle_id: Option<Uuid>,
+    #[serde(default)]
+    pub manifest_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistributionResumeRequest {
+    pub manifest_id: Uuid,
+    #[serde(default)]
+    pub after_ordinal: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistributionTargetsReadRequest {
+    pub manifest_id: Uuid,
+    #[serde(default)]
+    pub after_ordinal: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DistributionManifestRef {
+    pub manifest_id: Uuid,
+    pub cycle_id: Uuid,
+    pub revision: i32,
+    pub document_manifest_id: Uuid,
+    pub content_execution_id: Uuid,
+    pub content_handoff_id: Uuid,
+    pub expected_count: u64,
+    pub expansion_cursor: u64,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DistributionTargetRef {
+    pub target_id: Uuid,
+    pub ordinal: u64,
+    pub document_item_id: Uuid,
+    pub content_revision_id: Option<Uuid>,
+    pub platform_id: String,
+    pub variant_id: Option<Uuid>,
+    pub publication_intent_id: Option<Uuid>,
+    pub status: DistributionTargetStatus,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DistributionTargetsPage {
+    pub manifest_id: Uuid,
+    pub expected_count: u64,
+    pub items: Vec<DistributionTargetRef>,
+    pub next_ordinal: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1880,6 +2014,32 @@ mod tests {
         assert_eq!(budgets.limits(HostOp::ContentCheck).max_calls, 2_048);
         assert_eq!(budgets.limits(HostOp::ContentClose).max_calls, 4);
         assert_eq!(budgets.limits(HostOp::ContentStart).max_calls, 4);
+        assert_eq!(budgets.limits(HostOp::DistributionStart).max_calls, 4);
+        assert_eq!(
+            budgets.limits(HostOp::DistributionTargetsRead).max_calls,
+            128
+        );
+    }
+
+    #[test]
+    fn distribution_selectors_reject_scope_and_publishable_payloads() {
+        for raw in [
+            r#"{"cycle_id":null,"tenant_id":"other"}"#,
+            r#"{"cycle_id":null,"platform_id":"unverified"}"#,
+            r#"{"cycle_id":null,"body":"model-authored text"}"#,
+            r#"{"cycle_id":null,"capability_version":"claimed"}"#,
+        ] {
+            assert!(serde_json::from_str::<DistributionStartRequest>(raw).is_err());
+        }
+        assert!(serde_json::from_str::<DistributionTargetsReadRequest>(
+            r#"{"manifest_id":"00000000-0000-4000-8000-000000000001","account_id":"00000000-0000-4000-8000-000000000002"}"#
+        ).is_err());
+        assert_eq!(
+            serde_json::from_str::<DistributionStartRequest>("{}")
+                .unwrap()
+                .cycle_id,
+            None
+        );
     }
 
     #[test]

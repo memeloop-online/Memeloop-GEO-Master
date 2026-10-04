@@ -24,10 +24,11 @@ use serde::de::DeserializeOwned;
 use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
     ChannelTargetExecuteRequest, ContentCloseRequest, ContentExecutionReadRequest,
-    ContentItemsReadRequest, ContentStartRequest, ContentStepRequest, HOST_OP_ERROR_NAME,
-    HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest, KnowledgeSearchRequest,
-    KnowledgeSearchResult, ManifestReadRequest, MeasureRequest, ModelCompletionRequest,
-    PublishRequest, ReportGetRequest, ReportReduceRequest,
+    ContentItemsReadRequest, ContentStartRequest, ContentStepRequest, DistributionReadRequest,
+    DistributionResumeRequest, DistributionStartRequest, DistributionTargetsReadRequest,
+    HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
+    KnowledgeSearchRequest, KnowledgeSearchResult, ManifestReadRequest, MeasureRequest,
+    ModelCompletionRequest, PublishRequest, ReportGetRequest, ReportReduceRequest,
 };
 
 #[op2]
@@ -180,6 +181,81 @@ pub async fn op_host_content_execution_read_v1(
         .await?;
     Ok(encode(op, &result)?)
 }
+
+macro_rules! distribution_op {
+    ($name:ident, $variant:ident, $request:ty, $method:ident, $check:expr) => {
+        #[op2]
+        #[string]
+        pub async fn $name(
+            state: Rc<RefCell<OpState>>,
+            #[string] payload: String,
+        ) -> Result<String, JsErrorBox> {
+            let op = HostOp::$variant;
+            let bridge = bridge(&state.borrow())?;
+            let request = parse_request::<$request>(op, &payload)?;
+            ($check)(&request)
+                .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+            let result = bridge
+                .invoke(op, |bridge| async move {
+                    bridge.capabilities().$method(bridge.scope(), request).await
+                })
+                .await?;
+            Ok(encode(op, &result)?)
+        }
+    };
+}
+
+distribution_op!(
+    op_host_distribution_start_v1,
+    DistributionStart,
+    DistributionStartRequest,
+    distribution_start,
+    |request: &DistributionStartRequest| if request.cycle_id.is_some_and(|id| id.is_nil()) {
+        Err("cycle reference must be non-zero")
+    } else {
+        Ok(())
+    }
+);
+distribution_op!(
+    op_host_distribution_read_v1,
+    DistributionRead,
+    DistributionReadRequest,
+    distribution_read,
+    |request: &DistributionReadRequest| if request.cycle_id.is_some_and(|id| id.is_nil())
+        || request.manifest_id.is_some_and(|id| id.is_nil())
+        || request.cycle_id.is_some() && request.manifest_id.is_some()
+    {
+        Err("invalid or conflicting distribution selectors")
+    } else {
+        Ok(())
+    }
+);
+distribution_op!(
+    op_host_distribution_resume_v1,
+    DistributionResume,
+    DistributionResumeRequest,
+    distribution_resume,
+    |request: &DistributionResumeRequest| if request.manifest_id.is_nil() {
+        Err("manifest reference must be non-zero")
+    } else {
+        Ok(())
+    }
+);
+distribution_op!(
+    op_host_distribution_targets_read_v1,
+    DistributionTargetsRead,
+    DistributionTargetsReadRequest,
+    distribution_targets_read,
+    |request: &DistributionTargetsReadRequest| if request.manifest_id.is_nil()
+        || request
+            .limit
+            .is_some_and(|limit| !(1..=100).contains(&limit))
+    {
+        Err("invalid manifest reference or page limit")
+    } else {
+        Ok(())
+    }
+);
 
 #[op2]
 #[string]
@@ -591,6 +667,10 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ContentClose.op_name(),
     HostOp::ContentStart.op_name(),
     HostOp::ContentExecutionRead.op_name(),
+    HostOp::DistributionStart.op_name(),
+    HostOp::DistributionRead.op_name(),
+    HostOp::DistributionResume.op_name(),
+    HostOp::DistributionTargetsRead.op_name(),
     // Rust-owned run state: the loop's emit contract and the checkpoint probe.
     "op_host_emit",
     "op_host_checkpoint",

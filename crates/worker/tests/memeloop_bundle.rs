@@ -430,6 +430,24 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
             .any(|tool| tool.function.name == "content_execution_read"
                 && tool.function.parameters["required"][0] == "execution_id")
     );
+    for name in [
+        "distribution_start",
+        "distribution_read",
+        "distribution_resume",
+        "distribution_targets_read",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.function.name == name)
+            .expect("formal distribution tool must be available in native MemeLoop");
+        assert_eq!(tool.function.parameters["additionalProperties"], false);
+        assert!(
+            tool.function.parameters["properties"]
+                .get("account_id")
+                .is_none()
+        );
+        assert!(tool.function.parameters["properties"].get("body").is_none());
+    }
     assert_eq!(calls[1].1.messages.last().unwrap().role, "tool");
     assert_eq!(
         calls[1].1.messages.last().unwrap().tool_call_id.as_deref(),

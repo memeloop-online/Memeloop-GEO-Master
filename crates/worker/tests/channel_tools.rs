@@ -227,7 +227,7 @@ async fn four_channel_bridges_delegate_and_unconfigured_capabilities_fail_closed
             )
             .await
             .unwrap();
-        assert_eq!(runtime.host_ops_version(), "geo.hostops.v5");
+        assert_eq!(runtime.host_ops_version(), geo_worker::HOST_OPS_VERSION);
         for (topic, op) in [
             ("discover", HostOp::ChannelDiscover),
             ("plan", HostOp::ChannelPlan),

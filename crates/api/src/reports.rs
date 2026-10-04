@@ -7,9 +7,9 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, DistributionTarget, DistributionTargetStatus, ErrorCode, ProjectId,
-    ReportManifestKind, ReportManifestRef, ReportPublicationStatus, ReportPublicationTarget,
-    ReportReduceInput, ReportSnapshot, TenantScope, reduce_report,
+    AppError, DistributionPublicationResult, DistributionTarget, DistributionTargetStatus,
+    ErrorCode, ProjectId, ReportManifestKind, ReportManifestRef, ReportPublicationStatus,
+    ReportPublicationTarget, ReportReduceInput, ReportSnapshot, TenantScope, reduce_report,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -47,31 +47,43 @@ pub struct ReportEvidenceList {
     pub items: Vec<geo_domain::ReportEvidenceReference>,
 }
 
-fn formal_publication_target(target: DistributionTarget) -> ReportPublicationTarget {
-    let status = match target.status {
-        DistributionTargetStatus::Blocked => ReportPublicationStatus::Blocked,
-        DistributionTargetStatus::Deferred => ReportPublicationStatus::Deferred,
-        DistributionTargetStatus::NotApplicable => ReportPublicationStatus::NotApplicable,
-        DistributionTargetStatus::Cancelled => ReportPublicationStatus::Cancelled,
-        DistributionTargetStatus::ReusedUnknown => ReportPublicationStatus::Unknown,
-        // An intent marked verified is not target-associated public evidence.
-        // Until the actual receipt and read-back can be projected, do not
-        // claim the reused asset is verified in the report.
-        DistributionTargetStatus::ReusedVerified => ReportPublicationStatus::Unknown,
-        DistributionTargetStatus::Pending | DistributionTargetStatus::Ready => {
-            ReportPublicationStatus::Planned
+fn formal_publication_target(
+    target: DistributionTarget,
+    outcome: Option<DistributionPublicationResult>,
+) -> ReportPublicationTarget {
+    let status = if let Some(result) = &outcome {
+        // A later source deferral does not undo an earlier external send.
+        result.status
+    } else {
+        match target.status {
+            DistributionTargetStatus::Blocked => ReportPublicationStatus::Blocked,
+            DistributionTargetStatus::Deferred => ReportPublicationStatus::Deferred,
+            DistributionTargetStatus::NotApplicable => ReportPublicationStatus::NotApplicable,
+            DistributionTargetStatus::Cancelled => ReportPublicationStatus::Cancelled,
+            DistributionTargetStatus::ReusedUnknown | DistributionTargetStatus::ReusedVerified => {
+                ReportPublicationStatus::Unknown
+            }
+            DistributionTargetStatus::Pending | DistributionTargetStatus::Ready => {
+                ReportPublicationStatus::Planned
+            }
         }
     };
     ReportPublicationTarget {
         target_id: target.target_id,
         platform_id: target.platform_id,
         status,
-        reason: target.reason.or_else(|| {
-            (target.status == DistributionTargetStatus::ReusedVerified).then(|| {
-                "Reused intent has no target-associated public verification evidence".to_owned()
-            })
-        }),
-        evidence: vec![],
+        reason: target
+            .reason
+            .or_else(|| outcome.as_ref().and_then(|result| result.reason.clone()))
+            .or_else(|| {
+                (target.status == DistributionTargetStatus::ReusedVerified
+                    && status == ReportPublicationStatus::Unknown)
+                    .then(|| {
+                        "Reused intent has no target-associated public verification evidence"
+                            .to_owned()
+                    })
+            }),
+        evidence: outcome.map_or_else(Vec::new, |result| result.evidence),
     }
 }
 
@@ -255,8 +267,31 @@ pub async fn reduce_cycle_report(
         sealed: true,
         expected_count: Some(manifest.expected_count),
     });
-    let formal_publications =
-        formal.map(|(_, targets)| targets.into_iter().map(formal_publication_target).collect());
+    let formal_publications = if let Some((_, targets)) = formal {
+        let evidence_at = if correction_of.is_some() {
+            now
+        } else {
+            cycle.cutoff_at
+        };
+        let results = distribution_repository
+            .publication_results(scope, &targets, evidence_at)
+            .await?;
+        let mut outcomes: std::collections::HashMap<_, _> = results
+            .into_iter()
+            .map(|result| (result.target_id, result))
+            .collect();
+        Some(
+            targets
+                .into_iter()
+                .map(|target| {
+                    let outcome = outcomes.remove(&target.target_id);
+                    formal_publication_target(target, outcome)
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     let input = ReportReduceInput {
         project_id,
         cycle_id,
@@ -422,4 +457,40 @@ pub(crate) async fn create_reduction(
         .await
         .map(Json)
         .map_err(|e| api_error(e, context.request_id))
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    #[test]
+    fn attempted_publication_is_not_hidden_by_later_source_deferral() {
+        let target_id = Uuid::new_v4();
+        let target = DistributionTarget {
+            target_id,
+            manifest_id: Uuid::new_v4(),
+            ordinal: 0,
+            document_item_id: Uuid::new_v4(),
+            content_revision_id: Some(Uuid::new_v4()),
+            platform_id: "test-platform".into(),
+            placement_slot: "primary".into(),
+            variant_id: Some(Uuid::new_v4()),
+            account_id: Some(Uuid::new_v4()),
+            publication_intent_id: Some(Uuid::new_v4()),
+            status: DistributionTargetStatus::Deferred,
+            reason: Some("source_changed".into()),
+            version: 3,
+        };
+        let verified = formal_publication_target(
+            target,
+            Some(DistributionPublicationResult {
+                target_id,
+                status: ReportPublicationStatus::Verified,
+                reason: None,
+                evidence: vec![],
+            }),
+        );
+        assert_eq!(verified.status, ReportPublicationStatus::Verified);
+        assert_eq!(verified.reason.as_deref(), Some("source_changed"));
+    }
 }

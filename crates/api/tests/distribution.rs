@@ -2,19 +2,27 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use geo_api::{ContentService, ModelProviderBridge, distribution::DistributionService};
+use geo_api::{
+    AppState, ChannelService, ContentService, EventBus, MemoryIdempotencyStore,
+    MemoryOperationStore, ModelProviderBridge, RepositoryHostOps,
+    distribution::DistributionService,
+};
 use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelOwnerKind, ChannelRepository, ChannelStatus,
     ContentItemStatus, ContentRepository, DistributionScope, DistributionScopeMode,
     DistributionTargetStatus, DocumentManifestPlanRequest, DocumentScope, ErrorCode, ImportItem,
     InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
-    KnowledgeRepository, MemoryChannelRepository, MemoryContentRepository,
+    KnowledgeRepository, MemoryAuthRepository, MemoryChannelRepository, MemoryContentRepository,
     MemoryDistributionRepository, MemoryKnowledgeRepository, MemoryProjectRepository,
     PlatformPlacement, ProjectCreate, ProjectPatch, ProjectRepository, ProjectSettings,
     ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
     start_request_hash,
 };
-use geo_worker::{HostOpError, ModelCompletion, ModelCompletionRequest};
+use geo_worker::{
+    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
+    DistributionTargetsReadRequest, HostOpError, HostOpErrorCode, HostOps, ModelCompletion,
+    ModelCompletionRequest,
+};
 use uuid::Uuid;
 
 struct GroundedModel;
@@ -73,6 +81,7 @@ struct Fixture {
     scope: TenantScope,
     cycle_id: Uuid,
     projects: Arc<MemoryProjectRepository>,
+    knowledge: Arc<MemoryKnowledgeRepository>,
     content: Arc<MemoryContentRepository>,
     channels: Arc<MemoryChannelRepository>,
     distribution: Arc<MemoryDistributionRepository>,
@@ -212,7 +221,7 @@ async fn setup(second_blocked: bool) -> Fixture {
     let service = DistributionService::new(
         distribution.clone(),
         content.clone(),
-        knowledge,
+        knowledge.clone(),
         projects.clone(),
         channels.clone(),
     )
@@ -225,6 +234,7 @@ async fn setup(second_blocked: bool) -> Fixture {
         scope,
         cycle_id: started.cycle_id,
         projects,
+        knowledge,
         content,
         channels,
         distribution,
@@ -261,6 +271,154 @@ async fn add_account(fixture: &Fixture) {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn agent_distribution_tools_use_service_with_current_cycle_and_reference_only_pages() {
+    let fixture = setup(true).await;
+    add_account(&fixture).await;
+    let state = AppState::with_stores_and_auth_and_projects_and_knowledge(
+        Arc::new(MemoryOperationStore::default()),
+        Arc::new(MemoryIdempotencyStore::default()),
+        Arc::new(MemoryAuthRepository::development_with_password("unused")),
+        fixture.projects.clone(),
+        fixture.knowledge.clone(),
+        EventBus::default(),
+        false,
+    )
+    .with_content_repository(fixture.content.clone())
+    .with_distribution_repository(fixture.distribution.clone())
+    .with_channel_service(ChannelService::unconfigured(fixture.channels.clone()));
+    let host = RepositoryHostOps::new(fixture.knowledge.clone()).with_content(state);
+    let other_project = TenantScope::new(
+        fixture.scope.operator_id,
+        fixture.scope.tenant_id,
+        Some(Uuid::new_v4().into()),
+    );
+    assert_eq!(
+        host.distribution_start(&other_project, DistributionStartRequest { cycle_id: None })
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::NotFound
+    );
+    assert_eq!(
+        host.distribution_read(
+            &fixture.scope,
+            DistributionReadRequest {
+                cycle_id: None,
+                manifest_id: None,
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        HostOpErrorCode::NotFound
+    );
+    let started = host
+        .distribution_start(&fixture.scope, DistributionStartRequest { cycle_id: None })
+        .await
+        .unwrap();
+    assert_eq!(started.cycle_id, fixture.cycle_id);
+    assert_eq!(started.expected_count, 6);
+    assert!(started.complete);
+    assert_eq!(started.expansion_cursor, 6);
+    assert_eq!(
+        started,
+        host.distribution_start(
+            &fixture.scope,
+            DistributionStartRequest {
+                cycle_id: Some(fixture.cycle_id)
+            }
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        started,
+        host.distribution_read(
+            &fixture.scope,
+            DistributionReadRequest {
+                cycle_id: None,
+                manifest_id: None,
+            }
+        )
+        .await
+        .unwrap()
+    );
+    let first = host
+        .distribution_targets_read(
+            &fixture.scope,
+            DistributionTargetsReadRequest {
+                manifest_id: started.manifest_id,
+                after_ordinal: None,
+                limit: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.expected_count, 6);
+    assert_eq!(first.items.len(), 2);
+    assert!(first.next_ordinal.is_some());
+    let second = host
+        .distribution_targets_read(
+            &fixture.scope,
+            DistributionTargetsReadRequest {
+                manifest_id: started.manifest_id,
+                after_ordinal: first.next_ordinal,
+                limit: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.items.len(), 2);
+    assert!(second.items[0].ordinal > first.items[1].ordinal);
+    let view = serde_json::to_value(&first).unwrap();
+    let serialized = view.to_string();
+    for forbidden in [
+        "account_id",
+        "markdown",
+        "payload_hash",
+        "supported_formats",
+        "capability_version",
+        "platform_account_id",
+    ] {
+        assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+    }
+    assert_eq!(
+        host.distribution_resume(
+            &fixture.scope,
+            DistributionResumeRequest {
+                manifest_id: started.manifest_id,
+                after_ordinal: None,
+            }
+        )
+        .await
+        .unwrap(),
+        started
+    );
+    assert_eq!(
+        host.distribution_targets_read(
+            &other_project,
+            DistributionTargetsReadRequest {
+                manifest_id: started.manifest_id,
+                after_ordinal: None,
+                limit: None,
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        HostOpErrorCode::NotFound
+    );
+    // In-memory channel count and IDs cannot claim real connector support.
+    // The unverified server snapshot leaves all targets non-publishable.
+    assert!(
+        first
+            .items
+            .iter()
+            .all(|item| item.status != DistributionTargetStatus::Ready)
+    );
 }
 
 #[tokio::test]

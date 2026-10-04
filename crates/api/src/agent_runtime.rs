@@ -29,18 +29,22 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AgentRuntime, AppError, AttachmentReference, DocumentManifestItemState, DocumentManifestState,
-    ErrorCode, ImportItem, ImportStatus, KnowledgeRepository, RUNTIME_NOT_CONFIGURED,
-    ReportSnapshot, RuntimeCapability, SourceKind, TenantScope, TurnInput, TurnReport,
+    AgentRuntime, AppError, AttachmentReference, DistributionManifest, DistributionTarget,
+    DocumentManifestItemState, DocumentManifestState, ErrorCode, ImportItem, ImportStatus,
+    KnowledgeRepository, RUNTIME_NOT_CONFIGURED, ReportSnapshot, RuntimeCapability, SourceKind,
+    TenantScope, TurnInput, TurnReport,
 };
 use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryPage, ChannelExecutionResult, ChannelManifestPage,
     ChannelManifestReadRequest, ChannelPlanReceipt, ChannelPlanRequest,
-    ChannelTargetExecuteRequest, HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge,
-    HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOps, HostRuntime, ManifestCoverage,
-    ManifestItem, ManifestKind, ManifestPage, ManifestPlanningState, ManifestReadRequest,
-    MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
-    PublishRequest, ReportGetRequest, ReportReduceRequest, TURN_COMPLETION_TOPIC, WorkerError,
+    ChannelTargetExecuteRequest, DistributionManifestRef, DistributionReadRequest,
+    DistributionResumeRequest, DistributionStartRequest, DistributionTargetRef,
+    DistributionTargetsPage, DistributionTargetsReadRequest, HOST_BUNDLE, HOST_MAIN_MODULE,
+    HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOps,
+    HostRuntime, ManifestCoverage, ManifestItem, ManifestKind, ManifestPage, ManifestPlanningState,
+    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
+    PublishReceipt, PublishRequest, ReportGetRequest, ReportReduceRequest, TURN_COMPLETION_TOPIC,
+    WorkerError,
 };
 use serde_json::{Value, json};
 
@@ -565,6 +569,69 @@ impl RepositoryHostOps {
     }
 }
 
+fn distribution_ref(manifest: DistributionManifest) -> DistributionManifestRef {
+    DistributionManifestRef {
+        manifest_id: manifest.manifest_id,
+        cycle_id: manifest.cycle_id,
+        revision: manifest.revision,
+        document_manifest_id: manifest.document_manifest_id,
+        content_execution_id: manifest.content_execution_id,
+        content_handoff_id: manifest.content_handoff_id,
+        expected_count: manifest.expected_count,
+        expansion_cursor: manifest.expansion_cursor,
+        complete: manifest.complete,
+    }
+}
+
+fn distribution_target_ref(target: DistributionTarget) -> DistributionTargetRef {
+    DistributionTargetRef {
+        target_id: target.target_id,
+        ordinal: target.ordinal,
+        document_item_id: target.document_item_id,
+        content_revision_id: target.content_revision_id,
+        platform_id: target.platform_id,
+        variant_id: target.variant_id,
+        publication_intent_id: target.publication_intent_id,
+        status: target.status,
+        reason: target.reason,
+    }
+}
+
+async fn current_distribution_cycle(
+    state: &AppState,
+    scope: &TenantScope,
+) -> Result<uuid::Uuid, AppError> {
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::forbidden("project scope required"))?;
+    state
+        .project_repository()
+        .get_current_cycle(scope, project_id)
+        .await?
+        .map(|cycle| cycle.cycle_id)
+        .ok_or_else(|| AppError::not_found("current cycle not found"))
+}
+
+async fn scoped_distribution_manifest(
+    state: &AppState,
+    scope: &TenantScope,
+    manifest_id: uuid::Uuid,
+) -> Result<DistributionManifest, AppError> {
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::forbidden("project scope required"))?;
+    let manifest = state.distribution_service().get(scope, manifest_id).await?;
+    if manifest.project_id != project_id {
+        return Err(AppError::not_found("distribution manifest not found"));
+    }
+    state
+        .project_repository()
+        .get_report_cycle(scope, project_id, manifest.cycle_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("cycle not found"))?;
+    Ok(manifest)
+}
+
 impl fmt::Debug for RepositoryHostOps {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -587,6 +654,104 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
 
 #[async_trait]
 impl HostOps for RepositoryHostOps {
+    async fn distribution_start(
+        &self,
+        scope: &TenantScope,
+        request: DistributionStartRequest,
+    ) -> Result<DistributionManifestRef, HostOpError> {
+        let op = HostOp::DistributionStart;
+        let state = self.content_state(op)?;
+        let cycle_id = match request.cycle_id {
+            Some(id) => id,
+            None => current_distribution_cycle(state, scope)
+                .await
+                .map_err(|error| worker_error(op, error))?,
+        };
+        let service = state.distribution_service();
+        let frozen = service
+            .freeze(scope, cycle_id)
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        service
+            .resume(scope, frozen.manifest_id, 1)
+            .await
+            .map(distribution_ref)
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn distribution_read(
+        &self,
+        scope: &TenantScope,
+        request: DistributionReadRequest,
+    ) -> Result<DistributionManifestRef, HostOpError> {
+        let op = HostOp::DistributionRead;
+        let state = self.content_state(op)?;
+        let manifest = if let Some(manifest_id) = request.manifest_id {
+            scoped_distribution_manifest(state, scope, manifest_id).await
+        } else {
+            let cycle_id = match request.cycle_id {
+                Some(id) => id,
+                None => current_distribution_cycle(state, scope)
+                    .await
+                    .map_err(|error| worker_error(op, error))?,
+            };
+            state
+                .distribution_service()
+                .latest_for_cycle(scope, cycle_id)
+                .await
+                .map_err(|error| worker_error(op, error))?
+                .ok_or_else(|| AppError::not_found("distribution manifest not frozen"))
+        }
+        .map_err(|error| worker_error(op, error))?;
+        Ok(distribution_ref(manifest))
+    }
+
+    async fn distribution_resume(
+        &self,
+        scope: &TenantScope,
+        request: DistributionResumeRequest,
+    ) -> Result<DistributionManifestRef, HostOpError> {
+        let op = HostOp::DistributionResume;
+        let state = self.content_state(op)?;
+        scoped_distribution_manifest(state, scope, request.manifest_id)
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        state
+            .distribution_service()
+            .resume_from(scope, request.manifest_id, 4, request.after_ordinal)
+            .await
+            .map(distribution_ref)
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn distribution_targets_read(
+        &self,
+        scope: &TenantScope,
+        request: DistributionTargetsReadRequest,
+    ) -> Result<DistributionTargetsPage, HostOpError> {
+        let op = HostOp::DistributionTargetsRead;
+        let state = self.content_state(op)?;
+        scoped_distribution_manifest(state, scope, request.manifest_id)
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        let page = state
+            .distribution_service()
+            .targets(
+                scope,
+                request.manifest_id,
+                request.after_ordinal,
+                request.limit.unwrap_or(25) as usize,
+            )
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        Ok(DistributionTargetsPage {
+            manifest_id: page.manifest_id,
+            expected_count: page.expected_count,
+            items: page.rows.into_iter().map(distribution_target_ref).collect(),
+            next_ordinal: page.next_ordinal,
+        })
+    }
+
     async fn content_start(
         &self,
         scope: &TenantScope,

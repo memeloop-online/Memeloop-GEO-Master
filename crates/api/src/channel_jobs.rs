@@ -5,7 +5,7 @@ use axum::{
     Json,
     extract::{Extension, Path, State},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelStatus, ChannelTarget,
     ChannelTargetInput, ChannelTargetView, ErrorCode, KnowledgePurpose, ProjectId, ProjectStatus,
@@ -175,6 +175,155 @@ fn publication_readback(
                 == proof.get("readback_sha256").and_then(|v| v.as_str())
             && proof.get("expected_sha256").and_then(|v| v.as_str()) == Some(expected_hash.as_str())
     })
+}
+
+// The authenticated runner is the only source of these fields. A plausible
+// answer, citations, or a caller-supplied search_verified flag is not proof.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfficialSearchEvent {
+    kind: String,
+    event_id: String,
+    request_id: String,
+    occurred_at: DateTime<Utc>,
+    source: String,
+    provenance: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeasurementEvidence {
+    kind: String,
+    schema_version: String,
+    target_id: Uuid,
+    account_id: Uuid,
+    provider: String,
+    model: String,
+    surface: String,
+    search_mode: String,
+    protocol_version: String,
+    question_set_version: String,
+    question_sha256: String,
+    market: String,
+    language: String,
+    scheduled_at: DateTime<Utc>,
+    sample_ordinal: u32,
+    connector_version: String,
+    provenance: String,
+    disposition: String,
+    raw_answer: String,
+    citations: Vec<String>,
+    search_event: OfficialSearchEvent,
+}
+
+fn measurement_observation(
+    result: &crate::browser_bridge::BrowserExecution,
+    target: &ChannelTarget,
+    claimed_at: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+) -> Option<(ChannelOutcomeStatus, String, Vec<String>)> {
+    let ChannelTargetInput::Measure {
+        account_id,
+        provider,
+        model,
+        surface,
+        search_mode,
+        protocol_version,
+        question_set_version,
+        question,
+        market,
+        language,
+        scheduled_at,
+        sample_ordinal,
+    } = &target.input
+    else {
+        return None;
+    };
+    if result.status != "completed"
+        || result.stage.as_deref() != Some("official_search_observation")
+        || result.public_url.is_some()
+    {
+        return None;
+    }
+    let mut proofs = result.evidence.iter().filter(|value| {
+        value.get("kind").and_then(|kind| kind.as_str()) == Some("official_search_observation")
+    });
+    let proof: MeasurementEvidence = serde_json::from_value(proofs.next()?.clone()).ok()?;
+    if proofs.next().is_some() {
+        return None;
+    }
+    let version = result.connector_version.as_deref()?;
+    if version.trim().is_empty()
+        || version.len() > 100
+        // Provenance is established by the typed proof, not substrings such
+        // as "test" (which also occur in legitimate "attested" versions).
+        || version.starts_with("fixture")
+        || result.occurred_at.is_none()
+        || proof.kind != "official_search_observation"
+        || proof.schema_version != "geo.measure.official_search.v1"
+        || proof.target_id != target.target_id
+        || proof.account_id != *account_id
+        || proof.provider != *provider
+        || proof.model != *model
+        || proof.surface != *surface
+        || proof.search_mode != *search_mode
+        || proof.protocol_version != *protocol_version
+        || proof.question_set_version != *question_set_version
+        || proof.question_sha256 != sha256_hex(question.as_bytes())
+        || proof.market != *market
+        || proof.language != *language
+        || proof.scheduled_at != *scheduled_at
+        || proof.sample_ordinal != *sample_ordinal
+        || proof.connector_version != version
+        || proof.provenance != "live"
+        || proof.search_event.kind != "official_search_event"
+        || proof.search_event.source != "provider_search_event"
+        || proof.search_event.provenance != "live"
+        || proof.search_event.event_id.is_empty()
+        || proof.search_event.event_id.len() > 128
+        || proof.search_event.request_id.is_empty()
+        || proof.search_event.request_id.len() > 128
+        || !proof
+            .search_event
+            .event_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || !proof
+            .search_event
+            .request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || proof.raw_answer.trim().is_empty()
+        || proof.raw_answer.len() > 100_000
+        || proof.citations.len() > 50
+    {
+        return None;
+    }
+    let completed_at = result.occurred_at?;
+    if claimed_at > proof.search_event.occurred_at
+        || proof.search_event.occurred_at > completed_at
+        || completed_at > received_at
+        || completed_at < claimed_at
+    {
+        return None;
+    }
+    let status = match proof.disposition.as_str() {
+        "observed" => ChannelOutcomeStatus::Observed,
+        "refused" if proof.citations.is_empty() => ChannelOutcomeStatus::Refused,
+        _ => return None,
+    };
+    for citation in &proof.citations {
+        let url = reqwest::Url::parse(citation).ok()?;
+        if citation.len() > 2048
+            || !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return None;
+        }
+    }
+    Some((status, proof.raw_answer, proof.citations))
 }
 
 /// The queued input is an index, never an authority for publishable bytes.
@@ -803,6 +952,7 @@ async fn execute_reserved_channel_target(
             ("publish", json!({"title":title,"body":body}))
         }
         ChannelTargetInput::Measure {
+            account_id,
             provider,
             model,
             surface,
@@ -817,7 +967,7 @@ async fn execute_reserved_channel_target(
             ..
         } => (
             "measure",
-            json!({"provider":provider,"model":model,"surface":surface,"search_mode":search_mode,"protocol_version":protocol_version,"question_set_version":question_set_version,"question":question,"market":market,"language":language,"scheduled_at":scheduled_at,"sample_ordinal":sample_ordinal}),
+            json!({"target_id":target.target_id,"account_id":account_id,"provider":provider,"model":model,"surface":surface,"search_mode":search_mode,"protocol_version":protocol_version,"question_set_version":question_set_version,"question":question,"market":market,"language":language,"scheduled_at":scheduled_at,"sample_ordinal":sample_ordinal}),
         ),
     };
     let now = Utc::now();
@@ -867,31 +1017,47 @@ async fn execute_reserved_channel_target(
     {
         tracing::warn!("browser execution session cleanup failed");
     }
+    let received_at = Utc::now();
     let outcome = match resolved {
         Ok(result) => {
             let matched = result.execution_id == attempt.attempt_id;
             let verified = matched && publication_readback(&result, &target.input);
+            let observation = if matched {
+                measurement_observation(&result, &target, attempt.claimed_at, received_at)
+            } else {
+                None
+            };
             let status = match result.status.as_str() {
                 "unsupported" if matched => ChannelOutcomeStatus::Unsupported,
                 "login_required" | "challenge" if matched => ChannelOutcomeStatus::LoginRequired,
                 "unknown" => ChannelOutcomeStatus::Unknown,
+                "completed" if observation.is_some() => observation.as_ref().unwrap().0,
                 // A completed generic browser action is not proof of
                 // publication nor valid independent search observation.
                 "completed" if verified => ChannelOutcomeStatus::Verified,
+                _ if operation == "measure" && matched => ChannelOutcomeStatus::Missing,
                 _ => ChannelOutcomeStatus::Unknown,
             };
+            let (raw_answer, citations) = observation
+                .map(|(_, answer, citations)| (Some(answer), citations))
+                .unwrap_or((None, vec![]));
             ChannelOutcome {
                 status,
                 detail: result.reason.or_else(|| {
                     Some(if verified {
                         "public readback verified".into()
+                    } else if raw_answer.is_some() {
+                        "official search observation verified".into()
                     } else {
                         "runner did not provide verified external evidence".into()
                     })
                 }),
-                occurred_at: result.occurred_at.unwrap_or(now),
-                raw_answer: None,
-                citations: vec![],
+                occurred_at: result
+                    .occurred_at
+                    .filter(|at| *at <= received_at)
+                    .unwrap_or(now),
+                raw_answer,
+                citations,
                 public_url: if verified { result.public_url } else { None },
                 screenshot_ref: None,
                 connector_version: result.connector_version,

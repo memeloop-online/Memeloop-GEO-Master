@@ -208,6 +208,10 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "channel_target_execute",
         "content_start",
         "content_execution_read",
+        "distribution_start",
+        "distribution_read",
+        "distribution_resume",
+        "distribution_targets_read",
       ],
     );
     assert.match(requests[1].messages.at(-1).content, /"status":"partial"/u);
@@ -339,6 +343,10 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "channel_target_execute",
         "content_start",
         "content_execution_read",
+        "distribution_start",
+        "distribution_read",
+        "distribution_resume",
+        "distribution_targets_read",
       ],
     );
     const importSchema = modelRequests[0].tools[0].function.parameters;
@@ -663,6 +671,131 @@ test("content start accepts a reference-only current cycle and reads durable cov
     assert.deepEqual(calls, [
       ["start", {}],
       ["read", { execution_id: executionId }],
+    ]);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("formal distribution tools pass only scoped selectors and expose a paged coverage matrix", async () => {
+  const manifestId = "00000000-0000-4000-8000-000000000101";
+  const calls = [];
+  let next = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async distributionStart(request) {
+      calls.push(["start", request]);
+      return {
+        manifest_id: manifestId,
+        expected_count: 3,
+        expansion_cursor: 3,
+        complete: true,
+      };
+    },
+    async distributionRead(request) {
+      calls.push(["read", request]);
+      return { manifest_id: manifestId, expected_count: 3, complete: true };
+    },
+    async distributionTargetsRead(request) {
+      calls.push(["targets", request]);
+      return {
+        manifest_id: manifestId,
+        expected_count: 3,
+        items: [
+          { ordinal: 0, status: "deferred", reason: "connector_unverified" },
+        ],
+        next_ordinal: 0,
+      };
+    },
+    async distributionResume(request) {
+      calls.push(["resume", request]);
+      return { manifest_id: manifestId, expected_count: 3, complete: true };
+    },
+    async modelComplete(request) {
+      const definitions = Object.fromEntries(
+        request.tools.map((tool) => [
+          tool.function.name,
+          tool.function.parameters,
+        ]),
+      );
+      for (const name of [
+        "distribution_start",
+        "distribution_read",
+        "distribution_resume",
+        "distribution_targets_read",
+      ]) {
+        assert.equal(definitions[name].additionalProperties, false);
+      }
+      assert.deepEqual(
+        definitions.distribution_start.properties.cycle_id.format,
+        "uuid",
+      );
+      assert.deepEqual(definitions.distribution_read.required, undefined);
+      assert.deepEqual(definitions.distribution_resume.required, [
+        "manifest_id",
+      ]);
+      assert.deepEqual(definitions.distribution_targets_read.required, [
+        "manifest_id",
+      ]);
+      const names = [
+        "distribution_start",
+        "distribution_read",
+        "distribution_targets_read",
+        "distribution_resume",
+      ];
+      const requests = [
+        {},
+        { manifest_id: manifestId },
+        { manifest_id: manifestId, limit: 1 },
+        { manifest_id: manifestId, after_ordinal: 0 },
+      ];
+      const index = next++;
+      return index < names.length
+        ? {
+            text: "",
+            tool_calls: [
+              {
+                id: `distribution-${index}`,
+                type: "function",
+                function: {
+                  name: names[index],
+                  arguments: JSON.stringify(requests[index]),
+                },
+              },
+            ],
+            model: "stub-model",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "tool_calls",
+          }
+        : {
+            text: "Manifest has three planned cells; one is deferred, not published.",
+            model: "stub-model",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "stop",
+          };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?distribution=${Date.now()}`
+    );
+    const result = await main({
+      conversation_id: "conversation-distribution",
+      prompt: "Start and review the second-stage coverage matrix",
+      run_id: "run-distribution",
+      turn_id: "turn-distribution",
+    });
+    assert.match(result.answer, /not published/u);
+    assert.deepEqual(calls, [
+      ["start", {}],
+      ["read", { manifest_id: manifestId }],
+      ["targets", { manifest_id: manifestId, limit: 1 }],
+      ["resume", { manifest_id: manifestId, after_ordinal: 0 }],
     ]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;

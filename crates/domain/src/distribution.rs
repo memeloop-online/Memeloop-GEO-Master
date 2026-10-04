@@ -2,7 +2,8 @@
 //! Persistence must commit targets, variants, intents and commands in ONE transaction.
 use crate::{
     AppError, ContentExecution, ContentExecutionStatus, ContentHandoff, ContentItemStatus,
-    ContentRevision, DocumentManifest, EvidenceRef, ProjectId, TenantScope,
+    ContentRevision, DocumentManifest, EvidenceRef, ProjectId, ReportEvidenceReference,
+    ReportPublicationStatus, TenantScope,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -252,6 +253,47 @@ pub struct DistributionCycleInputs {
     /// The reducer must not call missing cells successful. True only if all
     /// expected cells were committed at or before the requested cutoff.
     pub temporally_complete: bool,
+}
+
+/// A report result associated with one frozen coverage cell, not merely the
+/// logical intent (which may be reused by several cells across cycles).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributionPublicationResult {
+    pub target_id: Uuid,
+    pub status: ReportPublicationStatus,
+    pub reason: Option<String>,
+    pub evidence: Vec<ReportEvidenceReference>,
+}
+
+/// The receipt keeps its original timestamps, but each target has a distinct
+/// evidence identity so the report reducer cannot merge two coverage cells.
+pub fn target_publication_evidence(
+    target_id: Uuid,
+    intent_id: Uuid,
+    source_evidence_id: Uuid,
+    kind: &str,
+    occurred_at: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+) -> ReportEvidenceReference {
+    ReportEvidenceReference {
+        evidence_id: identity(&[
+            "distribution-target-evidence-v1",
+            &target_id.to_string(),
+            &intent_id.to_string(),
+            &source_evidence_id.to_string(),
+            kind,
+        ]),
+        kind: kind.into(),
+        resource_id: target_id,
+        resource_version: Some(format!("intent:{intent_id}:receipt:{source_evidence_id}")),
+        occurred_at: Some(occurred_at),
+        received_at: Some(received_at),
+        summary: if kind == "public_verification" {
+            "Verified public readback of the associated publication intent".into()
+        } else {
+            "Published receipt of the associated publication intent".into()
+        },
+    }
 }
 
 pub fn prepare_variant(
@@ -626,6 +668,15 @@ pub trait DistributionRepository: Send + Sync {
         cycle: Uuid,
         at: DateTime<Utc>,
     ) -> Result<DistributionCycleInputs, AppError>;
+    /// Read server-owned attempt and receipt records at a strict report cutoff.
+    /// The passed targets are historical snapshots; never look up their mutable
+    /// current binding when associating a reused intent.
+    async fn publication_results(
+        &self,
+        scope: &TenantScope,
+        targets: &[DistributionTarget],
+        at: DateTime<Utc>,
+    ) -> Result<Vec<DistributionPublicationResult>, AppError>;
 }
 
 #[derive(Default)]
@@ -685,6 +736,16 @@ fn recorded_at(history: &[DistributionTargetVersion]) -> DateTime<Utc> {
 
 #[async_trait]
 impl DistributionRepository for MemoryDistributionRepository {
+    async fn publication_results(
+        &self,
+        _scope: &TenantScope,
+        _targets: &[DistributionTarget],
+        _at: DateTime<Utc>,
+    ) -> Result<Vec<DistributionPublicationResult>, AppError> {
+        // Memory intent verification has no trusted persisted receipt ledger.
+        // Never upgrade it to a report success from an intent marker alone.
+        Ok(vec![])
+    }
     async fn get_publication_bundle(
         &self,
         scope: &TenantScope,
@@ -1203,5 +1264,52 @@ impl DistributionRepository for MemoryDistributionRepository {
                 temporally_complete: false,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod report_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn reused_receipt_retains_times_but_has_distinct_target_associations() {
+        let intent = Uuid::new_v4();
+        let receipt = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let observed = Utc::now() - Duration::hours(2);
+        let received = Utc::now() - Duration::hours(1);
+        let left = target_publication_evidence(
+            first,
+            intent,
+            receipt,
+            "public_verification",
+            observed,
+            received,
+        );
+        let right = target_publication_evidence(
+            second,
+            intent,
+            receipt,
+            "public_verification",
+            observed,
+            received,
+        );
+        assert_eq!(
+            left,
+            target_publication_evidence(
+                first,
+                intent,
+                receipt,
+                "public_verification",
+                observed,
+                received
+            )
+        );
+        assert_ne!(left.evidence_id, right.evidence_id);
+        assert_eq!(left.resource_id, first);
+        assert_eq!(right.resource_id, second);
+        assert_eq!(left.occurred_at, right.occurred_at);
+        assert_eq!(left.received_at, right.received_at);
     }
 }

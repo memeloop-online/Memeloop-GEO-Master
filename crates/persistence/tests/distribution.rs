@@ -13,6 +13,7 @@ use geo_domain::{
 use geo_persistence::{
     Database, DatabaseConfig, PgChannelJobRepository, PgDistributionRepository, PgProjectRepository,
 };
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -1034,5 +1035,204 @@ async fn outbox_bridge_is_atomic_replay_safe_and_coexists_with_legacy_plan() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL in GEO_TEST_DATABASE_URL"]
+async fn report_projects_verified_readback_at_received_cutoff_for_each_reused_target() {
+    let url = std::env::var("GEO_TEST_DATABASE_URL").unwrap();
+    // The global command scanner must not consume another test's outbox.
+    let admin = PgPool::connect(&url).await.unwrap();
+    let schema = format!("distribution_report_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .unwrap()
+        .options([("search_path", schema.as_str())]);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    let db = Database::from_pool(pool);
+    db.migrate().await.unwrap();
+    let first = fixture(db.pool()).await;
+    let repo = PgDistributionRepository::from_database(&db);
+    let jobs = PgChannelJobRepository::from_database(&db);
+    let mut frozen = freeze(&first);
+    frozen.placements = vec![PlatformPlacement {
+        platform_id: "zhihu".into(),
+        placement_slot: "primary".into(),
+        capability_version: "test-connector".into(),
+        supported_formats: vec!["article".into(), "faq".into()],
+        unavailable_reason: None,
+        fixture: false,
+    }];
+    let manifest = repo.freeze(&first.scope, frozen.clone()).await.unwrap();
+    let page = repo
+        .expansion_page(&first.scope, manifest.manifest_id, 0, 2)
+        .await
+        .unwrap();
+    repo.commit_expansion_page(&first.scope, manifest.manifest_id, 0, page.rows.clone())
+        .await
+        .unwrap();
+    let account_id = Uuid::new_v4();
+    let source = repo
+        .materialize(
+            &first.scope,
+            PreparedDistribution {
+                manifest_id: manifest.manifest_id,
+                target_id: page.rows[0].target_id,
+                revision: Some(first.revision.clone()),
+                account_id: Some(account_id),
+                defer_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    let source_target = source.target.clone();
+    let intent_id = source.intent.unwrap().intent_id;
+    let created = jobs.materialize_pending_commands(None, 10).await.unwrap();
+    assert_eq!(created.len(), 1);
+    let job_id = created[0].target_id;
+    let now = Utc::now();
+    let reservation = Uuid::new_v4();
+    jobs.reserve_account(
+        &first.scope,
+        account_id,
+        reservation,
+        now,
+        now + Duration::seconds(30),
+    )
+    .await
+    .unwrap();
+    let attempt = Uuid::new_v4();
+    jobs.claim_reserved(&first.scope, job_id, attempt, reservation, now)
+        .await
+        .unwrap();
+    let before = repo
+        .publication_results(&first.scope, std::slice::from_ref(&source_target), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        before[0].status,
+        geo_domain::ReportPublicationStatus::Unknown
+    );
+    assert!(before[0].evidence.is_empty());
+    let job = jobs.get_target(&first.scope, job_id).await.unwrap().target;
+    let ChannelTargetInput::GeneratedPublish { title, body, .. } = job.input else {
+        panic!("generated publication expected");
+    };
+    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let hash = hex::encode(Sha256::digest(
+        format!("{}\n{}", normalize(&title), normalize(&body)).as_bytes(),
+    ));
+    let public_url = "https://www.zhihu.com/p/12345";
+    let received = now + Duration::seconds(2);
+    jobs.finish(
+        &first.scope,
+        job_id,
+        attempt,
+        ChannelOutcome {
+            status: ChannelOutcomeStatus::Verified,
+            detail: None,
+            occurred_at: now + Duration::seconds(1),
+            raw_answer: None,
+            citations: vec![],
+            public_url: Some(public_url.into()),
+            screenshot_ref: None,
+            connector_version: Some("test-connector".into()),
+            runner_evidence: vec![serde_json::json!({
+                "kind":"public_readback", "url":public_url,
+                "content_matched":true, "owned_by_account":true,
+                "expected_sha256":hash,"readback_sha256":hash
+            })],
+            fixture: false,
+        },
+        received,
+    )
+    .await
+    .unwrap();
+    let before_receipt = repo
+        .publication_results(
+            &first.scope,
+            std::slice::from_ref(&source_target),
+            now + Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before_receipt[0].status,
+        geo_domain::ReportPublicationStatus::Unknown
+    );
+    let verified = repo
+        .publication_results(&first.scope, std::slice::from_ref(&source_target), received)
+        .await
+        .unwrap();
+    assert_eq!(
+        verified[0].status,
+        geo_domain::ReportPublicationStatus::Verified
+    );
+    let evidence = &verified[0].evidence[0];
+    assert_eq!(evidence.kind, "public_verification");
+    assert_eq!(evidence.resource_id, source_target.target_id);
+    assert_eq!(evidence.occurred_at, Some(now + Duration::seconds(1)));
+    assert_eq!(evidence.received_at, Some(received));
+
+    let next = next_cycle(db.pool(), &first).await;
+    frozen.cycle_id = next.cycle;
+    frozen.document_manifest = next.manifest.clone();
+    frozen.content_execution = next.execution.clone();
+    frozen.content_handoff = next.handoff.clone();
+    let next_manifest = repo.freeze(&next.scope, frozen).await.unwrap();
+    let page = repo
+        .expansion_page(&next.scope, next_manifest.manifest_id, 0, 2)
+        .await
+        .unwrap();
+    repo.commit_expansion_page(&next.scope, next_manifest.manifest_id, 0, page.rows.clone())
+        .await
+        .unwrap();
+    let reused = repo
+        .materialize(
+            &next.scope,
+            PreparedDistribution {
+                manifest_id: next_manifest.manifest_id,
+                target_id: page.rows[0].target_id,
+                revision: Some(next.revision),
+                account_id: Some(account_id),
+                defer_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused.intent.unwrap().intent_id, intent_id);
+    assert_eq!(
+        reused.target.status,
+        DistributionTargetStatus::ReusedVerified
+    );
+    assert!(reused.publication_commands.is_empty());
+    let both = repo
+        .publication_results(&next.scope, &[source_target, reused.target], received)
+        .await
+        .unwrap();
+    assert_eq!(both.len(), 2);
+    assert_eq!(
+        both[0].status,
+        geo_domain::ReportPublicationStatus::Verified
+    );
+    assert_eq!(
+        both[1].status,
+        geo_domain::ReportPublicationStatus::Verified
+    );
+    assert_ne!(
+        both[0].evidence[0].evidence_id,
+        both[1].evidence[0].evidence_id
+    );
+    assert_eq!(
+        both[0].evidence[0].occurred_at,
+        both[1].evidence[0].occurred_at
     );
 }
