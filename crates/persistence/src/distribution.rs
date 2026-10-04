@@ -240,7 +240,11 @@ impl DistributionRepository for PgDistributionRepository {
                 if real
                     && outcome_time_valid
                     && valid_time
-                    && observed == Some(outcome.occurred_at)
+                    // TIMESTAMPTZ stores microseconds, while the immutable
+                    // JSON outcome can retain chrono's nanoseconds.
+                    && observed.is_some_and(|time| {
+                        time.timestamp_micros() == outcome.occurred_at.timestamp_micros()
+                    })
                     && row.get::<Option<String>, _>("result").as_deref() == Some("verified")
                     && !row
                         .get::<Option<bool>, _>("evidence_fixture")

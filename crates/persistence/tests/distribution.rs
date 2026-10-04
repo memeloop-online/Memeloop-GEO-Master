@@ -1098,7 +1098,8 @@ async fn report_projects_verified_readback_at_received_cutoff_for_each_reused_ta
     let created = jobs.materialize_pending_commands(None, 10).await.unwrap();
     assert_eq!(created.len(), 1);
     let job_id = created[0].target_id;
-    let now = Utc::now();
+    // Exercise the JSON nanosecond / SQL microsecond boundary deterministically.
+    let now = chrono::Timelike::with_nanosecond(&Utc::now(), 123_456_789).unwrap();
     let reservation = Uuid::new_v4();
     jobs.reserve_account(
         &first.scope,
@@ -1179,8 +1180,16 @@ async fn report_projects_verified_readback_at_received_cutoff_for_each_reused_ta
     let evidence = &verified[0].evidence[0];
     assert_eq!(evidence.kind, "public_verification");
     assert_eq!(evidence.resource_id, source_target.target_id);
-    assert_eq!(evidence.occurred_at, Some(now + Duration::seconds(1)));
-    assert_eq!(evidence.received_at, Some(received));
+    // Compare the originally persisted instants at PostgreSQL's precision;
+    // JSON outcomes may retain sub-microsecond digits.
+    assert_eq!(
+        evidence.occurred_at,
+        chrono::DateTime::from_timestamp_micros((now + Duration::seconds(1)).timestamp_micros())
+    );
+    assert_eq!(
+        evidence.received_at,
+        chrono::DateTime::from_timestamp_micros(received.timestamp_micros())
+    );
 
     let next = next_cycle(db.pool(), &first).await;
     frozen.cycle_id = next.cycle;
