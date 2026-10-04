@@ -1211,6 +1211,7 @@ async fn execute_reserved_channel_target(
         Err(failure) => ChannelOutcome {
             status: if failure.message.starts_with("source ")
                 || failure.message.starts_with("generated publication ")
+                || failure.message.starts_with("connector ")
             {
                 ChannelOutcomeStatus::Unsupported
             } else if matches!(failure.code, ErrorCode::Conflict) {
