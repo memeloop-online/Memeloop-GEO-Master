@@ -8,8 +8,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelStatus, ChannelTarget,
-    ChannelTargetInput, ChannelTargetView, ErrorCode, KnowledgePurpose, ProjectId, ProjectStatus,
-    SourceState, TenantScope, sha256_hex,
+    ChannelTargetInput, ChannelTargetView, ConnectorAvailability, ConnectorKey, ErrorCode,
+    KnowledgePurpose, ProjectId, ProjectStatus, SourceState, TenantScope, sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -63,7 +63,125 @@ pub enum ChannelDispatchDeferred {
     RunnerUnavailable,
     AccountBusy,
     SourceUnavailable,
+    ConnectorUnavailable,
     FixtureOnly,
+}
+
+async fn generated_connector_available(
+    state: &AppState,
+    scope: &TenantScope,
+    input: &ChannelTargetInput,
+) -> Result<bool, AppError> {
+    let ChannelTargetInput::GeneratedPublish {
+        platform,
+        publication_intent_id,
+        distribution_target_id,
+        ..
+    } = input
+    else {
+        return Ok(true);
+    };
+    // The target retains its immutable snapshot; it cannot be silently
+    // upgraded after freeze. Current operator revocation/version drift may
+    // still prevent a new attempt against that snapshot.
+    let bundle = state
+        .distribution_repository()
+        .get_publication_bundle(scope, *publication_intent_id)
+        .await?;
+    let frozen = bundle.target;
+    let manifest = state
+        .distribution_repository()
+        .get(scope, frozen.manifest_id)
+        .await?;
+    let Some(document) = manifest
+        .document_roster
+        .iter()
+        .find(|item| item.document_item_id == frozen.document_item_id)
+    else {
+        return Ok(false);
+    };
+    let Some(placement) = manifest.platform_scope.iter().find(|item| {
+        item.platform_id == frozen.platform_id && item.placement_slot == frozen.placement_slot
+    }) else {
+        return Ok(false);
+    };
+    let key = ConnectorKey {
+        platform_id: platform.clone(),
+        placement_slot: frozen.placement_slot.clone(),
+    };
+    let connectors = crate::connector_capabilities::deployed_versions(state).await;
+    let Some(version) = crate::connector_capabilities::deployed_version(&connectors, &key) else {
+        return Ok(false);
+    };
+    if frozen.target_id != *distribution_target_id
+        || frozen.platform_id != *platform
+        || placement.capability_version != version
+        || placement.fixture
+        || placement.unavailable_reason.is_some()
+        || !placement.supported_formats.contains(&document.content_type)
+    {
+        return Ok(false);
+    }
+    let settings = state
+        .connector_capability_repository()
+        .get(scope.operator_id, &key)
+        .await?;
+    let Some(settings) = settings else {
+        return Ok(false);
+    };
+    if settings.content_types.contains(&document.content_type)
+        && state
+            .connector_capability_repository()
+            .resolve(scope.operator_id, &key, version, &document.content_type)
+            .await?
+            .availability
+            == ConnectorAvailability::Available
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn legacy_connector_available(
+    state: &AppState,
+    scope: &TenantScope,
+    input: &ChannelTargetInput,
+) -> Result<bool, AppError> {
+    let ChannelTargetInput::Publish { platform, .. } = input else {
+        return Ok(true);
+    };
+    let key = ConnectorKey {
+        platform_id: platform.clone(),
+        placement_slot: "primary".into(),
+    };
+    let Some(settings) = state
+        .connector_capability_repository()
+        .get(scope.operator_id, &key)
+        .await?
+    else {
+        // Legacy source publication is the trusted bootstrap probe: absence
+        // of a registry entry cannot depend on an already verified proof.
+        return Ok(true);
+    };
+    if !settings.enabled {
+        return Ok(false);
+    }
+    let connectors = crate::connector_capabilities::deployed_versions(state).await;
+    let Some(version) = crate::connector_capabilities::deployed_version(&connectors, &key) else {
+        return Ok(false);
+    };
+    for kind in &settings.content_types {
+        if state
+            .connector_capability_repository()
+            .resolve(scope.operator_id, &key, version, kind)
+            .await?
+            .availability
+            == ConnectorAvailability::Available
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -730,6 +848,11 @@ pub async fn execute_channel_target(
             "target already attempted; inspect or reconcile existing outcome",
         ));
     }
+    if !legacy_connector_available(state, scope, &planned.target.input).await? {
+        return Ok(ChannelDispatchResult::Deferred(
+            ChannelDispatchDeferred::ConnectorUnavailable,
+        ));
+    }
     if matches!(
         &planned.target.input,
         ChannelTargetInput::GeneratedPublish { .. }
@@ -747,6 +870,11 @@ pub async fn execute_channel_target(
                 ));
             }
             Err(error) => return Err(error),
+        }
+        if !generated_connector_available(state, scope, &planned.target.input).await? {
+            return Ok(ChannelDispatchResult::Deferred(
+                ChannelDispatchDeferred::ConnectorUnavailable,
+            ));
         }
     }
     if let ChannelTargetInput::Measure { scheduled_at, .. } = &planned.target.input
@@ -828,6 +956,11 @@ async fn execute_reserved_channel_target(
             "target already attempted; inspect or reconcile existing outcome",
         ));
     }
+    if !legacy_connector_available(state, scope, &planned.target.input).await? {
+        return Ok(ChannelDispatchResult::Deferred(
+            ChannelDispatchDeferred::ConnectorUnavailable,
+        ));
+    }
     let account = match service
         .resolve_available_account(scope, planned.target.input.account_id())
         .await
@@ -894,6 +1027,11 @@ async fn execute_reserved_channel_target(
                 ));
             }
             Err(error) => return Err(error),
+        }
+        if !generated_connector_available(state, scope, &planned.target.input).await? {
+            return Ok(ChannelDispatchResult::Deferred(
+                ChannelDispatchDeferred::ConnectorUnavailable,
+            ));
         }
     }
     // Opening and verifying an ephemeral browser context is reversible; no
@@ -994,10 +1132,16 @@ async fn execute_reserved_channel_target(
                 .await?
                 .ok_or_else(|| AppError::conflict("source version no longer available"))?;
         }
+        if !legacy_connector_available(state, scope, &target.input).await? {
+            return Err(AppError::conflict("connector no longer available"));
+        }
         if matches!(&target.input, ChannelTargetInput::GeneratedPublish { .. })
             && generated_publication_preflight(state, scope, &target.input).await?
         {
             return Err(AppError::conflict("source fixture cannot publish"));
+        }
+        if !generated_connector_available(state, scope, &target.input).await? {
+            return Err(AppError::conflict("connector no longer available"));
         }
         execute_and_close(
             bridge,
@@ -1010,10 +1154,9 @@ async fn execute_reserved_channel_target(
         .await
     }
     .await;
-    if resolved
-        .as_ref()
-        .is_err_and(|error| error.message.starts_with("source "))
-        && bridge.close(session).await.is_err()
+    if resolved.as_ref().is_err_and(|error| {
+        error.message.starts_with("source ") || error.message.starts_with("connector ")
+    }) && bridge.close(session).await.is_err()
     {
         tracing::warn!("browser execution session cleanup failed");
     }

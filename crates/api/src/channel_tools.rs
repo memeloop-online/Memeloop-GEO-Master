@@ -198,6 +198,7 @@ fn deferred(target_id: Uuid, reason: ChannelDispatchDeferred) -> ChannelExecutio
                 ChannelDispatchDeferred::AccountBusy => "account_busy",
                 ChannelDispatchDeferred::RunnerUnavailable => "runner_unavailable",
                 ChannelDispatchDeferred::SourceUnavailable => "source_unavailable",
+                ChannelDispatchDeferred::ConnectorUnavailable => "connector_unavailable",
                 ChannelDispatchDeferred::FixtureOnly => "fixture_only",
             }
             .to_owned(),

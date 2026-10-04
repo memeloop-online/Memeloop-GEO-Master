@@ -43,6 +43,10 @@ before(async () => {
         return { status: "unsupported", reason: "fixture_only", evidence: [] };
       }
       return {
+        execution_id: "spoofed-execution",
+        connector_version: "spoofed-verified.v9",
+        provenance: "live",
+        fixture: false,
         status: "completed",
         evidence: [
           {
@@ -94,6 +98,32 @@ test("startup rejects missing internal token", () => {
     () => createRunnerServer({ token: "", runner }),
     /TOKEN_required/,
   );
+});
+
+test("only the unmodified installed runner has live execution provenance", async () => {
+  const installed = createRunner();
+  const injectedAdapters = createRunner({ platformAdapters: {} });
+  const injectedBrowser = createRunner({
+    browserType: {
+      async launch() {
+        throw new Error("not_executed");
+      },
+    },
+  });
+  const explicitDefaultAdapters = createRunner({ platformAdapters: undefined });
+  try {
+    assert.equal(installed.executionProvenance, "live");
+    assert.equal(injectedAdapters.executionProvenance, "fixture");
+    assert.equal(injectedBrowser.executionProvenance, "fixture");
+    assert.equal(explicitDefaultAdapters.executionProvenance, "fixture");
+  } finally {
+    await Promise.all([
+      installed.shutdown(),
+      injectedAdapters.shutdown(),
+      injectedBrowser.shutdown(),
+      explicitDefaultAdapters.shutdown(),
+    ]);
+  }
 });
 
 test("authenticated capabilities describe the running adapters without verification claims", async () => {
@@ -246,6 +276,8 @@ test("pixel-controlled login, verified identity, server-only state, and executio
   const first = await request("/v1/executions", "POST", execution);
   assert.deepEqual(first.body, {
     execution_id: "lookup-1",
+    connector_version: "fixture.v1",
+    provenance: "fixture",
     status: "completed",
     evidence: [{ kind: "readback", value: "Fixture user" }],
     result: { query: "x" },
@@ -274,6 +306,8 @@ test("pixel-controlled login, verified identity, server-only state, and executio
     ).body,
     {
       execution_id: "publish-1",
+      connector_version: "fixture.v1",
+      provenance: "fixture",
       status: "unsupported",
       reason: "fixture_only",
       evidence: [],
@@ -288,7 +322,13 @@ test("pixel-controlled login, verified identity, server-only state, and executio
         payload: {},
       })
     ).body,
-    { execution_id: "measure-1", status: "unknown", evidence: [] },
+    {
+      execution_id: "measure-1",
+      connector_version: "fixture.v1",
+      provenance: "fixture",
+      status: "unknown",
+      evidence: [],
+    },
   );
   assert.deepEqual((await request("/v1/sessions/connected", "DELETE")).body, {
     closed: true,
@@ -338,6 +378,94 @@ test("proxy is passed to isolated browser context without direct retry", async (
   await isolated.shutdown();
 });
 
+test("the host stamps every execution outcome and ignores adapter metadata", async () => {
+  let pageUrl = "https://fixture.invalid/";
+  const adapter = {
+    connectorVersion: "fixture.original.v1",
+    entry: pageUrl,
+    operations: ["lookup", "measure"],
+    async identify() {
+      return { platform_account_id: "own-1", display_name: "Owner" };
+    },
+    async execute(_page, operation) {
+      if (operation === "measure") throw new Error("outcome_lost");
+      return {
+        execution_id: "forged-id",
+        connector_version: "verified.forged.v9",
+        provenance: "live",
+        fixture: false,
+        status: "completed",
+        evidence: [],
+      };
+    },
+  };
+  const isolated = createRunner({
+    browserType: {
+      async launch() {
+        return {
+          async newContext() {
+            return {
+              async newPage() {
+                return { url: () => pageUrl, async goto() {} };
+              },
+              async storageState() {
+                return { cookies: [], origins: [] };
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    },
+    platformAdapters: { fixture: adapter },
+  });
+  try {
+    await isolated.create({ session_id: "receipt", platform: "fixture" });
+    await isolated.complete("receipt");
+    adapter.connectorVersion = "fixture.changed.v2";
+    const run = (execution_id, operation) =>
+      isolated.execute({
+        execution_id,
+        session_id: "receipt",
+        operation,
+        payload: {},
+      });
+    const stamp = {
+      connector_version: "fixture.original.v1",
+      provenance: "fixture",
+    };
+    assert.deepEqual(await run("success", "lookup"), {
+      execution_id: "success",
+      ...stamp,
+      status: "completed",
+      evidence: [],
+    });
+    assert.deepEqual(await run("failure", "measure"), {
+      execution_id: "failure",
+      ...stamp,
+      status: "unknown",
+      evidence: [],
+    });
+    assert.deepEqual(await run("unsupported", "publish"), {
+      execution_id: "unsupported",
+      ...stamp,
+      status: "unsupported",
+      reason: "operation_not_supported",
+      evidence: [],
+    });
+    pageUrl = "https://fixture.invalid/challenge";
+    assert.deepEqual(await run("challenged", "lookup"), {
+      execution_id: "challenged",
+      ...stamp,
+      status: "challenge",
+      evidence: [],
+    });
+  } finally {
+    await isolated.shutdown();
+  }
+});
+
 test("idle contexts and settled cache expire, but active execution is never reaped", async () => {
   let now = 0;
   let closed = 0;
@@ -371,6 +499,7 @@ test("idle contexts and settled cache expire, but active execution is never reap
     },
     platformAdapters: {
       fixture: {
+        connectorVersion: "fixture.cache.v1",
         entry: "http://127.0.0.1/",
         async identify() {
           return { platform_account_id: "own-1", display_name: "Owner" };
@@ -417,6 +546,13 @@ test("idle contexts and settled cache expire, but active execution is never reap
     const duplicate = expiring.execute(input);
     finishFirst();
     assert.deepEqual(await duplicate, await first);
+    assert.deepEqual(await first, {
+      execution_id: "ttl-execution",
+      connector_version: "fixture.cache.v1",
+      provenance: "fixture",
+      status: "completed",
+      evidence: [],
+    });
     assert.equal(calls, 1);
     now = 1011;
     await expiring.reap();
@@ -462,6 +598,7 @@ test("a stalled execution expires as unknown and closes its context", async () =
     },
     platformAdapters: {
       fixture: {
+        connectorVersion: "fixture.timeout.v1",
         entry: "http://127.0.0.1/",
         operations: ["publish"],
         async identify() {
@@ -485,6 +622,8 @@ test("a stalled execution expires as unknown and closes its context", async () =
     });
     assert.deepEqual(result, {
       execution_id: "stalled-attempt",
+      connector_version: "fixture.timeout.v1",
+      provenance: "fixture",
       status: "unknown",
       reason: "execution_deadline",
       evidence: [],

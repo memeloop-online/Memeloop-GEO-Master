@@ -11,12 +11,13 @@ use axum::{
 };
 use chrono::Utc;
 use geo_domain::{
-    AppError, ChannelAccount, ChannelRepository, ChannelStatus, ContentExecutionStatus,
-    ContentItemStatus, ContentRepository, ContentRevision, DistributionDeferralReason,
-    DistributionManifest, DistributionRepository, DistributionScopeMode, DistributionTarget,
-    DistributionTargetPage, DistributionTargetStatus, FreezeDistribution, KnowledgePurpose,
-    KnowledgeRepository, PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository,
-    ProjectStatus, SourceState, TenantScope,
+    AppError, ChannelAccount, ChannelRepository, ChannelStatus, ConnectorAvailability,
+    ConnectorCapabilityRepository, ConnectorKey, ContentExecutionStatus, ContentItemStatus,
+    ContentRepository, ContentRevision, DistributionDeferralReason, DistributionManifest,
+    DistributionRepository, DistributionScopeMode, DistributionTarget, DistributionTargetPage,
+    DistributionTargetStatus, FreezeDistribution, KnowledgePurpose, KnowledgeRepository,
+    PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository, ProjectStatus,
+    SourceState, TenantScope,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -52,6 +53,8 @@ pub struct DistributionService {
     projects: Arc<dyn ProjectRepository>,
     channels: Arc<dyn ChannelRepository>,
     capabilities: Arc<Vec<PlatformPlacement>>,
+    registry: Option<Arc<dyn ConnectorCapabilityRepository>>,
+    browser: Option<crate::BrowserBridge>,
 }
 
 impl DistributionService {
@@ -69,7 +72,21 @@ impl DistributionService {
             projects,
             channels,
             capabilities: Arc::new(default_capabilities()),
+            registry: None,
+            browser: None,
         }
+    }
+
+    /// The production resolver reads trusted deployed versions from the
+    /// authenticated runner and independent operator verification at freeze.
+    pub fn with_connector_registry(
+        mut self,
+        registry: Arc<dyn ConnectorCapabilityRepository>,
+        browser: Option<crate::BrowserBridge>,
+    ) -> Self {
+        self.registry = Some(registry);
+        self.browser = browser;
+        self
     }
 
     /// Only a trusted, server-side capability probe can supply this snapshot.
@@ -82,6 +99,76 @@ impl DistributionService {
 
     pub fn repository(&self) -> Arc<dyn DistributionRepository> {
         Arc::clone(&self.distribution)
+    }
+
+    async fn current_capabilities(
+        &self,
+        operator: geo_domain::OperatorId,
+    ) -> Result<Vec<PlatformPlacement>, AppError> {
+        let Some(registry) = &self.registry else {
+            return Ok(self.capabilities.as_ref().clone());
+        };
+        let configured = registry.list(operator).await?;
+        let mut keys: BTreeSet<(String, String)> = default_capabilities()
+            .into_iter()
+            .map(|place| (place.platform_id, place.placement_slot))
+            .collect();
+        keys.extend(configured.iter().map(|item| {
+            (
+                item.key.platform_id.clone(),
+                item.key.placement_slot.clone(),
+            )
+        }));
+        let connectors = if let Some(browser) = &self.browser {
+            browser
+                .capabilities()
+                .await
+                .map(|response| response.connectors)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut placements = Vec::with_capacity(keys.len());
+        for (platform_id, placement_slot) in keys {
+            let key = ConnectorKey {
+                platform_id: platform_id.clone(),
+                placement_slot: placement_slot.clone(),
+            };
+            let deployed =
+                crate::connector_capabilities::deployed_version(&connectors, &key).unwrap_or("");
+            let settings = registry.get(operator, &key).await?;
+            let mut supported_formats = Vec::new();
+            let reason = match settings {
+                None => Some("connector_unverified"),
+                Some(settings) if !settings.enabled => Some("connector_disabled"),
+                Some(settings) => {
+                    let mut failure = Some("connector_unverified");
+                    for kind in &settings.content_types {
+                        let resolved = registry.resolve(operator, &key, deployed, kind).await?;
+                        if resolved.availability == ConnectorAvailability::Available {
+                            supported_formats.push(kind.clone());
+                            failure = None;
+                        } else if resolved.availability == ConnectorAvailability::VersionMismatch {
+                            failure = Some("connector_version_mismatch");
+                        }
+                    }
+                    failure
+                }
+            };
+            placements.push(PlatformPlacement {
+                platform_id,
+                placement_slot,
+                capability_version: if deployed.is_empty() {
+                    "unverified-v1".into()
+                } else {
+                    deployed.into()
+                },
+                supported_formats,
+                unavailable_reason: reason.map(str::to_owned),
+                fixture: false,
+            });
+        }
+        Ok(placements)
     }
 
     async fn require_active(&self, scope: &TenantScope) -> Result<ProjectId, AppError> {
@@ -212,13 +299,13 @@ impl DistributionService {
             .await?
             .ok_or_else(|| AppError::conflict("frozen cycle settings unavailable"))?;
         let platforms = &settings.distribution_scope;
+        let capabilities = self.current_capabilities(scope.operator_id).await?;
         let excluded: BTreeSet<_> = platforms.excluded_platform_ids.iter().cloned().collect();
         let mut selected: BTreeSet<String> = match platforms.mode {
             DistributionScopeMode::Explicit => {
                 platforms.included_platform_ids.iter().cloned().collect()
             }
-            DistributionScopeMode::AllEligible => self
-                .capabilities
+            DistributionScopeMode::AllEligible => capabilities
                 .iter()
                 .map(|placement| placement.platform_id.clone())
                 .collect(),
@@ -232,7 +319,7 @@ impl DistributionService {
         let placements = selected
             .into_iter()
             .map(|platform_id| {
-                self.capabilities
+                capabilities
                     .iter()
                     .find(|entry| entry.platform_id == platform_id)
                     .cloned()

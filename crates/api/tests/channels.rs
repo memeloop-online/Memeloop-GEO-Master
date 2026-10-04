@@ -170,6 +170,131 @@ async fn json_body(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
+async fn connector_settings_are_resource_admin_only_and_fail_closed() {
+    let (app, project, cookie, csrf) = pool_fixture(Role::ResourceAdmin, true).await;
+    let operator_url = "/api/v1/operator/connector-capabilities";
+    let list = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            operator_url,
+            Some(&cookie),
+            None,
+            String::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list = json_body(list).await;
+    assert!(list["items"].as_array().unwrap().iter().any(|entry| {
+        entry["platform_id"] == "zhihu" && entry["availability"] == "unavailable"
+    }));
+
+    let patch = format!("{operator_url}/zhihu/primary");
+    let enabled = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &patch,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_revision":0,"enabled":true,"content_types":["article"]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), StatusCode::BAD_REQUEST);
+    let unknown = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &patch,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_revision":0,"enabled":false,"content_types":[],"verification":true})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let disabled = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &patch,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_revision":0,"enabled":false,"content_types":[]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::OK);
+    assert_eq!(json_body(disabled).await["revision"], 1);
+    let stale = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &patch,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_revision":0,"enabled":false,"content_types":[]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let project_list = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/v1/projects/{project}/connector-capabilities"),
+            Some(&cookie),
+            None,
+            String::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(project_list.status(), StatusCode::OK);
+    let project_list = json_body(project_list).await;
+    let row = project_list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["platform_id"] == "zhihu")
+        .unwrap();
+    assert!(row.get("verified_content_types").is_none());
+    assert!(row.get("deployed_version").is_none());
+    assert_eq!(row["content_types"], json!([]));
+
+    for (role, matches_pool) in [(Role::CustomerAdmin, true), (Role::ResourceAdmin, false)] {
+        let (app, _, cookie, csrf) = pool_fixture(role, matches_pool).await;
+        let list = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                operator_url,
+                Some(&cookie),
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::FORBIDDEN);
+        let denied = app
+            .clone()
+            .oneshot(request(
+                "PATCH",
+                &patch,
+                Some(&cookie),
+                Some(&csrf),
+                json!({"expected_revision":0,"enabled":false,"content_types":[]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
 async fn account_group_settings_scope_and_no_client_claimed_identity() {
     let (app, project, cookie, csrf) = fixture().await;
     let group = app

@@ -13,8 +13,9 @@ use geo_api::{
     router,
 };
 use geo_domain::{
-    AppError, ChannelAccount, ChannelAccountRecord, ChannelOwnerKind, ChannelSecret, ChannelStatus,
-    ChannelTarget, ChannelTargetInput, ChunkLocator, ContentBlock, ContentBlockKind,
+    AppError, ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus,
+    ChannelOwnerKind, ChannelSecret, ChannelStatus, ChannelTarget, ChannelTargetInput,
+    ChunkLocator, ConnectorKey, ConnectorVerification, ContentBlock, ContentBlockKind,
     ContentCoverage, ContentExecution, ContentExecutionStatus, ContentHandoff, ContentHandoffItem,
     ContentItemStatus, ContentRevision, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID,
     DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
@@ -327,6 +328,8 @@ struct RunnerCalls {
     sends: Arc<Mutex<Vec<serde_json::Value>>>,
     revoke_on_complete: Arc<AtomicBool>,
     revoked: Arc<RevokingKnowledge>,
+    runner_version: Arc<Mutex<String>>,
+    connector_settings: Arc<Mutex<Option<AppState>>>,
 }
 
 async fn runner(
@@ -336,6 +339,15 @@ async fn runner(
     payload: Option<Json<serde_json::Value>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match (method.as_str(), uri.path()) {
+        ("GET", "/v1/capabilities") => {
+            let version = calls.runner_version.lock().await.clone();
+            (
+                StatusCode::OK,
+                Json(json!({"connectors":[{"platform":"zhihu",
+                "placement_slot":"primary","connector_version":version,
+                "operations":["publish"],"verified":false}]})),
+            )
+        }
         ("POST", "/v1/sessions") => (
             StatusCode::OK,
             Json(json!({"session_id":payload.unwrap().0["session_id"]})),
@@ -355,6 +367,23 @@ async fn runner(
         ("POST", path) if path.ends_with("/complete") => {
             if calls.revoke_on_complete.load(Ordering::SeqCst) {
                 calls.revoked.revoked.store(true, Ordering::SeqCst);
+            }
+            if let Some(state) = calls.connector_settings.lock().await.take() {
+                state
+                    .connector_capability_repository()
+                    .configure(
+                        geo_domain::DEVELOPMENT_OPERATOR_ID,
+                        ConnectorKey {
+                            platform_id: "zhihu".into(),
+                            placement_slot: "primary".into(),
+                        },
+                        1,
+                        false,
+                        vec![],
+                        "",
+                    )
+                    .await
+                    .unwrap();
             }
             (
                 StatusCode::OK,
@@ -572,7 +601,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
                 placements: vec![PlatformPlacement {
                     platform_id: "zhihu".into(),
                     placement_slot: "primary".into(),
-                    capability_version: "injected-fixture".into(),
+                    capability_version: "test-live.v1".into(),
                     supported_formats: vec!["faq".into()],
                     unavailable_reason: None,
                     fixture,
@@ -638,6 +667,8 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
         sends: Arc::default(),
         revoke_on_complete: Arc::default(),
         revoked: knowledge.clone(),
+        runner_version: Arc::new(Mutex::new("test-live.v1".into())),
+        connector_settings: Arc::new(Mutex::new(None)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -651,6 +682,60 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
         .unwrap();
     });
     let bridge = BrowserBridge::new(format!("http://{address}"), "test-token".into()).unwrap();
+    if !fixture {
+        let repo = state.connector_capability_repository();
+        let now = Utc::now();
+        let url = "https://example.com/public/readback".to_owned();
+        let hash = "a".repeat(64);
+        let published = ChannelOutcome {
+            status: ChannelOutcomeStatus::Published,
+            detail: None,
+            occurred_at: now,
+            raw_answer: None,
+            citations: vec![],
+            public_url: Some(url.clone()),
+            screenshot_ref: None,
+            connector_version: Some("test-live.v1".into()),
+            runner_evidence: vec![],
+            fixture: false,
+        };
+        repo.insert_verification(
+            scope.operator_id,
+            ConnectorVerification {
+                verification_id: Uuid::new_v4(),
+                key: ConnectorKey {
+                    platform_id: "zhihu".into(),
+                    placement_slot: "primary".into(),
+                },
+                connector_version: "test-live.v1".into(),
+                content_type: "faq".into(),
+                publication_receipt: published.clone(),
+                public_readback: ChannelOutcome {
+                    status: ChannelOutcomeStatus::Verified,
+                    runner_evidence: vec![json!({"kind":"public_readback","url":url,
+                    "content_matched":true,"owned_by_account":true,
+                    "expected_sha256":hash,"readback_sha256":hash})],
+                    ..published
+                },
+                verified_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        repo.configure(
+            scope.operator_id,
+            ConnectorKey {
+                platform_id: "zhihu".into(),
+                placement_slot: "primary".into(),
+            },
+            0,
+            true,
+            vec!["faq".into()],
+            "test-live.v1",
+        )
+        .await
+        .unwrap();
+    }
     let service = ChannelService::persistent(channels, &key, Some(bridge)).unwrap();
     FrozenFixture {
         state: state.with_channel_service(service),
@@ -707,6 +792,150 @@ async fn generated_publication_uses_frozen_revision_bytes_and_claims_once() {
             .await
             .is_err()
     );
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn operator_disabling_connector_before_send_preserves_unattempted_frozen_target() {
+    let fixture = frozen_fixture(false).await;
+    let key = ConnectorKey {
+        platform_id: "zhihu".into(),
+        placement_slot: "primary".into(),
+    };
+    fixture
+        .state
+        .connector_capability_repository()
+        .configure(fixture.scope.operator_id, key, 1, false, vec![], "")
+        .await
+        .unwrap();
+    assert!(matches!(
+        execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ConnectorUnavailable)
+    ));
+    assert!(fixture.calls.sends.lock().await.is_empty());
+    assert!(
+        fixture
+            .state
+            .channel_job_repository()
+            .get_target(&fixture.scope, fixture.command_id)
+            .await
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn deployed_version_drift_preserves_frozen_coverage_and_blocks_send() {
+    let fixture = frozen_fixture(false).await;
+    let before = fixture
+        .state
+        .distribution_repository()
+        .get_publication_bundle(
+            &fixture.scope,
+            match &fixture
+                .state
+                .channel_job_repository()
+                .get_target(&fixture.scope, fixture.command_id)
+                .await
+                .unwrap()
+                .target
+                .input
+            {
+                ChannelTargetInput::GeneratedPublish {
+                    publication_intent_id,
+                    ..
+                } => *publication_intent_id,
+                _ => unreachable!(),
+            },
+        )
+        .await
+        .unwrap();
+    *fixture.calls.runner_version.lock().await = "test-live.v2".into();
+    assert!(matches!(
+        execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ConnectorUnavailable)
+    ));
+    assert_eq!(
+        fixture
+            .state
+            .distribution_repository()
+            .get(&fixture.scope, before.target.manifest_id)
+            .await
+            .unwrap()
+            .platform_scope[0]
+            .capability_version,
+        "test-live.v1"
+    );
+    assert!(
+        fixture
+            .state
+            .channel_job_repository()
+            .get_target(&fixture.scope, fixture.command_id)
+            .await
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    assert!(fixture.calls.sends.lock().await.is_empty());
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn verified_other_format_does_not_authorize_frozen_faq() {
+    let fixture = frozen_fixture(false).await;
+    let key = ConnectorKey {
+        platform_id: "zhihu".into(),
+        placement_slot: "primary".into(),
+    };
+    let repo = fixture.state.connector_capability_repository();
+    let mut proof = repo
+        .history(fixture.scope.operator_id, &key)
+        .await
+        .unwrap()
+        .remove(0);
+    proof.verification_id = Uuid::new_v4();
+    proof.content_type = "company_profile".into();
+    repo.insert_verification(fixture.scope.operator_id, proof)
+        .await
+        .unwrap();
+    repo.configure(
+        fixture.scope.operator_id,
+        key,
+        1,
+        true,
+        vec!["company_profile".into()],
+        "test-live.v1",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ConnectorUnavailable)
+    ));
+    assert!(fixture.calls.sends.lock().await.is_empty());
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn revocation_during_browser_preflight_records_attempt_without_sending() {
+    let fixture = frozen_fixture(false).await;
+    *fixture.calls.connector_settings.lock().await = Some(fixture.state.clone());
+    let result = execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+        .await
+        .unwrap();
+    let ChannelDispatchResult::Executed(view) = result else {
+        panic!("post-claim connector revocation must retain the attempt");
+    };
+    assert_eq!(view.attempts.len(), 1);
+    assert!(fixture.calls.sends.lock().await.is_empty());
     fixture.server.abort();
 }
 

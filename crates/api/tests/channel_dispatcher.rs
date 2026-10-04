@@ -16,9 +16,10 @@ use geo_api::{
 };
 use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelJobRepository, ChannelOwnerKind, ChannelPlan,
-    ChannelSecret, ChannelStatus, ChannelTarget, ChannelTargetInput, DEVELOPMENT_OPERATOR_ID,
-    DEVELOPMENT_TENANT_ID, MemoryAuthRepository, MemoryChannelRepository, MemoryProjectRepository,
-    ProjectCreate, ProjectRepository, ProjectSettings, ProjectStatus, TenantScope,
+    ChannelSecret, ChannelStatus, ChannelTarget, ChannelTargetInput, ConnectorKey,
+    DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, ImportItem, KnowledgePurpose,
+    MemoryAuthRepository, MemoryChannelRepository, MemoryProjectRepository, ProjectCreate,
+    ProjectRepository, ProjectSettings, ProjectStatus, SourceKind, TenantScope,
 };
 use geo_provider::SecretEnvelope;
 use serde_json::{Value, json};
@@ -62,6 +63,100 @@ async fn mock_runner(
         ("DELETE", _) => (StatusCode::CONFLICT, Json(json!({"error":"busy"}))),
         _ => (StatusCode::OK, Json(json!({"closed":true}))),
     }
+}
+
+#[tokio::test]
+async fn explicit_operator_disable_defers_legacy_publication_without_an_attempt() {
+    let (state, scope, account, sends, server, _) = fixture().await;
+    let imported = state
+        .knowledge_repository()
+        .import_batch(
+            &scope,
+            vec![ImportItem {
+                client_item_id: "generic".into(),
+                kind: SourceKind::Text,
+                name: "Generic public source".into(),
+                purpose: KnowledgePurpose::Public,
+                text: Some("A public text that may be published.".into()),
+                url: None,
+                object_id: None,
+                knowledge_release_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let source = imported.items[0].source.as_ref().unwrap();
+    let version = imported.items[0].source_version.as_ref().unwrap();
+    let mut record = state
+        .channel_service()
+        .repository
+        .get_account(&scope, account)
+        .await
+        .unwrap();
+    record.account.platform = "zhihu".into();
+    state
+        .channel_service()
+        .repository
+        .save_account(&scope, record)
+        .await
+        .unwrap();
+    let target_id = Uuid::new_v4();
+    let repo = state.channel_job_repository();
+    repo.create_plan(
+        &scope,
+        ChannelPlan {
+            plan_id: Uuid::new_v4(),
+            project_id: scope.project_id.unwrap(),
+            cycle_id: Uuid::new_v4(),
+            input_hash: target_id.to_string(),
+            revision: 1,
+            created_at: Utc::now(),
+            targets: vec![ChannelTarget {
+                target_id,
+                input: ChannelTargetInput::Publish {
+                    source_id: source.source_id,
+                    source_version_id: version.source_version_id,
+                    platform: "zhihu".into(),
+                    account_id: account,
+                    title: "Test".into(),
+                    body: "Text".into(),
+                    body_sha256: geo_domain::sha256_hex(b"Text"),
+                },
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    state
+        .connector_capability_repository()
+        .configure(
+            scope.operator_id,
+            ConnectorKey {
+                platform_id: "zhihu".into(),
+                placement_slot: "primary".into(),
+            },
+            0,
+            false,
+            vec![],
+            "",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        execute_channel_target(&state, &scope, target_id)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ConnectorUnavailable)
+    ));
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    assert!(
+        repo.get_target(&scope, target_id)
+            .await
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    server.abort();
 }
 
 async fn fixture() -> (

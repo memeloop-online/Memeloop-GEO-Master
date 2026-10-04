@@ -13,6 +13,27 @@ export interface ChannelPlatform {
   login_supported: boolean;
 }
 
+export type ConnectorAvailability =
+  | "unavailable"
+  | "disabled"
+  | "version_mismatch"
+  | "unsupported_content_type"
+  | "available";
+
+export interface ProjectConnectorCapability {
+  platform_id: string;
+  placement_slot: string;
+  revision: number;
+  enabled: boolean;
+  content_types: string[];
+  availability: ConnectorAvailability;
+}
+
+export interface OperatorConnectorCapability extends ProjectConnectorCapability {
+  deployed_version?: string | null;
+  verified_content_types: string[];
+}
+
 export interface ChannelGroup {
   group_id: string;
   project_id: string;
@@ -96,7 +117,48 @@ export const channelKeys = {
     tenantId: string,
     projectId: string,
   ) => ["channel-groups", userId, operatorId, tenantId, projectId] as const,
+  projectCapabilities: (
+    userId: string,
+    operatorId: string,
+    tenantId: string,
+    projectId: string,
+  ) =>
+    [
+      "project-connector-capabilities",
+      userId,
+      operatorId,
+      tenantId,
+      projectId,
+    ] as const,
+  operatorCapabilities: (userId: string, operatorId: string) =>
+    ["operator-connector-capabilities", userId, operatorId] as const,
 };
+
+export const listProjectConnectorCapabilities = (
+  tenantId: string,
+  projectId: string,
+) =>
+  apiFetch<{ items: ProjectConnectorCapability[] }>(
+    `/projects/${encoded(projectId)}/connector-capabilities`,
+    { tenantId },
+  );
+export const listOperatorConnectorCapabilities = () =>
+  apiFetch<{ items: OperatorConnectorCapability[] }>(
+    "/operator/connector-capabilities",
+  );
+export const updateOperatorConnectorCapability = (
+  platformId: string,
+  placementSlot: string,
+  update: {
+    expected_revision: number;
+    enabled: boolean;
+    content_types: string[];
+  },
+) =>
+  apiFetch<OperatorConnectorCapability>(
+    `/operator/connector-capabilities/${encoded(platformId)}/${encoded(placementSlot)}`,
+    { method: "PATCH", body: update },
+  );
 
 export const listChannelPlatforms = () =>
   apiFetch<{ items: ChannelPlatform[] }>("/channel-platforms");

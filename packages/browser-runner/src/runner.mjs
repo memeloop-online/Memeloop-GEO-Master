@@ -105,16 +105,26 @@ function isChallenge(page) {
   );
 }
 
-export function createRunner({
-  browserType = chromium,
-  browserChannel = process.env.GEO_BROWSER_CHANNEL,
-  platformAdapters = defaultAdapters,
-  sessionIdleMs = 15 * 60_000,
-  executionRetentionMs = 5 * 60_000,
-  executionTimeoutMs = 120_000,
-  maintenanceIntervalMs = 30_000,
-  clock = () => Date.now(),
-} = {}) {
+export function createRunner(options = {}) {
+  const {
+    browserType = chromium,
+    browserChannel = process.env.GEO_BROWSER_CHANNEL,
+    sessionIdleMs = 15 * 60_000,
+    executionRetentionMs = 5 * 60_000,
+    executionTimeoutMs = 120_000,
+    maintenanceIntervalMs = 30_000,
+    clock = () => Date.now(),
+  } = options;
+  // Only the installed browser and adapters are a live execution path. Tests
+  // and other injected components cannot upgrade their own receipt provenance.
+  const injected =
+    Object.hasOwn(options, "platformAdapters") ||
+    Object.hasOwn(options, "browserType");
+  const provenance = injected ? "fixture" : "live";
+  const platformAdapters =
+    injected && Object.hasOwn(options, "platformAdapters")
+      ? options.platformAdapters
+      : defaultAdapters;
   const selectedBrowserChannel = parseBrowserChannel(browserChannel);
   if (
     ![
@@ -290,6 +300,8 @@ export function createRunner({
       });
       const record = {
         adapter,
+        // Snapshot host configuration before executing any adapter code.
+        connectorVersion: adapter.connectorVersion,
         context,
         page,
         proxy,
@@ -408,21 +420,28 @@ export function createRunner({
       return previous.promise;
     }
     const record = session(input.session_id);
+    const hostReceipt = {
+      execution_id: input.execution_id,
+      provenance,
+      ...(typeof record.connectorVersion === "string"
+        ? { connector_version: record.connectorVersion }
+        : {}),
+    };
     if (!record.completed) throw new RunnerError(409, "login_required");
     if (!record.adapter.operations?.includes(input.operation)) {
       return {
-        execution_id: input.execution_id,
         status: "unsupported",
         reason: "operation_not_supported",
         evidence: [],
+        ...hostReceipt,
       };
     }
     if (record.busy) throw new RunnerError(409, "session_busy");
     if (isChallenge(record.page)) {
       return {
-        execution_id: input.execution_id,
         status: "challenge",
         evidence: [],
+        ...hostReceipt,
       };
     }
     // Reserve this context before the asynchronous identity probe; otherwise
@@ -444,10 +463,10 @@ export function createRunner({
         }
         void record.context.close().catch(() => {});
         return {
-          execution_id: input.execution_id,
           status: "unknown",
           reason: "execution_deadline",
           evidence: [],
+          ...hostReceipt,
         };
       }
       try {
@@ -462,10 +481,10 @@ export function createRunner({
             record.identity.platform_account_id
         ) {
           return {
-            execution_id: input.execution_id,
             status: "login_required",
             reason: "account_identity_unverified",
             evidence: [],
+            ...hostReceipt,
           };
         }
         // Adapters own fixed, typed platform actions; user payload is never script
@@ -485,14 +504,23 @@ export function createRunner({
         ) {
           throw new Error("invalid_adapter_outcome");
         }
-        return { execution_id: input.execution_id, ...outcome };
+        // Adapter observations may describe a result, but cannot assert
+        // whether the runner was live or which connector version was loaded.
+        const {
+          execution_id: _executionId,
+          connector_version: _connectorVersion,
+          provenance: _provenance,
+          fixture: _fixture,
+          ...observation
+        } = outcome;
+        return { ...observation, ...hostReceipt };
       } catch {
         // A timeout or crash after submit can be an external success. Rust must
         // reconcile an unknown result; this service cannot safely retry it.
         return {
-          execution_id: input.execution_id,
           status: "unknown",
           evidence: [],
+          ...hostReceipt,
         };
       } finally {
         clearTimeout(timer);
@@ -523,6 +551,7 @@ export function createRunner({
   }
 
   return {
+    executionProvenance: provenance,
     create,
     snapshot,
     action,

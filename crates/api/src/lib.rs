@@ -6,6 +6,7 @@ mod browser_bridge;
 mod channel_jobs;
 mod channel_tools;
 mod channels;
+mod connector_capabilities;
 mod content;
 pub mod content_runtime;
 mod content_tools;
@@ -35,11 +36,12 @@ use axum::{
 };
 use futures_util::StreamExt;
 use geo_domain::{
-    AgentRepository, AgentRuntime, AppError, DEFAULT_SESSION_TTL_SECS, DistributionScope,
-    DocumentScope, EventEnvelope, InitialSource, KnowledgeRepository, Membership,
-    MemoryAgentRepository, MemoryAuthRepository, MemoryKnowledgeRepository, MissingAgentRuntime,
-    Operation, Operator, Project, ProjectCreate, ProjectId, ProjectOverview, ProjectPage,
-    ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
+    AgentRepository, AgentRuntime, AppError, ConnectorCapabilityRepository,
+    DEFAULT_SESSION_TTL_SECS, DistributionScope, DocumentScope, EventEnvelope, InitialSource,
+    KnowledgeRepository, Membership, MemoryAgentRepository, MemoryAuthRepository,
+    MemoryConnectorCapabilityRepository, MemoryKnowledgeRepository, MissingAgentRuntime, Operation,
+    Operator, Project, ProjectCreate, ProjectId, ProjectOverview, ProjectPage, ProjectPatch,
+    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
     ReportRepository, ReportSchedule, ResourceMode, Role, TenantId, TenantScope, User,
     hash_idempotency_key, settings_hash, start_request_hash,
 };
@@ -107,6 +109,7 @@ pub struct AppState {
     project_repository: Arc<dyn ProjectRepository>,
     knowledge_repository: Arc<dyn KnowledgeRepository>,
     report_repository: Arc<dyn ReportRepository>,
+    connector_capability_repository: Arc<dyn ConnectorCapabilityRepository>,
     channel_service: ChannelService,
     channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
@@ -140,6 +143,9 @@ impl AppState {
             project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
             knowledge_repository: Arc::new(MemoryKnowledgeRepository::default()),
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
+            connector_capability_repository: Arc::new(
+                MemoryConnectorCapabilityRepository::default(),
+            ),
             channel_service: ChannelService::development(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
@@ -226,6 +232,9 @@ impl AppState {
             project_repository,
             knowledge_repository,
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
+            connector_capability_repository: Arc::new(
+                MemoryConnectorCapabilityRepository::default(),
+            ),
             channel_service: ChannelService::development(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
@@ -276,6 +285,9 @@ impl AppState {
             database,
         )))
         .with_report_repository(Arc::new(PgReportRepository::from_database(database)))
+        .with_connector_capability_repository(Arc::new(
+            geo_persistence::PgConnectorCapabilityRepository::from_database(database),
+        ))
         .with_content_repository(Arc::new(
             geo_persistence::PgContentRepository::from_database(database),
         ))
@@ -335,6 +347,18 @@ impl AppState {
         Arc::clone(&self.report_repository)
     }
 
+    pub fn connector_capability_repository(&self) -> Arc<dyn ConnectorCapabilityRepository> {
+        Arc::clone(&self.connector_capability_repository)
+    }
+
+    pub fn with_connector_capability_repository(
+        mut self,
+        repository: Arc<dyn ConnectorCapabilityRepository>,
+    ) -> Self {
+        self.connector_capability_repository = repository;
+        self
+    }
+
     pub fn with_report_repository(mut self, repository: Arc<dyn ReportRepository>) -> Self {
         self.report_repository = repository;
         self
@@ -376,6 +400,10 @@ impl AppState {
             self.knowledge_repository(),
             self.project_repository(),
             Arc::clone(&self.channel_service.repository),
+        )
+        .with_connector_registry(
+            self.connector_capability_repository(),
+            self.channel_service.browser.clone(),
         )
     }
 
@@ -1914,11 +1942,23 @@ pub fn router(state: AppState) -> Router {
     // Operator pool scope comes from deployment configuration plus trusted
     // membership, not a customer tenant selector. The catalogue is session-only.
     let operator_channel_routes = channels::operator_routes()
+        .route(
+            "/operator/connector-capabilities",
+            get(connector_capabilities::list_operator),
+        )
+        .route(
+            "/operator/connector-capabilities/{platform_id}/{placement_slot}",
+            axum::routing::patch(connector_capabilities::configure_operator),
+        )
         .layer(middleware::from_fn(no_store_middleware))
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(session_auth_from_request));
 
     let content_routes: Router<AppState> = Router::new()
+        .route(
+            "/projects/{id}/connector-capabilities",
+            get(connector_capabilities::list_project),
+        )
         .route(
             "/projects/{id}/cycles/{cycle_id}/distribution-manifest",
             get(distribution::cycle_manifest).post(distribution::freeze),

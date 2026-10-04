@@ -11,12 +11,16 @@ import {
   createChannelAccount,
   createChannelGroup,
   getChannelLoginSnapshot,
+  listOperatorConnectorCapabilities,
+  listProjectConnectorCapabilities,
   listChannelAccounts,
   listChannelGroups,
   listPoolAccounts,
   sendChannelLoginAction,
   unassignPoolAccount,
   updateChannelAccount,
+  updateOperatorConnectorCapability,
+  type OperatorConnectorCapability,
 } from "../api/channels";
 import {
   ChannelAccountsPage,
@@ -76,13 +80,33 @@ const snapshot = {
   screenshot_base64: "AA==",
   identity: null,
 };
+const unverifiedCapability: OperatorConnectorCapability = {
+  platform_id: "zhihu",
+  placement_slot: "primary",
+  revision: 0,
+  enabled: false,
+  content_types: [],
+  availability: "unavailable",
+  deployed_version: null,
+  verified_content_types: [],
+};
+const verifiedCapability = {
+  ...unverifiedCapability,
+  revision: 3,
+  verified_content_types: ["article", "short_post"],
+  deployed_version: "live.v1",
+};
 function response(body: unknown, status = 200) {
   return new Response(body === undefined ? null : JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json" },
   });
 }
-function mockApi(initialAccounts: unknown[] = [], operator = false) {
+function mockApi(
+  initialAccounts: unknown[] = [],
+  operator = false,
+  connector = unverifiedCapability,
+) {
   const requests: { path: string; method: string; body?: unknown; url: URL }[] =
     [];
   const fetchMock = vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
@@ -103,6 +127,17 @@ function mockApi(initialAccounts: unknown[] = [], operator = false) {
               }
             : session,
         ),
+      );
+    if (path.endsWith("/operator/connector-capabilities") && method === "GET")
+      return Promise.resolve(response({ items: [connector] }));
+    if (path.endsWith("/projects/project-1/connector-capabilities"))
+      return Promise.resolve(response({ items: [connector] }));
+    if (
+      path.endsWith("/operator/connector-capabilities/zhihu/primary") &&
+      method === "PATCH"
+    )
+      return Promise.resolve(
+        response({ ...connector, ...body, revision: connector.revision + 1 }),
       );
     if (path.endsWith("/operator/channel-groups") && method === "GET")
       return Promise.resolve(
@@ -220,6 +255,31 @@ afterEach(() => {
 });
 
 describe("channel API scope", () => {
+  it("keeps project capability reads scoped and passes only revisioned settings to operator PATCH", async () => {
+    const { requests } = mockApi();
+    await listProjectConnectorCapabilities("tenant-1", "project-1");
+    await listOperatorConnectorCapabilities();
+    await updateOperatorConnectorCapability("zhihu", "primary", {
+      expected_revision: 3,
+      enabled: true,
+      content_types: ["article"],
+    });
+    const projectRead = requests.find((entry) =>
+      entry.path.endsWith("/projects/project-1/connector-capabilities"),
+    )!;
+    expect(projectRead.url.searchParams.get("tenant_id")).toBe("tenant-1");
+    expect(projectRead.url.searchParams.has("project_id")).toBe(false);
+    const update = requests.find((entry) =>
+      entry.path.endsWith("/operator/connector-capabilities/zhihu/primary"),
+    )!;
+    expect(update.body).toEqual({
+      expected_revision: 3,
+      enabled: true,
+      content_types: ["article"],
+    });
+    expect(update.url.searchParams.has("tenant_id")).toBe(false);
+  });
+
   it("scopes lists, group creation, and account updates to the selected project", async () => {
     const { requests } = mockApi();
     await listChannelAccounts("tenant-1", "project-1");
@@ -299,6 +359,39 @@ describe("channel API scope", () => {
 });
 
 describe("account page", () => {
+  it("shows account connection separately from read-only project publication verification", async () => {
+    const { requests } = mockApi([account]);
+    renderPage();
+    expect(await screen.findByText("已识别账号")).toBeTruthy();
+    const section = await screen.findByLabelText("项目发布连接器能力");
+    expect(within(section).getByText("未实测可用")).toBeTruthy();
+    expect(
+      within(section).getByText(/账号已连接只代表登录身份有效/),
+    ).toBeTruthy();
+    expect(within(section).queryByRole("checkbox")).toBeNull();
+    expect(
+      requests.some((entry) =>
+        entry.path.endsWith("/operator/connector-capabilities/zhihu/primary"),
+      ),
+    ).toBe(false);
+  });
+
+  it("shows project capability permission errors without implying publishing is ready", async () => {
+    const { fetchMock } = mockApi([account]);
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((request, init) =>
+      String(request).includes("/projects/project-1/connector-capabilities")
+        ? Promise.resolve(
+            response({ code: "forbidden", message: "forbidden" }, 403),
+          )
+        : original(request, init),
+    );
+    renderPage();
+    const section = await screen.findByLabelText("项目发布连接器能力");
+    expect(await within(section).findByText("权限不足")).toBeTruthy();
+    expect(within(section).queryByText("已验证可用")).toBeNull();
+  });
+
   it("shows real loaded accounts and reconnects without changing identity locally", async () => {
     const { requests } = mockApi([account]);
     renderPage();
@@ -449,6 +542,86 @@ describe("account page", () => {
 });
 
 describe("operator pool", () => {
+  it("cannot enable an unverified connector from an account login", async () => {
+    const { requests } = mockApi([account], true);
+    renderOperator();
+    const section = await screen.findByLabelText("运营连接器能力");
+    const toggle = await within(section).findByRole("checkbox", {
+      name: "启用 zhihu primary 连接器",
+    });
+    expect(toggle).toBeDisabled();
+    expect(within(section).getByText("未实测可用")).toBeTruthy();
+    expect(
+      requests.filter(
+        (item) =>
+          item.method === "PATCH" &&
+          item.path.includes("connector-capabilities"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("saves only a verified content subset with an optimistic revision", async () => {
+    const { requests } = mockApi([], true, verifiedCapability);
+    renderOperator();
+    const section = await screen.findByLabelText("运营连接器能力");
+    await userEvent.click(
+      await within(section).findByRole("checkbox", {
+        name: "允许 zhihu article",
+      }),
+    );
+    await userEvent.click(
+      within(section).getByRole("checkbox", {
+        name: "启用 zhihu primary 连接器",
+      }),
+    );
+    await userEvent.click(
+      within(section).getByRole("button", { name: "保存连接器配置" }),
+    );
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (entry) =>
+            entry.path.endsWith(
+              "/operator/connector-capabilities/zhihu/primary",
+            ) && entry.method === "PATCH",
+        )?.body,
+      ).toEqual({
+        expected_revision: 3,
+        enabled: true,
+        content_types: ["article"],
+      }),
+    );
+  });
+
+  it("reports a stale revision and reloads instead of claiming a configuration save", async () => {
+    const { fetchMock } = mockApi([], true, verifiedCapability);
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((request, init) => {
+      if (
+        String(request).endsWith(
+          "/operator/connector-capabilities/zhihu/primary",
+        ) &&
+        init?.method === "PATCH"
+      )
+        return Promise.resolve(
+          response({ code: "conflict", message: "revision changed" }, 409),
+        );
+      return original(request, init);
+    });
+    renderOperator();
+    const section = await screen.findByLabelText("运营连接器能力");
+    await userEvent.click(
+      await within(section).findByRole("checkbox", {
+        name: "允许 zhihu article",
+      }),
+    );
+    await userEvent.click(
+      within(section).getByRole("button", { name: "保存连接器配置" }),
+    );
+    expect(await within(section).findByText(/配置已由其他人更新/)).toBeTruthy();
+    expect(within(section).queryByText(/连接器配置已更新/)).toBeNull();
+  });
+
   it("lists the separate shared pool and assigns an account to an explicit project", async () => {
     const { requests } = mockApi(
       [{ ...account, group_id: "pool-group-1" }],

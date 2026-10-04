@@ -368,7 +368,10 @@ fn writer(auth: &AuthContext, context: RequestContext) -> Result<(), ApiError> {
     require_project_writer(auth).map_err(|error| err(error, context))
 }
 
-fn pool_tenant(service: &ChannelService, auth: &AuthContext) -> Result<TenantId, AppError> {
+pub(crate) fn pool_tenant(
+    service: &ChannelService,
+    auth: &AuthContext,
+) -> Result<TenantId, AppError> {
     let tenant_id = service
         .operator_pool_tenant_id
         .ok_or_else(|| AppError::forbidden("operator resource administration unavailable"))?;

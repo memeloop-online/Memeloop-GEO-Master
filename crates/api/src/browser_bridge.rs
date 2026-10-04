@@ -14,6 +14,24 @@ pub struct BrowserBridge {
 }
 
 impl BrowserBridge {
+    /// Discover only the version advertised by the authenticated running
+    /// adapter. This is not publication verification or an enablement claim.
+    pub async fn capabilities(&self) -> Result<RunnerCapabilities, AppError> {
+        let response = self
+            .client
+            .get(format!("{}/v1/capabilities", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser runner unavailable",
+                )
+            })?;
+        Self::response(response).await
+    }
+
     pub fn new(base_url: String, token: String) -> Result<Self, AppError> {
         let url = reqwest::Url::parse(&base_url)
             .map_err(|_| AppError::invalid_request("invalid browser runner configuration"))?;
@@ -244,6 +262,23 @@ impl BrowserBridge {
             })?;
         Self::response(response).await
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RunnerCapabilities {
+    pub connectors: Vec<RunnerConnector>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RunnerConnector {
+    pub platform: String,
+    pub placement_slot: String,
+    pub connector_version: String,
+    pub operations: Vec<String>,
+    // Explicitly never use a self-reported verification claim to authorize
+    // publishing; independent publication/readback history is the authority.
+    #[allow(dead_code)]
+    pub verified: bool,
 }
 
 /// Private runner receipt. This is not a client-submittable success claim.

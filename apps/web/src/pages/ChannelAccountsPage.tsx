@@ -33,6 +33,8 @@ import {
   listPoolAccounts,
   listPoolAssignments,
   listPoolGroups,
+  listOperatorConnectorCapabilities,
+  listProjectConnectorCapabilities,
   listChannelPlatforms,
   sendPoolLoginAction,
   sendChannelLoginAction,
@@ -41,13 +43,16 @@ import {
   unassignPoolAccount,
   updatePoolAccount,
   updatePoolGroup,
+  updateOperatorConnectorCapability,
   updateChannelAccount,
   updateChannelGroup,
   useChannelData,
   type ChannelAccount,
   type ChannelPlatformId,
+  type ConnectorAvailability,
   type LoginAction,
   type LoginSnapshot,
+  type OperatorConnectorCapability,
   type ProxyInput,
 } from "../api/channels";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
@@ -62,6 +67,147 @@ const accountState: Record<ChannelAccount["status"], string> = {
   disabled: "已停用",
   expired: "登录已失效",
 };
+const connectorState: Record<ConnectorAvailability, string> = {
+  unavailable: "未实测可用",
+  disabled: "运营方已停用",
+  version_mismatch: "连接器版本未验证",
+  unsupported_content_type: "内容类型不可用",
+  available: "已验证可用",
+};
+
+function ConnectorCapabilityRow({
+  item,
+  queryKey,
+  userId,
+  operatorId,
+}: {
+  item: OperatorConnectorCapability;
+  queryKey: readonly string[];
+  userId: string;
+  operatorId: string;
+}) {
+  const client = useQueryClient();
+  const [enabled, setEnabled] = useState(item.enabled);
+  const [types, setTypes] = useState(item.content_types);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  useEffect(() => {
+    setEnabled(item.enabled);
+    setTypes(item.content_types);
+  }, [item.enabled, item.content_types, item.revision]);
+  const verified = item.verified_content_types;
+  const changed =
+    enabled !== item.enabled ||
+    types.length !== item.content_types.length ||
+    types.some((type) => !item.content_types.includes(type));
+
+  async function save() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const updated = await updateOperatorConnectorCapability(
+        item.platform_id,
+        item.placement_slot,
+        { expected_revision: item.revision, enabled, content_types: types },
+      );
+      client.setQueryData<{ items: OperatorConnectorCapability[] }>(
+        queryKey,
+        (previous) =>
+          previous && {
+            items: previous.items.map((entry) =>
+              entry.platform_id === item.platform_id &&
+              entry.placement_slot === item.placement_slot
+                ? updated
+                : entry,
+            ),
+          },
+      );
+      await Promise.all([
+        client.invalidateQueries({ queryKey }),
+        client.invalidateQueries({
+          queryKey: ["project-connector-capabilities", userId, operatorId],
+        }),
+      ]);
+      setNotice("连接器配置已更新；账号登录状态不受此操作影响。");
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 409) {
+        setError("配置已由其他人更新，请检查最新状态后重试。");
+        await client.invalidateQueries({ queryKey });
+      } else {
+        setError(errorText(cause));
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <li>
+      <div className="channel-row">
+        <div>
+          <h3>
+            {item.platform_id} · {item.placement_slot}
+          </h3>
+          <p>
+            部署版本：{item.deployed_version ?? "未部署"} · 配置修订{" "}
+            {item.revision}
+          </p>
+        </div>
+        <Badge
+          color={item.availability === "available" ? "success" : "warning"}
+        >
+          {connectorState[item.availability]}
+        </Badge>
+      </div>
+      <p>
+        实测内容类型：
+        {verified.length ? verified.join("、") : "尚无真实发布及公开读回验证"}。
+        配置开关仅选择已验证类型，不能创建验证记录。
+      </p>
+      <Checkbox
+        label={`启用 ${item.platform_id} ${item.placement_slot} 连接器`}
+        checked={enabled}
+        disabled={busy || (!enabled && verified.length === 0)}
+        onChange={(_, data) => setEnabled(Boolean(data.checked))}
+      />
+      {verified.map((type) => (
+        <Checkbox
+          key={type}
+          label={`允许 ${item.platform_id} ${type}`}
+          checked={types.includes(type)}
+          disabled={busy}
+          onChange={(_, data) =>
+            setTypes((previous) =>
+              data.checked
+                ? [...previous.filter((value) => value !== type), type]
+                : previous.filter((value) => value !== type),
+            )
+          }
+        />
+      ))}
+      <Button
+        disabled={
+          busy ||
+          !changed ||
+          (enabled &&
+            (!types.length || types.some((type) => !verified.includes(type))))
+        }
+        onClick={() => void save()}
+      >
+        保存连接器配置
+      </Button>
+      {busy && <Spinner size="tiny" label="正在保存连接器配置" />}
+      {error && <ErrorState title="连接器配置未保存" detail={error} />}
+      {notice && (
+        <MessageBar intent="success">
+          <MessageBarBody>{notice}</MessageBarBody>
+        </MessageBar>
+      )}
+    </li>
+  );
+}
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : "操作失败，请重试。";
@@ -411,6 +557,17 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
     session && tenantId && projectId
       ? queryScopeFor(session, tenantId, projectId)
       : undefined;
+  const capabilities = useQuery({
+    queryKey: channelKeys.projectCapabilities(
+      keyArgs?.userId ?? "",
+      keyArgs?.operatorId ?? "",
+      keyArgs?.tenantId ?? "",
+      keyArgs?.projectId ?? "",
+    ),
+    queryFn: () => listProjectConnectorCapabilities(tenantId!, projectId!),
+    enabled: Boolean(keyArgs) && view === "channels",
+    retry: false,
+  });
   const invalidate = async () => {
     if (!keyArgs) return;
     await Promise.all([
@@ -998,6 +1155,66 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
           </Card>
         </section>
       </div>
+      {view === "channels" && (
+        <section aria-label="项目发布连接器能力">
+          <Card className="channel-card">
+            <h2>项目发布连接器能力</h2>
+            <p>
+              账号已连接只代表登录身份有效；发布能力需独立完成真实发布与公开读回验证，并由运营方启用。
+            </p>
+            {capabilities.isPending && (
+              <LoadingState label="正在加载连接器能力" />
+            )}
+            {capabilities.isError &&
+              (capabilities.error instanceof ApiError &&
+              capabilities.error.status === 403 ? (
+                <ErrorState
+                  title="权限不足"
+                  detail="无权查看此项目的连接器能力。"
+                />
+              ) : (
+                <ErrorState
+                  detail={errorText(capabilities.error)}
+                  onRetry={() => void capabilities.refetch()}
+                />
+              ))}
+            {capabilities.data?.items.length === 0 && (
+              <EmptyState
+                title="尚无连接器能力"
+                detail="尚未发现可核验的平台连接器；账号登录不会自动开放发布。"
+              />
+            )}
+            <ul className="channel-accounts">
+              {capabilities.data?.items.map((item) => (
+                <li key={`${item.platform_id}:${item.placement_slot}`}>
+                  <div className="channel-row">
+                    <h3>
+                      {item.platform_id} · {item.placement_slot}
+                    </h3>
+                    <Badge
+                      color={
+                        item.availability === "available"
+                          ? "success"
+                          : "warning"
+                      }
+                    >
+                      {connectorState[item.availability]}
+                    </Badge>
+                  </div>
+                  <p>
+                    {item.availability === "available"
+                      ? `当前配置的内容类型：${item.content_types.join("、") || "无"}。`
+                      : "当前没有可确认的发布内容类型；已有账号或旧配置不构成验证。"}
+                  </p>
+                  <p>
+                    此处只读；项目账号或共享账号的连接状态不代表该平台已可发布。
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </Card>
+        </section>
+      )}
       <MessageBar intent="info">
         <MessageBarBody>
           Kimi 网页登录用于独立搜索测量；Kimi Code 的编码 OAuth
@@ -1021,6 +1238,16 @@ export function OperatorAccountsPage() {
   const ownerKey = [session?.user.id, session?.operator.id];
   const accountsKey = ["operator-channel-accounts", ...ownerKey];
   const groupsKey = ["operator-channel-groups", ...ownerKey];
+  const capabilitiesKey = channelKeys.operatorCapabilities(
+    session?.user.id ?? "",
+    session?.operator.id ?? "",
+  );
+  const capabilities = useQuery({
+    queryKey: capabilitiesKey,
+    queryFn: listOperatorConnectorCapabilities,
+    enabled: allowed,
+    retry: false,
+  });
   const accounts = useQuery({
     queryKey: accountsKey,
     queryFn: listPoolAccounts,
@@ -1579,6 +1806,44 @@ export function OperatorAccountsPage() {
           </Card>
         </section>
       </div>
+      <section aria-label="运营连接器能力">
+        <Card className="channel-card">
+          <h2>发布连接器能力</h2>
+          <p>
+            登录和账号启用不证明发布能力。仅真实发布及公开读回核验过、且与当前部署版本一致的内容类型可由运营方启用。
+          </p>
+          {capabilities.isPending && (
+            <LoadingState label="正在加载发布连接器能力" />
+          )}
+          {capabilities.isError &&
+            (capabilities.error instanceof ApiError &&
+            capabilities.error.status === 403 ? (
+              <ErrorState title="权限不足" detail="无权管理运营连接器能力。" />
+            ) : (
+              <ErrorState
+                detail={errorText(capabilities.error)}
+                onRetry={() => void capabilities.refetch()}
+              />
+            ))}
+          {capabilities.data?.items.length === 0 && (
+            <EmptyState
+              title="尚无发布连接器"
+              detail="尚未发现平台连接器；账号登录无法替代发布与公开读回验证。"
+            />
+          )}
+          <ul className="channel-accounts">
+            {capabilities.data?.items.map((item) => (
+              <ConnectorCapabilityRow
+                key={`${item.platform_id}:${item.placement_slot}`}
+                item={item}
+                queryKey={capabilitiesKey}
+                userId={session?.user.id ?? ""}
+                operatorId={session?.operator.id ?? ""}
+              />
+            ))}
+          </ul>
+        </Card>
+      </section>
     </div>
   );
 }
