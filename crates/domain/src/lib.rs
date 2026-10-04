@@ -9,6 +9,8 @@ mod channel_jobs;
 pub use channel_jobs::*;
 mod channels;
 pub use channels::*;
+mod connector_capabilities;
+pub use connector_capabilities::*;
 mod content;
 pub use content::*;
 mod distribution;

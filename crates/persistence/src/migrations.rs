@@ -88,6 +88,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 19,
         description: "autonomous cycle recovery",
     },
+    MigrationMetadata {
+        version: 20,
+        description: "connector capabilities",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

@@ -945,6 +945,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "url",
  "utoipa",
  "uuid",
 ]
