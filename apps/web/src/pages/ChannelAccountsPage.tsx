@@ -15,6 +15,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor } from "../auth/types";
+import { ApiError } from "../api/client";
 import {
   assignPoolAccount,
   cancelPoolLogin,
@@ -113,9 +114,16 @@ function RemoteLogin({
     queryKey,
     queryFn: getSnapshot,
     refetchInterval: (query) =>
-      busy || terminalPhases.has(query.state.data?.phase ?? "") ? false : 2000,
+      busy ||
+      terminalPhases.has(query.state.data?.phase ?? "") ||
+      (query.state.error instanceof ApiError &&
+        query.state.error.status === 404)
+        ? false
+        : 2000,
     refetchIntervalInBackground: false,
     retry: false,
+    // Account screenshots and identity must not linger in an inactive cache.
+    gcTime: 0,
   });
   const screen = snapshot.data;
   useEffect(() => {
@@ -196,6 +204,11 @@ function RemoteLogin({
       await cancelSession();
       onClose();
     } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 404) {
+        // An expired runner session is already gone. Let the user reconnect.
+        onClose();
+        return;
+      }
       setError(errorText(cause));
       setBusy(false);
     }

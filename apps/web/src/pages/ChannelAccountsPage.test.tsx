@@ -173,13 +173,12 @@ function mockApi(initialAccounts: unknown[] = [], operator = false) {
   vi.stubGlobal("fetch", fetchMock);
   return { requests, fetchMock };
 }
-function renderPage(view: "channels" | "connect" | "settings" = "channels") {
+function renderPage(
+  view: "channels" | "connect" | "settings" = "channels",
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   return render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <FluentProvider theme={webLightTheme}>
         <AuthProvider>
           <MemoryRouter initialEntries={["/app/tenant-1/project-1/channels"]}>
@@ -399,6 +398,53 @@ describe("account page", () => {
     );
     expect((input as HTMLInputElement).value).toBe("");
     expect(await screen.findByText("已验证账号身份并保存连接。")).toBeTruthy();
+  });
+
+  it("closes an already expired login and discards cached account screenshots", async () => {
+    const { fetchMock } = mockApi();
+    const defaultFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((request, init) => {
+      if (
+        String(request).includes("/channel-login-sessions/login-1") &&
+        init?.method === "DELETE"
+      )
+        return Promise.resolve(
+          response(
+            { code: "not_found", message: "login session expired" },
+            404,
+          ),
+        );
+      return defaultFetch(request, init);
+    });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    renderPage("connect", client);
+    await userEvent.click(
+      await screen.findByRole("button", { name: "启动远程登录" }),
+    );
+    await screen.findByRole("img", { name: /远程登录页面截图/ });
+    expect(
+      client.getQueryData([
+        "channel-login",
+        "tenant-1",
+        "project-1",
+        "login-1",
+      ]),
+    ).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "取消并关闭" }));
+    await waitFor(() => expect(screen.queryByLabelText("远程登录")).toBeNull());
+    await waitFor(() =>
+      expect(
+        client.getQueryData([
+          "channel-login",
+          "tenant-1",
+          "project-1",
+          "login-1",
+        ]),
+      ).toBeUndefined(),
+    );
+    expect(screen.getByRole("button", { name: "启动远程登录" })).toBeEnabled();
   });
 });
 
