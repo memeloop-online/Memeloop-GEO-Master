@@ -1204,12 +1204,14 @@ async fn execute_reserved_channel_target(
             let status = match result.status.as_str() {
                 "unsupported" if matched => ChannelOutcomeStatus::Unsupported,
                 "login_required" | "challenge" if matched => ChannelOutcomeStatus::LoginRequired,
-                "unknown" => ChannelOutcomeStatus::Unknown,
+                "unknown" if operation == "publish" => ChannelOutcomeStatus::Unknown,
                 "completed" if observation.is_some() => observation.as_ref().unwrap().0,
                 // A completed generic browser action is not proof of
                 // publication nor valid independent search observation.
                 "completed" if verified => ChannelOutcomeStatus::Verified,
-                _ if operation == "measure" && matched => ChannelOutcomeStatus::Missing,
+                // A receipt for another execution supplies no sample for this
+                // measurement. Publication stays unknown to avoid resending.
+                _ if operation == "measure" => ChannelOutcomeStatus::Missing,
                 _ => ChannelOutcomeStatus::Unknown,
             };
             let (raw_answer, citations) = observation

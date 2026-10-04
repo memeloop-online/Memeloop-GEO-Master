@@ -22,7 +22,7 @@ use geo_provider::SecretEnvelope;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Receipt {
     Valid,
     Refusal,
@@ -40,6 +40,7 @@ enum Receipt {
     InvalidProvenance,
     ForgedMarker,
     MismatchedExecution,
+    Unknown,
 }
 
 #[derive(Clone)]
@@ -126,7 +127,7 @@ async fn runner(
             // not a production search or real-world acceptance result.
             let mut receipt = json!({
                 "execution_id":if matches!(case, Receipt::MismatchedExecution) {json!(Uuid::new_v4())} else {input["execution_id"].clone()},
-                "status":if matches!(case, Receipt::Unsupported) {"unsupported"} else {"completed"},
+                "status":if matches!(case, Receipt::Unsupported) {"unsupported"} else if matches!(case, Receipt::Unknown) {"unknown"} else {"completed"},
                 "stage":"official_search_observation",
                 "occurred_at":completed_at,
                 "connector_version":if matches!(case, Receipt::Fixture) {"fixture.v1"} else if matches!(case, Receipt::AttestedVersion) {"attested-search.v2"} else {"official_search_verified.v1"},
@@ -340,9 +341,10 @@ async fn fixtures_and_plausible_answers_without_official_search_are_missing() {
         Receipt::InvalidProvenance,
         Receipt::ForgedMarker,
         Receipt::MismatchedExecution,
+        Receipt::Unknown,
     ] {
         let outcome = run(case).await;
-        assert_eq!(outcome.status, ChannelOutcomeStatus::Missing);
+        assert_eq!(outcome.status, ChannelOutcomeStatus::Missing, "{case:?}");
         assert!(outcome.raw_answer.is_none());
         if matches!(
             case,
