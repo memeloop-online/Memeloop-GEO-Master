@@ -27,6 +27,7 @@ before(async () => {
   await new Promise((resolve) => fixture.listen(0, "127.0.0.1", resolve));
   url = `http://127.0.0.1:${fixture.address().port}/`;
   const fixtureAdapter = {
+    connectorVersion: "fixture.v1",
     entry: url,
     operations: ["publish", "measure", "lookup"],
     allowLoginControl: (current) => current.origin === new URL(url).origin,
@@ -92,6 +93,32 @@ test("startup rejects missing internal token", () => {
   assert.throws(
     () => createRunnerServer({ token: "", runner }),
     /TOKEN_required/,
+  );
+});
+
+test("authenticated capabilities describe the running adapters without verification claims", async () => {
+  assert.deepEqual(
+    await request("/v1/capabilities", "GET", undefined, "wrong"),
+    { status: 401, body: { error: "unauthorized" } },
+  );
+  assert.deepEqual(await request("/v1/capabilities"), {
+    status: 200,
+    body: {
+      connectors: [
+        {
+          platform: "fixture",
+          placement_slot: "primary",
+          connector_version: "fixture.v1",
+          operations: ["publish", "measure", "lookup"],
+          verified: false,
+        },
+      ],
+    },
+  });
+  assert.deepEqual(
+    await request("/v1/capabilities?connector_version=verified", "GET"),
+    await request("/v1/capabilities"),
+    "caller cannot override running adapter metadata",
   );
 });
 

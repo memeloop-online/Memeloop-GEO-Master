@@ -215,6 +215,152 @@ export function extractKimiCandidateObservation(value) {
   };
 }
 
+// A live connector must supply the UI action, provider-event decoder and
+// answer reader only after an authenticated browser trace establishes their
+// actual semantics. This captures *candidates*, never a verified receipt.
+// In particular, a same-origin response or a request ID from the answer is
+// not by itself proof that the provider performed official web search.
+export async function observeKimiSearchAttempt(
+  page,
+  question,
+  { submit, decodeEvent, readAnswer, trustedOrigin = KIMI_ORIGIN },
+) {
+  if (
+    typeof question !== "string" ||
+    !question.trim() ||
+    typeof submit !== "function" ||
+    typeof decodeEvent !== "function" ||
+    typeof readAnswer !== "function"
+  ) {
+    return null;
+  }
+  const events = [];
+  const pending = new Set();
+  const onResponse = (response) => {
+    const task = (async () => {
+      try {
+        const url = new URL(response.url());
+        if (
+          url.origin !== trustedOrigin ||
+          response.status() !== 200 ||
+          !/application\/json/i.test(response.headers()["content-type"] ?? "")
+        ) {
+          return;
+        }
+        const body = await response.body();
+        if (body.length > 128_000) return;
+        const event = decodeEvent(JSON.parse(body.toString("utf8")), response);
+        if (
+          event &&
+          typeof event.event_id === "string" &&
+          /^[\w-]{1,128}$/u.test(event.event_id) &&
+          typeof event.request_id === "string" &&
+          /^[\w-]{1,128}$/u.test(event.request_id)
+        ) {
+          events.push({
+            event_id: event.event_id,
+            request_id: event.request_id,
+            // Local observation time is not the provider's event timestamp.
+            received_at: new Date().toISOString(),
+          });
+        }
+      } catch {
+        // Malformed and unrelated browser traffic is not search evidence.
+      }
+    })();
+    pending.add(task);
+    void task.finally(() => pending.delete(task));
+  };
+  page.on("response", onResponse);
+  try {
+    await submit(page, question);
+    const answer = extractKimiCandidateObservation(await readAnswer(page));
+    await Promise.allSettled([...pending]);
+    if (!answer?.request_id) return null;
+    const matched = events.filter(
+      (event) => event.request_id === answer.request_id,
+    );
+    if (matched.length !== 1) return null;
+    return { ...answer, candidate_search_event: matched[0] };
+  } catch {
+    return null;
+  } finally {
+    page.off("response", onResponse);
+  }
+}
+
+function validKimiMeasurementPayload(payload) {
+  return (
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    Object.keys(payload).every((key) =>
+      [
+        "target_id",
+        "account_id",
+        "provider",
+        "model",
+        "surface",
+        "search_mode",
+        "protocol_version",
+        "question_set_version",
+        "question",
+        "market",
+        "language",
+        "scheduled_at",
+        "sample_ordinal",
+      ].includes(key),
+    ) &&
+    ["target_id", "account_id"].every(
+      (key) =>
+        typeof payload[key] === "string" &&
+        /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu.test(
+          payload[key],
+        ),
+    ) &&
+    payload.provider === "kimi" &&
+    payload.surface === "consumer_web" &&
+    payload.search_mode === "web_search" &&
+    [
+      "model",
+      "protocol_version",
+      "question_set_version",
+      "question",
+      "market",
+      "language",
+    ].every(
+      (key) =>
+        typeof payload[key] === "string" &&
+        payload[key].trim().length > 0 &&
+        payload[key].length <= 4096,
+    ) &&
+    typeof payload.scheduled_at === "string" &&
+    Number.isFinite(Date.parse(payload.scheduled_at)) &&
+    Number.isInteger(payload.sample_ordinal) &&
+    payload.sample_ordinal >= 0
+  );
+}
+
+export async function measureKimi(
+  page,
+  payload,
+  { searchFlow, expectedAccountId } = {},
+) {
+  if (!validKimiMeasurementPayload(payload))
+    return unsupported("invalid_measurement_payload");
+  if (typeof expectedAccountId !== "string" || !expectedAccountId.trim())
+    return unsupported("account_identity_unverified");
+  // No authenticated search-mode control, provider-event decoder, or answer
+  // reader has been verified. A test-injected flow is still only a candidate
+  // and cannot elevate this unverified connector to a completed receipt.
+  if (!searchFlow) return unsupported("official_web_search_unverified");
+  const candidate = await observeKimiSearchAttempt(page, payload.question, {
+    ...searchFlow,
+  });
+  if (!candidate) return unknown("official_search_event_unverified", "measure");
+  return unknown("official_search_provenance_unverified", "measure");
+}
+
 export async function xiaohongshuIdentity(
   page,
   { trustedOrigin = "https://creator.xiaohongshu.com" } = {},
@@ -553,6 +699,7 @@ export async function publishBaidu(
 
 export const adapters = Object.freeze({
   zhihu: Object.freeze({
+    connectorVersion: CONNECTOR_VERSION,
     origin: "https://www.zhihu.com",
     entry: "https://www.zhihu.com/creator",
     operations: Object.freeze(["publish", "lookup"]),
@@ -575,6 +722,7 @@ export const adapters = Object.freeze({
     },
   }),
   baidu_creator: Object.freeze({
+    connectorVersion: CONNECTOR_VERSION,
     origin: "https://baijiahao.baidu.com",
     entry: "https://baijiahao.baidu.com/builder/theme/bjh/login",
     operations: Object.freeze(["publish", "lookup"]),
@@ -593,6 +741,7 @@ export const adapters = Object.freeze({
     },
   }),
   xiaohongshu: Object.freeze({
+    connectorVersion: CONNECTOR_VERSION,
     origin: "https://creator.xiaohongshu.com",
     entry: "https://creator.xiaohongshu.com/login",
     operations: Object.freeze(["publish", "lookup"]),
@@ -609,6 +758,7 @@ export const adapters = Object.freeze({
     },
   }),
   kimi: Object.freeze({
+    connectorVersion: CONNECTOR_VERSION,
     origin: "https://www.kimi.com",
     entry: "https://www.kimi.com/",
     operations: Object.freeze(["measure"]),
@@ -618,10 +768,10 @@ export const adapters = Object.freeze({
     identify(page) {
       return probeKimiAccount(page);
     },
-    async execute() {
-      // A generated answer, OAuth login, or candidate citations alone do not
-      // establish an authenticated official web-search measurement.
-      return unsupported("official_web_search_unverified");
+    async execute(page, operation, payload, network) {
+      if (operation !== "measure")
+        return unsupported("operation_not_supported");
+      return measureKimi(page, payload, network);
     },
   }),
 });

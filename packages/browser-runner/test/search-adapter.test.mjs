@@ -6,8 +6,11 @@ import {
   adapters,
   extractKimiCandidateObservation,
   kimiIdentity,
+  measureKimi,
+  observeKimiSearchAttempt,
   probeKimiAccount,
 } from "../src/adapters.mjs";
+import { createRunner } from "../src/runner.mjs";
 
 test("source-derived Kimi self probe requires authenticated browser storage and own user JSON", async () => {
   const server = createServer((request, response) => {
@@ -138,10 +141,188 @@ test("Kimi web measurement cannot report fixture data or plain chat as a verifie
     adapters.kimi.allowLoginControl(new URL("https://www.kimi.com.evil.test/")),
     false,
   );
-  assert.deepEqual(await adapters.kimi.execute(), {
+  assert.deepEqual(await adapters.kimi.execute(null, "measure", {}), {
     status: "unsupported",
-    reason: "official_web_search_unverified",
+    reason: "invalid_measurement_payload",
     evidence: [],
     connector_version: "live_unverified.source_derived.v1",
   });
+});
+
+test("installed measurement capability is explicitly unverified", async () => {
+  const runner = createRunner();
+  try {
+    const kimi = runner
+      .capabilities()
+      .connectors.find((entry) => entry.platform === "kimi");
+    assert.deepEqual(kimi, {
+      platform: "kimi",
+      placement_slot: "primary",
+      connector_version: "live_unverified.source_derived.v1",
+      operations: ["measure"],
+      verified: false,
+    });
+  } finally {
+    await runner.shutdown();
+  }
+});
+
+const frozenMeasurement = Object.freeze({
+  target_id: "11111111-1111-4111-8111-111111111111",
+  account_id: "22222222-2222-4222-8222-222222222222",
+  provider: "kimi",
+  model: "sample-model",
+  surface: "consumer_web",
+  search_mode: "web_search",
+  protocol_version: "v1",
+  question_set_version: "v1",
+  question: "What is a test?",
+  market: "test-market",
+  language: "en",
+  scheduled_at: "2026-01-01T00:00:00Z",
+  sample_ordinal: 0,
+});
+
+test("frozen web-search input is required; no injected content or mode fallback", async () => {
+  for (const invalid of [
+    { ...frozenMeasurement, question: "" },
+    { ...frozenMeasurement, provider: "other" },
+    { ...frozenMeasurement, surface: "api" },
+    { ...frozenMeasurement, search_mode: "standard" },
+    { ...frozenMeasurement, url: "https://example.org" },
+    { ...frozenMeasurement, sample_ordinal: -1 },
+  ]) {
+    assert.equal(
+      (await measureKimi(null, invalid, { expectedAccountId: "own-123" }))
+        .reason,
+      "invalid_measurement_payload",
+    );
+  }
+  assert.equal(
+    (await measureKimi(null, frozenMeasurement)).reason,
+    "account_identity_unverified",
+  );
+  assert.deepEqual(
+    await measureKimi(null, frozenMeasurement, {
+      expectedAccountId: "own-123",
+    }),
+    {
+      status: "unsupported",
+      reason: "official_web_search_unverified",
+      evidence: [],
+      connector_version: "live_unverified.source_derived.v1",
+    },
+  );
+});
+
+test("browser capture matches provider event and answer request ID but never verifies fixtures", async () => {
+  const server = createServer((request, response) => {
+    if (request.url === "/") {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end("<!doctype html><html><body>Local test page</body></html>");
+    } else if (request.url === "/event") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          kind: "official_search_event",
+          event_id: "event-1",
+          request_id: "request-1",
+        }),
+      );
+    } else {
+      response.writeHead(404);
+      response.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  let browser;
+  try {
+    browser = await chromium.launch({
+      ...(process.env.GEO_TEST_CHROMIUM_PATH
+        ? { executablePath: process.env.GEO_TEST_CHROMIUM_PATH }
+        : {}),
+    });
+    const page = await browser.newPage();
+    await page.goto(origin);
+    const searchFlow = {
+      trustedOrigin: origin,
+      submit: async (browserPage, question) => {
+        assert.equal(question, frozenMeasurement.question);
+        await browserPage.evaluate(async () => {
+          await fetch("/event");
+        });
+      },
+      decodeEvent: (body) =>
+        body.kind === "official_search_event" ? body : null,
+      readAnswer: async () => ({
+        raw_answer: "Fixture answer",
+        citations: [{ url: "https://example.org/answer#paragraph" }],
+        request_id: "request-1",
+      }),
+    };
+    const captured = await observeKimiSearchAttempt(
+      page,
+      frozenMeasurement.question,
+      searchFlow,
+    );
+    assert.match(captured.candidate_search_event.received_at, /^\d{4}-/u);
+    assert.deepEqual(
+      {
+        ...captured,
+        candidate_search_event: {
+          ...captured.candidate_search_event,
+          received_at: "timestamp",
+        },
+      },
+      {
+        raw_answer: "Fixture answer",
+        citations: [{ url: "https://example.org/answer#paragraph" }],
+        request_id: "request-1",
+        search_verified: false,
+        candidate_search_event: {
+          event_id: "event-1",
+          request_id: "request-1",
+          received_at: "timestamp",
+        },
+      },
+    );
+    assert.deepEqual(
+      await measureKimi(page, frozenMeasurement, {
+        expectedAccountId: "own-123",
+        searchFlow,
+      }),
+      {
+        status: "unknown",
+        reason: "official_search_provenance_unverified",
+        stage: "measure",
+        evidence: [],
+        connector_version: "live_unverified.source_derived.v1",
+      },
+    );
+    assert.equal(
+      await observeKimiSearchAttempt(page, frozenMeasurement.question, {
+        ...searchFlow,
+        readAnswer: async () => ({
+          raw_answer: "Answer with unrelated request",
+          citations: [],
+          request_id: "other-request",
+        }),
+      }),
+      null,
+    );
+    assert.equal(
+      await observeKimiSearchAttempt(page, frozenMeasurement.question, {
+        ...searchFlow,
+        readAnswer: async () => ({
+          raw_answer: "Answer without a request",
+          citations: [],
+        }),
+      }),
+      null,
+    );
+  } finally {
+    await browser?.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

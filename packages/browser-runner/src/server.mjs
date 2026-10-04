@@ -50,7 +50,9 @@ export function createRunnerServer({
       }
       const path = new URL(request.url, "http://localhost").pathname;
       const parts = path.split("/").filter(Boolean);
-      if (request.method === "POST" && path === "/v1/sessions") {
+      if (request.method === "GET" && path === "/v1/capabilities") {
+        send(response, 200, runner.capabilities());
+      } else if (request.method === "POST" && path === "/v1/sessions") {
         send(response, 201, await runner.create(await readJson(request)));
       } else if (request.method === "POST" && path === "/v1/executions") {
         send(response, 200, await runner.execute(await readJson(request)));

@@ -132,6 +132,30 @@ export function createRunner({
   let browserPromise;
   let reapingPromise;
 
+  function capabilities() {
+    return {
+      connectors: Object.entries(platformAdapters)
+        .filter(
+          ([platform, adapter]) =>
+            /^[a-z][a-z0-9_]{0,63}$/.test(platform) &&
+            adapter &&
+            typeof adapter.connectorVersion === "string" &&
+            adapter.connectorVersion.length > 0 &&
+            adapter.connectorVersion.length <= 100 &&
+            Array.isArray(adapter.operations) &&
+            adapter.operations.every((operation) => OPERATIONS.has(operation)),
+        )
+        .map(([platform, adapter]) => ({
+          platform,
+          placement_slot: "primary",
+          connector_version: adapter.connectorVersion,
+          operations: [...adapter.operations],
+          // Presence in a deployed runner is not live account verification.
+          verified: false,
+        })),
+    };
+  }
+
   async function browser() {
     if (!browserPromise) {
       browserPromise = browserType
@@ -498,5 +522,15 @@ export function createRunner({
     if (browserPromise) await (await browserPromise).close();
   }
 
-  return { create, snapshot, action, complete, execute, close, shutdown, reap };
+  return {
+    create,
+    snapshot,
+    action,
+    complete,
+    execute,
+    close,
+    shutdown,
+    reap,
+    capabilities,
+  };
 }
