@@ -803,6 +803,7 @@ pub struct ContentExecutionReadRequest {
 #[serde(deny_unknown_fields)]
 pub struct ContentExecutionRef {
     pub execution_id: Uuid,
+    pub cycle_id: Uuid,
     pub status: ContentExecutionStatus,
     pub coverage: ContentCoverage,
 }

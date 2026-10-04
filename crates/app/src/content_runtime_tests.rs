@@ -16,10 +16,10 @@ use geo_api::{
 use geo_domain::{
     ContentExecutionStatus, ContentItemStatus, DocumentScope, ImportItem, InitialSource,
     InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository,
-    MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
-    MemoryProjectRepository, ProjectCreate, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    MemoryAuthRepository, MemoryContentRepository, MemoryDistributionRepository,
+    MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate, ProjectRepository,
+    ProjectSettings, ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key,
+    settings_hash, start_request_hash,
 };
 use geo_worker::{
     ContentStartRequest, HostOpError, HostOps, ModelCompletion, ModelCompletionRequest,
@@ -96,7 +96,8 @@ fn assembled_state(
     projects: Arc<MemoryProjectRepository>,
     knowledge: Arc<MemoryKnowledgeRepository>,
     content: Arc<MemoryContentRepository>,
-    model: Arc<GroundedModel>,
+    distribution: Arc<MemoryDistributionRepository>,
+    model: Option<Arc<GroundedModel>>,
     bundle_path: &str,
     digest: &str,
 ) -> AppState {
@@ -111,8 +112,11 @@ fn assembled_state(
         EventBus::default(),
         false,
     )
-    .with_content_repository(content);
-    state.configure_content_model(model);
+    .with_content_repository(content)
+    .with_distribution_repository(distribution);
+    if let Some(model) = model {
+        state.configure_content_model(model);
+    }
     assemble_content_workflow(&state, bundle_path, digest)
         .expect("approved generated bundle assembles with Rust host capabilities");
     state
@@ -129,12 +133,14 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
     let projects = Arc::new(MemoryProjectRepository::default());
     let knowledge = Arc::new(MemoryKnowledgeRepository::default());
     let content = Arc::new(MemoryContentRepository::default());
+    let distribution = Arc::new(MemoryDistributionRepository::default());
     let model = Arc::new(GroundedModel::default());
     let state = assembled_state(
         projects.clone(),
         knowledge.clone(),
         content.clone(),
-        model.clone(),
+        distribution.clone(),
+        Some(model.clone()),
         path,
         &digest,
     );
@@ -242,7 +248,14 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
                 .await
                 .unwrap()
                 .unwrap();
-            if current.status == ContentExecutionStatus::Closed {
+            if current.status == ContentExecutionStatus::Closed
+                && state
+                    .distribution_service()
+                    .latest_for_cycle(&scope, started.cycle_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|manifest| manifest.complete)
+            {
                 break current;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -282,10 +295,76 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
     }
     assert_eq!(model.generated.load(Ordering::SeqCst), 2);
     assert_eq!(model.checked.load(Ordering::SeqCst), 2);
+    let frozen_distribution = state
+        .distribution_service()
+        .latest_for_cycle(&scope, started.cycle_id)
+        .await
+        .unwrap()
+        .expect("native workflow froze the second-stage manifest");
+    assert!(frozen_distribution.complete);
+    assert_eq!(
+        frozen_distribution.expansion_cursor,
+        frozen_distribution.expected_count
+    );
+    assert_eq!(
+        frozen_distribution.content_execution_id,
+        execution.execution_id
+    );
+    assert_eq!(
+        frozen_distribution.content_handoff_id,
+        closed.handoff_id.unwrap()
+    );
+    assert_eq!(frozen_distribution.expected_count, 6);
+    let target_page = state
+        .distribution_service()
+        .targets(&scope, frozen_distribution.manifest_id, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(target_page.rows.len(), 6);
+    assert!(
+        target_page
+            .rows
+            .iter()
+            .all(|target| target.publication_intent_id.is_none())
+    );
 
-    // Reassemble the app/engine against the same repository-owned state to
-    // simulate role restart. Separate PostgreSQL tests cover process durability.
-    let restarted = assembled_state(projects, knowledge, content, model.clone(), path, &digest);
+    let initial_cycle = projects
+        .get_report_cycle(&scope, project.id, started.cycle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let successor = projects
+        .schedule_next_cycle(
+            &scope,
+            project.id,
+            started.cycle_id,
+            initial_cycle.cutoff_at + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert_ne!(successor.cycle_id, started.cycle_id);
+    // Reassemble against the same durable state with no model configured and
+    // a newer current cycle. Closed replay may only recheck its original
+    // immutable manifest; it needs neither generation nor a model provider.
+    let restarted = assembled_state(
+        projects.clone(),
+        knowledge,
+        content,
+        distribution,
+        None,
+        path,
+        &digest,
+    );
+    assert!(!restarted.content_model_available());
+    assert_eq!(
+        projects
+            .get_current_cycle(&scope, project.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id,
+        successor.cycle_id
+    );
     restarted
         .dispatch_content_execution(scope.clone(), execution.execution_id)
         .expect("re-dispatch the existing reference");
@@ -316,6 +395,26 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
     .expect("native replay succeeds");
     assert_eq!(model.generated.load(Ordering::SeqCst), 2);
     assert_eq!(model.checked.load(Ordering::SeqCst), 2);
+    assert!(
+        restarted
+            .distribution_service()
+            .latest_for_cycle(&scope, successor.cycle_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "old execution must not freeze the newer current cycle"
+    );
+    assert_eq!(
+        restarted
+            .distribution_service()
+            .latest_for_cycle(&scope, started.cycle_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest_id,
+        frozen_distribution.manifest_id,
+        "restart must reuse the same frozen distribution manifest"
+    );
     assert_eq!(
         restarted
             .content_service()

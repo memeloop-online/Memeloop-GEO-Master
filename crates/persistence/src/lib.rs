@@ -36,6 +36,6 @@ pub use error::PersistenceError;
 pub use idempotency::PgIdempotencyStore;
 pub use knowledge::PgKnowledgeRepository;
 pub use migrations::{MIGRATOR, MigrationMetadata, embedded_migrations, migration_metadata};
-pub use projects::PgProjectRepository;
+pub use projects::{ContentBootstrapLease, PendingContentCycle, PgProjectRepository};
 pub use report::PgReportRepository;
 pub use scope::set_local_scope;

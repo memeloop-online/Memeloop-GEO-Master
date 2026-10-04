@@ -17,6 +17,7 @@ const WORKFLOW_DEADLINE: Duration = Duration::from_secs(3600);
 const V8_HEAP_LIMIT: usize = 64 * 1024 * 1024;
 pub const CONTENT_WORKFLOW_ENTRY: &str = "memeloop://bundle/content-workflow.mjs";
 pub const CONTENT_COMPLETION_TOPIC: &str = "content.completed";
+pub const DISTRIBUTION_PREPARED_TOPIC: &str = "distribution.prepared";
 
 fn workflow_budgets() -> HostOpBudgets {
     // Match the existing finite planner's 10,000-item bound. Interactive-turn
@@ -28,6 +29,11 @@ fn workflow_budgets() -> HostOpBudgets {
         HostOp::ContentGenerate,
         HostOp::ContentCheck,
     ] {
+        budgets = budgets.with_limits(op, HostOpLimits::new(120_000, 10_000));
+    }
+    for op in [HostOp::DistributionResume, HostOp::DistributionTargetsRead] {
+        // 10,000 documents x up to 3 placements is > 256 cells. Recovery
+        // revisits every target page, including a previously completed freeze.
         budgets = budgets.with_limits(op, HostOpLimits::new(120_000, 10_000));
     }
     budgets
@@ -45,6 +51,8 @@ mod budget_tests {
             HostOp::ContentPrepare,
             HostOp::ContentGenerate,
             HostOp::ContentCheck,
+            HostOp::DistributionResume,
+            HostOp::DistributionTargetsRead,
         ] {
             assert!(budgets.limits(op).max_calls >= 10_000);
         }
@@ -160,21 +168,28 @@ impl EmbeddedContentWorkflowExecutor {
                     .await
                     .map_err(worker_error)?;
                 let completed = runtime.host_state().events.iter().any(|event| {
-                    event.topic == CONTENT_COMPLETION_TOPIC
+                    event.topic == DISTRIBUTION_PREPARED_TOPIC
                         && serde_json::from_str::<serde_json::Value>(&event.payload)
                             .ok()
                             .and_then(|value| {
-                                value
-                                    .get("execution_id")
-                                    .and_then(|id| id.as_str())
-                                    .map(str::to_owned)
+                                Some((
+                                    value.get("execution_id")?.as_str()?.to_owned(),
+                                    value.get("cycle_id")?.as_str()?.to_owned(),
+                                    value.get("manifest_id")?.as_str()?.to_owned(),
+                                    value.get("handoff_id")?.as_str()?.to_owned(),
+                                    value.get("targets")?.as_u64()?,
+                                ))
                             })
-                            .as_deref()
-                            == Some(execution_id.to_string().as_str())
+                            .is_some_and(|(id, cycle, manifest, handoff, _)| {
+                                id == execution_id.to_string()
+                                    && [cycle, manifest, handoff]
+                                        .iter()
+                                        .all(|id| Uuid::parse_str(id).is_ok())
+                            })
                 });
                 if !completed {
                     return Err(runtime_error(
-                        "native workflow did not persist a completion handoff",
+                        "native workflow did not prepare the distribution handoff",
                     ));
                 }
                 Ok(())

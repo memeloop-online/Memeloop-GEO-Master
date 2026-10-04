@@ -554,6 +554,28 @@ impl AgentRepository for PgAgentRepository {
         Ok(cancelled_run)
     }
 
+    async fn run_status(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+    ) -> Result<Option<RunStatus>, AppError> {
+        let mut transaction = self.transaction(scope).await?;
+        let status: Option<String> = sqlx::query_scalar(
+            r#"SELECT status FROM agent_runs
+                WHERE run_id = $1 AND operator_id = $2 AND tenant_id = $3
+                  AND ($4::UUID IS NULL OR project_id = $4)"#,
+        )
+        .bind(run_id.as_uuid())
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(scope.project_id.map(|project_id| project_id.as_uuid()))
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        status.as_deref().map(run_status_from_text).transpose()
+    }
+
     async fn begin_run(&self, scope: &TenantScope, run_id: RunId) -> Result<Option<Run>, AppError> {
         let mut transaction = self.transaction(scope).await?;
         // The conversation is located first and locked first: the guarded run

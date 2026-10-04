@@ -17,6 +17,19 @@ pub struct PgProjectRepository {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingContentCycle {
+    pub scope: TenantScope,
+    pub cycle_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentBootstrapLease {
+    pub scope: TenantScope,
+    pub cycle_id: Uuid,
+    pub token: Uuid,
+}
+
 impl PgProjectRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -28,6 +41,198 @@ impl PgProjectRepository {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Bounded keyset scan of active, current cycles with no content execution.
+    /// A failed cycle cannot prevent enumeration of later cycles in this pass.
+    pub async fn scan_pending_content_cycles_after(
+        &self,
+        after: Option<Uuid>,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<PendingContentCycle>, AppError> {
+        if !(1..=1000).contains(&limit) {
+            return Err(AppError::invalid_request("invalid cycle scan page size"));
+        }
+        let rows: Vec<(Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "SELECT c.operator_id,c.tenant_id,c.project_id,c.cycle_id \
+             FROM optimization_cycles c JOIN projects p \
+               ON (p.operator_id,p.tenant_id,p.project_id)=(c.operator_id,c.tenant_id,c.project_id) \
+             WHERE ($1::uuid IS NULL OR c.cycle_id>$1) AND p.current_cycle_id=c.cycle_id \
+               AND p.status='active' \
+               AND (c.content_bootstrap_expires_at IS NULL OR c.content_bootstrap_expires_at<=$2) \
+               AND (c.content_bootstrap_retry_after IS NULL OR c.content_bootstrap_retry_after<=$2) \
+               AND NOT EXISTS (SELECT 1 FROM content_executions e WHERE \
+                 (e.operator_id,e.tenant_id,e.project_id,e.cycle_id)= \
+                 (c.operator_id,c.tenant_id,c.project_id,c.cycle_id)) \
+             ORDER BY c.cycle_id LIMIT $3",
+        )
+        .bind(after)
+        .bind(now)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_database_error)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(operator, tenant, project, cycle_id)| PendingContentCycle {
+                    scope: TenantScope::new(operator.into(), tenant.into(), Some(project.into())),
+                    cycle_id,
+                },
+            )
+            .collect())
+    }
+
+    /// The project lock serializes with cycle advancement and pause. The
+    /// cycle lock serializes bootstrap attempts across scanner replicas.
+    pub async fn try_claim_content_bootstrap(
+        &self,
+        scope: &TenantScope,
+        cycle_id: Uuid,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<Option<ContentBootstrapLease>, AppError> {
+        if ttl <= chrono::Duration::zero() {
+            return Err(AppError::invalid_request(
+                "bootstrap lease lifetime must be positive",
+            ));
+        }
+        let project_id = scope
+            .project_id
+            .ok_or_else(|| AppError::invalid_request("project scope required"))?;
+        let mut tx = self.pool.begin().await.map_err(map_database_error)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(map_database_error)?;
+        let project: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT status,current_cycle_id FROM projects \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+        if !matches!(project, Some((ref status, Some(current))) if status == "active" && current == cycle_id)
+        {
+            return Ok(None);
+        }
+        #[derive(sqlx::FromRow)]
+        struct BootstrapTiming {
+            content_bootstrap_expires_at: Option<DateTime<Utc>>,
+            content_bootstrap_retry_after: Option<DateTime<Utc>>,
+        }
+        let row: Option<BootstrapTiming> = sqlx::query_as(
+            "SELECT content_bootstrap_expires_at,content_bootstrap_retry_after \
+             FROM optimization_cycles WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND cycle_id=$4 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(cycle_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+        let Some(BootstrapTiming {
+            content_bootstrap_expires_at: expires,
+            content_bootstrap_retry_after: retry,
+        }) = row
+        else {
+            return Ok(None);
+        };
+        if expires.is_some_and(|time| time > now) || retry.is_some_and(|time| time > now) {
+            return Ok(None);
+        }
+        let existing: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM content_executions WHERE operator_id=$1 \
+             AND tenant_id=$2 AND project_id=$3 AND cycle_id=$4)",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(cycle_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_database_error)?;
+        if existing {
+            return Ok(None);
+        }
+        let token = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE optimization_cycles SET content_bootstrap_token=$1, \
+             content_bootstrap_expires_at=$2,content_bootstrap_retry_after=NULL, \
+             content_bootstrap_attempts=content_bootstrap_attempts+1,content_bootstrap_error_code=NULL \
+             WHERE cycle_id=$3 AND operator_id=$4 AND tenant_id=$5 AND project_id=$6",
+        )
+        .bind(token).bind(now + ttl).bind(cycle_id).bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid()).bind(project_id.as_uuid())
+        .execute(&mut *tx).await.map_err(map_database_error)?;
+        tx.commit().await.map_err(map_database_error)?;
+        Ok(Some(ContentBootstrapLease {
+            scope: scope.clone(),
+            cycle_id,
+            token,
+        }))
+    }
+
+    /// Classify by stable error code only: diagnostic text may contain
+    /// sensitive operational context and must not enter durable state.
+    pub async fn finish_content_bootstrap(
+        &self,
+        lease: &ContentBootstrapLease,
+        now: DateTime<Utc>,
+        outcome: Result<(), geo_domain::ErrorCode>,
+    ) -> Result<bool, AppError> {
+        let project = lease
+            .scope
+            .project_id
+            .ok_or_else(|| AppError::invalid_request("project scope required"))?;
+        let (retry, code) = match outcome {
+            Ok(()) => (None, None),
+            Err(code) => {
+                let (name, base): (&str, i64) = match code {
+                    geo_domain::ErrorCode::NotReady
+                    | geo_domain::ErrorCode::DependencyUnavailable => {
+                        ("dependency_unavailable", 120)
+                    }
+                    geo_domain::ErrorCode::Conflict | geo_domain::ErrorCode::NotFound => {
+                        ("input_unavailable", 1800)
+                    }
+                    geo_domain::ErrorCode::CapabilityMissing => ("capability_missing", 3600),
+                    _ => ("invalid_input", 3600),
+                };
+                let attempts: i32 = sqlx::query_scalar(
+                    "SELECT content_bootstrap_attempts FROM optimization_cycles \
+                     WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND cycle_id=$4 AND content_bootstrap_token=$5",
+                )
+                .bind(lease.scope.operator_id.as_uuid()).bind(lease.scope.tenant_id.as_uuid())
+                .bind(project.as_uuid()).bind(lease.cycle_id).bind(lease.token)
+                .fetch_optional(&self.pool).await.map_err(map_database_error)?
+                .unwrap_or_default();
+                (
+                    Some(
+                        now + chrono::Duration::seconds(
+                            (base * (1_i64 << attempts.saturating_sub(1).clamp(0, 5))).min(21_600),
+                        ),
+                    ),
+                    Some(name),
+                )
+            }
+        };
+        let updated = sqlx::query(
+            "UPDATE optimization_cycles SET content_bootstrap_token=NULL,content_bootstrap_expires_at=NULL, \
+             content_bootstrap_retry_after=$1,content_bootstrap_error_code=$2 \
+             WHERE operator_id=$3 AND tenant_id=$4 AND project_id=$5 AND cycle_id=$6 \
+             AND content_bootstrap_token=$7 AND content_bootstrap_expires_at>$8",
+        )
+        .bind(retry).bind(code).bind(lease.scope.operator_id.as_uuid())
+        .bind(lease.scope.tenant_id.as_uuid()).bind(project.as_uuid())
+        .bind(lease.cycle_id).bind(lease.token).bind(now)
+        .execute(&self.pool).await.map_err(map_database_error)?;
+        Ok(updated.rows_affected() == 1)
     }
 
     /// Trusted, bounded crash-recovery selector. Call schedule_next_cycle

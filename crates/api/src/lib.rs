@@ -496,7 +496,10 @@ impl AppState {
                 if let Some(Err(error)) = &outcome {
                     tracing::warn!(code = ?error.code, "content workflow interrupted; durable item state remains resumable");
                 }
-                let backoff = if matches!(outcome, Some(Ok(()))) { 0 } else { 30 };
+                // A completed preparation pass may still have deferred account
+                // or source dependencies. Retry those with backoff; a fully
+                // prepared execution is excluded by the durable scanner.
+                let backoff = if matches!(outcome, Some(Ok(()))) { 300 } else { 30 };
                 if let Err(error) = repository.release_dispatch(&lease, chrono::Utc::now(), chrono::Duration::seconds(backoff)).await {
                     tracing::warn!(code = ?error.code, "content dispatch release failed");
                 }

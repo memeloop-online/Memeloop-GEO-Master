@@ -703,6 +703,18 @@ pub trait AgentRuntime: Send + Sync {
     /// nothing will ever drive.
     async fn run_turn(&self, scope: &TenantScope, input: TurnInput)
     -> Result<TurnReport, AppError>;
+
+    /// The executor's run-scoped stop signal. Existing runtime adapters retain
+    /// their normal implementation; embedded runtimes can also interrupt an
+    /// isolate while a turn is suspended or executing synchronous JavaScript.
+    async fn run_turn_with_cancellation(
+        &self,
+        scope: &TenantScope,
+        input: TurnInput,
+        _cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<TurnReport, AppError> {
+        self.run_turn(scope, input).await
+    }
 }
 
 #[derive(Debug, Default)]
@@ -760,6 +772,13 @@ pub trait AgentRepository: Send + Sync {
     /// replayed Idempotency-Key returns the *stored* acceptance whose
     /// `run.status` still reads `queued` long after the run finished.
     async fn begin_run(&self, scope: &TenantScope, run_id: RunId) -> Result<Option<Run>, AppError>;
+    /// Narrow scoped status read for the live cancellation watcher. A missing
+    /// or inaccessible run cannot be treated as permission to keep working.
+    async fn run_status(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+    ) -> Result<Option<RunStatus>, AppError>;
     /// Records a run's terminal outcome, its assistant message and the turn's
     /// terminal status together.
     ///
@@ -1253,6 +1272,19 @@ impl AgentRepository for MemoryAgentRepository {
         )
         .await;
         Ok(cancelled_run)
+    }
+
+    async fn run_status(
+        &self,
+        scope: &TenantScope,
+        run_id: RunId,
+    ) -> Result<Option<RunStatus>, AppError> {
+        let state = self.state.read().await;
+        Ok(state
+            .runs
+            .get(&run_id)
+            .filter(|run| scope.contains(&run.scope()))
+            .map(|run| run.status))
     }
 
     async fn begin_run(&self, scope: &TenantScope, run_id: RunId) -> Result<Option<Run>, AppError> {

@@ -2,13 +2,15 @@
 use chrono::Utc;
 use geo_domain::{
     ContentBlock, ContentBlockKind, ContentBrief, ContentEvidence, ContentRepository, ContentStep,
-    DocumentManifestPlanRequest, ErrorCode, EvidenceRef, ImportItem, InitialSource,
-    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository,
-    ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand, SourceKind,
-    StructuredDocument, TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
+    DistributionRepository, DocumentManifestPlanRequest, ErrorCode, EvidenceRef,
+    FreezeDistribution, ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility,
+    KnowledgePurpose, KnowledgeRepository, PlatformPlacement, ProjectCreate, ProjectRepository,
+    ProjectSettings, ProjectStartCommand, SourceKind, StructuredDocument, TenantScope,
+    hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{
-    Database, DatabaseConfig, PgContentRepository, PgKnowledgeRepository, PgProjectRepository,
+    Database, DatabaseConfig, PgContentRepository, PgDistributionRepository, PgKnowledgeRepository,
+    PgProjectRepository,
 };
 use uuid::Uuid;
 
@@ -133,10 +135,141 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .await
         .unwrap();
     let repository = PgContentRepository::from_database(&database);
+    let bootstrap_candidates = projects
+        .scan_pending_content_cycles_after(None, Utc::now(), 100)
+        .await
+        .unwrap();
+    assert!(
+        bootstrap_candidates
+            .iter()
+            .any(|candidate| candidate.cycle_id == accepted.cycle_id)
+    );
+    let bootstrap_time = Utc::now();
+    let replica = PgProjectRepository::from_database(&database);
+    let (claimed, duplicate) = tokio::join!(
+        projects.try_claim_content_bootstrap(
+            &scope,
+            accepted.cycle_id,
+            bootstrap_time,
+            chrono::Duration::minutes(15)
+        ),
+        replica.try_claim_content_bootstrap(
+            &scope,
+            accepted.cycle_id,
+            bootstrap_time,
+            chrono::Duration::minutes(15)
+        ),
+    );
+    let bootstrap = claimed
+        .unwrap()
+        .or(duplicate.unwrap())
+        .expect("one bootstrap owner");
+    assert!(
+        projects
+            .scan_pending_content_cycles_after(None, bootstrap_time, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.cycle_id != accepted.cycle_id)
+    );
+    assert!(
+        projects
+            .finish_content_bootstrap(&bootstrap, bootstrap_time, Err(ErrorCode::NotReady))
+            .await
+            .unwrap()
+    );
+    assert!(
+        projects
+            .scan_pending_content_cycles_after(None, bootstrap_time, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.cycle_id != accepted.cycle_id)
+    );
+    let retry_at = bootstrap_time + chrono::Duration::minutes(3);
+    sqlx::query("UPDATE projects SET status='paused' WHERE project_id=$1")
+        .bind(project.id.as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        projects
+            .scan_pending_content_cycles_after(None, retry_at, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.cycle_id != accepted.cycle_id)
+    );
+    assert!(
+        projects
+            .try_claim_content_bootstrap(
+                &scope,
+                accepted.cycle_id,
+                retry_at,
+                chrono::Duration::minutes(15)
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        repository
+            .start(
+                &scope,
+                accepted.cycle_id,
+                manifest.clone(),
+                "test-policy-paused",
+            )
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    sqlx::query("UPDATE projects SET status='active' WHERE project_id=$1")
+        .bind(project.id.as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let bootstrap = projects
+        .try_claim_content_bootstrap(
+            &scope,
+            accepted.cycle_id,
+            retry_at,
+            chrono::Duration::minutes(15),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     let first = repository
         .start(&scope, accepted.cycle_id, manifest.clone(), "test-policy")
         .await
         .unwrap();
+    assert!(
+        projects
+            .finish_content_bootstrap(&bootstrap, retry_at, Ok(()))
+            .await
+            .unwrap()
+    );
+    assert!(
+        projects
+            .scan_pending_content_cycles_after(None, retry_at, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.cycle_id != accepted.cycle_id)
+    );
+    assert!(
+        projects
+            .try_claim_content_bootstrap(
+                &scope,
+                accepted.cycle_id,
+                retry_at,
+                chrono::Duration::minutes(15)
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
     let restarted = PgContentRepository::from_database(&database);
     assert_eq!(
         first,
@@ -253,6 +386,19 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             .renew_dispatch(&replacement, takeover, chrono::Duration::seconds(90))
             .await
             .unwrap()
+    );
+    assert!(
+        projects
+            .try_claim_content_bootstrap(
+                &scope,
+                accepted.cycle_id,
+                takeover,
+                chrono::Duration::minutes(15)
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "paused projects cannot bootstrap"
     );
     assert!(
         !restarted
@@ -486,6 +632,42 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .await
         .unwrap();
     let handoff = repository.close(&scope, first.execution_id).await.unwrap();
+    let stage2_at = Utc::now();
+    assert!(
+        repository
+            .scan_closed_after(None, stage2_at, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id)
+    );
+    let stage2 = repository
+        .try_claim_dispatch(
+            &scope,
+            first.execution_id,
+            stage2_at,
+            chrono::Duration::seconds(90),
+        )
+        .await
+        .unwrap()
+        .expect("closed stage can take same fence");
+    assert!(
+        repository
+            .renew_dispatch(
+                &stage2,
+                stage2_at + chrono::Duration::seconds(15),
+                chrono::Duration::seconds(90)
+            )
+            .await
+            .unwrap(),
+        "closing content must not cancel distribution preparation"
+    );
+    assert!(
+        repository
+            .release_dispatch(&stage2, stage2_at, chrono::Duration::zero())
+            .await
+            .unwrap()
+    );
     assert_eq!(handoff.coverage.total, manifest.items.len() as u64);
     assert_eq!(handoff.coverage.ready, 1);
     assert_eq!(
@@ -559,15 +741,11 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
     );
     assert!(
         repository
-            .try_claim_dispatch(
-                &scope,
-                first.execution_id,
-                Utc::now(),
-                chrono::Duration::seconds(90)
-            )
+            .scan_closed_after(None, Utc::now(), 100)
             .await
             .unwrap()
-            .is_none()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id)
     );
     assert_eq!(successor.revision, 2);
     assert_eq!(successor.supersedes_handoff_id, Some(handoff.handoff_id));
@@ -605,6 +783,117 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .execute(database.pool())
         .await;
     assert!(immutable.is_err());
+    let distribution = PgDistributionRepository::from_database(&database);
+    let formats: Vec<String> = manifest
+        .items
+        .iter()
+        .map(|item| item.content_type.clone())
+        .collect();
+    let placements = (0..3)
+        .map(|i| PlatformPlacement {
+            platform_id: format!("fixture-{i}"),
+            placement_slot: "primary".into(),
+            capability_version: "fixture-v1".into(),
+            supported_formats: formats.clone(),
+            unavailable_reason: None,
+            fixture: true,
+        })
+        .collect();
+    let frozen = distribution
+        .freeze(
+            &scope,
+            FreezeDistribution {
+                cycle_id: accepted.cycle_id,
+                revision: 1,
+                document_manifest: manifest.clone(),
+                content_execution: repository
+                    .get_execution(&scope, first.execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                content_handoff: successor,
+                placements,
+                sealed_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    let partial = distribution
+        .expansion_page(&scope, frozen.manifest_id, 0, 1)
+        .await
+        .unwrap();
+    let partial = distribution
+        .commit_expansion_page(&scope, frozen.manifest_id, 0, partial.rows)
+        .await
+        .unwrap();
+    assert!(!partial.complete);
+    assert!(
+        repository
+            .scan_closed_after(None, Utc::now(), 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id),
+        "partial expansion remains recoverable"
+    );
+    let remaining = distribution
+        .expansion_page(&scope, frozen.manifest_id, partial.expansion_cursor, 100)
+        .await
+        .unwrap();
+    let complete = distribution
+        .commit_expansion_page(&scope, frozen.manifest_id, remaining.cursor, remaining.rows)
+        .await
+        .unwrap();
+    assert!(complete.complete);
+    // A permanently unsupported first cell must not hide a pending cell on
+    // a later page. Reused unknown cells never trigger another preparation.
+    sqlx::query("UPDATE distribution_execution_targets SET \
+        current_body=jsonb_set(jsonb_set(current_body,'{status}','\"deferred\"'::jsonb),'{reason}','\"connector_unconfigured\"'::jsonb) \
+        WHERE manifest_id=$1 AND ordinal=0")
+        .bind(frozen.manifest_id).execute(database.pool()).await.unwrap();
+    let target = complete.expected_count - 1;
+    assert!(target > 1);
+    assert!(
+        repository
+            .scan_closed_after(None, Utc::now(), 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id),
+        "later-page pending target remains discoverable"
+    );
+    sqlx::query(
+        "UPDATE distribution_execution_targets SET \
+        current_body=jsonb_set(current_body,'{status}','\"reused_unknown\"'::jsonb) \
+        WHERE manifest_id=$1 AND current_body->>'status'='pending'",
+    )
+    .bind(frozen.manifest_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        repository
+            .scan_closed_after(None, Utc::now(), 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.execution_id != first.execution_id),
+        "unsupported and unknown targets cannot drive blind retry"
+    );
+    sqlx::query("UPDATE distribution_execution_targets SET \
+        current_body=jsonb_set(jsonb_set(current_body,'{status}','\"deferred\"'::jsonb),'{reason}','\"account_unassigned\"'::jsonb) \
+        WHERE manifest_id=$1 AND ordinal=$2")
+        .bind(frozen.manifest_id).bind(target as i64)
+        .execute(database.pool()).await.unwrap();
+    assert!(
+        repository
+            .scan_closed_after(None, Utc::now(), 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.execution_id == first.execution_id),
+        "later-page recheckable deferral must recover"
+    );
     let cancelled = repository
         .start(&scope, accepted.cycle_id, manifest, "test-policy-cancel")
         .await

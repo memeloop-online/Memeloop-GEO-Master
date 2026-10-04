@@ -5,6 +5,7 @@ import { createAgentAgentLoopDefinition } from "memeloop/loop-api";
 // reference; every branch resumes from the Rust-owned item state.
 const PAGE_SIZE = 32;
 const PAGE_CONCURRENCY = 4;
+const TARGET_PAGE_SIZE = 64;
 const TERMINAL = new Set([
   "ready",
   "blocked",
@@ -23,6 +24,10 @@ function host() {
     "op_host_content_generate_v1",
     "op_host_content_check_v1",
     "op_host_content_close_v1",
+    "op_host_content_execution_read_v1",
+    "op_host_distribution_start_v1",
+    "op_host_distribution_resume_v1",
+    "op_host_distribution_targets_read_v1",
     "op_host_emit",
   ]) {
     if (typeof ops?.[name] !== "function") {
@@ -37,8 +42,142 @@ function host() {
     generate: (input) => invoke("op_host_content_generate_v1", input),
     check: (input) => invoke("op_host_content_check_v1", input),
     close: (input) => invoke("op_host_content_close_v1", input),
+    executionRead: (input) =>
+      invoke("op_host_content_execution_read_v1", input),
+    distributionStart: (input) =>
+      invoke("op_host_distribution_start_v1", input),
+    distributionResume: (input) =>
+      invoke("op_host_distribution_resume_v1", input),
+    distributionTargetsRead: (input) =>
+      invoke("op_host_distribution_targets_read_v1", input),
     emit: (topic, value) => ops.op_host_emit(topic, JSON.stringify(value)),
   };
+}
+
+function validateDistribution(manifest, execution, handoff, previous) {
+  if (
+    typeof manifest?.manifest_id !== "string" ||
+    manifest.cycle_id !== execution.cycle_id ||
+    manifest.content_execution_id !== execution.execution_id ||
+    manifest.content_handoff_id !== handoff.handoff_id ||
+    !Number.isSafeInteger(manifest.expected_count) ||
+    manifest.expected_count < 0 ||
+    !Number.isSafeInteger(manifest.expansion_cursor) ||
+    manifest.expansion_cursor < 0 ||
+    manifest.expansion_cursor > manifest.expected_count ||
+    (previous &&
+      (manifest.manifest_id !== previous.manifest_id ||
+        manifest.expected_count !== previous.expected_count ||
+        manifest.expansion_cursor < previous.expansion_cursor))
+  ) {
+    throw new Error(
+      "Distribution manifest changed or is outside the content handoff.",
+    );
+  }
+  return manifest;
+}
+
+async function prepareDistribution(execution, handoff, capability, ctx) {
+  let manifest = validateDistribution(
+    await capability.distributionStart({ cycle_id: execution.cycle_id }),
+    execution,
+    handoff,
+  );
+  while (!manifest.complete) {
+    if (ctx.isCancelled())
+      throw new Error("Distribution preparation cancelled.");
+    const advanced = validateDistribution(
+      await capability.distributionResume({
+        manifest_id: manifest.manifest_id,
+      }),
+      execution,
+      handoff,
+      manifest,
+    );
+    if (advanced.expansion_cursor <= manifest.expansion_cursor) {
+      throw new Error("Distribution expansion cursor made no progress.");
+    }
+    manifest = advanced;
+  }
+  if (manifest.expansion_cursor !== manifest.expected_count) {
+    throw new Error(
+      "Distribution expansion did not cover its frozen denominator.",
+    );
+  }
+
+  // Expansion and eligibility recheck are distinct: an already complete
+  // manifest still needs every materialized target revisited after recovery.
+  let afterOrdinal;
+  let observed = 0;
+  let finished = false;
+  while (!finished) {
+    if (ctx.isCancelled())
+      throw new Error("Distribution preparation cancelled.");
+    manifest = validateDistribution(
+      await capability.distributionResume({
+        manifest_id: manifest.manifest_id,
+        ...(afterOrdinal === undefined ? {} : { after_ordinal: afterOrdinal }),
+      }),
+      execution,
+      handoff,
+      manifest,
+    );
+    // One trusted resume rechecks at most four 64-target pages. Inspect all
+    // four pages before requesting the next bounded recheck window.
+    for (let index = 0; index < 4; index++) {
+      const page = await capability.distributionTargetsRead({
+        manifest_id: manifest.manifest_id,
+        ...(afterOrdinal === undefined ? {} : { after_ordinal: afterOrdinal }),
+        limit: TARGET_PAGE_SIZE,
+      });
+      if (
+        page.manifest_id !== manifest.manifest_id ||
+        page.expected_count !== manifest.expected_count ||
+        !Array.isArray(page.items) ||
+        page.items.length > TARGET_PAGE_SIZE
+      ) {
+        throw new Error("Distribution target page changed during preparation.");
+      }
+      let ordinal = afterOrdinal ?? -1;
+      for (const item of page.items) {
+        if (
+          typeof item.target_id !== "string" ||
+          !Number.isSafeInteger(item.ordinal) ||
+          item.ordinal !== ordinal + 1 ||
+          item.status === "pending"
+        ) {
+          throw new Error(
+            "Distribution target is missing or not materialized.",
+          );
+        }
+        ordinal = item.ordinal;
+      }
+      observed += page.items.length;
+      if (page.next_ordinal != null) {
+        if (
+          !page.items.length ||
+          page.next_ordinal !== ordinal ||
+          page.next_ordinal <= (afterOrdinal ?? -1)
+        ) {
+          throw new Error("Distribution target cursor made no progress.");
+        }
+        afterOrdinal = page.next_ordinal;
+      } else {
+        if (observed !== manifest.expected_count) {
+          throw new Error("Distribution target denominator is incomplete.");
+        }
+        finished = true;
+        break;
+      }
+    }
+  }
+  await capability.emit("distribution.prepared", {
+    execution_id: execution.execution_id,
+    cycle_id: execution.cycle_id,
+    handoff_id: handoff.handoff_id,
+    manifest_id: manifest.manifest_id,
+    targets: observed,
+  });
 }
 
 async function processItem(item, executionId, capability, ctx) {
@@ -94,6 +233,15 @@ export async function contentWorkflow(ctx) {
     throw new TypeError("Content workflow requires an execution reference.");
   }
   const capability = host();
+  const execution = await capability.executionRead({
+    execution_id: executionId,
+  });
+  if (
+    execution.execution_id !== executionId ||
+    typeof execution.cycle_id !== "string"
+  ) {
+    throw new Error("Content execution has no immutable cycle binding.");
+  }
   let cursor;
   let total;
   let observed = 0;
@@ -169,8 +317,9 @@ export async function contentWorkflow(ctx) {
     total,
     failed_steps: failed,
   });
+  await prepareDistribution(execution, handoff, capability, ctx);
   ctx.finish(
-    `Content execution ${executionId} closed with ${total} planned items.`,
+    `Content execution ${executionId} and distribution preparation completed.`,
   );
 }
 

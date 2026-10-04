@@ -15,6 +15,7 @@ use crate::AppState;
 fn execution_ref(execution: ContentExecution) -> ContentExecutionRef {
     ContentExecutionRef {
         execution_id: execution.execution_id,
+        cycle_id: execution.cycle_id,
         status: execution.status,
         coverage: execution.coverage,
     }

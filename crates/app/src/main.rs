@@ -61,8 +61,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
         }
         state.set_ready(true);
-        spawn_due_report_scanner(state.clone(), report_scanner, cycle_scanner);
-        (state, true, Some(content_scanner))
+        spawn_due_report_scanner(state.clone(), report_scanner, cycle_scanner.clone());
+        (state, true, Some((content_scanner, cycle_scanner)))
     } else {
         let password = config.validate_for_memory_mode()?;
         let state = channels::configure(
@@ -84,8 +84,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         (state, false, None)
     };
     runtime::configure_content_workflow(&state)?;
-    if let Some(scanner) = content_scanner {
-        content_dispatch::spawn(state.clone(), scanner);
+    if let Some((scanner, cycles)) = content_scanner {
+        content_dispatch::spawn(state.clone(), scanner, cycles);
     }
     dispatch::spawn(state.clone());
     let app: Router = router(state);

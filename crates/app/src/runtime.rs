@@ -135,9 +135,8 @@ pub(crate) fn configure_content_workflow(state: &AppState) -> Result<(), Assembl
     let (Ok(path), Ok(digest)) = (path, digest) else {
         return Err(AssemblyError::ContentConfiguration);
     };
-    if !state.content_model_available() {
-        return Err(AssemblyError::ContentConfiguration);
-    }
+    // Closed content executions can recover distribution preparation without
+    // generating text. Generation/bootstrapping is gated at dispatch instead.
     assemble_content_workflow(state, &path, &digest)
 }
 

@@ -11,13 +11,74 @@
 //! scheduler — is what makes the run's progress observable and its completion
 //! exactly once.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use geo_domain::{
-    AgentRepository, AgentRuntime, AppError, RunCompletion, RunStatus, StoreCheckpoint,
+    AgentRepository, AgentRuntime, AppError, RunCompletion, RunId, RunStatus, StoreCheckpoint,
     SubmitAcceptance, TenantScope, TurnInput, TurnReport, sha256_hex,
 };
 use serde_json::json;
+
+fn active_runs() -> &'static Mutex<HashMap<RunId, Arc<AtomicBool>>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<RunId, Arc<AtomicBool>>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ActiveRun(RunId);
+
+impl ActiveRun {
+    fn register(run_id: RunId, cancellation: Arc<AtomicBool>) -> Self {
+        active_runs()
+            .lock()
+            .expect("active run lock")
+            .insert(run_id, cancellation);
+        Self(run_id)
+    }
+}
+
+impl Drop for ActiveRun {
+    fn drop(&mut self) {
+        active_runs()
+            .lock()
+            .expect("active run lock")
+            .remove(&self.0);
+    }
+}
+
+/// Called only after the scoped repository has committed a cancelled run.
+/// A terminal success/failure must not interrupt another run.
+pub(crate) fn signal_cancelled(run_id: RunId) {
+    if let Some(flag) = active_runs().lock().expect("active run lock").get(&run_id) {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A cancellation can be accepted on another API replica. Check durable state
+/// while this particular run is live; a failed scoped read must fail closed.
+async fn watch_run(
+    repository: Arc<dyn AgentRepository>,
+    scope: TenantScope,
+    run_id: RunId,
+    cancellation: Arc<AtomicBool>,
+) {
+    // Local requests signal immediately. Remote replicas have a bounded
+    // fallback without keeping a connection occupied or reading histories.
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        interval.tick().await;
+        let still_running = matches!(
+            repository.run_status(&scope, run_id).await,
+            Ok(Some(RunStatus::Running))
+        );
+        if !still_running {
+            cancellation.store(true, Ordering::SeqCst);
+            break;
+        }
+    }
+}
 
 /// Starts the run an accepted message created.
 ///
@@ -80,6 +141,36 @@ async fn execute(
             return;
         }
     }
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let _active = ActiveRun::register(run_id, Arc::clone(&cancellation));
+    // A cancel on another replica may have committed after begin_run but
+    // before this executor registered its local flag. Resolve that gap before
+    // the first model/tool call; later changes are caught by the watcher.
+    if !matches!(
+        repository.run_status(&scope, run_id).await,
+        Ok(Some(RunStatus::Running))
+    ) {
+        cancellation.store(true, Ordering::SeqCst);
+        let _ = repository
+            .finish_run(
+                &scope,
+                run_id,
+                RunCompletion::Failed {
+                    error: AppError::new(
+                        geo_domain::ErrorCode::DependencyUnavailable,
+                        "run state could not be verified before execution",
+                    ),
+                },
+            )
+            .await;
+        return;
+    }
+    let monitor = tokio::spawn(watch_run(
+        Arc::clone(&repository),
+        scope.clone(),
+        run_id,
+        Arc::clone(&cancellation),
+    ));
 
     // The accepted message is the durable input authority, including its
     // attachment bindings. Reconstruct exactly the same input on reentry.
@@ -89,10 +180,33 @@ async fn execute(
             .await?
             .ok_or_else(|| AppError::not_found("run conversation not found"))?;
         let restored = detail.turn_input(run_id)?;
-        let report = runtime.run_turn(&scope, restored.clone()).await?;
+        let report = runtime
+            .run_turn_with_cancellation(&scope, restored.clone(), Arc::clone(&cancellation))
+            .await?;
         Ok::<_, AppError>((restored, report))
     }
     .await;
+    monitor.abort();
+    let _ = monitor.await;
+    // Cancellation may have committed while the runtime was returning its
+    // answer; only the store can decide the final result.
+    if cancellation.load(Ordering::SeqCst) {
+        // A replica's cancel remains authoritative; a failed watch read
+        // instead closes this run as failed, never as a fabricated success.
+        let _ = repository
+            .finish_run(
+                &scope,
+                run_id,
+                RunCompletion::Failed {
+                    error: AppError::new(
+                        geo_domain::ErrorCode::DependencyUnavailable,
+                        "run state could not be verified during execution",
+                    ),
+                },
+            )
+            .await;
+        return;
+    }
     let completion = match execution {
         Ok((restored, report)) => {
             match persist_runtime_state(&*repository, &scope, &restored, &report).await {
@@ -177,9 +291,42 @@ mod tests {
     };
     use serde_json::Value;
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     struct FixtureRuntime {
         metadata: Value,
+    }
+
+    struct WaitingRuntime {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl AgentRuntime for WaitingRuntime {
+        async fn capability(&self) -> RuntimeCapability {
+            RuntimeCapability::available("waiting", Some("1".to_owned()))
+        }
+
+        async fn run_turn(
+            &self,
+            _scope: &TenantScope,
+            _input: TurnInput,
+        ) -> Result<TurnReport, AppError> {
+            unreachable!("executor must provide the run-scoped cancellation flag")
+        }
+
+        async fn run_turn_with_cancellation(
+            &self,
+            _scope: &TenantScope,
+            _input: TurnInput,
+            cancellation: Arc<AtomicBool>,
+        ) -> Result<TurnReport, AppError> {
+            self.started.notify_one();
+            while !cancellation.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(AppError::conflict("run stopped"))
+        }
     }
 
     #[async_trait]
@@ -277,5 +424,124 @@ mod tests {
             .await
             .expect("ledger lookup");
         assert!(calls.is_empty(), "script metadata is not a trusted ledger");
+    }
+
+    #[tokio::test]
+    async fn durable_cancellation_on_another_replica_stops_only_its_run() {
+        let repository = Arc::new(MemoryAgentRepository::new());
+        let scope = fixture_scope();
+        let conversation = repository
+            .create_conversation(&scope, None, CreateConversation::default())
+            .await
+            .unwrap();
+        let acceptance = repository
+            .append_message(
+                &scope,
+                conversation.id,
+                AppendMessage {
+                    content: "wait".to_owned(),
+                    attachments: Vec::new(),
+                    metadata: Value::Null,
+                },
+                "waiting-key".to_owned(),
+                "waiting-body".to_owned(),
+                RuntimeCapability::available("waiting", None),
+            )
+            .await
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let ready = started.notified();
+        dispatch(
+            Arc::new(WaitingRuntime {
+                started: Arc::clone(&started),
+            }),
+            repository.clone(),
+            scope.clone(),
+            &acceptance,
+        );
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("run must start");
+        // Simulate the cancellation being committed by a different API
+        // replica: no local signal_cancelled call is made.
+        repository
+            .cancel_turn(&scope, acceptance.turn.id)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while active_runs()
+                .lock()
+                .unwrap()
+                .contains_key(&acceptance.run.id)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("durable cancellation must stop the running executor");
+        let detail = repository
+            .get_conversation(&scope, conversation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail
+                .runs
+                .iter()
+                .find(|run| run.id == acceptance.run.id)
+                .unwrap()
+                .status,
+            RunStatus::Cancelled
+        );
+        assert!(
+            repository
+                .load_checkpoint(&scope, acceptance.run.id, "agent.turn", "completed")
+                .await
+                .unwrap()
+                .is_none(),
+            "cancelled run cannot publish a completed checkpoint"
+        );
+        let next = repository
+            .append_message(
+                &scope,
+                conversation.id,
+                AppendMessage {
+                    content: "new turn".to_owned(),
+                    attachments: Vec::new(),
+                    metadata: Value::Null,
+                },
+                "fresh-key".to_owned(),
+                "fresh-body".to_owned(),
+                RuntimeCapability::available("fixture", None),
+            )
+            .await
+            .unwrap();
+        dispatch(
+            Arc::new(FixtureRuntime {
+                metadata: Value::Null,
+            }),
+            repository.clone(),
+            scope.clone(),
+            &next,
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = repository
+                    .get_conversation(&scope, conversation.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if detail
+                    .runs
+                    .iter()
+                    .any(|run| run.id == next.run.id && run.status == RunStatus::Succeeded)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a new run is not poisoned by the cancelled run");
     }
 }

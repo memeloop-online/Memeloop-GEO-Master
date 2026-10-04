@@ -505,6 +505,9 @@ pub(crate) async fn cancel_turn(
         .cancel_turn(&scope, turn_id)
         .await
         .map_err(|error| api_error(error, request_id(context)))?;
+    if run.status == geo_domain::RunStatus::Cancelled {
+        run_executor::signal_cancelled(run.id);
+    }
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 

@@ -6,7 +6,10 @@
 //! `capability_missing` result the API has always produced, with no field
 //! through which a fabricated reply could reach the UI.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -75,6 +78,14 @@ export async function main() {
 "#;
 
 static HEAP_RUNAWAY_BUNDLE: &[(&str, &str)] = &[(HEAP_RUNAWAY_MODULE, HEAP_RUNAWAY_JS)];
+
+const SPIN_MODULE: &str = "memeloop://bundle/cancel-spin.js";
+const SPIN_JS: &str = r#"
+export async function main() {
+  while (true) {}
+}
+"#;
+static SPIN_BUNDLE: &[(&str, &str)] = &[(SPIN_MODULE, SPIN_JS)];
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -926,5 +937,83 @@ async fn cancelling_an_executing_turn_outranks_its_completion() {
     assert!(
         assistant_messages(&detail).is_empty(),
         "a cancelled turn must not record an answer: {detail}"
+    );
+}
+
+fn cancellation_input() -> geo_domain::TurnInput {
+    geo_domain::TurnInput {
+        conversation_id: uuid::Uuid::new_v4().into(),
+        message_id: uuid::Uuid::new_v4().into(),
+        turn_id: uuid::Uuid::new_v4().into(),
+        run_id: uuid::Uuid::new_v4().into(),
+        prompt: "isolated cancellation".to_owned(),
+        attachments: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_interrupts_a_spinning_isolate_without_affecting_a_new_turn() {
+    let runtime =
+        EmbeddedAgentRuntime::with_bundle(SPIN_BUNDLE, SPIN_MODULE, Arc::new(Recorder::new()));
+    let spin_scope = scope();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        runtime
+            .run_turn_with_cancellation(&spin_scope, cancellation_input(), flag)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancelled.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("a spinning isolate must stop promptly")
+        .expect("turn task must not panic");
+    assert!(
+        result.is_err(),
+        "cancelled JavaScript cannot report success"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let clean = EmbeddedAgentRuntime::configured(Arc::new(Recorder::new()));
+    let answer = clean
+        .run_turn(&scope(), cancellation_input())
+        .await
+        .expect("a new run must use its own cancellation state");
+    assert!(answer.content.starts_with("bridge:"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_interrupts_a_suspended_model_op_without_waiting_for_its_budget() {
+    let recorder = Arc::new(Recorder::stalling(Duration::from_secs(5)));
+    let runtime = EmbeddedAgentRuntime::configured(recorder.clone());
+    let scope = scope();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    let task = tokio::spawn(async move {
+        runtime
+            .run_turn_with_cancellation(&scope, cancellation_input(), flag)
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while recorder.seen().is_empty() {
+        assert!(Instant::now() < deadline, "model op never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cancelled.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("a suspended model op must stop before its five-second budget")
+        .expect("turn task must not panic");
+    assert!(result.is_err(), "cancelled model op cannot report success");
+    assert_eq!(
+        recorder
+            .seen()
+            .iter()
+            .filter(|(op, _)| *op == HostOp::ModelComplete)
+            .count(),
+        1,
+        "no additional model calls after cancellation"
     );
 }

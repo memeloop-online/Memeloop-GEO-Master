@@ -23,7 +23,10 @@
 //!   reporting one is an error, never an empty answer.
 
 use std::fmt;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -274,7 +277,12 @@ impl fmt::Debug for EmbeddedAgentRuntime {
 
 impl EmbeddedAgentRuntime {
     /// Runs one turn on its own thread and reports what the bundle produced.
-    async fn run(&self, scope: &TenantScope, input: TurnInput) -> Result<TurnReport, AppError> {
+    async fn run(
+        &self,
+        scope: &TenantScope,
+        input: TurnInput,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<TurnReport, AppError> {
         let Some(configured) = self.configured.as_ref() else {
             return Err(AppError::capability_missing(RUNTIME_NOT_CONFIGURED));
         };
@@ -285,6 +293,10 @@ impl EmbeddedAgentRuntime {
         let v8_heap_limit_bytes = configured.v8_heap_limit_bytes;
         let run_scope = scope.clone();
         let attachments = input.attachments.clone();
+        let worker_cancellation = Arc::clone(&cancellation);
+        if cancellation.load(Ordering::SeqCst) {
+            return Err(AppError::new(ErrorCode::Conflict, "run was cancelled"));
+        }
         // The isolate is `!Send`, so it is built, driven and dropped inside one
         // blocking task — and on a current-thread runtime of its own, because
         // that is the only flavor the engine's op driver can be driven on.  The
@@ -302,9 +314,38 @@ impl EmbeddedAgentRuntime {
             engine.block_on(async {
                 let bridge = HostBridge::new(capabilities, run_scope, application)
                     .with_attachments(attachments)
+                    .with_cancellation(Arc::clone(&worker_cancellation))
                     .with_budgets(HostOpBudgets::default());
                 let mut runtime = Self::new_host_runtime(bundle, bridge, v8_heap_limit_bytes)?;
-                runtime.call_main(entry, &argument, TURN_DEADLINE).await?;
+                let isolate_handle = runtime.thread_safe_handle();
+                let (stop, stopped) = std::sync::mpsc::channel();
+                let watch_cancel = Arc::clone(&worker_cancellation);
+                let watcher = std::thread::spawn(move || {
+                    while !watch_cancel.load(Ordering::SeqCst) {
+                        if !matches!(
+                            stopped.recv_timeout(Duration::from_millis(5)),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        ) {
+                            return;
+                        }
+                    }
+                    isolate_handle.terminate_execution();
+                });
+                // The isolate can be in a synchronous JS loop, so a Tokio
+                // timer alone cannot interrupt it. For suspended promises the
+                // select also wakes the current-thread event loop promptly.
+                let called = tokio::select! {
+                    result = runtime.call_main(entry, &argument, TURN_DEADLINE) => result,
+                    () = wait_for_cancel(Arc::clone(&worker_cancellation)) => {
+                        Err(WorkerError::new("cancelled", "run was cancelled"))
+                    }
+                };
+                let _ = stop.send(());
+                let _ = watcher.join();
+                called?;
+                if worker_cancellation.load(Ordering::SeqCst) {
+                    return Err(WorkerError::new("cancelled", "run was cancelled"));
+                }
                 Ok::<_, WorkerError>(runtime.host_state())
             })
         })
@@ -318,6 +359,9 @@ impl EmbeddedAgentRuntime {
             )
         })?;
         let state = finished.map_err(turn_failure)?;
+        if cancellation.load(Ordering::SeqCst) {
+            return Err(AppError::new(ErrorCode::Conflict, "run was cancelled"));
+        }
         let completed = state
             .events
             .iter()
@@ -368,7 +412,23 @@ impl AgentRuntime for EmbeddedAgentRuntime {
         scope: &TenantScope,
         input: TurnInput,
     ) -> Result<TurnReport, AppError> {
-        self.run(scope, input).await
+        self.run(scope, input, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    async fn run_turn_with_cancellation(
+        &self,
+        scope: &TenantScope,
+        input: TurnInput,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<TurnReport, AppError> {
+        self.run(scope, input, cancellation).await
+    }
+}
+
+async fn wait_for_cancel(cancellation: Arc<AtomicBool>) {
+    while !cancellation.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 

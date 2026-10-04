@@ -8,6 +8,24 @@ use geo_domain::{
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
+// Only work that can still create a coverage row or a logical publication
+// intent is a closed-stage dispatch candidate. Unknown/sent intents and
+// permanently unsupported cells must not cause hot-loop rescans.
+const CLOSED_WORK_ELIGIBLE: &str = "\
+    (NOT EXISTS (SELECT 1 FROM distribution_execution_manifests d WHERE \
+      (d.operator_id,d.tenant_id,d.project_id,d.cycle_id)= \
+      (c.operator_id,c.tenant_id,c.project_id,c.cycle_id)) \
+     OR EXISTS (SELECT 1 FROM distribution_execution_manifests d WHERE \
+       (d.operator_id,d.tenant_id,d.project_id,d.cycle_id)= \
+       (c.operator_id,c.tenant_id,c.project_id,c.cycle_id) \
+       AND d.content_execution_id=c.execution_id \
+       AND (NOT d.complete OR EXISTS (SELECT 1 FROM distribution_execution_targets t \
+         WHERE (t.operator_id,t.tenant_id,t.project_id,t.manifest_id)= \
+           (d.operator_id,d.tenant_id,d.project_id,d.manifest_id) \
+         AND (t.current_body->>'status'='pending' \
+              OR (t.current_body->>'status'='deferred' AND t.current_body->>'reason' IN \
+                ('account_unassigned','source_unavailable','source_changed','content_unsupported')))))))";
+
 #[derive(Debug, Clone)]
 pub struct ContentDispatchCandidate {
     pub scope: TenantScope,
@@ -71,6 +89,46 @@ impl PgContentRepository {
             })
             .collect())
     }
+    /// Independent closed-stage scan works even without a configured model.
+    /// A later page can never be hidden by an earlier deferred target.
+    pub async fn scan_closed_after(
+        &self,
+        after: Option<Uuid>,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ContentDispatchCandidate>, AppError> {
+        if !(1..=1000).contains(&limit) {
+            return Err(AppError::invalid_request("invalid content scan page size"));
+        }
+        let query = format!(
+            "SELECT c.operator_id,c.tenant_id,c.project_id,c.execution_id \
+             FROM content_executions c JOIN projects p \
+               ON (p.operator_id,p.tenant_id,p.project_id)=(c.operator_id,c.tenant_id,c.project_id) \
+             WHERE ($1::uuid IS NULL OR c.execution_id>$1) \
+               AND c.state->'execution'->>'status'='closed' AND p.status='active' \
+               AND (c.dispatch_expires_at IS NULL OR c.dispatch_expires_at<=$2) \
+               AND (c.dispatch_retry_after IS NULL OR c.dispatch_retry_after<=$2) \
+               AND {CLOSED_WORK_ELIGIBLE} ORDER BY c.execution_id LIMIT $3"
+        );
+        let rows = sqlx::query(&query)
+            .bind(after)
+            .bind(now)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ContentDispatchCandidate {
+                scope: TenantScope::new(
+                    row.get::<Uuid, _>("operator_id").into(),
+                    row.get::<Uuid, _>("tenant_id").into(),
+                    Some(row.get::<Uuid, _>("project_id").into()),
+                ),
+                execution_id: row.get("execution_id"),
+            })
+            .collect())
+    }
     /// Serializes with content step transitions and status changes on the
     /// execution row. A live old step lease delays takeover until it expires.
     pub async fn try_claim_dispatch(
@@ -104,7 +162,7 @@ impl PgContentRepository {
         .map_err(db)?;
         let Some(row) = row else { return Ok(None) };
         let state = decode(row.get("state"))?;
-        if state.execution.status != geo_domain::ContentExecutionStatus::Running
+        if state.execution.status == geo_domain::ContentExecutionStatus::Cancelled
             || row
                 .get::<Option<DateTime<Utc>>, _>("dispatch_expires_at")
                 .is_some_and(|t| t > now)
@@ -113,6 +171,23 @@ impl PgContentRepository {
                 .is_some_and(|t| t > now)
         {
             return Ok(None);
+        }
+        if state.execution.status == geo_domain::ContentExecutionStatus::Closed {
+            let query = format!(
+                "SELECT {CLOSED_WORK_ELIGIBLE} AS eligible FROM content_executions c \
+                 WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 AND c.execution_id=$4"
+            );
+            let eligible: bool = sqlx::query_scalar(&query)
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(project.as_uuid())
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?;
+            if !eligible {
+                return Ok(None);
+            }
         }
         if let Some(until) = state
             .items
@@ -165,7 +240,7 @@ impl PgContentRepository {
             "UPDATE content_executions SET dispatch_expires_at=$1 \
              WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 AND execution_id=$5 \
                AND dispatch_token=$6 AND dispatch_expires_at>$7 \
-               AND state->'execution'->>'status'='running' \
+               AND state->'execution'->>'status' IN ('running','closed') \
                AND EXISTS (SELECT 1 FROM projects p WHERE p.operator_id=$2 AND p.tenant_id=$3 \
                    AND p.project_id=$4 AND p.status='active')",
         )
@@ -355,6 +430,24 @@ impl ContentRepository for PgContentRepository {
             return Err(AppError::invalid_request("project scope required"));
         };
         let mut tx = self.transaction(scope).await?;
+        // Serializes bootstrap with schedule_next_cycle and project pause.
+        // Service-level validation alone is insufficient across those calls.
+        let current: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT status,current_cycle_id FROM projects \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if !matches!(current, Some((ref status, Some(id))) if status == "active" && id == cycle_id)
+        {
+            return Err(AppError::conflict(
+                "content start requires an active current cycle",
+            ));
+        }
         let linked: Option<i32> = sqlx::query_scalar(
             "SELECT revision FROM document_manifests WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND cycle_id=$4 AND manifest_id=$5 AND sealed=true",
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid()).bind(cycle_id)
