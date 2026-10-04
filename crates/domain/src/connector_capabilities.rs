@@ -1,8 +1,12 @@
 //! Operator-wide connector availability. Account login is not publication proof.
-use crate::{AppError, ChannelOutcome, ChannelOutcomeStatus, OperatorId};
+use crate::{
+    AppError, ChannelAttempt, ChannelOutcome, ChannelOutcomeStatus, ChannelTarget,
+    ChannelTargetInput, OperatorId,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -35,6 +39,169 @@ pub struct ConnectorVerification {
     pub publication_receipt: ChannelOutcome,
     pub public_readback: ChannelOutcome,
     pub verified_at: DateTime<Utc>,
+}
+
+/// The actual wire representation of both a frozen source article and a
+/// markdown-based generated variant. Document semantics are not wire formats.
+pub const PLAIN_TEXT_ARTICLE_FORMAT: &str = "plain_text_article.v1";
+
+pub fn publication_format_for_semantic_type(content_type: &str) -> Option<&'static str> {
+    match content_type {
+        "faq" | "guide" | "article" | "comparison" | "case_study" | "landing_page"
+        | "product_page" | "how_to" | "company_profile" => Some(PLAIN_TEXT_ARTICLE_FORMAT),
+        _ => None,
+    }
+}
+
+/// Hash of the exact normalized title/body submitted to the plain text runner.
+pub fn plain_text_article_readback_hash(title: &str, body: &str) -> String {
+    let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    hex::encode(Sha256::digest(
+        format!("{}\n{}", normalized(title), normalized(body)).as_bytes(),
+    ))
+}
+
+/// SQLx/chrono encodes PostgreSQL `timestamptz` with truncated microseconds;
+/// keep exact Rust receipt-marker comparison, but use persisted precision
+/// for claimed/observed/received ordering and idempotent database replay.
+pub fn publication_storage_timestamp(at: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_micros(at.timestamp_micros())
+        .expect("valid persisted event timestamp")
+}
+
+/// Pure portion of the trusted projection; the caller MUST first load and
+/// cross-check the scoped saved target, attempt, account and source/intent.
+pub fn saved_publication_verification(
+    target: &ChannelTarget,
+    attempt: &ChannelAttempt,
+) -> Result<Option<ConnectorVerification>, AppError> {
+    let (platform, title, body, frozen_hash) = match &target.input {
+        ChannelTargetInput::Publish {
+            platform,
+            title,
+            body,
+            body_sha256,
+            ..
+        }
+        | ChannelTargetInput::GeneratedPublish {
+            platform,
+            title,
+            body,
+            body_sha256,
+            ..
+        } => (platform, title, body, body_sha256),
+        ChannelTargetInput::Measure { .. } => return Ok(None),
+    };
+    let Some(outcome) = attempt.outcome.as_ref() else {
+        return Ok(None);
+    };
+    let Some(received_at) = attempt.received_at else {
+        return Ok(None);
+    };
+    if attempt.target_id != target.target_id
+        || outcome.fixture
+        || outcome.status != ChannelOutcomeStatus::Verified
+        || publication_storage_timestamp(attempt.claimed_at)
+            > publication_storage_timestamp(outcome.occurred_at)
+        || publication_storage_timestamp(outcome.occurred_at)
+            > publication_storage_timestamp(received_at)
+        || !valid_label(platform)
+        || title.trim().is_empty()
+        || body.trim().is_empty()
+        || hex::encode(Sha256::digest(body.as_bytes())) != *frozen_hash
+    {
+        return Ok(None);
+    }
+    let Some(version) = outcome.connector_version.as_deref() else {
+        return Ok(None);
+    };
+    if !valid_label(version) || version.to_ascii_lowercase().contains("fixture") {
+        return Ok(None);
+    }
+    // The marker is appended by Rust after the runner reply has been checked;
+    // a legacy false fixture flag alone is not evidence of a live execution.
+    let markers: Vec<_> = outcome
+        .runner_evidence
+        .iter()
+        .filter(|proof| proof.get("kind").and_then(|v| v.as_str()) == Some("runner_receipt"))
+        .collect();
+    if markers.len() != 1
+        || !markers.iter().any(|proof| {
+            proof.get("schema_version").and_then(|v| v.as_str()) == Some("geo.runner.receipt.v1")
+                && proof.get("provenance").and_then(|v| v.as_str()) == Some("live")
+                && proof.get("execution_id").and_then(|v| v.as_str())
+                    == Some(attempt.attempt_id.to_string().as_str())
+                && proof.get("connector_version").and_then(|v| v.as_str()) == Some(version)
+                && proof
+                    .get("occurred_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+                    .is_some_and(|time| time.with_timezone(&Utc) == outcome.occurred_at)
+        })
+    {
+        return Ok(None);
+    }
+    let hash = plain_text_article_readback_hash(title, body);
+    let readback: Vec<_> = outcome
+        .runner_evidence
+        .iter()
+        .filter(|proof| {
+            proof.get("kind").and_then(|v| v.as_str()) == Some("public_readback")
+                && proof.get("url").and_then(|v| v.as_str()) == outcome.public_url.as_deref()
+                && proof.get("content_matched").and_then(|v| v.as_bool()) == Some(true)
+                && proof.get("owned_by_account").and_then(|v| v.as_bool()) == Some(true)
+                && proof.get("expected_sha256").and_then(|v| v.as_str()) == Some(hash.as_str())
+                && proof.get("readback_sha256").and_then(|v| v.as_str()) == Some(hash.as_str())
+        })
+        .collect();
+    if readback.len() != 1
+        || !outcome.public_url.as_deref().is_some_and(|raw| {
+            Url::parse(raw).is_ok_and(|url| {
+                let zhihu_post = url
+                    .path()
+                    .strip_prefix("/p/")
+                    .unwrap_or_default()
+                    .trim_end_matches('/');
+                url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.fragment().is_none()
+                    && (platform != "zhihu"
+                        || (matches!(url.host_str(), Some("www.zhihu.com" | "zhuanlan.zhihu.com"))
+                            && !zhihu_post.is_empty()
+                            && zhihu_post.bytes().all(|byte| byte.is_ascii_digit())
+                            && url.query().is_none()))
+            })
+        })
+    {
+        return Ok(None);
+    }
+    let id_hash = Sha256::digest(
+        format!(
+            "connector-saved-attempt:{}:{PLAIN_TEXT_ARTICLE_FORMAT}",
+            attempt.attempt_id
+        )
+        .as_bytes(),
+    );
+    let mut id_bytes = [0_u8; 16];
+    id_bytes.copy_from_slice(&id_hash[..16]);
+    id_bytes[6] = (id_bytes[6] & 0x0f) | 0x50;
+    id_bytes[8] = (id_bytes[8] & 0x3f) | 0x80;
+    let verification = ConnectorVerification {
+        verification_id: Uuid::from_bytes(id_bytes),
+        key: ConnectorKey {
+            platform_id: platform.clone(),
+            placement_slot: "primary".into(),
+        },
+        connector_version: version.into(),
+        content_type: PLAIN_TEXT_ARTICLE_FORMAT.into(),
+        publication_receipt: outcome.clone(),
+        public_readback: outcome.clone(),
+        verified_at: outcome.occurred_at,
+    };
+    verification.validate_saved()?;
+    Ok(Some(verification))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,9 +253,24 @@ impl ConnectorVerification {
     /// client-provided input. This validates provenance and content readback,
     /// but cannot itself establish that the caller contacted the platform.
     pub fn validate(&self) -> Result<(), AppError> {
+        self.validate_inner(true)
+    }
+
+    /// Only saved attempts with a separately verified Rust-owned live marker.
+    pub fn validate_saved(&self) -> Result<(), AppError> {
+        self.validate_inner(false)
+    }
+
+    fn validate_inner(&self, legacy_version_policy: bool) -> Result<(), AppError> {
         self.key.validate()?;
         if self.verification_id.is_nil()
-            || !trusted_version(&self.connector_version)
+            || (legacy_version_policy && !trusted_version(&self.connector_version))
+            || (!legacy_version_policy
+                && (!valid_label(&self.connector_version)
+                    || self
+                        .connector_version
+                        .to_ascii_lowercase()
+                        .contains("fixture")))
             || !valid_label(&self.content_type)
             || self.publication_receipt.fixture
             || self.public_readback.fixture
@@ -160,7 +342,8 @@ pub fn resolve_connector(
     };
     if !current.enabled {
         result.availability = ConnectorAvailability::Disabled;
-    } else if !trusted_version(deployed_version)
+    } else if !valid_label(deployed_version)
+        || deployed_version.to_ascii_lowercase().contains("fixture")
         || !verifications
             .iter()
             .any(|v| v.connector_version == deployed_version)
@@ -197,7 +380,8 @@ pub fn validate_connector_settings(
     }
     if enabled
         && (content_types.is_empty()
-            || !trusted_version(deployed_version)
+            || !valid_label(deployed_version)
+            || deployed_version.to_ascii_lowercase().contains("fixture")
             || content_types.iter().any(|kind| {
                 !verifications
                     .iter()
@@ -573,5 +757,152 @@ mod tests {
             ConnectorAvailability::Disabled
         );
         assert_eq!(repo.history(operator, &key).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn saved_attempt_requires_rust_live_receipt_exact_payload_and_event_times() {
+        let claimed_at = Utc::now();
+        let target = ChannelTarget {
+            target_id: Uuid::new_v4(),
+            input: ChannelTargetInput::Publish {
+                source_id: Uuid::new_v4(),
+                source_version_id: Uuid::new_v4(),
+                platform: "creator".into(),
+                account_id: Uuid::new_v4(),
+                title: "Title".into(),
+                body: "Body content".into(),
+                body_sha256: hex::encode(Sha256::digest(b"Body content")),
+            },
+        };
+        let attempt_id = Uuid::new_v4();
+        let version = "source_derived.unverified.v1";
+        let url = "https://example.com/posts/123";
+        let hash = plain_text_article_readback_hash("Title", "Body content");
+        let outcome = ChannelOutcome {
+            status: ChannelOutcomeStatus::Verified,
+            detail: None,
+            occurred_at: claimed_at,
+            raw_answer: None,
+            citations: vec![],
+            public_url: Some(url.into()),
+            screenshot_ref: None,
+            connector_version: Some(version.into()),
+            fixture: false,
+            runner_evidence: vec![serde_json::json!({
+                "kind":"public_readback","url":url,"content_matched":true,
+                "owned_by_account":true,"expected_sha256":hash,"readback_sha256":hash
+            })],
+        };
+        let mut attempt = ChannelAttempt {
+            attempt_id,
+            target_id: target.target_id,
+            claimed_at,
+            outcome: Some(outcome),
+            received_at: Some(claimed_at),
+        };
+        assert!(
+            saved_publication_verification(&target, &attempt)
+                .unwrap()
+                .is_none(),
+            "a legacy fixture:false flag alone cannot promote a connector"
+        );
+        attempt
+            .outcome
+            .as_mut()
+            .unwrap()
+            .runner_evidence
+            .push(serde_json::json!({
+                "kind":"runner_receipt","schema_version":"geo.runner.receipt.v1",
+                "provenance":"live","execution_id":attempt_id,
+                "connector_version":version,"occurred_at":claimed_at
+            }));
+        let proof = saved_publication_verification(&target, &attempt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.content_type, PLAIN_TEXT_ARTICLE_FORMAT);
+        assert_eq!(proof.connector_version, version);
+        assert_eq!(
+            saved_publication_verification(&target, &attempt)
+                .unwrap()
+                .unwrap(),
+            proof
+        );
+        let mut changed = target.clone();
+        if let ChannelTargetInput::Publish { body_sha256, .. } = &mut changed.input {
+            *body_sha256 = "0".repeat(64);
+        }
+        assert!(
+            saved_publication_verification(&changed, &attempt)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = attempt.clone();
+        changed.received_at = Some(claimed_at - chrono::Duration::seconds(1));
+        assert!(
+            saved_publication_verification(&target, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = attempt.clone();
+        changed.outcome.as_mut().unwrap().runner_evidence[0]["readback_sha256"] =
+            "0".repeat(64).into();
+        assert!(
+            saved_publication_verification(&target, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = attempt.clone();
+        changed.outcome.as_mut().unwrap().runner_evidence[1]["execution_id"] =
+            Uuid::new_v4().to_string().into();
+        assert!(
+            saved_publication_verification(&target, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = attempt.clone();
+        changed.outcome.as_mut().unwrap().runner_evidence[1]["connector_version"] =
+            "other.v1".into();
+        assert!(
+            saved_publication_verification(&target, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = attempt.clone();
+        changed.outcome.as_mut().unwrap().fixture = true;
+        assert!(
+            saved_publication_verification(&target, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = attempt.clone();
+        changed.outcome.as_mut().unwrap().public_url = Some("https://example.com/p/other".into());
+        assert!(
+            saved_publication_verification(&target, &changed)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn publication_format_does_not_relabel_unknown_or_rich_formats() {
+        assert_eq!(
+            publication_format_for_semantic_type("faq"),
+            Some(PLAIN_TEXT_ARTICLE_FORMAT)
+        );
+        assert_eq!(
+            publication_format_for_semantic_type("article"),
+            Some(PLAIN_TEXT_ARTICLE_FORMAT)
+        );
+        assert_eq!(publication_format_for_semantic_type("image"), None);
+        assert_eq!(publication_format_for_semantic_type("rich_text"), None);
+    }
+
+    #[test]
+    fn persisted_event_timestamp_truncates_submicrosecond_precision() {
+        let event = DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        assert_eq!(
+            publication_storage_timestamp(event),
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_000).unwrap()
+        );
     }
 }

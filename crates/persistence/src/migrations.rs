@@ -92,6 +92,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 20,
         description: "connector capabilities",
     },
+    MigrationMetadata {
+        version: 21,
+        description: "saved connector verifications",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

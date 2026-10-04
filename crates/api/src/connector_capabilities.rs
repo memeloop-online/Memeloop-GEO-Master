@@ -8,7 +8,8 @@ use axum::{
     extract::{Extension, Path, State},
 };
 use geo_domain::{
-    AppError, ConnectorAvailability, ConnectorKey, ConnectorSettings, ProjectId, TenantScope,
+    AppError, ConnectorAvailability, ConnectorKey, ConnectorSettings, PLAIN_TEXT_ARTICLE_FORMAT,
+    ProjectId, TenantScope, publication_format_for_semantic_type,
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,41 @@ fn catalog(settings: &[ConnectorSettings]) -> Vec<ConnectorKey> {
             placement_slot,
         })
         .collect()
+}
+
+/// Resolve a generated document's semantic type to the proven publication
+/// wire format. Old explicitly proven semantic settings remain readable; an
+/// unrecognized/media semantic never inherits a plain-text article proof.
+pub(crate) fn configured_publication_format<'a>(
+    settings: &ConnectorSettings,
+    semantic: &'a str,
+) -> Option<&'a str> {
+    let wire = publication_format_for_semantic_type(semantic)?;
+    if settings
+        .content_types
+        .iter()
+        .any(|configured| configured == wire)
+    {
+        Some(wire)
+    } else if settings
+        .content_types
+        .iter()
+        .any(|configured| configured == semantic)
+    {
+        Some(semantic)
+    } else {
+        None
+    }
+}
+
+/// Source articles carry no document semantic label. Unlike generated
+/// documents, old semantic proofs cannot authorize their plain-text payload.
+pub(crate) fn configured_source_format(settings: &ConnectorSettings) -> Option<&'static str> {
+    settings
+        .content_types
+        .iter()
+        .any(|configured| configured == PLAIN_TEXT_ARTICLE_FORMAT)
+        .then_some(PLAIN_TEXT_ARTICLE_FORMAT)
 }
 
 pub(crate) async fn deployed_versions(
@@ -249,3 +285,7 @@ pub async fn list_project(
     }
     Ok(Json(ConnectorCapabilityList { items }))
 }
+
+#[cfg(test)]
+#[path = "connector_capabilities_tests.rs"]
+mod tests;

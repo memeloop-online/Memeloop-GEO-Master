@@ -47,7 +47,7 @@ async fn mock_runner(
                 StatusCode::OK,
                 Json(json!({
                     "execution_id":payload.unwrap().0["execution_id"],
-                    "status":"unknown","evidence":[]
+                    "status":"unknown","provenance":"fixture","evidence":[]
                 })),
             )
         }
@@ -316,6 +316,7 @@ async fn duplicated_dispatch_sends_once_and_unknown_is_never_retried() {
     );
     let view = repo.get_target(&scope, target).await.unwrap();
     assert_eq!(view.attempts.len(), 1);
+    assert!(view.attempts[0].outcome.as_ref().unwrap().fixture);
     assert_eq!(sends.load(Ordering::SeqCst), 1);
     // Unknown may mean the remote request outlived our response; retain the
     // account reservation for its bounded deadline, without retrying target.

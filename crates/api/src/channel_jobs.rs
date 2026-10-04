@@ -129,13 +129,18 @@ async fn generated_connector_available(
     let Some(settings) = settings else {
         return Ok(false);
     };
-    if settings.content_types.contains(&document.content_type)
-        && state
-            .connector_capability_repository()
-            .resolve(scope.operator_id, &key, version, &document.content_type)
-            .await?
-            .availability
-            == ConnectorAvailability::Available
+    let Some(proof_format) = crate::connector_capabilities::configured_publication_format(
+        &settings,
+        &document.content_type,
+    ) else {
+        return Ok(false);
+    };
+    if state
+        .connector_capability_repository()
+        .resolve(scope.operator_id, &key, version, proof_format)
+        .await?
+        .availability
+        == ConnectorAvailability::Available
     {
         return Ok(true);
     }
@@ -170,18 +175,18 @@ async fn legacy_connector_available(
     let Some(version) = crate::connector_capabilities::deployed_version(&connectors, &key) else {
         return Ok(false);
     };
-    for kind in &settings.content_types {
-        if state
-            .connector_capability_repository()
-            .resolve(scope.operator_id, &key, version, kind)
-            .await?
-            .availability
-            == ConnectorAvailability::Available
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    // Source publications have no document semantic type. They can bootstrap
+    // an absent configuration, but configured sends require proof of their
+    // actual title/body wire representation, not any unrelated semantic proof.
+    let Some(format) = crate::connector_capabilities::configured_source_format(&settings) else {
+        return Ok(false);
+    };
+    Ok(state
+        .connector_capability_repository()
+        .resolve(scope.operator_id, &key, version, format)
+        .await?
+        .availability
+        == ConnectorAvailability::Available)
 }
 
 #[derive(Debug)]
@@ -242,6 +247,17 @@ fn publication_readback(
     result: &crate::browser_bridge::BrowserExecution,
     target: &ChannelTargetInput,
 ) -> bool {
+    if result.provenance != Some(crate::browser_bridge::BrowserReceiptProvenance::Live)
+        || result.connector_version.as_deref().is_none_or(|version| {
+            version.trim().is_empty() || version.len() > 100 || version.starts_with("fixture")
+        })
+        || result
+            .evidence
+            .iter()
+            .any(|proof| proof["kind"] == "runner_receipt")
+    {
+        return false;
+    }
     let (platform, title, body) = match target {
         ChannelTargetInput::Publish {
             platform,
@@ -259,7 +275,10 @@ fn publication_readback(
     };
     let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let expected_hash = sha256_hex(format!("{}\n{}", normalize(title), normalize(body)).as_bytes());
-    if result.status != "completed" || result.stage.as_deref() != Some("public_readback") {
+    if result.status != "completed"
+        || result.stage.as_deref() != Some("public_readback")
+        || result.occurred_at.is_none()
+    {
         return false;
     }
     let Some(url) = result
@@ -340,6 +359,14 @@ fn measurement_observation(
     claimed_at: DateTime<Utc>,
     received_at: DateTime<Utc>,
 ) -> Option<(ChannelOutcomeStatus, String, Vec<String>)> {
+    if result.provenance != Some(crate::browser_bridge::BrowserReceiptProvenance::Live)
+        || result
+            .evidence
+            .iter()
+            .any(|proof| proof["kind"] == "runner_receipt")
+    {
+        return None;
+    }
     let ChannelTargetInput::Measure {
         account_id,
         provider,
@@ -1162,9 +1189,13 @@ async fn execute_reserved_channel_target(
     }
     let received_at = Utc::now();
     let outcome = match resolved {
-        Ok(result) => {
+        Ok(mut result) => {
             let matched = result.execution_id == attempt.attempt_id;
-            let verified = matched && publication_readback(&result, &target.input);
+            let verified = matched
+                && result
+                    .occurred_at
+                    .is_some_and(|at| at >= attempt.claimed_at && at <= received_at)
+                && publication_readback(&result, &target.input);
             let observation = if matched {
                 measurement_observation(&result, &target, attempt.claimed_at, received_at)
             } else {
@@ -1184,6 +1215,52 @@ async fn execute_reserved_channel_target(
             let (raw_answer, citations) = observation
                 .map(|(_, answer, citations)| (Some(answer), citations))
                 .unwrap_or((None, vec![]));
+            // Adapter evidence must never supply a Rust-owned receipt marker.
+            // Retain genuine raw evidence and add one normalized marker only
+            // for the attempted execution identity.
+            let marker_spoofed = result
+                .evidence
+                .iter()
+                .any(|proof| proof["kind"] == "runner_receipt");
+            result
+                .evidence
+                .retain(|proof| proof["kind"] != "runner_receipt");
+            if matched {
+                let provenance = match result.provenance {
+                    Some(crate::browser_bridge::BrowserReceiptProvenance::Live)
+                        if !marker_spoofed
+                            && result.occurred_at.is_some()
+                            && result.connector_version.as_deref().is_some_and(|version| {
+                                !version.trim().is_empty()
+                                    && version.len() <= 100
+                                    && !version.starts_with("fixture")
+                            }) =>
+                    {
+                        "live"
+                    }
+                    Some(crate::browser_bridge::BrowserReceiptProvenance::Fixture) => "fixture",
+                    _ => "unknown",
+                };
+                result.evidence.push(json!({
+                    "kind":"runner_receipt",
+                    "schema_version":"geo.runner.receipt.v1",
+                    "provenance":provenance,
+                    "execution_id":result.execution_id,
+                    "connector_version":result.connector_version,
+                    "occurred_at":result.occurred_at,
+                }));
+            }
+            // A receipt without proven live origin is never allowed to look
+            // like a verified non-fixture outcome in historical reports.
+            let fixture = !matched
+                || marker_spoofed
+                || result.provenance != Some(crate::browser_bridge::BrowserReceiptProvenance::Live)
+                || result.occurred_at.is_none()
+                || result.connector_version.as_deref().is_none_or(|version| {
+                    version.trim().is_empty()
+                        || version.len() > 100
+                        || version.starts_with("fixture")
+                });
             ChannelOutcome {
                 status,
                 detail: result.reason.or_else(|| {
@@ -1205,7 +1282,8 @@ async fn execute_reserved_channel_target(
                 screenshot_ref: None,
                 connector_version: result.connector_version,
                 runner_evidence: result.evidence,
-                fixture: false,
+                // The marker distinguishes explicit fixture from unknown.
+                fixture,
             }
         }
         Err(failure) => ChannelOutcome {
@@ -1231,7 +1309,8 @@ async fn execute_reserved_channel_target(
             screenshot_ref: None,
             connector_version: None,
             runner_evidence: vec![],
-            fixture: false,
+            // A failed/invalid response cannot provide live provenance.
+            fixture: true,
         },
     };
     repo.finish(scope, target_id, attempt.attempt_id, outcome, Utc::now())
@@ -1294,7 +1373,7 @@ mod tests {
                     "execution_id": payload.and_then(|Json(value)|
                         value.get("execution_id").and_then(|value|value.as_str()).map(str::to_owned)
                     ),
-                    "status":"unsupported","evidence":[]
+                    "status":"unsupported","provenance":"fixture","evidence":[]
                 })),
             );
         }
@@ -1407,6 +1486,7 @@ mod tests {
         };
         let receipt = BrowserExecution {
             execution_id: Uuid::new_v4(),
+            provenance: Some(crate::browser_bridge::BrowserReceiptProvenance::Live),
             status: "completed".into(),
             reason: None,
             evidence: vec![json!({
@@ -1459,6 +1539,7 @@ mod tests {
         };
         let receipt = BrowserExecution {
             execution_id: Uuid::new_v4(),
+            provenance: Some(crate::browser_bridge::BrowserReceiptProvenance::Live),
             status: "completed".into(),
             reason: None,
             evidence: vec![proof(&exact_hash)],
@@ -1468,9 +1549,28 @@ mod tests {
             stage: Some("public_readback".into()),
         };
         assert!(publication_readback(&receipt, &input));
+        let fixture = BrowserExecution {
+            provenance: Some(crate::browser_bridge::BrowserReceiptProvenance::Fixture),
+            ..receipt
+        };
+        assert!(!publication_readback(&fixture, &input));
+        let missing = BrowserExecution {
+            provenance: None,
+            ..fixture
+        };
+        assert!(!publication_readback(&missing, &input));
+        let spoof = BrowserExecution {
+            provenance: Some(crate::browser_bridge::BrowserReceiptProvenance::Live),
+            evidence: vec![
+                proof(&exact_hash),
+                json!({"kind":"runner_receipt","provenance":"live"}),
+            ],
+            ..missing
+        };
+        assert!(!publication_readback(&spoof, &input));
         let wrong = BrowserExecution {
             evidence: vec![proof(&sha256_hex(b"Later draft\nFrozen body"))],
-            ..receipt
+            ..spoof
         };
         assert!(!publication_readback(&wrong, &input));
         let wrong = BrowserExecution {

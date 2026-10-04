@@ -7,6 +7,7 @@ mod content_runtime_tests;
 mod dispatch;
 mod production_runtime;
 mod runtime;
+mod verification_dispatch;
 
 use axum::Router;
 use config::AppConfig;
@@ -43,6 +44,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let report_scanner = PgReportRepository::from_database(&database);
         let content_scanner = geo_persistence::PgContentRepository::from_database(&database);
         let cycle_scanner = PgProjectRepository::from_database(&database);
+        let verification_scanner =
+            geo_persistence::PgConnectorCapabilityRepository::from_database(&database);
         let state = channels::configure(
             AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone()),
         )?;
@@ -62,6 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         state.set_ready(true);
         spawn_due_report_scanner(state.clone(), report_scanner, cycle_scanner.clone());
+        verification_dispatch::spawn(verification_scanner);
         (state, true, Some((content_scanner, cycle_scanner)))
     } else {
         let password = config.validate_for_memory_mode()?;

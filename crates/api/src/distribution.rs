@@ -17,7 +17,7 @@ use geo_domain::{
     DistributionRepository, DistributionScopeMode, DistributionTarget, DistributionTargetPage,
     DistributionTargetStatus, FreezeDistribution, KnowledgePurpose, KnowledgeRepository,
     PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository, ProjectStatus,
-    SourceState, TenantScope,
+    SourceState, TenantScope, publication_format_for_semantic_type,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -101,9 +101,10 @@ impl DistributionService {
         Arc::clone(&self.distribution)
     }
 
-    async fn current_capabilities(
+    pub(crate) async fn current_capabilities(
         &self,
         operator: geo_domain::OperatorId,
+        semantic_types: &BTreeSet<String>,
     ) -> Result<Vec<PlatformPlacement>, AppError> {
         let Some(registry) = &self.registry else {
             return Ok(self.capabilities.as_ref().clone());
@@ -143,10 +144,21 @@ impl DistributionService {
                 Some(settings) if !settings.enabled => Some("connector_disabled"),
                 Some(settings) => {
                     let mut failure = Some("connector_unverified");
-                    for kind in &settings.content_types {
-                        let resolved = registry.resolve(operator, &key, deployed, kind).await?;
+                    for semantic in semantic_types {
+                        let Some(proof_format) =
+                            crate::connector_capabilities::configured_publication_format(
+                                &settings, semantic,
+                            )
+                        else {
+                            continue;
+                        };
+                        let resolved = registry
+                            .resolve(operator, &key, deployed, proof_format)
+                            .await?;
                         if resolved.availability == ConnectorAvailability::Available {
-                            supported_formats.push(kind.clone());
+                            // A frozen placement describes document semantics,
+                            // not the format of the bytes delivered to the runner.
+                            supported_formats.push(semantic.clone());
                             failure = None;
                         } else if resolved.availability == ConnectorAvailability::VersionMismatch {
                             failure = Some("connector_version_mismatch");
@@ -299,7 +311,15 @@ impl DistributionService {
             .await?
             .ok_or_else(|| AppError::conflict("frozen cycle settings unavailable"))?;
         let platforms = &settings.distribution_scope;
-        let capabilities = self.current_capabilities(scope.operator_id).await?;
+        let semantic_types = document_manifest
+            .items
+            .iter()
+            .map(|item| item.content_type.clone())
+            .filter(|semantic| publication_format_for_semantic_type(semantic).is_some())
+            .collect();
+        let capabilities = self
+            .current_capabilities(scope.operator_id, &semantic_types)
+            .await?;
         let excluded: BTreeSet<_> = platforms.excluded_platform_ids.iter().cloned().collect();
         let mut selected: BTreeSet<String> = match platforms.mode {
             DistributionScopeMode::Explicit => {

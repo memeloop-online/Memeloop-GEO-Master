@@ -1,19 +1,22 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::{Json, Router, routing::get};
 use chrono::Utc;
 use geo_api::{
-    AppState, ChannelService, ContentService, EventBus, MemoryIdempotencyStore,
+    AppState, BrowserBridge, ChannelService, ContentService, EventBus, MemoryIdempotencyStore,
     MemoryOperationStore, ModelProviderBridge, RepositoryHostOps,
     distribution::DistributionService,
 };
 use geo_domain::{
-    ChannelAccount, ChannelAccountRecord, ChannelOwnerKind, ChannelRepository, ChannelStatus,
-    ContentItemStatus, ContentRepository, DistributionScope, DistributionScopeMode,
-    DistributionTargetStatus, DocumentManifestPlanRequest, DocumentScope, ErrorCode, ImportItem,
-    InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
-    KnowledgeRepository, MemoryAuthRepository, MemoryChannelRepository, MemoryContentRepository,
-    MemoryDistributionRepository, MemoryKnowledgeRepository, MemoryProjectRepository,
+    ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
+    ChannelRepository, ChannelStatus, ConnectorCapabilityRepository, ConnectorKey,
+    ConnectorVerification, ContentItemStatus, ContentRepository, DistributionScope,
+    DistributionScopeMode, DistributionTargetStatus, DocumentManifestPlanRequest, DocumentScope,
+    ErrorCode, ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility,
+    KnowledgePurpose, KnowledgeRepository, MemoryAuthRepository, MemoryChannelRepository,
+    MemoryConnectorCapabilityRepository, MemoryContentRepository, MemoryDistributionRepository,
+    MemoryKnowledgeRepository, MemoryProjectRepository, PLAIN_TEXT_ARTICLE_FORMAT,
     PlatformPlacement, ProjectCreate, ProjectPatch, ProjectRepository, ProjectSettings,
     ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
     start_request_hash,
@@ -64,6 +67,123 @@ impl ModelProviderBridge for GroundedModel {
             finish_reason: "stop".into(),
         })
     }
+}
+
+#[tokio::test]
+async fn saved_article_proof_enables_frozen_semantic_coverage_without_mutating_old_freeze() {
+    let fixture = setup(false).await;
+    let registry = Arc::new(MemoryConnectorCapabilityRepository::default());
+    let key = ConnectorKey {
+        platform_id: "a".into(),
+        placement_slot: "primary".into(),
+    };
+    let now = Utc::now();
+    let url = "https://example.com/public".to_owned();
+    let hash = "a".repeat(64);
+    let published = ChannelOutcome {
+        status: ChannelOutcomeStatus::Published,
+        detail: None,
+        occurred_at: now,
+        raw_answer: None,
+        citations: vec![],
+        public_url: Some(url.clone()),
+        screenshot_ref: None,
+        connector_version: Some("live.v1".into()),
+        runner_evidence: vec![],
+        fixture: false,
+    };
+    registry
+        .insert_verification(
+            fixture.scope.operator_id,
+            ConnectorVerification {
+                verification_id: Uuid::new_v4(),
+                key: key.clone(),
+                connector_version: "live.v1".into(),
+                content_type: PLAIN_TEXT_ARTICLE_FORMAT.into(),
+                publication_receipt: published.clone(),
+                public_readback: ChannelOutcome {
+                    status: ChannelOutcomeStatus::Verified,
+                    runner_evidence: vec![serde_json::json!({
+                        "kind":"public_readback", "url":url,
+                        "content_matched":true, "owned_by_account":true,
+                        "expected_sha256":hash, "readback_sha256":hash
+                    })],
+                    ..published
+                },
+                verified_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    registry
+        .configure(
+            fixture.scope.operator_id,
+            key.clone(),
+            0,
+            true,
+            vec![PLAIN_TEXT_ARTICLE_FORMAT.into()],
+            "live.v1",
+        )
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let runner = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/v1/capabilities",
+                get(|| async {
+                    Json(serde_json::json!({"connectors":[{
+                        "platform":"a", "placement_slot":"primary",
+                        "connector_version":"live.v1", "operations":["publish"],
+                        "verified":false
+                    }]}))
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let service = DistributionService::new(
+        fixture.distribution.clone(),
+        fixture.content.clone(),
+        fixture.knowledge.clone(),
+        fixture.projects.clone(),
+        fixture.channels.clone(),
+    )
+    .with_connector_registry(
+        registry.clone(),
+        Some(BrowserBridge::new(format!("http://{addr}"), "test-token".into()).unwrap()),
+    );
+    let frozen = service
+        .freeze(&fixture.scope, fixture.cycle_id)
+        .await
+        .unwrap();
+    let platform = frozen
+        .platform_scope
+        .iter()
+        .find(|placement| placement.platform_id == "a")
+        .unwrap();
+    assert_eq!(
+        platform.supported_formats,
+        vec!["company_profile", "faq"],
+        "wire-format proof must freeze document semantics, not the wire key"
+    );
+    assert_eq!(platform.unavailable_reason, None);
+    registry
+        .configure(fixture.scope.operator_id, key, 1, false, vec![], "")
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .freeze(&fixture.scope, fixture.cycle_id)
+            .await
+            .unwrap(),
+        frozen,
+        "explicit disable cannot rewrite an existing frozen manifest"
+    );
+    runner.abort();
 }
 
 fn placement(name: &str, formats: &[&str], unavailable: Option<&str>) -> PlatformPlacement {

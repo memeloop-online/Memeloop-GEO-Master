@@ -35,6 +35,11 @@ enum Receipt {
     AuxiliaryEvidence,
     FutureTimestamp,
     AttestedVersion,
+    RunnerFixtureProofLive,
+    MissingProvenance,
+    InvalidProvenance,
+    ForgedMarker,
+    MismatchedExecution,
 }
 
 #[derive(Clone)]
@@ -107,6 +112,8 @@ async fn runner(
                 vec![]
             } else if matches!(case, Receipt::DuplicateProof) {
                 vec![proof.clone(), proof]
+            } else if matches!(case, Receipt::ForgedMarker) {
+                vec![proof, json!({"kind":"runner_receipt","provenance":"live"})]
             } else if matches!(case, Receipt::AuxiliaryEvidence) {
                 vec![
                     json!({"kind":"screenshot_metadata","reference":"redacted"}),
@@ -115,14 +122,21 @@ async fn runner(
             } else {
                 vec![proof]
             };
-            json!({
-                "execution_id":input["execution_id"],
+            // Synthetic protocol fixture: "live" exercises consumer gating,
+            // not a production search or real-world acceptance result.
+            let mut receipt = json!({
+                "execution_id":if matches!(case, Receipt::MismatchedExecution) {json!(Uuid::new_v4())} else {input["execution_id"].clone()},
                 "status":if matches!(case, Receipt::Unsupported) {"unsupported"} else {"completed"},
                 "stage":"official_search_observation",
                 "occurred_at":completed_at,
                 "connector_version":if matches!(case, Receipt::Fixture) {"fixture.v1"} else if matches!(case, Receipt::AttestedVersion) {"attested-search.v2"} else {"official_search_verified.v1"},
+                "provenance":if matches!(case, Receipt::Fixture | Receipt::RunnerFixtureProofLive) {"fixture"} else if matches!(case, Receipt::InvalidProvenance) {"untrusted"} else {"live"},
                 "evidence":evidence,
-            })
+            });
+            if matches!(case, Receipt::MissingProvenance) {
+                receipt.as_object_mut().unwrap().remove("provenance");
+            }
+            receipt
         }
         ("POST", path) if path.ends_with("/complete") => json!({
             "identity":{"platform_account_id":"verified","display_name":"Verified"},
@@ -267,10 +281,19 @@ async fn verified_search_retains_original_answer_and_citations() {
     assert_eq!(outcome.status, ChannelOutcomeStatus::Observed);
     assert_eq!(outcome.raw_answer.as_deref(), Some("Original answer"));
     assert_eq!(outcome.citations, ["http://example.org/source#section"]);
-    assert_eq!(outcome.runner_evidence.len(), 1);
+    assert_eq!(outcome.runner_evidence.len(), 2);
+    assert!(!outcome.fixture);
+    assert_eq!(outcome.runner_evidence[1]["kind"], "runner_receipt");
+    assert_eq!(outcome.runner_evidence[1]["provenance"], "live");
+    assert_eq!(
+        outcome.runner_evidence[1]["connector_version"],
+        outcome.connector_version.as_deref().unwrap()
+    );
+    assert!(outcome.runner_evidence[1]["execution_id"].is_string());
+    assert!(outcome.runner_evidence[1]["occurred_at"].is_string());
     let with_metadata = run(Receipt::AuxiliaryEvidence).await;
     assert_eq!(with_metadata.status, ChannelOutcomeStatus::Observed);
-    assert_eq!(with_metadata.runner_evidence.len(), 2);
+    assert_eq!(with_metadata.runner_evidence.len(), 3);
     assert_eq!(
         run(Receipt::AttestedVersion).await.status,
         ChannelOutcomeStatus::Observed
@@ -312,10 +335,34 @@ async fn fixtures_and_plausible_answers_without_official_search_are_missing() {
         Receipt::AnswerAlone,
         Receipt::DuplicateProof,
         Receipt::FutureTimestamp,
+        Receipt::RunnerFixtureProofLive,
+        Receipt::MissingProvenance,
+        Receipt::InvalidProvenance,
+        Receipt::ForgedMarker,
+        Receipt::MismatchedExecution,
     ] {
         let outcome = run(case).await;
         assert_eq!(outcome.status, ChannelOutcomeStatus::Missing);
         assert!(outcome.raw_answer.is_none());
+        if matches!(
+            case,
+            Receipt::Fixture
+                | Receipt::RunnerFixtureProofLive
+                | Receipt::MissingProvenance
+                | Receipt::InvalidProvenance
+                | Receipt::ForgedMarker
+                | Receipt::MismatchedExecution
+        ) {
+            assert!(outcome.fixture);
+        }
+        assert!(
+            outcome
+                .runner_evidence
+                .iter()
+                .filter(|proof| proof["kind"] == "runner_receipt")
+                .count()
+                <= 1
+        );
     }
     assert_eq!(
         run(Receipt::Unsupported).await.status,

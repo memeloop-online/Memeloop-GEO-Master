@@ -360,6 +360,7 @@ async fn runner(
                 Json(json!({
                     "execution_id":payload["execution_id"],
                     "status":"unsupported",
+                    "provenance":"fixture",
                     "evidence":[]
                 })),
             )

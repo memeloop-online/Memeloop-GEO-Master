@@ -282,9 +282,20 @@ pub struct RunnerConnector {
 }
 
 /// Private runner receipt. This is not a client-submittable success claim.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserReceiptProvenance {
+    Live,
+    Fixture,
+}
+
 #[derive(Deserialize)]
 pub struct BrowserExecution {
     pub execution_id: Uuid,
+    // Missing provenance remains untrusted. Unknown values fail receipt
+    // deserialization, leaving ambiguous publishes in the unknown state.
+    #[serde(default)]
+    pub provenance: Option<BrowserReceiptProvenance>,
     pub status: String,
     #[serde(default)]
     pub reason: Option<String>,
