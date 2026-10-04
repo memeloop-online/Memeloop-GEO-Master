@@ -329,6 +329,7 @@ impl PgContentRepository {
             .bind(id).fetch_optional(&mut *tx).await.map_err(db)?;
         let mut state =
             decode(json.ok_or_else(|| AppError::not_found("content execution not found"))?)?;
+        let was_running = state.execution.status == geo_domain::ContentExecutionStatus::Running;
         let previous_briefs: Vec<Uuid> = state
             .items
             .iter()
@@ -373,9 +374,26 @@ impl PgContentRepository {
                     .bind(serde_json::to_value(handoff).map_err(encode)?).bind(handoff.created_at)
                     .execute(&mut *tx).await.map_err(db)?;
         }
-        sqlx::query("UPDATE content_executions SET state=$1 WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 AND execution_id=$5")
-            .bind(serde_json::to_value(state).map_err(encode)?).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
-            .bind(project.as_uuid()).bind(id).execute(&mut *tx).await.map_err(db)?;
+        // The previous workflow may have deferred dispatch until a now-finished
+        // item step lease expires. Once a closed handoff is persisted, that
+        // step-based delay must not hide the new distribution stage. Later
+        // closed-stage retry backoff remains intact on idempotent close calls.
+        let just_closed =
+            was_running && state.execution.status == geo_domain::ContentExecutionStatus::Closed;
+        sqlx::query(
+            "UPDATE content_executions SET state=$1, \
+             dispatch_retry_after=CASE WHEN $6 THEN NULL ELSE dispatch_retry_after END \
+             WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 AND execution_id=$5",
+        )
+        .bind(serde_json::to_value(state).map_err(encode)?)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(id)
+        .bind(just_closed)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(result)
     }

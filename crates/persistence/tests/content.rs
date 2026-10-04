@@ -474,6 +474,14 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             .iter()
             .any(|candidate| candidate.execution_id == first.execution_id)
     );
+    let step_retry: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT dispatch_retry_after FROM content_executions WHERE execution_id=$1",
+    )
+    .bind(first.execution_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(step_retry.is_some_and(|until| until > Utc::now()));
     assert_eq!(
         repository
             .claim(
@@ -632,6 +640,17 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .await
         .unwrap();
     let handoff = repository.close(&scope, first.execution_id).await.unwrap();
+    let closed_retry: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT dispatch_retry_after FROM content_executions WHERE execution_id=$1",
+    )
+    .bind(first.execution_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        closed_retry.is_none(),
+        "step-based deferral ends at content close"
+    );
     let stage2_at = Utc::now();
     assert!(
         repository
@@ -664,9 +683,20 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
     );
     assert!(
         repository
-            .release_dispatch(&stage2, stage2_at, chrono::Duration::zero())
+            .release_dispatch(&stage2, stage2_at, chrono::Duration::minutes(5))
             .await
             .unwrap()
+    );
+    let deferred_stage2: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT dispatch_retry_after FROM content_executions WHERE execution_id=$1",
+    )
+    .bind(first.execution_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        deferred_stage2.map(|time| time.timestamp_micros()),
+        Some((stage2_at + chrono::Duration::minutes(5)).timestamp_micros())
     );
     assert_eq!(handoff.coverage.total, manifest.items.len() as u64);
     assert_eq!(handoff.coverage.ready, 1);
@@ -674,6 +704,14 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         repository.close(&scope, first.execution_id).await.unwrap(),
         handoff
     );
+    let preserved_stage2: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT dispatch_retry_after FROM content_executions WHERE execution_id=$1",
+    )
+    .bind(first.execution_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(preserved_stage2, deferred_stage2);
     let post_close = restarted
         .edit(
             &scope,
