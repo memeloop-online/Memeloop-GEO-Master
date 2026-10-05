@@ -230,6 +230,15 @@ function AgentChat({
   const activeTurnId = activeRun?.turn_id ?? localTurnId;
   const capabilityNotice = unavailableRuntimeNotice(conversation.runs);
   const displayedRuntimeNotice = capabilityNotice ?? runtimeNotice;
+  const latestAnswer = [...conversation.messages]
+    .filter((message) => message.role === "assistant")
+    .sort((a, b) => b.sequence - a.sequence)[0];
+  const omittedHistory =
+    latestAnswer?.metadata &&
+    typeof latestAnswer.metadata === "object" &&
+    !Array.isArray(latestAnswer.metadata)
+      ? (latestAnswer.metadata as Record<string, unknown>).history_omitted_turns
+      : undefined;
 
   function addFiles(files: readonly File[]) {
     if (!files.length) return;
@@ -463,6 +472,16 @@ function AgentChat({
           <MessageBarBody>{attachmentNotice}</MessageBarBody>
         </MessageBar>
       )}
+      {typeof omittedHistory === "number" &&
+        Number.isSafeInteger(omittedHistory) &&
+        omittedHistory > 0 && (
+          <MessageBar intent="info" aria-label="历史上下文范围">
+            <MessageBarBody>
+              最近一次回复未包含较早的 {omittedHistory}{" "}
+              轮已完成对话。历史消息仍保留在会话中；如需引用较早细节，请在新消息中补充。
+            </MessageBarBody>
+          </MessageBar>
+        )}
       {attachments.length > 0 && (
         <div className="agent-file-reference-notice" aria-label="待发送附件">
           <p>

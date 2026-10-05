@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -7,6 +15,25 @@ import { MemoryRouter } from "react-router-dom";
 import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import type { AuthSession } from "../auth/types";
+
+const originalScrollTo = Object.getOwnPropertyDescriptor(
+  HTMLElement.prototype,
+  "scrollTo",
+);
+beforeAll(() => {
+  // jsdom has no layout scrolling; populated native transcripts invoke it.
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+    configurable: true,
+    value: vi.fn(),
+  });
+});
+afterAll(() => {
+  if (originalScrollTo) {
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", originalScrollTo);
+  } else {
+    Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
+  }
+});
 
 const session: AuthSession = {
   user: {
@@ -60,6 +87,74 @@ afterEach(() => {
 });
 
 describe("P00 AI workbench routing", () => {
+  it.each([3, 0, -1, "3", null])(
+    "shows an omission notice only for a valid latest assistant count (%s)",
+    async (count) => {
+      const conversation = {
+        id: "conversation-a",
+        title: "历史范围",
+        status: "active",
+        revision: 1,
+        created_at: "2026-09-19T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+      };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((request: RequestInfo | URL) => {
+          const path = new URL(String(request), "http://localhost").pathname;
+          if (path.endsWith("/auth/session"))
+            return Promise.resolve(response(session));
+          if (path.endsWith("/agent/conversations/conversation-a")) {
+            return Promise.resolve(
+              response({
+                conversation,
+                messages: [
+                  {
+                    id: "answer-old",
+                    conversation_id: conversation.id,
+                    turn_id: "turn-old",
+                    role: "assistant",
+                    content: "Earlier answer",
+                    sequence: 1,
+                    metadata: { history_omitted_turns: 9 },
+                    created_at: conversation.created_at,
+                  },
+                  {
+                    id: "answer-new",
+                    conversation_id: conversation.id,
+                    turn_id: "turn-new",
+                    role: "assistant",
+                    content: "Latest answer",
+                    sequence: 2,
+                    metadata: { history_omitted_turns: count },
+                    created_at: conversation.created_at,
+                  },
+                ],
+                turns: [],
+                runs: [],
+              }),
+            );
+          }
+          if (path.endsWith("/agent/conversations")) {
+            return Promise.resolve(
+              response({ items: [conversation], next_cursor: null }),
+            );
+          }
+          return Promise.resolve(response({ items: [], next_cursor: null }));
+        }),
+      );
+      renderApp("/app/tenant-a/project-a/chat/conversation-a");
+      await screen.findByTestId("memeloop-agent-chat");
+      if (count === 3) {
+        expect(screen.getByLabelText("历史上下文范围")).toHaveTextContent(
+          "3 轮已完成对话",
+        );
+      } else {
+        expect(screen.queryByLabelText("历史上下文范围")).toBeNull();
+      }
+    },
+  );
+
   it("makes P00 the first/default project destination and renders an honest empty state", async () => {
     const fetchMock = vi.fn((request: RequestInfo | URL) => {
       const url = new URL(String(request), "http://localhost");
