@@ -459,10 +459,9 @@ describe("knowledge workbench", () => {
       value: vi.fn().mockResolvedValue(new TextEncoder().encode("demo").buffer),
     });
     await user.upload(screen.getByLabelText("选择资料文件"), file);
-    await user.type(
-      screen.getByRole("textbox", { name: "多个网页 URL" }),
-      "https://example.com/a\nhttps://example.com/b",
-    );
+    // Bulk URL import is a paste interaction; avoid a render per character.
+    await user.click(screen.getByRole("textbox", { name: "多个网页 URL" }));
+    await user.paste("https://example.com/a\nhttps://example.com/b");
     await user.click(screen.getByRole("button", { name: "开始导入" }));
 
     expect(
