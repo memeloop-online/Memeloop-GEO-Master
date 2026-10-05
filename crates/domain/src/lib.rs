@@ -19,6 +19,7 @@ mod error;
 mod event;
 mod idempotency;
 mod knowledge;
+mod knowledge_csv;
 mod model_routes;
 pub use model_routes::ModelRouteGrant;
 mod operation;
@@ -56,6 +57,7 @@ pub use knowledge::{
     MemoryKnowledgeRepository, Product, ProductState, Source, SourceDetail, SourceKind,
     SourceState, SourceVersion, StoredObject, StoredObjectState, UPLOAD_SESSION_TTL_SECONDS,
     UploadSession, UploadSessionCommand, UploadSessionState, deterministic_chunks,
+    is_supported_knowledge_media_type, knowledge_parser_version, parsed_knowledge_chunks,
     plan_document_manifest, sha256_hex,
 };
 pub use operation::{Operation, OperationStatus};

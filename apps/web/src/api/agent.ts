@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { uploadMediaType as attachmentMediaType } from "./upload-media";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor, type QueryScope } from "../auth/types";
 import {
@@ -180,16 +181,6 @@ async function fileSha256(file: File): Promise<string> {
   return Array.from(new Uint8Array(digest), (value) =>
     value.toString(16).padStart(2, "0"),
   ).join("");
-}
-
-function attachmentMediaType(file: File): string {
-  if (file.type) return file.type;
-  const filename = file.name.toLowerCase();
-  if (filename.endsWith(".txt")) return "text/plain";
-  if (filename.endsWith(".md") || filename.endsWith(".markdown"))
-    return "text/markdown";
-  if (filename.endsWith(".csv")) return "text/csv";
-  return "application/octet-stream";
 }
 
 /**

@@ -365,6 +365,215 @@ async fn seed_project(pool: &PgPool, operator_id: Uuid, tenant_id: Uuid, label: 
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn csv_upload_and_attachment_import_preserve_evidence_and_reject_partial_parses() {
+    let database = connect().await;
+    let repository = PgKnowledgeRepository::from_database(&database);
+    let scope = seed_scope(database.pool(), "csv-import").await;
+    let sibling = seed_sibling_scope(database.pool(), &scope, "csv-other").await;
+    let bytes = "\u{feff}Product,Price (USD),Notes\r\nWidget,12.50,\"first\r\nsecond\"\r\nGadget,9,\"quoted \"\"text\"\"\"\r\n".as_bytes();
+
+    for attachment in [false, true] {
+        let session = repository
+            .create_upload_session(
+                &scope,
+                UploadSessionCommand {
+                    filename: "catalog.csv".to_owned(),
+                    declared_media_type: "Text/CSV; charset=utf-8".to_owned(),
+                    expected_size: bytes.len() as u64,
+                    expected_sha256: sha256_hex(bytes),
+                    purpose: KnowledgePurpose::Internal,
+                },
+            )
+            .await
+            .expect("CSV upload session");
+        repository
+            .put_upload_content(&scope, session.upload_session_id, bytes.to_vec())
+            .await
+            .expect("CSV upload bytes");
+        let imported = if attachment {
+            let (object, filename) = repository
+                .complete_attachment_upload(&scope, session.upload_session_id, "csv-attachment")
+                .await
+                .expect("store CSV attachment");
+            let item = ImportItem {
+                client_item_id: format!("csv:{}", object.object_id),
+                kind: SourceKind::Object,
+                name: filename,
+                purpose: KnowledgePurpose::Internal,
+                text: None,
+                url: None,
+                object_id: Some(object.object_id),
+                knowledge_release_id: None,
+            };
+            let denied = repository
+                .import_batch(&sibling, vec![item.clone()])
+                .await
+                .expect("scoped import");
+            assert_eq!(
+                denied.items[0].error.as_ref().unwrap().code,
+                ErrorCode::NotFound
+            );
+            let imported = repository
+                .import_batch(&scope, vec![item.clone()])
+                .await
+                .expect("import CSV attachment")
+                .items
+                .remove(0);
+            assert_eq!(
+                repository
+                    .import_batch(&scope, vec![item])
+                    .await
+                    .unwrap()
+                    .items[0],
+                imported
+            );
+            imported
+        } else {
+            let imported = repository
+                .complete_upload(&scope, session.upload_session_id, "csv-upload")
+                .await
+                .expect("import ordinary CSV upload");
+            assert_eq!(
+                repository
+                    .complete_upload(&scope, session.upload_session_id, "csv-upload")
+                    .await
+                    .unwrap(),
+                imported
+            );
+            imported
+        };
+        assert_eq!(imported.status, geo_domain::ImportStatus::Succeeded);
+        let version = imported.source_version.as_ref().unwrap();
+        assert_eq!(version.content_sha256, sha256_hex(bytes));
+        assert_eq!(version.parser_version, "deterministic-csv-v1");
+        assert_eq!(
+            imported.release.as_ref().unwrap().pipeline_versions["parsers"],
+            json!(["deterministic-csv-v1"])
+        );
+        let detail = repository
+            .get_source_detail(&scope, version.source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.chunks.len(), 2);
+        for (index, chunk) in detail.chunks.iter().enumerate() {
+            assert_eq!(chunk.kind, geo_domain::ChunkKind::Table);
+            assert_eq!(chunk.text_hash, sha256_hex(chunk.text.as_bytes()));
+            let locator = serde_json::to_value(&chunk.locator).unwrap();
+            assert_eq!(locator["kind"], "csv");
+            assert_eq!(locator["start_row"], index + 2);
+            assert_eq!(locator["end_row"], index + 2);
+            assert_eq!(locator["start_column"], 1);
+            assert_eq!(locator["end_column"], 3);
+            assert_eq!(locator["header_row"], 1);
+            let table: Value = serde_json::from_str(&chunk.text).unwrap();
+            assert_eq!(table["headers"], json!(["Product", "Price (USD)", "Notes"]));
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&detail.chunks[0].text).unwrap()["values"],
+            json!(["Widget", "12.50", "first\r\nsecond"])
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&detail.chunks[1].text).unwrap()["values"],
+            json!(["Gadget", "9", "quoted \"text\""])
+        );
+        let search = repository
+            .search(
+                &scope,
+                geo_domain::KnowledgeSearchRequest {
+                    query: "Widget".to_owned(),
+                    knowledge_release_id: imported
+                        .release
+                        .as_ref()
+                        .map(|release| release.knowledge_release_id),
+                    purpose: KnowledgePurpose::Internal,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            search
+                .evidence
+                .iter()
+                .any(|evidence| evidence.locator == detail.chunks[0].locator)
+        );
+        assert!(
+            repository
+                .get_source_detail(&sibling, version.source_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let before = repository.overview(&scope).await.unwrap();
+    // A valid first record followed by a malformed record must never leave a
+    // partially imported source or advance the usable release, even on retry.
+    let malformed = b"Product,Price\r\nWidget,12\r\nGadget,\"unterminated";
+    for attachment in [false, true] {
+        let session = repository
+            .create_upload_session(
+                &scope,
+                UploadSessionCommand {
+                    filename: "malformed.csv".to_owned(),
+                    declared_media_type: "text/csv".to_owned(),
+                    expected_size: malformed.len() as u64,
+                    expected_sha256: sha256_hex(malformed),
+                    purpose: KnowledgePurpose::Internal,
+                },
+            )
+            .await
+            .unwrap();
+        repository
+            .put_upload_content(&scope, session.upload_session_id, malformed.to_vec())
+            .await
+            .unwrap();
+        if attachment {
+            let (object, filename) = repository
+                .complete_attachment_upload(&scope, session.upload_session_id, "malformed-object")
+                .await
+                .unwrap();
+            let item = ImportItem {
+                client_item_id: format!("malformed:{}", object.object_id),
+                kind: SourceKind::Object,
+                name: filename,
+                purpose: KnowledgePurpose::Internal,
+                text: None,
+                url: None,
+                object_id: Some(object.object_id),
+                knowledge_release_id: None,
+            };
+            for _ in 0..2 {
+                let result = repository
+                    .import_batch(&scope, vec![item.clone()])
+                    .await
+                    .unwrap()
+                    .items
+                    .remove(0);
+                assert_eq!(result.status, geo_domain::ImportStatus::Failed);
+                assert_eq!(result.error.unwrap().code, ErrorCode::InvalidRequest);
+                assert!(result.source.is_none());
+                assert!(result.release.is_none());
+            }
+        } else {
+            for _ in 0..2 {
+                assert_eq!(
+                    repository
+                        .complete_upload(&scope, session.upload_session_id, "malformed-upload")
+                        .await
+                        .unwrap_err()
+                        .code,
+                    ErrorCode::InvalidRequest
+                );
+            }
+        }
+        assert_eq!(repository.overview(&scope).await.unwrap(), before);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
 async fn attachment_upload_commits_object_without_knowledge_import_and_ordinary_upload_imports() {
     let database = connect().await;
     let repository = PgKnowledgeRepository::from_database(&database);

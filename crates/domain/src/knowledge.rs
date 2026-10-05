@@ -1,8 +1,8 @@
 //! Versioned, tenant-scoped knowledge-import contracts.
 //!
 //! This module deliberately models the usable first vertical slice only:
-//! verified upload bytes and `text/plain` / Markdown can be turned into
-//! deterministic paragraph chunks and an immutable release.  It does not
+//! verified upload bytes and text / Markdown / UTF-8 CSV can be turned into
+//! deterministic paragraph/table chunks and an immutable release. It does not
 //! pretend that crawling, office/PDF parsing, OCR, embeddings, or an LLM are
 //! available.
 
@@ -161,9 +161,12 @@ impl KnowledgeCapability {
             max_inline_text_bytes: MAX_INLINE_TEXT_BYTES,
             max_upload_bytes: MAX_UPLOAD_BYTES,
             max_batch_files: 100,
-            supported_media_types: vec!["text/plain".to_owned(), "text/markdown".to_owned()],
-            accepted_unparsed_media_types: vec![
+            supported_media_types: vec![
+                "text/plain".to_owned(),
+                "text/markdown".to_owned(),
                 "text/csv".to_owned(),
+            ],
+            accepted_unparsed_media_types: vec![
                 "application/pdf".to_owned(),
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_owned(),
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_owned(),
@@ -171,7 +174,8 @@ impl KnowledgeCapability {
             limitations: vec![
                 "uploaded bytes are kept only in process memory".to_owned(),
                 "the first upload implementation buffers a whole request; production should use streaming direct object storage".to_owned(),
-                "only text/plain and text/markdown are parsed".to_owned(),
+                "only text/plain, text/markdown and UTF-8 comma-separated text/csv with a header are parsed".to_owned(),
+                "CSV limits: 256 columns, 10000 data records, 256 KiB per encoded cell, 32 MiB total chunk text".to_owned(),
                 "a text declaration is parsed only after UTF-8 validation; the declared media type is not content sniffing".to_owned(),
                 "URL acquisition, office/PDF parsing, OCR, vector search, and LLM answers require adapters".to_owned(),
             ],
@@ -353,6 +357,8 @@ pub enum ChunkLocator {
         end_row: u32,
         start_column: u32,
         end_column: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header_row: Option<u32>,
     },
     Manual {},
 }
@@ -1030,7 +1036,11 @@ impl MemoryKnowledgeRepository {
             return Err(AppError::invalid_request("text must not be empty"));
         }
         let hash = sha256_hex(text.as_bytes());
-        let (source, version) = Self::source_and_version(
+        let media_type = object
+            .as_ref()
+            .map(|object| object.detected_media_type.as_str())
+            .unwrap_or("text/plain");
+        let (source, mut version) = Self::source_and_version(
             scope,
             item.kind,
             item.name.clone(),
@@ -1051,7 +1061,8 @@ impl MemoryKnowledgeRepository {
             ),
         );
         operation.status = OperationStatus::Succeeded;
-        let chunks = deterministic_chunks(scope, version.source_version_id, &text);
+        version.parser_version = knowledge_parser_version(media_type).to_owned();
+        let chunks = parsed_knowledge_chunks(scope, version.source_version_id, &text, media_type)?;
         let job = ImportJob {
             import_job_id: Uuid::new_v4(),
             operator_id: scope.operator_id,
@@ -1139,6 +1150,20 @@ impl MemoryKnowledgeRepository {
             .filter(|job| Self::in_scope(scope, *job))
             .filter(|job| matches!(job.status, ImportStatus::Failed | ImportStatus::Partial))
             .count() as u64;
+        let mut pipeline_versions = json!({
+            "parser": "deterministic-text-v1",
+            "extractor": "none-v1",
+            "index": "substring-v1"
+        });
+        let parsers = source_versions
+            .iter()
+            .filter_map(|id| state.versions.get(id))
+            .map(|version| version.parser_version.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if parsers.contains("deterministic-csv-v1") {
+            pipeline_versions["parser"] = json!("deterministic-knowledge-v1");
+            pipeline_versions["parsers"] = json!(parsers);
+        }
         let release = KnowledgeRelease {
             knowledge_release_id: Uuid::new_v4(),
             operator_id: scope.operator_id,
@@ -1149,11 +1174,7 @@ impl MemoryKnowledgeRepository {
             source_version_refs: source_versions.clone(),
             fact_revision_refs: fact_refs,
             index_build_id: "deterministic-text-index-v1".to_owned(),
-            pipeline_versions: json!({
-                "parser": "deterministic-text-v1",
-                "extractor": "none-v1",
-                "index": "substring-v1"
-            }),
+            pipeline_versions,
             content_hash: sha256_hex(
                 source_versions
                     .iter()
@@ -1421,7 +1442,6 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             state: StoredObjectState::Committed,
             created_at: Utc::now(),
         };
-        state.object_bytes.insert(object.object_id, content.clone());
         let item = ImportItem {
             client_item_id: format!("upload:{id}"),
             kind: SourceKind::File,
@@ -1432,8 +1452,8 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             object_id: Some(object.object_id),
             knowledge_release_id: None,
         };
-        let mut acceptance = if is_text_media_type(&session.declared_media_type) {
-            let text = String::from_utf8(content)
+        let mut acceptance = if is_supported_knowledge_media_type(&session.declared_media_type) {
+            let text = String::from_utf8(content.clone())
                 .map_err(|_| AppError::invalid_request("text upload bytes must be valid UTF-8"))?;
             Self::import_text_locked(&mut state, scope, &item, text, Some(object.clone()))?
         } else {
@@ -1449,6 +1469,7 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 .insert(object.object_id, object.clone());
             result
         };
+        state.object_bytes.insert(object.object_id, content);
         if let Some(operation) = acceptance.operation.as_mut() {
             operation.result = Some(json!({
                 "upload_session_id": id,
@@ -1731,7 +1752,7 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                                 "committed attachment bytes do not match object metadata",
                             ));
                         }
-                        if !is_text_media_type(&object.detected_media_type) {
+                        if !is_supported_knowledge_media_type(&object.detected_media_type) {
                             return Err(AppError::capability_missing(
                                 "document_parser is not configured",
                             ));
@@ -2158,6 +2179,38 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
     }
 }
 
+/// Parse without changing source bytes, interpreting formulas, or inferring cell types.
+pub fn parsed_knowledge_chunks(
+    scope: &TenantScope,
+    source_version_id: Uuid,
+    text: &str,
+    media_type: &str,
+) -> Result<Vec<Chunk>, AppError> {
+    if normalize_media_type(media_type) == "text/csv" {
+        crate::knowledge_csv::csv_chunks(scope, source_version_id, text)
+    } else if is_text_media_type(media_type) {
+        Ok(deterministic_chunks(scope, source_version_id, text))
+    } else {
+        Err(AppError::capability_missing(
+            "document_parser is not configured",
+        ))
+    }
+}
+
+pub fn knowledge_parser_version(media_type: &str) -> &'static str {
+    if normalize_media_type(media_type) == "text/csv" {
+        "deterministic-csv-v1"
+    } else if is_text_media_type(media_type) {
+        "deterministic-text-v1"
+    } else {
+        "unsupported"
+    }
+}
+
+pub fn is_supported_knowledge_media_type(media_type: &str) -> bool {
+    is_text_media_type(media_type) || normalize_media_type(media_type) == "text/csv"
+}
+
 pub fn deterministic_chunks(
     scope: &TenantScope,
     source_version_id: Uuid,
@@ -2307,11 +2360,220 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_capabilities_agree_with_shared_media_dispatch() {
+        let capabilities = super::KnowledgeCapability::memory();
+        assert!(
+            capabilities
+                .supported_media_types
+                .iter()
+                .any(|media| media == "text/csv")
+        );
+        for media in capabilities.supported_media_types {
+            assert!(super::is_supported_knowledge_media_type(&media));
+            assert!(!capabilities.accepted_unparsed_media_types.contains(&media));
+        }
+        for media in capabilities.accepted_unparsed_media_types {
+            assert!(!super::is_supported_knowledge_media_type(&media));
+        }
+        assert!(super::is_supported_knowledge_media_type(
+            " TEXT/CSV; charset=UTF-8 "
+        ));
+        assert_eq!(
+            super::knowledge_parser_version("TEXT/CSV"),
+            "deterministic-csv-v1"
+        );
+        assert_eq!(
+            super::knowledge_parser_version("text/x-markdown; charset=utf-8"),
+            "deterministic-text-v1"
+        );
+    }
+
+    #[test]
     fn source_kind_uses_snake_case_and_accepts_legacy_alias_in_project_contract() {
         assert_eq!(
             serde_json::to_string(&SourceKind::KnowledgeCollection).unwrap(),
             "\"knowledge_collection\""
         );
+    }
+
+    #[tokio::test]
+    async fn csv_upload_and_attachment_import_preserve_raw_hash_and_table_evidence() {
+        let bytes = "\u{feff}name,amount,note\r\n\"样品,蓝\",001,\"first\r\nsecond\"\r\nother, 2 kg ,=SUM(A1)\r\n".as_bytes().to_vec();
+        for attachment in [false, true] {
+            let repository = MemoryKnowledgeRepository::default();
+            let scope = scope();
+            let session = repository
+                .create_upload_session(
+                    &scope,
+                    UploadSessionCommand {
+                        filename: "table.csv".to_owned(),
+                        declared_media_type: "Text/CSV; charset=utf-8".to_owned(),
+                        expected_size: bytes.len() as u64,
+                        expected_sha256: sha256_hex(&bytes),
+                        purpose: KnowledgePurpose::Public,
+                    },
+                )
+                .await
+                .unwrap();
+            repository
+                .put_upload_content(&scope, session.upload_session_id, bytes.clone())
+                .await
+                .unwrap();
+            let accepted = if attachment {
+                let (object, name) = repository
+                    .complete_attachment_upload(&scope, session.upload_session_id, "commit")
+                    .await
+                    .unwrap();
+                assert_eq!(object.sha256, sha256_hex(&bytes));
+                assert!(repository.list_sources(&scope).await.unwrap().is_empty());
+                repository
+                    .import_batch(
+                        &scope,
+                        vec![ImportItem {
+                            client_item_id: "csv-object".to_owned(),
+                            kind: SourceKind::Object,
+                            name,
+                            purpose: KnowledgePurpose::Public,
+                            text: None,
+                            url: None,
+                            object_id: Some(object.object_id),
+                            knowledge_release_id: None,
+                        }],
+                    )
+                    .await
+                    .unwrap()
+                    .items
+                    .remove(0)
+            } else {
+                repository
+                    .complete_upload(&scope, session.upload_session_id, "commit")
+                    .await
+                    .unwrap()
+            };
+            let source = accepted.source.unwrap();
+            let version = accepted.source_version.unwrap();
+            assert_eq!(version.content_sha256, sha256_hex(&bytes));
+            assert_eq!(version.parser_version, "deterministic-csv-v1");
+            let detail = repository
+                .get_source_detail(&scope, source.source_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(detail.chunks.len(), 2);
+            assert_eq!(detail.versions[0], version);
+            for (index, chunk) in detail.chunks.iter().enumerate() {
+                assert_eq!(chunk.kind, super::ChunkKind::Table);
+                assert_eq!(chunk.source_version_id, version.source_version_id);
+                assert_eq!(
+                    chunk.locator,
+                    super::ChunkLocator::Csv {
+                        start_row: index as u32 + 2,
+                        end_row: index as u32 + 2,
+                        start_column: 1,
+                        end_column: 3,
+                        header_row: Some(1),
+                    }
+                );
+                let table: serde_json::Value = serde_json::from_str(&chunk.text).unwrap();
+                assert_eq!(
+                    table["headers"],
+                    serde_json::json!(["name", "amount", "note"])
+                );
+                let expected = if index == 0 {
+                    serde_json::json!(["样品,蓝", "001", "first\r\nsecond"])
+                } else {
+                    serde_json::json!(["other", " 2 kg ", "=SUM(A1)"])
+                };
+                assert_eq!(table["values"], expected);
+            }
+            assert_eq!(accepted.release.unwrap().coverage.chunk_count, 2);
+            let result = repository
+                .search(
+                    &scope,
+                    KnowledgeSearchRequest {
+                        query: "样品".to_owned(),
+                        purpose: KnowledgePurpose::Public,
+                        limit: 10,
+                        knowledge_release_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.evidence.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_csv_upload_and_object_import_never_publish_partial_sources() {
+        for bytes in [
+            b"name,value\nvalid,1\nwrong\n".to_vec(),
+            b"name,value\nvalid,1\nwrong,\"unclosed".to_vec(),
+            b"name,value\nvalid,1\nwrong,\xff\n".to_vec(),
+        ] {
+            for attachment in [false, true] {
+                let repository = MemoryKnowledgeRepository::default();
+                let scope = scope();
+                let session = repository
+                    .create_upload_session(
+                        &scope,
+                        UploadSessionCommand {
+                            filename: "invalid.csv".to_owned(),
+                            declared_media_type: "text/csv".to_owned(),
+                            expected_size: bytes.len() as u64,
+                            expected_sha256: sha256_hex(&bytes),
+                            purpose: KnowledgePurpose::Internal,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                repository
+                    .put_upload_content(&scope, session.upload_session_id, bytes.clone())
+                    .await
+                    .unwrap();
+                if attachment {
+                    let (object, name) = repository
+                        .complete_attachment_upload(&scope, session.upload_session_id, "commit")
+                        .await
+                        .unwrap();
+                    let result = repository
+                        .import_batch(
+                            &scope,
+                            vec![ImportItem {
+                                client_item_id: "invalid-csv".to_owned(),
+                                kind: SourceKind::Object,
+                                name,
+                                purpose: KnowledgePurpose::Internal,
+                                text: None,
+                                url: None,
+                                object_id: Some(object.object_id),
+                                knowledge_release_id: None,
+                            }],
+                        )
+                        .await
+                        .unwrap();
+                    let item = &result.items[0];
+                    assert_eq!(item.status, super::ImportStatus::Failed);
+                    assert!(item.source.is_none() && item.source_version.is_none());
+                    assert!(item.release.is_none());
+                    assert_eq!(
+                        item.error.as_ref().unwrap().code,
+                        crate::ErrorCode::InvalidRequest
+                    );
+                } else {
+                    assert!(
+                        repository
+                            .complete_upload(&scope, session.upload_session_id, "commit")
+                            .await
+                            .is_err()
+                    );
+                }
+                assert!(repository.list_sources(&scope).await.unwrap().is_empty());
+                let state = repository.state.read().await;
+                assert!(state.versions.is_empty());
+                assert!(state.chunks.is_empty());
+                assert!(state.releases.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

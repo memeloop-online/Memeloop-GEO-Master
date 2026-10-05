@@ -18,7 +18,8 @@ use geo_domain::{
     MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES, Operation, OperationStatus, Product, Source,
     SourceDetail, SourceKind, SourceState, SourceVersion, StoredObject, StoredObjectState,
     TenantScope, UPLOAD_SESSION_TTL_SECONDS, UploadSession, UploadSessionCommand,
-    UploadSessionState, deterministic_chunks, plan_document_manifest, sha256_hex,
+    UploadSessionState, is_supported_knowledge_media_type, knowledge_parser_version,
+    parsed_knowledge_chunks, plan_document_manifest, sha256_hex,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -156,6 +157,26 @@ impl PgKnowledgeRepository {
             failed_source_count: failed_source_count as u64,
             blocked_reasons: Vec::new(),
         };
+        let parsers = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT parser_version FROM knowledge_source_versions
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3
+               AND source_version_id = ANY($4) ORDER BY parser_version",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(&versions)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+        let pipeline_versions = if parsers
+            .iter()
+            .any(|parser| parser == "deterministic-csv-v1")
+        {
+            json!({"parser":"deterministic-knowledge-v1","parsers":parsers,"extractor":"none-v1","index":"substring-v1"})
+        } else {
+            json!({"parser":"deterministic-text-v1","extractor":"none-v1","index":"substring-v1"})
+        };
         let release = KnowledgeRelease {
             knowledge_release_id: Uuid::new_v4(),
             operator_id: scope.operator_id,
@@ -166,7 +187,7 @@ impl PgKnowledgeRepository {
             source_version_refs: versions.clone(),
             fact_revision_refs: fact_refs.clone(),
             index_build_id: "deterministic-text-index-v1".to_owned(),
-            pipeline_versions: json!({"parser":"deterministic-text-v1","extractor":"none-v1","index":"substring-v1"}),
+            pipeline_versions,
             content_hash,
             coverage,
             created_at: Utc::now(),
@@ -316,7 +337,7 @@ impl PgKnowledgeRepository {
                 "committed attachment bytes do not match object metadata",
             ));
         }
-        if !is_text(&object.detected_media_type) {
+        if !is_supported_knowledge_media_type(&object.detected_media_type) {
             return Err(AppError::capability_missing(
                 "document_parser is not configured",
             ));
@@ -344,6 +365,14 @@ impl PgKnowledgeRepository {
         let operation_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
         let content_hash = sha256_hex(text.as_bytes());
+        let media_type = object
+            .as_ref()
+            .map(|object| object.detected_media_type.as_str())
+            .unwrap_or("text/plain");
+        let parser_version = knowledge_parser_version(media_type);
+        // Batch item errors are recorded in the surrounding transaction, so
+        // validate the entire input before creating any successful import state.
+        let chunks = parsed_knowledge_chunks(scope, source_version_id, &text, media_type)?;
         if let Some(object) = &object
             && create_object
         {
@@ -390,7 +419,7 @@ impl PgKnowledgeRepository {
         sqlx::query(
             "INSERT INTO knowledge_source_versions
              (source_version_id,operator_id,tenant_id,project_id,source_id,version,object_id,object_version,content_sha256,captured_at,parser_version,extraction_version,created_at)
-             VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8,$9,'deterministic-text-v1','none-v1',$9)",
+             VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,'none-v1',$9)",
         )
         .bind(source_version_id)
         .bind(scope.operator_id.as_uuid())
@@ -401,6 +430,7 @@ impl PgKnowledgeRepository {
         .bind(object.as_ref().map(|value| value.object_version))
         .bind(&content_hash)
         .bind(now)
+        .bind(parser_version)
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
@@ -416,12 +446,11 @@ impl PgKnowledgeRepository {
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
-        let chunks = deterministic_chunks(scope, source_version_id, &text);
         for chunk in &chunks {
             sqlx::query(
                 "INSERT INTO knowledge_chunks
                  (chunk_id,operator_id,tenant_id,project_id,source_version_id,ordinal,kind,text,text_hash,locator,product_ids,market,language,extraction_method,confidence)
-                 VALUES ($1,$2,$3,$4,$5,$6,'paragraph',$7,$8,$9,$10,$11,$12,$13,$14)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$15,$7,$8,$9,$10,$11,$12,$13,$14)",
             )
             .bind(chunk.chunk_id)
             .bind(scope.operator_id.as_uuid())
@@ -437,6 +466,11 @@ impl PgKnowledgeRepository {
             .bind(&chunk.language)
             .bind(&chunk.extraction_method)
             .bind(chunk.confidence)
+            .bind(match chunk.kind {
+                geo_domain::ChunkKind::Paragraph => "paragraph",
+                geo_domain::ChunkKind::Table => "table",
+                geo_domain::ChunkKind::ImageDescription => "image_description",
+            })
             .execute(&mut **transaction)
             .await
             .map_err(database_error)?;
@@ -470,7 +504,7 @@ impl PgKnowledgeRepository {
             captured_at: now,
             original_url: None,
             parent_version_id: None,
-            parser_version: "deterministic-text-v1".to_owned(),
+            parser_version: parser_version.to_owned(),
             extraction_version: "none-v1".to_owned(),
             created_at: now,
         };
@@ -960,7 +994,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
             state: StoredObjectState::Committed,
             created_at: Utc::now(),
         };
-        let acceptance = if !is_text(&object.detected_media_type) {
+        let acceptance = if !is_supported_knowledge_media_type(&object.detected_media_type) {
             Self::failed_adapter_in_transaction(
                 &mut transaction,
                 scope,
@@ -1873,12 +1907,6 @@ fn parse_source_kind(value: &str) -> Result<SourceKind, AppError> {
         )),
     }
 }
-fn is_text(value: &str) -> bool {
-    matches!(
-        value.split(';').next().unwrap_or(value).trim(),
-        "text/plain" | "text/markdown" | "text/x-markdown"
-    )
-}
 fn source_from_row(
     row: &sqlx::postgres::PgRow,
     scope: &TenantScope,
@@ -1945,7 +1973,8 @@ fn chunk_from_row(
         project_id,
         source_version_id: row.get("source_version_id"),
         ordinal: row.get("ordinal"),
-        kind: geo_domain::ChunkKind::Paragraph,
+        kind: serde_json::from_value(Value::String(row.get("kind")))
+            .map_err(serialization_error)?,
         text: row.get("text"),
         text_hash: row.get("text_hash"),
         locator: serde_json::from_value(row.get::<Value, _>("locator"))

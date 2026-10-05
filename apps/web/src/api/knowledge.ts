@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { uploadMediaType as declaredMediaType } from "./upload-media";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor, type QueryScope } from "../auth/types";
 import {
@@ -52,6 +53,7 @@ export interface SourceLocator {
   sheet?: string | null;
   range?: string | null;
   header_range?: string | null;
+  header_row?: number | null;
   snapshot_object_id?: string | null;
   original_url?: string | null;
   selector?: string | null;
@@ -792,17 +794,6 @@ async function sha256(file: File) {
   return Array.from(new Uint8Array(digest), (value) =>
     value.toString(16).padStart(2, "0"),
   ).join("");
-}
-
-function declaredMediaType(file: File) {
-  if (file.type) return file.type;
-  const filename = file.name.toLocaleLowerCase();
-  if (filename.endsWith(".txt")) return "text/plain";
-  if (filename.endsWith(".md") || filename.endsWith(".markdown")) {
-    return "text/markdown";
-  }
-  if (filename.endsWith(".csv")) return "text/csv";
-  return "application/octet-stream";
 }
 
 export async function uploadFile(

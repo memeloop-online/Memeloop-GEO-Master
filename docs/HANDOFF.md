@@ -47,7 +47,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 - 上传会话、SHA-256 字节核验、批量导入、来源/版本、确定性文本分段、不可变 KnowledgeRelease、证据定位和 evidence-only 问答。
 - P01 已能物化文本、URL 引用和已上传对象；P03–P05 已接真实 API。
-- 当前只确定性解析 `text/plain` 与 `text/markdown`。PDF、DOCX、XLSX、CSV、网页抓取、OCR、向量检索、LLM 回答和结构化事实提取尚未实现。
+- 当前已验证基线支持 `text/plain` 与 `text/markdown`；本批另接 UTF-8、逗号分隔、含表头 CSV 的共享解析和表格引用，验收状态见工作日志，输入契约见 `csv-import.md`。PDF、DOCX、XLSX、网页抓取、OCR、向量检索、LLM 回答和结构化事实提取尚未实现。
 
 ### P00 AI 工作台
 

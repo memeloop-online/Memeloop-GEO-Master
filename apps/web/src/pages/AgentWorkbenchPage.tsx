@@ -390,7 +390,7 @@ function AgentChat({
           );
           if (references.length) {
             setRuntimeNotice(
-              "附件已提交。可在对话中要求导入 TXT / Markdown 并依据原文回答；上传不代表已阅读。",
+              "附件已提交。可在对话中要求导入 TXT / Markdown / UTF-8 CSV 并依据原文回答；上传不代表已阅读。",
             );
           }
           if (acceptance.error?.code === "capability_missing") {
@@ -485,8 +485,8 @@ function AgentChat({
       {attachments.length > 0 && (
         <div className="agent-file-reference-notice" aria-label="待发送附件">
           <p>
-            上传不直接加入知识库。可在对话中要求 AI 导入 TXT / Markdown
-            并引用原文回答。
+            上传不直接加入知识库。可在对话中要求 AI 导入 TXT / Markdown / UTF-8
+            CSV 并引用原文回答。CSV 使用逗号分隔，首条记录作为表头。
           </p>
           {attachments.map((item) => (
             <div key={item.id}>

@@ -59,10 +59,11 @@ export function formatLocator(locator: SourceLocator | null | undefined) {
     case "csv":
       return [
         "CSV",
+        locator.header_row != null ? `表头记录 ${locator.header_row}` : null,
         locator.range ? `范围 ${locator.range}` : null,
         locator.header_range ? `表头 ${locator.header_range}` : null,
         locator.start_row !== undefined && locator.start_row !== null
-          ? `第 ${locator.start_row}–${locator.end_row ?? locator.start_row} 行`
+          ? `第 ${locator.start_row}–${locator.end_row ?? locator.start_row} 条逻辑记录`
           : null,
         locator.start_column !== undefined && locator.start_column !== null
           ? `第 ${locator.start_column}–${locator.end_column ?? locator.start_column} 列`
