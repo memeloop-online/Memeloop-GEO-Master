@@ -1899,7 +1899,7 @@ mod tests {
         assert_eq!(expected.attachments, vec![attachment]);
         assert_eq!(expected.history.len(), 6);
         assert_eq!(expected.history_omitted_turns, 0);
-        for (index, pair) in expected.history.chunks_exact(2).enumerate() {
+        for (index, pair) in expected.history.as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(pair[0].role, MessageRole::User);
             assert_eq!(pair[1].role, MessageRole::Assistant);
             assert_eq!(pair[0].content, format!("question {index}"));

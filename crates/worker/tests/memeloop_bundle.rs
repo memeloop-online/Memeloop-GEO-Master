@@ -307,6 +307,83 @@ fn report_fixture() -> geo_domain::ReportSnapshot {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires `pnpm agent:bundle`; run with `cargo test -p geo-worker --test memeloop_bundle -- --ignored`"]
+async fn durable_history_reaches_model_in_fresh_v8_isolates_without_duplication() {
+    let source = generated_bundle();
+    let bundle = [(BUNDLE_SPECIFIER, source.as_str())];
+    let input = serde_json::json!({
+        "conversation_id": "history-conversation",
+        "message_id": "current-message",
+        "turn_id": "current-turn",
+        "run_id": "current-run",
+        "prompt": "What did you say?",
+        "timestamp": 1_700_000_000_000_u64,
+        "history_omitted_turns": 2,
+        "history": [
+            {"message_id":"prior-user","root_message_id":"prior-user",
+             "sequence":1,"role":"user","content":"Remember the warranty"},
+            {"message_id":"prior-answer","root_message_id":"prior-user",
+             "sequence":2,"role":"assistant","content":"Two years"}
+        ]
+    })
+    .to_string();
+    for _ in 0..2 {
+        let provider = Arc::new(RecordingHostOps::default());
+        let scope = test_scope();
+        let expected_scope = scope.storage_key();
+        let bridge = HostBridge::new(
+            Arc::clone(&provider) as Arc<dyn HostOps>,
+            scope,
+            tokio::runtime::Handle::current(),
+        );
+        let mut runtime = HostRuntime::new(&bundle, bridge, Some(64 * 1024 * 1024)).unwrap();
+        runtime.install_heap_limit_guard(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        runtime
+            .call_main(BUNDLE_SPECIFIER, &input, TURN_DEADLINE)
+            .await
+            .unwrap();
+        let calls = provider.model_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, expected_scope);
+        let transcript: Vec<_> = calls[0]
+            .1
+            .messages
+            .iter()
+            .filter(|message| message.role == "user" || message.role == "assistant")
+            .map(|message| {
+                (
+                    message.role.as_str(),
+                    message.content.as_deref().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            transcript,
+            vec![
+                ("user", "Remember the warranty"),
+                ("assistant", "Two years"),
+                ("user", "What did you say?"),
+            ]
+        );
+        assert!(
+            !calls[0]
+                .1
+                .tools
+                .iter()
+                .any(|tool| tool.function.name == "knowledge_import_attachments")
+        );
+        let completed = runtime
+            .host_state()
+            .events
+            .into_iter()
+            .find(|event| event.topic == "loop.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&completed.payload).unwrap();
+        assert_eq!(payload["history_omitted_turns"], 2);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires `pnpm agent:bundle`; run with `cargo test -p geo-worker --test memeloop_bundle -- --ignored`"]
 async fn generated_memeloop_bundle_reduces_and_reads_a_report_through_rust() {
     let source = generated_bundle();
     let bundle = [(BUNDLE_SPECIFIER, source.as_str())];
