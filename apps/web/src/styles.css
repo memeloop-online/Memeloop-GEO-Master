@@ -1466,6 +1466,29 @@ input {
     monospace;
   white-space: pre-wrap;
 }
+
+.csv-evidence-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.csv-evidence-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.csv-evidence-table th,
+.csv-evidence-table td {
+  padding: 8px;
+  border: 1px solid #d1d1d1;
+  text-align: left;
+  vertical-align: top;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 100px;
+}
+.csv-evidence-table th span,
+.csv-evidence-table th small {
+  display: block;
+}
 .source-chunk-list {
   display: grid;
   gap: 8px;

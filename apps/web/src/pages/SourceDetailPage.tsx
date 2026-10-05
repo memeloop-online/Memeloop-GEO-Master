@@ -18,6 +18,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { useSourceQuery } from "../api/knowledge";
 import { ErrorState, EmptyState, LoadingState } from "../components/AsyncState";
 import { KnowledgeLocator } from "../components/KnowledgeLocator";
+import { CsvEvidenceTable } from "../components/CsvEvidenceTable";
 import { StatusPill, type StatusKind } from "../components/StatusPill";
 
 function statusKind(value: string | null | undefined): StatusKind {
@@ -227,6 +228,10 @@ export function SourceDetailPage() {
                   ? `提取方式：${selectedChunk.extraction_method}`
                   : "正在等待提取方式记录"}
               </small>
+              {selectedChunk.kind === "table" &&
+                selectedChunk.locator?.kind === "csv" && (
+                  <CsvEvidenceTable text={selectedChunk.text} />
+                )}
             </section>
           )}
           {facts.length === 0 ? (

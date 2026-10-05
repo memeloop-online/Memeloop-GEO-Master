@@ -274,6 +274,51 @@ describe("knowledge workbench", () => {
     expect(screen.getAllByText(/PDF 第 12 页/)).toHaveLength(2);
   });
 
+  it("opens a CSV record as exact cells with its header and logical row locator", async () => {
+    const text = JSON.stringify({
+      headers: ["型号", "价格"],
+      values: ["001", "1.00 元"],
+    });
+    vi.stubGlobal(
+      "fetch",
+      requestHandler({
+        sourceDetail: {
+          source,
+          versions: [],
+          chunks: [
+            {
+              chunk_id: "csv-row",
+              source_version_id: "version-a",
+              ordinal: 0,
+              kind: "table",
+              text,
+              product_ids: [],
+              locator: {
+                kind: "csv",
+                start_row: 2,
+                end_row: 2,
+                start_column: 1,
+                end_column: 2,
+                header_row: 1,
+              },
+            },
+          ],
+          facts: [],
+          import_jobs: [],
+          impact: {},
+        },
+      }),
+    );
+    renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
+    await userEvent.click(await screen.findByText(text));
+    expect(screen.getByRole("table")).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "001" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "1.00 元" })).toBeInTheDocument();
+    expect(screen.getAllByText(/表头记录 1.*第 2–2 条逻辑记录/)).toHaveLength(
+      2,
+    );
+  });
+
   it("uses evidence-only mode and reports insufficient evidence without invented prose", async () => {
     vi.stubGlobal(
       "fetch",
