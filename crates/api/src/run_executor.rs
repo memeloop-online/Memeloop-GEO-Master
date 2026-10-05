@@ -5,11 +5,11 @@
 //! records a turn.  What was missing was the thing in between, which is why a
 //! run accepted against a configured runtime stayed `queued` forever.
 //!
-//! It is an in-process background task.  There is deliberately no second
-//! runtime, no queue service and no polling worker: one process accepts the
-//! turn and runs it, and the durable state machine in the repository — not a
-//! scheduler — is what makes the run's progress observable and its completion
-//! exactly once.
+//! HTTP dispatch and the PostgreSQL queued-run scanner both enter the same
+//! atomic claim. The repository is authoritative for execution ownership and
+//! for the turn input; scanning never synthesizes a message or a prompt.
+//! Running runs are not reclaimed here: recovering a mid-turn side effect
+//! requires a separate lease and durable tool-call protocol.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,18 +102,19 @@ pub fn dispatch(
     if acceptance.run.status != RunStatus::Queued {
         return;
     }
-    let input = TurnInput {
-        conversation_id: acceptance.conversation.id,
-        message_id: acceptance.message.id,
-        turn_id: acceptance.turn.id,
-        run_id: acceptance.run.id,
-        prompt: acceptance.message.content.clone(),
-        attachments: acceptance.message.attachments.clone(),
-        history: Vec::new(),
-        history_omitted_turns: 0,
-    };
+    dispatch_queued(runtime, repository, scope, acceptance.run.id);
+}
+
+/// Schedule a durable queued run for an atomic claim. Called by the HTTP
+/// acceptance path and by PostgreSQL recovery; duplicate schedules are safe.
+pub fn dispatch_queued(
+    runtime: Arc<dyn AgentRuntime>,
+    repository: Arc<dyn AgentRepository>,
+    scope: TenantScope,
+    run_id: RunId,
+) {
     tokio::spawn(async move {
-        execute(runtime, repository, scope, input).await;
+        execute(runtime, repository, scope, run_id).await;
     });
 }
 
@@ -126,23 +127,20 @@ async fn execute(
     runtime: Arc<dyn AgentRuntime>,
     repository: Arc<dyn AgentRepository>,
     scope: TenantScope,
-    input: TurnInput,
+    run_id: RunId,
 ) {
-    let run_id = input.run_id;
-    match repository.begin_run(&scope, run_id).await {
+    let claimed = match repository.begin_run(&scope, run_id).await {
         // Claimed by someone else, already terminal, or cancelled between
         // acceptance and dispatch. Either way it is not ours to run, and
         // reporting anything would be reporting a turn that never happened.
         Ok(None) => return,
-        Ok(Some(_)) => {}
+        Ok(Some(claimed)) => claimed,
         Err(error) => {
-            // The run stays `queued` with no successor. Recovering it is the
-            // restart-reconciliation gap recorded in TODO.md, not something to
-            // paper over here by pretending the turn ran.
-            tracing::warn!(%run_id, %error, "the run could not be claimed for execution");
+            // The run remains queued and is eligible for the next scan.
+            tracing::warn!(code = ?error.code, "the run could not be claimed for execution");
             return;
         }
-    }
+    };
     let cancellation = Arc::new(AtomicBool::new(false));
     let _active = ActiveRun::register(run_id, Arc::clone(&cancellation));
     // A cancel on another replica may have committed after begin_run but
@@ -178,7 +176,7 @@ async fn execute(
     // attachment bindings. Reconstruct exactly the same input on reentry.
     let execution = async {
         let detail = repository
-            .get_conversation(&scope, input.conversation_id)
+            .get_conversation(&scope, claimed.conversation_id)
             .await?
             .ok_or_else(|| AppError::not_found("run conversation not found"))?;
         let restored = detail.turn_input(run_id)?;
@@ -231,9 +229,7 @@ async fn execute(
             "the turn reached a terminal state"
         ),
         Ok(None) => tracing::debug!(%run_id, "the run was already terminal; nothing written"),
-        Err(error) => {
-            tracing::warn!(%run_id, %error, "the run's outcome could not be recorded");
-        }
+        Err(error) => tracing::warn!(code = ?error.code, "the run's outcome could not be recorded"),
     }
 }
 
@@ -288,10 +284,11 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use geo_domain::{
-        AgentRepository, AppendMessage, CreateConversation, MemoryAgentRepository,
-        RuntimeCapability,
+        AgentRepository, AppendMessage, AttachmentId, AttachmentReference, CreateConversation,
+        MemoryAgentRepository, RuntimeCapability,
     };
     use serde_json::Value;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::sync::Notify;
 
@@ -301,6 +298,32 @@ mod tests {
 
     struct WaitingRuntime {
         started: Arc<Notify>,
+    }
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        inputs: Mutex<Vec<TurnInput>>,
+        invocations: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentRuntime for RecordingRuntime {
+        async fn capability(&self) -> RuntimeCapability {
+            RuntimeCapability::available("fixture", None)
+        }
+
+        async fn run_turn(
+            &self,
+            _scope: &TenantScope,
+            input: TurnInput,
+        ) -> Result<TurnReport, AppError> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            self.inputs.lock().unwrap().push(input);
+            Ok(TurnReport {
+                content: "recorded answer".to_owned(),
+                metadata: Value::Null,
+            })
+        }
     }
 
     #[async_trait]
@@ -355,6 +378,186 @@ mod tests {
             uuid::Uuid::new_v4().into(),
             Some(uuid::Uuid::new_v4().into()),
         )
+    }
+
+    #[tokio::test]
+    async fn queued_recovery_uses_durable_root_history_and_attachments() {
+        let repository = Arc::new(MemoryAgentRepository::new());
+        let runtime = Arc::new(RecordingRuntime::default());
+        let scope = fixture_scope();
+        let conversation = repository
+            .create_conversation(&scope, None, CreateConversation::default())
+            .await
+            .unwrap();
+        let first = repository
+            .append_message(
+                &scope,
+                conversation.id,
+                AppendMessage {
+                    content: "earlier prompt".into(),
+                    attachments: vec![],
+                    metadata: Value::Null,
+                },
+                "history-key".into(),
+                "history-body".into(),
+                runtime.capability().await,
+            )
+            .await
+            .unwrap();
+        execute(
+            runtime.clone(),
+            repository.clone(),
+            scope.clone(),
+            first.run.id,
+        )
+        .await;
+        let attachment = AttachmentReference {
+            attachment_id: AttachmentId::from(uuid::Uuid::new_v4()),
+            object_id: "stored-object".into(),
+            filename: "notes.txt".into(),
+            media_type: Some("text/plain".into()),
+            size_bytes: Some(8),
+            sha256: None,
+            object_version: Some("v1".into()),
+        };
+        let second = repository
+            .append_message(
+                &scope,
+                conversation.id,
+                AppendMessage {
+                    content: "follow-up".into(),
+                    attachments: vec![attachment.clone()],
+                    metadata: Value::Null,
+                },
+                "recovery-key".into(),
+                "recovery-body".into(),
+                runtime.capability().await,
+            )
+            .await
+            .unwrap();
+        // There was no HTTP dispatch for this turn. The scanner can supply
+        // only its scoped run ID; all input must come from the store.
+        execute(
+            runtime.clone(),
+            repository.clone(),
+            scope.clone(),
+            second.run.id,
+        )
+        .await;
+        let inputs = runtime.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[1].run_id, second.run.id);
+        assert_eq!(inputs[1].prompt, "follow-up");
+        assert_eq!(inputs[1].attachments, vec![attachment]);
+        assert_eq!(inputs[1].history.len(), 2);
+        assert_eq!(inputs[1].history[0].content, "earlier prompt");
+        assert_eq!(inputs[1].history[1].content, "recorded answer");
+    }
+
+    #[tokio::test]
+    async fn duplicate_http_and_recovery_claim_executes_once() {
+        let repository = Arc::new(MemoryAgentRepository::new());
+        let runtime = Arc::new(RecordingRuntime::default());
+        let scope = fixture_scope();
+        let conversation = repository
+            .create_conversation(&scope, None, CreateConversation::default())
+            .await
+            .unwrap();
+        let acceptance = repository
+            .append_message(
+                &scope,
+                conversation.id,
+                AppendMessage {
+                    content: "one turn".into(),
+                    attachments: vec![],
+                    metadata: Value::Null,
+                },
+                "claim-key".into(),
+                "claim-body".into(),
+                runtime.capability().await,
+            )
+            .await
+            .unwrap();
+        let run_id = acceptance.run.id;
+        tokio::join!(
+            execute(runtime.clone(), repository.clone(), scope.clone(), run_id),
+            execute(runtime.clone(), repository.clone(), scope.clone(), run_id)
+        );
+        assert_eq!(runtime.invocations.load(Ordering::SeqCst), 1);
+        let detail = repository
+            .get_conversation(&scope, conversation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.runs[0].status, RunStatus::Succeeded);
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|message| message.content == "recorded answer")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_running_runs_are_never_reclaimed() {
+        let repository = Arc::new(MemoryAgentRepository::new());
+        let runtime = Arc::new(RecordingRuntime::default());
+        let scope = fixture_scope();
+        for (index, cancel) in [true, false].into_iter().enumerate() {
+            let conversation = repository
+                .create_conversation(&scope, None, CreateConversation::default())
+                .await
+                .unwrap();
+            let acceptance = repository
+                .append_message(
+                    &scope,
+                    conversation.id,
+                    AppendMessage {
+                        content: "pending".into(),
+                        attachments: vec![],
+                        metadata: Value::Null,
+                    },
+                    format!("pending-key-{index}"),
+                    format!("pending-body-{index}"),
+                    runtime.capability().await,
+                )
+                .await
+                .unwrap();
+            if cancel {
+                repository
+                    .cancel_turn(&scope, acceptance.turn.id)
+                    .await
+                    .unwrap();
+            } else {
+                repository
+                    .begin_run(&scope, acceptance.run.id)
+                    .await
+                    .unwrap();
+            }
+            execute(
+                runtime.clone(),
+                repository.clone(),
+                scope.clone(),
+                acceptance.run.id,
+            )
+            .await;
+            let detail = repository
+                .get_conversation(&scope, conversation.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                detail.runs[0].status,
+                if cancel {
+                    RunStatus::Cancelled
+                } else {
+                    RunStatus::Running
+                }
+            );
+        }
+        assert_eq!(runtime.invocations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

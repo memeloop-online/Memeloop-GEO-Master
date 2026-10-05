@@ -30,7 +30,7 @@ mod projects;
 mod report;
 mod scope;
 
-pub use agent::PgAgentRepository;
+pub use agent::{PgAgentRepository, QueuedAgentRun};
 pub use auth::PgAuthRepository;
 pub use config::{DatabaseConfig, DatabaseConfigError};
 pub use database::{Database, HealthCheck};

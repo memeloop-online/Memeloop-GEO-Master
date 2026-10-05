@@ -96,6 +96,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 21,
         description: "saved connector verifications",
     },
+    MigrationMetadata {
+        version: 22,
+        description: "agent queued scan",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

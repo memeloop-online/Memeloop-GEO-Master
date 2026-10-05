@@ -1,8 +1,10 @@
 //! PostgreSQL implementation of the P00 agent repository.
 //!
-//! Every statement filters on the explicit operator/tenant/project columns and
-//! every write runs inside a transaction that first sets the transaction-local
-//! scope, so the mapping is ready for FORCE RLS once 0004 stops being a no-op.
+//! Tenant-facing statements filter on explicit operator/tenant/project columns
+//! and every write runs inside a transaction that first sets the
+//! transaction-local scope, so the mapping is ready for FORCE RLS once 0004
+//! stops being a no-op. The read-only queued discovery selector is reserved
+//! for trusted background dispatch and returns scope identifiers only.
 //! Writes that allocate a per-conversation sequence or decide a state-machine
 //! transition first take a row lock, which is what makes the sequence monotonic
 //! and cancel-vs-completion a single serialized decision.
@@ -22,7 +24,7 @@ use geo_domain::{
     validate_checkpoint_write, validate_message_content, validate_tool_call_write,
 };
 use serde_json::{Value, json};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -31,6 +33,15 @@ use crate::{Database, set_local_scope};
 /// Live delivery fan-out for one process.  Durable replay is the source of
 /// truth; live tailing stays per-process, exactly as in the in-memory store.
 const EVENT_CHANNEL_CAPACITY: usize = 512;
+
+/// Trusted background discovery result. The scan is intentionally not an
+/// execution claim; `begin_run` remains the atomic scoped claim.
+#[derive(Debug, Clone)]
+pub struct QueuedAgentRun {
+    pub scope: TenantScope,
+    pub run_id: RunId,
+    pub created_at: DateTime<Utc>,
+}
 
 #[derive(Clone)]
 pub struct PgAgentRepository {
@@ -50,6 +61,50 @@ impl PgAgentRepository {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Enumerates queued work across tenants for the trusted process dispatcher.
+    /// Never expose this selector to tenant APIs; callers must pass each
+    /// returned scope to the guarded `begin_run` before executing any work.
+    pub async fn scan_queued_after(
+        &self,
+        after: Option<(DateTime<Utc>, RunId)>,
+        limit: u32,
+    ) -> Result<Vec<QueuedAgentRun>, AppError> {
+        if !(1..=100).contains(&limit) {
+            return Err(AppError::invalid_request(
+                "invalid queued agent scan page size",
+            ));
+        }
+        let (after_created_at, after_run_id) = after
+            .map(|(created_at, run_id)| (Some(created_at), Some(run_id.as_uuid())))
+            .unwrap_or((None, None));
+        let rows = sqlx::query(
+            r#"SELECT operator_id, tenant_id, project_id, run_id, created_at
+                 FROM agent_runs
+                WHERE status = 'queued'
+                  AND ($1::timestamptz IS NULL OR (created_at, run_id) > ($1, $2))
+                ORDER BY created_at ASC, run_id ASC
+                LIMIT $3"#,
+        )
+        .bind(after_created_at)
+        .bind(after_run_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| QueuedAgentRun {
+                scope: TenantScope::new(
+                    row.get::<Uuid, _>("operator_id").into(),
+                    row.get::<Uuid, _>("tenant_id").into(),
+                    Some(row.get::<Uuid, _>("project_id").into()),
+                ),
+                run_id: row.get::<Uuid, _>("run_id").into(),
+                created_at: row.get("created_at"),
+            })
+            .collect())
     }
 
     async fn transaction(

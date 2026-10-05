@@ -20,6 +20,7 @@ mod knowledge;
 mod provider_bridge;
 mod reports;
 mod run_executor;
+pub use run_executor::dispatch_queued;
 mod storage;
 
 use axum::{

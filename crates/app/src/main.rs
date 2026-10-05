@@ -1,3 +1,4 @@
+mod agent_dispatch;
 mod bootstrap;
 mod channels;
 mod config;
@@ -36,12 +37,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if production_ai.is_some() && !durable_storage {
         return Err("production model configuration requires PostgreSQL".into());
     }
-    let (state, durable_storage, content_scanner) = if durable_storage {
+    let (state, durable_storage, content_scanner, agent_scanner) = if durable_storage {
         // A configured database is authoritative.  Connection or migration
         // failures terminate startup; the process never falls back to memory
         // authentication or idempotency state.
         let database = Database::connect_and_migrate_from_env().await?;
         let report_scanner = PgReportRepository::from_database(&database);
+        let agent_scanner = geo_persistence::PgAgentRepository::from_database(&database);
         let content_scanner = geo_persistence::PgContentRepository::from_database(&database);
         let cycle_scanner = PgProjectRepository::from_database(&database);
         let verification_scanner =
@@ -66,7 +68,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         state.set_ready(true);
         spawn_due_report_scanner(state.clone(), report_scanner, cycle_scanner.clone());
         verification_dispatch::spawn(verification_scanner);
-        (state, true, Some((content_scanner, cycle_scanner)))
+        (
+            state,
+            true,
+            Some((content_scanner, cycle_scanner)),
+            Some(agent_scanner),
+        )
     } else {
         let password = config.validate_for_memory_mode()?;
         let state = channels::configure(
@@ -85,9 +92,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if config.ready_on_start {
             state.set_ready(true);
         }
-        (state, false, None)
+        (state, false, None, None)
     };
     runtime::configure_content_workflow(&state)?;
+    if let Some(scanner) = agent_scanner {
+        agent_dispatch::spawn(state.clone(), scanner);
+    }
     if let Some((scanner, cycles)) = content_scanner {
         content_dispatch::spawn(state.clone(), scanner, cycles);
     }

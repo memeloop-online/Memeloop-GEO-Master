@@ -1824,6 +1824,229 @@ async fn agent_begin_run_claims_a_queued_run_exactly_once() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn agent_queued_scan_pages_across_scopes_without_claiming_or_resurrecting_runs() {
+    // Global discovery is intentionally isolated from concurrently running
+    // tests; otherwise their queued runs can appear in these exact pages.
+    let url = std::env::var("GEO_TEST_DATABASE_URL").expect("test database");
+    let admin = PgPoolOptions::new()
+        .connect(&url)
+        .await
+        .expect("admin pool");
+    let schema = format!("queued_scan_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .expect("isolated schema");
+    let options = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .expect("connection options")
+        .options([("search_path", schema.as_str())]);
+    let pool = PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .expect("isolated pool");
+    geo_persistence::MIGRATOR
+        .run(&pool)
+        .await
+        .expect("isolated migrations");
+    let first_repo = PgAgentRepository::new(pool.clone());
+    let first_scope = seed_scope(&pool, "queued-first").await;
+    let sibling_scope = seed_sibling_scope(&pool, &first_scope, "queued-sibling").await;
+    let other_tenant = seed_scope(&pool, "queued-other-tenant").await;
+    let mut queued = Vec::new();
+    for (index, scope) in [&first_scope, &sibling_scope, &other_tenant]
+        .into_iter()
+        .enumerate()
+    {
+        let conversation = create_conversation(&first_repo, scope).await;
+        let acceptance = first_repo
+            .append_message(
+                scope,
+                conversation.id,
+                message("queued"),
+                format!("queued-key-{index}"),
+                format!("queued-body-{index}"),
+                RuntimeCapability::available("deno_core", None),
+            )
+            .await
+            .expect("queued acceptance");
+        queued.push((scope.clone(), acceptance.run.id));
+    }
+    let stamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .expect("fixed timestamp")
+        .with_timezone(&chrono::Utc);
+    for (index, (_, run_id)) in queued.iter().enumerate() {
+        sqlx::query("UPDATE agent_runs SET created_at = $1 WHERE run_id = $2")
+            .bind(stamp + chrono::Duration::seconds(if index == 2 { 1 } else { 0 }))
+            .bind(run_id.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("set deterministic cursor");
+    }
+    // An unavailable capability is durably failed on acceptance, not queued.
+    let failed_conversation = create_conversation(&first_repo, &first_scope).await;
+    let failed = first_repo
+        .append_message(
+            &first_scope,
+            failed_conversation.id,
+            message("unavailable"),
+            "failed-key".to_owned(),
+            "failed-body".to_owned(),
+            RuntimeCapability::missing("runtime unavailable"),
+        )
+        .await
+        .expect("failed acceptance");
+    assert_eq!(failed.run.status, RunStatus::Failed);
+    let cancelled_conversation = create_conversation(&first_repo, &first_scope).await;
+    let cancelled = first_repo
+        .append_message(
+            &first_scope,
+            cancelled_conversation.id,
+            message("cancel"),
+            "cancelled-key".to_owned(),
+            "cancelled-body".to_owned(),
+            RuntimeCapability::available("deno_core", None),
+        )
+        .await
+        .expect("cancelled acceptance");
+    first_repo
+        .cancel_turn(&first_scope, cancelled.turn.id)
+        .await
+        .expect("cancel queued turn");
+    let running_conversation = create_conversation(&first_repo, &first_scope).await;
+    let running = first_repo
+        .append_message(
+            &first_scope,
+            running_conversation.id,
+            message("running"),
+            "running-key".to_owned(),
+            "running-body".to_owned(),
+            RuntimeCapability::available("deno_core", None),
+        )
+        .await
+        .expect("running acceptance");
+    first_repo
+        .begin_run(&first_scope, running.run.id)
+        .await
+        .expect("begin running")
+        .expect("running claim");
+
+    let restarted = PgAgentRepository::new(pool.clone());
+    assert_eq!(
+        restarted
+            .scan_queued_after(None, 0)
+            .await
+            .expect_err("zero page size")
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        restarted
+            .scan_queued_after(None, 101)
+            .await
+            .expect_err("oversized page")
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    let mut discovered = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = restarted
+            .scan_queued_after(cursor, 1)
+            .await
+            .expect("keyset page");
+        if page.is_empty() {
+            break;
+        }
+        let row = page.into_iter().next().expect("page row");
+        cursor = Some((row.created_at, row.run_id));
+        discovered.push(row);
+    }
+    assert_eq!(discovered.len(), 3);
+    queued[..2].sort_by_key(|(_, run_id)| run_id.as_uuid());
+    for (row, (scope, run_id)) in discovered.iter().zip(&queued) {
+        assert_eq!(&row.scope, scope);
+        assert_eq!(row.run_id, *run_id);
+    }
+    assert_eq!(discovered[0].created_at, stamp);
+    assert_eq!(discovered[1].created_at, stamp);
+    assert_eq!(
+        discovered[2].created_at,
+        stamp + chrono::Duration::seconds(1)
+    );
+    assert_eq!(
+        first_repo
+            .run_status(&discovered[0].scope, discovered[0].run_id)
+            .await
+            .expect("scan does not claim"),
+        Some(RunStatus::Queued)
+    );
+    let foreign_scope = if discovered[0].scope == first_scope {
+        &sibling_scope
+    } else {
+        &first_scope
+    };
+    assert!(
+        restarted
+            .begin_run(foreign_scope, discovered[0].run_id)
+            .await
+            .expect("sibling cannot claim")
+            .is_none()
+    );
+    let mut claims = Vec::new();
+    for repository in [first_repo.clone(), restarted.clone()] {
+        let row = discovered[0].clone();
+        claims.push(tokio::spawn(async move {
+            repository.begin_run(&row.scope, row.run_id).await
+        }));
+    }
+    let mut winners = 0;
+    for claim in claims {
+        if claim
+            .await
+            .expect("join claim")
+            .expect("claim transaction")
+            .is_some()
+        {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "only one repository may begin a queued run");
+    let claimed_conversation: Uuid =
+        sqlx::query_scalar("SELECT conversation_id FROM agent_runs WHERE run_id = $1")
+            .bind(discovered[0].run_id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("claimed conversation");
+    let events = restarted
+        .replay_events(&discovered[0].scope, claimed_conversation.into(), Some(0))
+        .await
+        .expect("running events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "run.running")
+            .count(),
+        1
+    );
+    assert_eq!(
+        restarted
+            .scan_queued_after(None, 100)
+            .await
+            .expect("scan excludes claimed run")
+            .len(),
+        2
+    );
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .expect("remove isolated schema");
+    admin.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
 async fn agent_single_process_startup_reconciles_only_running_runs() {
     // This operation intentionally scans all running rows in a single-process
     // deployment. Isolate its schema from parallel repository tests rather
