@@ -252,6 +252,16 @@ function mockApi({
       }
       if (path.endsWith("/channel-targets/target-1"))
         return Promise.resolve(response(detail));
+      if (path.endsWith("/channel-targets/target-1/publication-lookup"))
+        return Promise.resolve(
+          response({
+            target_id: "target-1",
+            attempt_id: "attempt-1",
+            job: null,
+            observations: [],
+            next_before: null,
+          }),
+        );
       return Promise.resolve(
         response({ code: "not_found", message: "not found" }, 404),
       );
@@ -559,6 +569,11 @@ describe("P12 channel jobs", () => {
       expect(
         requests.filter((item) => item.path.endsWith("/execute")),
       ).toHaveLength(1);
+      const lookupRequests = requests.filter((item) =>
+        item.path.endsWith("/publication-lookup"),
+      );
+      expect(lookupRequests).toHaveLength(outcome === "unknown" ? 1 : 0);
+      expect(lookupRequests.every((item) => item.method === "GET")).toBe(true);
     },
   );
 

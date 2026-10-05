@@ -3,21 +3,230 @@
 
 use std::sync::Arc;
 
+use axum::{
+    Json,
+    extract::{Extension, Path, Query, State},
+};
 use chrono::{DateTime, Duration, Utc};
 use geo_domain::{
-    AppError, ChannelTargetInput, ErrorCode, PublicationLookupFinding, PublicationLookupJob,
-    PublicationLookupObservation, PublicationLookupRepository, TenantScope, sha256_hex,
+    AppError, ChannelTargetInput, ErrorCode, ProjectId, PublicationLookupFinding,
+    PublicationLookupJob, PublicationLookupObservation, PublicationLookupRepository, TenantScope,
+    sha256_hex,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    AppState,
+    ApiError, AppState, RequestContext, api_error,
     browser_bridge::{BrowserExecution, BrowserReceiptProvenance},
     channel_jobs::{execute_and_close_with_cleanup, publication_readback},
 };
 
 const LEASE: Duration = Duration::minutes(5);
+const PAGE_SIZE: usize = 20;
+
+#[derive(Deserialize)]
+pub struct LookupPageQuery {
+    before: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LookupRead {
+    pub(crate) target_id: Uuid,
+    pub(crate) attempt_id: Option<Uuid>,
+    pub(crate) job: Option<LookupJobRead>,
+    pub(crate) observations: Vec<LookupObservationRead>,
+    pub(crate) next_before: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LookupJobRead {
+    pub(crate) query_count: i32,
+    pub(crate) next_due_at: Option<DateTime<Utc>>,
+    pub(crate) last_error_code: Option<&'static str>,
+    pub(crate) in_progress: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LookupObservationRead {
+    pub(crate) execution_id: Uuid,
+    pub(crate) finding: PublicationLookupFinding,
+    pub(crate) observed_at: DateTime<Utc>,
+    pub(crate) received_at: DateTime<Utc>,
+    pub(crate) error_code: Option<&'static str>,
+    pub(crate) public_url: Option<String>,
+}
+
+/// Only locally defined, non-secret failure classes can cross the HTTP
+/// boundary; arbitrary stored codes (including future connector messages)
+/// collapse to a generic class.
+fn public_error_code(code: Option<&str>) -> Option<&'static str> {
+    code.map(|value| match value {
+        "candidate_missing" => "candidate_missing",
+        "candidate_invalid" => "candidate_invalid",
+        "target_mismatch" => "target_mismatch",
+        "connector_version_missing" => "connector_version_missing",
+        "connector_version_invalid" => "connector_version_invalid",
+        "binding_missing" => "binding_missing",
+        "binding_unavailable" => "binding_unavailable",
+        "runner_unavailable" => "runner_unavailable",
+        "account_busy" => "account_busy",
+        "account_reservation_failed" => "account_reservation_failed",
+        "account_or_network_unavailable" => "account_or_network_unavailable",
+        "connector_version_mismatch" => "connector_version_mismatch",
+        "lookup_preflight_expired" => "lookup_preflight_expired",
+        "readback_unverified" => "readback_unverified",
+        "lookup_unavailable" => "lookup_unavailable",
+        _ => "lookup_error",
+    })
+}
+
+fn public_observed_url(
+    observation: &PublicationLookupObservation,
+    job: &PublicationLookupJob,
+) -> Option<String> {
+    if observation.finding != PublicationLookupFinding::AssetObserved
+        || !job.frozen_input.is_publication()
+        || job.frozen_input.account_id() != job.account_id
+    {
+        return None;
+    }
+    let (platform, title, body) = match &job.frozen_input {
+        ChannelTargetInput::Publish {
+            platform,
+            title,
+            body,
+            ..
+        }
+        | ChannelTargetInput::GeneratedPublish {
+            platform,
+            title,
+            body,
+            ..
+        } => (platform, title, body),
+        ChannelTargetInput::Measure { .. } => return None,
+    };
+    let evidence = observation.evidence.as_object()?;
+    let url = evidence.get("public_url")?.as_str()?;
+    let digest = evidence.get("content_sha256")?.as_str()?;
+    let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected_digest =
+        sha256_hex(format!("{}\n{}", normalized(title), normalized(body)).as_bytes());
+    (evidence.get("schema_version")?.as_str()? == "geo.publication.asset_observation.v1"
+        && evidence.get("provenance")?.as_str()? == "live"
+        && evidence.get("original_attempt_id")?.as_str()? == job.attempt_id.to_string()
+        && evidence.get("target_id")?.as_str()? == job.target_id.to_string()
+        && evidence.get("account_id")?.as_str()? == job.account_id.to_string()
+        && evidence.get("connector_version")?.as_str()? == job.connector_version.as_deref()?
+        && evidence
+            .get("observed_at")?
+            .as_str()?
+            .parse::<DateTime<Utc>>()
+            .ok()?
+            .timestamp_micros()
+            == observation.observed_at.timestamp_micros()
+        && job.candidate_public_url.as_deref() == Some(url)
+        && digest == expected_digest
+        && valid_candidate(url, platform))
+    .then(|| url.to_owned())
+}
+
+/// Shared Rust projection for HTTP and later P00 reads. It never returns
+/// the frozen input, evidence JSON, account, binding or lease identifiers.
+pub(crate) async fn read_publication_lookup(
+    state: &AppState,
+    scope: &TenantScope,
+    target_id: Uuid,
+    before: Option<Uuid>,
+) -> Result<LookupRead, AppError> {
+    let target = state
+        .channel_job_repository()
+        .get_target(scope, target_id)
+        .await?;
+    if !target.target.input.is_publication() {
+        return Err(AppError::invalid_request(
+            "publication lookup requires a publication target",
+        ));
+    }
+    let attempt_id = target.attempts.first().map(|attempt| attempt.attempt_id);
+    let empty = || LookupRead {
+        target_id,
+        attempt_id,
+        job: None,
+        observations: vec![],
+        next_before: None,
+    };
+    let Some(attempt_id) = attempt_id else {
+        if before.is_some() {
+            return Err(AppError::invalid_request("invalid lookup cursor"));
+        }
+        return Ok(empty());
+    };
+    let Some(repository) = &state.publication_lookup_repository else {
+        if before.is_some() {
+            return Err(AppError::invalid_request("invalid lookup cursor"));
+        }
+        return Ok(empty());
+    };
+    let job = match repository.get(scope, attempt_id).await {
+        Ok(job) if job.target_id == target_id && job.attempt_id == attempt_id => job,
+        Ok(_) => return Err(AppError::not_found("lookup job not found")),
+        Err(error) if error.code == ErrorCode::NotFound => {
+            if before.is_some() {
+                return Err(AppError::invalid_request("invalid lookup cursor"));
+            }
+            return Ok(empty());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut page = repository
+        .observation_page(scope, attempt_id, before, PAGE_SIZE)
+        .await?;
+    let has_more = page.len() > PAGE_SIZE;
+    page.truncate(PAGE_SIZE);
+    let next_before = has_more.then(|| page.last().expect("page has 20 observations").execution_id);
+    Ok(LookupRead {
+        target_id,
+        attempt_id: Some(attempt_id),
+        job: Some(LookupJobRead {
+            query_count: job.query_count,
+            next_due_at: job.next_due_at,
+            last_error_code: public_error_code(job.last_error_code.as_deref()),
+            in_progress: job
+                .lease_expires_at
+                .is_some_and(|expires| expires > Utc::now()),
+        }),
+        observations: page
+            .iter()
+            .map(|observation| LookupObservationRead {
+                execution_id: observation.execution_id,
+                finding: observation.finding,
+                observed_at: observation.observed_at,
+                received_at: observation.received_at,
+                error_code: public_error_code(observation.error_code.as_deref()),
+                public_url: public_observed_url(observation, &job),
+            })
+            .collect(),
+        next_before,
+    })
+}
+
+pub async fn get_publication_lookup(
+    State(state): State<AppState>,
+    Path((project_id, target_id)): Path<(ProjectId, Uuid)>,
+    Query(query): Query<LookupPageQuery>,
+    Extension(tenant): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<LookupRead>, ApiError> {
+    let scope = crate::channel_jobs::scope(&state, &tenant, project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    read_publication_lookup(&state, &scope, target_id, query.before)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(error, context.request_id))
+}
 
 /// Atomically claim before creating a task: competing scans cannot accumulate
 /// unclaimed browser work. `false` means another worker holds this lookup.
@@ -310,6 +519,7 @@ fn observed_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use axum::{
         Json, Router,
         extract::State,
@@ -318,6 +528,268 @@ mod tests {
     };
     use geo_domain::{OperatorId, ProjectId, TenantId};
     use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct ReadOnlyLookup {
+        job: PublicationLookupJob,
+        history: Vec<PublicationLookupObservation>,
+    }
+
+    #[async_trait]
+    impl PublicationLookupRepository for ReadOnlyLookup {
+        async fn enqueue(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+            _: Uuid,
+            _: DateTime<Utc>,
+        ) -> Result<PublicationLookupJob, AppError> {
+            panic!("a read must never enqueue")
+        }
+        async fn scan_due(
+            &self,
+            _: Option<Uuid>,
+            _: DateTime<Utc>,
+            _: usize,
+        ) -> Result<Vec<geo_domain::PublicationLookupCandidate>, AppError> {
+            panic!("a read must never scan")
+        }
+        async fn claim(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+            _: Uuid,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+        ) -> Result<PublicationLookupJob, AppError> {
+            panic!("a read must never claim")
+        }
+        async fn finish(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+            _: PublicationLookupObservation,
+            _: Option<DateTime<Utc>>,
+        ) -> Result<PublicationLookupJob, AppError> {
+            panic!("a read must never finish")
+        }
+        async fn get(
+            &self,
+            _: &TenantScope,
+            attempt: Uuid,
+        ) -> Result<PublicationLookupJob, AppError> {
+            (attempt == self.job.attempt_id)
+                .then(|| self.job.clone())
+                .ok_or_else(|| AppError::not_found("lookup job not found"))
+        }
+        async fn observations(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+        ) -> Result<Vec<PublicationLookupObservation>, AppError> {
+            panic!("unbounded observation read is prohibited")
+        }
+        async fn observation_page(
+            &self,
+            _: &TenantScope,
+            attempt: Uuid,
+            before: Option<Uuid>,
+            limit: usize,
+        ) -> Result<Vec<PublicationLookupObservation>, AppError> {
+            assert_eq!(attempt, self.job.attempt_id);
+            assert_eq!(limit, PAGE_SIZE);
+            let offset = before
+                .map(|cursor| {
+                    self.history
+                        .iter()
+                        .position(|row| row.execution_id == cursor)
+                        .map(|index| index + 1)
+                        .ok_or_else(|| AppError::invalid_request("invalid lookup cursor"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok(self
+                .history
+                .iter()
+                .skip(offset)
+                .take(limit + 1)
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn read_projection_is_bounded_no_mutations_and_strips_arbitrary_evidence() {
+        use geo_domain::{
+            ChannelJobRepository, ChannelPlan, ChannelTarget, MemoryChannelJobRepository,
+        };
+        let job = job();
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let channels = Arc::new(MemoryChannelJobRepository::default());
+        channels
+            .create_plan(
+                &scope,
+                ChannelPlan {
+                    plan_id: Uuid::new_v4(),
+                    project_id: scope.project_id.unwrap(),
+                    cycle_id: Uuid::new_v4(),
+                    input_hash: "fixture".into(),
+                    revision: 1,
+                    created_at: Utc::now(),
+                    targets: vec![ChannelTarget {
+                        target_id: job.target_id,
+                        input: job.frozen_input.clone(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let state = AppState::development().with_channel_job_repository(channels.clone());
+        let empty = serde_json::to_value(
+            read_publication_lookup(&state, &scope, job.target_id, None)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty,
+            json!({"target_id":job.target_id,"attempt_id":null,"job":null,"observations":[],"next_before":null})
+        );
+        channels
+            .claim(&scope, job.target_id, job.attempt_id, Utc::now())
+            .await
+            .unwrap();
+        let unscheduled = serde_json::to_value(
+            read_publication_lookup(&state, &scope, job.target_id, None)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unscheduled["attempt_id"], job.attempt_id.to_string());
+        assert!(unscheduled["job"].is_null());
+        let at = Utc::now();
+        let candidate = job.candidate_public_url.as_ref().unwrap();
+        let valid_evidence = json!({
+            "schema_version":"geo.publication.asset_observation.v1",
+            "provenance":"live",
+            "original_attempt_id":job.attempt_id,
+            "target_id":job.target_id,
+            "account_id":job.account_id,
+            "connector_version":"zhihu.v1",
+            "content_sha256":sha256_hex(b"Original title\nOriginal body"),
+            "observed_at":at,
+            "public_url":candidate,
+            "secret_field":"never expose me"
+        });
+        let history: Vec<_> = (0..23).map(|number| PublicationLookupObservation {
+            execution_id: Uuid::from_u128(100 + number),
+            attempt_id: job.attempt_id,
+            finding: PublicationLookupFinding::AssetObserved,
+            evidence: if number == 1 { json!({"public_url":"https://www.zhihu.com/p/999","schema_version":"geo.publication.asset_observation.v1","provenance":"live"}) } else {valid_evidence.clone()},
+            observed_at: at,
+            received_at: at,
+            error_code: (number == 0).then(|| "secret_error_detail".into()),
+        }).collect();
+        let state = state.with_publication_lookup_repository(Arc::new(ReadOnlyLookup {
+            job: PublicationLookupJob {
+                last_error_code: Some("secret_job_detail".into()),
+                lease_expires_at: Some(at + Duration::minutes(1)),
+                ..job.clone()
+            },
+            history,
+        }));
+        let first = serde_json::to_value(
+            read_publication_lookup(&state, &scope, job.target_id, None)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["observations"].as_array().unwrap().len(), 20);
+        assert_eq!(first["next_before"], Uuid::from_u128(119).to_string());
+        assert_eq!(first["job"]["last_error_code"], "lookup_error");
+        assert_eq!(first["job"]["in_progress"], true);
+        assert_eq!(first["observations"][0]["error_code"], "lookup_error");
+        assert!(first["observations"][1]["public_url"].is_null());
+        assert_eq!(first["observations"][2]["public_url"], candidate.as_str());
+        let serialized = first.to_string();
+        for forbidden in [
+            "secret_field",
+            "secret_error_detail",
+            "secret_job_detail",
+            "frozen_input",
+            "account_id",
+            "lease_execution_id",
+            "evidence",
+            "content_sha256",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+        assert_eq!(first["job"].as_object().unwrap().len(), 4);
+        let next = serde_json::to_value(
+            read_publication_lookup(&state, &scope, job.target_id, Some(Uuid::from_u128(119)))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(next["observations"].as_array().unwrap().len(), 3);
+        assert!(next["next_before"].is_null());
+        assert_eq!(
+            read_publication_lookup(&state, &scope, job.target_id, Some(Uuid::new_v4()))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn only_bound_sanitized_live_observation_exposes_public_url() {
+        let job = job();
+        let at = Utc::now();
+        let evidence = json!({
+            "schema_version":"geo.publication.asset_observation.v1",
+            "provenance":"live",
+            "original_attempt_id":job.attempt_id,
+            "target_id":job.target_id,
+            "account_id":job.account_id,
+            "connector_version":job.connector_version,
+            "content_sha256":sha256_hex(b"Original title\nOriginal body"),
+            "observed_at":at,
+            "public_url":job.candidate_public_url,
+        });
+        let mut observation = PublicationLookupObservation {
+            execution_id: Uuid::new_v4(),
+            attempt_id: job.attempt_id,
+            finding: PublicationLookupFinding::AssetObserved,
+            evidence,
+            observed_at: DateTime::from_timestamp_micros(at.timestamp_micros()).unwrap(),
+            received_at: at,
+            error_code: None,
+        };
+        assert_eq!(
+            public_observed_url(&observation, &job),
+            job.candidate_public_url
+        );
+        for (key, value) in [
+            ("content_sha256", json!("wrong")),
+            ("public_url", json!("https://www.zhihu.com/p/999")),
+            ("provenance", json!("fixture")),
+            ("original_attempt_id", json!(Uuid::new_v4())),
+            ("observed_at", json!(at - Duration::minutes(1))),
+        ] {
+            let original = observation.evidence[key].clone();
+            observation.evidence[key] = value;
+            assert!(
+                public_observed_url(&observation, &job).is_none(),
+                "accepted altered {key}"
+            );
+            observation.evidence[key] = original;
+        }
+    }
 
     #[derive(Clone, Default)]
     struct Stub {

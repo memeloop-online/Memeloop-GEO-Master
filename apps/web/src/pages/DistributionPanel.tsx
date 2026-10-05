@@ -18,8 +18,10 @@ import {
   type DistributionTarget,
   type DistributionTargetStatus,
 } from "../api/distribution";
+import { getChannelTarget } from "../api/channelJobs";
 import { useAuth } from "../auth/AuthProvider";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
+import { PublicationLookupPanel } from "./PublicationLookupPanel";
 
 const targetLabels: Record<DistributionTargetStatus, string> = {
   pending: "待判定",
@@ -32,16 +34,50 @@ const targetLabels: Record<DistributionTargetStatus, string> = {
   reused_unknown: "复用既有未知结果，禁止重发",
 };
 
+const publicationLabels: Record<string, string> = {
+  unknown: "结果未知",
+  published: "已发布（未公开验证）",
+  verified: "公开读回已验证",
+  failed: "明确失败",
+  login_required: "需要重新登录",
+  unsupported: "暂不支持",
+};
+
 const message = (error: unknown) =>
   error instanceof Error ? error.message : "请求失败，请重试。";
 
 function DistributionRow({
   row,
   manifest,
+  tenantId,
+  projectId,
 }: {
   row: DistributionTarget;
   manifest: DistributionManifest;
+  tenantId: string;
+  projectId: string;
 }) {
+  const { session } = useAuth();
+  const [expanded, setExpanded] = useState(false);
+  // A reused intent can belong to an earlier cycle's target. Its original
+  // channel target ID is not present in this coverage row.
+  const canReadAttempt = Boolean(
+    row.publication_intent_id && row.status === "ready",
+  );
+  const attempt = useQuery({
+    queryKey: [
+      "channel-target",
+      session?.user.id,
+      session?.operator.id,
+      tenantId,
+      projectId,
+      row.target_id,
+    ],
+    queryFn: ({ signal }) =>
+      getChannelTarget(tenantId, projectId, row.target_id, signal),
+    enabled: canReadAttempt && expanded,
+    retry: false,
+  });
   const document = manifest.document_roster.find(
     (item) => item.document_item_id === row.document_item_id,
   );
@@ -74,6 +110,54 @@ function DistributionRow({
       )}
       {row.status === "reused_unknown" && (
         <p>历史发送结果仍未知；本周期不会另建新意图盲目重发。</p>
+      )}
+      {canReadAttempt && (
+        <>
+          <Button
+            appearance="subtle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? "收起执行记录" : "查看执行记录与查回"}
+          </Button>
+          {expanded && (
+            <div className="channel-job-attempt">
+              {attempt.isPending ? (
+                <LoadingState label="正在读取原发送记录" compact />
+              ) : attempt.isError ? (
+                <ErrorState
+                  title="原发送记录无法读取"
+                  detail={message(attempt.error)}
+                  onRetry={() => void attempt.refetch()}
+                />
+              ) : attempt.data?.attempts.length ? (
+                <>
+                  {attempt.data.attempts.map((entry) => (
+                    <p key={entry.attempt_id}>
+                      原发送尝试 {entry.attempt_id} ·{" "}
+                      {!entry.outcome
+                        ? "结果未知"
+                        : (publicationLabels[entry.outcome.status] ??
+                          "结果待核对")}
+                    </p>
+                  ))}
+                  {attempt.data.attempts.some(
+                    (entry) =>
+                      !entry.outcome || entry.outcome.status === "unknown",
+                  ) && (
+                    <PublicationLookupPanel
+                      tenantId={tenantId}
+                      projectId={projectId}
+                      targetId={row.target_id}
+                    />
+                  )}
+                </>
+              ) : (
+                <p>尚无发送尝试；排队不等于已发送。</p>
+              )}
+            </div>
+          )}
+        </>
       )}
     </Card>
   );
@@ -282,6 +366,8 @@ export function DistributionPanel({
                           key={row.target_id}
                           row={row}
                           manifest={manifest}
+                          tenantId={tenantId}
+                          projectId={projectId}
                         />
                       ))}
                     </div>

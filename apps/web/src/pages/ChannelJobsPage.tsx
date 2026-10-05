@@ -32,6 +32,10 @@ import { useChannelData } from "../api/channels";
 import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { DistributionPanel } from "./DistributionPanel";
+import {
+  PublicationLookupPanel,
+  safeOriginalPublicUrl,
+} from "./PublicationLookupPanel";
 import "./ChannelJobsPage.css";
 
 const statusLabels: Record<string, string> = {
@@ -70,6 +74,8 @@ function validText(value: string, maxBytes: number) {
 
 function TargetCard({
   target,
+  tenantId,
+  projectId,
   view,
   loading,
   loadError,
@@ -80,6 +86,8 @@ function TargetCard({
   executeError,
 }: {
   target: ChannelTarget;
+  tenantId: string;
+  projectId: string;
   view?: ChannelTargetView;
   loading: boolean;
   loadError: unknown;
@@ -150,10 +158,10 @@ function TargetCard({
                 {" · "}连接器 {attempt.outcome.connector_version ?? "未记录"}
                 {attempt.outcome.fixture && " · 测试数据，非真实外部结果"}
               </p>
-              {attempt.outcome.public_url && (
+              {safeOriginalPublicUrl(attempt.outcome.public_url) && (
                 <p>
                   <a
-                    href={attempt.outcome.public_url}
+                    href={safeOriginalPublicUrl(attempt.outcome.public_url)!}
                     target="_blank"
                     rel="noopener noreferrer"
                   >
@@ -194,6 +202,16 @@ function TargetCard({
       {attempted && status === "unknown" && (
         <p role="status">结果未知；当前没有安全的手动重发操作，请等待对账。</p>
       )}
+      {input.kind === "publish" &&
+        view?.attempts.some(
+          (attempt) => !attempt.outcome || attempt.outcome.status === "unknown",
+        ) && (
+          <PublicationLookupPanel
+            tenantId={tenantId}
+            projectId={projectId}
+            targetId={target.target_id}
+          />
+        )}
       {executeError && (
         <ErrorState
           title="执行请求未确认"
@@ -248,6 +266,8 @@ function PlannedTarget({
   return (
     <TargetCard
       target={target}
+      tenantId={tenantId}
+      projectId={projectId}
       view={detail.data}
       loading={detail.isPending}
       loadError={detail.error}

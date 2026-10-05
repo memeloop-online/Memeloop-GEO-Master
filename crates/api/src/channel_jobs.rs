@@ -199,7 +199,7 @@ fn error(error: AppError, context: RequestContext) -> ApiError {
     api_error(error, context.request_id)
 }
 
-async fn scope(
+pub(crate) async fn scope(
     state: &AppState,
     tenant: &TenantScope,
     project_id: ProjectId,

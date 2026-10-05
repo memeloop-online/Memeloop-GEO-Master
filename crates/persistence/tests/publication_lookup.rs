@@ -616,6 +616,78 @@ async fn lookup_is_scoped_fenced_append_only_and_never_rewrites_send() {
         .enqueue(&scope, sibling_target_id, sibling_attempt, now)
         .await
         .unwrap();
+    // Explicit read pagination regression: >20 rows, identical received_at
+    // ties, cursor isolation and a genuine bounded SQL page.
+    let tied_at = later + Duration::seconds(2);
+    for number in 1..=25_u128 {
+        let execution = Uuid::from_u128(number);
+        sqlx::query(
+            "INSERT INTO publication_lookup_executions \
+             (execution_id,operator_id,tenant_id,project_id,attempt_id,claimed_at,expires_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(execution)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(scope.project_id.unwrap().as_uuid())
+        .bind(attempt_id)
+        .bind(now)
+        .bind(now + Duration::minutes(5))
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO publication_lookup_observations \
+             (execution_id,operator_id,tenant_id,project_id,attempt_id,finding,evidence,observed_at,received_at) \
+             VALUES ($1,$2,$3,$4,$5,'unknown','{}'::jsonb,$6,$6)",
+        )
+        .bind(execution)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(scope.project_id.unwrap().as_uuid())
+        .bind(attempt_id)
+        .bind(tied_at)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    let page = lookup
+        .observation_page(&scope, attempt_id, None, 20)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 21);
+    assert_eq!(page[0].execution_id, Uuid::from_u128(25));
+    assert_eq!(page[19].execution_id, Uuid::from_u128(6));
+    let second = lookup
+        .observation_page(&scope, attempt_id, Some(page[19].execution_id), 20)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 7);
+    assert_eq!(second[0].execution_id, Uuid::from_u128(5));
+    assert_eq!(
+        lookup
+            .observation_page(&other, attempt_id, Some(page[19].execution_id), 20)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        lookup
+            .observation_page(&scope, sibling_attempt, Some(page[19].execution_id), 20)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        lookup
+            .observation_page(&scope, attempt_id, Some(Uuid::new_v4()), 20)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
     let wrong_association = sqlx::query(
         "INSERT INTO publication_lookup_observations \
          (execution_id,operator_id,tenant_id,project_id,attempt_id,finding,evidence,observed_at,received_at) \

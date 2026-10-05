@@ -30,7 +30,8 @@ use uuid::Uuid;
 // grows a parallel set of types for the same concepts.
 use geo_domain::{
     AppError, AttachmentReference, ContentCoverage, ContentExecutionStatus, ContentItemStatus,
-    DistributionTargetStatus, ImportStatus, KnowledgePurpose, ReportSnapshot,
+    DistributionTargetStatus, ImportStatus, KnowledgePurpose, PublicationLookupFinding,
+    ReportSnapshot,
 };
 pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
 
@@ -1025,6 +1026,31 @@ pub struct ChannelTargetSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_at: Option<DateTime<Utc>>,
     pub execution: ChannelExecutionResult,
+    /// Independent, read-only lookup of an ambiguous send. An observed asset
+    /// proves existence, not that the original attempt published or verified it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_lookup: Option<ChannelPublicationLookupSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPublicationLookupSummary {
+    pub query_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub in_progress: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_observation: Option<ChannelPublicationLookupObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPublicationLookupObservation {
+    pub finding: PublicationLookupFinding,
+    pub observed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1053,6 +1079,28 @@ fn channel_cursor_valid(cursor: &Option<String>) -> bool {
 
 fn channel_label_valid(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 512
+}
+
+fn channel_lookup_error_valid(value: &str) -> bool {
+    matches!(
+        value,
+        "candidate_missing"
+            | "candidate_invalid"
+            | "target_mismatch"
+            | "connector_version_missing"
+            | "connector_version_invalid"
+            | "binding_missing"
+            | "binding_unavailable"
+            | "runner_unavailable"
+            | "account_busy"
+            | "account_reservation_failed"
+            | "account_or_network_unavailable"
+            | "connector_version_mismatch"
+            | "lookup_preflight_expired"
+            | "readback_unverified"
+            | "lookup_unavailable"
+            | "lookup_error"
+    )
 }
 
 impl ChannelDiscoverRequest {
@@ -1206,6 +1254,21 @@ impl ChannelManifestPage {
                     || item.source_id.is_some_and(|id| id.is_nil())
                     || item.source_version_id.is_some_and(|id| id.is_nil())
                     || item.execution.validate_for(item.target_id).is_err()
+                    || item.publication_lookup.as_ref().is_some_and(|lookup| {
+                        item.kind != ChannelTargetKind::Publish
+                            || item.execution.state != ChannelExecutionState::UnknownResult
+                            || item.execution.attempt_id.is_none()
+                            || lookup
+                                .last_error_code
+                                .as_deref()
+                                .is_some_and(|code| !channel_lookup_error_valid(code))
+                            || lookup
+                                .latest_observation
+                                .as_ref()
+                                .is_some_and(|observation| {
+                                    observation.observed_at > observation.received_at
+                                })
+                    })
                     || match item.kind {
                         ChannelTargetKind::Publish => {
                             item.source_id.is_none() || item.source_version_id.is_none()

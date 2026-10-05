@@ -189,6 +189,34 @@ function mockApi({
               )
             : response(current),
         );
+      if (path.endsWith("/channel-targets/target-1"))
+        return Promise.resolve(
+          response({
+            target: {
+              target_id: "target-1",
+              input: { kind: "publish", title: "generated", platform: "zhihu" },
+            },
+            attempts: [
+              {
+                attempt_id: "attempt-1",
+                target_id: "target-1",
+                claimed_at: "2026-10-01T00:00:00Z",
+                received_at: null,
+                outcome: null,
+              },
+            ],
+          }),
+        );
+      if (path.endsWith("/channel-targets/target-1/publication-lookup"))
+        return Promise.resolve(
+          response({
+            target_id: "target-1",
+            attempt_id: "attempt-1",
+            job: null,
+            observations: [],
+            next_before: null,
+          }),
+        );
       return Promise.resolve(
         response({ code: "not_found", message: "not found" }, 404),
       );
@@ -232,6 +260,28 @@ afterEach(() => {
 });
 
 describe("formal distribution coverage", () => {
+  it("opens generated publication attempts on demand and reads lookup without sending", async () => {
+    const requests = mockApi({ firstStatus: "ready" });
+    const user = userEvent.setup();
+    renderPanel();
+    const button = await screen.findByRole("button", {
+      name: "查看执行记录与查回",
+    });
+    expect(
+      requests.some((item) => item.path.endsWith("/channel-targets/target-1")),
+    ).toBe(false);
+    await user.click(button);
+    expect(
+      await screen.findByText(/原发送尝试 attempt-1 · 结果未知/),
+    ).toBeInTheDocument();
+    expect(await screen.findByText(/尚未安排自动查回/)).toBeInTheDocument();
+    const lookup = requests.filter((item) =>
+      item.path.endsWith("/publication-lookup"),
+    );
+    expect(lookup).toHaveLength(1);
+    expect(lookup[0].url.searchParams.get("tenant_id")).toBe("tenant-1");
+    expect(requests.every((item) => item.method === "GET")).toBe(true);
+  });
   it("keeps expanded, unexpanded and deferred cells distinct from publication", async () => {
     const requests = mockApi();
     const user = userEvent.setup();

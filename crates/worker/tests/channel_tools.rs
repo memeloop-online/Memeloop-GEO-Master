@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryItem, ChannelDiscoveryKind, ChannelDiscoveryPage,
     ChannelExecutionResult, ChannelExecutionState, ChannelManifestPage, ChannelManifestReadRequest,
-    ChannelPlanReceipt, ChannelPlanRequest, ChannelTargetExecuteRequest, ChannelTargetKind,
+    ChannelPlanReceipt, ChannelPlanRequest, ChannelPublicationLookupObservation,
+    ChannelPublicationLookupSummary, ChannelTargetExecuteRequest, ChannelTargetKind,
     ChannelTargetSummary, HostBridge, HostOp, HostOpError, HostOps, HostRuntime,
     KnowledgeSearchRequest, KnowledgeSearchResult, ManifestPage, ManifestReadRequest,
     MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
@@ -155,6 +156,7 @@ impl HostOps for Available {
                     evidence_ref: None,
                     fixture: None,
                 },
+                publication_lookup: None,
             }],
             next_cursor: None,
         })
@@ -330,4 +332,71 @@ fn channel_dtos_are_strict_and_keep_old_publish_contract() {
         ChannelDiscoveryKind::PublicSources,
         serde_json::from_str("\"public_sources\"").unwrap()
     );
+}
+
+#[test]
+fn manifest_lookup_is_optional_bounded_and_cannot_upgrade_the_original_attempt() {
+    let target_id = Uuid::new_v4();
+    let request = ChannelManifestReadRequest {
+        cycle_id: None,
+        revision: None,
+        cursor: None,
+        limit: None,
+    };
+    let old = json!({
+        "plan_id":Uuid::new_v4(),"cycle_id":Uuid::new_v4(),
+        "revision":1,"sealed":true,"expected_count":1,
+        "items":[{
+            "target_id":target_id,"kind":"publish","account_id":Uuid::new_v4(),
+            "platform_or_provider":"example",
+            "source_id":Uuid::new_v4(),"source_version_id":Uuid::new_v4(),
+            "execution":{"target_id":target_id,"state":"unknown_result","attempt_id":Uuid::new_v4()}
+        }]
+    });
+    let mut page: ChannelManifestPage = serde_json::from_value(old).unwrap();
+    assert!(page.validate_for(&request).is_ok());
+    assert!(page.items[0].publication_lookup.is_none());
+    page.items[0].publication_lookup = Some(ChannelPublicationLookupSummary {
+        query_count: 2,
+        next_due_at: None,
+        in_progress: false,
+        last_error_code: Some("lookup_error".into()),
+        latest_observation: Some(ChannelPublicationLookupObservation {
+            finding: geo_domain::PublicationLookupFinding::AssetObserved,
+            observed_at: chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            received_at: chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }),
+    });
+    assert!(page.validate_for(&request).is_ok());
+    let encoded = serde_json::to_value(&page).unwrap();
+    assert_eq!(encoded["items"][0]["execution"]["state"], "unknown_result");
+    assert_eq!(
+        encoded["items"][0]["publication_lookup"]["latest_observation"]["finding"],
+        "asset_observed"
+    );
+    assert!(
+        encoded["items"][0]["publication_lookup"]
+            .get("public_url")
+            .is_none()
+    );
+    let decoded: ChannelManifestPage = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, page);
+
+    let mut invalid = page.clone();
+    invalid.items[0].execution.state = ChannelExecutionState::Completed;
+    assert!(invalid.validate_for(&request).is_err());
+    let mut invalid = page.clone();
+    invalid.items[0]
+        .publication_lookup
+        .as_mut()
+        .unwrap()
+        .last_error_code = Some("untrusted connector response".into());
+    assert!(invalid.validate_for(&request).is_err());
+    let mut invalid = serde_json::to_value(page).unwrap();
+    invalid["items"][0]["publication_lookup"]["latest_observation"]["evidence"] = json!("private");
+    assert!(serde_json::from_value::<ChannelManifestPage>(invalid).is_err());
 }

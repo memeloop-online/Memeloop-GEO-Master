@@ -115,6 +115,7 @@ pub struct AppState {
     connector_capability_repository: Arc<dyn ConnectorCapabilityRepository>,
     channel_service: ChannelService,
     channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
+    publication_lookup_repository: Option<Arc<dyn geo_domain::PublicationLookupRepository>>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
     content_dispatch_repository: Option<geo_persistence::PgContentRepository>,
@@ -151,6 +152,7 @@ impl AppState {
             ),
             channel_service: ChannelService::development(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+            publication_lookup_repository: None,
             content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
             distribution_repository: Arc::new(geo_domain::MemoryDistributionRepository::default()),
             content_dispatch_repository: None,
@@ -240,6 +242,7 @@ impl AppState {
             ),
             channel_service: ChannelService::development(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+            publication_lookup_repository: None,
             content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
             distribution_repository: Arc::new(geo_domain::MemoryDistributionRepository::default()),
             content_dispatch_repository: None,
@@ -302,6 +305,9 @@ impl AppState {
         ))
         .with_channel_job_repository(Arc::new(
             geo_persistence::PgChannelJobRepository::from_database(database),
+        ))
+        .with_publication_lookup_repository(Arc::new(
+            geo_persistence::PgPublicationLookupRepository::from_database(database),
         ))
         .with_channel_service(ChannelService::unconfigured(Arc::new(
             geo_persistence::PgChannelRepository::from_database(database),
@@ -540,6 +546,14 @@ impl AppState {
 
     pub fn channel_job_repository(&self) -> Arc<dyn geo_domain::ChannelJobRepository> {
         Arc::clone(&self.channel_job_repository)
+    }
+
+    pub fn with_publication_lookup_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::PublicationLookupRepository>,
+    ) -> Self {
+        self.publication_lookup_repository = Some(repository);
+        self
     }
 
     pub fn with_channel_job_repository(
@@ -1933,6 +1947,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/projects/{project_id}/channel-targets/{target_id}",
             get(channel_jobs::get_target),
+        )
+        .route(
+            "/projects/{project_id}/channel-targets/{target_id}/publication-lookup",
+            get(publication_lookup::get_publication_lookup),
         )
         .route(
             "/projects/{project_id}/channel-targets/{target_id}/execute",

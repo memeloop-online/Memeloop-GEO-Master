@@ -640,6 +640,59 @@ impl PublicationLookupRepository for PgPublicationLookupRepository {
         .map_err(db)?;
         rows.iter().map(decode_observation).collect()
     }
+
+    async fn observation_page(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        before: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<PublicationLookupObservation>, AppError> {
+        if limit == 0 || limit > 100 {
+            return Err(AppError::invalid_request("invalid lookup page size"));
+        }
+        let project_id = project(scope)?;
+        // A cursor from another tenant, project or attempt is not a valid
+        // pagination position, even if its UUID exists in the database.
+        let cursor = if let Some(execution_id) = before {
+            Some(
+                sqlx::query_scalar::<_, DateTime<Utc>>(
+                    "SELECT received_at FROM publication_lookup_observations \
+                     WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+                       AND attempt_id=$4 AND execution_id=$5",
+                )
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(project_id)
+                .bind(attempt_id)
+                .bind(execution_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?
+                .ok_or_else(|| AppError::invalid_request("invalid lookup cursor"))?,
+            )
+        } else {
+            None
+        };
+        let rows = sqlx::query(
+            "SELECT execution_id,attempt_id,finding,evidence,observed_at,received_at,error_code \
+             FROM publication_lookup_observations \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND attempt_id=$4 \
+               AND ($5::timestamptz IS NULL OR (received_at,execution_id)<($5,$6)) \
+             ORDER BY received_at DESC,execution_id DESC LIMIT $7",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id)
+        .bind(attempt_id)
+        .bind(cursor)
+        .bind(before)
+        .bind((limit + 1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter().map(decode_observation).collect()
+    }
 }
 
 #[cfg(test)]

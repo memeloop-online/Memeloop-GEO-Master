@@ -90,6 +90,40 @@ export interface ChannelTargetView {
   attempts: ChannelAttempt[];
 }
 
+export interface PublicationLookupPage {
+  target_id: string;
+  attempt_id: string | null;
+  job: {
+    query_count: number;
+    next_due_at: string | null;
+    last_error_code: string | null;
+    in_progress: boolean;
+  } | null;
+  observations: {
+    execution_id: string;
+    finding: "unknown" | "asset_observed";
+    observed_at: string;
+    received_at: string;
+    error_code: string | null;
+    public_url: string | null;
+  }[];
+  next_before: string | null;
+}
+
+export function getPublicationLookup(
+  tenantId: string,
+  projectId: string,
+  targetId: string,
+  before?: string,
+  signal?: AbortSignal,
+) {
+  const path = `/projects/${encoded(projectId)}/channel-targets/${encoded(targetId)}/publication-lookup`;
+  return apiFetch<PublicationLookupPage>(
+    `${path}${before ? `?before=${encoded(before)}` : ""}`,
+    { ...scope(tenantId, projectId), signal },
+  );
+}
+
 export interface PublicationRequest {
   source_id: string;
   source_version_id: string;
@@ -172,10 +206,11 @@ export function getChannelTarget(
   tenantId: string,
   projectId: string,
   targetId: string,
+  signal?: AbortSignal,
 ) {
   return apiFetch<ChannelTargetView>(
     `/projects/${encoded(projectId)}/channel-targets/${encoded(targetId)}`,
-    scope(tenantId, projectId),
+    { ...scope(tenantId, projectId), signal },
   );
 }
 

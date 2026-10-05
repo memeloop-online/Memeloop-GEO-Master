@@ -49,6 +49,17 @@
   overflow-wrap: anywhere;
 }
 
+.publication-lookup {
+  border-top: 1px solid var(--colorNeutralStroke2);
+  overflow-wrap: anywhere;
+}
+
+.publication-lookup-list {
+  display: grid;
+  gap: 8px;
+  padding-inline-start: 24px;
+}
+
 .channel-jobs-draft {
   display: grid;
   gap: 8px;

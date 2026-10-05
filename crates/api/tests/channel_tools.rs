@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
-use chrono::Utc;
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
 use geo_api::{AppState, RepositoryHostOps};
 use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
     ChannelStatus, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, ImportItem, KnowledgePurpose,
-    ProjectCreate, ProjectSettings, ProjectStartCommand, SourceKind, TenantScope,
-    hash_idempotency_key, settings_hash, start_request_hash,
+    ProjectCreate, ProjectSettings, ProjectStartCommand, PublicationLookupCandidate,
+    PublicationLookupFinding, PublicationLookupJob, PublicationLookupObservation,
+    PublicationLookupRepository, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
+    start_request_hash,
 };
 use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryItem, ChannelDiscoveryKind, ChannelExecutionState,
@@ -15,6 +18,91 @@ use geo_worker::{
 };
 use uuid::Uuid;
 
+struct ReadOnlyLookup {
+    job: PublicationLookupJob,
+    latest: PublicationLookupObservation,
+    fail_read: bool,
+}
+
+#[async_trait]
+impl PublicationLookupRepository for ReadOnlyLookup {
+    async fn enqueue(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+        _: Uuid,
+        _: DateTime<Utc>,
+    ) -> Result<PublicationLookupJob, geo_domain::AppError> {
+        panic!("manifest must never enqueue a publication lookup")
+    }
+
+    async fn scan_due(
+        &self,
+        _: Option<Uuid>,
+        _: DateTime<Utc>,
+        _: usize,
+    ) -> Result<Vec<PublicationLookupCandidate>, geo_domain::AppError> {
+        panic!("manifest must never scan lookup jobs")
+    }
+
+    async fn claim(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+        _: Uuid,
+        _: DateTime<Utc>,
+        _: DateTime<Utc>,
+    ) -> Result<PublicationLookupJob, geo_domain::AppError> {
+        panic!("manifest must never claim a lookup job")
+    }
+
+    async fn finish(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+        _: PublicationLookupObservation,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<PublicationLookupJob, geo_domain::AppError> {
+        panic!("manifest must never write a lookup observation")
+    }
+
+    async fn get(
+        &self,
+        _: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<PublicationLookupJob, geo_domain::AppError> {
+        assert_eq!(attempt_id, self.job.attempt_id);
+        if self.fail_read {
+            return Err(geo_domain::AppError::new(
+                geo_domain::ErrorCode::DependencyUnavailable,
+                "lookup read unavailable",
+            ));
+        }
+        Ok(self.job.clone())
+    }
+
+    async fn observations(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+    ) -> Result<Vec<PublicationLookupObservation>, geo_domain::AppError> {
+        panic!("manifest must not read unbounded observation history")
+    }
+
+    async fn observation_page(
+        &self,
+        _: &TenantScope,
+        attempt_id: Uuid,
+        before: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<PublicationLookupObservation>, geo_domain::AppError> {
+        assert_eq!(attempt_id, self.job.attempt_id);
+        assert!(before.is_none());
+        assert_eq!(limit, 20);
+        Ok(vec![self.latest.clone()])
+    }
+}
+
 struct Fixture {
     state: AppState,
     scope: TenantScope,
@@ -22,6 +110,157 @@ struct Fixture {
     public_source: (Uuid, Uuid),
     internal_source: Uuid,
     account_ids: [Uuid; 2],
+}
+
+#[tokio::test]
+async fn manifest_reports_lookup_observation_without_upgrading_or_resending_unknown_result() {
+    let f = fixture().await;
+    let receipt = ops(&f).channel_plan(&f.scope, plan(&f)).await.unwrap();
+    let target_id = f
+        .state
+        .channel_job_repository()
+        .get_plan(&f.scope, receipt.cycle_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .targets[0]
+        .target_id;
+    let repository = f.state.channel_job_repository();
+    let (view, attempt) = repository
+        .claim(&f.scope, target_id, Uuid::new_v4(), Utc::now())
+        .await
+        .unwrap();
+    let at = Utc::now();
+    repository
+        .finish(
+            &f.scope,
+            target_id,
+            attempt.attempt_id,
+            ChannelOutcome {
+                status: ChannelOutcomeStatus::Unknown,
+                detail: Some("opaque runner evidence".into()),
+                occurred_at: at,
+                raw_answer: None,
+                citations: vec![],
+                public_url: Some("https://example.invalid/private-asset".into()),
+                screenshot_ref: None,
+                connector_version: None,
+                runner_evidence: vec![serde_json::json!({"opaque":"runner data"})],
+                fixture: false,
+            },
+            at,
+        )
+        .await
+        .unwrap();
+    let job = PublicationLookupJob {
+        attempt_id: attempt.attempt_id,
+        target_id,
+        account_id: view.input.account_id(),
+        frozen_input: view.input.clone(),
+        connector_version: None,
+        candidate_public_url: None,
+        next_due_at: Some(at + Duration::minutes(3)),
+        lease_execution_id: None,
+        lease_expires_at: Some(at + Duration::minutes(1)),
+        query_count: 1,
+        last_error_code: Some("opaque internal diagnostic".into()),
+    };
+    let latest = PublicationLookupObservation {
+        execution_id: Uuid::new_v4(),
+        attempt_id: attempt.attempt_id,
+        finding: PublicationLookupFinding::AssetObserved,
+        evidence: serde_json::json!({"public_url":"https://example.invalid/private-asset","raw_evidence":"opaque runner evidence"}),
+        observed_at: at,
+        received_at: at + Duration::seconds(1),
+        error_code: None,
+    };
+    let state = f
+        .state
+        .clone()
+        .with_publication_lookup_repository(Arc::new(ReadOnlyLookup {
+            job: job.clone(),
+            latest: latest.clone(),
+            fail_read: false,
+        }));
+    let ops = RepositoryHostOps::new(state.knowledge_repository()).with_channels(state.clone());
+    let manifest = ops
+        .channel_manifest_read(
+            &f.scope,
+            ChannelManifestReadRequest {
+                cycle_id: None,
+                revision: None,
+                cursor: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        manifest
+            .items
+            .iter()
+            .any(|item| { item.target_id != target_id && item.publication_lookup.is_none() })
+    );
+    let target = manifest
+        .items
+        .iter()
+        .find(|item| item.target_id == target_id)
+        .unwrap();
+    assert_eq!(target.execution.state, ChannelExecutionState::UnknownResult);
+    assert_eq!(target.execution.outcome_status.as_deref(), Some("unknown"));
+    let lookup = target.publication_lookup.as_ref().unwrap();
+    assert_eq!(lookup.query_count, 1);
+    assert_eq!(lookup.last_error_code.as_deref(), Some("lookup_error"));
+    assert_eq!(
+        lookup.latest_observation.as_ref().unwrap().finding,
+        PublicationLookupFinding::AssetObserved
+    );
+    assert_eq!(lookup.latest_observation.as_ref().unwrap().observed_at, at);
+    let serialized = serde_json::to_string(&manifest).unwrap();
+    for forbidden in [
+        "private-asset",
+        "opaque runner",
+        "raw_evidence",
+        "candidate_public_url",
+        "account_id\":\"private",
+    ] {
+        assert!(!serialized.contains(forbidden), "lookup leaked evidence");
+    }
+    let replay = ops
+        .channel_target_execute(&f.scope, ChannelTargetExecuteRequest { target_id })
+        .await
+        .unwrap();
+    assert_eq!(replay.state, ChannelExecutionState::UnknownResult);
+    assert_eq!(
+        repository
+            .get_target(&f.scope, target_id)
+            .await
+            .unwrap()
+            .attempts
+            .len(),
+        1
+    );
+    let unavailable = state.with_publication_lookup_repository(Arc::new(ReadOnlyLookup {
+        job,
+        latest,
+        fail_read: true,
+    }));
+    let unavailable_ops =
+        RepositoryHostOps::new(unavailable.knowledge_repository()).with_channels(unavailable);
+    assert!(
+        unavailable_ops
+            .channel_manifest_read(
+                &f.scope,
+                ChannelManifestReadRequest {
+                    cycle_id: None,
+                    revision: None,
+                    cursor: None,
+                    limit: None,
+                },
+            )
+            .await
+            .is_err()
+    );
 }
 
 async fn fixture() -> Fixture {
@@ -298,6 +537,8 @@ async fn plan_freezes_refs_manifest_paginates_and_replay_never_sends_again() {
         .unwrap();
     assert_eq!(second.items.len(), 1);
     assert_ne!(first.items[0].target_id, second.items[0].target_id);
+    assert!(first.items[0].publication_lookup.is_none());
+    assert!(second.items[0].publication_lookup.is_none());
     let mut tampered = cursor.clone();
     tampered.push('0');
     assert_eq!(

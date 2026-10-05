@@ -101,4 +101,15 @@ pub trait PublicationLookupRepository: Send + Sync {
         scope: &TenantScope,
         attempt_id: Uuid,
     ) -> Result<Vec<PublicationLookupObservation>, AppError>;
+
+    /// Newest-first, bounded page. A cursor must belong to this exact
+    /// scope and original attempt; unknown/foreign IDs are invalid requests.
+    /// Returns at most `limit + 1` rows to detect another page.
+    async fn observation_page(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        before: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<PublicationLookupObservation>, AppError>;
 }

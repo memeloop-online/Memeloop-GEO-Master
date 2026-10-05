@@ -10,8 +10,10 @@ use geo_domain::{
 use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryItem, ChannelDiscoveryKind, ChannelDiscoveryPage,
     ChannelExecutionResult, ChannelExecutionState, ChannelManifestPage, ChannelManifestReadRequest,
-    ChannelMeasurementPlanItem, ChannelPlanReceipt, ChannelPlanRequest, ChannelPublicationPlanItem,
-    ChannelTargetExecuteRequest, ChannelTargetKind, ChannelTargetSummary,
+    ChannelMeasurementPlanItem, ChannelPlanReceipt, ChannelPlanRequest,
+    ChannelPublicationLookupObservation, ChannelPublicationLookupSummary,
+    ChannelPublicationPlanItem, ChannelTargetExecuteRequest, ChannelTargetKind,
+    ChannelTargetSummary,
 };
 use uuid::Uuid;
 
@@ -21,6 +23,7 @@ use crate::{
         ChannelDispatchDeferred, ChannelDispatchResult, MeasurementRequest, PlanRequest,
         PublicationRequest, create_channel_plan, execute_channel_target,
     },
+    publication_lookup::read_publication_lookup,
 };
 
 #[async_trait]
@@ -128,7 +131,10 @@ fn execution(view: &ChannelTargetView) -> ChannelExecutionResult {
     }
 }
 
-fn summary(view: ChannelTargetView) -> ChannelTargetSummary {
+fn summary(
+    view: ChannelTargetView,
+    publication_lookup: Option<ChannelPublicationLookupSummary>,
+) -> ChannelTargetSummary {
     let execution = execution(&view);
     let (kind, account_id, platform_or_provider, source_id, source_version_id, scheduled_at) =
         match view.target.input {
@@ -181,7 +187,41 @@ fn summary(view: ChannelTargetView) -> ChannelTargetSummary {
         source_version_id,
         scheduled_at,
         execution,
+        publication_lookup,
     }
+}
+
+async fn lookup_summary(
+    state: &AppState,
+    scope: &TenantScope,
+    view: &ChannelTargetView,
+) -> Result<Option<ChannelPublicationLookupSummary>, AppError> {
+    let execution = execution(view);
+    if !view.target.input.is_publication()
+        || execution.state != ChannelExecutionState::UnknownResult
+        || execution.attempt_id.is_none()
+    {
+        return Ok(None);
+    }
+    let lookup = read_publication_lookup(state, scope, view.target.target_id, None).await?;
+    let Some(job) = lookup.job else {
+        return Ok(None);
+    };
+    let query_count = u32::try_from(job.query_count)
+        .map_err(|_| AppError::invalid_request("invalid lookup query count"))?;
+    Ok(Some(ChannelPublicationLookupSummary {
+        query_count,
+        next_due_at: job.next_due_at,
+        in_progress: job.in_progress,
+        last_error_code: job.last_error_code.map(str::to_owned),
+        latest_observation: lookup.observations.first().map(|observation| {
+            ChannelPublicationLookupObservation {
+                finding: observation.finding,
+                observed_at: observation.observed_at,
+                received_at: observation.received_at,
+            }
+        }),
+    }))
 }
 
 fn deferred(target_id: Uuid, reason: ChannelDispatchDeferred) -> ChannelExecutionResult {
@@ -451,7 +491,8 @@ impl ChannelToolService for AppState {
                 .channel_job_repository()
                 .get_target(scope, target.target_id)
                 .await?;
-            items.push(summary(view));
+            let publication_lookup = lookup_summary(self, scope, &view).await?;
+            items.push(summary(view, publication_lookup));
         }
         Ok(ChannelManifestPage {
             plan_id: plan.plan_id,
