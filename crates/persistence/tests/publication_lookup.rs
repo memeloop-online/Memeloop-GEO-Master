@@ -702,3 +702,369 @@ async fn lookup_is_scoped_fenced_append_only_and_never_rewrites_send() {
         Some("23514")
     );
 }
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL in GEO_TEST_DATABASE_URL"]
+async fn discovery_paginates_ambiguous_sends_and_enriches_only_newly_finalized_jobs() {
+    let url =
+        std::env::var("GEO_TEST_DATABASE_URL").expect("disposable test database URL required");
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("lookup_discovery_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .unwrap()
+        .options([("search_path", schema.as_str())]);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    let database = Database::from_pool(pool);
+    database.migrate().await.unwrap();
+    let channels = PgChannelJobRepository::from_database(&database);
+    let lookup = PgPublicationLookupRepository::from_database(&database);
+    let (scope, cycle) = create_scope(&database).await;
+    let (paused, paused_cycle) = create_scope(&database).await;
+    let now = chrono::DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
+        .expect("valid timestamp");
+    let old = now - Duration::minutes(6);
+    let near = now - Duration::minutes(4);
+    let publication = || ChannelTarget {
+        target_id: Uuid::new_v4(),
+        input: ChannelTargetInput::Publish {
+            source_id: Uuid::new_v4(),
+            source_version_id: Uuid::new_v4(),
+            platform: "zhihu".into(),
+            account_id: Uuid::new_v4(),
+            title: "Example title".into(),
+            body: "Example body".into(),
+            body_sha256: hex::encode(Sha256::digest(b"Example body")),
+        },
+    };
+    let stale = publication();
+    let fresh = publication();
+    let missing_unknown = publication();
+    let late_hint = publication();
+    let no_version = publication();
+    let failed = publication();
+    let verified_fixture = publication();
+    let measure = ChannelTarget {
+        target_id: Uuid::new_v4(),
+        input: ChannelTargetInput::Measure {
+            account_id: Uuid::new_v4(),
+            provider: "test".into(),
+            model: "test".into(),
+            surface: "web".into(),
+            search_mode: "web_search".into(),
+            protocol_version: "v1".into(),
+            question_set_version: "v1".into(),
+            question: "Example".into(),
+            market: "global".into(),
+            language: "en".into(),
+            scheduled_at: old,
+            sample_ordinal: 1,
+        },
+    };
+    let targets = [
+        stale.clone(),
+        fresh.clone(),
+        missing_unknown.clone(),
+        late_hint.clone(),
+        no_version.clone(),
+        failed.clone(),
+        verified_fixture.clone(),
+        measure.clone(),
+    ];
+    channels
+        .create_plan(
+            &scope,
+            ChannelPlan {
+                plan_id: Uuid::new_v4(),
+                project_id: scope.project_id.unwrap(),
+                cycle_id: cycle,
+                input_hash: "discovery".into(),
+                revision: 1,
+                created_at: old,
+                targets: targets.to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    let paused_target = publication();
+    channels
+        .create_plan(
+            &paused,
+            ChannelPlan {
+                plan_id: Uuid::new_v4(),
+                project_id: paused.project_id.unwrap(),
+                cycle_id: paused_cycle,
+                input_hash: "paused-discovery".into(),
+                revision: 1,
+                created_at: old,
+                targets: vec![paused_target.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    let mut attempts = std::collections::HashMap::new();
+    for target in &targets {
+        let attempt = Uuid::new_v4();
+        let claimed_at = if target.target_id == fresh.target_id {
+            near
+        } else {
+            old
+        };
+        channels
+            .claim(&scope, target.target_id, attempt, claimed_at)
+            .await
+            .unwrap();
+        attempts.insert(target.target_id, attempt);
+    }
+    let paused_attempt = Uuid::new_v4();
+    channels
+        .claim(&paused, paused_target.target_id, paused_attempt, old)
+        .await
+        .unwrap();
+    let id = |target: &ChannelTarget| attempts[&target.target_id];
+
+    let early = lookup
+        .enqueue(&scope, late_hint.target_id, id(&late_hint), old)
+        .await
+        .unwrap();
+    assert!(early.connector_version.is_none());
+    assert!(early.candidate_public_url.is_none());
+    let mut unknown_without_version = outcome(ChannelOutcomeStatus::Unknown, now, vec![]);
+    unknown_without_version.connector_version = None;
+    channels
+        .finish(
+            &scope,
+            no_version.target_id,
+            id(&no_version),
+            unknown_without_version,
+            now,
+        )
+        .await
+        .unwrap();
+    channels
+        .finish(
+            &scope,
+            missing_unknown.target_id,
+            id(&missing_unknown),
+            outcome(ChannelOutcomeStatus::Unknown, now, vec![]),
+            now,
+        )
+        .await
+        .unwrap();
+    channels
+        .finish(
+            &scope,
+            failed.target_id,
+            id(&failed),
+            outcome(ChannelOutcomeStatus::Failed, now, vec![]),
+            now,
+        )
+        .await
+        .unwrap();
+    let mut fixture_success = outcome(ChannelOutcomeStatus::Verified, now, vec![]);
+    fixture_success.fixture = true;
+    channels
+        .finish(
+            &scope,
+            verified_fixture.target_id,
+            id(&verified_fixture),
+            fixture_success,
+            now,
+        )
+        .await
+        .unwrap();
+    channels
+        .finish(
+            &scope,
+            measure.target_id,
+            id(&measure),
+            outcome(ChannelOutcomeStatus::Unknown, now, vec![]),
+            now,
+        )
+        .await
+        .unwrap();
+    let mut fixture_unknown = outcome(ChannelOutcomeStatus::Unknown, now, vec![]);
+    fixture_unknown.fixture = true;
+    channels
+        .finish(
+            &paused,
+            paused_target.target_id,
+            paused_attempt,
+            fixture_unknown,
+            now,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE projects SET status='paused' WHERE project_id=$1")
+        .bind(paused.project_id.unwrap().as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    // Before the bounded send window expires, even a finalized Unknown
+    // cannot produce a job; a finished early job has no new data yet.
+    let early_page = lookup
+        .scan_unresolved(
+            None,
+            old + Duration::minutes(5) - Duration::microseconds(1),
+            100,
+        )
+        .await
+        .unwrap();
+    assert!(early_page.is_empty());
+
+    let mut pages = vec![];
+    let mut cursor = None;
+    loop {
+        let page = lookup.scan_unresolved(cursor, now, 2).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2);
+        cursor = page.last().map(|item| item.attempt_id);
+        pages.extend(page);
+    }
+    let expected = [
+        id(&stale),
+        id(&missing_unknown),
+        id(&no_version),
+        paused_attempt,
+    ];
+    assert_eq!(pages.len(), expected.len());
+    assert_eq!(
+        pages
+            .iter()
+            .map(|item| item.attempt_id)
+            .collect::<std::collections::HashSet<_>>(),
+        expected.into_iter().collect()
+    );
+    assert!(
+        pages
+            .windows(2)
+            .all(|pair| pair[0].attempt_id < pair[1].attempt_id)
+    );
+    assert!(pages.iter().any(|item| item.scope == paused
+        && item.target_id == paused_target.target_id
+        && item.attempt_id == paused_attempt));
+    for candidate in &pages {
+        lookup
+            .enqueue(
+                &candidate.scope,
+                candidate.target_id,
+                candidate.attempt_id,
+                now,
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        lookup
+            .scan_unresolved(None, now, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        lookup
+            .get(&paused, paused_attempt)
+            .await
+            .unwrap()
+            .candidate_public_url,
+        None
+    );
+
+    let candidate_url = "https://www.zhihu.com/p/12345";
+    channels
+        .finish(
+            &scope,
+            late_hint.target_id,
+            id(&late_hint),
+            outcome(
+                ChannelOutcomeStatus::Unknown,
+                now,
+                vec![serde_json::json!({
+                    "kind": "publication_candidate",
+                    "schema_version": "geo.publication.candidate.v1",
+                    "source": "post_submit_navigation",
+                    "url": candidate_url,
+                    "expected_sha256": hex::encode(Sha256::digest(b"Example title\nExample body")),
+                    "attempt_id": id(&late_hint),
+                    "target_id": late_hint.target_id,
+                    "account_id": late_hint.input.account_id(),
+                    "connector_version": "fixture.connector.v1",
+                    "observed_at": now,
+                })],
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+    let revisit = lookup.scan_unresolved(None, now, 100).await.unwrap();
+    assert_eq!(revisit.len(), 1);
+    assert_eq!(revisit[0].attempt_id, id(&late_hint));
+    let enriched = lookup
+        .enqueue(
+            &revisit[0].scope,
+            revisit[0].target_id,
+            revisit[0].attempt_id,
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        enriched.candidate_public_url.as_deref(),
+        Some(candidate_url)
+    );
+    assert!(
+        lookup
+            .scan_unresolved(None, now, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        lookup.scan_unresolved(None, now, 0).await.unwrap_err().code,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        lookup
+            .scan_unresolved(None, now, 1001)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+
+    let fresh_due = lookup
+        .scan_unresolved(None, near + Duration::minutes(5), 100)
+        .await
+        .unwrap();
+    assert_eq!(fresh_due.len(), 1);
+    assert_eq!(fresh_due[0].attempt_id, id(&fresh));
+    assert_eq!(
+        lookup
+            .enqueue(
+                &fresh_due[0].scope,
+                fresh_due[0].target_id,
+                fresh_due[0].attempt_id,
+                now
+            )
+            .await
+            .unwrap()
+            .candidate_public_url,
+        None
+    );
+    assert_eq!(
+        lookup
+            .scan_unresolved(None, near + Duration::minutes(5), 100)
+            .await
+            .unwrap(),
+        vec![]
+    );
+}

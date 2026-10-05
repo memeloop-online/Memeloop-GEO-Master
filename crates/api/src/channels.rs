@@ -278,6 +278,243 @@ impl ChannelService {
             Err(error) => Err(error),
         }
     }
+
+    /// Freeze the actual browser network and account used by this send attempt.
+    /// The returned opaque envelope is exclusively server-side; never include
+    /// it (or its decrypted proxy credentials) in a response or receipt.
+    pub(crate) async fn resume_available_browser_bound(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<(Uuid, ChannelSecret), AppError> {
+        let prepared = self.prepare_available_browser(scope, account_id).await?;
+        let version = self
+            .publication_connector_version(&prepared.platform, "publish")
+            .await?;
+        let binding = PublicationBrowserBinding {
+            version: 1,
+            account_id,
+            owner_kind: prepared.owner_kind,
+            platform: prepared.platform.clone(),
+            platform_account_id: prepared.platform_account_id.clone(),
+            connector_version: version,
+            effective_proxy: prepared.effective_proxy.clone(),
+        };
+        let bytes = serde_json::to_vec(&binding)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "publication binding invalid"))?;
+        let sealed = self.encrypt(scope, attempt_id, "publication_execution", &bytes)?;
+        let session_id = Uuid::new_v4();
+        self.browser()?
+            .start(
+                session_id,
+                &prepared.platform,
+                prepared.proxy,
+                Some(&prepared.storage_state),
+            )
+            .await?;
+        Ok((session_id, sealed))
+    }
+
+    /// Restore only a currently authorized, usable session under the original
+    /// publication's account identity, owner, network and connector version.
+    /// The original platform account ID and connector version must be checked
+    /// against the runner's completion/lookup receipt by the caller.
+    pub(crate) async fn resume_publication_lookup_browser(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        attempt_id: Uuid,
+        binding: &ChannelSecret,
+    ) -> Result<(Uuid, String, String), AppError> {
+        let bytes = self.decrypt(scope, attempt_id, "publication_execution", binding)?;
+        let original: PublicationBrowserBinding = serde_json::from_slice(&bytes)
+            .map_err(|_| AppError::conflict("publication browser binding is invalid"))?;
+        if original.version != 1
+            || original.account_id != account_id
+            || original.platform_account_id.trim().is_empty()
+            || original.connector_version.trim().is_empty()
+        {
+            return Err(AppError::conflict(
+                "publication browser binding has changed",
+            ));
+        }
+        let current = self.prepare_available_browser(scope, account_id).await?;
+        if original.owner_kind != current.owner_kind
+            || original.platform != current.platform
+            || original.platform_account_id != current.platform_account_id
+            || original.effective_proxy != current.effective_proxy
+        {
+            return Err(AppError::conflict(
+                "publication browser binding has changed",
+            ));
+        }
+        if self
+            .publication_connector_version(&current.platform, "lookup")
+            .await?
+            != original.connector_version
+        {
+            return Err(AppError::conflict(
+                "publication browser binding has changed",
+            ));
+        }
+        let session_id = Uuid::new_v4();
+        self.browser()?
+            .start(
+                session_id,
+                &current.platform,
+                current.proxy,
+                Some(&current.storage_state),
+            )
+            .await?;
+        Ok((
+            session_id,
+            original.platform_account_id,
+            original.connector_version,
+        ))
+    }
+
+    async fn publication_connector_version(
+        &self,
+        platform: &str,
+        operation: &str,
+    ) -> Result<String, AppError> {
+        let capabilities = self.browser()?.capabilities().await?;
+        let connector = capabilities.connectors.into_iter().find(|connector| {
+            connector.platform == platform
+                && connector.placement_slot == "primary"
+                && connector.operations.iter().any(|op| op == operation)
+                && !connector.connector_version.trim().is_empty()
+                && connector.connector_version.len() <= 100
+                && !connector.connector_version.starts_with("fixture")
+        });
+        connector
+            .map(|connector| connector.connector_version)
+            .ok_or_else(|| AppError::conflict("publication connector is unavailable"))
+    }
+
+    async fn prepare_available_browser(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+    ) -> Result<PreparedPublicationBrowser, AppError> {
+        self.browser()?;
+        match self.repository.get_account(scope, account_id).await {
+            Ok(record) => {
+                if !record.account.enabled || record.account.status != ChannelStatus::Ready {
+                    return Err(AppError::conflict("channel account is not ready"));
+                }
+                let platform_account_id = record
+                    .account
+                    .platform_account_id
+                    .filter(|identity| !identity.trim().is_empty())
+                    .ok_or_else(|| AppError::conflict("channel account needs login"))?;
+                let session = record
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| AppError::conflict("channel account needs login"))?;
+                let bytes = self.decrypt(scope, account_id, "session", session)?;
+                let storage_state = serde_json::from_slice(&bytes).map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "stored browser session is invalid")
+                })?;
+                let proxy = self
+                    .resolved_proxy(scope, account_id, record.proxy.as_ref())
+                    .await?;
+                let effective_proxy = serde_json::to_value(&proxy)
+                    .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
+                Ok(PreparedPublicationBrowser {
+                    owner_kind: ChannelOwnerKind::Customer,
+                    platform: record.account.platform,
+                    platform_account_id,
+                    storage_state,
+                    effective_proxy,
+                    proxy,
+                })
+            }
+            Err(error) if error.code == ErrorCode::NotFound => {
+                let assigned = self
+                    .repository
+                    .list_assigned_pool_accounts(scope)
+                    .await?
+                    .iter()
+                    .any(|account| account.account_id == account_id);
+                if !assigned {
+                    return Err(AppError::not_found(
+                        "channel account not assigned to project",
+                    ));
+                }
+                let pool_tenant = self.operator_pool_tenant_id.ok_or_else(|| {
+                    AppError::capability_missing("operator pool is not configured")
+                })?;
+                let pool_scope = TenantScope::new(scope.operator_id, pool_tenant, None);
+                let record = self
+                    .repository
+                    .get_pool_account(scope.operator_id, account_id)
+                    .await?;
+                if !record.account.enabled || record.account.status != ChannelStatus::Ready {
+                    return Err(AppError::conflict("channel account is not ready"));
+                }
+                let platform_account_id = record
+                    .account
+                    .platform_account_id
+                    .filter(|identity| !identity.trim().is_empty())
+                    .ok_or_else(|| AppError::conflict("channel account needs login"))?;
+                let session = record
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| AppError::conflict("channel account needs login"))?;
+                let bytes = self.decrypt(&pool_scope, account_id, "pool_session", session)?;
+                let storage_state = serde_json::from_slice(&bytes).map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "stored browser session is invalid")
+                })?;
+                let proxy = record
+                    .proxy
+                    .as_ref()
+                    .map(|secret| {
+                        let bytes = self.decrypt(&pool_scope, account_id, "pool_proxy", secret)?;
+                        let proxy: ProxyInput = serde_json::from_slice(&bytes).map_err(|_| {
+                            AppError::new(ErrorCode::Internal, "stored proxy is invalid")
+                        })?;
+                        Ok::<_, AppError>(proxy.runner())
+                    })
+                    .transpose()?;
+                let effective_proxy = serde_json::to_value(&proxy)
+                    .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
+                Ok(PreparedPublicationBrowser {
+                    owner_kind: ChannelOwnerKind::OperatorPool,
+                    platform: record.account.platform,
+                    platform_account_id,
+                    storage_state,
+                    effective_proxy,
+                    proxy,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+struct PreparedPublicationBrowser {
+    owner_kind: ChannelOwnerKind,
+    platform: String,
+    platform_account_id: String,
+    storage_state: serde_json::Value,
+    effective_proxy: serde_json::Value,
+    proxy: Option<BrowserProxy>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationBrowserBinding {
+    version: u8,
+    account_id: Uuid,
+    owner_kind: ChannelOwnerKind,
+    platform: String,
+    platform_account_id: String,
+    connector_version: String,
+    // Null means direct access. Any selected proxy includes credentials, all
+    // protected by the attempt-scoped authenticated envelope.
+    effective_proxy: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1742,4 +1979,345 @@ pub fn operator_routes() -> Router<AppState> {
             "/operator/channel-login-sessions/{id}",
             axum::routing::delete(cancel_pool_login),
         )
+}
+
+#[cfg(test)]
+mod publication_binding_tests {
+    use super::*;
+    use axum::{Router, http::StatusCode, routing::any};
+    use geo_domain::{DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID};
+    use serde_json::{Value, json};
+    use tokio::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct RunnerStub {
+        starts: Arc<Mutex<Vec<Value>>>,
+        version: Arc<Mutex<String>>,
+    }
+
+    async fn runner(
+        State(stub): State<RunnerStub>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> (StatusCode, Json<Value>) {
+        if uri.path() == "/v1/capabilities" {
+            return (
+                StatusCode::OK,
+                Json(json!({"connectors":[{
+                    "platform":"zhihu","placement_slot":"primary",
+                    "connector_version":stub.version.lock().await.clone(),
+                    "operations":["publish","lookup"],"verified":false
+                }]})),
+            );
+        }
+        if method == axum::http::Method::POST && uri.path() == "/v1/sessions" {
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            stub.starts.lock().await.push(payload.clone());
+            return (
+                StatusCode::OK,
+                Json(json!({"session_id":payload["session_id"]})),
+            );
+        }
+        (StatusCode::OK, Json(json!({"closed":true})))
+    }
+
+    async fn fixture() -> (
+        ChannelService,
+        TenantScope,
+        Uuid,
+        RunnerStub,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let stub = RunnerStub {
+            version: Arc::new(Mutex::new("connector.v1".into())),
+            ..RunnerStub::default()
+        };
+        let app = Router::new().fallback(any(runner)).with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let browser =
+            BrowserBridge::new(format!("http://{address}"), "runner-token".into()).unwrap();
+        let service = ChannelService::development().with_browser(browser);
+        let scope = TenantScope::new(
+            DEVELOPMENT_OPERATOR_ID,
+            DEVELOPMENT_TENANT_ID,
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let account_id = Uuid::new_v4();
+        service
+            .repository
+            .save_account(
+                &scope,
+                ChannelAccountRecord {
+                    account: ChannelAccount {
+                        account_id,
+                        project_id: scope.project_id.unwrap(),
+                        owner_kind: ChannelOwnerKind::Customer,
+                        platform: "zhihu".into(),
+                        group_id: None,
+                        status: ChannelStatus::Ready,
+                        display_name: None,
+                        platform_account_id: Some("original-identity".into()),
+                        avatar_url: None,
+                        enabled: true,
+                        proxy_configured: false,
+                        proxy_server: None,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    },
+                    session: Some(
+                        service
+                            .encrypt(
+                                &scope,
+                                account_id,
+                                "session",
+                                br#"{"cookies":[{"name":"old"}]}"#,
+                            )
+                            .unwrap(),
+                    ),
+                    proxy: None,
+                },
+            )
+            .await
+            .unwrap();
+        (service, scope, account_id, stub, server)
+    }
+
+    async fn set_default_proxy(
+        service: &ChannelService,
+        scope: &TenantScope,
+        password: Option<&str>,
+    ) {
+        let proxy = password.map(|password| ProxyInput {
+            server: "http://127.0.0.1:9191".into(),
+            username: Some("proxy-user".into()),
+            password: Some(password.into()),
+        });
+        service
+            .repository
+            .save_settings(
+                scope,
+                ChannelSettingsRecord {
+                    settings: ChannelSettings {
+                        project_id: scope.project_id.unwrap(),
+                        default_group_id: None,
+                        proxy_configured: proxy.is_some(),
+                        proxy_server: proxy.as_ref().map(|proxy| proxy.server.clone()),
+                        updated_at: Utc::now(),
+                    },
+                    proxy: proxy.map(|proxy| {
+                        service
+                            .encrypt(
+                                scope,
+                                Uuid::nil(),
+                                "project_proxy",
+                                &serde_json::to_vec(&proxy).unwrap(),
+                            )
+                            .unwrap()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn original_proxy_and_identity_survive_session_rotation_but_not_network_or_scope_changes()
+    {
+        let (service, scope, account_id, stub, server) = fixture().await;
+        set_default_proxy(&service, &scope, Some("proxy-secret")).await;
+        let attempt = Uuid::new_v4();
+        let (_, bound) = service
+            .resume_available_browser_bound(&scope, account_id, attempt)
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.starts.lock().await[0]["proxy"]["password"],
+            "proxy-secret"
+        );
+        assert!(!String::from_utf8_lossy(bound.encrypted_bytes()).contains("proxy-secret"));
+        let mut record = service
+            .repository
+            .get_account(&scope, account_id)
+            .await
+            .unwrap();
+        record.session = Some(
+            service
+                .encrypt(
+                    &scope,
+                    account_id,
+                    "session",
+                    br#"{"cookies":[{"name":"renewed"}]}"#,
+                )
+                .unwrap(),
+        );
+        service
+            .repository
+            .save_account(&scope, record.clone())
+            .await
+            .unwrap();
+        let (_, identity, version) = service
+            .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+            .await
+            .unwrap();
+        assert_eq!(
+            (identity.as_str(), version.as_str()),
+            ("original-identity", "connector.v1")
+        );
+        assert_eq!(
+            stub.starts.lock().await[1]["storage_state"]["cookies"][0]["name"],
+            "renewed"
+        );
+        assert!(
+            service
+                .resume_publication_lookup_browser(&scope, account_id, Uuid::new_v4(), &bound)
+                .await
+                .is_err()
+        );
+        let other_scope = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        assert!(
+            service
+                .resume_publication_lookup_browser(&other_scope, account_id, attempt, &bound)
+                .await
+                .is_err()
+        );
+        set_default_proxy(&service, &scope, None).await;
+        assert_eq!(
+            service
+                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        set_default_proxy(&service, &scope, Some("changed-secret")).await;
+        assert!(
+            service
+                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+                .await
+                .is_err()
+        );
+        set_default_proxy(&service, &scope, Some("proxy-secret")).await;
+        record.account.platform_account_id = Some("changed-identity".into());
+        service
+            .repository
+            .save_account(&scope, record.clone())
+            .await
+            .unwrap();
+        assert!(
+            service
+                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+                .await
+                .is_err()
+        );
+        record.account.platform_account_id = Some("original-identity".into());
+        service
+            .repository
+            .save_account(&scope, record)
+            .await
+            .unwrap();
+        *stub.version.lock().await = "connector.v2".into();
+        assert!(
+            service
+                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+                .await
+                .is_err()
+        );
+        assert_eq!(stub.starts.lock().await.len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn revoked_pool_assignment_and_owner_change_cannot_restore_browser() {
+        let (service, scope, account_id, stub, server) = fixture().await;
+        let pool_tenant = TenantId::new(Uuid::new_v4());
+        let service = service.with_operator_pool_tenant_id(pool_tenant);
+        let pool_scope = TenantScope::new(scope.operator_id, pool_tenant, None);
+        let pool_id = Uuid::new_v4();
+        service
+            .repository
+            .save_pool_account(
+                scope.operator_id,
+                PoolAccountRecord {
+                    account: PoolAccount {
+                        account_id: pool_id,
+                        platform: "zhihu".into(),
+                        group_id: None,
+                        status: ChannelStatus::Ready,
+                        display_name: None,
+                        platform_account_id: Some("pool-identity".into()),
+                        avatar_url: None,
+                        enabled: true,
+                        proxy_configured: false,
+                        proxy_server: None,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    },
+                    session: Some(
+                        service
+                            .encrypt(&pool_scope, pool_id, "pool_session", br#"{"cookies":[]}"#)
+                            .unwrap(),
+                    ),
+                    proxy: None,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .repository
+            .assign_pool_account(&scope, pool_id, true)
+            .await
+            .unwrap();
+        let attempt = Uuid::new_v4();
+        let (_, bound) = service
+            .resume_available_browser_bound(&scope, pool_id, attempt)
+            .await
+            .unwrap();
+        service
+            .repository
+            .assign_pool_account(&scope, pool_id, false)
+            .await
+            .unwrap();
+        assert!(
+            service
+                .resume_publication_lookup_browser(&scope, pool_id, attempt, &bound)
+                .await
+                .is_err()
+        );
+        let mut customer = service
+            .repository
+            .get_account(&scope, account_id)
+            .await
+            .unwrap();
+        customer.account.account_id = pool_id;
+        customer.account.platform_account_id = Some("pool-identity".into());
+        customer.session = Some(
+            service
+                .encrypt(&scope, pool_id, "session", br#"{"cookies":[]}"#)
+                .unwrap(),
+        );
+        assert_eq!(
+            service
+                .repository
+                .save_account(&scope, customer)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert!(
+            service
+                .resume_publication_lookup_browser(&scope, pool_id, attempt, &bound)
+                .await
+                .is_err()
+        );
+        assert_eq!(stub.starts.lock().await.len(), 1);
+        server.abort();
+    }
 }

@@ -18,6 +18,8 @@ mod error;
 mod idempotency;
 mod knowledge;
 mod provider_bridge;
+mod publication_lookup;
+pub use publication_lookup::dispatch_publication_lookup;
 mod reports;
 mod run_executor;
 pub use run_executor::dispatch_queued;

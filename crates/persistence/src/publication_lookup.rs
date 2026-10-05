@@ -14,11 +14,70 @@ pub struct PgPublicationLookupRepository {
     pool: PgPool,
 }
 
+/// A trusted, scoped original send that still needs a lookup job or one-time
+/// enrichment from its finalized Unknown outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationLookupDiscoveryCandidate {
+    pub scope: TenantScope,
+    pub target_id: Uuid,
+    pub attempt_id: Uuid,
+}
+
 impl PgPublicationLookupRepository {
     pub fn from_database(database: &crate::Database) -> Self {
         Self {
             pool: database.pool().clone(),
         }
+    }
+
+    /// Discover original publication sends, never measurements or fresh
+    /// in-flight sends. An early job is rediscovered only when a later Unknown
+    /// result can enrich its initially absent connector version/hint; a job
+    /// already synchronized with that immutable result is not scanned again.
+    /// The original send may need reconciliation even if its project is paused.
+    pub async fn scan_unresolved(
+        &self,
+        after_attempt_id: Option<Uuid>,
+        as_of: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<PublicationLookupDiscoveryCandidate>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid lookup scan page size"));
+        }
+        let rows = sqlx::query(
+            "SELECT a.operator_id,a.tenant_id,a.project_id,a.target_id,a.attempt_id \
+             FROM channel_execution_attempts a \
+             JOIN channel_execution_targets t ON t.operator_id=a.operator_id \
+               AND t.tenant_id=a.tenant_id AND t.project_id=a.project_id AND t.target_id=a.target_id \
+             LEFT JOIN publication_lookup_jobs j ON j.operator_id=a.operator_id \
+               AND j.tenant_id=a.tenant_id AND j.project_id=a.project_id AND j.attempt_id=a.attempt_id \
+             WHERE ($1::uuid IS NULL OR a.attempt_id>$1) \
+               AND a.target_kind='publish' AND t.kind='publish' \
+               AND a.claimed_at + interval '5 minutes' <= $2 \
+               AND (a.outcome IS NULL OR a.outcome->>'status'='unknown') \
+               AND (j.attempt_id IS NULL OR \
+                    (j.connector_version IS NULL AND a.outcome->>'status'='unknown' \
+                     AND NULLIF(a.outcome->>'connector_version','') IS NOT NULL)) \
+             ORDER BY a.attempt_id LIMIT $3",
+        )
+        .bind(after_attempt_id)
+        .bind(as_of)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .iter()
+            .map(|row| PublicationLookupDiscoveryCandidate {
+                scope: TenantScope::new(
+                    row.get::<Uuid, _>("operator_id").into(),
+                    row.get::<Uuid, _>("tenant_id").into(),
+                    Some(ProjectId::new(row.get("project_id"))),
+                ),
+                target_id: row.get("target_id"),
+                attempt_id: row.get("attempt_id"),
+            })
+            .collect())
     }
 }
 

@@ -356,7 +356,7 @@ fn retain_publication_candidate(
     }
 }
 
-fn publication_readback(
+pub(crate) fn publication_readback(
     result: &crate::browser_bridge::BrowserExecution,
     target: &ChannelTargetInput,
 ) -> bool {
@@ -681,7 +681,7 @@ async fn generated_publication_preflight(
 /// Always release the fresh browser context after a resumed account has
 /// completed identity verification and its one typed operation. The runner's
 /// idle reaper remains the fallback if this process dies mid-request.
-async fn execute_and_close(
+pub(crate) async fn execute_and_close(
     bridge: &crate::browser_bridge::BrowserBridge,
     session: Uuid,
     expected_identity: Option<&str>,
@@ -689,6 +689,29 @@ async fn execute_and_close(
     operation: &str,
     payload: &serde_json::Value,
 ) -> Result<crate::browser_bridge::BrowserExecution, AppError> {
+    execute_and_close_with_cleanup(
+        bridge,
+        session,
+        expected_identity,
+        attempt_id,
+        operation,
+        payload,
+    )
+    .await
+    .0
+}
+
+pub(crate) async fn execute_and_close_with_cleanup(
+    bridge: &crate::browser_bridge::BrowserBridge,
+    session: Uuid,
+    expected_identity: Option<&str>,
+    attempt_id: Uuid,
+    operation: &str,
+    payload: &serde_json::Value,
+) -> (
+    Result<crate::browser_bridge::BrowserExecution, AppError>,
+    bool,
+) {
     let result = async {
         let verified = bridge.complete(session).await?;
         if Some(verified.identity.platform_account_id.as_str()) != expected_identity {
@@ -699,12 +722,13 @@ async fn execute_and_close(
             .await
     }
     .await;
-    if bridge.close(session).await.is_err() {
+    let closed = bridge.close(session).await.is_ok();
+    if !closed {
         // A successful external result is still evidence if cleanup fails.
         // The runner owns a bounded idle reaper as the crash/outage fallback.
         tracing::warn!("browser execution session cleanup failed");
     }
-    result
+    (result, closed)
 }
 
 /// Resolves the actual source text and verifies its current public eligibility
@@ -1177,11 +1201,20 @@ async fn execute_reserved_channel_target(
     // Opening and verifying an ephemeral browser context is reversible; no
     // publication or measurement is sent before the durable claim. This also
     // checks runner/cipher/session availability without consuming the attempt.
-    let session = match service
-        .resume_available_browser(scope, account.account_id)
-        .await
-    {
-        Ok(session) => session,
+    let attempt_id = Uuid::new_v4();
+    let opened = if planned.target.input.is_publication() {
+        service
+            .resume_available_browser_bound(scope, account.account_id, attempt_id)
+            .await
+            .map(|(session, binding)| (session, Some(binding)))
+    } else {
+        service
+            .resume_available_browser(scope, account.account_id)
+            .await
+            .map(|session| (session, None))
+    };
+    let (session, binding) = match opened {
+        Ok(opened) => opened,
         Err(error)
             if matches!(
                 error.code,
@@ -1211,7 +1244,7 @@ async fn execute_reserved_channel_target(
         ));
     }
     let (target, attempt) = match repo
-        .claim_reserved(scope, target_id, Uuid::new_v4(), reservation_id, Utc::now())
+        .claim_reserved(scope, target_id, attempt_id, reservation_id, Utc::now())
         .await
     {
         Ok(claimed) => claimed,
@@ -1252,6 +1285,16 @@ async fn execute_reserved_channel_target(
     // Recheck mutable eligibility after the claim. Even a withdrawal at this
     // point must leave an honest attempted outcome, not release the one-shot.
     let resolved = async {
+        // Persist the encrypted network/identity selected for this exact
+        // preflight before sending. A crash cannot resume on a new account or
+        // silently fall back to a different network.
+        if let Some(binding) = binding {
+            repo.store_publication_binding(scope, target_id, attempt.attempt_id, binding)
+                .await
+                .map_err(|error| {
+                    AppError::new(error.code, "publication binding persistence unavailable")
+                })?;
+        }
         if let ChannelTargetInput::Publish {
             source_id,
             source_version_id,
@@ -1295,7 +1338,9 @@ async fn execute_reserved_channel_target(
     }
     .await;
     if resolved.as_ref().is_err_and(|error| {
-        error.message.starts_with("source ") || error.message.starts_with("connector ")
+        error.message.starts_with("source ")
+            || error.message.starts_with("connector ")
+            || error.message.starts_with("publication binding ")
     }) && bridge.close(session).await.is_err()
     {
         tracing::warn!("browser execution session cleanup failed");

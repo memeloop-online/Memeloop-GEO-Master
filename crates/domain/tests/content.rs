@@ -384,6 +384,86 @@ fn document(citation: Uuid) -> StructuredDocument {
         }],
     }
 }
+
+#[tokio::test]
+async fn generation_policies_have_independent_asset_revision_chains() {
+    let repo = MemoryContentRepository::new();
+    let (scope, manifest, source, cycle) = fixture();
+    let item_id = manifest.items[0].document_manifest_item_id;
+    let reference = evidence(source);
+    let mut generated = Vec::new();
+    for policy in ["policy-a", "policy-b"] {
+        let execution = repo
+            .start(&scope, cycle, manifest.clone(), policy)
+            .await
+            .unwrap();
+        let prepare = repo
+            .claim(
+                &scope,
+                execution.execution_id,
+                item_id,
+                ContentStep::Prepare,
+                "worker",
+                Utc::now(),
+                60,
+            )
+            .await
+            .unwrap();
+        repo.complete_prepare(
+            &scope,
+            &prepare,
+            ContentBrief {
+                brief_id: Uuid::new_v4(),
+                title: "Brief".into(),
+                objective: "Evidence-based answer".into(),
+                evidence: vec![reference.clone()],
+                quotes: vec![],
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let lease = repo
+            .claim(
+                &scope,
+                execution.execution_id,
+                item_id,
+                ContentStep::Generate,
+                "worker",
+                Utc::now(),
+                60,
+            )
+            .await
+            .unwrap();
+        let revision = repo
+            .complete_generate(&scope, &lease, document(reference.chunk_id.unwrap()))
+            .await
+            .unwrap();
+        let replay = repo
+            .start(&scope, cycle, manifest.clone(), policy)
+            .await
+            .unwrap();
+        assert_eq!(replay.execution_id, execution.execution_id);
+        assert_eq!(
+            repo.get_item(&scope, replay.execution_id, item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .asset_id,
+            Some(revision.asset_id)
+        );
+        generated.push(revision);
+    }
+    assert_ne!(generated[0].asset_id, generated[1].asset_id);
+    for revision in generated {
+        assert_eq!(
+            repo.list_revisions(&scope, revision.asset_id)
+                .await
+                .unwrap(),
+            vec![revision]
+        );
+    }
+}
 fn blocking_finding(block: Uuid, reference: &EvidenceRef) -> ContentFinding {
     ContentFinding {
         finding_id: Uuid::new_v4(),

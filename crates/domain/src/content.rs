@@ -619,7 +619,12 @@ impl ContentState {
             return Err(AppError::conflict("draft already generated"));
         }
         let now = Utc::now();
-        let asset_id = stable_id(&format!("content-asset:{}", item.branch_key));
+        // Each frozen execution owns its revision chain. A new generation
+        // policy must not restart revision 1 on another execution's asset.
+        let asset_id = stable_id(&format!(
+            "content-asset:{}:{}",
+            item.execution_id, item.branch_key
+        ));
         let revision = ContentRevision {
             revision_id: Uuid::new_v4(),
             asset_id,

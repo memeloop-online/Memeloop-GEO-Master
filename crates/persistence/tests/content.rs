@@ -1054,6 +1054,8 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .complete_generate(&scope, &generation, repaired_document.clone())
         .await
         .unwrap();
+    assert_ne!(original.asset_id, revision.asset_id);
+    assert_eq!(original.revision, 1);
     let check = repository
         .claim(
             &scope,

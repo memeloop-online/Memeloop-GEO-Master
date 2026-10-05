@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelAttempt, ChannelCycleInputs, ChannelDispatchCandidate, ChannelJobRepository,
-    ChannelOutcome, ChannelPlan, ChannelTarget, ChannelTargetInput, ChannelTargetView, ErrorCode,
-    OperatorId, ProjectId, TenantId, TenantScope, frozen_cycle_inputs,
+    ChannelOutcome, ChannelPlan, ChannelSecret, ChannelTarget, ChannelTargetInput,
+    ChannelTargetView, ErrorCode, OperatorId, ProjectId, TenantId, TenantScope,
+    frozen_cycle_inputs,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -710,6 +711,140 @@ impl ChannelJobRepository for PgChannelJobRepository {
             return Err(AppError::conflict("attempt outcome already recorded"));
         }
         Ok(view)
+    }
+
+    async fn store_publication_binding(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        binding: ChannelSecret,
+    ) -> Result<(), AppError> {
+        if binding.encrypted_bytes().is_empty() {
+            return Err(AppError::invalid_request(
+                "empty encrypted publication binding",
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
+        let row: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT targets.kind,attempts.outcome \
+             FROM channel_execution_attempts attempts \
+             JOIN channel_execution_targets targets \
+               ON targets.operator_id=attempts.operator_id \
+              AND targets.tenant_id=attempts.tenant_id \
+              AND targets.project_id=attempts.project_id \
+              AND targets.target_id=attempts.target_id \
+             WHERE attempts.operator_id=$1 AND attempts.tenant_id=$2 \
+               AND attempts.project_id=$3 AND attempts.target_id=$4 \
+               AND attempts.attempt_id=$5 \
+             FOR UPDATE OF attempts",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(target_id)
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let (kind, outcome) = row.ok_or_else(|| AppError::not_found("attempt not found"))?;
+        if kind != "publish" {
+            return Err(AppError::invalid_request(
+                "binding requires a publication target",
+            ));
+        }
+        let previous: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT encrypted_binding FROM publication_execution_bindings \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+               AND target_id=$4 AND attempt_id=$5",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(target_id)
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if let Some(previous) = previous {
+            return if previous == binding.encrypted_bytes() {
+                Ok(())
+            } else {
+                Err(AppError::conflict("publication binding already recorded"))
+            };
+        }
+        if outcome.is_some() {
+            return Err(AppError::conflict("publication attempt already finished"));
+        }
+        sqlx::query(
+            "INSERT INTO publication_execution_bindings \
+             (attempt_id,operator_id,tenant_id,project_id,target_id,encrypted_binding) \
+             VALUES ($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(attempt_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(target_id)
+        .bind(binding.encrypted_bytes())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
+
+    async fn get_publication_binding(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Option<ChannelSecret>, AppError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
+        let kind: Option<String> = sqlx::query_scalar(
+            "SELECT targets.kind \
+             FROM channel_execution_attempts attempts \
+             JOIN channel_execution_targets targets \
+               ON targets.operator_id=attempts.operator_id \
+              AND targets.tenant_id=attempts.tenant_id \
+              AND targets.project_id=attempts.project_id \
+              AND targets.target_id=attempts.target_id \
+             WHERE attempts.operator_id=$1 AND attempts.tenant_id=$2 \
+               AND attempts.project_id=$3 AND attempts.target_id=$4 \
+               AND attempts.attempt_id=$5",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(target_id)
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if kind.as_deref() != Some("publish") {
+            return match kind {
+                Some(_) => Err(AppError::invalid_request(
+                    "binding requires a publication target",
+                )),
+                None => Err(AppError::not_found("attempt not found")),
+            };
+        }
+        let encrypted: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT encrypted_binding FROM publication_execution_bindings \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+               AND target_id=$4 AND attempt_id=$5",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(target_id)
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        Ok(encrypted.map(ChannelSecret::new))
     }
 
     async fn get_target(

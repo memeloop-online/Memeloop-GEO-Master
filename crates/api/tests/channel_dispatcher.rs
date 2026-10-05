@@ -35,6 +35,14 @@ async fn mock_runner(
     payload: Option<Json<Value>>,
 ) -> (StatusCode, Json<Value>) {
     match (method.as_str(), uri.path()) {
+        ("GET", "/v1/capabilities") => (
+            StatusCode::OK,
+            Json(json!({"connectors":[{
+                "platform":"zhihu","placement_slot":"primary",
+                "connector_version":"test.browser.v1",
+                "operations":["publish","lookup"],"verified":false
+            }]})),
+        ),
         ("POST", "/v1/sessions") => (
             StatusCode::OK,
             Json(json!({

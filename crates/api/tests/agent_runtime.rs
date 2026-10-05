@@ -1001,7 +1001,11 @@ async fn cancellation_interrupts_a_suspended_model_op_without_waiting_for_its_bu
             .await
     });
     let deadline = Instant::now() + Duration::from_secs(2);
-    while recorder.seen().is_empty() {
+    while !recorder
+        .seen()
+        .iter()
+        .any(|(op, _)| *op == HostOp::ModelComplete)
+    {
         assert!(Instant::now() < deadline, "model op never started");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

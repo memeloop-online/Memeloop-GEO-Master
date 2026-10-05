@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    AppError, EvidenceRef, ProjectId, ReportEvidenceReference, ReportManifestKind,
+    AppError, ChannelSecret, EvidenceRef, ProjectId, ReportEvidenceReference, ReportManifestKind,
     ReportManifestRef, ReportMeasurementStatus, ReportMeasurementTarget, ReportPublicationStatus,
     ReportPublicationTarget, TenantScope,
 };
@@ -246,6 +246,31 @@ pub trait ChannelJobRepository: Send + Sync {
         outcome: ChannelOutcome,
         received_at: DateTime<Utc>,
     ) -> Result<ChannelTargetView, AppError>;
+    /// Save an opaque encrypted execution envelope on the original publication
+    /// attempt before its outcome. Identical retries are safe; different bytes
+    /// cannot replace an existing binding, including after the attempt finishes.
+    async fn store_publication_binding(
+        &self,
+        _scope: &TenantScope,
+        _target_id: Uuid,
+        _attempt_id: Uuid,
+        _binding: ChannelSecret,
+    ) -> Result<(), AppError> {
+        Err(AppError::capability_missing(
+            "publication execution binding storage unavailable",
+        ))
+    }
+    /// Internal-only read; this secret must never be serialized into HTTP views.
+    async fn get_publication_binding(
+        &self,
+        _scope: &TenantScope,
+        _target_id: Uuid,
+        _attempt_id: Uuid,
+    ) -> Result<Option<ChannelSecret>, AppError> {
+        Err(AppError::capability_missing(
+            "publication execution binding storage unavailable",
+        ))
+    }
     async fn get_target(
         &self,
         scope: &TenantScope,
@@ -402,6 +427,7 @@ struct MemoryCycle {
     plan: Option<ChannelPlan>,
     generated: HashMap<Uuid, ChannelTarget>,
     attempts: HashMap<Uuid, Vec<ChannelAttempt>>,
+    publication_bindings: HashMap<Uuid, ChannelSecret>,
 }
 
 impl MemoryCycle {
@@ -722,6 +748,87 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         })
     }
 
+    async fn store_publication_binding(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        binding: ChannelSecret,
+    ) -> Result<(), AppError> {
+        if binding.encrypted_bytes().is_empty() {
+            return Err(AppError::invalid_request(
+                "empty encrypted publication binding",
+            ));
+        }
+        let mut all = self.0.lock().await;
+        let key = scope_key(scope)?;
+        let cycle = all
+            .iter_mut()
+            .find(|((o, t, p, _), cycle)| (*o, *t, *p) == key && cycle.target(target_id).is_some())
+            .map(|(_, cycle)| cycle)
+            .ok_or_else(|| AppError::not_found("target not found"))?;
+        if !cycle
+            .target(target_id)
+            .is_some_and(|target| target.input.is_publication())
+        {
+            return Err(AppError::invalid_request(
+                "binding requires a publication target",
+            ));
+        }
+        let attempt = cycle
+            .attempts
+            .get(&target_id)
+            .and_then(|attempts| {
+                attempts
+                    .iter()
+                    .find(|attempt| attempt.attempt_id == attempt_id)
+            })
+            .ok_or_else(|| AppError::not_found("attempt not found"))?;
+        if let Some(existing) = cycle.publication_bindings.get(&attempt_id) {
+            return if existing.encrypted_bytes() == binding.encrypted_bytes() {
+                Ok(())
+            } else {
+                Err(AppError::conflict("publication binding already recorded"))
+            };
+        }
+        if attempt.received_at.is_some() {
+            return Err(AppError::conflict("publication attempt already finished"));
+        }
+        cycle.publication_bindings.insert(attempt_id, binding);
+        Ok(())
+    }
+
+    async fn get_publication_binding(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Option<ChannelSecret>, AppError> {
+        let all = self.0.lock().await;
+        let key = scope_key(scope)?;
+        let cycle = all
+            .iter()
+            .find(|((o, t, p, _), cycle)| (*o, *t, *p) == key && cycle.target(target_id).is_some())
+            .map(|(_, cycle)| cycle)
+            .ok_or_else(|| AppError::not_found("target not found"))?;
+        if !cycle
+            .target(target_id)
+            .is_some_and(|target| target.input.is_publication())
+        {
+            return Err(AppError::invalid_request(
+                "binding requires a publication target",
+            ));
+        }
+        if !cycle.attempts.get(&target_id).is_some_and(|attempts| {
+            attempts
+                .iter()
+                .any(|attempt| attempt.attempt_id == attempt_id)
+        }) {
+            return Err(AppError::not_found("attempt not found"));
+        }
+        Ok(cycle.publication_bindings.get(&attempt_id).cloned())
+    }
+
     async fn get_target(
         &self,
         scope: &TenantScope,
@@ -770,6 +877,196 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
 mod tests {
     use super::*;
     use crate::{OperatorId, TenantId};
+
+    #[tokio::test]
+    async fn publication_binding_is_scoped_write_once_and_survives_outcome() {
+        let repo = MemoryChannelJobRepository::default();
+        let scope = TenantScope::new(
+            OperatorId::new(Uuid::new_v4()),
+            TenantId::new(Uuid::new_v4()),
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let foreign = TenantScope::new(
+            OperatorId::new(Uuid::new_v4()),
+            TenantId::new(Uuid::new_v4()),
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let measurement = Uuid::new_v4();
+        let now = Utc::now();
+        repo.create_plan(
+            &scope,
+            ChannelPlan {
+                plan_id: Uuid::new_v4(),
+                project_id: scope.project_id.unwrap(),
+                cycle_id: Uuid::new_v4(),
+                input_hash: "fixture".into(),
+                revision: 1,
+                created_at: now,
+                targets: vec![
+                    ChannelTarget {
+                        target_id: first,
+                        input: ChannelTargetInput::Publish {
+                            source_id: Uuid::new_v4(),
+                            source_version_id: Uuid::new_v4(),
+                            platform: "fixture".into(),
+                            account_id: Uuid::new_v4(),
+                            title: "title".into(),
+                            body: "body".into(),
+                            body_sha256: "fixture".into(),
+                        },
+                    },
+                    ChannelTarget {
+                        target_id: second,
+                        input: ChannelTargetInput::Publish {
+                            source_id: Uuid::new_v4(),
+                            source_version_id: Uuid::new_v4(),
+                            platform: "fixture".into(),
+                            account_id: Uuid::new_v4(),
+                            title: "title".into(),
+                            body: "body".into(),
+                            body_sha256: "fixture".into(),
+                        },
+                    },
+                    ChannelTarget {
+                        target_id: measurement,
+                        input: ChannelTargetInput::Measure {
+                            account_id: Uuid::new_v4(),
+                            provider: "fixture".into(),
+                            model: "fixture".into(),
+                            surface: "web".into(),
+                            search_mode: "off".into(),
+                            protocol_version: "v1".into(),
+                            question_set_version: "v1".into(),
+                            question: "question".into(),
+                            market: "generic".into(),
+                            language: "en".into(),
+                            scheduled_at: now,
+                            sample_ordinal: 0,
+                        },
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        let attempt = Uuid::new_v4();
+        let measured = Uuid::new_v4();
+        repo.claim(&scope, first, attempt, now).await.unwrap();
+        repo.claim(&scope, measurement, measured, now)
+            .await
+            .unwrap();
+        assert!(
+            repo.get_publication_binding(&scope, first, attempt)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let envelope = ChannelSecret::new(vec![1, 2, 3]);
+        repo.store_publication_binding(&scope, first, attempt, envelope.clone())
+            .await
+            .unwrap();
+        repo.store_publication_binding(&scope, first, attempt, envelope.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.store_publication_binding(&scope, first, attempt, ChannelSecret::new(vec![4]))
+                .await
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::Conflict
+        );
+        for (tested_scope, target) in [(&foreign, first), (&scope, second)] {
+            assert_eq!(
+                repo.get_publication_binding(tested_scope, target, attempt)
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                crate::ErrorCode::NotFound
+            );
+        }
+        assert_eq!(
+            repo.store_publication_binding(
+                &scope,
+                measurement,
+                measured,
+                ChannelSecret::new(vec![4])
+            )
+            .await
+            .unwrap_err()
+            .code,
+            crate::ErrorCode::InvalidRequest
+        );
+        repo.finish(
+            &scope,
+            first,
+            attempt,
+            ChannelOutcome {
+                status: ChannelOutcomeStatus::Unknown,
+                detail: None,
+                occurred_at: now,
+                raw_answer: None,
+                citations: vec![],
+                public_url: None,
+                screenshot_ref: None,
+                connector_version: None,
+                runner_evidence: vec![],
+                fixture: true,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.get_publication_binding(&scope, first, attempt)
+                .await
+                .unwrap()
+                .unwrap()
+                .encrypted_bytes(),
+            envelope.encrypted_bytes()
+        );
+        repo.store_publication_binding(&scope, first, attempt, envelope)
+            .await
+            .unwrap();
+        let second_attempt = Uuid::new_v4();
+        repo.claim(&scope, second, second_attempt, now)
+            .await
+            .unwrap();
+        repo.finish(
+            &scope,
+            second,
+            second_attempt,
+            ChannelOutcome {
+                status: ChannelOutcomeStatus::Unknown,
+                detail: None,
+                occurred_at: now,
+                raw_answer: None,
+                citations: vec![],
+                public_url: None,
+                screenshot_ref: None,
+                connector_version: None,
+                runner_evidence: vec![],
+                fixture: true,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.store_publication_binding(
+                &scope,
+                second,
+                second_attempt,
+                ChannelSecret::new(vec![9])
+            )
+            .await
+            .unwrap_err()
+            .code,
+            crate::ErrorCode::Conflict
+        );
+    }
 
     #[tokio::test]
     async fn generated_memory_target_is_idempotent_and_uses_publication_account_lease() {

@@ -7,6 +7,7 @@ mod content_dispatch;
 mod content_runtime_tests;
 mod dispatch;
 mod production_runtime;
+mod publication_lookup_dispatch;
 mod runtime;
 mod verification_dispatch;
 
@@ -66,6 +67,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
         }
         state.set_ready(true);
+        publication_lookup_dispatch::spawn(
+            state.clone(),
+            geo_persistence::PgPublicationLookupRepository::from_database(&database),
+        );
         spawn_due_report_scanner(state.clone(), report_scanner, cycle_scanner.clone());
         verification_dispatch::spawn(verification_scanner);
         (

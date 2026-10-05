@@ -28,7 +28,7 @@ mod model_routes;
 pub use model_routes::PgModelRouteRepository;
 mod projects;
 mod publication_lookup;
-pub use publication_lookup::PgPublicationLookupRepository;
+pub use publication_lookup::{PgPublicationLookupRepository, PublicationLookupDiscoveryCandidate};
 mod report;
 mod scope;
 

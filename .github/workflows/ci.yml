@@ -111,7 +111,7 @@ jobs:
         run: |
           set -o pipefail
           failed=0
-          for suite in postgres reports channels channel_identity successor_cycles channel_dispatcher bootstrap model_routes content distribution connector_capabilities publication_lookup; do
+          for suite in postgres reports channels channel_identity successor_cycles channel_dispatcher bootstrap model_routes content distribution connector_capabilities publication_lookup publication_bindings; do
             if ! cargo test -p geo-persistence --test "$suite" -- --ignored 2>&1 | tee "logs/cargo-${suite}-postgres.log"; then
               failed=1
             fi
