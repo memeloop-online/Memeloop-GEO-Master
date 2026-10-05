@@ -654,6 +654,56 @@ export async function readbackZhihu(
 ) {
   const publicUrl = zhihuPostUrl(url, postOrigin);
   if (!publicUrl) return unknown("public_url_unverified", "readback");
+  const observed = await publicZhihuArticle(page, publicUrl, expected, {
+    postOrigin,
+    proxy,
+  });
+  if (observed.status === "unknown") {
+    return observed.reason === "public_title_mismatch"
+      ? unknown("public_content_mismatch", "readback")
+      : observed;
+  }
+  if (
+    !(await ownZhihuArticle(page, observed.postId, observed.title, {
+      selfUrl,
+      articlesOrigin,
+      expectedAccountId,
+    }))
+  ) {
+    return unknown("account_ownership_unverified", "readback");
+  }
+  return completedZhihuReadback(publicUrl, expected, observed);
+}
+
+function completedZhihuReadback(publicUrl, expected, observed) {
+  const observedAt = new Date().toISOString();
+  return {
+    status: "completed",
+    public_url: publicUrl,
+    stage: "public_readback",
+    occurred_at: observedAt,
+    evidence: [
+      {
+        kind: "public_readback",
+        url: publicUrl,
+        observed_title: observed.title,
+        expected_sha256: digest(expected.title, expected.body),
+        readback_sha256: observed.sha256,
+        content_matched: true,
+        owned_by_account: true,
+        observed_at: observedAt,
+      },
+    ],
+    connector_version: CONNECTOR_VERSION,
+  };
+}
+
+async function publicZhihuArticle(
+  page,
+  publicUrl,
+  expected,
+  { postOrigin, proxy },
+) {
   let publicContext;
   try {
     // Public verification must not inherit account cookies/local storage.
@@ -686,45 +736,144 @@ export async function readbackZhihu(
     const observedBody = normalized(body);
     const expectedTitle = normalized(expected.title);
     const expectedBody = normalized(expected.body);
-    if (observedTitle !== expectedTitle || observedBody !== expectedBody) {
+    if (observedTitle !== expectedTitle) {
+      return unknown("public_title_mismatch", "readback");
+    }
+    if (observedBody !== expectedBody) {
       return unknown("public_content_mismatch", "readback");
     }
     const postId = new URL(publicUrl).pathname.match(/^\/p\/(\d+)/u)?.[1];
-    if (
-      !postId ||
-      !(await ownZhihuArticle(page, postId, expectedTitle, {
-        selfUrl,
-        articlesOrigin,
-        expectedAccountId,
-      }))
-    ) {
-      return unknown("account_ownership_unverified", "readback");
-    }
-    const observedAt = new Date().toISOString();
+    if (!postId) return unknown("public_url_unverified", "readback");
     return {
-      status: "completed",
-      public_url: publicUrl,
-      stage: "public_readback",
-      occurred_at: observedAt,
-      evidence: [
-        {
-          kind: "public_readback",
-          url: publicUrl,
-          observed_title: observedTitle,
-          expected_sha256: digest(expected.title, expected.body),
-          readback_sha256: digest(heading ?? "", body),
-          content_matched: true,
-          owned_by_account: true,
-          observed_at: observedAt,
-        },
-      ],
-      connector_version: CONNECTOR_VERSION,
+      postId,
+      title: observedTitle,
+      sha256: digest(heading ?? "", body),
     };
   } catch {
     return unknown("public_readback_unavailable", "readback");
   } finally {
     if (publicContext) await publicContext.close();
   }
+}
+
+// The list provides only IDs and titles. It is never evidence of content,
+// chronology, or a causal link to the unknown submission.
+async function discoverZhihuArticle(
+  page,
+  expected,
+  {
+    postOrigin = ZHIHU_POST_ORIGIN,
+    selfUrl = ZHIHU_SELF,
+    articlesOrigin = "https://www.zhihu.com",
+    proxy,
+    expectedAccountId,
+  } = {},
+) {
+  if (
+    typeof expectedAccountId !== "string" ||
+    !expectedAccountId.trim() ||
+    articlesOrigin !== new URL(articlesOrigin).origin ||
+    new URL(selfUrl).origin !== articlesOrigin
+  ) {
+    return unknown("own_account_list_unverified", "discovery");
+  }
+  let ownerToken;
+  const seen = new Set();
+  const titleMatchedIds = [];
+  let listComplete = false;
+  for (
+    let pageNumber = 0;
+    pageNumber < ZHIHU_OWNERSHIP_MAX_PAGES;
+    pageNumber++
+  ) {
+    const self = await probeOwnAccount(page, selfUrl, (data) => data);
+    const identity = zhihuIdentity(self);
+    const token = self?.url_token;
+    if (
+      identity?.platform_account_id !== expectedAccountId ||
+      typeof token !== "string" ||
+      !/^[\w-]{1,128}$/u.test(token) ||
+      (ownerToken !== undefined && token !== ownerToken)
+    ) {
+      return unknown("own_account_list_unverified", "discovery");
+    }
+    ownerToken = token;
+    const endpoint = `${articlesOrigin}/api/v4/members/${encodeURIComponent(token)}/articles?limit=${ZHIHU_ARTICLES_PAGE_SIZE}&offset=${pageNumber * ZHIHU_ARTICLES_PAGE_SIZE}`;
+    const result = await probeOwnAccount(page, endpoint, (data) => data);
+    const articles = result?.data;
+    const isEnd = result?.paging?.is_end;
+    if (
+      !Array.isArray(articles) ||
+      articles.length > ZHIHU_ARTICLES_PAGE_SIZE ||
+      typeof isEnd !== "boolean" ||
+      (!isEnd && articles.length !== ZHIHU_ARTICLES_PAGE_SIZE)
+    ) {
+      return unknown("own_account_list_unverified", "discovery");
+    }
+    for (const article of articles) {
+      const id = article?.id;
+      const postId =
+        typeof id === "number" && Number.isSafeInteger(id) && id > 0
+          ? String(id)
+          : typeof id === "string" && /^[1-9]\d*$/u.test(id)
+            ? id
+            : null;
+      if (
+        !postId ||
+        typeof article?.title !== "string" ||
+        !article.title.trim() ||
+        seen.has(postId)
+      ) {
+        return unknown("own_account_list_unverified", "discovery");
+      }
+      seen.add(postId);
+      if (normalized(article.title) === normalized(expected.title)) {
+        titleMatchedIds.push(postId);
+      }
+    }
+    if (isEnd) {
+      listComplete = true;
+      break;
+    }
+  }
+  if (!listComplete) return unknown("own_account_list_unverified", "discovery");
+
+  let match;
+  for (const id of titleMatchedIds) {
+    const publicUrl = zhihuPublicationCandidateUrl(
+      `${postOrigin}/p/${id}`,
+      postOrigin,
+    );
+    if (!publicUrl) return unknown("public_url_unverified", "discovery");
+    const observed = await publicZhihuArticle(page, publicUrl, expected, {
+      postOrigin,
+      proxy,
+    });
+    if (observed.status === "unknown") {
+      // A title-matched asset which cannot be read leaves the result
+      // ambiguous even when a different candidate matched exactly.
+      if (observed.reason === "public_content_mismatch") continue;
+      return unknown(observed.reason, "discovery");
+    }
+    if (match) return unknown("own_account_list_ambiguous", "discovery");
+    match = { publicUrl, observed };
+  }
+  if (!match) return unknown("own_account_list_no_match", "discovery");
+  const completed = completedZhihuReadback(
+    match.publicUrl,
+    expected,
+    match.observed,
+  );
+  completed.evidence.push({
+    kind: "own_account_list_discovery",
+    schema_version: "geo.publication.discovery.v1",
+    public_url: match.publicUrl,
+    expected_sha256: digest(expected.title, expected.body),
+    list_complete: true,
+    exact_match_count: 1,
+    observed_at: completed.occurred_at,
+  });
+  return completed;
 }
 
 export async function publishZhihu(
@@ -905,10 +1054,16 @@ export const adapters = Object.freeze({
       if (operation === "publish") return publishZhihu(page, payload, network);
       if (operation === "lookup") {
         const content = contentPayload(payload, true);
-        if (!content || typeof payload.public_url !== "string") {
+        if (
+          !content ||
+          (payload.public_url !== undefined &&
+            typeof payload.public_url !== "string")
+        ) {
           return unsupported("invalid_lookup_payload");
         }
-        return readbackZhihu(page, payload.public_url, content, network);
+        return payload.public_url === undefined
+          ? discoverZhihuArticle(page, content, network)
+          : readbackZhihu(page, payload.public_url, content, network);
       }
       return unsupported("operation_not_supported");
     },

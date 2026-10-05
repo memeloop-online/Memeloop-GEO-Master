@@ -268,7 +268,7 @@ function SnapshotDetail({
         <CoveragePanel
           title="发布目标覆盖"
           coverage={snapshot.publications}
-          note="发布回执与公开验证分别计数；结果未知仍需查回，不视作失败。"
+          note="发布回执、公开验证与独立资产查回分开呈现；查回发现资产不证明原发送成功，结果未知仍保留。"
         />
         <CoveragePanel
           title="AI 渠道测量覆盖"
@@ -357,7 +357,7 @@ function SnapshotDetail({
                         <li key={id}>
                           {evidenceIds.has(id) ? (
                             <a href={`#evidence-${encodeURIComponent(id)}`}>
-                              查看原始证据 {id}
+                              查看快照证据 {id}
                             </a>
                           ) : evidenceLoading || evidenceError ? (
                             <>证据 {id} 的明细暂不可用；请重试证据读取</>
@@ -399,12 +399,13 @@ function SnapshotDetail({
             ))}
           </ul>
         ) : !evidenceLoading && !evidenceError ? (
-          <p>当前快照未包含原始证据引用。</p>
+          <p>当前快照未包含证据引用。</p>
         ) : null}
       </section>
       <MessageBar intent="info">
         <MessageBarBody>
-          此 CSV 仅导出快照已有的覆盖、结论与证据。资产明细、费用、下一轮动作及
+          此 CSV
+          仅导出快照已有的覆盖、结论与证据。独立查回只陈述资产存在，不证明原发送成功。资产明细、费用、下一轮动作及
           PDF 尚未由此接口提供；页面不会生成替代数据或将本快照称作完整商业报告。
         </MessageBarBody>
       </MessageBar>

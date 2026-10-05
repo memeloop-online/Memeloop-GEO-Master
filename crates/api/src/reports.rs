@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, DistributionPublicationResult, DistributionTarget, DistributionTargetStatus,
     ErrorCode, ProjectId, ReportManifestKind, ReportManifestRef, ReportPublicationStatus,
-    ReportPublicationTarget, ReportReduceInput, ReportSnapshot, TenantScope, reduce_report,
+    ReportPublicationTarget, ReportReduceInput, ReportSnapshot, TenantScope,
+    publication_lookup_asset_evidence, reduce_report,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -267,12 +268,94 @@ pub async fn reduce_cycle_report(
         sealed: true,
         expected_count: Some(manifest.expected_count),
     });
+    let evidence_at = if correction_of.is_some() {
+        now
+    } else {
+        cycle.cutoff_at
+    };
+    // A formal frozen coverage cell can reuse a send from an earlier cycle.
+    // Resolve its original intent binding, never equate its coverage-cell ID
+    // with the original channel send target. Legacy target IDs already are
+    // original send IDs. Process bounded keysets without a report-size gate.
+    let mut lookup_by_target: std::collections::HashMap<Uuid, Vec<_>> =
+        std::collections::HashMap::new();
+    if let Some(repository) = &state.publication_lookup_repository {
+        let mut original_targets = Vec::new();
+        if let Some((manifest, targets)) = &formal {
+            for target in targets {
+                if let Some(intent_id) = target.publication_intent_id {
+                    let bundle = distribution_repository
+                        .get_publication_bundle(scope, intent_id)
+                        .await?;
+                    if target.manifest_id != manifest.manifest_id
+                        || bundle.intent.intent_id != intent_id
+                        || bundle.intent.project_id != manifest.project_id
+                        || bundle.intent.channel_target_id != bundle.target.target_id
+                        || bundle.command.target_id != bundle.target.target_id
+                        || Some(bundle.intent.content_revision_id) != target.content_revision_id
+                        || bundle.intent.platform_id != target.platform_id
+                        || bundle.intent.placement_slot != target.placement_slot
+                    {
+                        return Err(AppError::conflict(
+                            "publication target binding is inconsistent",
+                        ));
+                    }
+                    original_targets.push((target.target_id, bundle.intent.channel_target_id));
+                }
+            }
+        } else if let Some(targets) = &channel_inputs.publications {
+            original_targets.extend(
+                targets
+                    .iter()
+                    .map(|target| (target.target_id, target.target_id)),
+            );
+        }
+        let mut frozen_by_original: std::collections::HashMap<Uuid, Vec<Uuid>> =
+            std::collections::HashMap::new();
+        for (frozen_id, original_id) in original_targets {
+            frozen_by_original
+                .entry(original_id)
+                .or_default()
+                .push(frozen_id);
+        }
+        let original_ids: Vec<_> = frozen_by_original.keys().copied().collect();
+        for chunk in original_ids.chunks(64) {
+            let mut accepted_originals = std::collections::HashSet::new();
+            for record in repository
+                .report_asset_observations(scope, chunk, evidence_at)
+                .await?
+            {
+                if accepted_originals.contains(&record.original_target_id)
+                    || record.job.target_id != record.original_target_id
+                    || record.job.attempt_id != record.observation.attempt_id
+                    || crate::publication_lookup::public_observed_url(
+                        state,
+                        scope,
+                        &record.observation,
+                        &record.job,
+                    )
+                    .await
+                    .is_none()
+                {
+                    continue;
+                }
+                accepted_originals.insert(record.original_target_id);
+                if let Some(frozen_ids) = frozen_by_original.get(&record.original_target_id) {
+                    for frozen_id in frozen_ids {
+                        lookup_by_target.entry(*frozen_id).or_default().push(
+                            publication_lookup_asset_evidence(
+                                *frozen_id,
+                                record.observation.execution_id,
+                                record.observation.observed_at,
+                                record.observation.received_at,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let formal_publications = if let Some((_, targets)) = formal {
-        let evidence_at = if correction_of.is_some() {
-            now
-        } else {
-            cycle.cutoff_at
-        };
         let results = distribution_repository
             .publication_results(scope, &targets, evidence_at)
             .await?;
@@ -285,7 +368,13 @@ pub async fn reduce_cycle_report(
                 .into_iter()
                 .map(|target| {
                     let outcome = outcomes.remove(&target.target_id);
-                    formal_publication_target(target, outcome)
+                    let mut publication = formal_publication_target(target, outcome);
+                    publication.evidence.extend(
+                        lookup_by_target
+                            .remove(&publication.target_id)
+                            .unwrap_or_default(),
+                    );
+                    publication
                 })
                 .collect(),
         )
@@ -331,7 +420,18 @@ pub async fn reduce_cycle_report(
             }))
             .collect(),
         document_manifest,
-        publication_targets: formal_publications.or(channel_inputs.publications),
+        publication_targets: formal_publications.or_else(|| {
+            channel_inputs.publications.map(|mut targets| {
+                for target in &mut targets {
+                    target.evidence.extend(
+                        lookup_by_target
+                            .remove(&target.target_id)
+                            .unwrap_or_default(),
+                    );
+                }
+                targets
+            })
+        }),
         measurement_targets: channel_inputs.measurements,
     };
     let snapshot = reduce_report(scope, &input, revision, correction_of, now)?;

@@ -49,6 +49,15 @@ pub struct PublicationLookupObservation {
     pub error_code: Option<String>,
 }
 
+/// Internal report input only. Never serialize the job or raw observation:
+/// both can contain account and unverified external evidence.
+#[derive(Debug, Clone)]
+pub struct PublicationLookupReportObservation {
+    pub original_target_id: Uuid,
+    pub job: PublicationLookupJob,
+    pub observation: PublicationLookupObservation,
+}
+
 #[async_trait]
 pub trait PublicationLookupRepository: Send + Sync {
     /// Create one job per original attempt. Read its bound target, outcome,
@@ -112,4 +121,19 @@ pub trait PublicationLookupRepository: Send + Sync {
         before: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<PublicationLookupObservation>, AppError>;
+
+    /// A scoped, bounded fan-in: at most 32 newest timely asset candidates
+    /// and their original job per requested original send. The reducer takes
+    /// the first candidate passing independent validation, then projects one
+    /// representative reference per frozen target. Older than 32 fails closed.
+    async fn report_asset_observations(
+        &self,
+        scope: &TenantScope,
+        original_channel_target_ids: &[Uuid],
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<PublicationLookupReportObservation>, AppError> {
+        let _ = (scope, original_channel_target_ids, as_of);
+        // In-memory/read-only fixtures cannot assert durable send provenance.
+        Ok(Vec::new())
+    }
 }

@@ -3,7 +3,8 @@ use chrono::{DateTime, Duration, Utc};
 use geo_domain::{
     AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelTarget, ChannelTargetInput, ErrorCode,
     ProjectId, PublicationLookupCandidate, PublicationLookupFinding, PublicationLookupJob,
-    PublicationLookupObservation, PublicationLookupRepository, TenantScope,
+    PublicationLookupObservation, PublicationLookupReportObservation, PublicationLookupRepository,
+    TenantScope,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -256,6 +257,72 @@ async fn get_locked(
 
 #[async_trait]
 impl PublicationLookupRepository for PgPublicationLookupRepository {
+    async fn report_asset_observations(
+        &self,
+        scope: &TenantScope,
+        original_channel_target_ids: &[Uuid],
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<PublicationLookupReportObservation>, AppError> {
+        if original_channel_target_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Drive the lateral lookup from the frozen report's original target
+        // keyset. The indexed (attempt_id,received_at,execution_id) walk
+        // never materializes an attempt's entire observation history.
+        // The newest 32 let the validator skip a malformed newer candidate
+        // without turning this into an unbounded history scan.
+        let rows = sqlx::query(
+            "SELECT j.attempt_id,j.target_id,j.account_id,j.frozen_input,j.connector_version,\
+                    j.candidate_public_url,j.next_due_at,j.lease_execution_id,\
+                    j.lease_expires_at,j.query_count,j.last_error_code,\
+                    o.execution_id,o.finding,o.evidence,o.observed_at,o.received_at,o.error_code \
+             FROM (SELECT DISTINCT unnest($4::uuid[]) AS target_id) requested \
+             JOIN publication_lookup_jobs j ON j.operator_id=$1 AND j.tenant_id=$2 \
+               AND j.project_id=$3 AND j.target_id=requested.target_id \
+             JOIN LATERAL ( \
+                SELECT obs.execution_id,obs.finding,obs.evidence,obs.observed_at,\
+                       obs.received_at,obs.error_code \
+                FROM publication_lookup_observations obs \
+                JOIN publication_lookup_executions run ON \
+                   run.operator_id=obs.operator_id AND run.tenant_id=obs.tenant_id \
+                   AND run.project_id=obs.project_id AND run.attempt_id=obs.attempt_id \
+                   AND run.execution_id=obs.execution_id \
+                WHERE obs.operator_id=$1 AND obs.tenant_id=$2 AND obs.project_id=$3 \
+                  AND obs.attempt_id=j.attempt_id AND obs.finding='asset_observed' \
+                  AND obs.received_at<=$5 AND obs.observed_at<=obs.received_at \
+                  AND obs.observed_at>=run.claimed_at AND obs.received_at>=run.claimed_at \
+                  AND obs.received_at<=run.expires_at \
+                ORDER BY obs.received_at DESC,obs.execution_id DESC LIMIT 32 \
+             ) o ON true \
+             ORDER BY j.target_id,o.received_at DESC,o.execution_id DESC",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(original_channel_target_ids)
+        .bind(as_of)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|row| {
+                Ok(PublicationLookupReportObservation {
+                    original_target_id: row.get("target_id"),
+                    job: job(row)?,
+                    observation: PublicationLookupObservation {
+                        execution_id: row.get("execution_id"),
+                        attempt_id: row.get("attempt_id"),
+                        finding: PublicationLookupFinding::AssetObserved,
+                        evidence: row.get("evidence"),
+                        observed_at: row.get("observed_at"),
+                        received_at: row.get("received_at"),
+                        error_code: row.get("error_code"),
+                    },
+                })
+            })
+            .collect()
+    }
+
     async fn enqueue(
         &self,
         scope: &TenantScope,

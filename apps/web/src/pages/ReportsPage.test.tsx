@@ -211,7 +211,7 @@ describe("P14 immutable reports", () => {
     expect(within(coverage).getAllByText(/计划分母 未知/)).toHaveLength(2);
     expect(screen.getByText(/不能推断提及、引用或趋势/)).toBeInTheDocument();
     expect(screen.queryByText(/GEO 总分/)).not.toBeInTheDocument();
-    const link = screen.getByRole("link", { name: /查看原始证据/ });
+    const link = screen.getByRole("link", { name: /查看快照证据/ });
     expect(link).toHaveAttribute("href", "#evidence-evidence-1");
     expect(await screen.findByText("资料不足的文档分支")).toBeInTheDocument();
     expect(screen.getByText("item-1")).toBeInTheDocument();
@@ -287,6 +287,60 @@ describe("P14 immutable reports", () => {
     expect(within(groups).getByText("缺测 1")).toBeInTheDocument();
     expect(within(groups).getAllByText("逐口径计划分母未提供")).toHaveLength(2);
     expect(screen.queryByText(/%/)).not.toBeInTheDocument();
+  });
+
+  it("renders independent lookup findings without relabeling unknown publication or leaking private evidence to CSV", async () => {
+    const asset = {
+      evidence_id: "asset-evidence-1",
+      kind: "publication_lookup_asset_observed",
+      resource_id: "frozen-target-1",
+      resource_version: null,
+      occurred_at: "2026-09-28T08:00:00Z",
+      received_at: "2026-09-28T08:01:00Z",
+      summary:
+        "Independent lookup observed a public asset; original send remains unproven",
+    };
+    const report: ReportSnapshot = {
+      ...snapshot,
+      publications: {
+        availability: "available",
+        expected_count: 1,
+        observed_count: 1,
+        counts: { unknown: 1 },
+        reason: null,
+      },
+      findings: [
+        {
+          finding_id: "lookup-finding",
+          kind: "publication_asset_observed",
+          summary:
+            "A public asset was observed independently; this does not prove the original publication send succeeded.",
+          evidence_ids: [asset.evidence_id],
+          insufficient_reason:
+            "No trusted causal link between the original send and the observed asset is available.",
+        },
+      ],
+      evidence: [asset],
+    };
+    mockApi({ detail: report });
+    renderPage("/app/tenant-1/project-1/reports/report-1");
+    expect(await screen.findByText(asset.summary)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /this does not prove the original publication send succeeded/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/查回发现资产不证明原发送成功/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("结果未知")).toBeInTheDocument();
+    const csv = reportSnapshotCsv(report);
+    expect(csv).toContain('"publication_asset_observed"');
+    expect(csv).toContain('"publication_lookup_asset_observed"');
+    expect(csv).toContain('"publication","","unknown","1",""');
+    expect(csv).not.toContain("public_url");
+    expect(csv).not.toContain("account_id");
+    expect(csv).not.toContain("raw_evidence");
   });
 
   it("formats report and evidence timestamps in the frozen project timezone, not browser UTC", async () => {

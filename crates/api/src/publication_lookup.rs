@@ -82,11 +82,15 @@ fn public_error_code(code: Option<&str>) -> Option<&'static str> {
     })
 }
 
-fn public_observed_url(
+pub(crate) async fn public_observed_url(
+    state: &AppState,
+    scope: &TenantScope,
     observation: &PublicationLookupObservation,
     job: &PublicationLookupJob,
 ) -> Option<String> {
     if observation.finding != PublicationLookupFinding::AssetObserved
+        || observation.attempt_id != job.attempt_id
+        || observation.observed_at > observation.received_at
         || !job.frozen_input.is_publication()
         || job.frozen_input.account_id() != job.account_id
     {
@@ -113,12 +117,12 @@ fn public_observed_url(
     let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let expected_digest =
         sha256_hex(format!("{}\n{}", normalized(title), normalized(body)).as_bytes());
-    (evidence.get("schema_version")?.as_str()? == "geo.publication.asset_observation.v1"
-        && evidence.get("provenance")?.as_str()? == "live"
+    let schema = evidence.get("schema_version")?.as_str()?;
+    let version = evidence.get("connector_version")?.as_str()?;
+    let common = evidence.get("provenance")?.as_str()? == "live"
         && evidence.get("original_attempt_id")?.as_str()? == job.attempt_id.to_string()
         && evidence.get("target_id")?.as_str()? == job.target_id.to_string()
         && evidence.get("account_id")?.as_str()? == job.account_id.to_string()
-        && evidence.get("connector_version")?.as_str()? == job.connector_version.as_deref()?
         && evidence
             .get("observed_at")?
             .as_str()?
@@ -126,10 +130,47 @@ fn public_observed_url(
             .ok()?
             .timestamp_micros()
             == observation.observed_at.timestamp_micros()
-        && job.candidate_public_url.as_deref() == Some(url)
         && digest == expected_digest
-        && valid_candidate(url, platform))
-    .then(|| url.to_owned())
+        && valid_candidate(url, platform);
+    if !common {
+        return None;
+    }
+    match schema {
+        "geo.publication.asset_observation.v1"
+            if job.candidate_public_url.as_deref() == Some(url)
+                && job.connector_version.as_deref() == Some(version) =>
+        {
+            Some(url.to_owned())
+        }
+        "geo.publication.asset_observation.v2"
+            if evidence.len() == 11
+                && evidence.get("discovery_kind")?.as_str()? == "own_account_list_discovery"
+                && evidence.get("version_authority")?.as_str()? == "presend_encrypted_binding"
+                && job
+                    .connector_version
+                    .as_deref()
+                    .is_none_or(|saved| saved == version) =>
+        {
+            let binding = state
+                .channel_job_repository()
+                .get_publication_binding(scope, job.target_id, job.attempt_id)
+                .await
+                .ok()??;
+            (state
+                .channel_service()
+                .original_publication_connector_version(
+                    scope,
+                    job.account_id,
+                    job.attempt_id,
+                    &binding,
+                    platform,
+                )
+                .as_deref()
+                == Some(version))
+            .then(|| url.to_owned())
+        }
+        _ => None,
+    }
 }
 
 /// Shared Rust projection for HTTP and later P00 reads. It never returns
@@ -197,17 +238,20 @@ pub(crate) async fn read_publication_lookup(
                 .lease_expires_at
                 .is_some_and(|expires| expires > Utc::now()),
         }),
-        observations: page
-            .iter()
-            .map(|observation| LookupObservationRead {
-                execution_id: observation.execution_id,
-                finding: observation.finding,
-                observed_at: observation.observed_at,
-                received_at: observation.received_at,
-                error_code: public_error_code(observation.error_code.as_deref()),
-                public_url: public_observed_url(observation, &job),
-            })
-            .collect(),
+        observations: {
+            let mut reads = Vec::with_capacity(page.len());
+            for observation in &page {
+                reads.push(LookupObservationRead {
+                    execution_id: observation.execution_id,
+                    finding: observation.finding,
+                    observed_at: observation.observed_at,
+                    received_at: observation.received_at,
+                    error_code: public_error_code(observation.error_code.as_deref()),
+                    public_url: public_observed_url(state, scope, observation, &job).await,
+                });
+            }
+            reads
+        },
         next_before,
     })
 }
@@ -335,18 +379,15 @@ async fn lookup_once(
         } if job.frozen_input.account_id() == job.account_id => (platform, title, body),
         _ => return unknown("target_mismatch"),
     };
-    // Never allow arbitrary URLs from a malformed job or a later caller to
-    // become navigation instructions to an authenticated browser context.
-    let Some(candidate) = job.candidate_public_url.as_deref() else {
-        return unknown("candidate_missing");
-    };
-    if !valid_candidate(candidate, platform) {
+    // The candidate is never obtained from a caller: it is either the
+    // validated immutable hint or discovered inside the bound account.
+    let candidate = job.candidate_public_url.as_deref();
+    if candidate.is_some_and(|url| !valid_candidate(url, platform)) {
         return unknown("candidate_invalid");
     }
-    let Some(original_version) = job.connector_version.as_deref() else {
-        return unknown("connector_version_missing");
-    };
-    if original_version.is_empty() || original_version.len() > 100 {
+    if job.connector_version.as_deref().is_some_and(|version| {
+        version.is_empty() || version.len() > 100 || version.starts_with("fixture")
+    }) {
         return unknown("connector_version_invalid");
     }
     let binding = match state
@@ -358,6 +399,25 @@ async fn lookup_once(
         Ok(None) => return unknown("binding_missing"),
         Err(_) => return unknown("binding_unavailable"),
     };
+    let Some(original_version) = state
+        .channel_service()
+        .original_publication_connector_version(
+            scope,
+            job.account_id,
+            job.attempt_id,
+            &binding,
+            platform,
+        )
+    else {
+        return unknown("binding_unavailable");
+    };
+    if job
+        .connector_version
+        .as_deref()
+        .is_some_and(|version| version != original_version.as_str())
+    {
+        return unknown("connector_version_mismatch");
+    }
     let Some(bridge) = state.channel_service().browser.as_ref() else {
         return unknown("runner_unavailable");
     };
@@ -399,7 +459,7 @@ async fn lookup_once(
             return unknown("account_or_network_unavailable");
         }
     };
-    if original_version != bound_version {
+    if bound_version != original_version {
         if bridge.close(session).await.is_ok() {
             release_reservation(state, scope, job.account_id, reservation_id).await;
         }
@@ -414,7 +474,10 @@ async fn lookup_once(
         }
         return unknown("lookup_preflight_expired");
     }
-    let payload = json!({"title":title,"body":body,"public_url":candidate});
+    let payload = match candidate {
+        Some(candidate) => json!({"title":title,"body":body,"public_url":candidate}),
+        None => json!({"title":title,"body":body}),
+    };
     let (receipt, closed) = execute_and_close_with_cleanup(
         bridge,
         session,
@@ -430,7 +493,14 @@ async fn lookup_once(
     match receipt {
         Ok(receipt) => {
             let received_at = Utc::now();
-            match observed_asset(&receipt, job, execution_id, claimed_at, received_at) {
+            match observed_asset(
+                &receipt,
+                job,
+                &bound_version,
+                execution_id,
+                claimed_at,
+                received_at,
+            ) {
                 Some(evidence) => (PublicationLookupFinding::AssetObserved, evidence, None),
                 None => unknown("readback_unverified"),
             }
@@ -472,17 +542,43 @@ fn valid_candidate(candidate: &str, platform: &str) -> bool {
 fn observed_asset(
     receipt: &BrowserExecution,
     job: &PublicationLookupJob,
+    bound_version: &str,
     execution_id: Uuid,
     claimed_at: DateTime<Utc>,
     received_at: DateTime<Utc>,
 ) -> Option<Value> {
     let at = receipt.occurred_at?;
-    let version = job.connector_version.as_deref()?;
-    let candidate = job.candidate_public_url.as_deref()?;
+    let version = bound_version;
+    let (platform, title, body) = match &job.frozen_input {
+        ChannelTargetInput::Publish {
+            platform,
+            title,
+            body,
+            ..
+        }
+        | ChannelTargetInput::GeneratedPublish {
+            platform,
+            title,
+            body,
+            ..
+        } => (platform, title, body),
+        ChannelTargetInput::Measure { .. } => return None,
+    };
+    let url = receipt.public_url.as_deref()?;
+    let candidate = job.candidate_public_url.as_deref();
+    if job.frozen_input.account_id() != job.account_id
+        || !valid_candidate(url, platform)
+        || candidate.is_some_and(|candidate| candidate != url)
+        || job
+            .connector_version
+            .as_deref()
+            .is_some_and(|saved| saved != version)
+    {
+        return None;
+    }
     if receipt.execution_id != execution_id
         || receipt.provenance != Some(BrowserReceiptProvenance::Live)
         || receipt.connector_version.as_deref() != Some(version)
-        || receipt.public_url.as_deref() != Some(candidate)
         || at < claimed_at
         || at > received_at
         || receipt
@@ -495,16 +591,40 @@ fn observed_asset(
     {
         return None;
     }
-    let (title, body) = match &job.frozen_input {
-        ChannelTargetInput::Publish { title, body, .. }
-        | ChannelTargetInput::GeneratedPublish { title, body, .. } => (title, body),
-        ChannelTargetInput::Measure { .. } => return None,
-    };
     let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let digest = sha256_hex(format!("{}\n{}", normalize(title), normalize(body)).as_bytes());
-    Some(json!({
-        "schema_version": "geo.publication.asset_observation.v1",
-        "public_url": candidate,
+    if candidate.is_none() {
+        let discovery: Vec<_> = receipt
+            .evidence
+            .iter()
+            .filter(|proof| {
+                proof.get("kind").and_then(Value::as_str) == Some("own_account_list_discovery")
+            })
+            .collect();
+        if discovery.len() != 1 {
+            return None;
+        }
+        let proof = discovery[0].as_object()?;
+        if proof.len() != 7
+            || proof.get("schema_version")?.as_str()? != "geo.publication.discovery.v1"
+            || proof.get("public_url")?.as_str()? != url
+            || proof.get("expected_sha256")?.as_str()? != digest
+            || !proof.get("list_complete")?.as_bool()?
+            || proof.get("exact_match_count")?.as_u64()? != 1
+            || proof
+                .get("observed_at")?
+                .as_str()?
+                .parse::<DateTime<Utc>>()
+                .ok()?
+                .timestamp_micros()
+                != at.timestamp_micros()
+        {
+            return None;
+        }
+    }
+    let mut evidence = json!({
+        "schema_version": if candidate.is_some() { "geo.publication.asset_observation.v1" } else { "geo.publication.asset_observation.v2" },
+        "public_url": url,
         "content_sha256": digest,
         "connector_version": version,
         "observed_at": at,
@@ -513,7 +633,14 @@ fn observed_asset(
         "account_id": job.account_id,
         "provenance": "live",
         // Critically, no claim that the original send created this asset.
-    }))
+    });
+    if candidate.is_none() {
+        // A v2 observation is projected only after independently rechecking
+        // its original encrypted binding, including no-receipt jobs.
+        evidence["discovery_kind"] = json!("own_account_list_discovery");
+        evidence["version_authority"] = json!("presend_encrypted_binding");
+    }
+    Some(evidence)
 }
 
 #[cfg(test)]
@@ -615,6 +742,14 @@ mod tests {
                 .take(limit + 1)
                 .cloned()
                 .collect())
+        }
+        async fn report_asset_observations(
+            &self,
+            _: &TenantScope,
+            _: &[Uuid],
+            _: DateTime<Utc>,
+        ) -> Result<Vec<geo_domain::PublicationLookupReportObservation>, AppError> {
+            Ok(vec![])
         }
     }
 
@@ -746,8 +881,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_bound_sanitized_live_observation_exposes_public_url() {
+    #[tokio::test]
+    async fn only_bound_sanitized_live_observation_exposes_public_url() {
+        let state = AppState::development();
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
         let job = job();
         let at = Utc::now();
         let evidence = json!({
@@ -771,7 +912,7 @@ mod tests {
             error_code: None,
         };
         assert_eq!(
-            public_observed_url(&observation, &job),
+            public_observed_url(&state, &scope, &observation, &job).await,
             job.candidate_public_url
         );
         for (key, value) in [
@@ -784,11 +925,23 @@ mod tests {
             let original = observation.evidence[key].clone();
             observation.evidence[key] = value;
             assert!(
-                public_observed_url(&observation, &job).is_none(),
+                public_observed_url(&state, &scope, &observation, &job)
+                    .await
+                    .is_none(),
                 "accepted altered {key}"
             );
             observation.evidence[key] = original;
         }
+        let mut forged_discovery = observation;
+        forged_discovery.evidence["schema_version"] = json!("geo.publication.asset_observation.v2");
+        forged_discovery.evidence["discovery_kind"] = json!("own_account_list_discovery");
+        forged_discovery.evidence["version_authority"] = json!("presend_encrypted_binding");
+        assert!(
+            public_observed_url(&state, &scope, &forged_discovery, &job)
+                .await
+                .is_none(),
+            "a marker without the original encrypted binding is not authoritative"
+        );
     }
 
     #[derive(Clone, Default)]
@@ -812,15 +965,27 @@ mod tests {
             ("POST", "/v1/sessions") => json!({"session_id":payload["session_id"]}),
             ("POST", "/v1/executions") => {
                 stub.requests.lock().await.push(payload.clone());
-                let url = payload["payload"]["public_url"].clone();
+                let discovery = payload["payload"].get("public_url").is_none();
+                let url = if discovery {
+                    json!("https://www.zhihu.com/p/12345")
+                } else {
+                    payload["payload"]["public_url"].clone()
+                };
                 let digest = sha256_hex(b"Original title\nOriginal body");
+                let at = Utc::now();
+                let mut evidence = vec![json!({"kind":"public_readback","url":url,
+                    "content_matched":true,"owned_by_account":true,
+                    "expected_sha256":digest,"readback_sha256":digest})];
+                if discovery {
+                    evidence.push(json!({"kind":"own_account_list_discovery",
+                        "schema_version":"geo.publication.discovery.v1","public_url":url,
+                        "expected_sha256":digest,"list_complete":true,"exact_match_count":1,
+                        "observed_at":at}));
+                }
                 json!({
                     "execution_id":payload["execution_id"],"status":"completed",
                     "stage":"public_readback","provenance":"live","connector_version":"zhihu.v1",
-                    "occurred_at":Utc::now(),"public_url":url,
-                    "evidence":[{"kind":"public_readback","url":url,
-                        "content_matched":true,"owned_by_account":true,
-                        "expected_sha256":digest,"readback_sha256":digest}]
+                    "occurred_at":at,"public_url":url,"evidence":evidence
                 })
             }
             ("POST", path) if path.ends_with("/complete") => json!({
@@ -941,6 +1106,55 @@ mod tests {
         jobs.store_publication_binding(&scope, job.target_id, job.attempt_id, binding)
             .await
             .unwrap();
+        let mut no_receipt = job.clone();
+        no_receipt.connector_version = None;
+        no_receipt.candidate_public_url = None;
+        let (discovered, evidence, error) =
+            lookup_once(&state, &scope, &no_receipt, Uuid::new_v4(), Utc::now()).await;
+        assert_eq!(discovered, PublicationLookupFinding::AssetObserved);
+        assert_eq!(error, None);
+        assert_eq!(
+            evidence["schema_version"],
+            "geo.publication.asset_observation.v2"
+        );
+        assert_eq!(evidence["connector_version"], "zhihu.v1");
+        assert!(
+            stub.requests.lock().await[0]["payload"]
+                .get("public_url")
+                .is_none()
+        );
+        let at = evidence["observed_at"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let observation = PublicationLookupObservation {
+            execution_id: Uuid::new_v4(),
+            attempt_id: job.attempt_id,
+            finding: discovered,
+            evidence: evidence.clone(),
+            observed_at: at,
+            received_at: Utc::now(),
+            error_code: None,
+        };
+        assert_eq!(
+            public_observed_url(&state, &scope, &observation, &no_receipt).await,
+            Some("https://www.zhihu.com/p/12345".into())
+        );
+        let mut corrupted = observation.clone();
+        corrupted.evidence["version_authority"] = json!("live_capability");
+        assert!(
+            public_observed_url(&state, &scope, &corrupted, &no_receipt)
+                .await
+                .is_none()
+        );
+        corrupted.evidence = evidence;
+        corrupted.evidence["content_sha256"] = json!("other");
+        assert!(
+            public_observed_url(&state, &scope, &corrupted, &no_receipt)
+                .await
+                .is_none()
+        );
         let original = ChannelOutcome {
             status: ChannelOutcomeStatus::Unknown,
             detail: None,
@@ -957,11 +1171,44 @@ mod tests {
             .finish(&scope, job.target_id, job.attempt_id, original, Utc::now())
             .await
             .unwrap();
+        // A late unknown receipt may once-fill the hint and version; that
+        // must not erase the earlier independently bound observation.
+        assert_eq!(
+            public_observed_url(&state, &scope, &observation, &job).await,
+            Some("https://www.zhihu.com/p/12345".into())
+        );
+        let mut different_late_hint = job.clone();
+        different_late_hint.candidate_public_url = Some("https://www.zhihu.com/p/999".into());
+        assert_eq!(
+            public_observed_url(&state, &scope, &observation, &different_late_hint).await,
+            Some("https://www.zhihu.com/p/12345".into())
+        );
+        let read_state =
+            state
+                .clone()
+                .with_publication_lookup_repository(Arc::new(ReadOnlyLookup {
+                    job: job.clone(),
+                    history: vec![observation.clone()],
+                }));
+        let projection = read_publication_lookup(&read_state, &scope, job.target_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            projection.observations[0].public_url.as_deref(),
+            Some("https://www.zhihu.com/p/12345")
+        );
+        let mut future_observation = observation;
+        future_observation.received_at = future_observation.observed_at - Duration::seconds(1);
+        assert!(
+            public_observed_url(&state, &scope, &future_observation, &job)
+                .await
+                .is_none()
+        );
         let result = lookup_once(&state, &scope, &job, Uuid::new_v4(), Utc::now()).await;
         assert_eq!(result.0, PublicationLookupFinding::AssetObserved);
         assert!(result.2.is_none());
-        assert_eq!(stub.requests.lock().await.len(), 1);
-        assert_eq!(stub.requests.lock().await[0]["operation"], "lookup");
+        assert_eq!(stub.requests.lock().await.len(), 2);
+        assert_eq!(stub.requests.lock().await[1]["operation"], "lookup");
         assert_eq!(
             jobs.get_target(&scope, job.target_id).await.unwrap(),
             before
@@ -970,7 +1217,7 @@ mod tests {
         *stub.identity.lock().await = "other-identity".into();
         let refused = lookup_once(&state, &scope, &job, Uuid::new_v4(), Utc::now()).await;
         assert_eq!(refused.0, PublicationLookupFinding::Unknown);
-        assert_eq!(stub.requests.lock().await.len(), 1);
+        assert_eq!(stub.requests.lock().await.len(), 2);
         let reservation = Uuid::new_v4();
         let reserve_at = Utc::now();
         jobs.reserve_account(
@@ -1032,7 +1279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_candidate_does_not_need_a_runner_or_a_binding() {
+    async fn missing_candidate_requires_original_binding_before_discovery() {
         let state = AppState::development();
         let scope = TenantScope::new(
             OperatorId::new(Uuid::new_v4()),
@@ -1044,7 +1291,7 @@ mod tests {
         let (finding, _, code) =
             lookup_once(&state, &scope, &job, Uuid::new_v4(), Utc::now()).await;
         assert_eq!(finding, PublicationLookupFinding::Unknown);
-        assert_eq!(code, Some("candidate_missing"));
+        assert_eq!(code, Some("binding_unavailable"));
     }
 
     #[tokio::test]
@@ -1097,6 +1344,7 @@ mod tests {
         let evidence = observed_asset(
             &valid(),
             &job,
+            "zhihu.v1",
             execution_id,
             now - Duration::seconds(1),
             now + Duration::seconds(1),
@@ -1106,26 +1354,106 @@ mod tests {
         assert!(!evidence.to_string().contains("DO NOT PERSIST"));
         let mut fixture = valid();
         fixture.provenance = Some(BrowserReceiptProvenance::Fixture);
-        assert!(observed_asset(&fixture, &job, execution_id, now, now).is_none());
+        assert!(observed_asset(&fixture, &job, "zhihu.v1", execution_id, now, now).is_none());
         let mut other_execution = valid();
         other_execution.execution_id = Uuid::new_v4();
-        assert!(observed_asset(&other_execution, &job, execution_id, now, now).is_none());
+        assert!(
+            observed_asset(&other_execution, &job, "zhihu.v1", execution_id, now, now).is_none()
+        );
         let mut other_version = valid();
         other_version.connector_version = Some("zhihu.v2".into());
-        assert!(observed_asset(&other_version, &job, execution_id, now, now).is_none());
+        assert!(observed_asset(&other_version, &job, "zhihu.v1", execution_id, now, now).is_none());
         let mut other_asset = valid();
         other_asset.public_url = Some("https://www.zhihu.com/p/999".into());
-        assert!(observed_asset(&other_asset, &job, execution_id, now, now).is_none());
+        assert!(observed_asset(&other_asset, &job, "zhihu.v1", execution_id, now, now).is_none());
         let mut spoof = valid();
         spoof.evidence.push(json!({"kind":"runner_receipt"}));
-        assert!(observed_asset(&spoof, &job, execution_id, now, now).is_none());
+        assert!(observed_asset(&spoof, &job, "zhihu.v1", execution_id, now, now).is_none());
         let mut stale = valid();
         stale.occurred_at = Some(now - Duration::seconds(2));
-        assert!(observed_asset(&stale, &job, execution_id, now, now).is_none());
+        assert!(observed_asset(&stale, &job, "zhihu.v1", execution_id, now, now).is_none());
         let mut original_changed = job.clone();
         if let ChannelTargetInput::Publish { title, .. } = &mut original_changed.frozen_input {
             *title = "Altered title".into();
         }
-        assert!(observed_asset(&valid(), &original_changed, execution_id, now, now).is_none());
+        assert!(
+            observed_asset(
+                &valid(),
+                &original_changed,
+                "zhihu.v1",
+                execution_id,
+                now,
+                now
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn discovery_requires_one_exact_complete_list_proof_and_matching_readback() {
+        let mut job = job();
+        job.candidate_public_url = None;
+        job.connector_version = None;
+        let at = Utc::now();
+        let execution_id = Uuid::new_v4();
+        let url = "https://www.zhihu.com/p/12345";
+        let digest = sha256_hex(b"Original title\nOriginal body");
+        let valid = || BrowserExecution {
+            execution_id,
+            provenance: Some(BrowserReceiptProvenance::Live),
+            status: "completed".into(),
+            reason: None,
+            evidence: vec![
+                json!({"kind":"public_readback","url":url,"content_matched":true,
+                    "owned_by_account":true,"expected_sha256":digest,"readback_sha256":digest}),
+                json!({"kind":"own_account_list_discovery",
+                    "schema_version":"geo.publication.discovery.v1","public_url":url,
+                    "expected_sha256":digest,"list_complete":true,"exact_match_count":1,
+                    "observed_at":at}),
+            ],
+            public_url: Some(url.into()),
+            occurred_at: Some(at),
+            connector_version: Some("zhihu.v1".into()),
+            stage: Some("public_readback".into()),
+        };
+        let accepts = |receipt: &BrowserExecution| {
+            observed_asset(receipt, &job, "zhihu.v1", execution_id, at, at).is_some()
+        };
+        assert!(accepts(&valid()));
+        assert!(!accepts(&BrowserExecution {
+            provenance: Some(BrowserReceiptProvenance::Fixture),
+            ..valid()
+        }));
+        assert!(!accepts(&BrowserExecution {
+            connector_version: Some("zhihu.v2".into()),
+            ..valid()
+        }));
+        for (key, value) in [
+            ("list_complete", json!(false)),
+            ("exact_match_count", json!(2)),
+            ("exact_match_count", json!(0)),
+            ("expected_sha256", json!("wrong")),
+            ("public_url", json!("https://www.zhihu.com/p/999")),
+            ("observed_at", json!(at - Duration::seconds(1))),
+            ("schema_version", json!("other")),
+        ] {
+            let mut wrong = valid();
+            wrong.evidence[1][key] = value;
+            assert!(!accepts(&wrong), "accepted altered discovery {key}");
+        }
+        let mut extra = valid();
+        extra.evidence[1]["unexpected"] = json!("extra");
+        assert!(!accepts(&extra));
+        let mut repeated = valid();
+        repeated.evidence.push(repeated.evidence[1].clone());
+        assert!(!accepts(&repeated));
+        let mut wrong_readback = valid();
+        wrong_readback.evidence[0]["owned_by_account"] = json!(false);
+        assert!(!accepts(&wrong_readback));
+        let mut wrong_identity = job.clone();
+        wrong_identity.account_id = Uuid::new_v4();
+        assert!(
+            observed_asset(&valid(), &wrong_identity, "zhihu.v1", execution_id, at, at).is_none()
+        );
     }
 }

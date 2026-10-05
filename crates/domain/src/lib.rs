@@ -81,6 +81,7 @@ pub use report::{
     ReportEvidenceReference, ReportFinding, ReportManifestKind, ReportManifestRef,
     ReportMeasurementGroup, ReportMeasurementStatus, ReportMeasurementTarget,
     ReportPublicationGroup, ReportPublicationStatus, ReportPublicationTarget, ReportReduceInput,
-    ReportRepository, ReportSnapshot, ReportStatus, reduce_report, validate_correction,
+    ReportRepository, ReportSnapshot, ReportStatus, publication_lookup_asset_evidence,
+    reduce_report, validate_correction,
 };
 pub use tenancy::{OperatorId, ProjectId, TenantId, TenantScope, TenantScopeId};

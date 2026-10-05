@@ -108,6 +108,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 24,
         description: "publication execution bindings",
     },
+    MigrationMetadata {
+        version: 25,
+        description: "publication lookup report indexes",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

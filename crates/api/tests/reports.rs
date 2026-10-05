@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -9,21 +10,170 @@ use geo_api::{
     RepositoryHostOps, reduce_cycle_report, router,
 };
 use geo_domain::{
-    ChannelPlan, ChannelTarget, ChannelTargetInput, ContentBlock, ContentBlockKind,
+    AppError, ChannelPlan, ChannelTarget, ChannelTargetInput, ContentBlock, ContentBlockKind,
     ContentCoverage, ContentExecution, ContentExecutionStatus, ContentHandoff, ContentHandoffItem,
     ContentItemStatus, ContentRevision, DEVELOPMENT_TENANT_ID, DEVELOPMENT_USER_EMAIL,
     DistributionRepository, DistributionTargetStatus, DocumentManifest, DocumentManifestCoverage,
     DocumentManifestItem, DocumentManifestItemState, DocumentManifestState, ErrorCode,
     FreezeDistribution, IntentVerification, Membership, MemoryAuthRepository, PlatformPlacement,
-    PreparedDistribution, ProjectCreate, ProjectSettings, ProjectStartCommand, ReportAvailability,
-    ReportManifestKind, Role, StructuredDocument, TenantScope, User, hash_idempotency_key,
-    settings_hash, start_request_hash,
+    PreparedDistribution, ProjectCreate, ProjectSettings, ProjectStartCommand,
+    PublicationLookupCandidate, PublicationLookupFinding, PublicationLookupJob,
+    PublicationLookupObservation, PublicationLookupReportObservation, PublicationLookupRepository,
+    ReportAvailability, ReportManifestKind, Role, StructuredDocument, TenantScope, User,
+    hash_idempotency_key, settings_hash, sha256_hex, start_request_hash,
 };
 use geo_worker::{HostOps, ReportGetRequest, ReportReduceRequest};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+struct ReportLookup {
+    scope: TenantScope,
+    row: PublicationLookupReportObservation,
+    invalid_newer: bool,
+}
+
+#[async_trait]
+impl PublicationLookupRepository for ReportLookup {
+    async fn enqueue(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+        _: Uuid,
+        _: chrono::DateTime<Utc>,
+    ) -> Result<PublicationLookupJob, AppError> {
+        panic!("report enqueued lookup")
+    }
+    async fn scan_due(
+        &self,
+        _: Option<Uuid>,
+        _: chrono::DateTime<Utc>,
+        _: usize,
+    ) -> Result<Vec<PublicationLookupCandidate>, AppError> {
+        panic!("report scanned lookup")
+    }
+    async fn claim(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+        _: Uuid,
+        _: chrono::DateTime<Utc>,
+        _: chrono::DateTime<Utc>,
+    ) -> Result<PublicationLookupJob, AppError> {
+        panic!("report claimed lookup")
+    }
+    async fn finish(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+        _: PublicationLookupObservation,
+        _: Option<chrono::DateTime<Utc>>,
+    ) -> Result<PublicationLookupJob, AppError> {
+        panic!("report finished lookup")
+    }
+    async fn get(&self, _: &TenantScope, _: Uuid) -> Result<PublicationLookupJob, AppError> {
+        panic!("report used single-job read")
+    }
+    async fn observations(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+    ) -> Result<Vec<PublicationLookupObservation>, AppError> {
+        panic!("report used unbounded history")
+    }
+    async fn observation_page(
+        &self,
+        _: &TenantScope,
+        _: Uuid,
+        _: Option<Uuid>,
+        _: usize,
+    ) -> Result<Vec<PublicationLookupObservation>, AppError> {
+        panic!("report used UI pagination")
+    }
+    async fn report_asset_observations(
+        &self,
+        scope: &TenantScope,
+        originals: &[Uuid],
+        as_of: chrono::DateTime<Utc>,
+    ) -> Result<Vec<PublicationLookupReportObservation>, AppError> {
+        assert!(originals.len() <= 64);
+        if scope != &self.scope
+            || !originals.contains(&self.row.original_target_id)
+            || self.row.observation.received_at > as_of
+        {
+            return Ok(vec![]);
+        }
+        let mut candidates = Vec::new();
+        if self.invalid_newer {
+            let mut invalid = self.row.clone();
+            invalid.observation.execution_id = Uuid::new_v4();
+            invalid.observation.received_at += Duration::seconds(1);
+            invalid.observation.evidence["public_url"] =
+                json!("https://private.example.invalid/?token=secret");
+            if invalid.observation.received_at <= as_of {
+                candidates.push(invalid);
+            }
+        }
+        candidates.push(self.row.clone());
+        Ok(candidates)
+    }
+}
+
+fn report_lookup_row(
+    target_id: Uuid,
+    account_id: Uuid,
+    at: chrono::DateTime<Utc>,
+) -> PublicationLookupReportObservation {
+    let attempt_id = Uuid::new_v4();
+    let execution_id = Uuid::new_v4();
+    let url = "https://www.zhihu.com/p/123456";
+    let job = PublicationLookupJob {
+        attempt_id,
+        target_id,
+        account_id,
+        frozen_input: ChannelTargetInput::Publish {
+            source_id: Uuid::new_v4(),
+            source_version_id: Uuid::new_v4(),
+            platform: "zhihu".into(),
+            account_id,
+            title: "Example title".into(),
+            body: "Example body".into(),
+            body_sha256: sha256_hex(b"Example body"),
+        },
+        connector_version: Some("browser.v1".into()),
+        candidate_public_url: Some(url.into()),
+        next_due_at: None,
+        lease_execution_id: None,
+        lease_expires_at: None,
+        query_count: 1,
+        last_error_code: None,
+    };
+    let observation = PublicationLookupObservation {
+        execution_id,
+        attempt_id,
+        finding: PublicationLookupFinding::AssetObserved,
+        evidence: json!({
+            "schema_version":"geo.publication.asset_observation.v1",
+            "provenance":"live",
+            "public_url":url,
+            "content_sha256":sha256_hex(b"Example title\nExample body"),
+            "connector_version":"browser.v1",
+            "observed_at":at.to_rfc3339(),
+            "original_attempt_id":attempt_id.to_string(),
+            "target_id":target_id.to_string(),
+            "account_id":account_id.to_string(),
+        }),
+        observed_at: at,
+        received_at: at,
+        error_code: None,
+    };
+    PublicationLookupReportObservation {
+        original_target_id: target_id,
+        job,
+        observation,
+    }
+}
 
 async fn fixture() -> (
     AppState,
@@ -149,6 +299,15 @@ async fn freeze_formal_coverage(
     scope: &TenantScope,
     cycle_id: Uuid,
 ) -> (Arc<dyn DistributionRepository>, Uuid) {
+    freeze_formal_coverage_with_revision(state, scope, cycle_id, None).await
+}
+
+async fn freeze_formal_coverage_with_revision(
+    state: &AppState,
+    scope: &TenantScope,
+    cycle_id: Uuid,
+    reused_revision_id: Option<Uuid>,
+) -> (Arc<dyn DistributionRepository>, Uuid) {
     let project_id = scope.project_id.unwrap();
     let cycle = state
         .project_repository()
@@ -205,7 +364,7 @@ async fn freeze_formal_coverage(
     };
     let execution_id = Uuid::new_v4();
     let handoff_id = Uuid::new_v4();
-    let revision_id = Uuid::new_v4();
+    let revision_id = reused_revision_id.unwrap_or_else(Uuid::new_v4);
     let repo = state.distribution_repository();
     let frozen = repo
         .freeze(
@@ -250,7 +409,7 @@ async fn freeze_formal_coverage(
                         .collect(),
                     created_at: Utc::now(),
                 },
-                placements: ["alpha", "beta", "gamma"]
+                placements: ["zhihu", "beta", "gamma"]
                     .into_iter()
                     .map(|platform_id| PlatformPlacement {
                         platform_id: platform_id.into(),
@@ -304,7 +463,7 @@ async fn create_legacy_measurement_and_publication(
                         input: ChannelTargetInput::Publish {
                             source_id: Uuid::new_v4(),
                             source_version_id: Uuid::new_v4(),
-                            platform: "legacy".into(),
+                            platform: "zhihu".into(),
                             account_id: Uuid::new_v4(),
                             title: "Unsent".into(),
                             body: "No public result".into(),
@@ -526,7 +685,12 @@ async fn ready_and_reused_verified_intents_without_target_receipts_are_not_repor
         .expansion_page(&scope, manifest_id, 0, 6)
         .await
         .unwrap();
-    let pending = page.rows[0].clone();
+    let pending = page
+        .rows
+        .iter()
+        .find(|row| row.platform_id == "zhihu")
+        .unwrap()
+        .clone();
     repo.commit_expansion_page(&scope, manifest_id, 0, page.rows)
         .await
         .unwrap();
@@ -624,6 +788,266 @@ async fn legacy_publications_are_used_only_when_formal_distribution_is_absent() 
             .unwrap()
             .manifest_id,
         legacy_id
+    );
+}
+
+#[tokio::test]
+async fn legacy_lookup_asset_is_late_only_in_explicit_correction_and_preserves_unknown() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    create_legacy_measurement_and_publication(&state, &scope, cycle_id).await;
+    let plan = state
+        .channel_job_repository()
+        .get_plan(&scope, cycle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let target = &plan.targets[0];
+    let attempt_id = Uuid::new_v4();
+    let sent_at = cutoff - Duration::minutes(5);
+    state
+        .channel_job_repository()
+        .claim(&scope, target.target_id, attempt_id, sent_at)
+        .await
+        .unwrap();
+    state
+        .channel_job_repository()
+        .finish(
+            &scope,
+            target.target_id,
+            attempt_id,
+            geo_domain::ChannelOutcome {
+                status: geo_domain::ChannelOutcomeStatus::Unknown,
+                detail: None,
+                occurred_at: sent_at,
+                raw_answer: None,
+                citations: vec![],
+                public_url: None,
+                screenshot_ref: None,
+                connector_version: Some("browser.v1".into()),
+                runner_evidence: vec![],
+                fixture: false,
+            },
+            sent_at,
+        )
+        .await
+        .unwrap();
+    let row = report_lookup_row(
+        target.target_id,
+        target.input.account_id(),
+        cutoff + Duration::seconds(1),
+    );
+    let state = state.with_publication_lookup_repository(Arc::new(ReportLookup {
+        scope: scope.clone(),
+        row,
+        invalid_newer: true,
+    }));
+    let first = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        None,
+        cutoff + Duration::seconds(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.publications.counts["unknown"], 1);
+    assert!(
+        !first
+            .findings
+            .iter()
+            .any(|f| f.kind == "publication_asset_observed")
+    );
+    let replay = reduce_cycle_report(&state, &scope, cycle_id, None, cutoff + Duration::days(1))
+        .await
+        .unwrap();
+    assert_eq!(first, replay);
+    let correction = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        Some(first.report_id),
+        cutoff + Duration::days(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(correction.publications.counts["unknown"], 1);
+    assert!(
+        correction
+            .findings
+            .iter()
+            .any(|f| f.kind == "publication_asset_observed")
+    );
+    assert!(correction.evidence.iter().any(|e| {
+        e.kind == "publication_lookup_asset_observed" && e.resource_id == target.target_id
+    }));
+    assert_eq!(
+        correction
+            .evidence
+            .iter()
+            .filter(|e| e.kind == "publication_lookup_asset_observed")
+            .count(),
+        1
+    );
+    let json = serde_json::to_string(&correction).unwrap();
+    assert!(!json.contains("https://"));
+    assert!(!json.contains("account_id"));
+    assert!(!json.contains("content_sha256"));
+}
+
+#[tokio::test]
+async fn formal_reused_intent_maps_lookup_to_frozen_cell_not_original_send_id() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let (repo, manifest_id) = freeze_formal_coverage(&state, &scope, cycle_id).await;
+    let page = repo
+        .expansion_page(&scope, manifest_id, 0, 6)
+        .await
+        .unwrap();
+    let target = page
+        .rows
+        .iter()
+        .find(|row| row.platform_id == "zhihu")
+        .unwrap()
+        .clone();
+    repo.commit_expansion_page(&scope, manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let document = StructuredDocument {
+        title: "Example title".into(),
+        blocks: vec![ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Paragraph,
+            text: "Example body".into(),
+            citation_ids: vec![],
+            items: vec![],
+        }],
+    };
+    let revision = ContentRevision {
+        revision_id: target.content_revision_id.unwrap(),
+        asset_id: Uuid::new_v4(),
+        revision: 1,
+        base_revision_id: None,
+        markdown: document.markdown(),
+        document,
+        evidence: vec![],
+        quotes: vec![],
+        findings: vec![],
+        created_at: Utc::now(),
+    };
+    let account_id = Uuid::new_v4();
+    let prepared = PreparedDistribution {
+        manifest_id,
+        target_id: target.target_id,
+        revision: Some(revision.clone()),
+        account_id: Some(account_id),
+        defer_reason: None,
+    };
+    let ready = repo.materialize(&scope, prepared).await.unwrap();
+    let original = repo
+        .get_publication_bundle(&scope, ready.intent.unwrap().intent_id)
+        .await
+        .unwrap();
+    assert_eq!(original.intent.channel_target_id, target.target_id);
+    let first = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        None,
+        cutoff + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.publications.counts["pending"], 1);
+    assert!(
+        !first
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "publication_asset_observed")
+    );
+    let next_cycle = state
+        .project_repository()
+        .schedule_next_cycle(&scope, project_id, cycle_id, cutoff + Duration::seconds(1))
+        .await
+        .unwrap();
+    let (_, second_manifest) = freeze_formal_coverage_with_revision(
+        &state,
+        &scope,
+        next_cycle.cycle_id,
+        Some(revision.revision_id),
+    )
+    .await;
+    let second_page = repo
+        .expansion_page(&scope, second_manifest, 0, 6)
+        .await
+        .unwrap();
+    let second_target = second_page
+        .rows
+        .iter()
+        .find(|row| row.platform_id == "zhihu")
+        .unwrap()
+        .clone();
+    assert_ne!(second_target.target_id, target.target_id);
+    repo.commit_expansion_page(&scope, second_manifest, 0, second_page.rows)
+        .await
+        .unwrap();
+    let reused = repo
+        .materialize(
+            &scope,
+            PreparedDistribution {
+                manifest_id: second_manifest,
+                target_id: second_target.target_id,
+                revision: Some(revision),
+                account_id: Some(account_id),
+                defer_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reused.target.status,
+        DistributionTargetStatus::ReusedUnknown
+    );
+    assert_eq!(reused.intent.unwrap().channel_target_id, target.target_id);
+    let row = report_lookup_row(
+        original.intent.channel_target_id,
+        original.intent.account_id,
+        cutoff - Duration::seconds(1),
+    );
+    let state = state.with_publication_lookup_repository(Arc::new(ReportLookup {
+        scope: scope.clone(),
+        row,
+        invalid_newer: false,
+    }));
+    let report = reduce_cycle_report(
+        &state,
+        &scope,
+        next_cycle.cycle_id,
+        None,
+        next_cycle.cutoff_at + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.publications.counts["unknown"], 1);
+    let asset = report
+        .evidence
+        .iter()
+        .find(|e| e.kind == "publication_lookup_asset_observed")
+        .unwrap();
+    assert_eq!(asset.resource_id, second_target.target_id);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == "publication_asset_observed")
     );
 }
 

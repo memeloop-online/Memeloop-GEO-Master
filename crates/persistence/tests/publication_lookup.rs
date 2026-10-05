@@ -472,6 +472,126 @@ async fn lookup_is_scoped_fenced_append_only_and_never_rewrites_send() {
         lookup.observations(&scope, attempt_id).await.unwrap(),
         vec![early_observation, observation]
     );
+    let report_initial = lookup
+        .report_asset_observations(&scope, &[target_id, sibling_target_id], later)
+        .await
+        .unwrap();
+    assert_eq!(report_initial.len(), 1);
+    assert_eq!(report_initial[0].job.attempt_id, attempt_id);
+    assert_eq!(report_initial[0].original_target_id, target_id);
+    assert_eq!(report_initial[0].observation.execution_id, recovered);
+    assert!(
+        lookup
+            .report_asset_observations(&other, &[target_id], later)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // More than a UI page of identical-receipt observations must be read in
+    // deterministic order and bounded to the latest 32 per original send.
+    // Malformed newest evidence can be skipped by the API validator.
+    let same_time = later + Duration::seconds(2);
+    let mut execution_ids = Vec::new();
+    for _ in 0..25 {
+        let execution_id = Uuid::new_v4();
+        execution_ids.push(execution_id);
+        sqlx::query(
+            "INSERT INTO publication_lookup_executions \
+             (execution_id,operator_id,tenant_id,project_id,attempt_id,claimed_at,expires_at) \
+             VALUES($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(execution_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(scope.project_id.unwrap().as_uuid())
+        .bind(attempt_id)
+        .bind(same_time)
+        .bind(same_time + Duration::seconds(5))
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO publication_lookup_observations \
+             (execution_id,operator_id,tenant_id,project_id,attempt_id,finding,evidence,\
+              observed_at,received_at) VALUES($1,$2,$3,$4,$5,'asset_observed',$6,$7,$7)",
+        )
+        .bind(execution_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(scope.project_id.unwrap().as_uuid())
+        .bind(attempt_id)
+        .bind(serde_json::json!({"private_internal":"never returned by report"}))
+        .bind(same_time)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    let latest = lookup
+        .report_asset_observations(&scope, &[target_id, target_id], same_time)
+        .await
+        .unwrap();
+    assert_eq!(latest.len(), 26);
+    assert_eq!(
+        latest[0].observation.execution_id,
+        *execution_ids.iter().max().unwrap()
+    );
+    assert_eq!(latest.last().unwrap().observation.execution_id, recovered);
+    for _ in 0..10 {
+        let execution_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO publication_lookup_executions \
+             (execution_id,operator_id,tenant_id,project_id,attempt_id,claimed_at,expires_at) \
+             VALUES($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(execution_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(scope.project_id.unwrap().as_uuid())
+        .bind(attempt_id)
+        .bind(same_time)
+        .bind(same_time + Duration::seconds(5))
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO publication_lookup_observations \
+             (execution_id,operator_id,tenant_id,project_id,attempt_id,finding,evidence,\
+              observed_at,received_at) VALUES($1,$2,$3,$4,$5,'asset_observed',$6,$7,$7)",
+        )
+        .bind(execution_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(scope.project_id.unwrap().as_uuid())
+        .bind(attempt_id)
+        .bind(serde_json::json!({"private_internal":"never returned by report"}))
+        .bind(same_time)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    let bounded = lookup
+        .report_asset_observations(&scope, &[target_id], same_time)
+        .await
+        .unwrap();
+    assert_eq!(bounded.len(), 32);
+    assert!(
+        bounded
+            .iter()
+            .all(|row| row.observation.received_at == same_time)
+    );
+    let cutoff = lookup
+        .report_asset_observations(&scope, &[target_id], later)
+        .await
+        .unwrap();
+    assert_eq!(cutoff.len(), 1);
+    assert_eq!(cutoff[0].observation.execution_id, recovered);
+    assert!(
+        lookup
+            .report_asset_observations(&scope, &[second_target], same_time)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         channels
             .get_target(&scope, target_id)

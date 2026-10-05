@@ -323,6 +323,29 @@ fn stable_uuid(value: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// A lookup establishes an independently observed public asset, not the
+/// provenance of the original send. One reused original send gets a distinct
+/// reference for each frozen report coverage cell.
+pub fn publication_lookup_asset_evidence(
+    frozen_target_id: Uuid,
+    execution_id: Uuid,
+    observed_at: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+) -> ReportEvidenceReference {
+    ReportEvidenceReference {
+        evidence_id: stable_uuid(&format!(
+            "publication-lookup-asset-v1:{frozen_target_id}:{execution_id}"
+        )),
+        kind: "publication_lookup_asset_observed".to_owned(),
+        resource_id: frozen_target_id,
+        resource_version: None,
+        occurred_at: Some(observed_at),
+        received_at: Some(received_at),
+        summary: "Independent lookup observed a public asset; original send remains unproven"
+            .to_owned(),
+    }
+}
+
 fn unavailable(reason: &str) -> ReportCoverage {
     ReportCoverage {
         availability: ReportAvailability::Unavailable,
@@ -574,6 +597,21 @@ pub fn reduce_report(
                     None,
                     &mut evidence_map,
                 )?;
+                let mut lookup_evidence = BTreeSet::new();
+                for reference in &target.evidence {
+                    if reference.kind == "publication_lookup_asset_observed"
+                        && reference.resource_id == target.target_id
+                        && reference
+                            .occurred_at
+                            .zip(reference.received_at)
+                            .is_some_and(|(occurred, received)| {
+                                occurred <= received && received <= evidence_as_of
+                            })
+                    {
+                        record_evidence(&mut evidence_map, reference.clone())?;
+                        lookup_evidence.insert(reference.evidence_id);
+                    }
+                }
                 let status = match target.status {
                     ReportPublicationStatus::Verified if valid => "verified",
                     ReportPublicationStatus::Published if valid => "published",
@@ -589,6 +627,20 @@ pub fn reduce_report(
                     ReportPublicationStatus::Planned => "pending",
                 };
                 bump(&mut counts, status);
+                if !lookup_evidence.is_empty() {
+                    findings.push(ReportFinding {
+                        finding_id: stable_uuid(&format!(
+                            "{report_id}:publication:asset_observed:{}",
+                            target.target_id
+                        )),
+                        kind: "publication_asset_observed".to_owned(),
+                        summary: "A public asset was observed independently; this does not prove the original publication send succeeded.".to_owned(),
+                        evidence_ids: lookup_evidence.iter().copied().collect(),
+                        insufficient_reason: Some(
+                            "No trusted causal link between the original send and the observed asset is available.".to_owned(),
+                        ),
+                    });
+                }
                 record_evidence(
                     &mut evidence_map,
                     ReportEvidenceReference {
@@ -1209,6 +1261,70 @@ mod tests {
         let reordered = reduce_report(&scope, &input, 1, None, instant(29)).unwrap();
         assert_eq!(first.input_hash, reordered.input_hash);
         assert_eq!(first.report_id, reordered.report_id);
+    }
+
+    #[test]
+    fn independent_lookup_asset_is_reported_without_changing_unknown_status() {
+        let (scope, mut input) = setup();
+        let distribution = input
+            .input_manifest_versions
+            .iter_mut()
+            .find(|r| r.kind == ReportManifestKind::Distribution)
+            .unwrap();
+        distribution.sealed = true;
+        distribution.expected_count = Some(1);
+        let target_id = Uuid::new_v4();
+        let asset =
+            publication_lookup_asset_evidence(target_id, Uuid::new_v4(), instant(25), instant(26));
+        input.publication_targets = Some(vec![ReportPublicationTarget {
+            target_id,
+            platform_id: "first".to_owned(),
+            status: ReportPublicationStatus::Unknown,
+            reason: None,
+            evidence: vec![asset.clone()],
+        }]);
+        let report = reduce_report(&scope, &input, 1, None, instant(29)).unwrap();
+        assert_eq!(report.publications.counts["unknown"], 1);
+        assert!(!report.publications.counts.contains_key("verified"));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == "publication_asset_observed"
+                && finding.evidence_ids == [asset.evidence_id]
+                && finding
+                    .insufficient_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("causal")
+        }));
+        assert!(report.evidence.contains(&asset));
+        let mut misbound = input.clone();
+        misbound.publication_targets.as_mut().unwrap()[0].evidence[0].resource_id = Uuid::new_v4();
+        let wrong_target = reduce_report(&scope, &misbound, 1, None, instant(29)).unwrap();
+        assert!(!wrong_target.evidence.contains(&asset));
+        assert!(
+            !wrong_target
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "publication_asset_observed")
+        );
+        let mut late = input.clone();
+        late.publication_targets.as_mut().unwrap()[0].evidence[0].received_at = Some(instant(29));
+        let initial = reduce_report(&scope, &late, 1, None, instant(29)).unwrap();
+        assert!(
+            !initial
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "publication_asset_observed")
+        );
+        let correction =
+            reduce_report(&scope, &late, 2, Some(initial.report_id), instant(30)).unwrap();
+        assert_eq!(correction.publications.counts["unknown"], 1);
+        assert!(
+            correction
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "publication_asset_observed")
+        );
+        assert_eq!(initial.publications, correction.publications);
     }
 
     #[test]

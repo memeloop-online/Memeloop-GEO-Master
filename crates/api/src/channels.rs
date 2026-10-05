@@ -374,6 +374,31 @@ impl ChannelService {
         ))
     }
 
+    /// Read only the immutable, encrypted pre-send version. In particular a
+    /// lookup without a send receipt must never adopt the runner's current
+    /// advertised version as the original send version.
+    pub(crate) fn original_publication_connector_version(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        attempt_id: Uuid,
+        binding: &ChannelSecret,
+        platform: &str,
+    ) -> Option<String> {
+        let bytes = self
+            .decrypt(scope, attempt_id, "publication_execution", binding)
+            .ok()?;
+        let original: PublicationBrowserBinding = serde_json::from_slice(&bytes).ok()?;
+        (original.version == 1
+            && original.account_id == account_id
+            && original.platform == platform
+            && !original.platform_account_id.trim().is_empty()
+            && !original.connector_version.trim().is_empty()
+            && original.connector_version.len() <= 100
+            && !original.connector_version.starts_with("fixture"))
+        .then_some(original.connector_version)
+    }
+
     async fn publication_connector_version(
         &self,
         platform: &str,
