@@ -1,6 +1,7 @@
 // Fixed platform URLs and source-derived selectors. This connector version is
 // not live-verified: no authenticated account was used to prove these flows.
 import { createHash } from "node:crypto";
+import { observeKimiConnectSearch } from "./kimi-connect-search.mjs";
 
 export const CONNECTOR_VERSION = "live_unverified.source_derived.v1";
 
@@ -417,15 +418,57 @@ export async function measureKimi(
     return unsupported("invalid_measurement_payload");
   if (typeof expectedAccountId !== "string" || !expectedAccountId.trim())
     return unsupported("account_identity_unverified");
-  // No authenticated search-mode control, provider-event decoder, or answer
-  // reader has been verified. A test-injected flow is still only a candidate
-  // and cannot elevate this unverified connector to a completed receipt.
-  if (!searchFlow) return unsupported("official_web_search_unverified");
-  const candidate = await observeKimiSearchAttempt(page, payload.question, {
-    ...searchFlow,
-  });
-  if (!candidate) return unknown("official_search_event_unverified", "measure");
-  return unknown("official_search_provenance_unverified", "measure");
+  // Historical injected JSON candidates never confer official search proof.
+  if (searchFlow) {
+    const candidate = await observeKimiSearchAttempt(page, payload.question, {
+      ...searchFlow,
+    });
+    if (!candidate)
+      return unknown("official_search_event_unverified", "measure");
+    return unknown("official_search_provenance_unverified", "measure");
+  }
+  if (!page) return unsupported("official_web_search_unverified");
+  const observation = await observeKimiConnectSearch(page, payload);
+  if (observation?.reason === "requested_model_unavailable")
+    return unsupported("requested_model_unavailable");
+  if (!observation)
+    return unknown("official_search_observation_unverified", "measure");
+  const observedAt = new Date().toISOString();
+  const rawAnswer = observation.raw_answer;
+  return {
+    status: "completed",
+    stage: "official_search_observation",
+    occurred_at: observedAt,
+    raw_answer: rawAnswer,
+    evidence: [
+      {
+        kind: "official_search_observation",
+        schema_version: "geo.measure.official_search.v2",
+        target_id: payload.target_id,
+        account_id: payload.account_id,
+        provider: payload.provider,
+        model: payload.model,
+        surface: payload.surface,
+        search_mode: payload.search_mode,
+        protocol_version: payload.protocol_version,
+        question_set_version: payload.question_set_version,
+        question_sha256: createHash("sha256")
+          .update(payload.question, "utf8")
+          .digest("hex"),
+        market: payload.market,
+        language: payload.language,
+        scheduled_at: payload.scheduled_at,
+        sample_ordinal: payload.sample_ordinal,
+        connector_version: CONNECTOR_VERSION,
+        provenance: "live",
+        disposition: "observed",
+        raw_answer: rawAnswer,
+        citations: observation.citations,
+        search_event: observation.search_event,
+      },
+    ],
+    connector_version: CONNECTOR_VERSION,
+  };
 }
 
 export async function xiaohongshuIdentity(

@@ -12,6 +12,7 @@ import {
   freezeDistributionManifest,
   getCycleDistributionManifest,
   getDistributionManifest,
+  getDistributionPublicationTarget,
   getDistributionTargets,
   resumeDistributionManifest,
   type DistributionManifest,
@@ -59,11 +60,31 @@ function DistributionRow({
 }) {
   const { session } = useAuth();
   const [expanded, setExpanded] = useState(false);
-  // A reused intent can belong to an earlier cycle's target. Its original
-  // channel target ID is not present in this coverage row.
-  const canReadAttempt = Boolean(
-    row.publication_intent_id && row.status === "ready",
-  );
+  const canReadAttempt = (
+    ["ready", "reused_unknown", "reused_verified"] as DistributionTargetStatus[]
+  ).includes(row.status);
+  const original = useQuery({
+    queryKey: [
+      "distribution-publication-target",
+      session?.user.id,
+      session?.operator.id,
+      tenantId,
+      projectId,
+      manifest.manifest_id,
+      row.target_id,
+    ],
+    queryFn: ({ signal }) =>
+      getDistributionPublicationTarget(
+        tenantId,
+        projectId,
+        manifest.manifest_id,
+        row.target_id,
+        signal,
+      ),
+    enabled: canReadAttempt && expanded,
+    retry: false,
+  });
+  const channelTargetId = original.data?.channel_target_id;
   const attempt = useQuery({
     queryKey: [
       "channel-target",
@@ -71,11 +92,11 @@ function DistributionRow({
       session?.operator.id,
       tenantId,
       projectId,
-      row.target_id,
+      channelTargetId,
     ],
     queryFn: ({ signal }) =>
-      getChannelTarget(tenantId, projectId, row.target_id, signal),
-    enabled: canReadAttempt && expanded,
+      getChannelTarget(tenantId, projectId, channelTargetId!, signal),
+    enabled: canReadAttempt && expanded && Boolean(channelTargetId),
     retry: false,
   });
   const document = manifest.document_roster.find(
@@ -122,7 +143,17 @@ function DistributionRow({
           </Button>
           {expanded && (
             <div className="channel-job-attempt">
-              {attempt.isPending ? (
+              {original.isPending ? (
+                <LoadingState label="正在读取原发送记录" compact />
+              ) : original.isError ? (
+                <ErrorState
+                  title="原发送目标无法读取"
+                  detail={message(original.error)}
+                  onRetry={() => void original.refetch()}
+                />
+              ) : !channelTargetId ? (
+                <p>尚无发布意图或原发送目标；覆盖就绪不等于已发送。</p>
+              ) : attempt.isPending ? (
                 <LoadingState label="正在读取原发送记录" compact />
               ) : attempt.isError ? (
                 <ErrorState
@@ -148,7 +179,7 @@ function DistributionRow({
                     <PublicationLookupPanel
                       tenantId={tenantId}
                       projectId={projectId}
-                      targetId={row.target_id}
+                      targetId={channelTargetId}
                     />
                   )}
                 </>
@@ -223,6 +254,9 @@ export function DistributionPanel({
     if (manifestId) {
       void detail.refetch();
       void targets.refetch();
+      void queryClient.invalidateQueries({
+        queryKey: ["distribution-publication-target", ...scopedKey, manifestId],
+      });
     }
   };
   const applyManifest = (next: DistributionManifest) => {
@@ -233,6 +267,13 @@ export function DistributionPanel({
     );
     void queryClient.invalidateQueries({
       queryKey: ["distribution-targets", ...scopedKey, next.manifest_id],
+    });
+    void queryClient.invalidateQueries({
+      queryKey: [
+        "distribution-publication-target",
+        ...scopedKey,
+        next.manifest_id,
+      ],
     });
   };
   const freeze = useMutation({

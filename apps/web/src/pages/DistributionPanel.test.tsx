@@ -77,12 +77,20 @@ function mockApi({
   manifestError = false,
   firstStatus = "deferred",
   nextCursor = 0,
+  originalTarget = "original-target",
+  referenceError = false,
+  noIntent = false,
+  reusedStatus = "reused_unknown",
 }: {
   initialManifest?: DistributionManifest | null;
   role?: string;
   manifestError?: boolean;
   firstStatus?: DistributionTargetStatus;
   nextCursor?: number;
+  originalTarget?: string | null;
+  referenceError?: boolean;
+  noIntent?: boolean;
+  reusedStatus?: DistributionTargetStatus;
 } = {}) {
   let current = initialManifest;
   const requests: Array<{
@@ -154,7 +162,7 @@ function mockApi({
                   ...target,
                   target_id: "target-2",
                   ordinal: 1,
-                  status: "reused_unknown",
+                  status: reusedStatus,
                   publication_intent_id: "prior-intent",
                 },
               ],
@@ -170,6 +178,9 @@ function mockApi({
                   {
                     ...target,
                     status: firstStatus,
+                    publication_intent_id: noIntent
+                      ? null
+                      : target.publication_intent_id,
                     reason: "account_unassigned",
                   },
                 ]
@@ -189,17 +200,38 @@ function mockApi({
               )
             : response(current),
         );
-      if (path.endsWith("/channel-targets/target-1"))
+      if (path.endsWith("/publication-target"))
+        return Promise.resolve(
+          referenceError
+            ? response(
+                { code: "unavailable", message: "lookup unavailable" },
+                503,
+              )
+            : response(
+                originalTarget
+                  ? {
+                      distribution_target_id: path.includes("/target-2/")
+                        ? "target-2"
+                        : "target-1",
+                      publication_intent_id: path.includes("/target-2/")
+                        ? "prior-intent"
+                        : "intent-1",
+                      channel_target_id: originalTarget,
+                    }
+                  : null,
+              ),
+        );
+      if (path.endsWith(`/channel-targets/${originalTarget}`))
         return Promise.resolve(
           response({
             target: {
-              target_id: "target-1",
+              target_id: originalTarget,
               input: { kind: "publish", title: "generated", platform: "zhihu" },
             },
             attempts: [
               {
                 attempt_id: "attempt-1",
-                target_id: "target-1",
+                target_id: originalTarget,
                 claimed_at: "2026-10-01T00:00:00Z",
                 received_at: null,
                 outcome: null,
@@ -207,10 +239,12 @@ function mockApi({
             ],
           }),
         );
-      if (path.endsWith("/channel-targets/target-1/publication-lookup"))
+      if (
+        path.endsWith(`/channel-targets/${originalTarget}/publication-lookup`)
+      )
         return Promise.resolve(
           response({
-            target_id: "target-1",
+            target_id: originalTarget,
             attempt_id: "attempt-1",
             job: null,
             observations: [],
@@ -279,8 +313,85 @@ describe("formal distribution coverage", () => {
       item.path.endsWith("/publication-lookup"),
     );
     expect(lookup).toHaveLength(1);
+    expect(lookup[0].path).toContain(
+      "/channel-targets/original-target/publication-lookup",
+    );
+    expect(
+      requests.some((item) => item.path.endsWith("/channel-targets/target-1")),
+    ).toBe(false);
     expect(lookup[0].url.searchParams.get("tenant_id")).toBe("tenant-1");
     expect(requests.every((item) => item.method === "GET")).toBe(true);
+  });
+  it.each(["reused_unknown", "reused_verified"] as const)(
+    "resolves a %s cell through the original intent from an earlier cycle",
+    async (reusedStatus) => {
+      const requests = mockApi({ reusedStatus });
+      const user = userEvent.setup();
+      renderPanel();
+      await screen.findByText(/尚未展开 1 项/);
+      await user.click(screen.getByRole("button", { name: "下一页" }));
+      await screen.findByText(
+        reusedStatus === "reused_unknown"
+          ? "复用既有未知结果，禁止重发"
+          : "复用已有验证记录",
+      );
+      await user.click(
+        screen.getByRole("button", { name: "查看执行记录与查回" }),
+      );
+      expect(
+        await screen.findByText(/原发送尝试 attempt-1 · 结果未知/),
+      ).toBeInTheDocument();
+      expect(
+        requests.some((item) =>
+          item.path.endsWith("/targets/target-2/publication-target"),
+        ),
+      ).toBe(true);
+      expect(
+        requests.some((item) =>
+          item.path.endsWith("/channel-targets/target-2"),
+        ),
+      ).toBe(false);
+      expect(
+        requests.some((item) =>
+          item.path.endsWith(
+            "/channel-targets/original-target/publication-lookup",
+          ),
+        ),
+      ).toBe(true);
+      expect(requests.every((item) => item.method === "GET")).toBe(true);
+    },
+  );
+
+  it("shows absent intent and lookup failure without guessing a channel target", async () => {
+    const user = userEvent.setup();
+    const requests = mockApi({
+      firstStatus: "ready",
+      noIntent: true,
+      originalTarget: null,
+    });
+    renderPanel();
+    await user.click(
+      await screen.findByRole("button", { name: "查看执行记录与查回" }),
+    );
+    expect(
+      await screen.findByText(/尚无发布意图或原发送目标/),
+    ).toBeInTheDocument();
+    expect(
+      requests.some((item) => item.path.includes("/channel-targets/")),
+    ).toBe(false);
+  });
+
+  it("surfaces an unavailable original-target lookup without reading a guessed target", async () => {
+    const requests = mockApi({ firstStatus: "ready", referenceError: true });
+    const user = userEvent.setup();
+    renderPanel();
+    await user.click(
+      await screen.findByRole("button", { name: "查看执行记录与查回" }),
+    );
+    expect(await screen.findByText("原发送目标无法读取")).toBeInTheDocument();
+    expect(
+      requests.some((item) => item.path.includes("/channel-targets/")),
+    ).toBe(false);
   });
   it("keeps expanded, unexpanded and deferred cells distinct from publication", async () => {
     const requests = mockApi();

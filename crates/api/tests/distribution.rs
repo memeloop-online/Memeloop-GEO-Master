@@ -11,15 +11,16 @@ use geo_api::{
 use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
     ChannelRepository, ChannelStatus, ConnectorCapabilityRepository, ConnectorKey,
-    ConnectorVerification, ContentItemStatus, ContentRepository, DistributionScope,
-    DistributionScopeMode, DistributionTargetStatus, DocumentManifestPlanRequest, DocumentScope,
-    ErrorCode, ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility,
+    ConnectorVerification, ContentItemStatus, ContentRepository, DistributionRepository,
+    DistributionScope, DistributionScopeMode, DistributionTargetStatus,
+    DocumentManifestPlanRequest, DocumentScope, ErrorCode, FreezeDistribution, ImportItem,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, IntentVerification,
     KnowledgePurpose, KnowledgeRepository, MemoryAuthRepository, MemoryChannelRepository,
     MemoryConnectorCapabilityRepository, MemoryContentRepository, MemoryDistributionRepository,
     MemoryKnowledgeRepository, MemoryProjectRepository, PLAIN_TEXT_ARTICLE_FORMAT,
-    PlatformPlacement, ProjectCreate, ProjectPatch, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    PlatformPlacement, PreparedDistribution, ProjectCreate, ProjectPatch, ProjectRepository,
+    ProjectSettings, ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key,
+    settings_hash, start_request_hash,
 };
 use geo_worker::{
     DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
@@ -391,6 +392,214 @@ async fn add_account(fixture: &Fixture) {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn publication_target_resolves_original_across_cycles_without_mutation_or_scope_leak() {
+    let fixture = setup(true).await;
+    add_account(&fixture).await;
+    let first = fixture
+        .service
+        .freeze(&fixture.scope, fixture.cycle_id)
+        .await
+        .unwrap();
+    fixture
+        .service
+        .resume(&fixture.scope, first.manifest_id, 1)
+        .await
+        .unwrap();
+    let rows = fixture
+        .service
+        .targets(&fixture.scope, first.manifest_id, None, 10)
+        .await
+        .unwrap()
+        .rows;
+    let sent = rows
+        .iter()
+        .find(|row| row.status == DistributionTargetStatus::Ready)
+        .unwrap();
+    let binding = fixture
+        .service
+        .publication_target(&fixture.scope, first.manifest_id, sent.target_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.distribution_target_id, sent.target_id);
+    assert_eq!(binding.channel_target_id, sent.target_id);
+    assert_eq!(
+        binding.publication_intent_id,
+        sent.publication_intent_id.unwrap()
+    );
+    let unbound = rows
+        .iter()
+        .find(|row| row.publication_intent_id.is_none())
+        .unwrap();
+    assert_eq!(
+        fixture
+            .service
+            .publication_target(&fixture.scope, first.manifest_id, unbound.target_id)
+            .await
+            .unwrap(),
+        None
+    );
+    fixture
+        .distribution
+        .record_intent_verification(
+            &fixture.scope,
+            binding.publication_intent_id,
+            IntentVerification::Unknown,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    let revision = fixture
+        .distribution
+        .get_publication_bundle(&fixture.scope, binding.publication_intent_id)
+        .await
+        .unwrap()
+        .revision;
+    let execution = fixture
+        .content
+        .list_executions(&fixture.scope, fixture.cycle_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let handoff = fixture
+        .content
+        .get_handoff(&fixture.scope, execution.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let documents = fixture
+        .knowledge
+        .get_document_manifest(&fixture.scope, first.document_manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let later_cycle = Uuid::new_v4();
+    let second = fixture
+        .distribution
+        .freeze(
+            &fixture.scope,
+            FreezeDistribution {
+                cycle_id: later_cycle,
+                content_execution: geo_domain::ContentExecution {
+                    cycle_id: later_cycle,
+                    ..execution
+                },
+                document_manifest: documents,
+                content_handoff: handoff,
+                placements: first.platform_scope.clone(),
+                revision: 1,
+                sealed_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    let page = fixture
+        .distribution
+        .expansion_page(&fixture.scope, second.manifest_id, 0, 64)
+        .await
+        .unwrap();
+    fixture
+        .distribution
+        .commit_expansion_page(&fixture.scope, second.manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let later_row = fixture
+        .distribution
+        .list_targets(&fixture.scope, second.manifest_id, None, 10)
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| {
+            row.document_item_id == sent.document_item_id && row.platform_id == sent.platform_id
+        })
+        .unwrap();
+    let reused = fixture
+        .distribution
+        .materialize(
+            &fixture.scope,
+            PreparedDistribution {
+                manifest_id: second.manifest_id,
+                target_id: later_row.target_id,
+                revision: Some(revision),
+                account_id: sent.account_id,
+                defer_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reused.target.status,
+        DistributionTargetStatus::ReusedUnknown
+    );
+    assert_ne!(reused.target.target_id, sent.target_id);
+    let resolved = fixture
+        .service
+        .publication_target(&fixture.scope, second.manifest_id, reused.target.target_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.distribution_target_id, reused.target.target_id);
+    assert_eq!(resolved.channel_target_id, sent.target_id);
+    assert_eq!(
+        resolved.publication_intent_id,
+        binding.publication_intent_id
+    );
+    assert_eq!(
+        fixture
+            .distribution
+            .publication_commands(&fixture.scope)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .service
+            .target(&fixture.scope, second.manifest_id, reused.target.target_id)
+            .await
+            .unwrap(),
+        reused.target
+    );
+    for foreign in [
+        TenantScope::new(
+            Uuid::new_v4().into(),
+            fixture.scope.tenant_id,
+            fixture.scope.project_id,
+        ),
+        TenantScope::new(
+            fixture.scope.operator_id,
+            Uuid::new_v4().into(),
+            fixture.scope.project_id,
+        ),
+        TenantScope::new(
+            fixture.scope.operator_id,
+            fixture.scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        ),
+    ] {
+        assert_eq!(
+            fixture
+                .service
+                .publication_target(&foreign, second.manifest_id, reused.target.target_id)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
+    assert_eq!(
+        fixture
+            .service
+            .publication_target(&fixture.scope, first.manifest_id, reused.target.target_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
 }
 
 #[tokio::test]

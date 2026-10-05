@@ -19,13 +19,20 @@ use geo_domain::{
     PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository, ProjectStatus,
     SourceState, TenantScope, publication_format_for_semantic_type,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{ApiError, AppState, AuthContext, RequestContext, api_error, require_project_writer};
 
 const PAGE_LIMIT: usize = 64;
 const MAX_PAGES_PER_REQUEST: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicationTargetReference {
+    pub distribution_target_id: Uuid,
+    pub publication_intent_id: Uuid,
+    pub channel_target_id: Uuid,
+}
 
 /// The default is a conservative server-side capability registry. These
 /// connectors have not been independently verified for this execution, so a
@@ -245,6 +252,47 @@ impl DistributionService {
         self.distribution
             .get_target(scope, manifest_id, target_id)
             .await
+    }
+
+    /// Resolve a coverage cell's persisted intent to the original send target.
+    /// Reused cells may point to a target in an earlier manifest or cycle.
+    pub async fn publication_target(
+        &self,
+        scope: &TenantScope,
+        manifest_id: Uuid,
+        target_id: Uuid,
+    ) -> Result<Option<PublicationTargetReference>, AppError> {
+        let manifest = self.distribution.get(scope, manifest_id).await?;
+        let target = self
+            .distribution
+            .get_target(scope, manifest_id, target_id)
+            .await?;
+        let Some(intent_id) = target.publication_intent_id else {
+            return Ok(None);
+        };
+        let bundle = self
+            .distribution
+            .get_publication_bundle(scope, intent_id)
+            .await?;
+        if target.target_id != target_id
+            || target.manifest_id != manifest.manifest_id
+            || bundle.intent.intent_id != intent_id
+            || bundle.intent.project_id != manifest.project_id
+            || bundle.intent.channel_target_id != bundle.target.target_id
+            || bundle.command.target_id != bundle.target.target_id
+            || Some(bundle.intent.content_revision_id) != target.content_revision_id
+            || bundle.intent.platform_id != target.platform_id
+            || bundle.intent.placement_slot != target.placement_slot
+        {
+            return Err(AppError::conflict(
+                "publication target binding is inconsistent",
+            ));
+        }
+        Ok(Some(PublicationTargetReference {
+            distribution_target_id: target.target_id,
+            publication_intent_id: intent_id,
+            channel_target_id: bundle.intent.channel_target_id,
+        }))
     }
 
     pub async fn freeze(
@@ -756,6 +804,23 @@ pub async fn target(
     state
         .distribution_service()
         .target(&scope, manifest_id, target_id)
+        .await
+        .map(Json)
+        .map_err(|e| err(e, context))
+}
+
+pub async fn publication_target(
+    State(state): State<AppState>,
+    Path((project_id, manifest_id, target_id)): Path<(ProjectId, Uuid, Uuid)>,
+    Extension(tenant): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<Option<PublicationTargetReference>>, ApiError> {
+    let scope = scoped(&state, &tenant, project_id)
+        .await
+        .map_err(|e| err(e, context))?;
+    state
+        .distribution_service()
+        .publication_target(&scope, manifest_id, target_id)
         .await
         .map(Json)
         .map_err(|e| err(e, context))

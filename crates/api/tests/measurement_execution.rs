@@ -1,4 +1,4 @@
-//! Synthetic contract tests: the production consumer-web adapter remains unsupported.
+//! Synthetic contract tests, not real-account official-search acceptance.
 use std::sync::Arc;
 
 use axum::{
@@ -41,6 +41,11 @@ enum Receipt {
     ForgedMarker,
     MismatchedExecution,
     Unknown,
+    Connect,
+    ConnectMismatch(&'static str),
+    ConnectWrongSchema,
+    ConnectFuture,
+    ConnectFixture,
 }
 
 #[derive(Clone)]
@@ -89,6 +94,37 @@ async fn runner(
             // The runner must echo the server-frozen sample identity.
             proof["target_id"] = frozen["target_id"].clone();
             proof["account_id"] = frozen["account_id"].clone();
+            if matches!(
+                case,
+                Receipt::Connect
+                    | Receipt::ConnectMismatch(_)
+                    | Receipt::ConnectWrongSchema
+                    | Receipt::ConnectFuture
+                    | Receipt::ConnectFixture
+            ) {
+                proof["schema_version"] = json!("geo.measure.official_search.v2");
+                proof["search_event"] = json!({
+                    "kind":"official_search_event",
+                    "source":"provider_connect_stream",
+                    "provenance":"live",
+                    "chat_id":"chat-1",
+                    "message_id":"message-1",
+                    "block_id":"block-1",
+                    "event_offset":"12",
+                    "observed_at":completed_at,
+                    "request_model":frozen["model"],
+                    "request_question_sha256":proof["question_sha256"]
+                });
+                if let Receipt::ConnectMismatch(field) = case {
+                    proof["search_event"][field] = json!("invalid value");
+                }
+                if matches!(case, Receipt::ConnectWrongSchema) {
+                    proof["schema_version"] = json!("geo.measure.official_search.v1");
+                }
+                if matches!(case, Receipt::ConnectFuture) {
+                    proof["search_event"]["observed_at"] = json!(completed_at + Duration::days(1));
+                }
+            }
             if let Receipt::Mismatch(field) = case {
                 proof[field] = json!("changed");
             }
@@ -131,7 +167,7 @@ async fn runner(
                 "stage":"official_search_observation",
                 "occurred_at":completed_at,
                 "connector_version":if matches!(case, Receipt::Fixture) {"fixture.v1"} else if matches!(case, Receipt::AttestedVersion) {"attested-search.v2"} else {"official_search_verified.v1"},
-                "provenance":if matches!(case, Receipt::Fixture | Receipt::RunnerFixtureProofLive) {"fixture"} else if matches!(case, Receipt::InvalidProvenance) {"untrusted"} else {"live"},
+                "provenance":if matches!(case, Receipt::Fixture | Receipt::RunnerFixtureProofLive | Receipt::ConnectFixture) {"fixture"} else if matches!(case, Receipt::InvalidProvenance) {"untrusted"} else {"live"},
                 "evidence":evidence,
             });
             if matches!(case, Receipt::MissingProvenance) {
@@ -303,6 +339,47 @@ async fn verified_search_retains_original_answer_and_citations() {
         run(Receipt::Refusal).await.status,
         ChannelOutcomeStatus::Refused
     );
+}
+
+#[tokio::test]
+async fn connect_search_uses_actual_stream_correlation_without_synthetic_request_ids() {
+    let outcome = run(Receipt::Connect).await;
+    assert_eq!(outcome.status, ChannelOutcomeStatus::Observed);
+    assert_eq!(outcome.raw_answer.as_deref(), Some("Original answer"));
+    let event = &outcome.runner_evidence[0]["search_event"];
+    assert_eq!(event["chat_id"], "chat-1");
+    assert_eq!(event["message_id"], "message-1");
+    assert_eq!(event["block_id"], "block-1");
+    assert_eq!(event["event_offset"], "12");
+    assert!(event.get("request_id").is_none());
+    assert!(event.get("event_id").is_none());
+    for field in [
+        "kind",
+        "source",
+        "provenance",
+        "chat_id",
+        "message_id",
+        "block_id",
+        "event_offset",
+        "observed_at",
+        "request_model",
+        "request_question_sha256",
+    ] {
+        assert_eq!(
+            run(Receipt::ConnectMismatch(field)).await.status,
+            ChannelOutcomeStatus::Missing,
+            "field {field}"
+        );
+    }
+    for case in [
+        Receipt::ConnectWrongSchema,
+        Receipt::ConnectFuture,
+        Receipt::ConnectFixture,
+    ] {
+        let outcome = run(case).await;
+        assert_eq!(outcome.status, ChannelOutcomeStatus::Missing, "{case:?}");
+        assert!(outcome.raw_answer.is_none());
+    }
 }
 
 #[tokio::test]

@@ -440,6 +440,81 @@ struct OfficialSearchEvent {
     provenance: String,
 }
 
+/// Connect providers may expose chat/message/block identities without a
+/// provider request ID. Preserve their actual correlation fields instead of
+/// manufacturing the v1 request_id/event_id pair.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectSearchEvent {
+    kind: String,
+    source: String,
+    provenance: String,
+    chat_id: String,
+    message_id: String,
+    block_id: String,
+    event_offset: String,
+    /// Browser-local observation time, not a claimed provider timestamp.
+    observed_at: DateTime<Utc>,
+    request_model: String,
+    request_question_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SearchEvent {
+    Provider(OfficialSearchEvent),
+    Connect(ConnectSearchEvent),
+}
+
+fn search_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+impl SearchEvent {
+    fn observed_at(
+        &self,
+        schema: &str,
+        model: &str,
+        question_sha256: &str,
+    ) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Provider(event)
+                if schema == "geo.measure.official_search.v1"
+                    && event.kind == "official_search_event"
+                    && event.source == "provider_search_event"
+                    && event.provenance == "live"
+                    && search_identifier(&event.event_id)
+                    && search_identifier(&event.request_id) =>
+            {
+                Some(event.occurred_at)
+            }
+            Self::Connect(event)
+                if schema == "geo.measure.official_search.v2"
+                    && event.kind == "official_search_event"
+                    && event.source == "provider_connect_stream"
+                    && event.provenance == "live"
+                    && search_identifier(&event.chat_id)
+                    && search_identifier(&event.message_id)
+                    && search_identifier(&event.block_id)
+                    && event.event_offset.len() <= 20
+                    && event
+                        .event_offset
+                        .parse::<u64>()
+                        .is_ok_and(|offset| offset.to_string() == event.event_offset)
+                    && event.request_model == model
+                    && event.request_question_sha256 == question_sha256 =>
+            {
+                Some(event.observed_at)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MeasurementEvidence {
@@ -463,7 +538,7 @@ struct MeasurementEvidence {
     disposition: String,
     raw_answer: String,
     citations: Vec<String>,
-    search_event: OfficialSearchEvent,
+    search_event: SearchEvent,
 }
 
 fn measurement_observation(
@@ -518,7 +593,6 @@ fn measurement_observation(
         || version.starts_with("fixture")
         || result.occurred_at.is_none()
         || proof.kind != "official_search_observation"
-        || proof.schema_version != "geo.measure.official_search.v1"
         || proof.target_id != target.target_id
         || proof.account_id != *account_id
         || proof.provider != *provider
@@ -534,23 +608,6 @@ fn measurement_observation(
         || proof.sample_ordinal != *sample_ordinal
         || proof.connector_version != version
         || proof.provenance != "live"
-        || proof.search_event.kind != "official_search_event"
-        || proof.search_event.source != "provider_search_event"
-        || proof.search_event.provenance != "live"
-        || proof.search_event.event_id.is_empty()
-        || proof.search_event.event_id.len() > 128
-        || proof.search_event.request_id.is_empty()
-        || proof.search_event.request_id.len() > 128
-        || !proof
-            .search_event
-            .event_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        || !proof
-            .search_event
-            .request_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         || proof.raw_answer.trim().is_empty()
         || proof.raw_answer.len() > 100_000
         || proof.citations.len() > 50
@@ -558,8 +615,17 @@ fn measurement_observation(
         return None;
     }
     let completed_at = result.occurred_at?;
-    if claimed_at > proof.search_event.occurred_at
-        || proof.search_event.occurred_at > completed_at
+    let observed_at =
+        proof
+            .search_event
+            .observed_at(&proof.schema_version, model, &proof.question_sha256)?;
+    if proof.schema_version == "geo.measure.official_search.v2"
+        && (surface != "consumer_web" || search_mode != "web_search")
+    {
+        return None;
+    }
+    if claimed_at > observed_at
+        || observed_at > completed_at
         || completed_at > received_at
         || completed_at < claimed_at
     {

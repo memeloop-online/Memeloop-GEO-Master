@@ -69,6 +69,12 @@ export interface DistributionTargetPage {
   expected_count: number;
 }
 
+export interface PublicationTargetReference {
+  distribution_target_id: string;
+  publication_intent_id: string;
+  channel_target_id: string;
+}
+
 const encoded = encodeURIComponent;
 const scope = (tenantId: string, projectId: string) => ({
   tenantId,
@@ -128,6 +134,19 @@ export function getDistributionTargets(
   return apiFetch<DistributionTargetPage>(
     `${base(projectId)}/distribution-manifests/${encoded(manifestId)}/targets?${query}`,
     scope(tenantId, projectId),
+  );
+}
+
+export function getDistributionPublicationTarget(
+  tenantId: string,
+  projectId: string,
+  manifestId: string,
+  targetId: string,
+  signal?: AbortSignal,
+) {
+  return apiFetch<PublicationTargetReference | null>(
+    `${base(projectId)}/distribution-manifests/${encoded(manifestId)}/targets/${encoded(targetId)}/publication-target`,
+    { ...scope(tenantId, projectId), signal },
   );
 }
 

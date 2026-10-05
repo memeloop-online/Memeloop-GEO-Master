@@ -1997,6 +1997,10 @@ pub fn router(state: AppState) -> Router {
             get(distribution::target),
         )
         .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}/targets/{target_id}/publication-target",
+            get(distribution::publication_target),
+        )
+        .route(
             "/projects/{id}/distribution-manifests/{manifest_id}/resume",
             post(distribution::resume),
         )

@@ -710,7 +710,8 @@ export function ChannelJobsPage() {
                     <MessageBarBody>
                       Kimi
                       网页账号登录只表示可尝试采样。官方联网搜索适配器尚未实测验证，
-                      当前会返回不支持或缺测；不能将登录或普通模型回答视为官方搜索成功。
+                      无法确认实际搜索、完整答案或所选模型时会记录不支持或缺测；
+                      不能将登录或普通模型回答视为官方搜索成功。
                       模型标识和协议版本须按实际观测填写，系统尚不提供已验证的模型能力列表。
                     </MessageBarBody>
                   </MessageBar>
@@ -748,7 +749,10 @@ export function ChannelJobsPage() {
                         ))}
                       </Select>
                     </Field>
-                    <Field label="可见模型标识">
+                    <Field
+                      label="可见模型标识"
+                      hint="填写账号当前可选模型的标识，例如 k2d6-chat；不会自动切换为其他模型。"
+                    >
                       <Input
                         value={model}
                         onChange={(_, data) => setModel(data.value)}
