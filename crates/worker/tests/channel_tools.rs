@@ -7,8 +7,8 @@ use geo_worker::{
     ChannelExecutionResult, ChannelExecutionState, ChannelManifestPage, ChannelManifestReadRequest,
     ChannelPlanReceipt, ChannelPlanRequest, ChannelPublicationLookupObservation,
     ChannelPublicationLookupSummary, ChannelTargetExecuteRequest, ChannelTargetKind,
-    ChannelTargetSummary, HostBridge, HostOp, HostOpError, HostOps, HostRuntime,
-    KnowledgeSearchRequest, KnowledgeSearchResult, ManifestPage, ManifestReadRequest,
+    ChannelTargetSummary, DistributionTargetRef, HostBridge, HostOp, HostOpError, HostOps,
+    HostRuntime, KnowledgeSearchRequest, KnowledgeSearchResult, ManifestPage, ManifestReadRequest,
     MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
     PublishRequest, TenantScope,
 };
@@ -399,4 +399,47 @@ fn manifest_lookup_is_optional_bounded_and_cannot_upgrade_the_original_attempt()
     let mut invalid = serde_json::to_value(page).unwrap();
     invalid["items"][0]["publication_lookup"]["latest_observation"]["evidence"] = json!("private");
     assert!(serde_json::from_value::<ChannelManifestPage>(invalid).is_err());
+}
+
+#[test]
+fn distribution_target_lookup_is_optional_and_rejects_raw_evidence() {
+    let original = Uuid::new_v4();
+    let mut value = json!({
+        "target_id": Uuid::new_v4(),
+        "ordinal": 1,
+        "document_item_id": Uuid::new_v4(),
+        "content_revision_id": Uuid::new_v4(),
+        "platform_id": "generic",
+        "variant_id": Uuid::new_v4(),
+        "publication_intent_id": Uuid::new_v4(),
+        "status": "reused_unknown",
+        "reason": null,
+        "original_channel_target_id": original,
+        "publication_lookup": {
+            "query_count": 1,
+            "in_progress": false,
+            "last_error_code": "lookup_error",
+            "latest_observation": {
+                "finding": "asset_observed",
+                "observed_at": "2026-10-06T00:00:00Z",
+                "received_at": "2026-10-06T00:00:01Z"
+            }
+        }
+    });
+    let target: DistributionTargetRef = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(target.original_channel_target_id, Some(original));
+    assert_eq!(target.publication_lookup.as_ref().unwrap().query_count, 1);
+    let decoded: DistributionTargetRef =
+        serde_json::from_value(serde_json::to_value(&target).unwrap()).unwrap();
+    assert_eq!(decoded, target);
+    value["publication_lookup"]["latest_observation"]["evidence"] = json!({"private": true});
+    assert!(serde_json::from_value::<DistributionTargetRef>(value).is_err());
+    let mut old = serde_json::to_value(target).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("original_channel_target_id");
+    old.as_object_mut().unwrap().remove("publication_lookup");
+    let old: DistributionTargetRef = serde_json::from_value(old).unwrap();
+    assert!(old.original_channel_target_id.is_none());
+    assert!(old.publication_lookup.is_none());
 }

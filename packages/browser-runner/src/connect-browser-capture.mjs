@@ -213,8 +213,17 @@ export async function captureConnectExchange(
     // Structural doubles exercise lifecycle handling without a browser. A
     // real page must support byte-preserving observation; no text fallback.
     if (typeof page.context === "function") {
-      wire = await observeWireBytes(page, endpoint, maxTotalBytes);
-      if (controller.signal.aborted) return null;
+      const opening = observeWireBytes(page, endpoint, maxTotalBytes).then(
+        async (observer) => {
+          if (closed || controller.signal.aborted) {
+            await observer.close();
+            return null;
+          }
+          return observer;
+        },
+      );
+      wire = await Promise.race([opening, stopped]);
+      if (!wire || controller.signal.aborted) return null;
     }
     return await Promise.race([
       (async () => {

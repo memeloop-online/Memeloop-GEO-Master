@@ -742,8 +742,9 @@ impl ContentService {
             {
                 continue;
             }
-            for chunk in detail
-                .chunks
+            let mut chunks = detail.chunks;
+            chunks.sort_by_key(|chunk| chunk.ordinal);
+            for chunk in chunks
                 .into_iter()
                 .filter(|c| c.source_version_id == version_id)
             {
@@ -765,7 +766,6 @@ impl ContentService {
                 });
             }
         }
-        evidence.sort_by_key(|e| (e.source_version_id, e.chunk_id));
         evidence.truncate(MAX_EVIDENCE);
         Ok(evidence)
     }
@@ -1227,6 +1227,8 @@ mod tests {
             start_column: 1,
             end_column: 2,
             header_row: Some(1),
+            start_char: None,
+            end_char: None,
         };
         let row = serde_json::json!({
             "headers":["型号","价格"],
@@ -2046,6 +2048,147 @@ mod tests {
                 .unwrap()
                 .execution_id,
             execution.execution_id
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_csv_record_generates_from_persisted_slices_and_searches_full_row() {
+        let (scope, projects) = active_project().await;
+        let knowledge = Arc::new(MemoryKnowledgeRepository::default());
+        let value = "甲\n\"乙\", 001.00 元".repeat(180);
+        let bytes = format!("item,price\n\"{}\",001\n", value.replace('"', "\"\"")).into_bytes();
+        let upload = knowledge
+            .create_upload_session(
+                &scope,
+                UploadSessionCommand {
+                    filename: "table.csv".to_owned(),
+                    declared_media_type: "text/csv".to_owned(),
+                    expected_size: bytes.len() as u64,
+                    expected_sha256: geo_domain::sha256_hex(&bytes),
+                    purpose: KnowledgePurpose::Public,
+                },
+            )
+            .await
+            .unwrap();
+        knowledge
+            .put_upload_content(&scope, upload.upload_session_id, bytes)
+            .await
+            .unwrap();
+        let accepted = knowledge
+            .complete_upload(&scope, upload.upload_session_id, "content-test")
+            .await
+            .unwrap();
+        let source = accepted.source.unwrap();
+        let release = accepted.release.unwrap();
+        let detail = knowledge
+            .get_source_detail(&scope, source.source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original = &detail.chunks[0];
+        assert_eq!(
+            original.locator,
+            ChunkLocator::Csv {
+                start_row: 2,
+                end_row: 2,
+                start_column: 1,
+                end_column: 2,
+                header_row: Some(1),
+                start_char: None,
+                end_char: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&original.text).unwrap()["values"][0],
+            value
+        );
+        let search = knowledge
+            .search(
+                &scope,
+                KnowledgeSearchRequest {
+                    query: "001.00 元".into(),
+                    purpose: KnowledgePurpose::Public,
+                    limit: 50,
+                    knowledge_release_id: Some(release.knowledge_release_id),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(search.evidence.len(), 1);
+        assert_eq!(search.evidence[0].chunk_id, original.chunk_id);
+        assert_eq!(search.evidence[0].text, original.text);
+
+        let manifest = knowledge
+            .plan_document_manifest(
+                &scope,
+                DocumentManifestPlanRequest {
+                    manifest_id: Uuid::new_v4(),
+                    knowledge_release_id: release.knowledge_release_id,
+                },
+                DocumentScope::default(),
+            )
+            .await
+            .unwrap();
+        let repository = Arc::new(MemoryContentRepository::default());
+        let execution = repository
+            .start(&scope, Uuid::new_v4(), manifest, POLICY_VERSION)
+            .await
+            .unwrap();
+        let model = Arc::new(GroundedModel {
+            calls: AtomicUsize::new(0),
+            generations: AtomicUsize::new(0),
+            invalid_first: false,
+            fail_first: AtomicBool::new(false),
+        });
+        let service = ContentService::new(repository.clone(), knowledge.clone(), projects)
+            .with_model_provider(model);
+        let item = repository
+            .list_items(&scope, execution.execution_id)
+            .await
+            .unwrap()
+            .remove(0);
+        let prepared = service
+            .prepare(&scope, execution.execution_id, item.item_id)
+            .await
+            .unwrap();
+        let brief = prepared.brief.unwrap();
+        assert!(!brief.evidence.is_empty());
+        assert!(brief.evidence.len() <= MAX_EVIDENCE);
+        for quote in &brief.quotes {
+            assert!(quote.exact_quote.chars().count() <= MAX_QUOTE_CHARS);
+            let reference = &quote.reference;
+            let persisted = detail
+                .chunks
+                .iter()
+                .find(|chunk| Some(chunk.chunk_id) == reference.chunk_id)
+                .expect("citation must identify a persisted independent slice");
+            assert_ne!(persisted.chunk_id, original.chunk_id);
+            assert_eq!(persisted.locator, reference.locator);
+            assert_eq!(persisted.text, quote.exact_quote);
+        }
+        assert!(brief.quotes.iter().any(|q| {
+            matches!(
+                q.reference.locator,
+                ChunkLocator::Csv {
+                    start_row: 2,
+                    start_column: 1,
+                    start_char: Some(_),
+                    end_char: Some(_),
+                    ..
+                }
+            )
+        }));
+        assert!(
+            service
+                .generate(&scope, execution.execution_id, item.item_id)
+                .await
+                .is_ok()
+        );
+        assert!(
+            service
+                .check(&scope, execution.execution_id, item.item_id)
+                .await
+                .is_ok()
         );
     }
 

@@ -169,10 +169,12 @@ impl PgKnowledgeRepository {
         .fetch_all(&mut **transaction)
         .await
         .map_err(database_error)?;
-        let pipeline_versions = if parsers
-            .iter()
-            .any(|parser| parser == "deterministic-csv-v1")
-        {
+        let pipeline_versions = if parsers.iter().any(|parser| {
+            matches!(
+                parser.as_str(),
+                "deterministic-csv-v1" | "deterministic-csv-v2"
+            )
+        }) {
             json!({"parser":"deterministic-knowledge-v1","parsers":parsers,"extractor":"none-v1","index":"substring-v1"})
         } else {
             json!({"parser":"deterministic-text-v1","extractor":"none-v1","index":"substring-v1"})
@@ -1804,6 +1806,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
              JOIN knowledge_sources source ON source.source_id=version.source_id JOIN knowledge_chunks chunk ON chunk.source_version_id=version.source_version_id
              WHERE member.knowledge_release_id=$1 AND member.operator_id=$2 AND member.tenant_id=$3 AND member.project_id=$4
                AND source.state='active' AND ($5='internal' OR source.purpose='public')
+               AND chunk.extraction_method <> 'deterministic_csv_evidence_v1'
                AND strpos(lower(chunk.text), lower($6)) > 0
              ORDER BY version.source_version_id,chunk.ordinal LIMIT $7",
         ).bind(release_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project_id.as_uuid()).bind(purpose(request.purpose)).bind(request.query.trim()).bind(count)

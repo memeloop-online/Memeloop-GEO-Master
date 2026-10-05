@@ -209,6 +209,106 @@ test("invalid or pre-aborted capture never submits", async () => {
   }
 });
 
+test("unavailable raw-byte support never submits or falls back to text bodies", async () => {
+  const page = new EventEmitter();
+  const session = new EventEmitter();
+  let detached = 0;
+  session.send = async () => {
+    throw new Error("fixture raw transport unavailable");
+  };
+  session.detach = async () => {
+    detached += 1;
+  };
+  page.context = () => ({ newCDPSession: async () => session });
+  const result = await captureConnectExchange(
+    page,
+    options(async () => assert.fail("must not submit")),
+  );
+  assert.equal(result, null);
+  assert.equal(detached, 1);
+  assert.equal(page.listenerCount("response"), 0);
+});
+
+test("deadline also bounds raw-byte initialization and closes a late session", async () => {
+  const page = new EventEmitter();
+  const session = new EventEmitter();
+  let finishEnable;
+  let detached = 0;
+  session.send = () => new Promise((resolve) => (finishEnable = resolve));
+  session.detach = async () => {
+    detached += 1;
+  };
+  page.context = () => ({ newCDPSession: async () => session });
+  const result = await captureConnectExchange(
+    page,
+    options(async () => assert.fail("must not submit"), { timeoutMs: 10 }),
+  );
+  assert.equal(result, null);
+  assert.equal(page.listenerCount("response"), 0);
+  finishEnable({});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(detached, 1);
+});
+
+test("raw capture joins buffered and streamed bytes and refuses unrelated requests or oversized bytes", async () => {
+  for (const scenario of ["valid", "mismatch", "oversized", "broken"]) {
+    const page = new EventEmitter();
+    const session = new EventEmitter();
+    let detached = 0;
+    session.send = async (method) => {
+      if (method === "Network.enable") return {};
+      assert.equal(method, "Network.streamResourceContent");
+      return { bufferedData: body.subarray(0, 3).toString("base64") };
+    };
+    session.detach = async () => {
+      detached += 1;
+    };
+    page.context = () => ({ newCDPSession: async () => session });
+    const result = await captureConnectExchange(
+      page,
+      options(
+        async () => {
+          session.emit("Network.responseReceived", {
+            requestId: "raw-1",
+            response: { url: endpoint },
+          });
+          page.emit(
+            "response",
+            response({
+              request: () => ({
+                method: () => "POST",
+                postData: () =>
+                  scenario === "mismatch" ? "other-question" : "question-1",
+              }),
+              body: () => assert.fail("never use text-decoded body"),
+            }),
+          );
+          session.emit("Network.dataReceived", {
+            requestId: "raw-1",
+            data: body.subarray(3).toString("base64"),
+          });
+          session.emit(
+            scenario === "broken"
+              ? "Network.loadingFailed"
+              : "Network.loadingFinished",
+            { requestId: "raw-1" },
+          );
+        },
+        { maxTotalBytes: scenario === "oversized" ? 32 : 4096 },
+      ),
+    );
+    if (scenario === "valid") {
+      assert.deepEqual(result?.messages, [
+        { message: { id: "message-1", text: "中文" } },
+      ]);
+    } else {
+      assert.equal(result, null, scenario);
+    }
+    assert.equal(detached, 1);
+    assert.equal(page.listenerCount("response"), 0);
+  }
+});
+
 test("captures a real browser UI fetch without copying its session or submitting twice", async () => {
   // Force a length-header high byte that ordinary text-decoded response.body()
   // corrupts under application/connect+json.

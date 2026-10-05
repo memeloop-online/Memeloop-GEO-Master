@@ -187,6 +187,8 @@ impl HostOps for Fixture {
                     publication_intent_id: None,
                     status: DistributionTargetStatus::Deferred,
                     reason: Some("connector_unverified".into()),
+                    original_channel_target_id: None,
+                    publication_lookup: None,
                 })
                 .collect(),
             next_ordinal: (end > start && end < *self.expansion.lock().unwrap()).then_some(end - 1),

@@ -121,7 +121,7 @@ export function reduceKimiConnectExchange(
   let answerId = null;
   let answerStatus = null;
   let search = null;
-  let searchActivity = false;
+  const searches = new Map();
   const blocks = new Map();
   const citations = new Map();
   const citedIds = new Set();
@@ -145,6 +145,9 @@ export function reduceKimiConnectExchange(
           (!id(message.chat_id) || (chatId && message.chat_id !== chatId)))
       )
         return null;
+      // A message may arrive before the chat envelope. Bind its declared
+      // chat now so a later envelope cannot silently relabel that answer.
+      chatId ??= message.chat_id || null;
       if (
         message.role === "assistant" ||
         message.role === 3 ||
@@ -168,6 +171,7 @@ export function reduceKimiConnectExchange(
             if (!id(chunk?.id)) return null;
             citedIds.add(chunk.id);
             const url = citationUrl(chunk.base?.url);
+            if (chunk.base?.url !== undefined && !url) return null;
             if (url) citations.set(chunk.id, { message_id: message.id, url });
           }
         }
@@ -176,29 +180,32 @@ export function reduceKimiConnectExchange(
       const block = envelope.block;
       if (!id(block.id) || !id(block.message_id)) return null;
       if (block.search) {
+        const previousSearch = searches.get(block.id);
         if (
           !object(block.search) ||
           (block.search.keywords !== undefined &&
             !Array.isArray(block.search.keywords)) ||
           (block.search.web_pages !== undefined &&
             !Array.isArray(block.search.web_pages)) ||
-          (search &&
-            (search.block_id !== block.id ||
-              search.message_id !== block.message_id))
+          (previousSearch && previousSearch.message_id !== block.message_id)
         )
           return null;
-        searchActivity ||= Boolean(
+        const hasActivity = Boolean(
           block.search.keywords?.some(
             (keyword) => typeof keyword === "string" && keyword.trim(),
           ) || block.search.web_pages?.length,
         );
         const eventOffset = offset(envelope.event_offset ?? 0);
         if (eventOffset === null) return null;
-        search ??= {
+        const observedSearch = {
           block_id: block.id,
           message_id: block.message_id,
           event_offset: eventOffset,
         };
+        searches.set(block.id, observedSearch);
+        // Multi-step answers can execute several search rounds. Retain a
+        // real active block as evidence, and validate every round's owner.
+        if (hasActivity) search ??= observedSearch;
       } else if (block.text) {
         const current = blocks.get(block.id);
         if (current && current.message_id !== block.message_id) return null;
@@ -213,6 +220,7 @@ export function reduceKimiConnectExchange(
       const source = ref.search;
       if (source?.id && id(source.id)) {
         const url = citationUrl(source.base?.url);
+        if (source.base?.url !== undefined && !url) citations.delete(source.id);
         if (url) {
           citations.set(source.id, {
             message_id: ref.message_id,
@@ -231,11 +239,11 @@ export function reduceKimiConnectExchange(
     !id(chatId) ||
     !id(answerId) ||
     (answerStatus !== "COMPLETED" && answerStatus !== 2) ||
-    !search ||
-    !searchActivity
+    !search
   )
     return null;
-  if (search.message_id !== answerId) return null;
+  if ([...searches.values()].some((item) => item.message_id !== answerId))
+    return null;
   const answer = [...blocks.values()]
     .filter((block) => block.message_id === answerId)
     .map((block) => block.text)

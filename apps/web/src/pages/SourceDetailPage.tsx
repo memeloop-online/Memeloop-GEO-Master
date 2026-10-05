@@ -200,6 +200,10 @@ export function SourceDetailPage() {
                   >
                     <small>
                       片段 {chunk.ordinal + 1} · {chunk.kind}
+                      {chunk.extraction_method ===
+                      "deterministic_csv_evidence_v1"
+                        ? " · 生成证据分片"
+                        : ""}
                     </small>
                     <span>{chunk.text}</span>
                     <KnowledgeLocator locator={chunk.locator} />
@@ -229,9 +233,17 @@ export function SourceDetailPage() {
                   : "正在等待提取方式记录"}
               </small>
               {selectedChunk.kind === "table" &&
-                selectedChunk.locator?.kind === "csv" && (
+                selectedChunk.locator?.kind === "csv" &&
+                selectedChunk.extraction_method !==
+                  "deterministic_csv_evidence_v1" && (
                   <CsvEvidenceTable text={selectedChunk.text} />
                 )}
+              {selectedChunk.extraction_method ===
+                "deterministic_csv_evidence_v1" && (
+                <p>
+                  这是供生成使用的有界证据分片；完整记录仍保存在原始片段中。
+                </p>
+              )}
             </section>
           )}
           {facts.length === 0 ? (

@@ -33,5 +33,19 @@ describe("CSV upload and evidence coordinates", () => {
     expect(formatLocator({ kind: "csv", start_row: 2, start_column: 1 })).toBe(
       "CSV · 第 2–2 条逻辑记录 · 第 1–1 列",
     );
+    expect(
+      formatLocator({
+        kind: "csv",
+        header_row: 1,
+        start_row: 3,
+        end_row: 3,
+        start_column: 2,
+        end_column: 2,
+        start_char: 80,
+        end_char: 240,
+      }),
+    ).toBe(
+      "CSV · 表头记录 1 · 第 3–3 条逻辑记录 · 第 2–2 列 · 单元格字符 80–240（从 0 开始，不含结束位置）",
+    );
   });
 });

@@ -365,6 +365,91 @@ async fn seed_project(pool: &PgPool, operator_id: Uuid, tenant_id: Uuid, label: 
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn csv_generation_slices_persist_without_duplicating_full_record_search() {
+    let database = connect().await;
+    let repository = PgKnowledgeRepository::from_database(&database);
+    let scope = seed_scope(database.pool(), "csv-slices").await;
+    let sibling = seed_sibling_scope(database.pool(), &scope, "csv-slices-other").await;
+    let value = "unique-slice-marker ".repeat(180);
+    let bytes = format!("Product,Details\nWidget,{value}\n").into_bytes();
+    let session = repository
+        .create_upload_session(
+            &scope,
+            UploadSessionCommand {
+                filename: "long-record.csv".to_owned(),
+                declared_media_type: "text/csv".to_owned(),
+                expected_size: bytes.len() as u64,
+                expected_sha256: sha256_hex(&bytes),
+                purpose: KnowledgePurpose::Public,
+            },
+        )
+        .await
+        .unwrap();
+    repository
+        .put_upload_content(&scope, session.upload_session_id, bytes)
+        .await
+        .unwrap();
+    let imported = repository
+        .complete_upload(&scope, session.upload_session_id, "csv-slices")
+        .await
+        .unwrap();
+    let version = imported.source_version.as_ref().unwrap();
+    assert_eq!(version.parser_version, "deterministic-csv-v2");
+    let restarted = PgKnowledgeRepository::from_database(&database);
+    let detail = restarted
+        .get_source_detail(&scope, version.source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let full = detail
+        .chunks
+        .iter()
+        .find(|chunk| chunk.extraction_method == "deterministic_csv_v1")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&full.text).unwrap()["values"][1],
+        value
+    );
+    let slices = detail
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.extraction_method == "deterministic_csv_evidence_v1")
+        .collect::<Vec<_>>();
+    assert!(slices.len() > 1);
+    for chunk in slices {
+        assert!(chunk.text.chars().count() <= 1600);
+        assert_ne!(chunk.chunk_id, full.chunk_id);
+        assert_eq!(chunk.text_hash, sha256_hex(chunk.text.as_bytes()));
+        assert_eq!(
+            serde_json::to_value(&chunk.locator).unwrap()["start_row"],
+            2
+        );
+    }
+    let result = restarted
+        .search(
+            &scope,
+            geo_domain::KnowledgeSearchRequest {
+                query: "unique-slice-marker".to_owned(),
+                knowledge_release_id: Some(imported.release.unwrap().knowledge_release_id),
+                purpose: KnowledgePurpose::Public,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.evidence.len(), 1);
+    assert_eq!(result.evidence[0].chunk_id, full.chunk_id);
+    assert!(
+        restarted
+            .get_source_detail(&sibling, version.source_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
 async fn csv_upload_and_attachment_import_preserve_evidence_and_reject_partial_parses() {
     let database = connect().await;
     let repository = PgKnowledgeRepository::from_database(&database);
@@ -445,10 +530,10 @@ async fn csv_upload_and_attachment_import_preserve_evidence_and_reject_partial_p
         assert_eq!(imported.status, geo_domain::ImportStatus::Succeeded);
         let version = imported.source_version.as_ref().unwrap();
         assert_eq!(version.content_sha256, sha256_hex(bytes));
-        assert_eq!(version.parser_version, "deterministic-csv-v1");
+        assert_eq!(version.parser_version, "deterministic-csv-v2");
         assert_eq!(
             imported.release.as_ref().unwrap().pipeline_versions["parsers"],
-            json!(["deterministic-csv-v1"])
+            json!(["deterministic-csv-v2"])
         );
         let detail = repository
             .get_source_detail(&scope, version.source_id)

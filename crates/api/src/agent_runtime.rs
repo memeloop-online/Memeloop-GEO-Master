@@ -32,14 +32,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AgentRuntime, AppError, AttachmentReference, DistributionManifest, DistributionTarget,
-    DocumentManifestItemState, DocumentManifestState, ErrorCode, ImportItem, ImportStatus,
-    KnowledgeRepository, RUNTIME_NOT_CONFIGURED, ReportSnapshot, RuntimeCapability, SourceKind,
-    TenantScope, TurnInput, TurnReport,
+    AgentRuntime, AppError, AttachmentReference, ChannelOutcomeStatus, DistributionManifest,
+    DistributionTarget, DocumentManifestItemState, DocumentManifestState, ErrorCode, ImportItem,
+    ImportStatus, KnowledgeRepository, RUNTIME_NOT_CONFIGURED, ReportSnapshot, RuntimeCapability,
+    SourceKind, TenantScope, TurnInput, TurnReport,
 };
 use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryPage, ChannelExecutionResult, ChannelManifestPage,
     ChannelManifestReadRequest, ChannelPlanReceipt, ChannelPlanRequest,
+    ChannelPublicationLookupObservation, ChannelPublicationLookupSummary,
     ChannelTargetExecuteRequest, DistributionManifestRef, DistributionReadRequest,
     DistributionResumeRequest, DistributionStartRequest, DistributionTargetRef,
     DistributionTargetsPage, DistributionTargetsReadRequest, HOST_BUNDLE, HOST_MAIN_MODULE,
@@ -656,7 +657,58 @@ fn distribution_target_ref(target: DistributionTarget) -> DistributionTargetRef 
         publication_intent_id: target.publication_intent_id,
         status: target.status,
         reason: target.reason,
+        original_channel_target_id: None,
+        publication_lookup: None,
     }
+}
+
+async fn distribution_lookup_summary(
+    state: &AppState,
+    scope: &TenantScope,
+    channel_target_id: uuid::Uuid,
+) -> Result<Option<ChannelPublicationLookupSummary>, AppError> {
+    let view = match state
+        .channel_job_repository()
+        .get_target(scope, channel_target_id)
+        .await
+    {
+        Ok(view) => view,
+        // An outbox command need not have been projected into a channel job
+        // yet. A missing target is not evidence of a missing publication.
+        Err(error) if error.code == ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(attempt) = view.attempts.last() else {
+        return Ok(None);
+    };
+    if !view.target.input.is_publication()
+        || !attempt
+            .outcome
+            .as_ref()
+            .is_none_or(|outcome| outcome.status == ChannelOutcomeStatus::Unknown)
+    {
+        return Ok(None);
+    }
+    let read =
+        crate::publication_lookup::read_publication_lookup(state, scope, channel_target_id, None)
+            .await?;
+    let Some(job) = read.job else {
+        return Ok(None);
+    };
+    Ok(Some(ChannelPublicationLookupSummary {
+        query_count: u32::try_from(job.query_count)
+            .map_err(|_| AppError::invalid_request("invalid lookup query count"))?,
+        next_due_at: job.next_due_at,
+        in_progress: job.in_progress,
+        last_error_code: job.last_error_code.map(str::to_owned),
+        latest_observation: read.observations.first().map(|observation| {
+            ChannelPublicationLookupObservation {
+                finding: observation.finding,
+                observed_at: observation.observed_at,
+                received_at: observation.received_at,
+            }
+        }),
+    }))
 }
 
 async fn current_distribution_cycle(
@@ -806,10 +858,31 @@ impl HostOps for RepositoryHostOps {
             )
             .await
             .map_err(|error| worker_error(op, error))?;
+        let service = state.distribution_service();
+        let mut items = Vec::with_capacity(page.rows.len());
+        for target in page.rows {
+            let binding = if target.publication_intent_id.is_some() {
+                service
+                    .publication_target(scope, request.manifest_id, target.target_id)
+                    .await
+                    .map_err(|error| worker_error(op, error))?
+            } else {
+                None
+            };
+            let mut item = distribution_target_ref(target);
+            if let Some(binding) = binding {
+                item.original_channel_target_id = Some(binding.channel_target_id);
+                item.publication_lookup =
+                    distribution_lookup_summary(state, scope, binding.channel_target_id)
+                        .await
+                        .map_err(|error| worker_error(op, error))?;
+            }
+            items.push(item);
+        }
         Ok(DistributionTargetsPage {
             manifest_id: page.manifest_id,
             expected_count: page.expected_count,
-            items: page.rows.into_iter().map(distribution_target_ref).collect(),
+            items,
             next_ordinal: page.next_ordinal,
         })
     }

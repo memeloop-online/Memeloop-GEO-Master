@@ -208,6 +208,76 @@ test("framed UI request must preserve frozen question, model, fresh chat and exp
   );
 });
 
+test("late chat identity cannot legitimize a message from another chat", () => {
+  const reordered = structuredClone(messages);
+  const chat = reordered.shift();
+  reordered[0].message.chat_id = "different-chat";
+  reordered.splice(1, 0, chat);
+  assert.equal(
+    reduceKimiConnectExchange(
+      { ...exchange, messages: reordered },
+      { question: QUESTION, model: MODEL, request },
+    ),
+    null,
+  );
+  reordered[0].message.chat_id = "chat-1";
+  assert.equal(
+    reduceKimiConnectExchange(
+      { ...exchange, messages: reordered },
+      { question: QUESTION, model: MODEL, request },
+    )?.raw_answer,
+    "An answer.",
+  );
+});
+
+test("invalid cited URL cannot silently fall back to an earlier valid ref", () => {
+  const changed = structuredClone(messages);
+  const cited = changed.find((event) => event.message?.refs);
+  cited.message.refs.used_search_chunks[0].base.url = "javascript:alert(1)";
+  assert.equal(
+    reduceKimiConnectExchange(
+      { ...exchange, messages: changed },
+      { question: QUESTION, model: MODEL, request },
+    ),
+    null,
+  );
+  const lateInvalid = structuredClone(messages);
+  lateInvalid.push({
+    ref: {
+      message_id: "assistant-1",
+      search: { id: "chunk-1", base: { url: "javascript:alert(1)" } },
+    },
+  });
+  assert.equal(
+    reduceKimiConnectExchange(
+      { ...exchange, messages: lateInvalid },
+      { question: QUESTION, model: MODEL, request },
+    ),
+    null,
+  );
+});
+
+test("multiple search rounds are valid only when every block belongs to the same answer", () => {
+  const several = structuredClone(messages);
+  several.splice(3, 0, {
+    block: {
+      id: "search-block-2",
+      message_id: "assistant-1",
+      search: { keywords: ["second search"] },
+    },
+    event_offset: "5",
+  });
+  const reduce = () =>
+    reduceKimiConnectExchange(
+      { ...exchange, messages: several },
+      { question: QUESTION, model: MODEL, request },
+    );
+  assert.equal(reduce()?.raw_answer, "An answer.");
+  assert.equal(reduce()?.search_event.block_id, "search-block-1");
+  several[3].block.message_id = "different-assistant";
+  assert.equal(reduce(), null);
+});
+
 const pageHtml = `<!doctype html><html><body>
 <button data-testid="model-select-trigger">Model</button>
 <button data-testid="model-option" data-moon-key="example-model">Example</button>

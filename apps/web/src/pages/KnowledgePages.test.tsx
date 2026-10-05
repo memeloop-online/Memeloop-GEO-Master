@@ -319,6 +319,48 @@ describe("knowledge workbench", () => {
     );
   });
 
+  it("labels a generated CSV cell slice without rendering it as a complete row", async () => {
+    const text = JSON.stringify({ values: ["连续片段"] });
+    vi.stubGlobal(
+      "fetch",
+      requestHandler({
+        sourceDetail: {
+          source,
+          versions: [],
+          chunks: [
+            {
+              chunk_id: "csv-slice",
+              source_version_id: "version-a",
+              ordinal: 1,
+              kind: "table",
+              text,
+              product_ids: [],
+              extraction_method: "deterministic_csv_evidence_v1",
+              locator: {
+                kind: "csv",
+                start_row: 2,
+                end_row: 2,
+                start_column: 2,
+                end_column: 2,
+                header_row: 1,
+                start_char: 4,
+                end_char: 8,
+              },
+            },
+          ],
+          facts: [],
+          import_jobs: [],
+          impact: {},
+        },
+      }),
+    );
+    renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
+    await userEvent.click(await screen.findByText(text));
+    expect(screen.getByText(/完整记录仍保存在原始片段中/)).toBeInTheDocument();
+    expect(screen.getAllByText(/单元格字符 4–8/)).toHaveLength(2);
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  });
+
   it("uses evidence-only mode and reports insufficient evidence without invented prose", async () => {
     vi.stubGlobal(
       "fetch",

@@ -793,6 +793,12 @@ pub struct DistributionTargetRef {
     pub publication_intent_id: Option<Uuid>,
     pub status: DistributionTargetStatus,
     pub reason: Option<String>,
+    /// The original send target may belong to an earlier cycle. This is a
+    /// navigation reference, not evidence that the send succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_channel_target_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_lookup: Option<ChannelPublicationLookupSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

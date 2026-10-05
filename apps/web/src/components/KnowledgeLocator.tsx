@@ -68,6 +68,9 @@ export function formatLocator(locator: SourceLocator | null | undefined) {
         locator.start_column !== undefined && locator.start_column !== null
           ? `第 ${locator.start_column}–${locator.end_column ?? locator.start_column} 列`
           : null,
+        locator.start_char != null && locator.end_char != null
+          ? `单元格字符 ${locator.start_char}–${locator.end_char}（从 0 开始，不含结束位置）`
+          : null,
       ]
         .filter(Boolean)
         .join(" · ");

@@ -359,6 +359,12 @@ pub enum ChunkLocator {
         end_column: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         header_row: Option<u32>,
+        /// Zero-based, half-open character range within a single CSV cell.
+        /// Absent on full records and multi-column evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_char: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_char: Option<u32>,
     },
     Manual {},
 }
@@ -1160,7 +1166,7 @@ impl MemoryKnowledgeRepository {
             .filter_map(|id| state.versions.get(id))
             .map(|version| version.parser_version.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        if parsers.contains("deterministic-csv-v1") {
+        if parsers.contains("deterministic-csv-v1") || parsers.contains("deterministic-csv-v2") {
             pipeline_versions["parser"] = json!("deterministic-knowledge-v1");
             pipeline_versions["parsers"] = json!(parsers);
         }
@@ -2102,6 +2108,7 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                     .get(&version.source_version_id)
                     .into_iter()
                     .flatten()
+                    .filter(|chunk| chunk.extraction_method != "deterministic_csv_evidence_v1")
                     .filter(move |chunk| chunk.text.to_lowercase().contains(&needle))
                     .map(move |chunk| KnowledgeEvidence {
                         source_id: source.source_id,
@@ -2199,7 +2206,7 @@ pub fn parsed_knowledge_chunks(
 
 pub fn knowledge_parser_version(media_type: &str) -> &'static str {
     if normalize_media_type(media_type) == "text/csv" {
-        "deterministic-csv-v1"
+        "deterministic-csv-v2"
     } else if is_text_media_type(media_type) {
         "deterministic-text-v1"
     } else {
@@ -2380,7 +2387,7 @@ mod tests {
         ));
         assert_eq!(
             super::knowledge_parser_version("TEXT/CSV"),
-            "deterministic-csv-v1"
+            "deterministic-csv-v2"
         );
         assert_eq!(
             super::knowledge_parser_version("text/x-markdown; charset=utf-8"),
@@ -2453,7 +2460,7 @@ mod tests {
             let source = accepted.source.unwrap();
             let version = accepted.source_version.unwrap();
             assert_eq!(version.content_sha256, sha256_hex(&bytes));
-            assert_eq!(version.parser_version, "deterministic-csv-v1");
+            assert_eq!(version.parser_version, "deterministic-csv-v2");
             let detail = repository
                 .get_source_detail(&scope, source.source_id)
                 .await
@@ -2472,6 +2479,8 @@ mod tests {
                         start_column: 1,
                         end_column: 3,
                         header_row: Some(1),
+                        start_char: None,
+                        end_char: None,
                     }
                 );
                 let table: serde_json::Value = serde_json::from_str(&chunk.text).unwrap();
