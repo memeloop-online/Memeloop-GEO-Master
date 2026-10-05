@@ -53,8 +53,9 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - 局部集成 `@memeloop/react-ui` 的 `AgentChatView`，外围应用壳继续使用 Fluent UI。
 - 已定义并实现内存版 Conversation、Message、Turn、Run、AttachmentReference、RuntimeCapability 和递增 ConversationEvent。
 - 已有会话创建/列表/详情、消息提交、Turn 取消和 SSE 重放 API；支持幂等提交、同键异请求冲突、附件-only 消息、跨项目隔离、`after`/`Last-Event-ID` 恢复。
+- 当前新增多回合历史接线：从同作用域持久消息重建当前序号之前的成功问答对，最近最多 20 对且 JSON UTF-8 不超过 128 KiB；整对省略并向模型报告省略数量，不生成虚构摘要。原生 MemeLoop 每轮独立恢复消息并分页读取，历史不授予附件导入权限。Node bundle 回归已通过，Rust/数据库新增回归的最终状态见工作日志；数据库查询仍加载完整会话，长期会话需补有界读取。此项不等于中途 checkpoint 恢复。
 - P00 已接多附件选择/拖拽/粘贴、逐项上传及失败重试；专用附件 API 核验字节与摘要，提交消息时核对作用域和已提交对象元数据。TXT/Markdown 可经模型显式导入工具形成知识版本，再检索并引用回答；上传本身不直接入库，原始大文件不塞入模型上下文。
-- 真实 MemeLoop 已执行模型 → `knowledge_search` → Rust 检索 → 模型回答；JSON function-tool 协议可用，尚无流式工具分片、多回合历史或中途恢复。
+- 真实 MemeLoop 已执行模型 → `knowledge_search` → Rust 检索 → 模型回答；JSON function-tool 协议可用，多回合历史本批接入（验证范围见上文），尚无流式工具分片或中途恢复。
 - Rust JS Runtime 未接入时明确返回 `capability_missing`，界面不会伪造 AI 回复。
 
 相关入口：

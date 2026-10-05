@@ -1027,6 +1027,86 @@ async fn agent_replay_after_restart_returns_the_durable_events() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn agent_history_restores_completed_pairs_after_repository_restart() {
+    let database = connect().await;
+    let pool = database.pool().clone();
+    let repository = PgAgentRepository::new(pool.clone());
+    let scope = seed_scope(&pool, "history").await;
+    let conversation = create_conversation(&repository, &scope).await;
+    let first = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("Remember the warranty"),
+            "history-first".into(),
+            "history-first-body".into(),
+            RuntimeCapability::available("deno_core", None),
+        )
+        .await
+        .unwrap();
+    repository
+        .begin_run(&scope, first.run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    repository
+        .finish_run(
+            &scope,
+            first.run.id,
+            RunCompletion::Succeeded {
+                content: "The warranty is two years.".into(),
+                metadata: json!({"internal": "not model history"}),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let second = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("What did you say?"),
+            "history-second".into(),
+            "history-second-body".into(),
+            RuntimeCapability::available("deno_core", None),
+        )
+        .await
+        .unwrap();
+    let restarted = PgAgentRepository::new(pool.clone());
+    let detail = restarted
+        .get_conversation(&scope, conversation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let restored = detail.turn_input(second.run.id).unwrap();
+    assert_eq!(restored.history.len(), 2);
+    assert_eq!(restored.history[0].message_id, first.message.id);
+    assert_eq!(restored.history[0].role, MessageRole::User);
+    assert_eq!(restored.history[1].role, MessageRole::Assistant);
+    assert_eq!(restored.history[1].root_message_id, first.message.id);
+    assert_eq!(restored.history[1].content, "The warranty is two years.");
+    assert_eq!(restored.history_omitted_turns, 0);
+    assert!(detail.turn_input(first.run.id).unwrap().history.is_empty());
+    let again = repository
+        .get_conversation(&scope, conversation.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .turn_input(second.run.id)
+        .unwrap();
+    assert_eq!(restored, again);
+    let sibling = seed_sibling_scope(&pool, &scope, "history-sibling").await;
+    assert!(
+        restarted
+            .get_conversation(&sibling, conversation.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
 async fn agent_checkpoints_survive_a_restart_and_reject_a_changed_input() {
     let database = connect().await;
     let pool = database.pool().clone();

@@ -447,6 +447,8 @@ fn turn_argument(input: &TurnInput) -> String {
         "conversation_id": input.conversation_id,
         "message_id": input.message_id,
         "attachments": input.attachments,
+        "history": input.history,
+        "history_omitted_turns": input.history_omitted_turns,
     })
     .to_string()
 }
@@ -1418,7 +1420,25 @@ mod tests {
     /// rather than left to whatever the request happened to carry.
     #[test]
     fn the_turn_argument_names_everything_a_bundle_needs() {
-        let input = turn_input();
+        let mut input = turn_input();
+        let root_message_id = uuid::Uuid::new_v4().into();
+        input.history = vec![
+            geo_domain::TurnHistoryMessage {
+                message_id: root_message_id,
+                role: geo_domain::MessageRole::User,
+                content: "earlier question".to_owned(),
+                root_message_id,
+                sequence: 1,
+            },
+            geo_domain::TurnHistoryMessage {
+                message_id: uuid::Uuid::new_v4().into(),
+                role: geo_domain::MessageRole::Assistant,
+                content: "earlier answer".to_owned(),
+                root_message_id,
+                sequence: 2,
+            },
+        ];
+        input.history_omitted_turns = 4;
         let argument: Value = serde_json::from_str(&turn_argument(&input)).expect("valid JSON");
         assert_eq!(argument["prompt"], "how long is the warranty?");
         assert_eq!(argument["query"], "how long is the warranty?");
@@ -1428,6 +1448,14 @@ mod tests {
             argument["conversation_id"],
             input.conversation_id.to_string().as_str()
         );
+        assert_eq!(
+            argument["history"],
+            serde_json::to_value(&input.history).unwrap()
+        );
+        assert_eq!(argument["history_omitted_turns"], 4);
+        assert_eq!(argument["attachments"], json!([]));
+        assert!(argument["history"][0].get("attachments").is_none());
+        assert!(argument["history"][1].get("metadata").is_none());
     }
 
     /// A thrown host-op failure keeps its declared class instead of degrading
@@ -1464,6 +1492,8 @@ mod tests {
             run_id: geo_domain::RunId::from(uuid::Uuid::new_v4()),
             prompt: "how long is the warranty?".to_owned(),
             attachments: Vec::new(),
+            history: Vec::new(),
+            history_omitted_turns: 0,
         }
     }
 }

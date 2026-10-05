@@ -273,6 +273,8 @@ async fn generated_memeloop_discovers_plans_reads_and_defers_without_external_se
                     run_id: Uuid::new_v4().into(),
                     prompt: "Plan one publication from the available public source.".into(),
                     attachments: vec![],
+                    history: Vec::new(),
+                    history_omitted_turns: 0,
                 },
             )
             .await

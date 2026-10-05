@@ -271,6 +271,8 @@ async fn generated_memeloop_imports_committed_attachment_then_searches_and_cites
                     prompt: "Import the attached documents and answer the warranty question."
                         .into(),
                     attachments: attachments.clone(),
+                    history: Vec::new(),
+                    history_omitted_turns: 0,
                 },
             )
             .await

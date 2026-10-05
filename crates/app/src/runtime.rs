@@ -300,6 +300,8 @@ mod tests {
                     run_id: uuid::Uuid::new_v4().into(),
                     prompt: "question".into(),
                     attachments: Vec::new(),
+                    history: Vec::new(),
+                    history_omitted_turns: 0,
                 },
             )
             .await

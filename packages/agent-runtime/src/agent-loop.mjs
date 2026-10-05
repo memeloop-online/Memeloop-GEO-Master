@@ -220,7 +220,8 @@ const KNOWLEDGE_SEARCH_SCHEMA = {
     knowledge_release_id: { type: "string", format: "uuid" },
   },
 };
-const sessions = new Map();
+const MAX_HISTORY_MESSAGES = 40;
+const MAX_HISTORY_BYTES = 128 * 1024;
 
 // deno_core's bare V8 context does not install the browser structuredClone
 // global. The pinned MemeLoop loop clones only its detached JSON tool payloads
@@ -247,7 +248,11 @@ if (typeof globalThis.structuredClone !== "function") {
 export async function main(input) {
   const turn = normalizeTurnInput(input);
   const host = resolveHost(turn.attachments.length > 0);
-  const session = getSession(turn.conversationId);
+  const session = createSession(
+    turn.conversationId,
+    turn.history,
+    turn.timestamp,
+  );
   const modelId = turn.model ?? DEFAULT_MODEL_ID;
   const toolFailures = [];
   const provider = createHostProvider(host, modelId, toolFailures);
@@ -271,6 +276,11 @@ export async function main(input) {
           ...DISTRIBUTION_TOOLS,
         ];
   const definition = createDefinition(modelId, toolNames);
+  if (turn.historyOmittedTurns > 0) {
+    definition.systemPrompt =
+      `${turn.historyOmittedTurns} earlier completed conversation turns were omitted from this bounded history. ` +
+      "Use only the supplied messages and tool evidence; do not claim complete recall or invent a summary of omitted turns.";
+  }
   const context = createContext({
     session,
     definition,
@@ -337,6 +347,7 @@ export async function main(input) {
     model: provider.lastModel ?? modelId,
     run_id: turn.runId,
     turn_id: turn.turnId,
+    history_omitted_turns: turn.historyOmittedTurns,
   };
   await host.emit("loop.completed", JSON.stringify(completion));
   return completion;
@@ -373,17 +384,96 @@ function normalizeTurnInput(input) {
     input.timestamp === undefined
       ? Date.now()
       : requiredPositiveSafeInteger(input.timestamp, "timestamp");
+  const history = normalizeHistory(
+    input.history === undefined ? [] : input.history,
+    messageId,
+  );
+  const historyOmittedTurns = requiredPositiveSafeInteger(
+    input.history_omitted_turns === undefined ? 0 : input.history_omitted_turns,
+    "history_omitted_turns",
+  );
 
   return {
     attachments,
+    history,
+    historyOmittedTurns,
     conversationId,
     messageId,
     model,
     prompt,
     runId,
-    timestamp,
+    timestamp: Math.max(timestamp, history.length),
     turnId,
   };
+}
+
+function normalizeHistory(value, currentMessageId) {
+  if (
+    !Array.isArray(value) ||
+    value.length > MAX_HISTORY_MESSAGES ||
+    value.length % 2 !== 0 ||
+    jsonBytes(value) > MAX_HISTORY_BYTES
+  ) {
+    throw new TypeError(
+      "history must contain at most 20 complete bounded turns.",
+    );
+  }
+  const ids = new Set([currentMessageId]);
+  let previousSequence = -1;
+  return value.map((message, index) => {
+    if (
+      !isRecord(message) ||
+      Object.keys(message).some(
+        (key) =>
+          ![
+            "message_id",
+            "role",
+            "content",
+            "root_message_id",
+            "sequence",
+          ].includes(key),
+      )
+    ) {
+      throw new TypeError(
+        "history permits only canonical text message fields.",
+      );
+    }
+    const messageId = requiredString(message.message_id, "history.message_id");
+    const rootMessageId = requiredString(
+      message.root_message_id,
+      "history.root_message_id",
+    );
+    const sequence = requiredPositiveSafeInteger(
+      message.sequence,
+      "history.sequence",
+    );
+    const role = index % 2 === 0 ? "user" : "assistant";
+    if (
+      ids.has(messageId) ||
+      [messageId, rootMessageId].some(
+        (id) =>
+          new TextEncoder().encode(id).byteLength > 512 ||
+          /[\u0000-\u001f\u007f]/u.test(id),
+      ) ||
+      sequence <= previousSequence ||
+      message.role !== role ||
+      typeof message.content !== "string" ||
+      (role === "assistant" && message.content.trim().length === 0) ||
+      rootMessageId !==
+        (role === "user" ? messageId : value[index - 1].message_id)
+    ) {
+      throw new TypeError(
+        "history requires ordered, unique, complete prior user/assistant pairs.",
+      );
+    }
+    ids.add(messageId);
+    previousSequence = sequence;
+    return { messageId, turnId: rootMessageId, role, content: message.content };
+  });
+}
+
+function jsonBytes(value) {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function normalizeAttachments(value) {
@@ -810,29 +900,38 @@ function withoutUndefined(value) {
   );
 }
 
-function getSession(conversationId) {
-  let session = sessions.get(conversationId);
-  if (!session) {
-    session = createSession(conversationId);
-    sessions.set(conversationId, session);
-  }
-  return session;
-}
-
-function createSession(conversationId) {
-  const events = [];
-  const messages = [];
-  let nextSequence = 0;
+// Each invocation imports only the Rust-selected snapshot. Never retain a
+// process-global transcript, including when a caller repeats the same run.
+export function createSession(
+  conversationId,
+  history = [],
+  timestamp = Date.now(),
+) {
+  const messages = history.map((message, index) => ({
+    ...message,
+    conversationId,
+    parts:
+      message.content.length > 0
+        ? [{ type: "text", text: message.content }]
+        : [],
+    originNodeId: LOCAL_NODE_ID,
+    originSequence: index + 1,
+    lamportClock: index + 1,
+    timestamp: Math.max(timestamp, history.length) - history.length + index,
+  }));
+  let nextSequence = history.length;
+  let lastTimestamp = messages.at(-1)?.timestamp ?? 0;
 
   const storage = {
     async appendLocalEvent(draft) {
       const originSequence = ++nextSequence;
       const event = {
         ...draft,
+        timestamp: Math.max(draft.timestamp, lastTimestamp),
         lamportClock: originSequence,
         originSequence,
       };
-      events.push(event);
+      lastTimestamp = event.timestamp;
       if (event.kind === "message") {
         messages.push({
           ...event.message,
@@ -864,20 +963,100 @@ function createSession(conversationId) {
         ? { conversationId, definitionId: "geo-embedded-agent" }
         : null;
     },
-    async getFullContentMessagePage(id) {
+    async getFullContentMessagePage(id, options = {}, callOptions = {}) {
+      callOptions.signal?.throwIfAborted();
       if (id !== conversationId) {
         throw new Error(
           "The embedded conversation store rejected a foreign conversation.",
         );
       }
-      return {
+      const {
+        limit = 50,
+        maxBytes = 256 * 1024,
+        direction = "forward",
+        before,
+        after,
+        expectedRevision,
+        afterCoveredVersion,
+      } = options;
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 50 ||
+        !Number.isSafeInteger(maxBytes) ||
+        maxBytes < 1 ||
+        maxBytes > 256 * 1024 ||
+        !["forward", "backward"].includes(direction) ||
+        (before !== undefined && after !== undefined) ||
+        ((before !== undefined || after !== undefined) &&
+          expectedRevision === undefined) ||
+        (expectedRevision !== undefined &&
+          (typeof expectedRevision !== "string" ||
+            expectedRevision.trim().length === 0)) ||
+        (afterCoveredVersion !== undefined &&
+          (!isRecord(afterCoveredVersion) ||
+            Object.values(afterCoveredVersion).some(
+              (sequence) => !isNonNegativeSafeInteger(sequence),
+            )))
+      ) {
+        throw new TypeError("Invalid canonical message page options.");
+      }
+      const revision = String(nextSequence);
+      const page = {
         conversationId,
         hasMoreAfter: false,
         hasMoreBefore: false,
-        items: [...messages],
-        reset: false,
-        revision: String(events.length),
+        items: [],
+        reset: expectedRevision !== undefined && expectedRevision !== revision,
+        revision,
       };
+      if (jsonBytes(page) > maxBytes) {
+        throw new Error("Canonical message page byte budget is too small.");
+      }
+      if (page.reset) return page;
+      const visible = messages.filter(
+        (message) =>
+          message.originSequence >
+          (afterCoveredVersion?.[message.originNodeId] ?? 0),
+      );
+      const cursorIndex = (cursor) => {
+        if (!isRecord(cursor))
+          throw new TypeError("Invalid canonical message cursor.");
+        const index = visible.findIndex((message) =>
+          Object.entries(messageCursor(message)).every(
+            ([key, value]) => cursor[key] === value,
+          ),
+        );
+        if (index < 0) throw new TypeError("Unknown canonical message cursor.");
+        return index;
+      };
+      const first = after === undefined ? 0 : cursorIndex(after) + 1;
+      const end = before === undefined ? visible.length : cursorIndex(before);
+      const candidates = visible.slice(first, end);
+      if (direction === "backward") candidates.reverse();
+      for (const message of candidates) {
+        if (page.items.length === limit) break;
+        const items =
+          direction === "backward"
+            ? [message, ...page.items]
+            : [...page.items, message];
+        const candidate = {
+          ...page,
+          items,
+          startCursor: messageCursor(items[0]),
+          endCursor: messageCursor(items.at(-1)),
+          hasMoreBefore: visible.indexOf(items[0]) > 0,
+          hasMoreAfter: visible.indexOf(items.at(-1)) < visible.length - 1,
+        };
+        if (jsonBytes(candidate) > maxBytes) {
+          if (page.items.length === 0)
+            throw new Error("Canonical message exceeds page byte budget.");
+          break;
+        }
+        Object.assign(page, candidate);
+      }
+      // Detach the snapshot so callers cannot mutate the canonical store.
+      return structuredClone(page);
     },
     async getRetainedCompactionControls() {
       return {
@@ -898,6 +1077,15 @@ function createSession(conversationId) {
         );
     },
     storage,
+  };
+}
+
+function messageCursor(message) {
+  return {
+    timestamp: message.timestamp,
+    lamportClock: message.lamportClock,
+    originNodeId: message.originNodeId,
+    messageId: message.messageId,
   };
 }
 

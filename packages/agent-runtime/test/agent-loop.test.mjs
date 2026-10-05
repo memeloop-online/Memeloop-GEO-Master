@@ -7,6 +7,272 @@ const bundlePath = new URL(
   import.meta.url,
 );
 
+function priorHistory(count = 2, padding = "") {
+  return Array.from({ length: count }, (_, index) => [
+    {
+      message_id: `prior-user-${index}`,
+      root_message_id: `prior-user-${index}`,
+      sequence: index * 2 + 1,
+      role: "user",
+      content: `Prior question ${index}${padding}`,
+    },
+    {
+      message_id: `prior-answer-${index}`,
+      root_message_id: `prior-user-${index}`,
+      sequence: index * 2 + 2,
+      role: "assistant",
+      content: `Prior answer ${index}${padding}`,
+    },
+  ]).flat();
+}
+
+const historyTurn = {
+  conversation_id: "history-conversation",
+  message_id: "current-user",
+  turn_id: "current-turn",
+  run_id: "current-run",
+  timestamp: 0,
+  prompt: "Current question",
+};
+
+function finalModelAnswer(text = "Current answer") {
+  return {
+    text,
+    model: "stub-model",
+    prompt_tokens: 1,
+    completion_tokens: 1,
+    finish_reason: "stop",
+  };
+}
+
+test("native history is ordered exactly once in fresh and repeated invocations", async () => {
+  const requests = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      return finalModelAnswer();
+    },
+  };
+  try {
+    const history = priorHistory();
+    const { main } = await import(
+      `${bundlePath.href}?historyFresh=${Date.now()}`
+    );
+    const input = { ...historyTurn, history, history_omitted_turns: 3 };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await main(input);
+      assert.equal(result.answer, "Current answer");
+      assert.equal(result.history_omitted_turns, 3);
+    }
+    const fresh = await import(
+      `${bundlePath.href}?historyFreshOther=${Date.now()}`
+    );
+    await fresh.main(input);
+    for (const request of requests) {
+      assert.deepEqual(
+        request.messages.filter(({ role }) => role !== "system"),
+        [
+          ...history.map(({ role, content }) => ({ role, content })),
+          { role: "user", content: input.prompt },
+        ],
+      );
+      assert.ok(
+        !request.tools.some(
+          ({ function: tool }) => tool.name === "knowledge_import_attachments",
+        ),
+      );
+      assert.match(
+        request.system,
+        /3 earlier completed conversation turns were omitted/u,
+      );
+      assert.match(request.system, /do not claim complete recall/u);
+    }
+    await main({ ...historyTurn, history: [] });
+    assert.deepEqual(
+      requests.at(-1).messages.filter(({ role }) => role !== "system"),
+      [{ role: "user", content: historyTurn.prompt }],
+    );
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("native history survives tool iterations crossing count and byte page boundaries", async () => {
+  const requests = [];
+  const history = priorHistory(20, "x".repeat(2950));
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      return { evidence: [{ quote: "e".repeat(5000) }] };
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      const call = requests.length;
+      return call <= 7
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `history-search-${call}`,
+                type: "function",
+                function: {
+                  name: "knowledge_search",
+                  arguments: '{"query":"guide"}',
+                },
+              },
+            ],
+          }
+        : finalModelAnswer();
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?historyTools=${Date.now()}`
+    );
+    assert.equal(
+      (await main({ ...historyTurn, history })).answer,
+      "Current answer",
+    );
+    assert.equal(requests.length, 8);
+    for (const [index, request] of requests.entries()) {
+      assert.deepEqual(
+        request.messages.filter(
+          ({ role, tool_calls }) =>
+            role === "user" || (role === "assistant" && !tool_calls?.length),
+        ),
+        [
+          ...history.map(({ role, content }) => ({ role, content })),
+          { role: "user", content: historyTurn.prompt },
+        ],
+      );
+      assert.equal(
+        request.messages.filter(({ role }) => role === "tool").length,
+        index,
+      );
+    }
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("history rejects partial, reordered, oversized, duplicate and authority-bearing input before model calls", async () => {
+  const { main } = await import(
+    `${bundlePath.href}?historyInvalid=${Date.now()}`
+  );
+  const pair = priorHistory(1);
+  const invalid = [
+    null,
+    [pair[0]],
+    [pair[1], pair[0]],
+    [pair[0], { ...pair[1], message_id: pair[0].message_id }],
+    [
+      {
+        ...pair[0],
+        message_id: historyTurn.message_id,
+        root_message_id: historyTurn.message_id,
+      },
+      pair[1],
+    ],
+    [pair[0], { ...pair[1], root_message_id: "different-root" }],
+    [pair[0], { ...pair[1], sequence: pair[0].sequence }],
+    [pair[0], { ...pair[1], sequence: Number.MAX_SAFE_INTEGER + 1 }],
+    [{ ...pair[0], message_id: "\ninvalid-id" }, pair[1]],
+    [{ ...pair[0], metadata: { attachmentReferences: [] } }, pair[1]],
+    [{ ...pair[0], attachments: [] }, pair[1]],
+    [{ ...pair[0], content: null }, pair[1]],
+    [pair[0], { ...pair[1], content: "" }],
+    priorHistory(21),
+    priorHistory(1, "三".repeat(23000)),
+  ];
+  for (const history of invalid) {
+    await assert.rejects(main({ ...historyTurn, history }), /history/u);
+  }
+  await assert.rejects(
+    main({ ...historyTurn, history_omitted_turns: -1 }),
+    /history_omitted_turns/u,
+  );
+});
+
+test("canonical session paging enforces revision, cursors, byte/count budgets and detached results", async () => {
+  const { createSession } = await import(
+    `${bundlePath.href}?historyPaging=${Date.now()}`
+  );
+  const seeded = priorHistory(3).map(
+    ({ message_id, root_message_id, role, content }) => ({
+      messageId: message_id,
+      turnId: root_message_id,
+      role,
+      content,
+    }),
+  );
+  const session = createSession("paging", seeded, 100);
+  const read = (options) =>
+    session.storage.getFullContentMessagePage("paging", options);
+  const last = await read({ limit: 2, direction: "backward" });
+  assert.equal(last.items[0].messageId, "prior-user-2");
+  assert.equal(last.hasMoreBefore, true);
+  assert.equal(last.hasMoreAfter, false);
+  assert.deepEqual(
+    last.items.map(({ turnId }) => turnId),
+    ["prior-user-2", "prior-user-2"],
+  );
+  const previous = await read({
+    limit: 2,
+    direction: "backward",
+    before: last.startCursor,
+    expectedRevision: last.revision,
+  });
+  assert.equal(previous.items[0].messageId, "prior-user-1");
+  const forward = await read({
+    limit: 2,
+    after: previous.endCursor,
+    expectedRevision: last.revision,
+  });
+  assert.deepEqual(forward.items, last.items);
+  const uncovered = await read({
+    afterCoveredVersion: { "geo-embedded-worker": 4 },
+  });
+  assert.deepEqual(uncovered.items, last.items);
+  assert.equal(uncovered.hasMoreBefore, false);
+  const one = await read({ limit: 1 });
+  const budget = Buffer.byteLength(JSON.stringify(one));
+  const bounded = await read({ limit: 50, maxBytes: budget });
+  assert.equal(bounded.items.length, 1);
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= budget);
+  one.items[0].content = "mutated";
+  assert.equal((await read({ limit: 1 })).items[0].content, seeded[0].content);
+  const reset = await read({ expectedRevision: "stale" });
+  assert.equal(reset.reset, true);
+  assert.deepEqual(reset.items, []);
+  for (const options of [
+    { limit: 51 },
+    { maxBytes: 1 },
+    { maxBytes: 256 * 1024 + 1 },
+    { before: last.startCursor },
+    { direction: "sideways" },
+    {
+      before: last.startCursor,
+      after: last.endCursor,
+      expectedRevision: last.revision,
+    },
+    {
+      before: { ...last.startCursor, messageId: "absent" },
+      expectedRevision: last.revision,
+    },
+  ]) {
+    await assert.rejects(read(options), /page|cursor/u);
+  }
+  await assert.rejects(
+    session.storage.getFullContentMessagePage("foreign"),
+    /foreign/u,
+  );
+});
+
 test("the generated ESM bundle runs a real MemeLoop loop through the host completion bridge", async () => {
   const emitted = [];
   const requests = [];
@@ -37,6 +303,7 @@ test("the generated ESM bundle runs a real MemeLoop loop through the host comple
       run_id: "run-smoke-0001",
       timestamp: 1_700_000_000_000,
       turn_id: "turn-smoke-0001",
+      history_omitted_turns: 0,
     });
 
     assert.equal(requests.length, 1);
@@ -45,6 +312,7 @@ test("the generated ESM bundle runs a real MemeLoop loop through the host comple
     assert.deepEqual(completion, {
       answer: "The warranty lasts two years.",
       conversation_id: "conversation-smoke-0001",
+      history_omitted_turns: 0,
       model: "stub-model",
       run_id: "run-smoke-0001",
       turn_id: "turn-smoke-0001",

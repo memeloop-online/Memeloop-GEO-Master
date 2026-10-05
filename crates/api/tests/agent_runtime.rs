@@ -593,6 +593,8 @@ async fn heap_runaway_child_returns_a_recoverable_failure() {
                 run_id: uuid::Uuid::new_v4().into(),
                 prompt: "allocate until V8 stops this turn".to_owned(),
                 attachments: Vec::new(),
+                history: Vec::new(),
+                history_omitted_turns: 0,
             },
         )
         .await
@@ -948,6 +950,8 @@ fn cancellation_input() -> geo_domain::TurnInput {
         run_id: uuid::Uuid::new_v4().into(),
         prompt: "isolated cancellation".to_owned(),
         attachments: Vec::new(),
+        history: Vec::new(),
+        history_omitted_turns: 0,
     }
 }
 

@@ -34,7 +34,7 @@ pub use agent::{
     RUNTIME_NOT_CONFIGURED, RecordToolCall, Run, RunCompletion, RunId, RunStatus, RunTransition,
     RuntimeCapability, RuntimeCapabilityStatus, SharedAgentRepository, StoreCheckpoint,
     SubmitAcceptance, ToolCallDecision, ToolCallLedgerEntry, ToolCallLedgerId, ToolCallOutcome,
-    Turn, TurnId, TurnInput, TurnReport, TurnStatus, validate_append_message,
+    Turn, TurnHistoryMessage, TurnId, TurnInput, TurnReport, TurnStatus, validate_append_message,
     validate_checkpoint_write, validate_message_content, validate_tool_call_write,
 };
 pub use auth::{

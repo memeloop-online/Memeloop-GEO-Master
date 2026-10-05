@@ -109,6 +109,8 @@ pub fn dispatch(
         run_id: acceptance.run.id,
         prompt: acceptance.message.content.clone(),
         attachments: acceptance.message.attachments.clone(),
+        history: Vec::new(),
+        history_omitted_turns: 0,
     };
     tokio::spawn(async move {
         execute(runtime, repository, scope, input).await;

@@ -620,7 +620,24 @@ pub struct TurnInput {
     pub prompt: String,
     #[serde(default)]
     pub attachments: Vec<AttachmentReference>,
+    #[serde(default)]
+    pub history: Vec<TurnHistoryMessage>,
+    #[serde(default)]
+    pub history_omitted_turns: usize,
 }
+
+/// Text-only durable context, never attachment authority or model instructions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TurnHistoryMessage {
+    pub message_id: MessageId,
+    pub role: MessageRole,
+    pub content: String,
+    pub root_message_id: MessageId,
+    pub sequence: u64,
+}
+
+pub const MAX_HISTORY_TURNS: usize = 20;
+pub const MAX_HISTORY_BYTES: usize = 128 * 1024;
 
 impl ConversationDetail {
     /// Rebuild the exact accepted input from scoped durable records. This is
@@ -629,12 +646,20 @@ impl ConversationDetail {
         let run = self
             .runs
             .iter()
-            .find(|run| run.id == run_id && run.conversation_id == self.conversation.id)
+            .find(|run| {
+                run.id == run_id
+                    && run.conversation_id == self.conversation.id
+                    && run.scope() == self.conversation.scope()
+            })
             .ok_or_else(|| AppError::not_found("run not found in conversation"))?;
         let turn = self
             .turns
             .iter()
-            .find(|turn| turn.id == run.turn_id && turn.run_id == Some(run.id))
+            .find(|turn| {
+                turn.id == run.turn_id
+                    && turn.run_id == Some(run.id)
+                    && turn.conversation_id == self.conversation.id
+            })
             .ok_or_else(|| AppError::not_found("run turn not found"))?;
         let message = self
             .messages
@@ -644,8 +669,10 @@ impl ConversationDetail {
                     && message.conversation_id == self.conversation.id
                     && message.turn_id == Some(turn.id)
                     && message.role == MessageRole::User
+                    && message.scope() == self.conversation.scope()
             })
             .ok_or_else(|| AppError::not_found("run input message not found"))?;
+        let (history, history_omitted_turns) = self.completed_history(turn.id, message.sequence);
         Ok(TurnInput {
             conversation_id: self.conversation.id,
             message_id: message.id,
@@ -653,7 +680,109 @@ impl ConversationDetail {
             run_id: run.id,
             prompt: message.content.clone(),
             attachments: message.attachments.clone(),
+            history,
+            history_omitted_turns,
         })
+    }
+
+    fn completed_history(
+        &self,
+        current_turn_id: TurnId,
+        before_sequence: u64,
+    ) -> (Vec<TurnHistoryMessage>, usize) {
+        let scope = self.conversation.scope();
+        let mut pairs = Vec::new();
+        for turn in &self.turns {
+            if turn.id == current_turn_id
+                || turn.conversation_id != self.conversation.id
+                || turn.status != TurnStatus::Succeeded
+                || self
+                    .turns
+                    .iter()
+                    .filter(|other| other.id == turn.id)
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            let mut runs = self.runs.iter().filter(|run| Some(run.id) == turn.run_id);
+            let Some(run) = runs.next() else { continue };
+            if runs.next().is_some()
+                || run.turn_id != turn.id
+                || run.conversation_id != self.conversation.id
+                || run.scope() != scope
+                || run.status != RunStatus::Succeeded
+            {
+                continue;
+            }
+            let mut roots = self
+                .messages
+                .iter()
+                .filter(|item| item.id == turn.root_message_id);
+            let Some(root) = roots.next() else { continue };
+            let mut answers = self.messages.iter().filter(|item| {
+                item.turn_id == Some(turn.id) && item.role == MessageRole::Assistant
+            });
+            let Some(answer) = answers.next() else {
+                continue;
+            };
+            if roots.next().is_some()
+                || answers.next().is_some()
+                || root.role != MessageRole::User
+                || root.turn_id != Some(turn.id)
+                || answer.id == root.id
+                || root.sequence >= answer.sequence
+                || answer.sequence >= before_sequence
+                || answer.content.trim().is_empty()
+                || [root, answer].iter().any(|item| {
+                    item.conversation_id != self.conversation.id
+                        || item.scope() != scope
+                        || self
+                            .messages
+                            .iter()
+                            .filter(|other| other.id == item.id)
+                            .count()
+                            != 1
+                })
+            {
+                continue;
+            }
+            pairs.push([root, answer]);
+        }
+        pairs.sort_by_key(|pair| (pair[0].sequence, pair[0].id));
+        // Valid repository turns never overlap. Reject an earlier malformed
+        // pair rather than emitting non-monotonic message order to the runtime.
+        let mut next_root_sequence = before_sequence;
+        pairs = pairs
+            .into_iter()
+            .rev()
+            .filter(|pair| {
+                let valid = pair[1].sequence < next_root_sequence;
+                next_root_sequence = pair[0].sequence;
+                valid
+            })
+            .collect();
+        pairs.reverse();
+        let eligible = pairs.len();
+        let mut history = Vec::new();
+        // Stop at the first oversized pair: retain a contiguous newest suffix,
+        // never skip a large recent turn to smuggle older context back in.
+        for pair in pairs.into_iter().rev().take(MAX_HISTORY_TURNS) {
+            let messages = pair.map(|item| TurnHistoryMessage {
+                message_id: item.id,
+                role: item.role,
+                content: item.content.clone(),
+                root_message_id: pair[0].id,
+                sequence: item.sequence,
+            });
+            history.splice(0..0, messages);
+            if serde_json::to_vec(&history).map_or(true, |bytes| bytes.len() > MAX_HISTORY_BYTES) {
+                history.drain(0..2);
+                break;
+            }
+        }
+        let omitted = eligible - history.len() / 2;
+        (history, omitted)
     }
 }
 
@@ -1696,6 +1825,189 @@ mod tests {
             attachments: Vec::new(),
             metadata: Value::Null,
         }
+    }
+
+    async fn history_fixture(count: usize) -> (ConversationDetail, RunId) {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let conversation = repository
+            .create_conversation(&scope, None, CreateConversation::default())
+            .await
+            .unwrap();
+        let mut current = None;
+        for index in 0..=count {
+            let acceptance = repository
+                .append_message(
+                    &scope,
+                    conversation.id,
+                    message(&format!("question {index}")),
+                    format!("key-{index}"),
+                    format!("body-{index}"),
+                    RuntimeCapability::available("test", None),
+                )
+                .await
+                .unwrap();
+            current = Some(acceptance.run.id);
+            if index < count {
+                repository
+                    .begin_run(&scope, acceptance.run.id)
+                    .await
+                    .unwrap();
+                repository
+                    .finish_run(
+                        &scope,
+                        acceptance.run.id,
+                        RunCompletion::Succeeded {
+                            content: format!("answer {index}"),
+                            metadata: json!({"must_not_forward": "metadata"}),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        (
+            repository
+                .get_conversation(&scope, conversation.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            current.unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn durable_history_is_ordered_text_only_and_restores_deterministically() {
+        let (mut detail, run_id) = history_fixture(3).await;
+        let attachment = AttachmentReference {
+            attachment_id: Uuid::new_v4().into(),
+            object_id: "fixture-object".to_owned(),
+            filename: "fixture.txt".to_owned(),
+            media_type: Some("text/plain".to_owned()),
+            size_bytes: Some(4),
+            sha256: None,
+            object_version: None,
+        };
+        detail.messages[0].attachments.push(attachment.clone());
+        detail
+            .messages
+            .last_mut()
+            .unwrap()
+            .attachments
+            .push(attachment.clone());
+        let expected = detail.turn_input(run_id).unwrap();
+        assert_eq!(expected.attachments, vec![attachment]);
+        assert_eq!(expected.history.len(), 6);
+        assert_eq!(expected.history_omitted_turns, 0);
+        for (index, pair) in expected.history.chunks_exact(2).enumerate() {
+            assert_eq!(pair[0].role, MessageRole::User);
+            assert_eq!(pair[1].role, MessageRole::Assistant);
+            assert_eq!(pair[0].content, format!("question {index}"));
+            assert_eq!(pair[1].content, format!("answer {index}"));
+            assert_eq!(pair[0].root_message_id, pair[0].message_id);
+            assert_eq!(pair[1].root_message_id, pair[0].message_id);
+            assert!(pair[0].sequence < pair[1].sequence);
+        }
+        let encoded = serde_json::to_string(&expected.history).unwrap();
+        assert!(!encoded.contains("metadata"));
+        assert!(!encoded.contains("attachments"));
+        assert!(!encoded.contains("fixture-object"));
+        detail.messages.reverse();
+        detail.turns.reverse();
+        detail.runs.reverse();
+        let restored: ConversationDetail =
+            serde_json::from_slice(&serde_json::to_vec(&detail).unwrap()).unwrap();
+        assert_eq!(expected, restored.turn_input(run_id).unwrap());
+        let mut legacy = serde_json::to_value(&expected).unwrap();
+        legacy.as_object_mut().unwrap().remove("history");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("history_omitted_turns");
+        let legacy: TurnInput = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.history.is_empty());
+        assert_eq!(legacy.history_omitted_turns, 0);
+    }
+
+    #[tokio::test]
+    async fn history_excludes_unsuccessful_foreign_future_and_malformed_pairs() {
+        let (detail, run_id) = history_fixture(1).await;
+        let old_turn = detail
+            .turns
+            .iter()
+            .find(|turn| turn.run_id != Some(run_id))
+            .unwrap()
+            .id;
+        for variant in 0..13 {
+            let mut changed = detail.clone();
+            let turn = changed
+                .turns
+                .iter_mut()
+                .find(|turn| turn.id == old_turn)
+                .unwrap();
+            let run = changed
+                .runs
+                .iter_mut()
+                .find(|run| run.turn_id == old_turn)
+                .unwrap();
+            match variant {
+                0 => turn.status = TurnStatus::Failed,
+                1 => turn.status = TurnStatus::Cancelled,
+                2 => run.status = RunStatus::Failed,
+                3 => run.status = RunStatus::Cancelled,
+                4 => run.project_id = Uuid::new_v4().into(),
+                5 => run.tenant_id = Uuid::new_v4().into(),
+                6 => turn.conversation_id = Uuid::new_v4().into(),
+                7 => changed.messages[1].sequence = 100,
+                8 => changed.messages[1].tenant_id = Uuid::new_v4().into(),
+                9 => changed.messages[0].role = MessageRole::System,
+                10 => changed.messages.push(changed.messages[1].clone()),
+                11 => run.turn_id = Uuid::new_v4().into(),
+                12 => changed.messages[1].content.clear(),
+                _ => unreachable!(),
+            }
+            let input = changed.turn_input(run_id).unwrap();
+            assert!(input.history.is_empty(), "variant {variant}");
+            assert_eq!(input.history_omitted_turns, 0);
+        }
+        // Even reconstructing an already completed turn excludes its own answer.
+        let old_run = detail
+            .runs
+            .iter()
+            .find(|run| run.turn_id == old_turn)
+            .unwrap()
+            .id;
+        assert!(detail.turn_input(old_run).unwrap().history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_limits_keep_only_complete_newest_pairs_and_count_omissions() {
+        let (mut detail, run_id) = history_fixture(MAX_HISTORY_TURNS + 2).await;
+        let input = detail.turn_input(run_id).unwrap();
+        assert_eq!(input.history.len(), MAX_HISTORY_TURNS * 2);
+        assert_eq!(input.history_omitted_turns, 2);
+        assert_eq!(input.history[0].content, "question 2");
+        // A multibyte pair fits alone, but two do not fit in the JSON byte budget.
+        for message in &mut detail.messages {
+            if message.role == MessageRole::Assistant {
+                message.content = "界".repeat(25_000);
+            }
+        }
+        let input = detail.turn_input(run_id).unwrap();
+        assert_eq!(input.history.len(), 2);
+        assert_eq!(input.history_omitted_turns, MAX_HISTORY_TURNS + 1);
+        assert_eq!(input.history[1].content, "界".repeat(25_000));
+        assert!(serde_json::to_vec(&input.history).unwrap().len() <= MAX_HISTORY_BYTES);
+        let newest = detail
+            .messages
+            .iter_mut()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .max_by_key(|message| message.sequence)
+            .unwrap();
+        newest.content = "界".repeat(50_000);
+        let input = detail.turn_input(run_id).unwrap();
+        assert!(input.history.is_empty());
+        assert_eq!(input.history_omitted_turns, MAX_HISTORY_TURNS + 2);
     }
 
     #[tokio::test]
