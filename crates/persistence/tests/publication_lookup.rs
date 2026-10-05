@@ -738,7 +738,9 @@ async fn lookup_is_scoped_fenced_append_only_and_never_rewrites_send() {
         .unwrap();
     // Explicit read pagination regression: >20 rows, identical received_at
     // ties, cursor isolation and a genuine bounded SQL page.
-    let tied_at = later + Duration::seconds(2);
+    // Keep the pagination batch newer than the report-candidate batch above.
+    // Both batches remain in the append-only history and must be returned.
+    let tied_at = later + Duration::seconds(3);
     for number in 1..=25_u128 {
         let execution = Uuid::from_u128(number);
         sqlx::query(
@@ -782,8 +784,28 @@ async fn lookup_is_scoped_fenced_append_only_and_never_rewrites_send() {
         .observation_page(&scope, attempt_id, Some(page[19].execution_id), 20)
         .await
         .unwrap();
-    assert_eq!(second.len(), 7);
+    assert_eq!(second.len(), 21);
     assert_eq!(second[0].execution_id, Uuid::from_u128(5));
+    let mut all_paged = page[..20].to_vec();
+    let mut current_page = second;
+    loop {
+        assert!(current_page.len() <= 21);
+        let has_more = current_page.len() > 20;
+        current_page.truncate(20);
+        let cursor = current_page.last().map(|item| item.execution_id);
+        all_paged.extend(current_page);
+        if !has_more {
+            break;
+        }
+        current_page = lookup
+            .observation_page(&scope, attempt_id, cursor, 20)
+            .await
+            .unwrap();
+    }
+    let mut expected_history = lookup.observations(&scope, attempt_id).await.unwrap();
+    expected_history.sort_by_key(|item| std::cmp::Reverse((item.received_at, item.execution_id)));
+    assert_eq!(expected_history.len(), 62);
+    assert_eq!(all_paged, expected_history);
     assert_eq!(
         lookup
             .observation_page(&other, attempt_id, Some(page[19].execution_id), 20)
