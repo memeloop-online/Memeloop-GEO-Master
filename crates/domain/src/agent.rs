@@ -876,6 +876,20 @@ pub trait AgentRepository: Send + Sync {
         scope: &TenantScope,
         id: ConversationId,
     ) -> Result<Option<ConversationDetail>, AppError>;
+    /// Restore execution input without requiring the whole conversation to be
+    /// materialized. Stores can override this to bound durable history reads;
+    /// the default preserves compatibility with in-memory implementations.
+    async fn load_turn_input(
+        &self,
+        scope: &TenantScope,
+        conversation_id: ConversationId,
+        run_id: RunId,
+    ) -> Result<TurnInput, AppError> {
+        self.get_conversation(scope, conversation_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("run conversation not found"))?
+            .turn_input(run_id)
+    }
     async fn create_conversation(
         &self,
         scope: &TenantScope,

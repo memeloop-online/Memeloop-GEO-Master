@@ -191,11 +191,9 @@ async fn execute_claimed(
     // The accepted message is the durable input authority, including its
     // attachment bindings. Reconstruct exactly the same input on reentry.
     let execution = async {
-        let detail = repository
-            .get_conversation(&scope, claimed.conversation_id)
-            .await?
-            .ok_or_else(|| AppError::not_found("run conversation not found"))?;
-        let restored = detail.turn_input(run_id)?;
+        let restored = repository
+            .load_turn_input(&scope, claimed.conversation_id, run_id)
+            .await?;
         let report = runtime
             .run_turn_with_cancellation(&scope, restored.clone(), Arc::clone(&cancellation))
             .await?;

@@ -1288,6 +1288,13 @@ async fn agent_history_restores_completed_pairs_after_repository_restart() {
         .unwrap()
         .unwrap();
     let restored = detail.turn_input(second.run.id).unwrap();
+    assert_eq!(
+        restored,
+        restarted
+            .load_turn_input(&scope, conversation.id, second.run.id)
+            .await
+            .unwrap()
+    );
     assert_eq!(restored.history.len(), 2);
     assert_eq!(restored.history[0].message_id, first.message.id);
     assert_eq!(restored.history[0].role, MessageRole::User);
@@ -1312,6 +1319,245 @@ async fn agent_history_restores_completed_pairs_after_repository_restart() {
             .unwrap()
             .is_none()
     );
+    assert!(
+        restarted
+            .load_turn_input(&sibling, conversation.id, second.run.id)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn agent_bounded_history_preserves_cutoffs_success_and_exact_omissions() {
+    let database = connect().await;
+    let pool = database.pool().clone();
+    let repository = PgAgentRepository::new(pool.clone());
+    let scope = seed_scope(&pool, "bounded-history").await;
+    let conversation = create_conversation(&repository, &scope).await;
+    let mut first_run = None;
+    let mut latest_turn = None;
+    for index in 0..28 {
+        let accepted = repository
+            .append_message(
+                &scope,
+                conversation.id,
+                message(&format!("question {index}")),
+                format!("bounded-question-{index}"),
+                format!("bounded-body-{index}"),
+                RuntimeCapability::available("deno_core", None),
+            )
+            .await
+            .unwrap();
+        repository
+            .begin_run(&scope, accepted.run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        repository
+            .finish_run(
+                &scope,
+                accepted.run.id,
+                RunCompletion::Succeeded {
+                    content: format!("answer {index}"),
+                    metadata: Value::Null,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        if index == 0 {
+            first_run = Some(accepted.run.id);
+        }
+        latest_turn = Some(accepted.turn.id);
+    }
+    let failed = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("failed prompt"),
+            "bounded-failed".into(),
+            "bounded-failed-body".into(),
+            RuntimeCapability::available("deno_core", None),
+        )
+        .await
+        .unwrap();
+    repository.begin_run(&scope, failed.run.id).await.unwrap();
+    repository
+        .finish_run(
+            &scope,
+            failed.run.id,
+            RunCompletion::Failed {
+                error: geo_domain::AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "model unavailable",
+                ),
+            },
+        )
+        .await
+        .unwrap();
+    let current = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("current prompt"),
+            "bounded-current".into(),
+            "bounded-current-body".into(),
+            RuntimeCapability::available("deno_core", None),
+        )
+        .await
+        .unwrap();
+    let restarted = PgAgentRepository::new(pool);
+    let loaded = restarted
+        .load_turn_input(&scope, conversation.id, current.run.id)
+        .await
+        .unwrap();
+    let detail = restarted
+        .get_conversation(&scope, conversation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded, detail.turn_input(current.run.id).unwrap());
+    assert_eq!(loaded.prompt, "current prompt");
+    assert_eq!(loaded.history.len(), 40);
+    assert_eq!(loaded.history_omitted_turns, 8);
+    assert_eq!(loaded.history[0].content, "question 8");
+    assert_eq!(loaded.history[39].content, "answer 27");
+    assert!(
+        restarted
+            .load_turn_input(&scope, conversation.id, first_run.unwrap())
+            .await
+            .unwrap()
+            .history
+            .is_empty()
+    );
+
+    // A legacy/corrupt whitespace-only answer is not a valid pair even when
+    // the whitespace is non-ASCII; the scoped bounded read must agree with
+    // domain reconstruction on both selection and omission count.
+    sqlx::query("UPDATE agent_messages SET content = $1 WHERE turn_id = $2 AND role = 'assistant'")
+        .bind("\u{00a0}\u{2003}")
+        .bind(latest_turn.unwrap().as_uuid())
+        .execute(restarted.pool())
+        .await
+        .unwrap();
+    let loaded = restarted
+        .load_turn_input(&scope, conversation.id, current.run.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded,
+        restarted
+            .get_conversation(&scope, conversation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .turn_input(current.run.id)
+            .unwrap()
+    );
+    assert_eq!(loaded.history_omitted_turns, 7);
+    assert_eq!(loaded.history[0].content, "question 7");
+    assert_eq!(loaded.history[39].content, "answer 26");
+
+    // A second answer recorded after the current prompt still invalidates
+    // the old turn: the cutoff applies to valid pairs, not the answer count.
+    let duplicate_turn: Uuid = sqlx::query_scalar(
+        "SELECT turn_id FROM agent_messages WHERE conversation_id = $1 AND content = 'answer 26'",
+    )
+    .bind(conversation.id.as_uuid())
+    .fetch_one(restarted.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO agent_messages
+                (message_id, conversation_id, operator_id, tenant_id, project_id,
+                 turn_id, role, content, sequence)
+            SELECT $1, conversation_id, operator_id, tenant_id, project_id,
+                   turn_id, role, 'duplicate answer',
+                   (SELECT MAX(sequence) + 1 FROM agent_messages WHERE conversation_id = $2)
+              FROM agent_messages
+             WHERE turn_id = $3 AND role = 'assistant'"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(conversation.id.as_uuid())
+    .bind(duplicate_turn)
+    .execute(restarted.pool())
+    .await
+    .unwrap();
+    let loaded = restarted
+        .load_turn_input(&scope, conversation.id, current.run.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded,
+        restarted
+            .get_conversation(&scope, conversation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .turn_input(current.run.id)
+            .unwrap()
+    );
+    assert_eq!(loaded.history_omitted_turns, 6);
+    assert_eq!(loaded.history[0].content, "question 6");
+    assert_eq!(loaded.history[39].content, "answer 25");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn agent_bounded_history_stops_at_oversized_recent_pair() {
+    let database = connect().await;
+    let pool = database.pool().clone();
+    let repository = PgAgentRepository::new(pool.clone());
+    let scope = seed_scope(&pool, "bounded-history-bytes").await;
+    let conversation = create_conversation(&repository, &scope).await;
+    for index in 0..25 {
+        let accepted = repository
+            .append_message(
+                &scope,
+                conversation.id,
+                message(&format!("question {index}")),
+                format!("bounded-bytes-{index}"),
+                format!("bounded-bytes-body-{index}"),
+                RuntimeCapability::available("deno_core", None),
+            )
+            .await
+            .unwrap();
+        repository.begin_run(&scope, accepted.run.id).await.unwrap();
+        repository
+            .finish_run(
+                &scope,
+                accepted.run.id,
+                RunCompletion::Succeeded {
+                    content: if index == 23 {
+                        "界".repeat(45_000)
+                    } else {
+                        format!("answer {index}")
+                    },
+                    metadata: Value::Null,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let current = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("current prompt"),
+            "bounded-bytes-current".into(),
+            "bounded-bytes-current-body".into(),
+            RuntimeCapability::available("deno_core", None),
+        )
+        .await
+        .unwrap();
+    let loaded = PgAgentRepository::new(pool)
+        .load_turn_input(&scope, conversation.id, current.run.id)
+        .await
+        .unwrap();
+    assert_eq!(loaded.history.len(), 2);
+    assert_eq!(loaded.history[0].content, "question 24");
+    assert_eq!(loaded.history_omitted_turns, 24);
 }
 
 #[tokio::test]

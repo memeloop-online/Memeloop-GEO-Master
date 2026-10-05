@@ -502,6 +502,36 @@ function zhihuPostUrl(value, origin = ZHIHU_POST_ORIGIN) {
   }
 }
 
+function zhihuPublicationCandidateUrl(value, postOrigin) {
+  try {
+    const expected = new URL(postOrigin);
+    const loopback =
+      expected.protocol === "http:" &&
+      (expected.hostname === "127.0.0.1" ||
+        expected.hostname === "localhost" ||
+        expected.hostname === "[::1]");
+    if (
+      postOrigin !== expected.origin ||
+      (postOrigin !== ZHIHU_POST_ORIGIN && !loopback)
+    ) {
+      return null;
+    }
+    const url = new URL(value);
+    const canonical = `${expected.origin}${url.pathname}`;
+    return url.origin === expected.origin &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      /^\/p\/[0-9]+$/u.test(url.pathname) &&
+      url.href === canonical
+      ? canonical
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 async function ownZhihuArticle(
   page,
   postId,
@@ -712,13 +742,31 @@ export async function publishZhihu(
   } catch {
     return unknown("submission_outcome_unverified", "submit");
   }
-  return readbackZhihu(page, page.url(), content, {
+  const candidateUrl = zhihuPublicationCandidateUrl(page.url(), postOrigin);
+  const observedAt = new Date().toISOString();
+  const outcome = await readbackZhihu(page, page.url(), content, {
     postOrigin,
     selfUrl,
     articlesOrigin,
     proxy,
     expectedAccountId,
   });
+  if (outcome.status !== "unknown" || !candidateUrl) return outcome;
+  return {
+    ...outcome,
+    occurred_at: observedAt,
+    evidence: [
+      ...outcome.evidence,
+      {
+        kind: "publication_candidate",
+        schema_version: "geo.publication.candidate.v1",
+        url: candidateUrl,
+        expected_sha256: digest(content.title, content.body),
+        observed_at: observedAt,
+        source: "post_submit_navigation",
+      },
+    ],
+  };
 }
 
 function plainTextHtml(text) {

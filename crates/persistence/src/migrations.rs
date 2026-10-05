@@ -100,6 +100,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 22,
         description: "agent queued scan",
     },
+    MigrationMetadata {
+        version: 23,
+        description: "publication lookup",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

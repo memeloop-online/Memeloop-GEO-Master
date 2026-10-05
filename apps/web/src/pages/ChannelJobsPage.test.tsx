@@ -35,6 +35,12 @@ const account = {
   created_at: "2026-10-01T00:00:00Z",
   updated_at: "2026-10-01T00:00:00Z",
 };
+const measurementAccount = {
+  ...account,
+  account_id: "measure-account-1",
+  platform: "kimi",
+  display_name: "测量账号",
+};
 const target = {
   target_id: "target-1",
   input: {
@@ -73,6 +79,8 @@ function mockApi({
   executeError = false,
   role = "tenant_admin",
   currentCycleId = cycleId,
+  measurementSupported = true,
+  planConflict = false,
 }: {
   accounts?: unknown[];
   sources?: unknown[];
@@ -81,6 +89,8 @@ function mockApi({
   executeError?: boolean;
   role?: string;
   currentCycleId?: string | null;
+  measurementSupported?: boolean;
+  planConflict?: boolean;
 } = {}) {
   let plan = initialPlan;
   let detail: ChannelTargetView = { target, attempts: [] };
@@ -140,6 +150,13 @@ function mockApi({
         );
       if (path.endsWith(`/cycles/${currentCycleId}/channel-plan`)) {
         if (method === "POST") {
+          if (planConflict)
+            return Promise.resolve(
+              response(
+                { code: "conflict", message: "plan already sealed" },
+                409,
+              ),
+            );
           plan = frozenPlan;
           return Promise.resolve(response(plan));
         }
@@ -182,6 +199,16 @@ function mockApi({
                 purpose: "publishing",
                 login_supported: true,
               },
+              ...(measurementSupported
+                ? [
+                    {
+                      id: "kimi",
+                      label: "Kimi 网页",
+                      purpose: "measurement",
+                      login_supported: true,
+                    },
+                  ]
+                : []),
             ],
           }),
         );
@@ -359,6 +386,151 @@ describe("P12 channel jobs", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "封存本轮计划" })).toBeDisabled();
     expect(requests.filter((item) => item.method === "POST")).toHaveLength(0);
+  });
+
+  it("freezes a typed independent Kimi measurement without any publication", async () => {
+    const requests = mockApi({
+      sources: [],
+      accounts: [account, measurementAccount],
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await user.selectOptions(
+      await screen.findByLabelText("项目 Kimi 测量账号"),
+      "measure-account-1",
+    );
+    await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
+    await user.type(screen.getByLabelText("采样协议版本"), "protocol-v1");
+    await user.type(screen.getByLabelText("问题集版本"), "evaluation-v2");
+    await user.type(screen.getByLabelText("市场"), "CN");
+    await user.type(screen.getByLabelText("语言"), "zh-CN");
+    await user.type(screen.getByLabelText("冻结评估问题"), "这是什么产品？");
+    await user.clear(screen.getByLabelText("样本序号（0–10000）"));
+    await user.type(screen.getByLabelText("样本序号（0–10000）"), "3");
+    await user.type(
+      screen.getByLabelText("计划采样时间（本地时间）"),
+      "2026-10-06T12:30",
+    );
+    expect(
+      screen.getByText(/官方联网搜索适配器尚未实测验证/),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "加入测量目标" }));
+    await user.click(screen.getByRole("button", { name: "封存本轮计划" }));
+    const request = requests.find(
+      (item) =>
+        item.method === "POST" &&
+        item.path.endsWith("/cycles/cycle-1/channel-plan"),
+    );
+    expect(request?.body).toEqual({
+      publications: [],
+      measurements: [
+        {
+          account_id: "measure-account-1",
+          provider: "kimi",
+          model: "observed-model",
+          surface: "consumer_web",
+          search_mode: "web_search",
+          protocol_version: "protocol-v1",
+          question_set_version: "evaluation-v2",
+          question: "这是什么产品？",
+          market: "CN",
+          language: "zh-CN",
+          scheduled_at: new Date("2026-10-06T12:30").toISOString(),
+          sample_ordinal: 3,
+        },
+      ],
+    });
+    expect(screen.queryByText(/已观察/)).not.toBeInTheDocument();
+  });
+
+  it("rejects empty or malformed measurement inputs, publishing accounts and unavailable Kimi accounts", async () => {
+    const requests = mockApi({
+      sources: [],
+      accounts: [account, { ...measurementAccount, status: "needs_login" }],
+    });
+    const user = userEvent.setup();
+    renderPage();
+    expect(
+      await screen.findByText(/没有已连接且就绪的项目 Kimi 测量账号/),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("项目 Kimi 测量账号")).toBeDisabled();
+    expect(
+      within(screen.getByLabelText("项目 Kimi 测量账号")).queryByRole(
+        "option",
+        { name: /项目账号/ },
+      ),
+    ).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("冻结评估问题"), "问题");
+    expect(screen.getByRole("button", { name: "加入测量目标" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "封存本轮计划" })).toBeDisabled();
+    expect(requests.filter((item) => item.method === "POST")).toHaveLength(0);
+  });
+
+  it("keeps a ready measurement disabled for malformed date or sample ordinal", async () => {
+    const requests = mockApi({ sources: [], accounts: [measurementAccount] });
+    const user = userEvent.setup();
+    renderPage();
+    await user.selectOptions(
+      await screen.findByLabelText("项目 Kimi 测量账号"),
+      "measure-account-1",
+    );
+    await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
+    await user.type(screen.getByLabelText("采样协议版本"), "v1");
+    await user.type(screen.getByLabelText("问题集版本"), "q1");
+    await user.type(screen.getByLabelText("市场"), "CN");
+    await user.type(screen.getByLabelText("语言"), "zh-CN");
+    await user.type(screen.getByLabelText("冻结评估问题"), "问题");
+    await user.clear(screen.getByLabelText("样本序号（0–10000）"));
+    await user.type(screen.getByLabelText("样本序号（0–10000）"), "10001");
+    expect(screen.getByRole("button", { name: "加入测量目标" })).toBeDisabled();
+    await user.clear(screen.getByLabelText("样本序号（0–10000）"));
+    await user.type(screen.getByLabelText("样本序号（0–10000）"), "0");
+    expect(screen.getByRole("button", { name: "加入测量目标" })).toBeDisabled();
+    expect(requests.filter((item) => item.method === "POST")).toHaveLength(0);
+  });
+
+  it("does not offer measurement accounts when the platform lacks measurement login support", async () => {
+    mockApi({
+      sources: [],
+      accounts: [measurementAccount],
+      measurementSupported: false,
+    });
+    renderPage();
+    expect(
+      await screen.findByText(/没有已连接且就绪的项目 Kimi 测量账号/),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("项目 Kimi 测量账号")).toBeDisabled();
+  });
+
+  it("keeps the plan editable after a 409 conflict and offers a refresh", async () => {
+    const requests = mockApi({
+      sources: [],
+      accounts: [measurementAccount],
+      planConflict: true,
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await user.selectOptions(
+      await screen.findByLabelText("项目 Kimi 测量账号"),
+      "measure-account-1",
+    );
+    await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
+    await user.type(screen.getByLabelText("采样协议版本"), "v1");
+    await user.type(screen.getByLabelText("问题集版本"), "q1");
+    await user.type(screen.getByLabelText("市场"), "CN");
+    await user.type(screen.getByLabelText("语言"), "zh-CN");
+    await user.type(screen.getByLabelText("冻结评估问题"), "问题");
+    await user.type(
+      screen.getByLabelText("计划采样时间（本地时间）"),
+      "2026-10-06T12:30",
+    );
+    await user.click(screen.getByRole("button", { name: "加入测量目标" }));
+    await user.click(screen.getByRole("button", { name: "封存本轮计划" }));
+    expect(
+      await screen.findByText(/本轮可能已由其他操作封存，请刷新计划/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "封存本轮计划" })).toBeEnabled();
+    expect(requests.filter((item) => item.method === "POST")).toHaveLength(1);
   });
 
   it.each(["unsupported", "login_required", "unknown"] as const)(

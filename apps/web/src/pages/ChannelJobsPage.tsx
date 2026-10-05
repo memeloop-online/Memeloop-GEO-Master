@@ -4,10 +4,12 @@ import {
   Button,
   Card,
   Field,
+  Input,
   MessageBar,
   MessageBarBody,
   Select,
   Spinner,
+  Textarea,
 } from "@fluentui/react-components";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
@@ -23,6 +25,7 @@ import {
   type ChannelPlan,
   type ChannelTarget,
   type ChannelTargetView,
+  type MeasurementRequest,
   type PublicationRequest,
 } from "../api/channelJobs";
 import { useChannelData } from "../api/channels";
@@ -56,6 +59,13 @@ function errorText(error: unknown) {
 
 function dateTime(value?: string | null) {
   return value ? new Date(value).toLocaleString("zh-CN") : "未记录";
+}
+
+function validText(value: string, maxBytes: number) {
+  return (
+    Boolean(value.trim()) &&
+    new TextEncoder().encode(value.trim()).length <= maxBytes
+  );
 }
 
 function TargetCard({
@@ -103,6 +113,16 @@ function TargetCard({
           </>
         )}
       </p>
+      {input.kind === "measure" && (
+        <p>
+          独立测量 · {input.surface} / {input.search_mode} · 模型 {input.model}
+          {" · "}协议 {input.protocol_version} · 问题集{" "}
+          {input.question_set_version}
+          {" · "}
+          {input.market} / {input.language} · 样本 {input.sample_ordinal}
+          {" · "}排期 {dateTime(input.scheduled_at)}
+        </p>
+      )}
       {loading && <Spinner label="正在读取执行记录" size="tiny" />}
       {loadError && (
         <ErrorState
@@ -325,6 +345,18 @@ export function ChannelJobsPage() {
   const [versionId, setVersionId] = useState("");
   const [accountId, setAccountId] = useState("");
   const [draft, setDraft] = useState<PublicationRequest[]>([]);
+  const [measurementDraft, setMeasurementDraft] = useState<
+    MeasurementRequest[]
+  >([]);
+  const [measurementAccountId, setMeasurementAccountId] = useState("");
+  const [model, setModel] = useState("");
+  const [protocolVersion, setProtocolVersion] = useState("");
+  const [questionSetVersion, setQuestionSetVersion] = useState("");
+  const [question, setQuestion] = useState("");
+  const [market, setMarket] = useState("");
+  const [language, setLanguage] = useState("");
+  const [scheduledAt, setScheduledAt] = useState("");
+  const [sampleOrdinal, setSampleOrdinal] = useState("0");
   const sourceDetail = useSourceQuery(
     tenantId,
     projectId,
@@ -346,19 +378,54 @@ export function ChannelJobsPage() {
   const selectedAccount = accounts.find(
     (account) => account.account_id === accountId,
   );
+  // The platform registry describes login support, not verified official search.
+  const kimiPlatform = channels.platforms.data?.items.find(
+    (platform) =>
+      platform.id === "kimi" &&
+      platform.purpose === "measurement" &&
+      platform.login_supported,
+  );
+  const measurementAccounts = kimiPlatform
+    ? (channels.accounts.data?.items ?? []).filter(
+        (account) =>
+          account.platform === "kimi" &&
+          account.enabled &&
+          account.status === "ready",
+      )
+    : [];
+  const selectedMeasurementAccount = measurementAccounts.find(
+    (account) => account.account_id === measurementAccountId,
+  );
+  const scheduledDate =
+    scheduledAt && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(scheduledAt)
+      ? new Date(scheduledAt)
+      : null;
+  const validMeasurement =
+    Boolean(selectedMeasurementAccount) &&
+    validText(model, 100) &&
+    validText(protocolVersion, 100) &&
+    validText(questionSetVersion, 100) &&
+    validText(question, 4000) &&
+    validText(market, 100) &&
+    validText(language, 100) &&
+    Boolean(scheduledDate && !Number.isNaN(scheduledDate.getTime())) &&
+    /^(0|[1-9]\d*)$/.test(sampleOrdinal) &&
+    Number(sampleOrdinal) <= 10000;
   useEffect(() => {
     setVersionId(sourceDetail.data?.source.current_version_id ?? "");
   }, [sourceDetail.data, sourceId]);
   useEffect(() => {
     setDraft([]);
+    setMeasurementDraft([]);
     setSourceId("");
     setAccountId("");
+    setMeasurementAccountId("");
   }, [cycleId, projectId]);
   const submission = useMutation({
     mutationFn: () =>
       submitChannelPlan(tenantId!, projectId!, cycleId!, {
         publications: draft,
-        measurements: [],
+        measurements: measurementDraft,
       }),
     onSuccess: (saved) => client.setQueryData(planKey, saved),
     onError: () => void client.invalidateQueries({ queryKey: planKey }),
@@ -380,6 +447,31 @@ export function ChannelJobsPage() {
     )
       return;
     setDraft((items) => [...items, item]);
+  };
+  const addMeasurement = () => {
+    if (!validMeasurement || !selectedMeasurementAccount || !scheduledDate)
+      return;
+    const item: MeasurementRequest = {
+      account_id: selectedMeasurementAccount.account_id,
+      provider: "kimi",
+      model: model.trim(),
+      surface: "consumer_web",
+      search_mode: "web_search",
+      protocol_version: protocolVersion.trim(),
+      question_set_version: questionSetVersion.trim(),
+      question: question.trim(),
+      market: market.trim(),
+      language: language.trim(),
+      scheduled_at: scheduledDate.toISOString(),
+      sample_ordinal: Number(sampleOrdinal),
+    };
+    if (
+      measurementDraft.some(
+        (other) => JSON.stringify(other) === JSON.stringify(item),
+      )
+    )
+      return;
+    setMeasurementDraft((items) => [...items, item]);
   };
 
   if (!tenantId || !projectId) {
@@ -441,7 +533,7 @@ export function ChannelJobsPage() {
               <MessageBar intent="warning">
                 <MessageBarBody>
                   提交将一次性封存本轮所有发布目标，之后不能追加、替换来源版本或账号。
-                  请先加入全部目标。当前独立测量列表为空，不会伪造测量样本。
+                  请先加入全部目标。独立测量可单独封存，无需发布来源；冻结计划不等于采样成功。
                 </MessageBarBody>
               </MessageBar>
               {!canWrite ? (
@@ -591,11 +683,162 @@ export function ChannelJobsPage() {
                       ))}
                     </ul>
                   ) : (
-                    <p>还没有目标。不会提交空计划。</p>
+                    <p>还没有发布目标；可以仅封存独立测量。</p>
+                  )}
+                  <h3>独立 AI 测量（消费端网页）</h3>
+                  <MessageBar intent="warning">
+                    <MessageBarBody>
+                      Kimi
+                      网页账号登录只表示可尝试采样。官方联网搜索适配器尚未实测验证，
+                      当前会返回不支持或缺测；不能将登录或普通模型回答视为官方搜索成功。
+                      模型标识和协议版本须按实际观测填写，系统尚不提供已验证的模型能力列表。
+                    </MessageBarBody>
+                  </MessageBar>
+                  {!channels.accounts.isPending &&
+                    !channels.platforms.isPending &&
+                    !channels.accounts.isError &&
+                    !channels.platforms.isError &&
+                    !measurementAccounts.length && (
+                      <p role="status">
+                        没有已连接且就绪的项目 Kimi
+                        测量账号；发布账号不能用于测量。
+                      </p>
+                    )}
+                  <div className="channel-jobs-form">
+                    <Field label="项目 Kimi 测量账号">
+                      <Select
+                        value={measurementAccountId}
+                        onChange={(_, data) =>
+                          setMeasurementAccountId(data.value)
+                        }
+                        disabled={!measurementAccounts.length}
+                      >
+                        <option value="">选择测量账号</option>
+                        {measurementAccounts.map((account) => (
+                          <option
+                            key={account.account_id}
+                            value={account.account_id}
+                          >
+                            {account.display_name ?? account.account_id}
+                            {" · "}
+                            {account.owner_kind === "operator_pool"
+                              ? "已分配资源"
+                              : "项目自有"}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    <Field label="可见模型标识">
+                      <Input
+                        value={model}
+                        onChange={(_, data) => setModel(data.value)}
+                        maxLength={100}
+                      />
+                    </Field>
+                    <Field label="采样协议版本">
+                      <Input
+                        value={protocolVersion}
+                        onChange={(_, data) => setProtocolVersion(data.value)}
+                        maxLength={100}
+                      />
+                    </Field>
+                    <Field label="问题集版本">
+                      <Input
+                        value={questionSetVersion}
+                        onChange={(_, data) =>
+                          setQuestionSetVersion(data.value)
+                        }
+                        maxLength={100}
+                      />
+                    </Field>
+                    <Field label="市场">
+                      <Input
+                        value={market}
+                        onChange={(_, data) => setMarket(data.value)}
+                        maxLength={100}
+                      />
+                    </Field>
+                    <Field label="语言">
+                      <Input
+                        value={language}
+                        onChange={(_, data) => setLanguage(data.value)}
+                        maxLength={100}
+                      />
+                    </Field>
+                    <Field label="计划采样时间（本地时间）">
+                      <Input
+                        type="datetime-local"
+                        value={scheduledAt}
+                        onChange={(_, data) => setScheduledAt(data.value)}
+                      />
+                    </Field>
+                    <Field label="样本序号（0–10000）">
+                      <Input
+                        type="number"
+                        min={0}
+                        max={10000}
+                        step={1}
+                        value={sampleOrdinal}
+                        onChange={(_, data) => setSampleOrdinal(data.value)}
+                      />
+                    </Field>
+                    <Field label="冻结评估问题">
+                      <Textarea
+                        value={question}
+                        onChange={(_, data) => setQuestion(data.value)}
+                        maxLength={4000}
+                      />
+                    </Field>
+                    <Button
+                      onClick={addMeasurement}
+                      disabled={
+                        !validMeasurement ||
+                        draft.length + measurementDraft.length >= 100
+                      }
+                    >
+                      加入测量目标
+                    </Button>
+                  </div>
+                  <p>
+                    固定协议：Kimi · consumer_web ·
+                    web_search。问题及其答案仅用于独立评估，不进入内容优化输入。
+                  </p>
+                  <h3>待封存测量（{measurementDraft.length}）</h3>
+                  {measurementDraft.length ? (
+                    <ul className="channel-jobs-draft">
+                      {measurementDraft.map((item, index) => (
+                        <li
+                          key={`${item.account_id}-${item.question_set_version}-${item.sample_ordinal}-${index}`}
+                        >
+                          {item.question} · {item.model} /{" "}
+                          {item.protocol_version}
+                          {" · "}
+                          {item.market} / {item.language}
+                          {" · "}样本 {item.sample_ordinal} ·{" "}
+                          {dateTime(item.scheduled_at)}
+                          <Button
+                            appearance="subtle"
+                            onClick={() =>
+                              setMeasurementDraft((items) =>
+                                items.filter((_, i) => i !== index),
+                              )
+                            }
+                          >
+                            移除测量
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>还没有测量目标。</p>
                   )}
                   <Button
                     appearance="primary"
-                    disabled={!draft.length || submission.isPending}
+                    disabled={
+                      (!draft.length && !measurementDraft.length) ||
+                      draft.length + measurementDraft.length > 100 ||
+                      submission.isPending
+                    }
                     onClick={() => submission.mutate()}
                   >
                     {submission.isPending ? "正在封存…" : "封存本轮计划"}

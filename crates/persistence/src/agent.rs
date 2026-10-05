@@ -17,10 +17,11 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AgentCheckpoint, AgentRepository, AppError, AppendMessage, AttachmentId, AttachmentReference,
     CheckpointId, Conversation, ConversationDetail, ConversationEvent, ConversationEventId,
-    ConversationId, ConversationStatus, CreateConversation, Message, MessageId, MessageRole,
-    RecordToolCall, Run, RunCompletion, RunId, RunStatus, RunTransition, RuntimeCapability,
-    StoreCheckpoint, SubmitAcceptance, TenantScope, ToolCallDecision, ToolCallLedgerEntry,
-    ToolCallLedgerId, ToolCallOutcome, Turn, TurnId, TurnStatus, UserId, validate_append_message,
+    ConversationId, ConversationStatus, CreateConversation, MAX_HISTORY_BYTES, MAX_HISTORY_TURNS,
+    Message, MessageId, MessageRole, RecordToolCall, Run, RunCompletion, RunId, RunStatus,
+    RunTransition, RuntimeCapability, StoreCheckpoint, SubmitAcceptance, TenantScope,
+    ToolCallDecision, ToolCallLedgerEntry, ToolCallLedgerId, ToolCallOutcome, Turn,
+    TurnHistoryMessage, TurnId, TurnInput, TurnStatus, UserId, validate_append_message,
     validate_checkpoint_write, validate_message_content, validate_tool_call_write,
 };
 use serde_json::{Value, json};
@@ -222,6 +223,196 @@ impl AgentRepository for PgAgentRepository {
             turns,
             runs,
         }))
+    }
+
+    async fn load_turn_input(
+        &self,
+        scope: &TenantScope,
+        conversation_id: ConversationId,
+        run_id: RunId,
+    ) -> Result<TurnInput, AppError> {
+        let mut transaction = self.transaction(scope).await?;
+        let run = fetch_run(&mut transaction, scope, run_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("run conversation not found"))?;
+        if run.conversation_id != conversation_id {
+            return Err(AppError::not_found("run conversation not found"));
+        }
+        let conversation = fetch_conversation(&mut transaction, scope, run.conversation_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("run conversation not found"))?;
+        let turn = sqlx::query_as::<_, TurnRow>(
+            r#"SELECT turn_id, conversation_id, root_message_id, previous_turn_id, run_id,
+                      status, cancel_version, created_at, updated_at
+                 FROM agent_turns
+                WHERE turn_id = $1 AND operator_id = $2 AND tenant_id = $3
+                  AND project_id = $4 AND conversation_id = $5"#,
+        )
+        .bind(run.turn_id.as_uuid())
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(run.project_id.as_uuid())
+        .bind(conversation.id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .map(Turn::try_from)
+        .transpose()?
+        .ok_or_else(|| AppError::not_found("run turn not found"))?;
+        if turn.run_id != Some(run.id) {
+            return Err(AppError::not_found("run turn not found"));
+        }
+        let message = sqlx::query_as::<_, MessageRow>(
+            r#"SELECT message_id, conversation_id, operator_id, tenant_id, project_id, turn_id,
+                      role, content, metadata, sequence, created_at
+                 FROM agent_messages
+                WHERE message_id = $1 AND operator_id = $2 AND tenant_id = $3
+                  AND project_id = $4 AND conversation_id = $5"#,
+        )
+        .bind(turn.root_message_id.as_uuid())
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(run.project_id.as_uuid())
+        .bind(conversation.id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| AppError::not_found("run input message not found"))?;
+        if message.turn_id != Some(turn.id.as_uuid()) || message.role != "user" {
+            return Err(AppError::not_found("run input message not found"));
+        }
+        let before_sequence = message.sequence;
+        let message_id = MessageId::from(message.message_id);
+        let prompt = message.content;
+        let attachments = sqlx::query_as::<_, AttachmentRow>(
+            r#"SELECT message_id, attachment_id, object_id, filename, media_type, size_bytes,
+                      sha256, object_version
+                 FROM agent_message_attachments
+                WHERE operator_id = $1 AND tenant_id = $2 AND project_id = $3
+                  AND conversation_id = $4 AND message_id = $5
+                ORDER BY ordinal ASC"#,
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(run.project_id.as_uuid())
+        .bind(conversation.id.as_uuid())
+        .bind(message_id.as_uuid())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(AttachmentReference::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+
+        // Count *all* eligible successful pairs but transfer only the newest
+        // twenty. This keeps the omission count exact without loading an
+        // unbounded conversation or historical attachment metadata into Rust.
+        let rows = sqlx::query(
+            r#"WITH single_answers AS (
+                   SELECT turn_id
+                     FROM agent_messages
+                    WHERE operator_id = $1 AND tenant_id = $2 AND project_id = $3
+                      AND conversation_id = $4 AND role = 'assistant'
+                    GROUP BY turn_id
+                   HAVING COUNT(*) = 1
+               ), candidates AS (
+                   SELECT root.message_id AS root_id, root.sequence AS root_sequence,
+                          root.content AS root_content, answer.message_id AS answer_id,
+                          answer.sequence AS answer_sequence, answer.content AS answer_content
+                     FROM agent_turns AS t
+                     JOIN agent_runs AS r
+                       ON r.run_id = t.run_id
+                      AND r.operator_id = t.operator_id AND r.tenant_id = t.tenant_id
+                      AND r.project_id = t.project_id AND r.conversation_id = t.conversation_id
+                      AND r.turn_id = t.turn_id AND r.status = 'succeeded'
+                     JOIN agent_messages AS root
+                       ON root.message_id = t.root_message_id
+                      AND root.operator_id = t.operator_id AND root.tenant_id = t.tenant_id
+                      AND root.project_id = t.project_id AND root.conversation_id = t.conversation_id
+                      AND root.turn_id = t.turn_id AND root.role = 'user'
+                     JOIN single_answers AS only_answer ON only_answer.turn_id = t.turn_id
+                     JOIN agent_messages AS answer
+                       ON answer.turn_id = t.turn_id
+                      AND answer.operator_id = t.operator_id AND answer.tenant_id = t.tenant_id
+                      AND answer.project_id = t.project_id AND answer.conversation_id = t.conversation_id
+                      AND answer.role = 'assistant'
+                    WHERE t.operator_id = $1 AND t.tenant_id = $2 AND t.project_id = $3
+                      AND t.conversation_id = $4 AND t.status = 'succeeded'
+                      AND t.turn_id <> $5
+                      AND root.sequence < answer.sequence AND answer.sequence < $6
+                      -- Match Rust str::trim's Unicode White_Space characters.
+                      AND btrim(answer.content,
+                          E' \t\n\r\f' || chr(11) || chr(133) || chr(160) || chr(5760)
+                          || chr(8192) || chr(8193) || chr(8194) || chr(8195)
+                          || chr(8196) || chr(8197) || chr(8198) || chr(8199)
+                          || chr(8200) || chr(8201) || chr(8202) || chr(8232)
+                          || chr(8233) || chr(8239) || chr(8287) || chr(12288)
+                      ) <> ''
+               ), ordered AS (
+                   SELECT *, LAG(root_sequence, 1, $6) OVER (
+                       ORDER BY root_sequence DESC, root_id DESC
+                   ) AS next_root_sequence
+                     FROM candidates
+               ), eligible AS (
+                   SELECT * FROM ordered WHERE answer_sequence < next_root_sequence
+               )
+               SELECT root_id, root_sequence, root_content, answer_id, answer_sequence,
+                      answer_content, COUNT(*) OVER () AS eligible_count
+                 FROM eligible
+                ORDER BY root_sequence DESC, root_id DESC
+                LIMIT $7"#,
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(run.project_id.as_uuid())
+        .bind(conversation.id.as_uuid())
+        .bind(turn.id.as_uuid())
+        .bind(before_sequence)
+        .bind(MAX_HISTORY_TURNS as i64)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        let eligible = rows
+            .first()
+            .map(|row| counter_u64(row.get::<i64, _>("eligible_count")))
+            .transpose()?
+            .unwrap_or_default() as usize;
+        let mut history = Vec::with_capacity(rows.len() * 2);
+        for row in rows {
+            let root_id = MessageId::from(row.get::<Uuid, _>("root_id"));
+            let pair = [
+                TurnHistoryMessage {
+                    message_id: root_id,
+                    role: MessageRole::User,
+                    content: row.get("root_content"),
+                    root_message_id: root_id,
+                    sequence: counter_u64(row.get("root_sequence"))?,
+                },
+                TurnHistoryMessage {
+                    message_id: MessageId::from(row.get::<Uuid, _>("answer_id")),
+                    role: MessageRole::Assistant,
+                    content: row.get("answer_content"),
+                    root_message_id: root_id,
+                    sequence: counter_u64(row.get("answer_sequence"))?,
+                },
+            ];
+            history.splice(0..0, pair);
+            if serde_json::to_vec(&history).map_or(true, |bytes| bytes.len() > MAX_HISTORY_BYTES) {
+                history.drain(0..2);
+                break;
+            }
+        }
+        Ok(TurnInput {
+            conversation_id: conversation.id,
+            message_id,
+            turn_id: turn.id,
+            run_id,
+            prompt,
+            attachments,
+            history_omitted_turns: eligible - history.len() / 2,
+            history,
+        })
     }
 
     async fn create_conversation(

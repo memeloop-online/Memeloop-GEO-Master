@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { after, before, test } from "node:test";
 import { chromium } from "playwright";
@@ -11,16 +12,27 @@ import {
   xiaohongshuIdentity,
   zhihuIdentity,
 } from "../src/adapters.mjs";
+import { createRunner } from "../src/runner.mjs";
 
 let fixture;
 let browser;
 let context;
 let page;
 let origin;
+let zhihuSubmissions = 0;
 
 before(async () => {
   fixture = createServer((request, response) => {
-    const path = new URL(request.url, "http://localhost").pathname;
+    const requestUrl = new URL(request.url, "http://localhost");
+    const path = requestUrl.pathname;
+    if (path === "/submit") {
+      zhihuSubmissions++;
+      response.writeHead(302, {
+        location: requestUrl.searchParams.get("to") ?? "/p/42",
+      });
+      response.end();
+      return;
+    }
     if (path === "/self" || path === "/baidu/self") {
       if (!request.headers.cookie?.includes("sid=ready")) {
         response.writeHead(302, { location: "/signin" });
@@ -61,10 +73,11 @@ before(async () => {
     }
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     if (path === "/write") {
+      const destination = requestUrl.searchParams.get("to") ?? "/p/42";
       response.end(`<!doctype html><html><body>
         <div class="WriteIndex-titleInput"><textarea></textarea></div>
         <div class="ProseMirror" contenteditable="true"></div>
-        <button onclick="location.assign('/p/42')">发布</button>
+        <button onclick="location.assign('/submit?to=${encodeURIComponent(destination)}')">发布</button>
       </body></html>`);
     } else if (path === "/p/42") {
       response.end(
@@ -169,6 +182,7 @@ test("creator dashboard identity never accepts an unrelated public author link",
 });
 
 test("source-derived editor can complete only after exact public readback and own-list match", async () => {
+  const submissions = zhihuSubmissions;
   const result = await publishZhihu(
     page,
     { title: "Fixture title", body: "Fixture body" },
@@ -186,6 +200,11 @@ test("source-derived editor can complete only after exact public readback and ow
     result.evidence[0].readback_sha256,
   );
   assert.equal(result.evidence[0].owned_by_account, true);
+  assert.equal(zhihuSubmissions, submissions + 1);
+  assert.equal(
+    result.evidence.some((item) => item.kind === "publication_candidate"),
+    false,
+  );
   assert.ok(Date.parse(result.occurred_at));
   assert.equal(
     (
@@ -235,6 +254,205 @@ test("source-derived editor can complete only after exact public readback and ow
     "unknown",
     "a different authenticated account cannot own the receipt",
   );
+});
+
+test("post-submit public navigation leaves a typed unverified candidate when readback fails", async () => {
+  const submissions = zhihuSubmissions;
+  const before = Date.now();
+  const result = await publishZhihu(
+    page,
+    { title: "Fixture title", body: "Fixture body" },
+    {
+      editorUrl: `${origin}/write?to=${encodeURIComponent("/p/43")}`,
+      postOrigin: origin,
+    },
+  );
+  const after = Date.now();
+  assert.equal(result.status, "unknown");
+  assert.equal(result.reason, "public_content_mismatch");
+  assert.equal(result.stage, "readback");
+  assert.equal(Object.hasOwn(result, "public_url"), false);
+  assert.equal(zhihuSubmissions, submissions + 1);
+  assert.equal(result.evidence.length, 1);
+  const candidate = result.evidence[0];
+  assert.deepEqual(Object.keys(candidate).sort(), [
+    "expected_sha256",
+    "kind",
+    "observed_at",
+    "schema_version",
+    "source",
+    "url",
+  ]);
+  assert.equal(candidate.kind, "publication_candidate");
+  assert.equal(candidate.schema_version, "geo.publication.candidate.v1");
+  assert.equal(candidate.url, `${origin}/p/43`);
+  assert.equal(
+    candidate.expected_sha256,
+    createHash("sha256")
+      .update("Fixture title\nFixture body", "utf8")
+      .digest("hex"),
+  );
+  assert.equal(candidate.source, "post_submit_navigation");
+  assert.equal(result.occurred_at, candidate.observed_at);
+  assert.ok(Date.parse(candidate.observed_at) >= before);
+  assert.ok(Date.parse(candidate.observed_at) <= after);
+
+  const lookup = await readbackZhihu(
+    page,
+    `${origin}/p/43`,
+    { title: "Fixture title", body: "Fixture body" },
+    { postOrigin: origin },
+  );
+  assert.equal(lookup.status, "unknown");
+  assert.deepEqual(lookup.evidence, [], "lookup never invents submit evidence");
+  assert.equal(zhihuSubmissions, submissions + 1, "lookup never resubmits");
+});
+
+test("runner preserves the unknown candidate observation time without upgrading provenance", async () => {
+  const submissions = zhihuSubmissions;
+  const runner = createRunner({
+    browserType: {
+      async launch() {
+        return {
+          newContext: (options) => browser.newContext(options),
+          async close() {},
+        };
+      },
+    },
+    platformAdapters: {
+      fixture: {
+        connectorVersion: "fixture.source_derived.v1",
+        entry: `${origin}/write`,
+        operations: ["publish"],
+        async identify() {
+          return {
+            platform_account_id: "fixture-account",
+            display_name: "Fixture owner",
+          };
+        },
+        execute: (runnerPage, _operation, payload, network) =>
+          publishZhihu(runnerPage, payload, {
+            ...network,
+            editorUrl: `${origin}/write?to=${encodeURIComponent("/p/43")}`,
+            postOrigin: origin,
+          }),
+      },
+    },
+  });
+  try {
+    await runner.create({ session_id: "candidate", platform: "fixture" });
+    await runner.complete("candidate");
+    const result = await runner.execute({
+      execution_id: "candidate-execution",
+      session_id: "candidate",
+      operation: "publish",
+      payload: { title: "Fixture title", body: "Fixture body" },
+    });
+    assert.equal(result.status, "unknown");
+    assert.equal(result.provenance, "fixture");
+    assert.equal(result.connector_version, "fixture.source_derived.v1");
+    assert.equal(Object.hasOwn(result, "public_url"), false);
+    assert.equal(result.evidence[0].kind, "publication_candidate");
+    assert.equal(result.occurred_at, result.evidence[0].observed_at);
+    assert.equal(zhihuSubmissions, submissions + 1);
+  } finally {
+    await runner.shutdown();
+  }
+});
+
+test("post-submit navigation cannot preserve query or fragment as candidate evidence", async () => {
+  const submissions = zhihuSubmissions;
+  for (const destination of ["/p/43?tracking=opaque", "/p/43#section"]) {
+    const result = await publishZhihu(
+      page,
+      { title: "Fixture title", body: "Fixture body" },
+      {
+        editorUrl: `${origin}/write?to=${encodeURIComponent(destination)}`,
+        postOrigin: origin,
+      },
+    );
+    assert.equal(result.status, "unknown");
+    assert.equal(Object.hasOwn(result, "public_url"), false);
+    assert.deepEqual(result.evidence, [], destination);
+  }
+  assert.equal(zhihuSubmissions, submissions + 2);
+});
+
+test("candidate requires the fixed production origin and a credential-free canonical path", async () => {
+  for (const [destination, postOrigin] of [
+    [
+      "https://example:placeholder@zhuanlan.zhihu.com/p/42",
+      "https://zhuanlan.zhihu.com",
+    ],
+    ["https://zhuanlan.zhihu.com/p/42/", "https://zhuanlan.zhihu.com"],
+    ["https://zhuanlan.zhihu.com:8443/p/42", "https://zhuanlan.zhihu.com:8443"],
+    [
+      "https://not-the-platform.example/p/42",
+      "https://not-the-platform.example",
+    ],
+  ]) {
+    let currentUrl = "https://zhuanlan.zhihu.com/write";
+    let clicks = 0;
+    const field = {
+      first() {
+        return this;
+      },
+      async isVisible() {
+        return true;
+      },
+      async fill() {},
+    };
+    const simulatedPage = {
+      async goto() {},
+      url: () => currentUrl,
+      locator: () => field,
+      getByRole: () => ({
+        async click() {
+          clicks++;
+          currentUrl = destination;
+        },
+      }),
+      async waitForURL(predicate) {
+        if (!predicate(new URL(currentUrl))) throw new Error("not a post");
+      },
+      context: () => ({
+        browser: () => ({
+          async newContext() {
+            throw new Error("public readback unavailable");
+          },
+        }),
+      }),
+    };
+    const result = await publishZhihu(
+      simulatedPage,
+      {
+        title: "Fixture title",
+        body: "Fixture body",
+      },
+      { postOrigin },
+    );
+    assert.equal(result.status, "unknown");
+    assert.equal(Object.hasOwn(result, "public_url"), false);
+    assert.deepEqual(result.evidence, [], destination);
+    assert.equal(clicks, 1, "candidate validation cannot retry the submit");
+  }
+});
+
+test("non-public post-submit navigation stays unknown without candidate or another submit", async () => {
+  const submissions = zhihuSubmissions;
+  const result = await publishZhihu(
+    page,
+    { title: "Fixture title", body: "Fixture body" },
+    {
+      editorUrl: `${origin}/write?to=${encodeURIComponent("/draft/42")}`,
+      postOrigin: origin,
+    },
+  );
+  assert.equal(result.status, "unknown");
+  assert.equal(result.reason, "submission_outcome_unverified");
+  assert.equal(Object.hasOwn(result, "public_url"), false);
+  assert.deepEqual(result.evidence, []);
+  assert.equal(zhihuSubmissions, submissions + 1);
 });
 
 test("moderated creator submit remains unknown, never verified from a click", async () => {

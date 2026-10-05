@@ -97,9 +97,24 @@ export interface PublicationRequest {
   account_id: string;
 }
 
+export interface MeasurementRequest {
+  account_id: string;
+  provider: string;
+  model: string;
+  surface: string;
+  search_mode: string;
+  protocol_version: string;
+  question_set_version: string;
+  question: string;
+  market: string;
+  language: string;
+  scheduled_at: string;
+  sample_ordinal: number;
+}
+
 export interface ChannelPlanRequest {
   publications: PublicationRequest[];
-  measurements: [];
+  measurements: MeasurementRequest[];
 }
 
 const encoded = (value: string) => encodeURIComponent(value);

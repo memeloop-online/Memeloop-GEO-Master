@@ -243,6 +243,119 @@ fn request_hash(targets: &[ChannelTarget]) -> Result<String, AppError> {
     })?))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationCandidate {
+    kind: String,
+    schema_version: String,
+    url: String,
+    expected_sha256: String,
+    observed_at: DateTime<Utc>,
+    source: String,
+}
+
+/// Retain only a bounded, canonical post-submit hint, not a verified receipt.
+/// Association identifiers are supplied by Rust, never by adapter JSON.
+fn publication_candidate(
+    value: &serde_json::Value,
+    target: &ChannelTarget,
+    attempt_id: Uuid,
+    claimed_at: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+    connector_version: &str,
+) -> Option<serde_json::Value> {
+    let hint: PublicationCandidate = serde_json::from_value(value.clone()).ok()?;
+    let (platform, title, body) = match &target.input {
+        ChannelTargetInput::Publish {
+            platform,
+            title,
+            body,
+            ..
+        }
+        | ChannelTargetInput::GeneratedPublish {
+            platform,
+            title,
+            body,
+            ..
+        } => (platform, title, body),
+        ChannelTargetInput::Measure { .. } => return None,
+    };
+    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected = sha256_hex(format!("{}\n{}", normalize(title), normalize(body)).as_bytes());
+    if hint.kind != "publication_candidate"
+        || hint.schema_version != "geo.publication.candidate.v1"
+        || hint.source != "post_submit_navigation"
+        || hint.expected_sha256 != expected
+        || hint.observed_at < claimed_at
+        || hint.observed_at > received_at
+        || hint.url.len() > 256
+        || platform != "zhihu"
+    {
+        return None;
+    }
+    let url = reqwest::Url::parse(&hint.url).ok()?;
+    let post_id = url.path().strip_prefix("/p/")?;
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("www.zhihu.com" | "zhuanlan.zhihu.com"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.as_str() != hint.url
+        || post_id.is_empty()
+        || !post_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(json!({
+        "kind": "publication_candidate",
+        "schema_version": "geo.publication.candidate.v1",
+        "url": hint.url,
+        "expected_sha256": expected,
+        "observed_at": hint.observed_at,
+        "source": hint.source,
+        "attempt_id": attempt_id,
+        "target_id": target.target_id,
+        "account_id": target.input.account_id(),
+        "connector_version": connector_version,
+    }))
+}
+
+fn retain_publication_candidate(
+    result: &mut crate::browser_bridge::BrowserExecution,
+    target: &ChannelTarget,
+    attempt: &geo_domain::ChannelAttempt,
+    received_at: DateTime<Utc>,
+    fixture: bool,
+    status: ChannelOutcomeStatus,
+) {
+    let candidates: Vec<_> = result
+        .evidence
+        .iter()
+        .filter(|proof| proof["kind"] == "publication_candidate")
+        .collect();
+    let candidate = if !fixture && status == ChannelOutcomeStatus::Unknown && candidates.len() == 1
+    {
+        publication_candidate(
+            candidates[0],
+            target,
+            attempt.attempt_id,
+            attempt.claimed_at,
+            received_at,
+            result.connector_version.as_deref().unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+    result
+        .evidence
+        .retain(|proof| proof["kind"] != "publication_candidate");
+    if let Some(candidate) = candidate {
+        result.evidence.push(candidate);
+    }
+}
+
 fn publication_readback(
     result: &crate::browser_bridge::BrowserExecution,
     target: &ChannelTargetInput,
@@ -1265,6 +1378,16 @@ async fn execute_reserved_channel_target(
                         || version.len() > 100
                         || version.starts_with("fixture")
                 });
+            // Untrusted or malformed hints must not persist raw URLs (which
+            // could contain account tokens), nor acquire success semantics.
+            retain_publication_candidate(
+                &mut result,
+                &target,
+                &attempt,
+                received_at,
+                fixture,
+                status,
+            );
             ChannelOutcome {
                 status,
                 detail: result.reason.or_else(|| {
@@ -1475,6 +1598,99 @@ mod tests {
             &format!("DELETE /v1/sessions/{session}")
         );
         server.abort();
+    }
+
+    #[test]
+    fn publication_candidate_is_scoped_unverified_and_strictly_sanitized() {
+        let target = ChannelTarget {
+            target_id: Uuid::new_v4(),
+            input: ChannelTargetInput::Publish {
+                source_id: Uuid::new_v4(),
+                source_version_id: Uuid::new_v4(),
+                platform: "zhihu".into(),
+                account_id: Uuid::new_v4(),
+                title: " source ".into(),
+                body: "body\ntext".into(),
+                body_sha256: sha256_hex(b"body\ntext"),
+            },
+        };
+        let now = Utc::now();
+        let attempt_id = Uuid::new_v4();
+        let hint = json!({
+            "kind":"publication_candidate",
+            "schema_version":"geo.publication.candidate.v1",
+            "url":"https://zhuanlan.zhihu.com/p/123",
+            "expected_sha256":sha256_hex(b"source\nbody text"),
+            "observed_at":now,
+            "source":"post_submit_navigation",
+        });
+        let parse = |value: &serde_json::Value| {
+            publication_candidate(value, &target, attempt_id, now, now, "connector.v1")
+        };
+        let saved = parse(&hint).unwrap();
+        assert_eq!(saved["attempt_id"], json!(attempt_id));
+        assert_eq!(saved["target_id"], json!(target.target_id));
+        assert_eq!(saved["account_id"], json!(target.input.account_id()));
+        assert_eq!(saved["connector_version"], "connector.v1");
+        assert!(saved.get("public_url").is_none());
+        assert!(saved.get("status").is_none());
+        let attempt = geo_domain::ChannelAttempt {
+            attempt_id,
+            target_id: target.target_id,
+            claimed_at: now,
+            outcome: None,
+            received_at: None,
+        };
+        for (fixture, status, hint_count, expected_count) in [
+            (false, ChannelOutcomeStatus::Unknown, 1, 1),
+            (true, ChannelOutcomeStatus::Unknown, 1, 0),
+            (false, ChannelOutcomeStatus::Verified, 1, 0),
+            (false, ChannelOutcomeStatus::Unknown, 2, 0),
+        ] {
+            let mut result = BrowserExecution {
+                execution_id: attempt_id,
+                provenance: Some(crate::browser_bridge::BrowserReceiptProvenance::Live),
+                status: "unknown".into(),
+                reason: None,
+                evidence: vec![hint.clone(); hint_count],
+                public_url: None,
+                occurred_at: Some(now),
+                connector_version: Some("connector.v1".into()),
+                stage: Some("readback".into()),
+            };
+            retain_publication_candidate(&mut result, &target, &attempt, now, fixture, status);
+            assert_eq!(result.evidence.len(), expected_count);
+            assert!(result.public_url.is_none());
+            assert_eq!(result.status, "unknown");
+            assert!(!publication_readback(&result, &target.input));
+        }
+        for url in [
+            "http://zhuanlan.zhihu.com/p/123",
+            "https://untrusted.zhihu.com/p/123",
+            "https://user:secret@zhuanlan.zhihu.com/p/123",
+            "https://zhuanlan.zhihu.com:8443/p/123",
+            "https://zhuanlan.zhihu.com/p/123?token=example",
+            "https://zhuanlan.zhihu.com/p/123#fragment",
+            "https://zhuanlan.zhihu.com/p/123/",
+            "https://zhuanlan.zhihu.com/p/%31",
+            "https://zhuanlan.zhihu.com/p/",
+        ] {
+            let mut invalid = hint.clone();
+            invalid["url"] = json!(url);
+            assert!(parse(&invalid).is_none(), "{url}");
+        }
+        for (field, value) in [
+            ("source", json!("existing_article")),
+            ("expected_sha256", json!(sha256_hex(b"other body"))),
+            ("observed_at", json!(now - chrono::Duration::seconds(1))),
+            ("observed_at", json!(now + chrono::Duration::seconds(1))),
+            ("account_id", json!(Uuid::new_v4())),
+            ("schema_version", json!("other.v1")),
+        ] {
+            let mut invalid = hint.clone();
+            invalid[field] = value;
+            assert!(parse(&invalid).is_none(), "{field}");
+        }
     }
 
     #[test]
