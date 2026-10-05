@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { chromium } from "playwright";
@@ -11,6 +12,78 @@ import {
   probeKimiAccount,
 } from "../src/adapters.mjs";
 import { createRunner } from "../src/runner.mjs";
+
+test("candidate collector waits for explicit completion and removes listeners", async () => {
+  const page = new EventEmitter();
+  const response = (requestId) => ({
+    url: () => "https://example.test/event",
+    status: () => 200,
+    headers: () => ({ "content-type": "application/json" }),
+    body: async () =>
+      Buffer.from(
+        JSON.stringify({ event_id: "event-1", request_id: requestId }),
+      ),
+  });
+  const flow = {
+    trustedOrigin: "https://example.test",
+    submit: async () => {},
+    readAnswer: async () => ({
+      raw_answer: "Synthetic answer",
+      request_id: "request-1",
+      citations: [],
+    }),
+    decodeEvent: (body) => body,
+    waitForCompletion: async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+      page.emit("response", response("unrelated"));
+      page.emit("response", response("request-1"));
+    },
+  };
+  const result = await observeKimiSearchAttempt(page, "Question", flow);
+  assert.equal(result.search_verified, false);
+  assert.equal(result.candidate_search_event.request_id, "request-1");
+  assert.equal(page.listenerCount("response"), 0);
+  assert.equal(
+    await observeKimiSearchAttempt(page, "Question", {
+      ...flow,
+      waitForCompletion: async () => {
+        page.emit("response", response("request-1"));
+        page.emit("response", response("request-1"));
+      },
+    }),
+    null,
+  );
+  assert.equal(page.listenerCount("response"), 0);
+  assert.equal(
+    await observeKimiSearchAttempt(page, "Question", {
+      ...flow,
+      decodeEvent: () => {
+        throw new Error("Malformed fixture");
+      },
+    }),
+    null,
+  );
+  assert.equal(page.listenerCount("response"), 0);
+});
+
+test("candidate collector bounds stalled work and aborts flow without verification", async () => {
+  const page = new EventEmitter();
+  let signal;
+  const result = await observeKimiSearchAttempt(page, "Question", {
+    timeoutMs: 10,
+    submit: async (_page, _question, abortSignal) => {
+      signal = abortSignal;
+      await new Promise(() => {});
+    },
+    decodeEvent: () => null,
+    readAnswer: async () => {
+      throw new Error("must not read after timeout");
+    },
+  });
+  assert.equal(result, null);
+  assert.equal(signal.aborted, true);
+  assert.equal(page.listenerCount("response"), 0);
+});
 
 test("source-derived Kimi self probe requires authenticated browser storage and own user JSON", async () => {
   const server = createServer((request, response) => {

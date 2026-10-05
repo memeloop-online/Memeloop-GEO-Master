@@ -223,19 +223,33 @@ export function extractKimiCandidateObservation(value) {
 export async function observeKimiSearchAttempt(
   page,
   question,
-  { submit, decodeEvent, readAnswer, trustedOrigin = KIMI_ORIGIN },
+  {
+    submit,
+    decodeEvent,
+    readAnswer,
+    waitForCompletion,
+    timeoutMs = 30_000,
+    trustedOrigin = KIMI_ORIGIN,
+  },
 ) {
   if (
     typeof question !== "string" ||
     !question.trim() ||
     typeof submit !== "function" ||
     typeof decodeEvent !== "function" ||
-    typeof readAnswer !== "function"
+    typeof readAnswer !== "function" ||
+    (waitForCompletion !== undefined &&
+      typeof waitForCompletion !== "function") ||
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs <= 0
   ) {
     return null;
   }
   const events = [];
   const pending = new Set();
+  let closed = false;
+  let timer;
+  const controller = new AbortController();
   const onResponse = (response) => {
     const task = (async () => {
       try {
@@ -251,6 +265,7 @@ export async function observeKimiSearchAttempt(
         if (body.length > 128_000) return;
         const event = decodeEvent(JSON.parse(body.toString("utf8")), response);
         if (
+          !closed &&
           event &&
           typeof event.event_id === "string" &&
           /^[\w-]{1,128}$/u.test(event.event_id) &&
@@ -273,18 +288,41 @@ export async function observeKimiSearchAttempt(
   };
   page.on("response", onResponse);
   try {
-    await submit(page, question);
-    const answer = extractKimiCandidateObservation(await readAnswer(page));
-    await Promise.allSettled([...pending]);
-    if (!answer?.request_id) return null;
-    const matched = events.filter(
-      (event) => event.request_id === answer.request_id,
-    );
-    if (matched.length !== 1) return null;
-    return { ...answer, candidate_search_event: matched[0] };
+    return await Promise.race([
+      (async () => {
+        await submit(page, question, controller.signal);
+        if (closed) return null;
+        const answer = extractKimiCandidateObservation(
+          await readAnswer(page, controller.signal),
+        );
+        if (closed || !answer?.request_id) return null;
+        // The adapter must identify provider completion, not infer it from
+        // answer rendering or an arbitrary quiet period. This remains only
+        // candidate collection, never proof of official search.
+        if (waitForCompletion) {
+          await waitForCompletion(page, answer.request_id, controller.signal);
+        }
+        if (closed) return null;
+        while (pending.size && !closed) {
+          await Promise.allSettled([...pending]);
+        }
+        if (closed) return null;
+        const matched = events.filter(
+          (event) => event.request_id === answer.request_id,
+        );
+        if (matched.length !== 1) return null;
+        return { ...answer, candidate_search_event: matched[0] };
+      })(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
   } catch {
     return null;
   } finally {
+    closed = true;
+    clearTimeout(timer);
+    controller.abort();
     page.off("response", onResponse);
   }
 }
