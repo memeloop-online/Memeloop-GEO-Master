@@ -4,6 +4,11 @@
 
 ## 2026-10-06
 
+- 本地构建恢复：在独立磁盘隔离 Cargo 缓存和 target，使用校验 TLS 的 HTTPS 下载官方锁定依赖并核验 Cargo.lock SHA-256，未关闭证书验证、未修改锁文件。从绿色 Actions `37362556996` 恢复 Windows/MSVC V8 150.4.0 缓存，构建日志确认解压并链接下载的静态库，没有本地源码编译 V8。完整 Rust 工作区默认测试已通过；数据库用例默认 ignored，不计实库通过。链接器仍报告 LNK4098，构建成功但警告尚未处理。
+- 自动修正回归校正：首次本地全量与 Actions `37368746011` Linux 均在同一测试失败，原因是读取修正版时会投影已经保存的独立检查 findings，测试却与检查前空 findings 比较。改为读取并核对唯一非阻断检查，再比较完整版本，仍断言模型仅调用四次；本地全量复跑通过，不修改生产修正行为或弱化幂等断言。生成 bundle 的显式 V8 测试、Clippy 和新 CI 验证另行记录。
+- 后续核验：Actions `37368746011` Windows 同样在上述断言失败，未取得新绿色基线。本地全工作区 Clippy `-D warnings`、Rust 格式检查、重新生成 bundle 后的 Node 编排测试 21/21 通过。冻结产品规格与依赖锁文件保持不变。
+- 04:39 前检查点：显式执行 CI 同款六组 `--ignored` 原生 V8 测试共 12/12 通过：`memeloop_bundle` 5、应用模型装配 1、`attachment_import_runtime` 1、`channel_tools_runtime` 1、`content_workflow` 3、应用 `content_runtime_tests` 1。覆盖跨隔离体历史、附件与引用、报告工具、渠道计划、内容分支恢复和不重复模型调用。均为注入模型/测试仓储；未执行新增 PostgreSQL 回归，也不代表真实外部账号验收。
+
 - 04:20 前检查点：Actions `37366395806` 已结束，两个作业的注释均为 “The job was not acquired by Runner of type hosted even after multiple attempts”，步骤列表为空，不归因为代码失败。queued 恢复本地提交 `ad2a023` 后，复查改为扫描方等待原子领取、仅对领取成功项创建执行任务，避免未领取任务反复堆积；HTTP 仍异步返回，不等待模型，不添加固定运行并发门槛。新增领取完成即返回及重复领取/取消回归，格式检查通过，Rust 未验证。发现独立构建空间后尝试本地领域测试：离线缺 CSV 索引，官方在线索引 TLS 握手失败；官方 GitHub 索引和 TLS 1.2 检查同样失败，未关闭证书验证、未进入编译。
 
 - 04:05 前检查点：`93dedfa` / Actions `37366395806` 仍处于 GitHub 排队状态，无 Rust/数据库结果。另接 queued Agent 回合恢复：可信 PostgreSQL 游标扫描只返回作用域/运行 ID/创建时间，迁移 `0022` 增加部分索引；HTTP 与后台共用原子领取，并从持久历史/附件重建输入。运行时配置完成后才启动扫描，无可用运行时不领取，running 回合不重跑。新增内存执行器恢复/竞争/取消与 PostgreSQL 跨作用域分页/重启/领取竞争回归，尚未执行 Rust 测试。保留单进程 running 对账默认关闭；未知发布自动查回另记实施设计，未冒充完成。

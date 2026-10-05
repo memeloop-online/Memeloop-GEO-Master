@@ -1717,9 +1717,20 @@ mod tests {
                 .status,
             ContentItemStatus::Ready
         );
+        let checks = repository
+            .list_checks(&scope, repaired.revision_id)
+            .await
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].findings.is_empty());
+        assert!(checks[0].findings.iter().all(|finding| !finding.blocking));
+        // Reads project the independently stored check onto the same immutable
+        // revision. Replaying repair must not regenerate or discard that check.
+        let mut checked_revision = repaired;
+        checked_revision.findings = checks[0].findings.clone();
         assert_eq!(
             service.repair(&scope, execution_id, item_id).await.unwrap(),
-            repaired
+            checked_revision
         );
         assert_eq!(model.calls.load(Ordering::SeqCst), 4);
     }
