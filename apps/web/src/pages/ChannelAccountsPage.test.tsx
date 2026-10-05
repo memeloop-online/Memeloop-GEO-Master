@@ -542,6 +542,43 @@ describe("account page", () => {
 });
 
 describe("operator pool", () => {
+  it("labels article wire format without changing its saved capability key", async () => {
+    const { requests } = mockApi([], true, {
+      ...verifiedCapability,
+      verified_content_types: ["plain_text_article.v1"],
+    });
+    renderOperator();
+    const section = await screen.findByLabelText("运营连接器能力");
+    await userEvent.click(
+      await within(section).findByRole("checkbox", {
+        name: "允许 zhihu 纯文本文章（标题与正文）",
+      }),
+    );
+    await userEvent.click(
+      within(section).getByRole("checkbox", {
+        name: "启用 zhihu primary 连接器",
+      }),
+    );
+    await userEvent.click(
+      within(section).getByRole("button", { name: "保存连接器配置" }),
+    );
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (entry) =>
+            entry.method === "PATCH" &&
+            entry.path.endsWith(
+              "/operator/connector-capabilities/zhihu/primary",
+            ),
+        )?.body,
+      ).toEqual({
+        expected_revision: 3,
+        enabled: true,
+        content_types: ["plain_text_article.v1"],
+      }),
+    );
+  });
+
   it("cannot enable an unverified connector from an account login", async () => {
     const { requests } = mockApi([account], true);
     renderOperator();

@@ -75,6 +75,12 @@ const connectorState: Record<ConnectorAvailability, string> = {
   available: "已验证可用",
 };
 
+function publicationFormatLabel(format: string) {
+  return format === "plain_text_article.v1"
+    ? "纯文本文章（标题与正文）"
+    : format;
+}
+
 function ConnectorCapabilityRow({
   item,
   queryKey,
@@ -162,9 +168,11 @@ function ConnectorCapabilityRow({
         </Badge>
       </div>
       <p>
-        实测内容类型：
-        {verified.length ? verified.join("、") : "尚无真实发布及公开读回验证"}。
-        配置开关仅选择已验证类型，不能创建验证记录。
+        实测发布格式：
+        {verified.length
+          ? verified.map(publicationFormatLabel).join("、")
+          : "尚无真实发布及公开读回验证"}
+        。 配置开关仅选择已验证类型，不能创建验证记录。
       </p>
       <Checkbox
         label={`启用 ${item.platform_id} ${item.placement_slot} 连接器`}
@@ -175,7 +183,7 @@ function ConnectorCapabilityRow({
       {verified.map((type) => (
         <Checkbox
           key={type}
-          label={`允许 ${item.platform_id} ${type}`}
+          label={`允许 ${item.platform_id} ${publicationFormatLabel(type)}`}
           checked={types.includes(type)}
           disabled={busy}
           onChange={(_, data) =>
@@ -1203,7 +1211,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                   </div>
                   <p>
                     {item.availability === "available"
-                      ? `当前配置的内容类型：${item.content_types.join("、") || "无"}。`
+                      ? `当前可用发布格式：${item.content_types.map(publicationFormatLabel).join("、") || "无"}。`
                       : "当前没有可确认的发布内容类型；已有账号或旧配置不构成验证。"}
                   </p>
                   <p>
