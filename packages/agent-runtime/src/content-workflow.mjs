@@ -23,6 +23,7 @@ function host() {
     "op_host_content_prepare_v1",
     "op_host_content_generate_v1",
     "op_host_content_check_v1",
+    "op_host_content_repair_v1",
     "op_host_content_close_v1",
     "op_host_content_execution_read_v1",
     "op_host_distribution_start_v1",
@@ -41,6 +42,7 @@ function host() {
     prepare: (input) => invoke("op_host_content_prepare_v1", input),
     generate: (input) => invoke("op_host_content_generate_v1", input),
     check: (input) => invoke("op_host_content_check_v1", input),
+    repair: (input) => invoke("op_host_content_repair_v1", input),
     close: (input) => invoke("op_host_content_close_v1", input),
     executionRead: (input) =>
       invoke("op_host_content_execution_read_v1", input),
@@ -183,6 +185,8 @@ async function prepareDistribution(execution, handoff, capability, ctx) {
 async function processItem(item, executionId, capability, ctx) {
   const request = { execution_id: executionId, item_id: item.item_id };
   let current = item;
+  let repairsThisInvocation = 0;
+  let checksThisInvocation = 0;
   // Completed steps are never inferred from a JS checkpoint. Reentry reads
   // durable item state and a step result is persisted before Rust replies.
   try {
@@ -192,8 +196,41 @@ async function processItem(item, executionId, capability, ctx) {
     if (current.status === "prepared") {
       current = await capability.generate(request);
     }
-    if (current.status === "drafted") {
-      current = await capability.check(request);
+    while (current.status === "drafted" || current.status === "needs_repair") {
+      if (
+        !Number.isSafeInteger(current.automatic_repair_count) ||
+        current.automatic_repair_count < 0 ||
+        current.automatic_repair_count > 2
+      ) {
+        throw new Error("The durable repair count is invalid.");
+      }
+      if (current.status === "drafted") {
+        if (checksThisInvocation >= 3) {
+          throw new Error("The content branch exhausted its check budget.");
+        }
+        const previousCount = current.automatic_repair_count;
+        current = await capability.check(request);
+        checksThisInvocation++;
+        if (
+          current.status === "drafted" ||
+          current.automatic_repair_count !== previousCount
+        ) {
+          throw new Error("The content check made no durable progress.");
+        }
+      } else {
+        if (repairsThisInvocation >= 2 || current.automatic_repair_count >= 2) {
+          throw new Error("The content branch exhausted its repair budget.");
+        }
+        const previousCount = current.automatic_repair_count;
+        current = await capability.repair(request);
+        repairsThisInvocation++;
+        if (
+          current.automatic_repair_count !== previousCount + 1 ||
+          current.status !== "drafted"
+        ) {
+          throw new Error("The repair did not persist a new draft.");
+        }
+      }
     }
     if (!TERMINAL.has(current.status)) {
       throw new Error("The content branch returned an unsupported state.");

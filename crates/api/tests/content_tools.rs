@@ -324,6 +324,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .unwrap();
     assert_eq!(first.total, 2);
     assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].automatic_repair_count, 0);
     let json = serde_json::to_string(&first).unwrap();
     for forbidden in [
         "quotes", "evidence", "brief", "document", "markdown", "provider", "token",
@@ -405,6 +406,23 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         execution_id: started_ref.execution_id,
         item_id,
     };
+    assert_eq!(
+        host.content_repair(&foreign, step.clone())
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::NotFound,
+        "the repair op must resolve scope before model work"
+    );
+    assert_eq!(
+        host.content_repair(&scope, step.clone())
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::Failed,
+        "an unprepared item cannot be repaired"
+    );
+    assert_eq!(model.0.load(Ordering::SeqCst), 0);
     let prepared = host.content_prepare(&scope, step.clone()).await.unwrap();
     assert_eq!(prepared.status, ContentItemStatus::Prepared);
     let projected = serde_json::to_string(&prepared).unwrap();

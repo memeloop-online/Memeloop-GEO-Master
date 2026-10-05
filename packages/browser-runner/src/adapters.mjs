@@ -9,6 +9,8 @@ const BAIDU_SELF = "https://baijiahao.baidu.com/builder/app/appinfo";
 const ZHIHU_EDITOR = "https://zhuanlan.zhihu.com/write";
 const BAIDU_EDITOR = "https://baijiahao.baidu.com/builder/rc/edit?type=news";
 const ZHIHU_POST_ORIGIN = "https://zhuanlan.zhihu.com";
+const ZHIHU_ARTICLES_PAGE_SIZE = 20;
+const ZHIHU_OWNERSHIP_MAX_PAGES = 10;
 const KIMI_ORIGIN = "https://www.kimi.com";
 // Public Kimi client bundle (2026-09-29) invokes
 // kimi.gateway.account.v1.UserService/GetCurrentUser via Connect JSON.
@@ -52,24 +54,44 @@ function ownIdentity(id, name, avatar) {
   };
 }
 
-// A temporary *browser page*, not Node fetch or APIRequestContext, guarantees
-// the same BrowserContext cookies and configured browser proxy for the probe.
+// A temporary Chromium page retains its assigned BrowserContext cookies and
+// proxy. Intercept its network request/response before a redirect is followed;
+// Playwright route.fetch would use a separate transport, bypassing that proxy.
 export async function probeOwnAccount(page, endpoint, extract) {
   const probe = await page.context().newPage();
+  let session;
+  let onPaused;
   try {
+    const expected = new URL(endpoint);
+    session = await page.context().newCDPSession(probe);
+    onPaused = (event) => {
+      const allowed =
+        event.request.url === expected.href &&
+        (event.responseStatusCode === undefined ||
+          event.responseStatusCode === 200);
+      void session
+        .send(
+          allowed ? "Fetch.continueRequest" : "Fetch.failRequest",
+          allowed
+            ? { requestId: event.requestId }
+            : { requestId: event.requestId, errorReason: "BlockedByClient" },
+        )
+        .catch(() => {});
+    };
+    session.on("Fetch.requestPaused", onPaused);
+    await session.send("Fetch.enable", {
+      patterns: [
+        { urlPattern: "*", requestStage: "Request" },
+        { urlPattern: "*", requestStage: "Response" },
+      ],
+    });
     const response = await probe.goto(endpoint, {
       waitUntil: "domcontentloaded",
       timeout: 12_000,
     });
     if (!response || response.status() !== 200) return null;
     const actual = new URL(probe.url());
-    const expected = new URL(endpoint);
-    if (
-      actual.origin !== expected.origin ||
-      actual.pathname !== expected.pathname
-    ) {
-      return null;
-    }
+    if (actual.href !== expected.href) return null;
     if (!/application\/json/i.test(response.headers()["content-type"] ?? ""))
       return null;
     const text = await response.text();
@@ -78,7 +100,14 @@ export async function probeOwnAccount(page, endpoint, extract) {
   } catch {
     return null;
   } finally {
-    await probe.close();
+    // Closing a stalled navigation first releases the browser's pending
+    // network request; otherwise disabling interception can wait indefinitely.
+    await probe.close({ timeout: 2_000 }).catch(() => {});
+    if (session) {
+      if (onPaused) session.off("Fetch.requestPaused", onPaused);
+      await session.send("Fetch.disable").catch(() => {});
+      await session.detach().catch(() => {});
+    }
   }
 }
 
@@ -483,25 +512,59 @@ async function ownZhihuArticle(
     expectedAccountId,
   } = {},
 ) {
-  const self = await probeOwnAccount(page, selfUrl, (data) => data);
+  // Only the configured account's fixed list endpoint is queried. Never
+  // navigate to an API-provided paging.next URL or search another account.
   if (
-    expectedAccountId !== undefined &&
-    zhihuIdentity(self)?.platform_account_id !== expectedAccountId
-  ) {
+    articlesOrigin !== new URL(articlesOrigin).origin ||
+    new URL(selfUrl).origin !== articlesOrigin
+  )
     return false;
+  let ownerId;
+  let ownerToken;
+  for (
+    let pageNumber = 0;
+    pageNumber < ZHIHU_OWNERSHIP_MAX_PAGES;
+    pageNumber++
+  ) {
+    const self = await probeOwnAccount(page, selfUrl, (data) => data);
+    const identity = zhihuIdentity(self);
+    const token = self?.url_token;
+    if (
+      !identity ||
+      (expectedAccountId !== undefined &&
+        identity.platform_account_id !== expectedAccountId) ||
+      (ownerId !== undefined && identity.platform_account_id !== ownerId) ||
+      typeof token !== "string" ||
+      !/^[\w-]{1,128}$/u.test(token) ||
+      (ownerToken !== undefined && token !== ownerToken)
+    ) {
+      return false;
+    }
+    ownerId = identity.platform_account_id;
+    ownerToken = token;
+    const endpoint = `${articlesOrigin}/api/v4/members/${encodeURIComponent(token)}/articles?limit=${ZHIHU_ARTICLES_PAGE_SIZE}&offset=${pageNumber * ZHIHU_ARTICLES_PAGE_SIZE}`;
+    const result = await probeOwnAccount(page, endpoint, (data) => data);
+    const articles = result?.data;
+    if (!Array.isArray(articles) || articles.length > ZHIHU_ARTICLES_PAGE_SIZE)
+      return false;
+    if (
+      articles.some(
+        (article) =>
+          String(article?.id) === postId &&
+          typeof article?.title === "string" &&
+          normalized(article.title) === title,
+      )
+    ) {
+      return true;
+    }
+    const isEnd = result?.paging?.is_end;
+    if (result?.paging !== undefined && typeof isEnd !== "boolean")
+      return false;
+    if (isEnd === true || articles.length === 0) return false;
+    if (isEnd === undefined && articles.length < ZHIHU_ARTICLES_PAGE_SIZE)
+      return false;
   }
-  const token = self?.url_token;
-  if (typeof token !== "string" || !/^[\w-]{1,128}$/u.test(token)) return false;
-  const endpoint = `${articlesOrigin}/api/v4/members/${encodeURIComponent(token)}/articles?limit=20&offset=0`;
-  const articles = await probeOwnAccount(page, endpoint, (data) => data?.data);
-  return (
-    Array.isArray(articles) &&
-    articles.some(
-      (article) =>
-        String(article?.id) === postId &&
-        normalized(article?.title ?? "") === title,
-    )
-  );
+  return false;
 }
 
 export async function readbackZhihu(

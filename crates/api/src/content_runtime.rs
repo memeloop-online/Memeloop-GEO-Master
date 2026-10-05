@@ -28,8 +28,19 @@ fn workflow_budgets() -> HostOpBudgets {
         HostOp::ContentPrepare,
         HostOp::ContentGenerate,
         HostOp::ContentCheck,
+        HostOp::ContentRepair,
     ] {
-        budgets = budgets.with_limits(op, HostOpLimits::new(120_000, 10_000));
+        budgets = budgets.with_limits(
+            op,
+            HostOpLimits::new(
+                120_000,
+                match op {
+                    HostOp::ContentCheck => 30_000,
+                    HostOp::ContentRepair => 20_000,
+                    _ => 10_000,
+                },
+            ),
+        );
     }
     for op in [HostOp::DistributionResume, HostOp::DistributionTargetsRead] {
         // 10,000 documents x up to 3 placements is > 256 cells. Recovery
@@ -51,11 +62,14 @@ mod budget_tests {
             HostOp::ContentPrepare,
             HostOp::ContentGenerate,
             HostOp::ContentCheck,
+            HostOp::ContentRepair,
             HostOp::DistributionResume,
             HostOp::DistributionTargetsRead,
         ] {
             assert!(budgets.limits(op).max_calls >= 10_000);
         }
+        assert_eq!(budgets.limits(HostOp::ContentCheck).max_calls, 30_000);
+        assert_eq!(budgets.limits(HostOp::ContentRepair).max_calls, 20_000);
     }
 }
 

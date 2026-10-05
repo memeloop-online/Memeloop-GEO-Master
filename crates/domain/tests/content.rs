@@ -1,8 +1,8 @@
 use chrono::{Duration, Utc};
 use geo_domain::{
     ChunkLocator, ContentAttemptOutcome, ContentBlock, ContentBlockKind, ContentBrief,
-    ContentEvidence, ContentItemStatus, ContentRepository, ContentStep, DocumentManifest,
-    DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
+    ContentEvidence, ContentFinding, ContentItemStatus, ContentRepository, ContentStep,
+    DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
     DocumentManifestState, ErrorCode, EvidenceRef, MemoryContentRepository, StructuredDocument,
     TenantScope,
 };
@@ -383,6 +383,507 @@ fn document(citation: Uuid) -> StructuredDocument {
             items: vec![],
         }],
     }
+}
+fn blocking_finding(block: Uuid, reference: &EvidenceRef) -> ContentFinding {
+    ContentFinding {
+        finding_id: Uuid::new_v4(),
+        code: "unsubstantiated_claim".into(),
+        block_id: Some(block),
+        evidence: vec![reference.clone()],
+        detail: "Revise claim against quoted source".into(),
+        blocking: true,
+    }
+}
+#[tokio::test]
+async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
+    let repo = MemoryContentRepository::new();
+    let (scope, manifest, source, cycle) = fixture();
+    let item_id = manifest.items[0].document_manifest_item_id;
+    let execution = repo
+        .start(&scope, cycle, manifest, "repair-policy")
+        .await
+        .unwrap();
+    let reference = evidence(source);
+    let prepare = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Prepare,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let quote = ContentEvidence {
+        reference: reference.clone(),
+        exact_quote: "Exact public source excerpt".into(),
+    };
+    repo.complete_prepare(
+        &scope,
+        &prepare,
+        ContentBrief {
+            brief_id: Uuid::new_v4(),
+            title: "Evidence".into(),
+            objective: "Cited answer".into(),
+            evidence: vec![reference.clone()],
+            quotes: vec![quote.clone()],
+            created_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let generate = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Generate,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let first = repo
+        .complete_generate(&scope, &generate, document(reference.chunk_id.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(first.quotes, vec![quote.clone()]);
+    let mut current = first.clone();
+    for count in 0..=2 {
+        let check = repo
+            .claim(
+                &scope,
+                execution.execution_id,
+                item_id,
+                ContentStep::Check,
+                "worker",
+                Utc::now(),
+                60,
+            )
+            .await
+            .unwrap();
+        assert_eq!(check.revision_id, Some(current.revision_id));
+        let finding = blocking_finding(current.document.blocks[0].block_id, &reference);
+        let checked = repo
+            .complete_check(&scope, &check, vec![finding.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.list_checks(&scope, current.revision_id).await.unwrap()[0].findings,
+            vec![finding]
+        );
+        assert_eq!(checked.automatic_repair_count, count);
+        if count == 2 {
+            assert_eq!(checked.status, ContentItemStatus::Blocked);
+            assert_eq!(
+                repo.claim(
+                    &scope,
+                    execution.execution_id,
+                    item_id,
+                    ContentStep::Repair,
+                    "worker",
+                    Utc::now(),
+                    60
+                )
+                .await
+                .unwrap_err()
+                .code,
+                ErrorCode::Conflict
+            );
+            break;
+        }
+        assert_eq!(checked.status, ContentItemStatus::NeedsRepair);
+        assert_eq!(
+            repo.close(&scope, execution.execution_id)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            repo.claim(
+                &scope,
+                execution.execution_id,
+                item_id,
+                ContentStep::Check,
+                "worker",
+                Utc::now(),
+                60
+            )
+            .await
+            .unwrap_err()
+            .code,
+            ErrorCode::Conflict
+        );
+        let repair = repo
+            .claim(
+                &scope,
+                execution.execution_id,
+                item_id,
+                ContentStep::Repair,
+                "worker",
+                Utc::now(),
+                60,
+            )
+            .await
+            .unwrap();
+        let mut stale = repair.clone();
+        stale.revision_id = Some(Uuid::new_v4());
+        assert_eq!(
+            repo.complete_repair(&scope, &stale, document(reference.chunk_id.unwrap()))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let invalid = document(Uuid::new_v4());
+        assert_eq!(
+            repo.complete_repair(&scope, &repair, invalid)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        let next = repo
+            .complete_repair(&scope, &repair, document(reference.chunk_id.unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(next.asset_id, first.asset_id);
+        assert_eq!(next.revision, current.revision + 1);
+        assert_eq!(next.base_revision_id, Some(current.revision_id));
+        assert_eq!(next.evidence, first.evidence);
+        assert_eq!(next.quotes, first.quotes);
+        assert!(next.findings.is_empty());
+        assert_eq!(
+            repo.complete_repair(&scope, &repair, document(reference.chunk_id.unwrap()))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let drafted = repo
+            .get_item(&scope, execution.execution_id, item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(drafted.status, ContentItemStatus::Drafted);
+        assert_eq!(drafted.automatic_repair_count, count + 1);
+        assert!(drafted.ready_revision_id.is_none());
+        current = next;
+    }
+    assert_eq!(
+        repo.list_revisions(&scope, first.asset_id)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    let blocked = repo
+        .get_item(&scope, execution.execution_id, item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked.automatic_repair_count, 2);
+    let handoff = repo.close(&scope, execution.execution_id).await.unwrap();
+    assert_eq!(handoff.coverage.blocked, 2);
+}
+
+#[tokio::test]
+async fn manual_edits_do_not_consume_repair_budget_and_fence_pending_checks() {
+    let repo = MemoryContentRepository::new();
+    let (scope, manifest, source, cycle) = fixture();
+    let item_id = manifest.items[0].document_manifest_item_id;
+    let execution = repo
+        .start(&scope, cycle, manifest, "manual-policy")
+        .await
+        .unwrap();
+    let reference = evidence(source);
+    let prepare = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Prepare,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    repo.complete_prepare(
+        &scope,
+        &prepare,
+        ContentBrief {
+            brief_id: Uuid::new_v4(),
+            title: "Brief".into(),
+            objective: "Cited answer".into(),
+            evidence: vec![reference.clone()],
+            quotes: vec![],
+            created_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let generate = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Generate,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let generated = repo
+        .complete_generate(&scope, &generate, document(reference.chunk_id.unwrap()))
+        .await
+        .unwrap();
+    let stale_check = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Check,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let edited = repo
+        .edit(
+            &scope,
+            generated.asset_id,
+            generated.revision_id,
+            document(reference.chunk_id.unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.complete_check(&scope, &stale_check, vec![])
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        repo.get_item(&scope, execution.execution_id, item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .automatic_repair_count,
+        0
+    );
+    let check = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Check,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    assert_eq!(check.revision_id, Some(edited.revision_id));
+    let needs_repair = repo
+        .complete_check(
+            &scope,
+            &check,
+            vec![blocking_finding(
+                edited.document.blocks[0].block_id,
+                &reference,
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(needs_repair.status, ContentItemStatus::NeedsRepair);
+    let stale_repair = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Repair,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let manual = repo
+        .edit(
+            &scope,
+            generated.asset_id,
+            edited.revision_id,
+            document(reference.chunk_id.unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.complete_repair(&scope, &stale_repair, document(reference.chunk_id.unwrap()))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        repo.get_item(&scope, execution.execution_id, item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .automatic_repair_count,
+        0
+    );
+    let check = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Check,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let still_needs_repair = repo
+        .complete_check(
+            &scope,
+            &check,
+            vec![blocking_finding(
+                manual.document.blocks[0].block_id,
+                &reference,
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(still_needs_repair.automatic_repair_count, 0);
+    let repair = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Repair,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let repaired = repo
+        .complete_repair(&scope, &repair, document(reference.chunk_id.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(repaired.base_revision_id, Some(manual.revision_id));
+    let final_check = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Check,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let ready = repo
+        .complete_check(&scope, &final_check, vec![])
+        .await
+        .unwrap();
+    assert_eq!(ready.status, ContentItemStatus::Ready);
+    assert_eq!(ready.ready_revision_id, Some(repaired.revision_id));
+    assert_eq!(ready.automatic_repair_count, 1);
+}
+#[tokio::test]
+async fn generic_blocked_results_never_enter_repair_and_old_records_default_to_zero() {
+    let repo = MemoryContentRepository::new();
+    let (scope, manifest, _, cycle) = fixture();
+    let first = manifest.items[0].document_manifest_item_id;
+    let execution = repo
+        .start(&scope, cycle, manifest, "generic-failure")
+        .await
+        .unwrap();
+    let lease = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            first,
+            ContentStep::Prepare,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let failed = repo
+        .fail_step(&scope, &lease, "provider unavailable")
+        .await
+        .unwrap();
+    assert_eq!(failed.status, ContentItemStatus::Blocked);
+    assert_eq!(failed.automatic_repair_count, 0);
+    assert_eq!(
+        repo.claim(
+            &scope,
+            execution.execution_id,
+            first,
+            ContentStep::Repair,
+            "worker",
+            Utc::now(),
+            60
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+    let mut legacy = serde_json::to_value(failed).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("automatic_repair_count");
+    let restored: geo_domain::ContentItem = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.automatic_repair_count, 0);
+    assert_eq!(restored.status, ContentItemStatus::Blocked);
+    let (scope, manifest, _, cycle) = fixture();
+    let classified_item = manifest.items[0].document_manifest_item_id;
+    let classified_execution = repo
+        .start(&scope, cycle, manifest, "generic-classification")
+        .await
+        .unwrap();
+    let classified = repo
+        .classify(
+            &scope,
+            classified_execution.execution_id,
+            classified_item,
+            ContentItemStatus::Blocked,
+            "source unavailable",
+        )
+        .await
+        .unwrap();
+    assert_eq!(classified.status, ContentItemStatus::Blocked);
+    assert_eq!(classified.automatic_repair_count, 0);
+    assert_eq!(
+        repo.claim(
+            &scope,
+            classified_execution.execution_id,
+            classified_item,
+            ContentStep::Repair,
+            "worker",
+            Utc::now(),
+            60
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
 }
 #[tokio::test]
 async fn replay_scope_fencing_cancel_and_denominator() {

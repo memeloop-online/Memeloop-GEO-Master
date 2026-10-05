@@ -35,6 +35,7 @@ const stateLabels: Record<ContentItem["status"], string> = {
   pending: "等待准备",
   prepared: "简报已准备",
   drafted: "草稿待检查",
+  needs_repair: "待自动修正",
   ready: "正文就绪",
   blocked: "阻断",
   deferred: "延后",
@@ -124,6 +125,17 @@ function ItemCard({
                     : "尚无执行记录"}
             {item?.reason ? `：${item.reason}` : ""}
           </dd>
+          {item &&
+            (item.status === "needs_repair" ||
+              (item.automatic_repair_count ?? 0) > 0) && (
+              <>
+                <dt>自动修正</dt>
+                <dd>
+                  已完成 {item.automatic_repair_count ?? 0} / 2 轮；
+                  修正后将重新检查，检查通过前不交给发布。
+                </dd>
+              </>
+            )}
           {item?.brief && (
             <>
               <dt>内容简报</dt>

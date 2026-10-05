@@ -103,6 +103,7 @@ content_step_op!(
     content_generate
 );
 content_step_op!(op_host_content_check_v1, ContentCheck, content_check);
+content_step_op!(op_host_content_repair_v1, ContentRepair, content_repair);
 
 #[op2]
 #[string]
@@ -664,6 +665,7 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ContentPrepare.op_name(),
     HostOp::ContentGenerate.op_name(),
     HostOp::ContentCheck.op_name(),
+    HostOp::ContentRepair.op_name(),
     HostOp::ContentClose.op_name(),
     HostOp::ContentStart.op_name(),
     HostOp::ContentExecutionRead.op_name(),

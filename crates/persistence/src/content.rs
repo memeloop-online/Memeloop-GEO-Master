@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ContentAsset, ContentBrief, ContentExecution, ContentFinding, ContentHandoff,
-    ContentItem, ContentItemStatus, ContentRepository, ContentRevision, ContentState, ContentStep,
-    DocumentManifest, ErrorCode, StepLease, StructuredDocument, TenantScope, start_content_state,
+    AppError, ContentAsset, ContentBrief, ContentCheck, ContentExecution, ContentFinding,
+    ContentHandoff, ContentItem, ContentItemStatus, ContentRepository, ContentRevision,
+    ContentState, ContentStep, DocumentManifest, ErrorCode, StepLease, StructuredDocument,
+    TenantScope, start_content_state,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -654,6 +655,33 @@ impl ContentRepository for PgContentRepository {
         }
         Ok(revisions)
     }
+    async fn list_checks(
+        &self,
+        scope: &TenantScope,
+        revision_id: Uuid,
+    ) -> Result<Vec<ContentCheck>, AppError> {
+        let Some(project) = scope.project_id else {
+            return Err(AppError::invalid_request("project scope required"));
+        };
+        let mut tx = self.transaction(scope).await?;
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT body FROM content_checks WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND revision_id=$4 ORDER BY created_at,check_id",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(revision_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        rows.into_iter()
+            .map(|value| {
+                serde_json::from_value(value)
+                    .map_err(|_| AppError::new(ErrorCode::Internal, "stored content check invalid"))
+            })
+            .collect()
+    }
     async fn claim(
         &self,
         scope: &TenantScope,
@@ -697,6 +725,17 @@ impl ContentRepository for PgContentRepository {
     ) -> Result<ContentItem, AppError> {
         self.mutate(scope, lease.execution_id, |s| {
             s.complete_check(lease, findings)
+        })
+        .await
+    }
+    async fn complete_repair(
+        &self,
+        scope: &TenantScope,
+        lease: &StepLease,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError> {
+        self.mutate(scope, lease.execution_id, |s| {
+            s.complete_repair(lease, document)
         })
         .await
     }

@@ -48,6 +48,7 @@ impl Fixture {
                         item_id: Uuid::from_u128(n),
                         branch_key: format!("cycle:1:document-{n}"),
                         status: ContentItemStatus::Pending,
+                        automatic_repair_count: 0,
                     })
                     .collect(),
             ),
@@ -257,11 +258,40 @@ impl HostOps for Fixture {
         _scope: &TenantScope,
         request: ContentStepRequest,
     ) -> Result<ContentItemRef, HostOpError> {
-        self.step(
-            request,
-            ContentItemStatus::Drafted,
-            ContentItemStatus::Ready,
-        )
+        let item = self
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|item| item.item_id == request.item_id)
+            .unwrap()
+            .clone();
+        let to = if request.item_id == Uuid::from_u128(1) && item.automatic_repair_count < 2 {
+            ContentItemStatus::NeedsRepair
+        } else {
+            ContentItemStatus::Ready
+        };
+        self.step(request, ContentItemStatus::Drafted, to)
+    }
+    async fn content_repair(
+        &self,
+        _scope: &TenantScope,
+        request: ContentStepRequest,
+    ) -> Result<ContentItemRef, HostOpError> {
+        let mut items = self.items.lock().unwrap();
+        let item = items
+            .iter_mut()
+            .find(|item| item.item_id == request.item_id)
+            .unwrap();
+        if item.status != ContentItemStatus::NeedsRepair || item.automatic_repair_count >= 2 {
+            return Err(HostOpError::denied(
+                HostOp::ContentRepair,
+                "repair is not eligible",
+            ));
+        }
+        item.status = ContentItemStatus::Drafted;
+        item.automatic_repair_count += 1;
+        Ok(item.clone())
     }
     async fn content_close(
         &self,
@@ -450,6 +480,7 @@ async fn two_documents_resume_after_generation_without_duplicate_model_call() {
             .any(|event| event.topic == "distribution.prepared")
     );
     assert_eq!(*fixture.expansion.lock().unwrap(), 300);
+    assert_eq!(fixture.items.lock().unwrap()[0].automatic_repair_count, 2);
     assert!(
         fixture.resume_pages.lock().unwrap().contains(&Some(255)),
         "eligibility recheck must reach target pages beyond the first 256"

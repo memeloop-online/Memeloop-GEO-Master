@@ -880,6 +880,17 @@ impl HostOps for RepositoryHostOps {
             .map_err(|error| worker_error(op, error))
     }
 
+    async fn content_repair(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentStepRequest,
+    ) -> Result<geo_worker::ContentItemRef, HostOpError> {
+        let op = HostOp::ContentRepair;
+        crate::content_tools::repair(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
     async fn content_close(
         &self,
         scope: &TenantScope,

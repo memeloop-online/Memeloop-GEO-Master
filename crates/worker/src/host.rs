@@ -38,7 +38,7 @@ pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope}
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v6";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v7";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -92,6 +92,7 @@ pub enum HostOp {
     ContentPrepare,
     ContentGenerate,
     ContentCheck,
+    ContentRepair,
     ContentClose,
     ContentStart,
     ContentExecutionRead,
@@ -103,7 +104,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 24;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -123,6 +124,7 @@ impl HostOp {
         Self::ContentPrepare,
         Self::ContentGenerate,
         Self::ContentCheck,
+        Self::ContentRepair,
         Self::ContentClose,
         Self::ContentStart,
         Self::ContentExecutionRead,
@@ -151,6 +153,7 @@ impl HostOp {
             Self::ContentPrepare => "content.prepare.v1",
             Self::ContentGenerate => "content.generate.v1",
             Self::ContentCheck => "content.check.v1",
+            Self::ContentRepair => "content.repair.v1",
             Self::ContentClose => "content.close.v1",
             Self::ContentStart => "content.start.v1",
             Self::ContentExecutionRead => "content.execution.read.v1",
@@ -180,6 +183,7 @@ impl HostOp {
             Self::ContentPrepare => "op_host_content_prepare_v1",
             Self::ContentGenerate => "op_host_content_generate_v1",
             Self::ContentCheck => "op_host_content_check_v1",
+            Self::ContentRepair => "op_host_content_repair_v1",
             Self::ContentClose => "op_host_content_close_v1",
             Self::ContentStart => "op_host_content_start_v1",
             Self::ContentExecutionRead => "op_host_content_execution_read_v1",
@@ -245,7 +249,8 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(15_000, 128), // paged content reads
                 HostOpLimits::new(120_000, 2_048), // prepare
                 HostOpLimits::new(120_000, 2_048), // generate
-                HostOpLimits::new(120_000, 2_048), // check
+                HostOpLimits::new(120_000, 6_144), // check, up to three passes
+                HostOpLimits::new(120_000, 4_096), // repair, up to two passes
                 HostOpLimits::new(30_000, 4),   // close
                 HostOpLimits::new(30_000, 4),   // start
                 HostOpLimits::new(15_000, 32),  // execution read
@@ -638,6 +643,17 @@ pub trait HostOps: Send + Sync {
         ))
     }
 
+    async fn content_repair(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentStepRequest,
+    ) -> Result<ContentItemRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentRepair,
+            "content repair is not configured",
+        ))
+    }
+
     async fn content_close(
         &self,
         _scope: &TenantScope,
@@ -847,6 +863,7 @@ pub struct ContentItemRef {
     pub item_id: Uuid,
     pub branch_key: String,
     pub status: ContentItemStatus,
+    pub automatic_repair_count: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2012,7 +2029,8 @@ mod tests {
             HostOpBudgets::default().limits(HostOp::ModelComplete)
         );
         assert_eq!(budgets.limits(HostOp::ContentGenerate).max_calls, 2_048);
-        assert_eq!(budgets.limits(HostOp::ContentCheck).max_calls, 2_048);
+        assert_eq!(budgets.limits(HostOp::ContentCheck).max_calls, 6_144);
+        assert_eq!(budgets.limits(HostOp::ContentRepair).max_calls, 4_096);
         assert_eq!(budgets.limits(HostOp::ContentClose).max_calls, 4);
         assert_eq!(budgets.limits(HostOp::ContentStart).max_calls, 4);
         assert_eq!(budgets.limits(HostOp::DistributionStart).max_calls, 4);

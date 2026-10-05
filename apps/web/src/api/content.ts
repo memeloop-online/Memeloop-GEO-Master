@@ -59,6 +59,7 @@ export interface ContentItem {
     | "pending"
     | "prepared"
     | "drafted"
+    | "needs_repair"
     | "ready"
     | "blocked"
     | "deferred"
@@ -70,7 +71,11 @@ export interface ContentItem {
   asset_id: string | null;
   current_revision_id: string | null;
   ready_revision_id: string | null;
-  steps: Array<{ step: "prepare" | "generate" | "check"; expires_at: string }>;
+  automatic_repair_count?: number;
+  steps: Array<{
+    step: "prepare" | "generate" | "check" | "repair";
+    expires_at: string;
+  }>;
 }
 
 export interface ContentAsset {
@@ -296,7 +301,9 @@ export function useContentItemsQuery(
     enabled: Boolean(scope && executionId),
     refetchInterval: (query) =>
       query.state.data?.some((item) =>
-        ["pending", "prepared", "drafted"].includes(item.status),
+        ["pending", "prepared", "drafted", "needs_repair"].includes(
+          item.status,
+        ),
       )
         ? 5000
         : false,

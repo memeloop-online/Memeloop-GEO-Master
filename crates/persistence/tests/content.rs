@@ -1,12 +1,13 @@
 //! Run with GEO_TEST_DATABASE_URL against a disposable database.
 use chrono::Utc;
 use geo_domain::{
-    ContentBlock, ContentBlockKind, ContentBrief, ContentEvidence, ContentRepository, ContentStep,
-    DistributionRepository, DocumentManifestPlanRequest, ErrorCode, EvidenceRef,
-    FreezeDistribution, ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility,
-    KnowledgePurpose, KnowledgeRepository, PlatformPlacement, ProjectCreate, ProjectRepository,
-    ProjectSettings, ProjectStartCommand, SourceKind, StructuredDocument, TenantScope,
-    hash_idempotency_key, settings_hash, start_request_hash,
+    ContentBlock, ContentBlockKind, ContentBrief, ContentEvidence, ContentFinding,
+    ContentItemStatus, ContentRepository, ContentStep, DistributionRepository,
+    DocumentManifestPlanRequest, ErrorCode, EvidenceRef, FreezeDistribution, ImportItem,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
+    KnowledgeRepository, PlatformPlacement, ProjectCreate, ProjectRepository, ProjectSettings,
+    ProjectStartCommand, SourceKind, StructuredDocument, TenantScope, hash_idempotency_key,
+    settings_hash, start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgContentRepository, PgDistributionRepository, PgKnowledgeRepository,
@@ -933,7 +934,12 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         "later-page recheckable deferral must recover"
     );
     let cancelled = repository
-        .start(&scope, accepted.cycle_id, manifest, "test-policy-cancel")
+        .start(
+            &scope,
+            accepted.cycle_id,
+            manifest.clone(),
+            "test-policy-cancel",
+        )
         .await
         .unwrap();
     let late = repository
@@ -976,7 +982,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
                 brief_id: Uuid::new_v4(),
                 title: "Late".into(),
                 objective: "Never commit".into(),
-                evidence: vec![reference],
+                evidence: vec![reference.clone()],
                 quotes: vec![],
                 created_at: Utc::now(),
             },
@@ -984,4 +990,163 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .await
         .unwrap_err();
     assert_eq!(rejected.code, ErrorCode::Conflict);
+
+    // Separate execution exercises a persisted factual repair across repository
+    // instances without disturbing the distribution handoff above.
+    let repairing = repository
+        .start(&scope, accepted.cycle_id, manifest, "test-policy-repair")
+        .await
+        .unwrap();
+    let prep = repository
+        .claim(
+            &scope,
+            repairing.execution_id,
+            item,
+            ContentStep::Prepare,
+            "owner",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let quote = ContentEvidence {
+        reference: reference.clone(),
+        exact_quote: chunk.text.clone(),
+    };
+    repository
+        .complete_prepare(
+            &scope,
+            &prep,
+            ContentBrief {
+                brief_id: Uuid::new_v4(),
+                title: "Verified brief".into(),
+                objective: "Cited answer".into(),
+                evidence: vec![reference.clone()],
+                quotes: vec![quote.clone()],
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    let generation = repository
+        .claim(
+            &scope,
+            repairing.execution_id,
+            item,
+            ContentStep::Generate,
+            "owner",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let repaired_document = StructuredDocument {
+        title: "Verified claim".into(),
+        blocks: vec![ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Paragraph,
+            text: "Evidence-linked claim".into(),
+            citation_ids: vec![reference.chunk_id.unwrap()],
+            items: vec![],
+        }],
+    };
+    let original = repository
+        .complete_generate(&scope, &generation, repaired_document.clone())
+        .await
+        .unwrap();
+    let check = repository
+        .claim(
+            &scope,
+            repairing.execution_id,
+            item,
+            ContentStep::Check,
+            "owner",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let finding = ContentFinding {
+        finding_id: Uuid::new_v4(),
+        code: "unsupported_claim".into(),
+        block_id: Some(repaired_document.blocks[0].block_id),
+        evidence: vec![reference.clone()],
+        detail: "Revise the unsupported claim".into(),
+        blocking: true,
+    };
+    let checked = restarted
+        .complete_check(&scope, &check, vec![finding.clone()])
+        .await
+        .unwrap();
+    assert_eq!(checked.status, ContentItemStatus::NeedsRepair);
+    assert_eq!(checked.automatic_repair_count, 0);
+    assert_eq!(
+        repository
+            .list_checks(&scope, original.revision_id)
+            .await
+            .unwrap()[0]
+            .findings,
+        vec![finding]
+    );
+    assert!(
+        repository
+            .list_checks(&wrong, original.revision_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let repair = restarted
+        .claim(
+            &scope,
+            repairing.execution_id,
+            item,
+            ContentStep::Repair,
+            "owner",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    assert_eq!(repair.revision_id, Some(original.revision_id));
+    let mut wrong_base = repair.clone();
+    wrong_base.revision_id = Some(Uuid::new_v4());
+    assert_eq!(
+        repository
+            .complete_repair(&scope, &wrong_base, repaired_document.clone())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    let second = repository
+        .complete_repair(&scope, &repair, repaired_document)
+        .await
+        .unwrap();
+    assert_eq!(second.base_revision_id, Some(original.revision_id));
+    assert_eq!(second.asset_id, original.asset_id);
+    assert_eq!(second.quotes, vec![quote]);
+    assert_eq!(second.evidence, original.evidence);
+    assert_eq!(
+        restarted
+            .complete_repair(&scope, &repair, second.document.clone())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    let recovered = restarted
+        .get_item(&scope, repairing.execution_id, item)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.automatic_repair_count, 1);
+    assert_eq!(recovered.status, ContentItemStatus::Drafted);
+    assert_eq!(recovered.current_revision_id, Some(second.revision_id));
+    let revisions = restarted
+        .list_revisions(&scope, original.asset_id)
+        .await
+        .unwrap();
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(revisions[0].revision_id, original.revision_id);
+    assert_eq!(revisions[1].revision_id, second.revision_id);
 }

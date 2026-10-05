@@ -362,6 +362,40 @@ afterEach(() => {
 });
 
 describe("P08 content assets", () => {
+  it("shows automatic repair as unfinished without a manual approval action", async () => {
+    mockApi({
+      executionList: [
+        {
+          ...execution,
+          status: "running",
+          handoff_id: null,
+          coverage: { ...coverage, ready: 0, incomplete: 1 },
+        },
+      ],
+      itemList: [
+        {
+          ...items[0],
+          status: "needs_repair",
+          ready_revision_id: null,
+          automatic_repair_count: 1,
+          reason: "当前版本仍有依据不足的表述",
+        },
+        items[1],
+      ],
+    });
+    renderPage("/app/tenant-1/project-1/content");
+    expect(await screen.findByText(/执行：running/)).toHaveTextContent(
+      "未完成 1",
+    );
+    const list = screen.getByRole("region", { name: "全部文档分支" });
+    expect(
+      await within(list).findByText(/已完成 1 \/ 2 轮/),
+    ).toBeInTheDocument();
+    expect(within(list).getAllByText(/待自动修正/)).toHaveLength(2);
+    expect(within(list).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+  });
+
   it("keeps the frozen denominator and missing-asset branch visible", async () => {
     mockApi();
     renderPage("/app/tenant-1/project-1/content");

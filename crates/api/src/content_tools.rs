@@ -26,6 +26,7 @@ fn item_ref(item: ContentItem) -> ContentItemRef {
         item_id: item.item_id,
         branch_key: item.branch_key,
         status: item.status,
+        automatic_repair_count: item.automatic_repair_count,
     }
 }
 
@@ -225,6 +226,27 @@ pub(crate) async fn check(
         .check(scope, request.execution_id, request.item_id)
         .await
         .map(item_ref)
+}
+
+pub(crate) async fn repair(
+    state: &AppState,
+    scope: &TenantScope,
+    request: ContentStepRequest,
+) -> Result<ContentItemRef, AppError> {
+    scoped_item(state, scope, &request).await?;
+    state
+        .content_service()
+        .repair(scope, request.execution_id, request.item_id)
+        .await?;
+    // Report fresh persisted state; the model response is never an authority
+    // for step status or the repair count exposed to the isolate.
+    let item = state
+        .content_service()
+        .repository()
+        .get_item(scope, request.execution_id, request.item_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("content item not found"))?;
+    Ok(item_ref(item))
 }
 
 pub(crate) async fn close(

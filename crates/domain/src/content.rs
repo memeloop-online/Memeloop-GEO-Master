@@ -24,6 +24,7 @@ pub enum ContentItemStatus {
     Pending,
     Prepared,
     Drafted,
+    NeedsRepair,
     Ready,
     Blocked,
     Deferred,
@@ -36,6 +37,7 @@ pub enum ContentStep {
     Prepare,
     Generate,
     Check,
+    Repair,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +176,8 @@ pub struct StepLease {
     pub owner: String,
     pub token: Uuid,
     pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub revision_id: Option<Uuid>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -254,6 +258,8 @@ pub struct ContentItem {
     pub asset_id: Option<Uuid>,
     pub current_revision_id: Option<Uuid>,
     pub ready_revision_id: Option<Uuid>,
+    #[serde(default)]
+    pub automatic_repair_count: u8,
     pub steps: Vec<StepLease>,
     #[serde(default)]
     pub attempts: Vec<ContentStepAttempt>,
@@ -361,6 +367,7 @@ pub fn start_content_state(
             asset_id: None,
             current_revision_id: None,
             ready_revision_id: None,
+            automatic_repair_count: 0,
             steps: Vec::new(),
             attempts: Vec::new(),
         });
@@ -444,15 +451,40 @@ impl ContentState {
         if owner.trim().is_empty() || !(1..=3600).contains(&ttl_seconds) {
             return Err(AppError::invalid_request("invalid lease owner or lifetime"));
         }
+        if step == ContentStep::Repair {
+            let item = self
+                .items
+                .iter()
+                .find(|item| item.item_id == item_id)
+                .ok_or_else(|| AppError::not_found("content item not found"))?;
+            if item.automatic_repair_count >= 2
+                || !item.current_revision_id.is_some_and(|revision_id| {
+                    self.checks.iter().any(|check| {
+                        check.revision_id == revision_id
+                            && check.findings.iter().any(|finding| finding.blocking)
+                    })
+                })
+            {
+                return Err(AppError::conflict(
+                    "current revision is not eligible for factual repair",
+                ));
+            }
+        }
         let execution_id = self.execution.execution_id;
         let item = self.item_mut(item_id)?;
         let expected = match step {
             ContentStep::Prepare => ContentItemStatus::Pending,
             ContentStep::Generate => ContentItemStatus::Prepared,
             ContentStep::Check => ContentItemStatus::Drafted,
+            ContentStep::Repair => ContentItemStatus::NeedsRepair,
         };
         if item.status != expected {
             return Err(AppError::conflict("step is not claimable for item status"));
+        }
+        if matches!(step, ContentStep::Check | ContentStep::Repair)
+            && item.current_revision_id.is_none()
+        {
+            return Err(AppError::conflict("draft revision is missing"));
         }
         if item
             .steps
@@ -482,6 +514,9 @@ impl ContentState {
             owner: owner.to_owned(),
             token: Uuid::new_v4(),
             expires_at: now + Duration::seconds(ttl_seconds),
+            revision_id: matches!(step, ContentStep::Check | ContentStep::Repair)
+                .then_some(item.current_revision_id)
+                .flatten(),
         };
         item.steps.push(lease.clone());
         item.attempts.push(ContentStepAttempt {
@@ -510,6 +545,12 @@ impl ContentState {
         let item = self.item_mut(lease.item_id)?;
         if !item.steps.iter().any(|stored| stored == lease) {
             return Err(AppError::conflict("stale step lease"));
+        }
+        if matches!(step, ContentStep::Check | ContentStep::Repair)
+            && lease.revision_id.is_some()
+            && item.current_revision_id != lease.revision_id
+        {
+            return Err(AppError::conflict("step revision changed"));
         }
         item.steps.retain(|stored| stored != lease);
         if let Some(attempt) = item.attempts.iter_mut().find(|a| a.token == lease.token) {
@@ -622,6 +663,9 @@ impl ContentState {
             .iter()
             .find(|r| r.revision_id == revision_id)
             .ok_or_else(|| AppError::conflict("draft is missing"))?;
+        if lease.revision_id.is_some() && lease.revision_id != Some(revision_id) {
+            return Err(AppError::conflict("check revision changed"));
+        }
         if findings.iter().any(|f| {
             f.code.trim().is_empty()
                 || f.detail.trim().is_empty()
@@ -642,7 +686,11 @@ impl ContentState {
         });
         let item = self.item_mut(lease.item_id)?;
         item.status = if findings.iter().any(|f| f.blocking) {
-            ContentItemStatus::Blocked
+            if item.automatic_repair_count < 2 {
+                ContentItemStatus::NeedsRepair
+            } else {
+                ContentItemStatus::Blocked
+            }
         } else {
             ContentItemStatus::Ready
         };
@@ -654,6 +702,85 @@ impl ContentState {
         let result = item.clone();
         self.recount();
         Ok(result)
+    }
+    pub fn complete_repair(
+        &mut self,
+        lease: &StepLease,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError> {
+        self.running()?;
+        if lease.step != ContentStep::Repair || lease.execution_id != self.execution.execution_id {
+            return Err(AppError::conflict("stale repair lease"));
+        }
+        let item = self
+            .items
+            .iter()
+            .find(|i| i.item_id == lease.item_id)
+            .ok_or_else(|| AppError::not_found("item not found"))?;
+        if item.status != ContentItemStatus::NeedsRepair || item.automatic_repair_count >= 2 {
+            return Err(AppError::conflict(
+                "item is not eligible for automatic repair",
+            ));
+        }
+        let revision_id = item
+            .current_revision_id
+            .ok_or_else(|| AppError::conflict("repair base revision is missing"))?;
+        if lease.revision_id != Some(revision_id) {
+            return Err(AppError::conflict("repair base revision changed"));
+        }
+        let previous = self
+            .revisions
+            .iter()
+            .find(|r| r.revision_id == revision_id)
+            .ok_or_else(|| AppError::conflict("repair base revision is missing"))?;
+        if !self
+            .checks
+            .iter()
+            .any(|c| c.revision_id == revision_id && c.findings.iter().any(|f| f.blocking))
+        {
+            return Err(AppError::conflict("current revision has no blocking check"));
+        }
+        let asset_id = item
+            .asset_id
+            .ok_or_else(|| AppError::conflict("repair asset is missing"))?;
+        if !self
+            .assets
+            .iter()
+            .any(|a| a.asset_id == asset_id && a.current_revision_id == revision_id)
+        {
+            return Err(AppError::conflict("repair base revision changed"));
+        }
+        document.validate(&previous.evidence)?;
+        let next = ContentRevision {
+            revision_id: Uuid::new_v4(),
+            asset_id,
+            revision: previous
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| AppError::conflict("too many content revisions"))?,
+            base_revision_id: Some(revision_id),
+            markdown: document.markdown(),
+            document,
+            evidence: previous.evidence.clone(),
+            quotes: previous.quotes.clone(),
+            findings: Vec::new(),
+            created_at: Utc::now(),
+        };
+        self.consume(lease, ContentStep::Repair)?;
+        let item = self.item_mut(lease.item_id)?;
+        item.automatic_repair_count += 1;
+        item.current_revision_id = Some(next.revision_id);
+        item.ready_revision_id = None;
+        item.status = ContentItemStatus::Drafted;
+        item.reason = None;
+        self.assets
+            .iter_mut()
+            .find(|a| a.asset_id == asset_id)
+            .expect("asset was verified above")
+            .current_revision_id = next.revision_id;
+        self.revisions.push(next.clone());
+        self.recount();
+        Ok(next)
     }
     pub fn edit(
         &mut self,
@@ -873,6 +1000,7 @@ impl ContentState {
                 ContentItemStatus::Pending
                     | ContentItemStatus::Prepared
                     | ContentItemStatus::Drafted
+                    | ContentItemStatus::NeedsRepair
             ) {
                 item.status = ContentItemStatus::Cancelled;
                 item.reason = Some("execution_cancelled".into());
@@ -940,6 +1068,11 @@ pub trait ContentRepository: Send + Sync {
         scope: &TenantScope,
         asset_id: Uuid,
     ) -> Result<Vec<ContentRevision>, AppError>;
+    async fn list_checks(
+        &self,
+        scope: &TenantScope,
+        revision_id: Uuid,
+    ) -> Result<Vec<ContentCheck>, AppError>;
     #[allow(clippy::too_many_arguments)] // Explicit scope, branch, step and fencing clock.
     async fn claim(
         &self,
@@ -969,6 +1102,12 @@ pub trait ContentRepository: Send + Sync {
         lease: &StepLease,
         findings: Vec<ContentFinding>,
     ) -> Result<ContentItem, AppError>;
+    async fn complete_repair(
+        &self,
+        scope: &TenantScope,
+        lease: &StepLease,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError>;
     async fn edit(
         &self,
         scope: &TenantScope,
@@ -1221,6 +1360,29 @@ impl ContentRepository for MemoryContentRepository {
             })
             .collect())
     }
+    async fn list_checks(
+        &self,
+        scope: &TenantScope,
+        revision_id: Uuid,
+    ) -> Result<Vec<ContentCheck>, AppError> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .values()
+            .filter(|(stored_scope, state)| {
+                scope.contains(stored_scope)
+                    && state.revisions.iter().any(|r| r.revision_id == revision_id)
+            })
+            .flat_map(|(_, state)| {
+                state
+                    .checks
+                    .iter()
+                    .filter(move |c| c.revision_id == revision_id)
+            })
+            .cloned()
+            .collect())
+    }
     async fn claim(
         &self,
         scope: &TenantScope,
@@ -1264,6 +1426,17 @@ impl ContentRepository for MemoryContentRepository {
     ) -> Result<ContentItem, AppError> {
         self.mutate(scope, lease.execution_id, |s| {
             s.complete_check(lease, findings)
+        })
+        .await
+    }
+    async fn complete_repair(
+        &self,
+        scope: &TenantScope,
+        lease: &StepLease,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError> {
+        self.mutate(scope, lease.execution_id, |s| {
+            s.complete_repair(lease, document)
         })
         .await
     }

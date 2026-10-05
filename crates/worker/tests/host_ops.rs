@@ -478,6 +478,7 @@ async fn the_reference_bundle_declares_the_surface_it_expects() {
         "publishSubmit",
         "measureSample",
         "distributionStart",
+        "contentRepair",
         "distributionRead",
         "distributionResume",
         "distributionTargetsRead",
