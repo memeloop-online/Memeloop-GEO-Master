@@ -40,6 +40,17 @@ const MAX_BLOCKS: usize = 32;
 // commit once another owner reclaims the step.
 const LEASE_SECONDS: i64 = 900;
 
+fn evidence_excerpt(text: &str, locator: &geo_domain::ChunkLocator) -> Option<String> {
+    if matches!(locator, geo_domain::ChunkLocator::Csv { .. }) {
+        // CSV chunks bind the entire header/value record to this locator.
+        // A prefix can cut a cell or discard its column association. Retain
+        // whole records only; fragmenting requires its own evidence identity.
+        (text.chars().count() <= MAX_QUOTE_CHARS).then(|| text.to_owned())
+    } else {
+        Some(text.chars().take(MAX_QUOTE_CHARS).collect())
+    }
+}
+
 fn stable_id(key: &str) -> Uuid {
     let digest = Sha256::digest(key.as_bytes());
     let mut bytes: [u8; 16] = digest[..16].try_into().expect("sha256 length");
@@ -599,6 +610,9 @@ impl ContentService {
                 if chunk.text.trim().is_empty() {
                     continue;
                 }
+                let Some(quote) = evidence_excerpt(&chunk.text, &chunk.locator) else {
+                    continue;
+                };
                 evidence.push(KnowledgeEvidence {
                     source_id: source.source_id,
                     source_version_id: version_id,
@@ -606,8 +620,8 @@ impl ContentService {
                     source_name: source.name.clone(),
                     purpose: KnowledgePurpose::Public,
                     locator: chunk.locator,
-                    quote: chunk.text.chars().take(MAX_QUOTE_CHARS).collect(),
-                    text: chunk.text.chars().take(MAX_QUOTE_CHARS).collect(),
+                    quote: quote.clone(),
+                    text: quote,
                 });
             }
         }
@@ -1064,6 +1078,47 @@ pub(crate) async fn edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_evidence_preserves_complete_records_and_never_truncates_cells() {
+        let locator = geo_domain::ChunkLocator::Csv {
+            start_row: 2,
+            end_row: 2,
+            start_column: 1,
+            end_column: 2,
+            header_row: Some(1),
+        };
+        let row = serde_json::json!({
+            "headers":["型号","价格"],
+            "values":["001\n\"quoted\"","001.00 元"]
+        })
+        .to_string();
+        assert_eq!(evidence_excerpt(&row, &locator), Some(row.clone()));
+        let large = serde_json::json!({
+            "headers":["型号","价格"],
+            "values":["字".repeat(MAX_QUOTE_CHARS),"001.00 元"]
+        })
+        .to_string();
+        assert_eq!(evidence_excerpt(&large, &locator), None);
+        let selected: Vec<_> = [&large, &row]
+            .into_iter()
+            .filter_map(|text| evidence_excerpt(text, &locator))
+            .collect();
+        assert_eq!(selected, vec![row]);
+        let plain = geo_domain::ChunkLocator::Text {
+            start_line: 1,
+            end_line: 1,
+            start_char: 0,
+            end_char: 2000,
+        };
+        assert_eq!(
+            evidence_excerpt(&"字".repeat(2000), &plain)
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_QUOTE_CHARS
+        );
+    }
     use async_trait::async_trait;
     use geo_domain::{
         ChunkLocator, DocumentManifestPlanRequest, DocumentScope, ImportItem, InitialSource,
