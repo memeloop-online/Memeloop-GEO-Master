@@ -341,7 +341,6 @@ async fn fixtures_and_plausible_answers_without_official_search_are_missing() {
         Receipt::InvalidProvenance,
         Receipt::ForgedMarker,
         Receipt::MismatchedExecution,
-        Receipt::Unknown,
     ] {
         let outcome = run(case).await;
         assert_eq!(outcome.status, ChannelOutcomeStatus::Missing, "{case:?}");
@@ -370,4 +369,7 @@ async fn fixtures_and_plausible_answers_without_official_search_are_missing() {
         run(Receipt::Unsupported).await.status,
         ChannelOutcomeStatus::Unsupported
     );
+    let unknown = run(Receipt::Unknown).await;
+    assert_eq!(unknown.status, ChannelOutcomeStatus::Unknown);
+    assert!(unknown.raw_answer.is_none());
 }

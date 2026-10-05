@@ -1204,7 +1204,9 @@ async fn execute_reserved_channel_target(
             let status = match result.status.as_str() {
                 "unsupported" if matched => ChannelOutcomeStatus::Unsupported,
                 "login_required" | "challenge" if matched => ChannelOutcomeStatus::LoginRequired,
-                "unknown" if operation == "publish" => ChannelOutcomeStatus::Unknown,
+                // A matching explicit unknown may still be running remotely;
+                // retain its reservation until the bounded deadline.
+                "unknown" if matched => ChannelOutcomeStatus::Unknown,
                 "completed" if observation.is_some() => observation.as_ref().unwrap().0,
                 // A completed generic browser action is not proof of
                 // publication nor valid independent search observation.
