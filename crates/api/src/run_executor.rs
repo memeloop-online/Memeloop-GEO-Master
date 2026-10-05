@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use geo_domain::{
-    AgentRepository, AgentRuntime, AppError, RunCompletion, RunId, RunStatus, StoreCheckpoint,
+    AgentRepository, AgentRuntime, AppError, Run, RunCompletion, RunId, RunStatus, StoreCheckpoint,
     SubmitAcceptance, TenantScope, TurnInput, TurnReport, sha256_hex,
 };
 use serde_json::json;
@@ -102,45 +102,61 @@ pub fn dispatch(
     if acceptance.run.status != RunStatus::Queued {
         return;
     }
-    dispatch_queued(runtime, repository, scope, acceptance.run.id);
+    let run_id = acceptance.run.id;
+    tokio::spawn(async move {
+        dispatch_queued(runtime, repository, scope, run_id).await;
+    });
 }
 
-/// Schedule a durable queued run for an atomic claim. Called by the HTTP
-/// acceptance path and by PostgreSQL recovery; duplicate schedules are safe.
-pub fn dispatch_queued(
+/// Claim a durable queued run before scheduling its execution. The scanner
+/// awaits the claim so pending claims cannot pile up across scan passes.
+/// This returns after the claim, without waiting for the model; duplicate
+/// HTTP and recovery dispatches are resolved by the repository.
+pub async fn dispatch_queued(
     runtime: Arc<dyn AgentRuntime>,
     repository: Arc<dyn AgentRepository>,
     scope: TenantScope,
     run_id: RunId,
 ) {
+    let Some(claimed) = claim_run(&*repository, &scope, run_id).await else {
+        return;
+    };
     tokio::spawn(async move {
-        execute(runtime, repository, scope, run_id).await;
+        execute_claimed(runtime, repository, scope, claimed).await;
     });
 }
 
-/// Claims the run, runs exactly one turn, and records its terminal outcome.
+async fn claim_run(
+    repository: &dyn AgentRepository,
+    scope: &TenantScope,
+    run_id: RunId,
+) -> Option<Run> {
+    match repository.begin_run(scope, run_id).await {
+        // Claimed by someone else, already terminal, or cancelled between
+        // acceptance and dispatch. Either way it is not ours to run, and
+        // reporting anything would be reporting a turn that never happened.
+        Ok(None) => None,
+        Ok(Some(claimed)) => Some(claimed),
+        Err(error) => {
+            // The run remains queued and is eligible for the next scan.
+            tracing::warn!(code = ?error.code, "the run could not be claimed for execution");
+            None
+        }
+    }
+}
+
+/// Runs exactly one claimed turn and records its terminal outcome.
 ///
 /// Every step reports its failure through the run's own state rather than
 /// through a return value nobody reads: a turn that failed produces a `failed`
 /// run with a typed error and no answer, which is what the client sees.
-async fn execute(
+async fn execute_claimed(
     runtime: Arc<dyn AgentRuntime>,
     repository: Arc<dyn AgentRepository>,
     scope: TenantScope,
-    run_id: RunId,
+    claimed: Run,
 ) {
-    let claimed = match repository.begin_run(&scope, run_id).await {
-        // Claimed by someone else, already terminal, or cancelled between
-        // acceptance and dispatch. Either way it is not ours to run, and
-        // reporting anything would be reporting a turn that never happened.
-        Ok(None) => return,
-        Ok(Some(claimed)) => claimed,
-        Err(error) => {
-            // The run remains queued and is eligible for the next scan.
-            tracing::warn!(code = ?error.code, "the run could not be claimed for execution");
-            return;
-        }
-    };
+    let run_id = claimed.id;
     let cancellation = Arc::new(AtomicBool::new(false));
     let _active = ActiveRun::register(run_id, Arc::clone(&cancellation));
     // A cancel on another replica may have committed after begin_run but
@@ -230,6 +246,18 @@ async fn execute(
         ),
         Ok(None) => tracing::debug!(%run_id, "the run was already terminal; nothing written"),
         Err(error) => tracing::warn!(code = ?error.code, "the run's outcome could not be recorded"),
+    }
+}
+
+#[cfg(test)]
+async fn execute(
+    runtime: Arc<dyn AgentRuntime>,
+    repository: Arc<dyn AgentRepository>,
+    scope: TenantScope,
+    run_id: RunId,
+) {
+    if let Some(claimed) = claim_run(&*repository, &scope, run_id).await {
+        execute_claimed(runtime, repository, scope, claimed).await;
     }
 }
 
@@ -480,9 +508,24 @@ mod tests {
             .unwrap();
         let run_id = acceptance.run.id;
         tokio::join!(
-            execute(runtime.clone(), repository.clone(), scope.clone(), run_id),
-            execute(runtime.clone(), repository.clone(), scope.clone(), run_id)
+            dispatch_queued(runtime.clone(), repository.clone(), scope.clone(), run_id),
+            dispatch_queued(runtime.clone(), repository.clone(), scope.clone(), run_id)
         );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = repository
+                    .get_conversation(&scope, conversation.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if detail.runs[0].status == RunStatus::Succeeded {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("claimed run must finish");
         assert_eq!(runtime.invocations.load(Ordering::SeqCst), 1);
         let detail = repository
             .get_conversation(&scope, conversation.id)
@@ -497,6 +540,80 @@ mod tests {
                 .filter(|message| message.content == "recorded answer")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_dispatch_returns_after_claim_while_runtime_is_still_running() {
+        let repository = Arc::new(MemoryAgentRepository::new());
+        let scope = fixture_scope();
+        let conversation = repository
+            .create_conversation(&scope, None, CreateConversation::default())
+            .await
+            .unwrap();
+        let acceptance = repository
+            .append_message(
+                &scope,
+                conversation.id,
+                AppendMessage {
+                    content: "wait for cancellation".into(),
+                    attachments: vec![],
+                    metadata: Value::Null,
+                },
+                "async-claim-key".into(),
+                "async-claim-body".into(),
+                RuntimeCapability::available("waiting", None),
+            )
+            .await
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let ready = started.notified();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatch_queued(
+                Arc::new(WaitingRuntime {
+                    started: Arc::clone(&started),
+                }),
+                repository.clone(),
+                scope.clone(),
+                acceptance.run.id,
+            ),
+        )
+        .await
+        .expect("dispatch must return after the atomic claim");
+        assert_eq!(
+            repository
+                .run_status(&scope, acceptance.run.id)
+                .await
+                .unwrap(),
+            Some(RunStatus::Running),
+            "claim must be durable before dispatch returns"
+        );
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("claimed runtime must start");
+        repository
+            .cancel_turn(&scope, acceptance.turn.id)
+            .await
+            .unwrap();
+        signal_cancelled(acceptance.run.id);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while active_runs()
+                .lock()
+                .unwrap()
+                .contains_key(&acceptance.run.id)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancellation must stop the claimed runtime");
+        assert_eq!(
+            repository
+                .run_status(&scope, acceptance.run.id)
+                .await
+                .unwrap(),
+            Some(RunStatus::Cancelled)
         );
     }
 

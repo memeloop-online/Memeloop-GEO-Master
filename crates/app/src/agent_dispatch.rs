@@ -33,7 +33,8 @@ pub fn spawn(state: AppState, scanner: PgAgentRepository) {
                                 repository.clone(),
                                 candidate.scope,
                                 candidate.run_id,
-                            );
+                            )
+                            .await;
                         }
                         if count < 100 {
                             break;
