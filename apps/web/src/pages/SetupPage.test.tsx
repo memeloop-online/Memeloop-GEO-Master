@@ -688,10 +688,8 @@ describe("project setup workflow", () => {
     const user = userEvent.setup();
     renderSetup();
 
-    await user.type(
-      await screen.findByRole("textbox", { name: "品牌名称" }),
-      "Northstar AI",
-    );
+    await user.click(await screen.findByRole("textbox", { name: "品牌名称" }));
+    await user.paste("Northstar AI");
     await user.selectOptions(
       screen.getByRole("combobox", { name: "文件用途" }),
       "internal",
