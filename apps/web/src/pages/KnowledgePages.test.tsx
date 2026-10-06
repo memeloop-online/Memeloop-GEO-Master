@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -70,7 +70,7 @@ function requestHandler({
   sourceDetail,
   ask,
 }: {
-  capabilities?: Record<string, boolean>;
+  capabilities?: Record<string, unknown>;
   sourceItems?: unknown[];
   sourceDetail?: unknown;
   ask?: unknown;
@@ -198,6 +198,12 @@ describe("knowledge workbench", () => {
     expect(screen.getByText(/向量检索/)).toBeInTheDocument();
     expect(screen.getByText(/LLM 问答/)).toBeInTheDocument();
     expect(screen.getByText(/网页抓取/)).toBeInTheDocument();
+    expect(screen.getByText(/PDF 文本解析未配置/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "导入资料" }));
+    expect(
+      screen.getByText(/PDF 文本解析未配置；扫描 PDF/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/当前未报告可解析格式/)).toBeInTheDocument();
   });
 
   it("renders source data and marks internal material instead of treating it as public", async () => {
@@ -261,7 +267,7 @@ describe("knowledge workbench", () => {
     renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
 
     expect(
-      await screen.findByText(/PDF 第 12 页 · 高亮区域 10, 20, 30, 40/),
+      await screen.findByText(/PDF 第 12 页 · 原文区域坐标 10, 20, 30, 40/),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "替换文件" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "重试失败部分" })).toBeDisabled();
@@ -539,5 +545,287 @@ describe("knowledge workbench", () => {
       expect(headers.get("x-tenant-id")).toBeNull();
       expect(headers.get("x-project-id")).toBeNull();
     }
+  });
+
+  it("keeps an accepted PDF pending until polling returns parsed page evidence", async () => {
+    let detailReads = 0;
+    const queued = {
+      ...source,
+      name: "sample.pdf",
+      purpose: "public",
+      current_version_id: null,
+      import_status: "queued",
+      chunk_count: 0,
+      fact_count: 0,
+    };
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const path = routePath(request);
+        const method = init?.method ?? "GET";
+        if (path.endsWith("/knowledge/upload-sessions") && method === "POST") {
+          return Promise.resolve(
+            response({
+              upload_session_id: "upload-pdf",
+              filename: "sample.pdf",
+              state: "created",
+            }),
+          );
+        }
+        if (path.endsWith("/upload-pdf/content") && method === "PUT")
+          return Promise.resolve(response(undefined, 204));
+        if (path.endsWith("/upload-pdf/complete") && method === "POST")
+          return Promise.resolve(
+            response(
+              {
+                status: "queued",
+                source: queued,
+                import_job: {
+                  import_job_id: "job-pdf",
+                  source_id: queued.source_id,
+                  status: "queued",
+                  stage: "parse",
+                  completed_units: 0,
+                  failed_units: 0,
+                },
+                source_version: null,
+                release: null,
+              },
+              202,
+            ),
+          );
+        if (path.endsWith("/knowledge/sources/source-a")) {
+          detailReads++;
+          const ready = detailReads > 1;
+          return Promise.resolve(
+            response({
+              source: ready
+                ? {
+                    ...queued,
+                    current_version_id: "version-pdf",
+                    import_status: "succeeded",
+                    chunk_count: 1,
+                  }
+                : queued,
+              versions: ready
+                ? [
+                    {
+                      source_version_id: "version-pdf",
+                      source_id: queued.source_id,
+                      version: 1,
+                    },
+                  ]
+                : [],
+              chunks: ready
+                ? [
+                    {
+                      chunk_id: "page-one",
+                      source_version_id: "version-pdf",
+                      ordinal: 0,
+                      kind: "paragraph",
+                      text: "已提取的 PDF 正文",
+                      locator: { kind: "pdf", page: 1 },
+                      product_ids: [],
+                    },
+                  ]
+                : [],
+              facts: [],
+              import_jobs: [
+                {
+                  import_job_id: "job-pdf",
+                  source_id: queued.source_id,
+                  status: ready ? "succeeded" : "queued",
+                  stage: "parse",
+                  completed_units: ready ? 1 : 0,
+                  failed_units: 0,
+                  errors: [],
+                },
+              ],
+              impact: {},
+            }),
+          );
+        }
+        return requestHandler({
+          sourceItems: [queued],
+          capabilities: {
+            ...defaultCapabilities({ ocr: false }),
+            pdf_parser: true,
+            supported_media_types: ["application/pdf"],
+          },
+        })(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", {
+      randomUUID: () => "pdf-request",
+      subtle: {
+        digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer),
+      },
+    });
+    const user = userEvent.setup();
+    renderPath("/app/tenant-a/project-a/knowledge");
+    await user.click(await screen.findByRole("button", { name: "导入资料" }));
+    const file = new File(["%PDF"], "sample.pdf", { type: "application/pdf" });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: vi.fn().mockResolvedValue(new TextEncoder().encode("%PDF").buffer),
+    });
+    await user.upload(screen.getByLabelText("选择资料文件"), file);
+    await user.click(screen.getByRole("button", { name: "开始导入" }));
+    expect(await screen.findByText("已受理，等待解析")).toBeInTheDocument();
+    expect(screen.queryByText("解析完成")).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("link", { name: "查看处理详情" }));
+    expect(
+      await screen.findByText(/完成前不代表全文已可用/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("已提取的 PDF 正文")).not.toBeInTheDocument();
+    expect(
+      await screen.findByText("已提取的 PDF 正文", {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("PDF 第 1 页")).toBeInTheDocument();
+    expect(detailReads).toBeGreaterThanOrEqual(2);
+  }, 8000);
+
+  it("retries only a partial job once and keeps old page evidence visible", async () => {
+    let retried = false;
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const path = routePath(request);
+        if (path.endsWith("/knowledge/import-jobs/job-partial/retry")) {
+          retried = true;
+          return Promise.resolve(
+            response(
+              {
+                import_job_id: "job-partial",
+                source_id: "source-a",
+                status: "queued",
+                stage: "parse",
+                completed_units: 1,
+                failed_units: 1,
+                errors: [],
+              },
+              202,
+            ),
+          );
+        }
+        return requestHandler({
+          sourceDetail: {
+            source: {
+              ...source,
+              current_version_id: "version-a",
+              import_status: retried ? "queued" : "partial",
+            },
+            versions: [
+              {
+                source_version_id: "version-a",
+                source_id: "source-a",
+                version: 2,
+              },
+            ],
+            chunks: [
+              {
+                chunk_id: "page-one",
+                source_version_id: "version-a",
+                ordinal: 0,
+                kind: "paragraph",
+                text: "上一轮保存的第 1 页证据",
+                locator: { kind: "pdf", page: 1 },
+                product_ids: [],
+              },
+            ],
+            facts: [],
+            import_jobs: [
+              {
+                import_job_id: "job-partial",
+                source_id: "source-a",
+                stage: "parse",
+                status: retried ? "queued" : "partial",
+                completed_units: 1,
+                failed_units: 1,
+                errors: retried
+                  ? []
+                  : [
+                      {
+                        page: 2,
+                        code: "ocr_required",
+                        message: "private raw provider error",
+                      },
+                    ],
+              },
+            ],
+            impact: {},
+          },
+        })(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
+    expect(
+      await screen.findByText(
+        "第 2 页：该页没有可提取的文字层；扫描内容需要 OCR",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("上一轮保存的第 1 页证据")).toBeInTheDocument();
+    expect(
+      screen.queryByText("private raw provider error"),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "重试失败部分" }));
+    await waitFor(() =>
+      expect(screen.getByText(/重试已受理/)).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("上一轮保存的第 1 页证据")).toBeInTheDocument(),
+    );
+    const retries = fetchMock.mock.calls.filter(([request]) =>
+      routePath(request).endsWith("/knowledge/import-jobs/job-partial/retry"),
+    );
+    expect(retries).toHaveLength(1);
+    const retryUrl = new URL(String(retries[0][0]), "http://localhost");
+    expect(retryUrl.searchParams.get("tenant_id")).toBe("tenant-a");
+    expect(retryUrl.searchParams.get("project_id")).toBe("project-a");
+    expect(retries[0][1]?.method).toBe("POST");
+    const headers = new Headers(retries[0][1]?.headers);
+    expect(headers.get("X-CSRF-Token")).toBe("csrf-a");
+    expect(headers.has("Idempotency-Key")).toBe(true);
+  });
+
+  it("disables retry for a viewer even if the latest PDF job failed", async () => {
+    const viewerSession = {
+      ...session,
+      memberships: [{ ...session.memberships[0], role: "viewer" }],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+        if (routePath(request).endsWith("/auth/session"))
+          return Promise.resolve(response(viewerSession));
+        return requestHandler({
+          sourceDetail: {
+            source: { ...source, import_status: "failed" },
+            versions: [],
+            chunks: [],
+            facts: [],
+            import_jobs: [
+              {
+                import_job_id: "job-failed",
+                source_id: "source-a",
+                stage: "parse",
+                status: "failed",
+                completed_units: 0,
+                failed_units: 1,
+                errors: [
+                  { code: "invalid_pdf", message: "private stack trace" },
+                ],
+              },
+            ],
+            impact: {},
+          },
+        })(request, init);
+      }),
+    );
+    renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
+    expect(
+      await screen.findByText(/PDF 文件无效或无法读取/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试失败部分" })).toBeDisabled();
+    expect(screen.queryByText("private stack trace")).not.toBeInTheDocument();
   });
 });

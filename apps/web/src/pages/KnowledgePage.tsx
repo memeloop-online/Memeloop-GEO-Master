@@ -21,11 +21,17 @@ import {
   OpenRegular,
   SearchRegular,
 } from "@fluentui/react-icons";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import {
   type CapabilityName,
   type FileUploadProgress,
   type ImportItem,
+  type ImportStatus,
   type KnowledgeCapabilities,
   type KnowledgePurpose,
   type SourceKind,
@@ -41,6 +47,7 @@ import { ErrorState, EmptyState, LoadingState } from "../components/AsyncState";
 import { StatusPill, type StatusKind } from "../components/StatusPill";
 
 const capabilityLabels: Record<CapabilityName, string> = {
+  pdf_parser: "PDF 文本解析",
   ocr: "OCR 扫描识别",
   vector: "向量检索",
   llm: "LLM 问答",
@@ -52,6 +59,8 @@ type ImportItemState = {
   label: string;
   state: "waiting" | "submitting" | "accepted" | "failed";
   detail?: string;
+  sourceId?: string;
+  importStatus?: ImportStatus;
 };
 
 type FileItem = {
@@ -85,6 +94,25 @@ function importStatusLabel(state: ImportItemState["state"]) {
     failed: "失败",
   };
   return labels[state];
+}
+
+function processingLabel(status: ImportStatus | null | undefined) {
+  switch (status) {
+    case "queued":
+      return "已受理，等待解析";
+    case "running":
+      return "正在解析";
+    case "partial":
+      return "部分解析完成，部分单元失败";
+    case "succeeded":
+      return "解析完成";
+    case "failed":
+      return "解析失败";
+    case "cancelled":
+      return "处理已取消";
+    default:
+      return "已受理，等待处理状态";
+  }
 }
 
 function formatBytes(value: number) {
@@ -136,6 +164,8 @@ export function KnowledgeCapabilitiesNotice({
         <span>
           {missing
             .map((name) => {
+              if (name === "pdf_parser")
+                return "PDF 文本解析未配置；PDF 上传受理不表示可解析";
               const detail = capabilities[name].reason;
               return `${capabilityLabels[name]}${detail ? `：${detail}` : ""}`;
             })
@@ -168,6 +198,7 @@ function ImportSidebar({
   const uploadFiles = useUploadFilesMutation(tenantId, projectId);
   const importBatch = useImportKnowledgeMutation(tenantId, projectId);
   const capabilities = useKnowledgeCapabilitiesQuery(tenantId, projectId);
+  const sourceItems = useSourcesQuery(tenantId, projectId).data?.items ?? [];
   const maxUploadBytes =
     capabilities.data?.max_upload_bytes ?? 100 * 1024 * 1024;
   const maxBatchFiles = capabilities.data?.max_batch_files ?? 100;
@@ -289,10 +320,10 @@ function ImportSidebar({
                 detail:
                   progress.error?.message ??
                   (progress.state === "accepted"
-                    ? progress.result?.status === "succeeded"
-                      ? "资料处理已完成"
-                      : "已受理；处理状态将继续更新"
+                    ? processingLabel(progress.result?.status)
                     : undefined),
+                sourceId: progress.result?.source?.source_id,
+                importStatus: progress.result?.status,
               });
             },
           })
@@ -321,6 +352,8 @@ function ImportSidebar({
                   item.status === "partial"
                     ? "资料已受理，但只有部分单元完成处理"
                     : (item.error?.message ?? item.error?.reason),
+                sourceId: item.source?.source_id,
+                importStatus: item.status,
               });
             }
           })
@@ -418,6 +451,11 @@ function ImportSidebar({
         <MessageBar intent="info">
           <MessageBarBody>
             文件会先上传，再由服务端按当前适配器决定能否解析。
+            {!capabilities.data?.pdf_parser.available
+              ? " PDF 文本解析未配置；扫描 PDF 还需要 OCR，当前不能保证识别。"
+              : !capabilities.data.ocr.available
+                ? " PDF 仅支持有文字层的页面；扫描页需 OCR，当前未配置。"
+                : " PDF 解析与 OCR 是独立能力；只有实际处理完成的页面才可引用。"}
             {acceptedMediaTypes.length > 0
               ? ` 当前可接收：${acceptedMediaTypes.join("、")}。`
               : ""}
@@ -474,24 +512,39 @@ function ImportSidebar({
               已受理 {acceptedCount} 项，失败 {failedCount} 项
             </b>
             <ul>
-              {settled.map((item) => (
-                <li key={item.id}>
-                  <StatusPill
-                    status={statusKind(
-                      item.state === "accepted"
-                        ? "succeeded"
-                        : item.state === "failed"
+              {settled.map((item) => {
+                const current = sourceItems.find(
+                  (source) => source.source_id === item.sourceId,
+                );
+                const progress = current?.import_status ?? item.importStatus;
+                return (
+                  <li key={item.id}>
+                    <StatusPill
+                      status={statusKind(
+                        item.state === "failed"
                           ? "failed"
-                          : "processing",
+                          : (progress ?? "queued"),
+                      )}
+                    />
+                    <span>{item.label}</span>
+                    <small>
+                      {item.state === "accepted"
+                        ? processingLabel(progress)
+                        : importStatusLabel(item.state)}
+                      {item.state !== "accepted" && item.detail
+                        ? `：${item.detail}`
+                        : ""}
+                    </small>
+                    {item.sourceId && tenantId && projectId && (
+                      <Link
+                        to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/knowledge/sources/${encodeURIComponent(item.sourceId)}`}
+                      >
+                        查看处理详情
+                      </Link>
                     )}
-                  />
-                  <span>{item.label}</span>
-                  <small>
-                    {importStatusLabel(item.state)}
-                    {item.detail ? `：${item.detail}` : ""}
-                  </small>
-                </li>
-              ))}
+                  </li>
+                );
+              })}
             </ul>
           </section>
         )}
@@ -647,10 +700,17 @@ export function KnowledgePage() {
               {sources.data?.items.filter(
                 (source) =>
                   source.import_status === "running" ||
-                  source.import_status === "queued" ||
-                  source.import_status === "partial",
+                  source.import_status === "queued",
               ).length ?? 0}
-              {" 处理中"}
+              {" 处理中 / "}
+              {sources.data?.items.filter(
+                (source) => source.import_status === "partial",
+              ).length ?? 0}
+              {" 部分完成 / "}
+              {sources.data?.items.filter(
+                (source) => source.import_status === "failed",
+              ).length ?? 0}
+              {" 失败"}
             </small>
           </div>
         </Card>

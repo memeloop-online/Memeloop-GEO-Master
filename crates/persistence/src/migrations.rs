@@ -112,6 +112,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 25,
         description: "publication lookup report indexes",
     },
+    MigrationMetadata {
+        version: 26,
+        description: "pdf page parse",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

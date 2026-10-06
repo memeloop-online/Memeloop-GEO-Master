@@ -6,7 +6,7 @@ export function formatLocator(locator: SourceLocator | null | undefined) {
     case "pdf":
       return [
         locator.page ? `PDF 第 ${locator.page} 页` : "PDF",
-        locator.bbox ? `高亮区域 ${locator.bbox.join(", ")}` : null,
+        locator.bbox ? `原文区域坐标 ${locator.bbox.join(", ")}` : null,
         locator.ocr ? "OCR" : null,
       ]
         .filter(Boolean)

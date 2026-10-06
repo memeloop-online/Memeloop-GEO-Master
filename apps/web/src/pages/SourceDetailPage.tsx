@@ -15,7 +15,13 @@ import {
   OpenRegular,
 } from "@fluentui/react-icons";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useSourceQuery } from "../api/knowledge";
+import {
+  type ImportJob,
+  useRetryImportJobMutation,
+  useSourceQuery,
+} from "../api/knowledge";
+import { useAuth } from "../auth/AuthProvider";
+import { membershipForTenant } from "../auth/types";
 import { ErrorState, EmptyState, LoadingState } from "../components/AsyncState";
 import { KnowledgeLocator } from "../components/KnowledgeLocator";
 import { CsvEvidenceTable } from "../components/CsvEvidenceTable";
@@ -45,10 +51,52 @@ function statusKind(value: string | null | undefined): StatusKind {
   }
 }
 
+const pdfFailureReasons: Record<string, string> = {
+  ocr_required: "该页没有可提取的文字层；扫描内容需要 OCR",
+  empty_text: "该页未提取到文字",
+  parse_failed: "该页解析失败",
+  page_limit: "页面超过解析限制",
+  invalid_pdf: "PDF 文件无效或无法读取",
+  encrypted_pdf: "PDF 已加密，无法解析",
+};
+
+function safeFailure(error: NonNullable<ImportJob["errors"]>[number]) {
+  const unit = typeof error.unit === "string" ? error.unit : "";
+  const unitPage = /^page[:_ -]?([1-9]\d{0,5})$/.exec(unit);
+  const page =
+    typeof error.page === "number" &&
+    Number.isInteger(error.page) &&
+    error.page > 0 &&
+    error.page <= 999999
+      ? error.page
+      : unitPage
+        ? Number(unitPage[1])
+        : null;
+  const position = page ? `第 ${page} 页：` : "";
+  return `${position}${pdfFailureReasons[error.code ?? ""] ?? "解析失败；请检查该单元或文件"}`;
+}
+
+function importStatusLabel(value: string | null | undefined) {
+  const labels: Record<string, string> = {
+    queued: "等待解析",
+    running: "正在解析",
+    partial: "部分完成",
+    succeeded: "解析完成",
+    failed: "解析失败",
+    cancelled: "已取消",
+  };
+  return labels[value ?? ""] ?? value ?? "等待处理";
+}
+
 export function SourceDetailPage() {
   const { tenantId, projectId, id } = useParams();
+  const { session } = useAuth();
+  const membership = membershipForTenant(session, tenantId ?? "");
+  const canRetry =
+    membership?.role === "tenant_admin" || membership?.role === "member";
   const navigate = useNavigate();
   const sourceQuery = useSourceQuery(tenantId, projectId, id);
+  const retryJob = useRetryImportJobMutation(tenantId, projectId);
   const knowledgePath =
     tenantId && projectId
       ? `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/knowledge`
@@ -82,8 +130,19 @@ export function SourceDetailPage() {
     );
   }
   const { source, versions, chunks, facts, import_jobs: jobs, impact } = detail;
-  const partialJobs = jobs.filter((job) => job.status === "partial");
-  const failedJobs = jobs.filter((job) => job.status === "failed");
+  const latestJob = jobs.at(-1);
+  const isPdf = source.name.toLowerCase().endsWith(".pdf");
+  const unitLabel = isPdf ? "页" : "个单元";
+  const currentVersion =
+    versions.find(
+      (version) => version.source_version_id === source.current_version_id,
+    ) ?? (source.current_version_id ? undefined : versions.at(-1));
+  const isParsing =
+    latestJob?.status === "queued" || latestJob?.status === "running";
+  const mayRetry =
+    canRetry &&
+    latestJob &&
+    (latestJob.status === "partial" || latestJob.status === "failed");
 
   return (
     <div className="source-detail-page">
@@ -96,10 +155,14 @@ export function SourceDetailPage() {
           <h1>{source.name}</h1>
           <div className="source-status-line">
             {source.purpose === "internal" ? "内部资料" : "公开资料"} · 当前版本
-            {versions[0] ? ` ${versions[0].version}` : "尚未形成"} ·{" "}
+            {currentVersion ? ` ${currentVersion.version}` : "尚未形成"} ·{" "}
             <StatusPill
-              status={statusKind(source.import_status ?? source.state)}
-              text={source.import_status ?? source.state}
+              status={statusKind(
+                latestJob?.status ?? source.import_status ?? source.state,
+              )}
+              text={importStatusLabel(
+                latestJob?.status ?? source.import_status ?? source.state,
+              )}
             />
           </div>
         </div>
@@ -115,10 +178,23 @@ export function SourceDetailPage() {
           <Button
             appearance="secondary"
             icon={<ArrowSyncRegular />}
-            disabled
-            title="重试解析端点尚未接入；系统不会假装已经重试。"
+            disabled={!mayRetry || retryJob.isPending}
+            title={
+              !canRetry
+                ? "当前成员只有读取权限。"
+                : !mayRetry
+                  ? "只有部分完成或失败的最新任务可以重试。"
+                  : "仅重试失败的单元；不会删除已完成的页或旧版本。"
+            }
+            onClick={() => {
+              if (latestJob && mayRetry) {
+                void retryJob.mutateAsync(latestJob.import_job_id).catch(() => {
+                  // The mutation exposes the scoped failure in the inline notice.
+                });
+              }
+            }}
           >
-            重试失败部分
+            {retryJob.isPending ? "正在受理重试…" : "重试失败部分"}
           </Button>
           <Button
             appearance="secondary"
@@ -137,37 +213,70 @@ export function SourceDetailPage() {
           </MessageBarBody>
         </MessageBar>
       )}
-      {partialJobs.length > 0 && (
+      {retryJob.isError && (
+        <MessageBar intent="error">
+          <MessageBarBody>
+            无法受理重试。请确认任务仍为部分完成或失败，并检查当前项目权限后重试。
+          </MessageBarBody>
+        </MessageBar>
+      )}
+      {retryJob.isSuccess && (
+        <MessageBar intent="info">
+          <MessageBarBody>
+            重试已受理；只会补处理失败单元，已有页和历史证据保持不变。
+          </MessageBarBody>
+        </MessageBar>
+      )}
+      {isParsing && (
+        <MessageBar intent="info">
+          <MessageBarBody>
+            {latestJob.status === "queued" ? "已受理，等待解析" : "正在解析"}。
+            当前已完成 {latestJob.completed_units ?? 0} {unitLabel}，失败{" "}
+            {latestJob.failed_units ?? 0} {unitLabel}；完成前不代表全文已可用。
+          </MessageBarBody>
+        </MessageBar>
+      )}
+      {latestJob?.status === "partial" && (
         <MessageBar intent="warning">
           <MessageBarBody>
             <b>部分处理完成</b>
             <span>
-              已完成{" "}
-              {partialJobs.reduce(
-                (sum, job) => sum + (job.completed_units ?? 0),
-                0,
-              )}
-              个单元，失败{" "}
-              {partialJobs.reduce(
-                (sum, job) => sum + (job.failed_units ?? 0),
-                0,
-              )}
-              个单元。事实数只代表已成功提取的部分。
+              已完成 {latestJob.completed_units ?? 0} {unitLabel}，失败{" "}
+              {latestJob.failed_units ?? 0} {unitLabel}
+              。仅成功单元的证据可用；失败单元不会计入。
             </span>
           </MessageBarBody>
         </MessageBar>
       )}
-      {failedJobs.length > 0 && (
+      {latestJob?.status === "failed" && (
         <MessageBar intent="error">
           <MessageBarBody>
-            {failedJobs.length} 个处理任务失败：
-            {failedJobs
-              .flatMap((job) => job.errors ?? [])
-              .map((error) => error.message)
-              .filter(Boolean)
-              .join("；") || "请查看任务记录中的实际原因。"}
+            解析失败：已完成 {latestJob.completed_units ?? 0} {unitLabel}，失败{" "}
+            {latestJob.failed_units ?? 0} {unitLabel}
+            。旧来源版本与已保存证据不会因此删除。
           </MessageBarBody>
         </MessageBar>
+      )}
+      {latestJob?.status === "succeeded" && isPdf && (
+        <MessageBar intent="success">
+          <MessageBarBody>
+            PDF 页面文字解析完成，共 {latestJob.completed_units ?? 0}{" "}
+            页。页面文字可按页定位； 这不表示扫描页 OCR、结构化事实或 PDF
+            原件可视预览已完成。
+          </MessageBarBody>
+        </MessageBar>
+      )}
+      {latestJob?.errors && latestJob.errors.length > 0 && (
+        <section aria-label="失败页面与原因">
+          <b>失败页面与原因</b>
+          <ul>
+            {latestJob.errors.map((error, index) => (
+              <li key={`${error.unit ?? "unit"}-${index}`}>
+                {safeFailure(error)}
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
       <section className="source-detail-workbench">
         <Card className="source-original-panel">
@@ -175,7 +284,8 @@ export function SourceDetailPage() {
             <div>
               <h2>原文与快照</h2>
               <p>
-                点击片段会定位到它的结构化位置；不会把定位信息简化为模糊页码。
+                点击片段可查看它的结构化定位；可能包含此前版本的已保存证据。
+                当前只显示提取文字，不提供 PDF 原件预览或区域高亮。
               </p>
             </div>
             <Badge appearance="tint">{chunks.length} 个片段</Badge>
@@ -219,9 +329,7 @@ export function SourceDetailPage() {
               <h2>提取结果</h2>
               <p>事实和片段均绑定当前来源版本。</p>
             </div>
-            {source.import_status === "running" && (
-              <Spinner size="tiny" label="正在处理" />
-            )}
+            {isParsing && <Spinner size="tiny" label="正在处理" />}
           </div>
           {selectedChunk && (
             <section className="source-selected-chunk">
@@ -302,20 +410,22 @@ export function SourceDetailPage() {
             <div>
               <dt>版本</dt>
               <dd>
-                {versions[0] ? `v${versions[0].version}` : "尚未形成版本"}
+                {currentVersion
+                  ? `v${currentVersion.version}`
+                  : "尚未形成可用版本"}
               </dd>
             </div>
             <div>
               <dt>处理进度</dt>
               <dd>
-                {jobs.length
-                  ? jobs.map((job) => `${job.stage}：${job.status}`).join("；")
+                {latestJob
+                  ? `${latestJob.stage}：${importStatusLabel(latestJob.status)}，已完成 ${latestJob.completed_units ?? 0} ${unitLabel}，失败 ${latestJob.failed_units ?? 0} ${unitLabel}`
                   : "等待导入任务"}
               </dd>
             </div>
             <div>
               <dt>内容哈希</dt>
-              <dd>{versions[0]?.content_sha256 ?? "等待完成核验"}</dd>
+              <dd>{currentVersion?.content_sha256 ?? "等待完成核验"}</dd>
             </div>
           </dl>
           {impact.document_manifest_items?.length ||
@@ -357,8 +467,12 @@ export function SourceDetailPage() {
               还没有引用这份资料的文档、渠道变体或发布证据。
             </p>
           )}
-          {versions[0]?.original_url && (
-            <a href={versions[0].original_url} target="_blank" rel="noreferrer">
+          {currentVersion?.original_url && (
+            <a
+              href={currentVersion.original_url}
+              target="_blank"
+              rel="noreferrer"
+            >
               <OpenRegular /> 打开原始 URL
             </a>
           )}

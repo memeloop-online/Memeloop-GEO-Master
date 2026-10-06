@@ -25,9 +25,11 @@ export interface Capability {
   configured_at?: string | null;
 }
 
-export type CapabilityName = "ocr" | "vector" | "llm" | "url_fetch";
+export type CapabilityName =
+  "pdf_parser" | "ocr" | "vector" | "llm" | "url_fetch";
 
 export interface KnowledgeCapabilities {
+  pdf_parser: Capability;
   ocr: Capability;
   vector: Capability;
   llm: Capability;
@@ -169,7 +171,12 @@ export interface ImportJob {
   attempt?: number | null;
   completed_units?: number | null;
   failed_units?: number | null;
-  errors?: Array<{ code?: string; message?: string; unit?: string }> | null;
+  errors?: Array<{
+    code?: string;
+    page?: number;
+    message?: string;
+    unit?: string;
+  }> | null;
   updated_at?: string | null;
 }
 
@@ -430,6 +437,7 @@ function normalizeCapabilities(value: unknown): KnowledgeCapabilities {
   const root = asRecord(value);
   const values = asRecord(root.capabilities ?? root);
   return {
+    pdf_parser: capability(values.pdf_parser),
     ocr: capability(values.ocr),
     vector: capability(values.vector ?? values.vector_search),
     llm: capability(values.llm ?? values.llm_answering),
@@ -675,6 +683,22 @@ export async function getSource(
       `/knowledge/sources/${encodeURIComponent(sourceId)}`,
       scopedOptions(tenantId, projectId),
     ),
+  );
+}
+
+export function retryImportJob(
+  tenantId: string,
+  projectId: string,
+  importJobId: string,
+  idempotencyKey = createIdempotencyKey(),
+): Promise<ImportJob> {
+  return apiFetch<ImportJob>(
+    `/knowledge/import-jobs/${encodeURIComponent(importJobId)}/retry`,
+    {
+      ...scopedOptions(tenantId, projectId),
+      method: "POST",
+      idempotencyKey,
+    },
   );
 }
 
@@ -948,6 +972,13 @@ export function useSourcesQuery(
         ],
     queryFn: () => listSources(tenantId!, projectId!, query),
     enabled: Boolean(scope),
+    refetchInterval: (queryState) =>
+      queryState.state.data?.items.some(
+        (item) =>
+          item.import_status === "queued" || item.import_status === "running",
+      )
+        ? 2500
+        : false,
   });
 }
 
@@ -972,6 +1003,12 @@ export function useSourceQuery(
           ],
     queryFn: () => getSource(tenantId!, projectId!, sourceId!),
     enabled: Boolean(scope && sourceId),
+    refetchInterval: (queryState) =>
+      ["queued", "running"].includes(
+        queryState.state.data?.import_jobs.at(-1)?.status ?? "",
+      )
+        ? 2500
+        : false,
   });
 }
 
@@ -1088,6 +1125,21 @@ export function useUploadFilesMutation(
         ),
       );
       return results;
+    },
+    onSuccess: () => invalidateKnowledge(queryClient, scope),
+  });
+}
+
+export function useRetryImportJobMutation(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+) {
+  const queryClient = useQueryClient();
+  const scope = useScope(tenantId, projectId);
+  return useMutation({
+    mutationFn: (importJobId: string) => {
+      if (!tenantId || !projectId) throw new Error("请先选择项目。");
+      return retryImportJob(tenantId, projectId, importJobId);
     },
     onSuccess: () => invalidateKnowledge(queryClient, scope),
   });

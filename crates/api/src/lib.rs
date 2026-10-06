@@ -17,6 +17,10 @@ mod cycles;
 mod error;
 mod idempotency;
 mod knowledge;
+mod pdf_parse;
+pub use pdf_parse::{
+    PDF_PARSER_PROFILE, PdfParserClient, dispatch_pdf_parse_job, spawn_pdf_parse_scanner,
+};
 mod provider_bridge;
 mod publication_lookup;
 pub use publication_lookup::dispatch_publication_lookup;
@@ -166,6 +170,13 @@ impl AppState {
         }
     }
 
+    pub fn development_with_pdf_parser_profile(password: &str, profile: String) -> Self {
+        let mut state = Self::development_with_password(password);
+        state.knowledge_repository =
+            Arc::new(MemoryKnowledgeRepository::with_pdf_parser_profile(profile));
+        state
+    }
+
     pub fn with_stores(
         operation_store: Arc<dyn OperationStore>,
         idempotency_store: Arc<dyn IdempotencyStore>,
@@ -312,6 +323,14 @@ impl AppState {
         .with_channel_service(ChannelService::unconfigured(Arc::new(
             geo_persistence::PgChannelRepository::from_database(database),
         )))
+    }
+
+    pub fn from_database_with_pdf_parser_profile(database: &Database, profile: String) -> Self {
+        let mut state = Self::from_database(database);
+        state.knowledge_repository = Arc::new(
+            PgKnowledgeRepository::from_database(database).with_pdf_parser_profile(profile),
+        );
+        state
     }
 
     pub fn operation_store(&self) -> Arc<dyn OperationStore> {
@@ -1703,6 +1722,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         knowledge::materialize_initial_sources,
         knowledge::list_sources,
         knowledge::get_source,
+        knowledge::retry_import_job,
         knowledge::get_source_version,
         knowledge::list_products,
         knowledge::list_facts,

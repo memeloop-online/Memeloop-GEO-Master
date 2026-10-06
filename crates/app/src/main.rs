@@ -13,7 +13,10 @@ mod verification_dispatch;
 
 use axum::Router;
 use config::AppConfig;
-use geo_api::{AppState, EmbeddedAgentRuntime, reduce_cycle_report, router};
+use geo_api::{
+    AppState, EmbeddedAgentRuntime, PDF_PARSER_PROFILE, PdfParserClient, reduce_cycle_report,
+    router, spawn_pdf_parse_scanner,
+};
 use geo_persistence::{Database, PgProjectRepository, PgReportRepository};
 use std::error::Error;
 use std::sync::Arc;
@@ -32,6 +35,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("unsupported command; use --bootstrap or no arguments".into());
     }
     let config = AppConfig::from_env()?;
+    let pdf_parser = match std::env::var_os("GEO_PDF_PARSER_URL") {
+        None => None,
+        Some(endpoint) => {
+            let endpoint = endpoint
+                .into_string()
+                .map_err(|_| "invalid PDF parser configuration")?;
+            let parser = PdfParserClient::new(&endpoint)?;
+            parser.check_ready().await?;
+            Some(parser)
+        }
+    };
     let durable_storage = AppConfig::database_url_configured();
     config.validate_ai_mode(durable_storage)?;
     let production_ai = production_runtime::ProductionAiConfig::from_env()?;
@@ -49,9 +63,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let cycle_scanner = PgProjectRepository::from_database(&database);
         let verification_scanner =
             geo_persistence::PgConnectorCapabilityRepository::from_database(&database);
-        let state = channels::configure(
-            AppState::from_database(&database).with_allowed_origins(config.allowed_origins.clone()),
-        )?;
+        let state = if pdf_parser.is_some() {
+            AppState::from_database_with_pdf_parser_profile(
+                &database,
+                PDF_PARSER_PROFILE.to_owned(),
+            )
+        } else {
+            AppState::from_database(&database)
+        };
+        let state =
+            channels::configure(state.with_allowed_origins(config.allowed_origins.clone()))?;
         let runtime = if let Some(ai) = production_ai.as_ref() {
             let provider = production_runtime::build_model_provider(&database, ai)?;
             runtime::assemble_with_provider(&state, &ai.bundle_path, &ai.bundle_sha256, provider)?
@@ -81,10 +102,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
     } else {
         let password = config.validate_for_memory_mode()?;
-        let state = channels::configure(
+        let state = if pdf_parser.is_some() {
+            AppState::development_with_pdf_parser_profile(password, PDF_PARSER_PROFILE.to_owned())
+        } else {
             AppState::development_with_password(password)
-                .with_allowed_origins(config.allowed_origins.clone()),
-        )?;
+        };
+        let state =
+            channels::configure(state.with_allowed_origins(config.allowed_origins.clone()))?;
         let runtime = runtime::assemble(&state, config.development_ai.as_ref())?;
         let state = state.with_agent_runtime(runtime);
         if config.single_process_executor {
@@ -100,6 +124,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         (state, false, None, None)
     };
     runtime::configure_content_workflow(&state)?;
+    if let Some(parser) = pdf_parser {
+        spawn_pdf_parse_scanner(state.clone(), parser);
+    }
     if let Some(scanner) = agent_scanner {
         agent_dispatch::spawn(state.clone(), scanner);
     }

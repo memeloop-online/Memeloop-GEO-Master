@@ -3,6 +3,27 @@
 name: memeloop-geo
 
 services:
+  document-parser:
+    profiles: ["document-parsing"]
+    build:
+      context: ./services/document-parser
+    environment:
+      GEO_PDF_BIND: 0.0.0.0
+      GEO_PDF_PORT: 8080
+      GEO_PDF_MAX_CONCURRENT: 1
+    ports:
+      - "127.0.0.1:${GEO_PDF_PARSER_PORT:-18081}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=268435456
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 256
+    networks:
+      - geo_parser_internal
+
   postgres:
     image: postgres:17-alpine
     environment:
@@ -86,5 +107,7 @@ volumes:
   minio_data:
 
 networks:
+  geo_parser_internal:
+    internal: true
   geo_local:
     name: memeloop-geo-local

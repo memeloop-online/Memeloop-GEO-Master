@@ -2,7 +2,7 @@
 
 更新时间：2026-10-06
 
-最新完整绿色基线：`8b35a80` / Actions `37391073374`，Linux/Windows、前端、显式 V8 与 PostgreSQL 全部通过。已读取 Linux 日志确认新增报告观察候选及完整分页所在的 `lookup_is_scoped_fenced_append_only_and_never_rewrites_send` 实际为 `ok`，不是默认忽略后的通过。Rust 实际调用侧工具账本为后续增量，必须独立复验。
+最新完整绿色基线：`1e2ea25` / Actions `37394756908`，Linux/Windows、前端、显式 V8 与 PostgreSQL 全部通过。已读取 Linux 日志确认工具账本旧拒绝/未知状态回归、checkpoint 和空引用兼容回归实际执行通过；PostgreSQL Agent 套件 25 项通过，不是默认忽略后的通过。PDF 导入为后续增量，验证状态见 `WORKLOG.md`。
 
 该绿色基线包含：P00 正文分发工具读取跨周期原发送目标及查回摘要；网页搜索修正乱序聊天关联、无效引用回退，支持同回答多次搜索及原始字节初始化超时。CSV v2 对超长记录保存独立生成证据及精确单元格范围，完整原记录不变、普通知识检索不重复返回分片；新增 PostgreSQL 持久分片/检索回归已通过。真实登录、发布/搜索、P04/P12 实机视觉、旧 CSV 版本补建与完整项目验收仍缺。
 
@@ -61,7 +61,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 - 上传会话、SHA-256 字节核验、批量导入、来源/版本、确定性文本分段、不可变 KnowledgeRelease、证据定位和 evidence-only 问答。
 - P01 已能物化文本、URL 引用和已上传对象；P03–P05 已接真实 API。
-- 当前已验证基线支持 `text/plain` 与 `text/markdown`；本批另接 UTF-8、逗号分隔、含表头 CSV 的共享解析和表格引用，验收状态见工作日志，输入契约见 `csv-import.md`。PDF、DOCX、XLSX、网页抓取、OCR、向量检索、LLM 回答和结构化事实提取尚未实现。
+- 已有基线支持 `text/plain`、`text/markdown` 与 UTF-8、逗号分隔、含表头 CSV，输入契约见 `csv-import.md`。本批增加可配置的 PDF 文字层解析：原件入队、独立 Tika/PDFBox 子进程、持久逐页进度、部分知识版本及失败页重试；P03/P04 和 P00 显式附件导入复用同一后台链路。启动设置、边界及测试入口见 [`pdf-import.md`](pdf-import.md)，最终实库及真实服务验证以工作日志为准。不配置解析服务时 PDF 仍明确不可用；DOCX、XLSX、网页抓取、OCR、原件高亮预览、向量检索、LLM 回答和结构化事实提取尚未完成。
 
 ### P00 AI 工作台
 

@@ -51,6 +51,21 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Set up isolated document parser build
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: services/document-parser/pom.xml
+
+      - name: Test and package real PDF parser
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          mvn -B -ntp -f services/document-parser/pom.xml clean verify 2>&1 | tee logs/pdf-parser-build.log
+
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -111,12 +126,38 @@ jobs:
         run: |
           set -o pipefail
           failed=0
-          for suite in postgres reports channels channel_identity successor_cycles channel_dispatcher bootstrap model_routes content distribution connector_capabilities publication_lookup publication_bindings; do
+          for suite in postgres reports channels channel_identity successor_cycles channel_dispatcher bootstrap model_routes content distribution connector_capabilities publication_lookup publication_bindings pdf_parse; do
             if ! cargo test -p geo-persistence --test "$suite" -- --ignored 2>&1 | tee "logs/cargo-${suite}-postgres.log"; then
               failed=1
             fi
           done
           exit "$failed"
+
+      - name: Test Rust import pipeline against real PDF parser
+        env:
+          GEO_PDF_BIND: 127.0.0.1
+          GEO_PDF_PORT: 18081
+          GEO_TEST_PDF_PARSER_URL: http://127.0.0.1:18081
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -jar services/document-parser/target/document-parser-1.0.0.jar > logs/pdf-parser-service.log 2>&1 &
+          parser_pid=$!
+          trap 'kill "$parser_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent "$GEO_TEST_PDF_PARSER_URL/health" > /dev/null; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$parser_pid" 2>/dev/null; then
+              echo "PDF parser exited before readiness"
+              exit 1
+            fi
+            sleep 1
+          done
+          test "$ready" -eq 1
+          cargo test -p geo-api --test pdf_parse -- --ignored 2>&1 | tee logs/cargo-pdf-parser-live.log
 
       - name: Write 5-minute milestone summary
         if: always()
@@ -149,6 +190,13 @@ jobs:
           name: ci-test-logs-${{ github.sha }}
           if-no-files-found: warn
           path: logs/
+
+      - name: Upload document parser artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: document-parser-java21-${{ github.sha }}
+          if-no-files-found: error
+          path: services/document-parser/target/document-parser-1.0.0.jar
 
   windows-msvc:
     name: Windows MSVC Rust/V8 (5-minute milestone)

@@ -20,6 +20,12 @@ mod event;
 mod idempotency;
 mod knowledge;
 mod knowledge_csv;
+mod pdf_parse;
+pub use pdf_parse::{
+    PDF_MAX_DOCUMENT_TEXT_BYTES, PDF_MAX_PAGE_TEXT_BYTES, PDF_MAX_PAGES, PDF_PARSE_SCHEMA_VERSION,
+    PdfDocumentManifest, PdfPageResult, PdfPageText, PdfParseCursor, PdfParseInput, PdfParseJobRef,
+    PdfParseLease, pdf_page_chunks,
+};
 mod model_routes;
 pub use model_routes::ModelRouteGrant;
 mod operation;

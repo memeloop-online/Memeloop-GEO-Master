@@ -8,10 +8,10 @@ use axum::{
 };
 use geo_domain::{
     AppError, CurrentKnowledgeRelease, DocumentManifest, DocumentManifestPlanRequest,
-    ImportAcceptance, ImportBatchAcceptance, ImportItem, InitialSourceKind, KnowledgeAskResult,
-    KnowledgeCapability, KnowledgeSearchRequest, KnowledgeSearchResult, MAX_UPLOAD_BYTES, Product,
-    ProjectId, Source, SourceDetail, SourceVersion, TenantScope, UploadSession,
-    UploadSessionCommand,
+    ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, InitialSourceKind,
+    KnowledgeAskResult, KnowledgeCapability, KnowledgeSearchRequest, KnowledgeSearchResult,
+    MAX_UPLOAD_BYTES, Product, ProjectId, Source, SourceDetail, SourceVersion, TenantScope,
+    UploadSession, UploadSessionCommand,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -436,6 +436,44 @@ pub(crate) async fn get_source(
 }
 
 #[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/import-jobs/{id}/retry",
+    security(("sessionCookie" = [])),
+    params(("id" = Uuid, Path), ("project_id" = ProjectId, Query)),
+    responses((status = 202, body = ImportJob), (status = 404, body = ErrorResponse))
+)]
+pub(crate) async fn retry_import_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<KnowledgeProjectQuery>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<(StatusCode, Json<ImportJob>), ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
+    let scope = knowledge_scope(&state, &auth.scope, query.project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    let repository = state.knowledge_repository();
+    let job = repository
+        .retry_pdf_parse(&scope, id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    if !state.durable_storage()
+        && let Some(operation) = repository
+            .pdf_parse_operation(&scope, job.import_job_id)
+            .await
+            .map_err(|error| api_error(error, context.request_id))?
+    {
+        state
+            .operation_store()
+            .save(operation)
+            .await
+            .map_err(|error| api_error(error, context.request_id))?;
+    }
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+#[utoipa::path(
     get,
     path = "/api/v1/knowledge/sources/{id}/versions/{version_id}",
     security(("sessionCookie" = [])),
@@ -707,6 +745,7 @@ pub(crate) fn routes() -> Router<AppState> {
             post(materialize_initial_sources),
         )
         .route("/knowledge/sources", get(list_sources))
+        .route("/knowledge/import-jobs/{id}/retry", post(retry_import_job))
         .route("/knowledge/sources/{id}", get(get_source))
         .route(
             "/knowledge/sources/{id}/versions/{version_id}",

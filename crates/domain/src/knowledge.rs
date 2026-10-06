@@ -20,6 +20,10 @@ use crate::{
     AppError, ErrorCode, Operation, OperationStatus, OperatorId, ProjectId, TenantId, TenantScope,
 };
 use crate::{DocumentScope, QuestionClusterState};
+use crate::{
+    PDF_MAX_DOCUMENT_TEXT_BYTES, PdfDocumentManifest, PdfPageResult, PdfPageText, PdfParseCursor,
+    PdfParseInput, PdfParseJobRef, PdfParseLease, pdf_page_chunks,
+};
 
 pub const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 /// The JSON idempotency middleware buffers at most 1 MiB including syntax
@@ -341,6 +345,10 @@ pub enum ChunkLocator {
         bbox: Option<Vec<i32>>,
         #[serde(default)]
         ocr: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_char: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_char: Option<u32>,
     },
     Docx {
         heading_path: Vec<String>,
@@ -838,6 +846,83 @@ pub struct KnowledgeOverview {
 #[async_trait]
 pub trait KnowledgeRepository: Send + Sync {
     async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError>;
+    /// A strict `(created_at, job_id)` cursor, not an offset into an unstable queue.
+    async fn pdf_parse_candidates(
+        &self,
+        _after: Option<PdfParseCursor>,
+        _limit: usize,
+    ) -> Result<Vec<PdfParseJobRef>, AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn claim_pdf_parse(
+        &self,
+        _scope: &TenantScope,
+        _job_id: Uuid,
+        _lease_id: Uuid,
+        _lease_seconds: i64,
+    ) -> Result<Option<PdfParseLease>, AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn renew_pdf_parse(
+        &self,
+        _scope: &TenantScope,
+        _lease: &PdfParseLease,
+        _lease_seconds: i64,
+    ) -> Result<Option<PdfParseLease>, AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn pdf_parse_input(
+        &self,
+        _scope: &TenantScope,
+        _lease: &PdfParseLease,
+    ) -> Result<PdfParseInput, AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn record_pdf_manifest(
+        &self,
+        _scope: &TenantScope,
+        _lease: &PdfParseLease,
+        _manifest: PdfDocumentManifest,
+    ) -> Result<(), AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn record_pdf_page(
+        &self,
+        _scope: &TenantScope,
+        _lease: &PdfParseLease,
+        _result: PdfPageResult,
+    ) -> Result<(), AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn finish_pdf_parse(
+        &self,
+        _scope: &TenantScope,
+        _lease: &PdfParseLease,
+    ) -> Result<ImportAcceptance, AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn fail_pdf_parse(
+        &self,
+        _scope: &TenantScope,
+        _lease: &PdfParseLease,
+        _code: &str,
+    ) -> Result<ImportAcceptance, AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn retry_pdf_parse(
+        &self,
+        _scope: &TenantScope,
+        _job_id: Uuid,
+    ) -> Result<ImportJob, AppError> {
+        Err(AppError::capability_missing("PDF parser is not configured"))
+    }
+    async fn pdf_parse_operation(
+        &self,
+        _scope: &TenantScope,
+        _job_id: Uuid,
+    ) -> Result<Option<Operation>, AppError> {
+        Ok(None)
+    }
     async fn create_upload_session(
         &self,
         scope: &TenantScope,
@@ -924,6 +1009,20 @@ pub trait KnowledgeRepository: Send + Sync {
 #[derive(Debug, Default)]
 pub struct MemoryKnowledgeRepository {
     state: RwLock<MemoryState>,
+    pdf_parser_profile: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryPdfState {
+    object_id: Uuid,
+    parser_profile: String,
+    created_at: DateTime<Utc>,
+    manifest: Option<PdfDocumentManifest>,
+    pages: HashMap<u32, PdfPageResult>,
+    lease: Option<PdfParseLease>,
+    fencing_token: i64,
+    acceptance: Option<ImportAcceptance>,
+    parent_job_id: Option<Uuid>,
 }
 
 #[derive(Debug, Default)]
@@ -935,6 +1034,8 @@ struct MemoryState {
     sources: HashMap<Uuid, Source>,
     versions: HashMap<Uuid, SourceVersion>,
     jobs: HashMap<Uuid, ImportJob>,
+    pdf_jobs: HashMap<Uuid, MemoryPdfState>,
+    operations: HashMap<Uuid, Operation>,
     chunks: HashMap<Uuid, Vec<Chunk>>,
     products: HashMap<Uuid, Product>,
     facts: HashMap<Uuid, Fact>,
@@ -947,6 +1048,109 @@ struct MemoryState {
 }
 
 impl MemoryKnowledgeRepository {
+    pub fn with_pdf_parser_profile(profile: String) -> Self {
+        Self {
+            state: RwLock::new(MemoryState::default()),
+            pdf_parser_profile: (!profile.trim().is_empty()).then_some(profile),
+        }
+    }
+
+    fn queue_pdf_locked(
+        &self,
+        state: &mut MemoryState,
+        scope: &TenantScope,
+        item: &ImportItem,
+        object: &StoredObject,
+    ) -> ImportAcceptance {
+        let (mut source, _) = Self::source_and_version(
+            scope,
+            item.kind,
+            item.name.clone(),
+            item.purpose,
+            json!({"kind":"object","object_id":object.object_id,"object_version":object.object_version}),
+            Some(object),
+            object.sha256.clone(),
+        );
+        source.current_version_id = None;
+        let operation = Operation::queued("knowledge.import", scope.clone());
+        let job = ImportJob {
+            import_job_id: Uuid::new_v4(),
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id: source.project_id,
+            operation_id: operation.id,
+            source_id: source.source_id,
+            source_version_id: None,
+            stage: ImportStage::Parse,
+            status: ImportStatus::Queued,
+            attempt: 1,
+            lease_until: None,
+            input_hash: object.sha256.clone(),
+            stage_output_refs: Vec::new(),
+            completed_units: 0,
+            failed_units: 0,
+            errors: Vec::new(),
+            resumed_from: None,
+        };
+        state.pdf_jobs.insert(
+            job.import_job_id,
+            MemoryPdfState {
+                object_id: object.object_id,
+                parser_profile: self
+                    .pdf_parser_profile
+                    .clone()
+                    .expect("configured PDF parser"),
+                created_at: operation.created_at,
+                manifest: None,
+                pages: HashMap::new(),
+                lease: None,
+                fencing_token: 0,
+                acceptance: None,
+                parent_job_id: None,
+            },
+        );
+        state.operations.insert(operation.id, operation.clone());
+        state.sources.insert(source.source_id, source.clone());
+        state.jobs.insert(job.import_job_id, job.clone());
+        ImportAcceptance {
+            client_item_id: item.client_item_id.clone(),
+            status: ImportStatus::Queued,
+            source: Some(source),
+            source_version: None,
+            import_job: Some(job),
+            operation: Some(operation),
+            release: None,
+            error: None,
+        }
+    }
+
+    fn checked_pdf_lease<'a>(
+        state: &'a MemoryState,
+        scope: &TenantScope,
+        lease: &PdfParseLease,
+    ) -> Result<(&'a ImportJob, &'a MemoryPdfState), AppError> {
+        let job = state
+            .jobs
+            .get(&lease.job_id)
+            .filter(|job| Self::in_scope(scope, *job))
+            .ok_or_else(|| AppError::not_found("PDF parse job not found"))?;
+        let pdf = state
+            .pdf_jobs
+            .get(&lease.job_id)
+            .ok_or_else(|| AppError::not_found("PDF parse job not found"))?;
+        if job.status != ImportStatus::Running
+            || !pdf.lease.as_ref().is_some_and(|current| {
+                current.job_id == lease.job_id
+                    && current.lease_id == lease.lease_id
+                    && current.fencing_token == lease.fencing_token
+                    && current.expires_at > Utc::now()
+            })
+        {
+            return Err(AppError::conflict("PDF parse lease is expired or fenced"));
+        }
+        Ok((job, pdf))
+    }
+
     fn require_project(scope: &TenantScope) -> Result<ProjectId, AppError> {
         scope.project_id.ok_or_else(|| {
             AppError::invalid_request("project_id is required for knowledge resources")
@@ -1135,7 +1339,12 @@ impl MemoryKnowledgeRepository {
                     .get(&version.source_id)
                     .is_some_and(|source| source.state == SourceState::Active)
             })
-            .filter(|version| state.chunks.contains_key(&version.source_version_id))
+            .filter(|version| {
+                state.chunks.contains_key(&version.source_version_id)
+                    && state.sources.get(&version.source_id).is_some_and(|source| {
+                        source.current_version_id == Some(version.source_version_id)
+                    })
+            })
             .map(|version| version.source_version_id)
             .collect::<Vec<_>>();
         source_versions.sort_unstable();
@@ -1155,6 +1364,12 @@ impl MemoryKnowledgeRepository {
             .values()
             .filter(|job| Self::in_scope(scope, *job))
             .filter(|job| matches!(job.status, ImportStatus::Failed | ImportStatus::Partial))
+            .filter(|job| {
+                state
+                    .sources
+                    .get(&job.source_id)
+                    .is_some_and(|source| source.current_version_id == job.source_version_id)
+            })
             .count() as u64;
         let mut pipeline_versions = json!({
             "parser": "deterministic-text-v1",
@@ -1166,7 +1381,10 @@ impl MemoryKnowledgeRepository {
             .filter_map(|id| state.versions.get(id))
             .map(|version| version.parser_version.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        if parsers.contains("deterministic-csv-v1") || parsers.contains("deterministic-csv-v2") {
+        if parsers.contains("deterministic-csv-v1")
+            || parsers.contains("deterministic-csv-v2")
+            || parsers.iter().any(|parser| parser.starts_with("tika-"))
+        {
             pipeline_versions["parser"] = json!("deterministic-knowledge-v1");
             pipeline_versions["parsers"] = json!(parsers);
         }
@@ -1193,7 +1411,24 @@ impl MemoryKnowledgeRepository {
                 source_version_count: source_versions.len() as u64,
                 chunk_count,
                 failed_source_count,
-                blocked_reasons: Vec::new(),
+                blocked_reasons: state
+                    .jobs
+                    .values()
+                    .filter(|job| {
+                        Self::in_scope(scope, *job) && job.status == ImportStatus::Partial
+                    })
+                    .filter(|job| {
+                        state.sources.get(&job.source_id).is_some_and(|source| {
+                            source.current_version_id == job.source_version_id
+                        })
+                    })
+                    .map(|job| {
+                        format!(
+                            "source {} has {} failed PDF pages",
+                            job.source_id, job.failed_units
+                        )
+                    })
+                    .collect(),
             },
             created_at: Utc::now(),
         };
@@ -1300,7 +1535,583 @@ scoped_knowledge!(
 impl KnowledgeRepository for MemoryKnowledgeRepository {
     async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError> {
         Self::require_project(scope)?;
-        Ok(KnowledgeCapability::memory())
+        let mut capability = KnowledgeCapability::memory();
+        if self.pdf_parser_profile.is_some() {
+            capability.pdf_parser = true;
+            capability
+                .supported_media_types
+                .push("application/pdf".to_owned());
+            capability
+                .accepted_unparsed_media_types
+                .retain(|media| media != "application/pdf");
+            capability
+                .limitations
+                .retain(|line| !line.contains("office/PDF parsing"));
+            capability.limitations.push(
+                "URL acquisition, office parsing, vector search, and LLM answers require adapters"
+                    .to_owned(),
+            );
+            capability
+                .limitations
+                .push("OCR for scanned PDFs is not configured".to_owned());
+        }
+        Ok(capability)
+    }
+
+    async fn pdf_parse_candidates(
+        &self,
+        after: Option<PdfParseCursor>,
+        limit: usize,
+    ) -> Result<Vec<PdfParseJobRef>, AppError> {
+        if self.pdf_parser_profile.is_none() {
+            return Err(AppError::capability_missing("PDF parser is not configured"));
+        }
+        let state = self.state.read().await;
+        let mut candidates = state
+            .pdf_jobs
+            .iter()
+            .filter_map(|(job_id, pdf)| {
+                let job = state.jobs.get(job_id)?;
+                let eligible = job.status == ImportStatus::Queued
+                    || (job.status == ImportStatus::Running
+                        && pdf
+                            .lease
+                            .as_ref()
+                            .is_none_or(|lease| lease.expires_at <= Utc::now()));
+                let after_cursor = after.is_none_or(|after| {
+                    (pdf.created_at, *job_id) > (after.created_at, after.job_id)
+                });
+                (eligible && after_cursor).then_some(PdfParseJobRef {
+                    scope: TenantScope::new(job.operator_id, job.tenant_id, Some(job.project_id)),
+                    job_id: *job_id,
+                    created_at: pdf.created_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| (candidate.created_at, candidate.job_id));
+        candidates.truncate(limit.min(1000));
+        Ok(candidates)
+    }
+
+    async fn claim_pdf_parse(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+        lease_id: Uuid,
+        lease_seconds: i64,
+    ) -> Result<Option<PdfParseLease>, AppError> {
+        Self::require_project(scope)?;
+        if !(1..=3600).contains(&lease_seconds) || lease_id.is_nil() {
+            return Err(AppError::invalid_request(
+                "invalid PDF lease duration or ID",
+            ));
+        }
+        let mut state = self.state.write().await;
+        let Some(job) = state
+            .jobs
+            .get(&job_id)
+            .filter(|job| Self::in_scope(scope, *job))
+        else {
+            return Ok(None);
+        };
+        if !matches!(job.status, ImportStatus::Queued | ImportStatus::Running) {
+            return Ok(None);
+        }
+        let Some(pdf) = state.pdf_jobs.get_mut(&job_id) else {
+            return Ok(None);
+        };
+        if pdf
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at > Utc::now())
+        {
+            return Ok(None);
+        }
+        pdf.fencing_token += 1;
+        let lease = PdfParseLease {
+            job_id,
+            lease_id,
+            fencing_token: pdf.fencing_token,
+            expires_at: Utc::now() + Duration::seconds(lease_seconds),
+        };
+        pdf.lease = Some(lease.clone());
+        let job = state.jobs.get_mut(&job_id).expect("scoped job");
+        job.status = ImportStatus::Running;
+        job.lease_until = Some(lease.expires_at);
+        let operation_id = job.operation_id;
+        if let Some(operation) = state.operations.get_mut(&operation_id) {
+            operation.status = OperationStatus::Running;
+            operation.updated_at = Utc::now();
+        }
+        Ok(Some(lease))
+    }
+
+    async fn renew_pdf_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &PdfParseLease,
+        lease_seconds: i64,
+    ) -> Result<Option<PdfParseLease>, AppError> {
+        if !(1..=3600).contains(&lease_seconds) {
+            return Err(AppError::invalid_request("invalid PDF lease duration"));
+        }
+        let mut state = self.state.write().await;
+        if Self::checked_pdf_lease(&state, scope, lease).is_err() {
+            return Ok(None);
+        }
+        let renewed = PdfParseLease {
+            expires_at: Utc::now() + Duration::seconds(lease_seconds),
+            ..lease.clone()
+        };
+        state
+            .pdf_jobs
+            .get_mut(&lease.job_id)
+            .expect("checked")
+            .lease = Some(renewed.clone());
+        state
+            .jobs
+            .get_mut(&lease.job_id)
+            .expect("checked")
+            .lease_until = Some(renewed.expires_at);
+        Ok(Some(renewed))
+    }
+
+    async fn pdf_parse_input(
+        &self,
+        scope: &TenantScope,
+        lease: &PdfParseLease,
+    ) -> Result<PdfParseInput, AppError> {
+        let state = self.state.read().await;
+        let (job, pdf) = Self::checked_pdf_lease(&state, scope, lease)?;
+        let object = state
+            .stored_objects
+            .get(&pdf.object_id)
+            .filter(|object| Self::in_scope(scope, *object))
+            .ok_or_else(|| AppError::not_found("PDF object not found"))?;
+        let bytes = state
+            .object_bytes
+            .get(&pdf.object_id)
+            .ok_or_else(|| AppError::not_found("PDF bytes not found"))?;
+        if object.actual_size != bytes.len() as u64
+            || sha256_hex(bytes) != object.sha256
+            || job.input_hash != object.sha256
+            || object.detected_media_type != "application/pdf"
+        {
+            return Err(AppError::conflict(
+                "PDF bytes or media type no longer match verified object",
+            ));
+        }
+        let mut successful_pages = pdf
+            .pages
+            .iter()
+            .filter_map(|(page, result)| {
+                matches!(result, PdfPageResult::Success { .. }).then_some(*page)
+            })
+            .collect::<Vec<_>>();
+        successful_pages.sort_unstable();
+        Ok(PdfParseInput {
+            bytes: bytes.clone(),
+            input_sha256: object.sha256.clone(),
+            media_type: object.detected_media_type.clone(),
+            parser_profile: pdf.parser_profile.clone(),
+            successful_pages,
+            manifest: pdf.manifest.clone(),
+        })
+    }
+
+    async fn record_pdf_manifest(
+        &self,
+        scope: &TenantScope,
+        lease: &PdfParseLease,
+        manifest: PdfDocumentManifest,
+    ) -> Result<(), AppError> {
+        let mut state = self.state.write().await;
+        let (job, pdf) = Self::checked_pdf_lease(&state, scope, lease)?;
+        manifest.validate(&job.input_hash, &pdf.parser_profile)?;
+        if pdf
+            .manifest
+            .as_ref()
+            .is_some_and(|prior| prior != &manifest)
+        {
+            return Err(AppError::conflict(
+                "PDF manifest cannot change across retries",
+            ));
+        }
+        state
+            .pdf_jobs
+            .get_mut(&lease.job_id)
+            .expect("checked")
+            .manifest = Some(manifest);
+        Ok(())
+    }
+
+    async fn record_pdf_page(
+        &self,
+        scope: &TenantScope,
+        lease: &PdfParseLease,
+        result: PdfPageResult,
+    ) -> Result<(), AppError> {
+        let mut state = self.state.write().await;
+        let (_, pdf) = Self::checked_pdf_lease(&state, scope, lease)?;
+        let manifest = pdf
+            .manifest
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("PDF manifest not recorded"))?;
+        result.validate(manifest.page_count)?;
+        if let Some(prior) = pdf.pages.get(&result.page()) {
+            if prior == &result {
+                return Ok(());
+            }
+            if matches!(prior, PdfPageResult::Success { .. }) {
+                return Err(AppError::conflict(
+                    "successful PDF page cannot be overwritten",
+                ));
+            }
+        }
+        let result = match result {
+            PdfPageResult::Success { page, text }
+                if pdf
+                    .pages
+                    .iter()
+                    .filter(|(existing_page, _)| **existing_page != page)
+                    .filter_map(|(_, existing)| match existing {
+                        PdfPageResult::Success { text, .. } => Some(text.len()),
+                        PdfPageResult::Failure { .. } => None,
+                    })
+                    .sum::<usize>()
+                    .saturating_add(text.len())
+                    > PDF_MAX_DOCUMENT_TEXT_BYTES =>
+            {
+                PdfPageResult::Failure {
+                    page,
+                    code: "page_limit".to_owned(),
+                }
+            }
+            result => result,
+        };
+        let pdf = state.pdf_jobs.get_mut(&lease.job_id).expect("checked");
+        pdf.pages.insert(result.page(), result);
+        let completed_units = pdf
+            .pages
+            .values()
+            .filter(|page| matches!(page, PdfPageResult::Success { .. }))
+            .count() as i32;
+        let mut errors = pdf
+            .pages
+            .iter()
+            .filter_map(|(page, result)| match result {
+                PdfPageResult::Failure { code, .. } => Some(json!({"page":page,"code":code})),
+                PdfPageResult::Success { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        errors.sort_by_key(|error| error["page"].as_u64());
+        let job = state.jobs.get_mut(&lease.job_id).expect("checked");
+        job.completed_units = completed_units;
+        job.failed_units = errors.len() as i32;
+        job.errors = errors;
+        Ok(())
+    }
+
+    async fn finish_pdf_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &PdfParseLease,
+    ) -> Result<ImportAcceptance, AppError> {
+        let mut state = self.state.write().await;
+        let (job, pdf) = Self::checked_pdf_lease(&state, scope, lease)?;
+        let manifest = pdf
+            .manifest
+            .clone()
+            .ok_or_else(|| AppError::conflict("PDF manifest not recorded"))?;
+        if pdf.pages.len() != manifest.page_count as usize {
+            return Err(AppError::conflict("PDF pages are incomplete"));
+        }
+        let job = job.clone();
+        let pdf = pdf.clone();
+        let mut source = state
+            .sources
+            .get(&job.source_id)
+            .filter(|source| Self::in_scope(scope, *source))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("PDF source not found"))?;
+        if source.state != SourceState::Active {
+            return Err(AppError::conflict("PDF source was removed"));
+        }
+        let object = state
+            .stored_objects
+            .get(&pdf.object_id)
+            .ok_or_else(|| AppError::not_found("PDF object not found"))?
+            .clone();
+        let bytes = state
+            .object_bytes
+            .get(&pdf.object_id)
+            .ok_or_else(|| AppError::not_found("PDF bytes not found"))?;
+        if sha256_hex(bytes) != object.sha256
+            || bytes.len() as u64 != object.actual_size
+            || job.input_hash != object.sha256
+        {
+            return Err(AppError::conflict("PDF object changed during parsing"));
+        }
+        let mut successes = pdf
+            .pages
+            .values()
+            .filter_map(|result| match result {
+                PdfPageResult::Success { page, text } => Some(PdfPageText {
+                    page: *page,
+                    text: text.clone(),
+                }),
+                PdfPageResult::Failure { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        successes.sort_by_key(|page| page.page);
+        let failed_units = manifest.page_count as usize - successes.len();
+        let status = if successes.is_empty() {
+            ImportStatus::Failed
+        } else if failed_units != 0 {
+            ImportStatus::Partial
+        } else {
+            ImportStatus::Succeeded
+        };
+        let mut version = None;
+        let mut release = None;
+        if !successes.is_empty() {
+            let parent_id = source.current_version_id;
+            let new_version = SourceVersion {
+                source_version_id: Uuid::new_v4(),
+                operator_id: scope.operator_id,
+                tenant_id: scope.tenant_id,
+                project_id: source.project_id,
+                source_id: source.source_id,
+                version: parent_id
+                    .and_then(|id| state.versions.get(&id))
+                    .map_or(1, |parent| parent.version + 1),
+                object_id: Some(object.object_id),
+                object_version: Some(object.object_version),
+                content_sha256: object.sha256.clone(),
+                captured_at: Utc::now(),
+                original_url: None,
+                parent_version_id: parent_id,
+                parser_version: pdf.parser_profile.clone(),
+                extraction_version: "pdf-text-v1".to_owned(),
+                created_at: Utc::now(),
+            };
+            let mut chunks = Vec::new();
+            for page in &successes {
+                chunks.extend(pdf_page_chunks(
+                    scope,
+                    new_version.source_version_id,
+                    page,
+                    chunks.len() as i32,
+                )?);
+            }
+            source.current_version_id = Some(new_version.source_version_id);
+            state.sources.insert(source.source_id, source.clone());
+            state.chunks.insert(new_version.source_version_id, chunks);
+            state
+                .versions
+                .insert(new_version.source_version_id, new_version.clone());
+            version = Some(new_version);
+        }
+        let mut finished_job = job;
+        finished_job.status = status;
+        finished_job.stage = if version.is_some() {
+            ImportStage::Release
+        } else {
+            ImportStage::Parse
+        };
+        finished_job.source_version_id = version.as_ref().map(|value| value.source_version_id);
+        finished_job.completed_units = successes.len() as i32;
+        finished_job.failed_units = failed_units as i32;
+        finished_job.lease_until = None;
+        finished_job.errors = pdf
+            .pages
+            .iter()
+            .filter_map(|(page, result)| match result {
+                PdfPageResult::Failure { code, .. } => Some(json!({"page":page,"code":code})),
+                PdfPageResult::Success { .. } => None,
+            })
+            .collect();
+        finished_job
+            .errors
+            .sort_by_key(|error| error["page"].as_u64());
+        finished_job.stage_output_refs = vec![format!(
+            "pdf:pages:{}/{}",
+            successes.len(),
+            manifest.page_count
+        )];
+        state
+            .jobs
+            .insert(finished_job.import_job_id, finished_job.clone());
+        if version.is_some() {
+            release = Some(Self::make_release_locked(&mut state, scope)?);
+        }
+        let operation = state
+            .operations
+            .get_mut(&finished_job.operation_id)
+            .expect("queued operation");
+        operation.status = if version.is_some() {
+            OperationStatus::Succeeded
+        } else {
+            OperationStatus::Failed
+        };
+        operation.updated_at = Utc::now();
+        operation.result = Some(
+            json!({"source_id": source.source_id, "source_version_id": version.as_ref().map(|v| v.source_version_id), "knowledge_release_id": release.as_ref().map(|r|r.knowledge_release_id), "completed_pages":successes.len(), "failed_pages":failed_units, "total_pages":manifest.page_count}),
+        );
+        if version.is_none() {
+            operation.error = Some(AppError::new(
+                ErrorCode::CapabilityMissing,
+                "no PDF pages could be parsed",
+            ));
+        }
+        let acceptance = ImportAcceptance {
+            client_item_id: format!("pdf:{}", finished_job.import_job_id),
+            status,
+            source: Some(source),
+            source_version: version,
+            import_job: Some(finished_job.clone()),
+            operation: Some(operation.clone()),
+            release,
+            error: operation.error.clone(),
+        };
+        let pdf = state.pdf_jobs.get_mut(&lease.job_id).expect("checked");
+        pdf.lease = None;
+        pdf.acceptance = Some(acceptance.clone());
+        Ok(acceptance)
+    }
+
+    async fn fail_pdf_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &PdfParseLease,
+        code: &str,
+    ) -> Result<ImportAcceptance, AppError> {
+        if !matches!(
+            code,
+            "invalid_pdf" | "encrypted_pdf" | "parse_failed" | "page_limit"
+        ) {
+            return Err(AppError::invalid_request(
+                "unknown PDF document failure code",
+            ));
+        }
+        let mut state = self.state.write().await;
+        let (job, pdf) = Self::checked_pdf_lease(&state, scope, lease)?;
+        if pdf.manifest.is_some() || !pdf.pages.is_empty() {
+            return Err(AppError::conflict("PDF page results already recorded"));
+        }
+        let mut job = job.clone();
+        job.status = ImportStatus::Failed;
+        job.lease_until = None;
+        job.failed_units = 1;
+        job.errors = vec![json!({"code":code})];
+        let source = state.sources.get(&job.source_id).cloned();
+        let operation = state
+            .operations
+            .get_mut(&job.operation_id)
+            .expect("queued operation");
+        operation.status = OperationStatus::Failed;
+        operation.updated_at = Utc::now();
+        operation.error = Some(
+            AppError::invalid_request("PDF document could not be parsed")
+                .with_details(json!({"reason":code})),
+        );
+        let acceptance = ImportAcceptance {
+            client_item_id: format!("pdf:{}", job.import_job_id),
+            status: ImportStatus::Failed,
+            source,
+            source_version: None,
+            import_job: Some(job.clone()),
+            operation: Some(operation.clone()),
+            release: None,
+            error: operation.error.clone(),
+        };
+        state.jobs.insert(job.import_job_id, job);
+        let pdf = state.pdf_jobs.get_mut(&lease.job_id).expect("checked");
+        pdf.lease = None;
+        pdf.acceptance = Some(acceptance.clone());
+        Ok(acceptance)
+    }
+
+    async fn retry_pdf_parse(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+    ) -> Result<ImportJob, AppError> {
+        let mut state = self.state.write().await;
+        let prior = state
+            .jobs
+            .get(&job_id)
+            .filter(|job| Self::in_scope(scope, *job))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("PDF parse job not found"))?;
+        if !matches!(prior.status, ImportStatus::Failed | ImportStatus::Partial) {
+            return Err(AppError::conflict("PDF parse job is not retryable"));
+        }
+        let old_pdf = state
+            .pdf_jobs
+            .get(&job_id)
+            .ok_or_else(|| AppError::not_found("PDF parse job not found"))?
+            .clone();
+        if let Some(existing) = state
+            .jobs
+            .values()
+            .find(|job| job.resumed_from == Some(job_id))
+        {
+            return Ok(existing.clone());
+        }
+        let source = state
+            .sources
+            .get(&prior.source_id)
+            .ok_or_else(|| AppError::not_found("PDF source not found"))?;
+        if source.state != SourceState::Active {
+            return Err(AppError::conflict("PDF source was removed"));
+        }
+        let operation = Operation::queued("knowledge.import", scope.clone());
+        let next = ImportJob {
+            import_job_id: Uuid::new_v4(),
+            operation_id: operation.id,
+            status: ImportStatus::Queued,
+            attempt: prior.attempt + 1,
+            stage: ImportStage::Parse,
+            source_version_id: None,
+            lease_until: None,
+            stage_output_refs: Vec::new(),
+            completed_units: old_pdf
+                .pages
+                .values()
+                .filter(|p| matches!(p, PdfPageResult::Success { .. }))
+                .count() as i32,
+            failed_units: 0,
+            errors: Vec::new(),
+            resumed_from: Some(job_id),
+            ..prior
+        };
+        let mut pdf = old_pdf;
+        pdf.created_at = operation.created_at;
+        pdf.lease = None;
+        pdf.acceptance = None;
+        pdf.parent_job_id = Some(job_id);
+        pdf.pages
+            .retain(|_, result| matches!(result, PdfPageResult::Success { .. }));
+        state.operations.insert(operation.id, operation);
+        state.pdf_jobs.insert(next.import_job_id, pdf);
+        state.jobs.insert(next.import_job_id, next.clone());
+        Ok(next)
+    }
+
+    async fn pdf_parse_operation(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+    ) -> Result<Option<Operation>, AppError> {
+        Self::require_project(scope)?;
+        let state = self.state.read().await;
+        Ok(state
+            .jobs
+            .get(&job_id)
+            .filter(|job| Self::in_scope(scope, *job) && state.pdf_jobs.contains_key(&job_id))
+            .and_then(|job| state.operations.get(&job.operation_id))
+            .cloned())
     }
 
     async fn create_upload_session(
@@ -1462,6 +2273,13 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             let text = String::from_utf8(content.clone())
                 .map_err(|_| AppError::invalid_request("text upload bytes must be valid UTF-8"))?;
             Self::import_text_locked(&mut state, scope, &item, text, Some(object.clone()))?
+        } else if session.declared_media_type == "application/pdf"
+            && self.pdf_parser_profile.is_some()
+        {
+            state
+                .stored_objects
+                .insert(object.object_id, object.clone());
+            self.queue_pdf_locked(&mut state, scope, &item, &object)
         } else {
             let result = Self::failed_missing_adapter(scope, &item, "document_parser");
             if let Some(source) = &result.source {
@@ -1757,6 +2575,11 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                             return Err(AppError::conflict(
                                 "committed attachment bytes do not match object metadata",
                             ));
+                        }
+                        if object.detected_media_type == "application/pdf"
+                            && self.pdf_parser_profile.is_some()
+                        {
+                            return Ok(self.queue_pdf_locked(&mut state, scope, &item, &object));
                         }
                         if !is_supported_knowledge_media_type(&object.detected_media_type) {
                             return Err(AppError::capability_missing(
@@ -2355,7 +3178,10 @@ mod tests {
         KnowledgeRepository, KnowledgeSearchRequest, MemoryKnowledgeRepository, SourceKind,
         UploadSessionCommand, sha256_hex,
     };
-    use crate::{DocumentScope, TenantScope};
+    use crate::{
+        DocumentScope, ImportStatus, PDF_PARSE_SCHEMA_VERSION, PdfDocumentManifest, PdfPageResult,
+        PdfPageText, TenantScope,
+    };
     use uuid::Uuid;
 
     fn scope() -> TenantScope {
@@ -2364,6 +3190,524 @@ mod tests {
             Uuid::new_v4().into(),
             Some(Uuid::new_v4().into()),
         )
+    }
+
+    async fn queued_pdf(
+        repository: &MemoryKnowledgeRepository,
+        scope: &TenantScope,
+    ) -> super::ImportAcceptance {
+        let bytes = b"%PDF-1.7\nverified original bytes".to_vec();
+        let session = repository
+            .create_upload_session(
+                scope,
+                UploadSessionCommand {
+                    filename: "example.pdf".to_owned(),
+                    declared_media_type: "application/pdf".to_owned(),
+                    expected_size: bytes.len() as u64,
+                    expected_sha256: sha256_hex(&bytes),
+                    purpose: KnowledgePurpose::Public,
+                },
+            )
+            .await
+            .unwrap();
+        repository
+            .put_upload_content(scope, session.upload_session_id, bytes.clone())
+            .await
+            .unwrap();
+        let accepted = repository
+            .complete_upload(scope, session.upload_session_id, "once")
+            .await
+            .unwrap();
+        assert_eq!(accepted.status, ImportStatus::Queued);
+        assert!(accepted.source_version.is_none());
+        assert!(accepted.release.is_none());
+        assert_eq!(
+            accepted.import_job.as_ref().unwrap().input_hash,
+            sha256_hex(&bytes)
+        );
+        assert_eq!(
+            repository
+                .complete_upload(scope, session.upload_session_id, "once")
+                .await
+                .unwrap(),
+            accepted
+        );
+        accepted
+    }
+
+    #[tokio::test]
+    async fn pdf_queue_partial_release_retry_keeps_old_evidence_and_scope_fence() {
+        let repository = MemoryKnowledgeRepository::with_pdf_parser_profile(
+            "tika-3.2.3_pdfbox-3.0.5_text-v1".to_owned(),
+        );
+        let scope = scope();
+        assert!(repository.capabilities(&scope).await.unwrap().pdf_parser);
+        let accepted = queued_pdf(&repository, &scope).await;
+        let job_id = accepted.import_job.unwrap().import_job_id;
+        let candidates = repository.pdf_parse_candidates(None, 10).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].job_id, job_id);
+        assert!(
+            repository
+                .pdf_parse_candidates(
+                    Some(crate::PdfParseCursor {
+                        created_at: candidates[0].created_at,
+                        job_id
+                    }),
+                    10
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let other = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        assert!(
+            repository
+                .claim_pdf_parse(&other, job_id, Uuid::new_v4(), 30)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let lease = repository
+            .claim_pdf_parse(&scope, job_id, Uuid::new_v4(), 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            repository
+                .claim_pdf_parse(&scope, job_id, Uuid::new_v4(), 30)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let input = repository.pdf_parse_input(&scope, &lease).await.unwrap();
+        assert_eq!(sha256_hex(&input.bytes), input.input_sha256);
+        assert_eq!(input.parser_profile, "tika-3.2.3_pdfbox-3.0.5_text-v1");
+        let manifest = PdfDocumentManifest {
+            schema_version: PDF_PARSE_SCHEMA_VERSION.to_owned(),
+            input_sha256: input.input_sha256,
+            parser_version: input.parser_profile,
+            page_count: 2,
+        };
+        repository
+            .record_pdf_manifest(&scope, &lease, manifest.clone())
+            .await
+            .unwrap();
+        repository
+            .record_pdf_page(
+                &scope,
+                &lease,
+                PdfPageResult::Success {
+                    page: 1,
+                    text: "Alpha product is available.".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        repository
+            .record_pdf_page(
+                &scope,
+                &lease,
+                PdfPageResult::Failure {
+                    page: 2,
+                    code: "ocr_required".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let progress = repository
+            .get_source_detail(&scope, accepted.source.as_ref().unwrap().source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.import_jobs[0].status, ImportStatus::Running);
+        assert_eq!(progress.import_jobs[0].completed_units, 1);
+        assert_eq!(progress.import_jobs[0].failed_units, 1);
+        let first = repository.finish_pdf_parse(&scope, &lease).await.unwrap();
+        assert_eq!(first.status, ImportStatus::Partial);
+        assert_eq!(first.import_job.as_ref().unwrap().completed_units, 1);
+        assert_eq!(first.import_job.as_ref().unwrap().failed_units, 1);
+        let old_version = first.source_version.unwrap();
+        assert_eq!(old_version.content_sha256, manifest.input_sha256);
+        let old_release = first.release.unwrap();
+        assert_eq!(old_release.coverage.chunk_count, 1);
+        assert!(!old_release.coverage.blocked_reasons.is_empty());
+        assert!(repository.pdf_parse_input(&scope, &lease).await.is_err());
+        let retry = repository.retry_pdf_parse(&scope, job_id).await.unwrap();
+        assert_eq!(
+            retry.import_job_id,
+            repository
+                .retry_pdf_parse(&scope, job_id)
+                .await
+                .unwrap()
+                .import_job_id
+        );
+        let new_lease = repository
+            .claim_pdf_parse(&scope, retry.import_job_id, Uuid::new_v4(), 30)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_input = repository
+            .pdf_parse_input(&scope, &new_lease)
+            .await
+            .unwrap();
+        assert_eq!(retry_input.successful_pages, vec![1]);
+        assert_eq!(retry_input.manifest, Some(manifest.clone()));
+        let stale = crate::PdfParseLease {
+            fencing_token: new_lease.fencing_token - 1,
+            ..new_lease.clone()
+        };
+        assert!(
+            repository
+                .record_pdf_page(
+                    &scope,
+                    &stale,
+                    PdfPageResult::Success {
+                        page: 2,
+                        text: "stale".to_owned()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        repository
+            .record_pdf_manifest(&scope, &new_lease, manifest)
+            .await
+            .unwrap();
+        repository
+            .record_pdf_page(
+                &scope,
+                &new_lease,
+                PdfPageResult::Success {
+                    page: 2,
+                    text: "Beta product is available.".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let second = repository
+            .finish_pdf_parse(&scope, &new_lease)
+            .await
+            .unwrap();
+        assert_eq!(second.status, ImportStatus::Succeeded);
+        assert_eq!(
+            second
+                .release
+                .as_ref()
+                .unwrap()
+                .coverage
+                .failed_source_count,
+            0
+        );
+        assert!(
+            second
+                .release
+                .as_ref()
+                .unwrap()
+                .coverage
+                .blocked_reasons
+                .is_empty()
+        );
+        let new_version = second.source_version.unwrap();
+        assert_eq!(
+            new_version.parent_version_id,
+            Some(old_version.source_version_id)
+        );
+        assert_ne!(new_version.source_version_id, old_version.source_version_id);
+        let prior = repository
+            .search(
+                &scope,
+                super::KnowledgeSearchRequest {
+                    query: "Alpha".to_owned(),
+                    knowledge_release_id: Some(old_release.knowledge_release_id),
+                    purpose: KnowledgePurpose::Public,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(prior.evidence.len(), 1);
+        assert_eq!(
+            prior.evidence[0].source_version_id,
+            old_version.source_version_id
+        );
+        let old_search = repository
+            .search(
+                &scope,
+                super::KnowledgeSearchRequest {
+                    query: "Beta".to_owned(),
+                    knowledge_release_id: Some(old_release.knowledge_release_id),
+                    purpose: KnowledgePurpose::Public,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(old_search.evidence.is_empty());
+        let new_search = repository
+            .search(
+                &scope,
+                super::KnowledgeSearchRequest {
+                    query: "Beta".to_owned(),
+                    knowledge_release_id: None,
+                    purpose: KnowledgePurpose::Public,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(new_search.evidence.len(), 1);
+        assert!(matches!(
+            new_search.evidence[0].locator,
+            super::ChunkLocator::Pdf {
+                page: 2,
+                start_char: Some(0),
+                ..
+            }
+        ));
+        assert_eq!(
+            repository
+                .get_source_detail(&scope, first.source.unwrap().source_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .versions
+                .len(),
+            2
+        );
+        assert!(
+            repository
+                .get_source_detail(&other, second.source.unwrap().source_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pdf_chunk_ranges_preserve_utf8_and_bound_large_pages() {
+        let scope = scope();
+        let text = "海".repeat(2001);
+        let chunks = crate::pdf_page_chunks(
+            &scope,
+            Uuid::new_v4(),
+            &PdfPageText {
+                page: 4,
+                text: text.clone(),
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].ordinal, 5);
+        assert_eq!(chunks[1].ordinal, 6);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>(),
+            text
+        );
+        assert!(matches!(
+            chunks[1].locator,
+            super::ChunkLocator::Pdf {
+                page: 4,
+                start_char: Some(2000),
+                end_char: Some(2001),
+                ..
+            }
+        ));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.text_hash == sha256_hex(chunk.text.as_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_pdf_is_queued_only_on_explicit_import_and_zero_success_never_releases() {
+        let repo = MemoryKnowledgeRepository::with_pdf_parser_profile("test-parser-v1".to_owned());
+        let scope = scope();
+        let bytes = b"%PDF-1.4\nraw".to_vec();
+        let upload = repo
+            .create_upload_session(
+                &scope,
+                UploadSessionCommand {
+                    filename: "attachment.pdf".to_owned(),
+                    declared_media_type: "application/pdf".to_owned(),
+                    expected_size: bytes.len() as u64,
+                    expected_sha256: sha256_hex(&bytes),
+                    purpose: KnowledgePurpose::Internal,
+                },
+            )
+            .await
+            .unwrap();
+        repo.put_upload_content(&scope, upload.upload_session_id, bytes)
+            .await
+            .unwrap();
+        let (object, filename) = repo
+            .complete_attachment_upload(&scope, upload.upload_session_id, "attachment")
+            .await
+            .unwrap();
+        assert!(
+            repo.pdf_parse_candidates(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let item = ImportItem {
+            client_item_id: "explicit-object-import".to_owned(),
+            kind: SourceKind::Object,
+            name: filename,
+            purpose: KnowledgePurpose::Internal,
+            text: None,
+            url: None,
+            object_id: Some(object.object_id),
+            knowledge_release_id: None,
+        };
+        let accepted = repo
+            .import_batch(&scope, vec![item])
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(accepted.status, ImportStatus::Queued);
+        assert!(accepted.release.is_none());
+        let job_id = accepted.import_job.unwrap().import_job_id;
+        let lease = repo
+            .claim_pdf_parse(&scope, job_id, Uuid::new_v4(), 30)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.record_pdf_manifest(
+            &scope,
+            &lease,
+            PdfDocumentManifest {
+                schema_version: PDF_PARSE_SCHEMA_VERSION.to_owned(),
+                input_sha256: object.sha256.clone(),
+                parser_version: "test-parser-v1".to_owned(),
+                page_count: 1,
+            },
+        )
+        .await
+        .unwrap();
+        repo.record_pdf_page(
+            &scope,
+            &lease,
+            PdfPageResult::Failure {
+                page: 1,
+                code: "ocr_required".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let finished = repo.finish_pdf_parse(&scope, &lease).await.unwrap();
+        assert_eq!(finished.status, ImportStatus::Failed);
+        assert!(finished.source_version.is_none());
+        assert!(finished.release.is_none());
+        assert!(
+            repo.current_release(&scope)
+                .await
+                .unwrap()
+                .knowledge_release_id
+                .is_none()
+        );
+        assert_eq!(
+            repo.retry_pdf_parse(&scope, job_id).await.unwrap().status,
+            ImportStatus::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn pdf_inspect_failure_is_terminal_without_manifest() {
+        let repo = MemoryKnowledgeRepository::with_pdf_parser_profile("test-parser-v1".to_owned());
+        let scope = scope();
+        let job_id = queued_pdf(&repo, &scope)
+            .await
+            .import_job
+            .unwrap()
+            .import_job_id;
+        let lease = repo
+            .claim_pdf_parse(&scope, job_id, Uuid::new_v4(), 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            repo.fail_pdf_parse(&scope, &lease, "unknown_code")
+                .await
+                .is_err()
+        );
+        let result = repo
+            .fail_pdf_parse(&scope, &lease, "invalid_pdf")
+            .await
+            .unwrap();
+        assert_eq!(result.status, ImportStatus::Failed);
+        assert!(
+            repo.pdf_parse_candidates(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.current_release(&scope)
+                .await
+                .unwrap()
+                .knowledge_release_id
+                .is_none()
+        );
+        assert!(repo.retry_pdf_parse(&scope, job_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn expired_pdf_worker_cannot_write_after_new_fenced_claim() {
+        let repo = MemoryKnowledgeRepository::with_pdf_parser_profile("test-parser-v1".to_owned());
+        let scope = scope();
+        let job_id = queued_pdf(&repo, &scope)
+            .await
+            .import_job
+            .unwrap()
+            .import_job_id;
+        let original = repo
+            .claim_pdf_parse(&scope, job_id, Uuid::new_v4(), 30)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let mut state = repo.state.write().await;
+            state
+                .pdf_jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .lease
+                .as_mut()
+                .unwrap()
+                .expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        }
+        let replacement = repo
+            .claim_pdf_parse(&scope, job_id, Uuid::new_v4(), 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(replacement.fencing_token > original.fencing_token);
+        assert!(repo.pdf_parse_input(&scope, &original).await.is_err());
+        assert!(
+            repo.record_pdf_page(
+                &scope,
+                &original,
+                PdfPageResult::Failure {
+                    page: 1,
+                    code: "parse_failed".to_owned()
+                }
+            )
+            .await
+            .is_err()
+        );
+        let input = repo.pdf_parse_input(&scope, &replacement).await.unwrap();
+        assert!(input.manifest.is_none());
     }
 
     #[test]
