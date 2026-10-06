@@ -171,6 +171,17 @@ jobs:
           cargo build -p geo-app 2>&1 | tee logs/cargo-web-smoke-build.log
           node scripts/verify-web-smoke.mjs 2>&1 | tee logs/web-smoke.log
 
+      - name: Verify persistent local login across service restart
+        env:
+          GEO_LOCAL_APP_BINARY: ${{ github.workspace }}/target/debug/geo-app
+          GEO_LOCAL_STATE_DIR: ${{ runner.temp }}/geo-private-restart-state
+          GEO_LOCAL_TMP_DIR: ${{ runner.temp }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"
+          node scripts/verify-local-workspace.mjs 2>&1 | tee logs/local-workspace-restart.log
+
       - name: Write 5-minute milestone summary
         if: always()
         shell: bash

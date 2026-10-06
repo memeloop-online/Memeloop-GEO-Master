@@ -62,6 +62,8 @@ async function checkComponents(path) {
             env: cleanEnv({ GEO_PRIVATE_PATH: cursor }),
             encoding: "utf8",
             windowsHide: true,
+            timeout: 15000,
+            maxBuffer: 8192,
           },
         );
         assert(
@@ -87,8 +89,13 @@ $path = $env:GEO_PRIVATE_PATH
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $item = if ([System.IO.Directory]::Exists($path)) { [System.IO.DirectoryInfo]::new($path) } else { [System.IO.FileInfo]::new($path) }
 $acl = $item.GetAccessControl()
-if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) { exit 5 }
-if ($env:GEO_PRIVATE_ACTION -eq 'set') {
+$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+if ($env:GEO_PRIVATE_ACTION -eq 'create') {
+  # Elevated Windows processes may give their own freshly created items the
+  # Administrators group as owner. Only the just-created path may be repaired.
+  $administrators = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+  if ($owner.Value -ne $identity.User.Value -and $owner.Value -ne $administrators.Value) { exit 5 }
+  if ($owner.Value -eq $administrators.Value) { $acl.SetOwner($identity.User) }
   $acl.SetAccessRuleProtection($true, $false)
   foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
   $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
@@ -97,7 +104,10 @@ if ($env:GEO_PRIVATE_ACTION -eq 'set') {
   [void]$acl.SetAccessRule($rule)
   $item.SetAccessControl($acl)
   $acl = $item.GetAccessControl()
+} elseif ($owner.Value -ne $identity.User.Value) {
+  exit 5
 }
+if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) { exit 5 }
 if (-not $acl.AreAccessRulesProtected) { exit 2 }
 foreach ($rule in $acl.Access) {
   if ($rule.IsInherited -or $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) { exit 3 }
@@ -117,10 +127,12 @@ async function privatePermissions(path, set = false) {
       {
         env: cleanEnv({
           GEO_PRIVATE_PATH: path,
-          GEO_PRIVATE_ACTION: set ? "set" : "check",
+          GEO_PRIVATE_ACTION: set ? "create" : "check",
         }),
         encoding: "utf8",
         windowsHide: true,
+        timeout: 15000,
+        maxBuffer: 8192,
       },
     );
     assert(

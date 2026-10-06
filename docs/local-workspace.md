@@ -15,3 +15,5 @@ The helper requires ports 8080, 5173, 38080, and 15432. It refuses preoccupied s
 The API retains Secure cookies in PostgreSQL mode. Chromium may accept them on `localhost`; if login fails because of browser cookie handling, use a correctly configured HTTPS ingress. Do not disable Secure cookies to make HTTP work. This helper does not add authentication bypasses or a product login endpoint.
 
 Run the helper's non-Docker unit tests with `node --test scripts/local-workspace.test.mjs`. Its readiness checks do not validate a real external account or official search.
+
+Linux CI additionally runs `node scripts/verify-local-workspace.mjs` with a new, nonexistent external state path and the built application. It launches `--check` twice, checks that owned service ports are released after each run, and compares protected configuration and aggregate PostgreSQL session facts across restarts. Private state is never uploaded; only fixed verification labels are logged. The dedicated container and volume remain until the disposable runner is reclaimed. This test verifies first-party persistence, not external account login or official search.

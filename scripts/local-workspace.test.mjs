@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   mkdtemp,
@@ -72,6 +73,56 @@ test("refuses checkout and foreign/preexisting state without rewriting it", asyn
     await rm(parent, { recursive: true, force: true });
   }
 });
+
+test(
+  "Windows creation owns private state; existing foreign owner is never repaired",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const parent = await mkdtemp(join(tmpdir(), "geo-private-check-"));
+    const powershell = (path, command) =>
+      spawnSync(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", command],
+        {
+          env: { ...process.env, GEO_PRIVATE_PATH: path },
+          encoding: "utf8",
+          windowsHide: true,
+          timeout: 15000,
+          maxBuffer: 8192,
+        },
+      );
+    const ownership = (path) =>
+      powershell(
+        path,
+        '$path=$env:GEO_PRIVATE_PATH; $item=if ([System.IO.Directory]::Exists($path)) { [System.IO.DirectoryInfo]::new($path) } else { [System.IO.FileInfo]::new($path) }; $owner=$item.GetAccessControl().GetOwner([System.Security.Principal.SecurityIdentifier]); $me=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; if ($owner.Value -eq $me.Value) { "owned" } else { "foreign" }',
+      ).stdout.trim();
+    try {
+      const state = join(parent, "owned");
+      await loadState(state);
+      for (const path of [
+        state,
+        join(state, ".geo-local-owned"),
+        join(state, "config.json"),
+      ]) {
+        assert.equal(ownership(path), "owned");
+      }
+      const marker = join(state, ".geo-local-owned");
+      const changed = powershell(
+        marker,
+        "$item=[System.IO.FileInfo]::new($env:GEO_PRIVATE_PATH); $acl=$item.GetAccessControl(); $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')); try { $item.SetAccessControl($acl); exit 0 } catch { exit 8 }",
+      );
+      if (changed.status !== 0) {
+        t.skip("Changing a synthetic fixture owner requires elevated Windows");
+        return;
+      }
+      assert.equal(ownership(marker), "foreign");
+      await assert.rejects(loadState(state), /Private state ACL/);
+      assert.equal(ownership(marker), "foreign");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  },
+);
 
 test("foreign Docker volume/container and changed binding never pass inspection", () => {
   const config = {
