@@ -4,6 +4,15 @@
 
 ## 2026-10-06
 
+- 08:15 前提交检查点：工具账本批次全 Rust 工作区默认测试、严格 Clippy 和格式检查通过；另显式运行 CI 同款 V8 六组共 12 项通过（含应用真实工具循环、附件、渠道与内容分支恢复）。新增 PostgreSQL 生命周期/竞争/取消/拒绝判定回归仍需提交后 CI；默认 ignored 不计实库通过。新增内容与文件名已检查私人上下文，产品计划及依赖锁文件不变；保留既有 LNK4098 警告，未从源码构建 V8。
+
+- 工具账本增量：24 项宿主操作通过 Rust 生成调用身份和请求摘要，先保存 Intent、原子领取 Attempted，再调用能力并在结果校验后记录终态；取消/超时/异常及外部无效回执保留 Unknown。运行取消后允许在途收尾，隔离体停止等待不丢应用侧结果写入；终态保存有独立截止。内存与 PostgreSQL 拒绝身份冲突、拒绝判定和重复领取；正常应用装配注入真实仓储，不从 JS 结果伪造记录，不新增依赖、人工审批或全局并发门槛。
+- 本批局部验证：Worker 34+7 项、API 原生 18/18、应用生成 bundle 工具循环 1/1、领域新增工具生命周期 3/3 及兼容账本 1/1 通过；新增 PostgreSQL 测试仅编译，仍需 CI 显式执行。应用夹具增加真实模型选择工具后第二次完成，核对实际 model/knowledge 调用账本。全工作区检查尚在运行；稳定重入、可重放输出和中途恢复未完成。
+
+- 08:05 前检查点：`8b35a80` / Actions `37391073374` Windows/Linux 全绿；显式 V8 与一次性 PostgreSQL 步骤通过。读取日志确认 `lookup_is_scoped_fenced_append_only_and_never_rewrites_send` 实际执行为 `ok`，覆盖报告候选/32 项边界及完整 62 条历史分页；迁移 `0025` 已通过实库验证。实际工具账本仍为后续未提交增量，真实外部发布/搜索仍未验收。
+
+- 08:00 检查点：`8b35a80` 已推送，Actions `37391073374` 尚未结束，不更新完整绿色基线。实际工具账本实现进入整合：领域 64/64、持久层库测试 6/6 通过，新增 PostgreSQL 回归仅编译，本地未配置可丢弃数据库。主代理审查要求补齐存储判定拒绝领取，以及领取完成时已经取消/超时不得再派发；Worker/API/V8 测试待完成。未修改产品规格或新增人工流程。
+
 - 07:55 CI 修正：`5d8731e` / Actions `37389926831` Windows 通过；Linux 前端、默认 Rust、显式 V8 通过，PostgreSQL 新增报告候选查询、32 项边界及截止断言执行后，后续分页测试因共用同一尝试下新增 35 条观察而失败。修正夹具时间使分页批次比报告候选晚一秒，并遍历全部页与独立排序的完整 62 条历史比较，保留同时间游标及跨作用域断言；不改生产查询、不删除历史记录。修正需新 CI；本地仅格式及 diff 检查，未将无数据库编译当作实库验证。
 
 - 07:15 检查点：`dfa1e12` / Actions `37386371842` Windows/Linux 全绿，显式 V8 与一次性 PostgreSQL 步骤均通过。读取 Linux 日志确认 `csv_generation_slices_persist_without_duplicating_full_record_search` 实际为 `ok`；默认套件中的 ignored 不计入此结论。无候选网址查回及周报观察投影为下一批未提交改动，仍需独立复验；真实账号验收未完成。
@@ -346,6 +355,7 @@
 - **clippy 收口**：`crates/domain/src/agent.rs` 的 `collapsible_if` 已用 let-chain 修掉（`if let Some(turn) = … && turn.status == …`，语义等价）。该 warning **由本轮引入**（base 为 0 条），而 CI 对每个 PR 跑 `cargo clippy -- -D warnings`，不修则本轮全部 PR 的 CI 必然为红。`crates/api` 内的同类 warning 同轮修掉；`cargo fmt --all -- --check` 同时暴露了 `crates/persistence/tests/postgres.rs` 的 3 处换行漂移（同样是本轮引入，base 为 0），已用 `cargo fmt --all` 修正。二者现已全部通过。
 - **更正本文件 2026-09-21 的本地环境结论**：该条称加 `--end-of-line crlf` 后 prettier 对 `apps/web` 41 个文件全部通过、故"47 个报错文件中无一存在真实风格问题"——**这个结论是错的**。首个 PR 的 CI 以 `prettier --check` 在 `apps/web/src/pages/SetupPage.test.tsx` 失败：两处超长 `reason` 字面量未按 prettier 期望在键后换行。CRLF 噪声恰好掩盖了这一处真实问题：本机 `format:check` 对**每一个**检出文件都报错，等于该信号已失效，不能由"本机全红"推断"没有真实缺陷"。可复现 CI 的做法是取出**提交后**的（LF）内容再检查：`git show <rev>:<path> > /tmp/x.tsx && prettier --check /tmp/x.tsx`。修复已作为独立提交进入各分支。
 - 已知限制（已同步进 `TODO.md`）：**重启对账缺失**——进程内没有任何优雅关闭，退出时在飞的 run 会永久停在 `running`，且修法只在单进程假设下成立、多副本下错误；取消不触达隔离体（`cancel_turn` 语义正确，`finish_run` 不会覆盖 `Cancelled`，但 turn 仍跑到 deadline）；**无堆上限**（`start` 传 `None`，`install_heap_limit_guard` 目前是死代码）；checkpoint 与 tool-call ledger 已有持久化实现但运行路径尚未写入。
+
 # 2026-09-30
 
 - CI 新增 Windows/MSVC 专用 `rusty-v8-msvc-<commit>` artifact：包含精确 `.lib.gz`、SHA-256 清单、target、rustc 与 V8 版本元数据；Linux bundle 单独上传，不能充当 Windows V8 缓存。

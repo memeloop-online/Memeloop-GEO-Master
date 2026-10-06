@@ -435,6 +435,83 @@ pub struct RecordToolCall {
     pub currency: Option<String>,
 }
 
+/// Rust-owned immutable identity of a tool invocation. Every transition checks
+/// all fields before using an existing ledger entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallIdentity {
+    pub run_id: RunId,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments_hash: String,
+    pub idempotency_key_hash: String,
+}
+
+impl ToolCallIdentity {
+    pub fn from_record(input: &RecordToolCall) -> Self {
+        Self {
+            run_id: input.run_id,
+            tool_call_id: input.tool_call_id.clone(),
+            tool_name: input.tool_name.clone(),
+            arguments_hash: input.arguments_hash.clone(),
+            idempotency_key_hash: input.idempotency_key_hash.clone(),
+        }
+    }
+
+    pub fn matches(&self, entry: &ToolCallLedgerEntry) -> bool {
+        self.run_id == entry.run_id
+            && self.tool_call_id == entry.tool_call_id
+            && self.tool_name == entry.tool_name
+            && self.arguments_hash == entry.arguments_hash
+            && self.idempotency_key_hash == entry.idempotency_key_hash
+    }
+}
+
+pub fn validate_tool_call_identity(identity: &ToolCallIdentity) -> Result<(), AppError> {
+    validate_agent_key("tool_call_id", &identity.tool_call_id)?;
+    validate_agent_key("tool_name", &identity.tool_name)?;
+    validate_agent_digest("arguments_hash", &identity.arguments_hash)?;
+    validate_agent_digest("idempotency_key_hash", &identity.idempotency_key_hash)?;
+    Ok(())
+}
+
+pub fn validate_tool_call_begin(input: &RecordToolCall) -> Result<(), AppError> {
+    validate_tool_call_write(input)?;
+    if input.outcome != ToolCallOutcome::Intent
+        || input.attempt_count != 0
+        || input.result_ref.is_some()
+        || input.cost_minor.is_some()
+        || input.currency.is_some()
+    {
+        return Err(AppError::invalid_request(
+            "tool call intent must not include an attempt, result, or cost",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_tool_call_finish(outcome: ToolCallOutcome) -> Result<(), AppError> {
+    if !matches!(
+        outcome,
+        ToolCallOutcome::Succeeded | ToolCallOutcome::Failed | ToolCallOutcome::Unknown
+    ) {
+        return Err(AppError::invalid_request(
+            "tool call completion must be succeeded, failed, or unknown",
+        ));
+    }
+    Ok(())
+}
+
+/// A durable decision, not a caller-supplied flag, controls the only transition
+/// that authorizes a real invocation.
+pub fn validate_tool_call_authorized(entry: &ToolCallLedgerEntry) -> Result<(), AppError> {
+    if entry.permission != ToolCallDecision::Allowed || entry.budget != ToolCallDecision::Allowed {
+        return Err(AppError::forbidden(
+            "tool call permission or budget was denied",
+        ));
+    }
+    Ok(())
+}
+
 /// Bounded identifier for a checkpoint scope, step or tool call.
 fn validate_agent_key(field: &str, value: &str) -> Result<(), AppError> {
     if value.trim().is_empty() || value.chars().count() > 200 {
@@ -975,6 +1052,39 @@ pub trait AgentRepository: Send + Sync {
         scope: &TenantScope,
         input: RecordToolCall,
     ) -> Result<ToolCallLedgerEntry, AppError>;
+    /// Persist an intent before invoking a tool. A replay returns the matching
+    /// record even after cancellation; a new intent requires a running run.
+    async fn begin_tool_call(
+        &self,
+        _scope: &TenantScope,
+        _input: RecordToolCall,
+    ) -> Result<ToolCallLedgerEntry, AppError> {
+        Err(AppError::capability_missing(
+            "tool call lifecycle is unavailable",
+        ))
+    }
+    /// Exactly one caller can advance Intent to Attempted. `false` means the
+    /// attempt has already been claimed or the record is terminal.
+    async fn attempt_tool_call(
+        &self,
+        _scope: &TenantScope,
+        _identity: ToolCallIdentity,
+    ) -> Result<bool, AppError> {
+        Err(AppError::capability_missing(
+            "tool call lifecycle is unavailable",
+        ))
+    }
+    /// An in-flight outcome can be recorded even after the run is cancelled.
+    async fn finish_tool_call(
+        &self,
+        _scope: &TenantScope,
+        _identity: ToolCallIdentity,
+        _outcome: ToolCallOutcome,
+    ) -> Result<ToolCallLedgerEntry, AppError> {
+        Err(AppError::capability_missing(
+            "tool call lifecycle is unavailable",
+        ))
+    }
     async fn list_tool_calls(
         &self,
         scope: &TenantScope,
@@ -1792,6 +1902,129 @@ impl AgentRepository for MemoryAgentRepository {
         Ok(entry)
     }
 
+    async fn begin_tool_call(
+        &self,
+        scope: &TenantScope,
+        input: RecordToolCall,
+    ) -> Result<ToolCallLedgerEntry, AppError> {
+        validate_tool_call_begin(&input)?;
+        let mut state = self.state.write().await;
+        let run = Self::visible_run(&state, scope, input.run_id)?;
+        let key = (run.id, input.tool_call_id.clone());
+        if let Some(existing) = state.tool_calls.get(&key) {
+            if !ToolCallIdentity::from_record(&input).matches(existing)
+                || existing.permission != input.permission
+                || existing.budget != input.budget
+                || existing.intent != input.intent
+                || existing.attempt_count > 1
+                || existing.result_ref.is_some()
+                || existing.cost_minor.is_some()
+                || existing.currency.is_some()
+            {
+                return Err(AppError::conflict(
+                    "tool call intent conflicts with its ledger",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        if run.status != RunStatus::Running {
+            return Err(AppError::conflict("run is not running"));
+        }
+        let now = Utc::now();
+        let entry = ToolCallLedgerEntry {
+            id: ToolCallLedgerId::from(Uuid::new_v4()),
+            run_id: run.id,
+            turn_id: run.turn_id,
+            conversation_id: run.conversation_id,
+            operator_id: run.operator_id,
+            tenant_id: run.tenant_id,
+            project_id: run.project_id,
+            tool_call_id: input.tool_call_id,
+            tool_name: input.tool_name,
+            arguments_hash: input.arguments_hash,
+            idempotency_key_hash: input.idempotency_key_hash,
+            permission: input.permission,
+            budget: input.budget,
+            intent: input.intent,
+            attempt_count: 0,
+            result_ref: None,
+            outcome: ToolCallOutcome::Intent,
+            cost_minor: None,
+            currency: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state.tool_calls.insert(key, entry.clone());
+        Ok(entry)
+    }
+
+    async fn attempt_tool_call(
+        &self,
+        scope: &TenantScope,
+        identity: ToolCallIdentity,
+    ) -> Result<bool, AppError> {
+        validate_tool_call_identity(&identity)?;
+        let mut state = self.state.write().await;
+        let run = Self::visible_run(&state, scope, identity.run_id)?;
+        let entry = state
+            .tool_calls
+            .get_mut(&(run.id, identity.tool_call_id.clone()))
+            .ok_or_else(|| AppError::not_found("tool call not found"))?;
+        if !identity.matches(entry) {
+            return Err(AppError::conflict(
+                "tool call identity conflicts with its ledger",
+            ));
+        }
+        if entry.outcome != ToolCallOutcome::Intent {
+            return Ok(false);
+        }
+        if entry.attempt_count != 0 {
+            return Err(AppError::conflict(
+                "tool call attempt state is inconsistent",
+            ));
+        }
+        validate_tool_call_authorized(entry)?;
+        if run.status != RunStatus::Running {
+            return Err(AppError::conflict("run is not running"));
+        }
+        entry.outcome = ToolCallOutcome::Attempted;
+        entry.attempt_count = 1;
+        entry.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn finish_tool_call(
+        &self,
+        scope: &TenantScope,
+        identity: ToolCallIdentity,
+        outcome: ToolCallOutcome,
+    ) -> Result<ToolCallLedgerEntry, AppError> {
+        validate_tool_call_identity(&identity)?;
+        validate_tool_call_finish(outcome)?;
+        let mut state = self.state.write().await;
+        let run = Self::visible_run(&state, scope, identity.run_id)?;
+        let entry = state
+            .tool_calls
+            .get_mut(&(run.id, identity.tool_call_id.clone()))
+            .ok_or_else(|| AppError::not_found("tool call not found"))?;
+        if !identity.matches(entry) {
+            return Err(AppError::conflict(
+                "tool call identity conflicts with its ledger",
+            ));
+        }
+        if entry.outcome == outcome && entry.attempt_count == 1 {
+            return Ok(entry.clone());
+        }
+        if entry.outcome != ToolCallOutcome::Attempted || entry.attempt_count != 1 {
+            return Err(AppError::conflict(
+                "tool call cannot change its recorded outcome",
+            ));
+        }
+        entry.outcome = outcome;
+        entry.updated_at = Utc::now();
+        Ok(entry.clone())
+    }
+
     async fn list_tool_calls(
         &self,
         scope: &TenantScope,
@@ -2250,6 +2483,302 @@ mod tests {
             .expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].outcome, ToolCallOutcome::Intent);
+    }
+
+    fn rust_tool_intent(run_id: RunId, tool_call_id: &str) -> RecordToolCall {
+        RecordToolCall {
+            run_id,
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: "geo.knowledge.search".to_owned(),
+            arguments_hash: "argument-digest".to_owned(),
+            idempotency_key_hash: "invocation-digest".to_owned(),
+            permission: ToolCallDecision::Allowed,
+            budget: ToolCallDecision::Allowed,
+            intent: json!({"safe": true}),
+            attempt_count: 0,
+            result_ref: None,
+            outcome: ToolCallOutcome::Intent,
+            cost_minor: None,
+            currency: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rust_tool_lifecycle_is_scoped_and_idempotent() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        let input = rust_tool_intent(run.id, "tool-a");
+        assert_eq!(
+            repository
+                .begin_tool_call(&scope, input.clone())
+                .await
+                .expect_err("queued run cannot open new intent")
+                .code,
+            crate::ErrorCode::Conflict
+        );
+        repository
+            .begin_run(&scope, run.id)
+            .await
+            .expect("claim run");
+        let intent = repository
+            .begin_tool_call(&scope, input.clone())
+            .await
+            .expect("intent");
+        assert_eq!(intent.attempt_count, 0);
+        assert_eq!(
+            repository
+                .begin_tool_call(&scope, input.clone())
+                .await
+                .expect("replay"),
+            intent
+        );
+        for changed in [
+            RecordToolCall {
+                tool_name: "geo.other".to_owned(),
+                ..input.clone()
+            },
+            RecordToolCall {
+                permission: ToolCallDecision::Denied,
+                ..input.clone()
+            },
+            RecordToolCall {
+                intent: json!({"safe": false}),
+                ..input.clone()
+            },
+            RecordToolCall {
+                idempotency_key_hash: "other-key".to_owned(),
+                ..input.clone()
+            },
+        ] {
+            assert_eq!(
+                repository
+                    .begin_tool_call(&scope, changed)
+                    .await
+                    .expect_err("immutable collision")
+                    .code,
+                crate::ErrorCode::Conflict
+            );
+        }
+        let identity = ToolCallIdentity::from_record(&input);
+        let sibling = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        assert_eq!(
+            repository
+                .attempt_tool_call(&sibling, identity.clone())
+                .await
+                .expect_err("other project")
+                .code,
+            crate::ErrorCode::NotFound
+        );
+        let changed_identity = ToolCallIdentity {
+            arguments_hash: "other-digest".to_owned(),
+            ..identity.clone()
+        };
+        assert_eq!(
+            repository
+                .attempt_tool_call(&scope, changed_identity)
+                .await
+                .expect_err("changed identity")
+                .code,
+            crate::ErrorCode::Conflict
+        );
+        assert!(
+            repository
+                .attempt_tool_call(&scope, identity.clone())
+                .await
+                .expect("claim")
+        );
+        assert!(
+            !repository
+                .attempt_tool_call(&scope, identity.clone())
+                .await
+                .expect("replay claim")
+        );
+        repository
+            .cancel_turn(&scope, run.turn_id)
+            .await
+            .expect("cancel");
+        let completed = repository
+            .finish_tool_call(&scope, identity.clone(), ToolCallOutcome::Unknown)
+            .await
+            .expect("late outcome");
+        assert_eq!(completed.attempt_count, 1);
+        assert_eq!(completed.outcome, ToolCallOutcome::Unknown);
+        assert_eq!(
+            repository
+                .finish_tool_call(&scope, identity.clone(), ToolCallOutcome::Unknown)
+                .await
+                .expect("terminal replay"),
+            completed
+        );
+        assert!(
+            !repository
+                .attempt_tool_call(&scope, identity.clone())
+                .await
+                .expect("no resend")
+        );
+        assert_eq!(
+            repository
+                .finish_tool_call(&scope, identity, ToolCallOutcome::Succeeded)
+                .await
+                .expect_err("unknown is immutable")
+                .code,
+            crate::ErrorCode::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_tool_attempt_is_single_claim_and_cancellation_prevents_new_attempts() {
+        let repository = Arc::new(MemoryAgentRepository::new());
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        repository
+            .begin_run(&scope, run.id)
+            .await
+            .expect("claim run");
+        let identity = ToolCallIdentity::from_record(&rust_tool_intent(run.id, "tool-a"));
+        repository
+            .begin_tool_call(&scope, rust_tool_intent(run.id, "tool-a"))
+            .await
+            .expect("intent");
+        let tasks = (0..12)
+            .map(|_| {
+                let repository = repository.clone();
+                let identity = identity.clone();
+                let scope = scope.clone();
+                tokio::spawn(async move {
+                    repository
+                        .attempt_tool_call(&scope, identity)
+                        .await
+                        .expect("claim race")
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut claims = 0;
+        for task in tasks {
+            claims += usize::from(task.await.expect("join"));
+        }
+        assert_eq!(claims, 1);
+        let unclaimed = rust_tool_intent(run.id, "tool-b");
+        repository
+            .begin_tool_call(&scope, unclaimed.clone())
+            .await
+            .expect("intent");
+        repository
+            .cancel_turn(&scope, run.turn_id)
+            .await
+            .expect("cancel");
+        assert_eq!(
+            repository
+                .attempt_tool_call(&scope, ToolCallIdentity::from_record(&unclaimed))
+                .await
+                .expect_err("cancel prevents attempt")
+                .code,
+            crate::ErrorCode::Conflict
+        );
+        assert_eq!(
+            repository
+                .begin_tool_call(&scope, rust_tool_intent(run.id, "tool-c"))
+                .await
+                .expect_err("cancel prevents new intent")
+                .code,
+            crate::ErrorCode::Conflict
+        );
+        assert_eq!(
+            repository
+                .finish_tool_call(
+                    &scope,
+                    ToolCallIdentity::from_record(&unclaimed),
+                    ToolCallOutcome::Failed,
+                )
+                .await
+                .expect_err("never attempted")
+                .code,
+            crate::ErrorCode::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_tool_attempt_requires_persisted_allowed_permission_and_budget() {
+        let repository = MemoryAgentRepository::new();
+        let scope = scope(Uuid::new_v4());
+        let run = accepted_run(&repository, &scope).await;
+        repository.begin_run(&scope, run.id).await.expect("run");
+        for (tool_id, permission, budget) in [
+            (
+                "permission-denied",
+                ToolCallDecision::Denied,
+                ToolCallDecision::Allowed,
+            ),
+            (
+                "budget-denied",
+                ToolCallDecision::Allowed,
+                ToolCallDecision::Denied,
+            ),
+        ] {
+            let input = RecordToolCall {
+                permission,
+                budget,
+                ..rust_tool_intent(run.id, tool_id)
+            };
+            let entry = repository
+                .begin_tool_call(&scope, input.clone())
+                .await
+                .expect("denied intent may be recorded");
+            assert_eq!(entry.outcome, ToolCallOutcome::Intent);
+            assert_eq!(
+                repository
+                    .attempt_tool_call(&scope, ToolCallIdentity::from_record(&input))
+                    .await
+                    .expect_err("denied decision cannot claim an attempt")
+                    .code,
+                crate::ErrorCode::Forbidden
+            );
+        }
+        let legacy_denied = RecordToolCall {
+            budget: ToolCallDecision::Denied,
+            cost_minor: Some(12),
+            ..rust_tool_intent(run.id, "legacy-denied")
+        };
+        repository
+            .append_tool_call(&scope, legacy_denied.clone())
+            .await
+            .expect("legacy append");
+        assert_eq!(
+            repository
+                .attempt_tool_call(&scope, ToolCallIdentity::from_record(&legacy_denied))
+                .await
+                .expect_err("legacy denied decision cannot claim an attempt")
+                .code,
+            crate::ErrorCode::Forbidden
+        );
+        let legacy_unknown = RecordToolCall {
+            attempt_count: 1,
+            outcome: ToolCallOutcome::Unknown,
+            ..rust_tool_intent(run.id, "legacy-unknown")
+        };
+        repository
+            .append_tool_call(&scope, legacy_unknown.clone())
+            .await
+            .expect("legacy unknown");
+        assert!(
+            !repository
+                .attempt_tool_call(&scope, ToolCallIdentity::from_record(&legacy_unknown))
+                .await
+                .expect("unknown can never be attempted again")
+        );
+        assert!(
+            repository
+                .list_tool_calls(&scope, run.id)
+                .await
+                .expect("ledger")
+                .iter()
+                .all(|entry| entry.outcome != ToolCallOutcome::Attempted)
+        );
     }
 
     #[tokio::test]

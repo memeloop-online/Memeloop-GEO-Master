@@ -22,7 +22,7 @@ use geo_worker::{
     KnowledgeImportAttachmentResultItem, KnowledgeImportAttachmentsRequest,
     KnowledgeImportAttachmentsResult, ManifestItem, ManifestPage, ManifestReadRequest,
     MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
-    PublishRequest, PublishState,
+    PublishRequest, PublishState, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder,
 };
 use serde_json::Value;
 
@@ -281,6 +281,27 @@ fn bridge(ops: Arc<FakeHostOps>) -> HostBridge {
 /// The scenario imports the crate's own host façade, so the tests exercise the
 /// same transport an embedding host would ship.
 fn runtime(script: &'static str, bridge: HostBridge) -> HostRuntime {
+    struct TestRecorder;
+    #[async_trait]
+    impl ToolCallRecorder for TestRecorder {
+        async fn begin(&self, _: &ToolCallIdentity) -> Result<bool, HostOpError> {
+            Ok(true)
+        }
+        async fn attempt(&self, _: &ToolCallIdentity) -> Result<bool, HostOpError> {
+            Ok(true)
+        }
+        async fn finish(
+            &self,
+            _: &ToolCallIdentity,
+            _: ToolCallOutcome,
+        ) -> Result<(), HostOpError> {
+            Ok(())
+        }
+    }
+    let bridge = bridge.with_recorder(
+        geo_domain::RunId::from(uuid::Uuid::new_v4()),
+        Arc::new(TestRecorder),
+    );
     let bundle = [
         ("memeloop://bundle/host-ops.js", geo_worker::HOST_OPS_JS),
         (SCENARIO_MODULE, script),

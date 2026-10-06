@@ -36,10 +36,11 @@ pub use agent::{
     MAX_HISTORY_TURNS, MAX_MESSAGE_CHARS, MemoryAgentRepository, Message, MessageId, MessageRole,
     MissingAgentRuntime, ObjectRef, RUNTIME_NOT_CONFIGURED, RecordToolCall, Run, RunCompletion,
     RunId, RunStatus, RunTransition, RuntimeCapability, RuntimeCapabilityStatus,
-    SharedAgentRepository, StoreCheckpoint, SubmitAcceptance, ToolCallDecision,
+    SharedAgentRepository, StoreCheckpoint, SubmitAcceptance, ToolCallDecision, ToolCallIdentity,
     ToolCallLedgerEntry, ToolCallLedgerId, ToolCallOutcome, Turn, TurnHistoryMessage, TurnId,
     TurnInput, TurnReport, TurnStatus, validate_append_message, validate_checkpoint_write,
-    validate_message_content, validate_tool_call_write,
+    validate_message_content, validate_tool_call_authorized, validate_tool_call_begin,
+    validate_tool_call_finish, validate_tool_call_identity, validate_tool_call_write,
 };
 pub use auth::{
     AuthRepository, DEFAULT_SESSION_TTL_SECS, DEVELOPMENT_USER_EMAIL, LoginIdentity, Membership,

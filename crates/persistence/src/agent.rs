@@ -20,9 +20,11 @@ use geo_domain::{
     ConversationId, ConversationStatus, CreateConversation, MAX_HISTORY_BYTES, MAX_HISTORY_TURNS,
     Message, MessageId, MessageRole, RecordToolCall, Run, RunCompletion, RunId, RunStatus,
     RunTransition, RuntimeCapability, StoreCheckpoint, SubmitAcceptance, TenantScope,
-    ToolCallDecision, ToolCallLedgerEntry, ToolCallLedgerId, ToolCallOutcome, Turn,
-    TurnHistoryMessage, TurnId, TurnInput, TurnStatus, UserId, validate_append_message,
-    validate_checkpoint_write, validate_message_content, validate_tool_call_write,
+    ToolCallDecision, ToolCallIdentity, ToolCallLedgerEntry, ToolCallLedgerId, ToolCallOutcome,
+    Turn, TurnHistoryMessage, TurnId, TurnInput, TurnStatus, UserId, validate_append_message,
+    validate_checkpoint_write, validate_message_content, validate_tool_call_authorized,
+    validate_tool_call_begin, validate_tool_call_finish, validate_tool_call_identity,
+    validate_tool_call_write,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -1451,6 +1453,163 @@ impl AgentRepository for PgAgentRepository {
         ToolCallLedgerEntry::try_from(row)
     }
 
+    async fn begin_tool_call(
+        &self,
+        scope: &TenantScope,
+        input: RecordToolCall,
+    ) -> Result<ToolCallLedgerEntry, AppError> {
+        validate_tool_call_begin(&input)?;
+        let mut transaction = self.transaction(scope).await?;
+        // The run lock serializes creation with both cancellation and
+        // competing first writers, without adding an executor-wide gate.
+        let run = lock_tool_call_run(&mut transaction, scope, input.run_id).await?;
+        if let Some(existing) =
+            lock_tool_call(&mut transaction, scope, &run, &input.tool_call_id).await?
+        {
+            let existing = ToolCallLedgerEntry::try_from(existing)?;
+            if !ToolCallIdentity::from_record(&input).matches(&existing)
+                || existing.permission != input.permission
+                || existing.budget != input.budget
+                || existing.intent != input.intent
+                || existing.attempt_count > 1
+                || existing.result_ref.is_some()
+                || existing.cost_minor.is_some()
+                || existing.currency.is_some()
+            {
+                return Err(AppError::conflict(
+                    "tool call intent conflicts with its ledger",
+                ));
+            }
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(existing);
+        }
+        if run.status != RunStatus::Running {
+            return Err(AppError::conflict("run is not running"));
+        }
+        let row = sqlx::query_as::<_, ToolCallRow>(
+            r#"INSERT INTO agent_tool_call_ledger
+                (ledger_entry_id, run_id, turn_id, conversation_id, operator_id, tenant_id,
+                 project_id, tool_call_id, tool_name, arguments_hash, idempotency_key_hash,
+                 permission, budget, intent, attempt_count, outcome)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 0, 'intent')
+            RETURNING ledger_entry_id, run_id, turn_id, conversation_id, operator_id, tenant_id,
+                      project_id, tool_call_id, tool_name, arguments_hash, idempotency_key_hash,
+                      permission, budget, intent, attempt_count, result_ref, outcome, cost_minor,
+                      currency, created_at, updated_at"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(run.id.as_uuid())
+        .bind(run.turn_id.as_uuid())
+        .bind(run.conversation_id.as_uuid())
+        .bind(run.operator_id.as_uuid())
+        .bind(run.tenant_id.as_uuid())
+        .bind(run.project_id.as_uuid())
+        .bind(&input.tool_call_id)
+        .bind(&input.tool_name)
+        .bind(&input.arguments_hash)
+        .bind(&input.idempotency_key_hash)
+        .bind(tool_call_decision_text(input.permission))
+        .bind(tool_call_decision_text(input.budget))
+        .bind(input.intent)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        ToolCallLedgerEntry::try_from(row)
+    }
+
+    async fn attempt_tool_call(
+        &self,
+        scope: &TenantScope,
+        identity: ToolCallIdentity,
+    ) -> Result<bool, AppError> {
+        validate_tool_call_identity(&identity)?;
+        let mut transaction = self.transaction(scope).await?;
+        let run = lock_tool_call_run(&mut transaction, scope, identity.run_id).await?;
+        let entry = lock_tool_call(&mut transaction, scope, &run, &identity.tool_call_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("tool call not found"))?;
+        let entry = ToolCallLedgerEntry::try_from(entry)?;
+        if !identity.matches(&entry) {
+            return Err(AppError::conflict(
+                "tool call identity conflicts with its ledger",
+            ));
+        }
+        if entry.outcome != ToolCallOutcome::Intent {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        if entry.attempt_count != 0 {
+            return Err(AppError::conflict(
+                "tool call attempt state is inconsistent",
+            ));
+        }
+        validate_tool_call_authorized(&entry)?;
+        if run.status != RunStatus::Running {
+            return Err(AppError::conflict("run is not running"));
+        }
+        sqlx::query(
+            r#"UPDATE agent_tool_call_ledger
+                  SET outcome = 'attempted', attempt_count = 1, updated_at = now()
+                WHERE ledger_entry_id = $1 AND outcome = 'intent' AND attempt_count = 0
+                  AND permission = 'allowed' AND budget = 'allowed'"#,
+        )
+        .bind(entry.id.as_uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(true)
+    }
+
+    async fn finish_tool_call(
+        &self,
+        scope: &TenantScope,
+        identity: ToolCallIdentity,
+        outcome: ToolCallOutcome,
+    ) -> Result<ToolCallLedgerEntry, AppError> {
+        validate_tool_call_identity(&identity)?;
+        validate_tool_call_finish(outcome)?;
+        let mut transaction = self.transaction(scope).await?;
+        // Do not require a running run: cancellation cannot discard an
+        // already-started external operation's late result.
+        let run = lock_tool_call_run(&mut transaction, scope, identity.run_id).await?;
+        let entry = lock_tool_call(&mut transaction, scope, &run, &identity.tool_call_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("tool call not found"))?;
+        let entry = ToolCallLedgerEntry::try_from(entry)?;
+        if !identity.matches(&entry) {
+            return Err(AppError::conflict(
+                "tool call identity conflicts with its ledger",
+            ));
+        }
+        if entry.outcome == outcome && entry.attempt_count == 1 {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(entry);
+        }
+        if entry.outcome != ToolCallOutcome::Attempted || entry.attempt_count != 1 {
+            return Err(AppError::conflict(
+                "tool call cannot change its recorded outcome",
+            ));
+        }
+        let row = sqlx::query_as::<_, ToolCallRow>(
+            r#"UPDATE agent_tool_call_ledger
+                  SET outcome = $2, updated_at = now()
+                WHERE ledger_entry_id = $1 AND outcome = 'attempted' AND attempt_count = 1
+            RETURNING ledger_entry_id, run_id, turn_id, conversation_id, operator_id, tenant_id,
+                      project_id, tool_call_id, tool_name, arguments_hash, idempotency_key_hash,
+                      permission, budget, intent, attempt_count, result_ref, outcome, cost_minor,
+                      currency, created_at, updated_at"#,
+        )
+        .bind(entry.id.as_uuid())
+        .bind(tool_call_outcome_text(outcome))
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        ToolCallLedgerEntry::try_from(row)
+    }
+
     async fn list_tool_calls(
         &self,
         scope: &TenantScope,
@@ -1554,6 +1713,56 @@ async fn fetch_run(
     .await
     .map_err(database_error)?;
     row.map(Run::try_from).transpose()
+}
+
+async fn lock_tool_call_run(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    run_id: RunId,
+) -> Result<Run, AppError> {
+    let row = sqlx::query_as::<_, RunRow>(
+        r#"SELECT run_id, conversation_id, turn_id, operator_id, tenant_id, project_id,
+                  status, capability, error, cancel_version, created_at, updated_at
+             FROM agent_runs
+            WHERE run_id = $1 AND operator_id = $2 AND tenant_id = $3
+              AND ($4::UUID IS NULL OR project_id = $4)
+            FOR UPDATE"#,
+    )
+    .bind(run_id.as_uuid())
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(scope.project_id.map(|project_id| project_id.as_uuid()))
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .ok_or_else(|| AppError::not_found("run not found"))?;
+    Run::try_from(row)
+}
+
+async fn lock_tool_call(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    run: &Run,
+    tool_call_id: &str,
+) -> Result<Option<ToolCallRow>, AppError> {
+    sqlx::query_as::<_, ToolCallRow>(
+        r#"SELECT ledger_entry_id, run_id, turn_id, conversation_id, operator_id, tenant_id,
+                  project_id, tool_call_id, tool_name, arguments_hash, idempotency_key_hash,
+                  permission, budget, intent, attempt_count, result_ref, outcome, cost_minor,
+                  currency, created_at, updated_at
+             FROM agent_tool_call_ledger
+            WHERE operator_id = $1 AND tenant_id = $2 AND project_id = $3
+              AND run_id = $4 AND tool_call_id = $5
+            FOR UPDATE"#,
+    )
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(run.project_id.as_uuid())
+    .bind(run.id.as_uuid())
+    .bind(tool_call_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)
 }
 
 async fn fetch_attachments(

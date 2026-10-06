@@ -7,8 +7,8 @@ use geo_domain::{
     InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, MessageRole, ObjectRef,
     ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand, RecordToolCall,
     RunCompletion, RunStatus, RuntimeCapability, SourceKind, StoreCheckpoint, TenantScope,
-    ToolCallDecision, ToolCallOutcome, TurnStatus, UploadSessionCommand, hash_idempotency_key,
-    settings_hash, sha256_hex, start_request_hash,
+    ToolCallDecision, ToolCallIdentity, ToolCallOutcome, TurnStatus, UploadSessionCommand,
+    hash_idempotency_key, settings_hash, sha256_hex, start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgAgentRepository, PgKnowledgeRepository, PgProjectRepository,
@@ -1809,6 +1809,375 @@ async fn agent_tool_call_ledger_appends_idempotently_per_tool_call() {
             .expect_err("cross-project append")
             .code,
         ErrorCode::NotFound
+    );
+}
+
+fn rust_tool_intent(run_id: geo_domain::RunId, tool_call_id: &str) -> RecordToolCall {
+    RecordToolCall {
+        run_id,
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: "geo.knowledge.search".to_owned(),
+        arguments_hash: "arguments-hash".to_owned(),
+        idempotency_key_hash: "stable-key-hash".to_owned(),
+        permission: ToolCallDecision::Allowed,
+        budget: ToolCallDecision::Allowed,
+        intent: json!({"tool": "search"}),
+        attempt_count: 0,
+        result_ref: None,
+        outcome: ToolCallOutcome::Intent,
+        cost_minor: None,
+        currency: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn agent_rust_tool_lifecycle_serializes_replays_attempt_and_late_outcome() {
+    let database = connect().await;
+    let pool = database.pool().clone();
+    let repository = Arc::new(PgAgentRepository::new(pool.clone()));
+    let scope = seed_scope(&pool, "rust-tool-ledger").await;
+    let sibling = seed_sibling_scope(&pool, &scope, "rust-tool-ledger-sibling").await;
+    let conversation = create_conversation(&repository, &scope).await;
+    let acceptance = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("hello"),
+            "rust-ledger-key".to_owned(),
+            "rust-ledger-body".to_owned(),
+            RuntimeCapability::available("test", None),
+        )
+        .await
+        .expect("accept");
+    let run_id = acceptance.run.id;
+    let input = rust_tool_intent(run_id, "call-1");
+    assert_eq!(
+        repository
+            .begin_tool_call(&scope, input.clone())
+            .await
+            .expect_err("queued")
+            .code,
+        ErrorCode::Conflict
+    );
+    repository
+        .begin_run(&scope, run_id)
+        .await
+        .expect("claim run");
+    let writes = (0..8)
+        .map(|_| {
+            let repository = repository.clone();
+            let scope = scope.clone();
+            let input = input.clone();
+            tokio::spawn(async move {
+                repository
+                    .begin_tool_call(&scope, input)
+                    .await
+                    .expect("race intent")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut initial = None;
+    for write in writes {
+        let entry = write.await.expect("join");
+        assert_eq!(entry.attempt_count, 0);
+        assert_eq!(entry.outcome, ToolCallOutcome::Intent);
+        if let Some(previous) = &initial {
+            assert_eq!(previous, &entry);
+        } else {
+            initial = Some(entry);
+        }
+    }
+    let original = initial.expect("intent");
+    let identity = ToolCallIdentity::from_record(&input);
+    let collision = RecordToolCall {
+        tool_name: "geo.other".to_owned(),
+        ..input.clone()
+    };
+    assert_eq!(
+        repository
+            .begin_tool_call(&scope, collision)
+            .await
+            .expect_err("tool name")
+            .code,
+        ErrorCode::Conflict
+    );
+    let collision = RecordToolCall {
+        budget: ToolCallDecision::Denied,
+        ..input.clone()
+    };
+    assert_eq!(
+        repository
+            .begin_tool_call(&scope, collision)
+            .await
+            .expect_err("decision")
+            .code,
+        ErrorCode::Conflict
+    );
+    let collision = RecordToolCall {
+        intent: json!({"tool": "different"}),
+        ..input.clone()
+    };
+    assert_eq!(
+        repository
+            .begin_tool_call(&scope, collision)
+            .await
+            .expect_err("intent")
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        repository
+            .attempt_tool_call(&sibling, identity.clone())
+            .await
+            .expect_err("other project")
+            .code,
+        ErrorCode::NotFound
+    );
+    let claims = (0..8)
+        .map(|_| {
+            let repository = repository.clone();
+            let scope = scope.clone();
+            let identity = identity.clone();
+            tokio::spawn(async move {
+                repository
+                    .attempt_tool_call(&scope, identity)
+                    .await
+                    .expect("attempt race")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut won = 0;
+    for claim in claims {
+        won += usize::from(claim.await.expect("join"));
+    }
+    assert_eq!(won, 1);
+    let entry = repository
+        .list_tool_calls(&scope, run_id)
+        .await
+        .expect("list");
+    assert_eq!(entry.len(), 1);
+    assert_eq!(entry[0].id, original.id);
+    assert_eq!(entry[0].attempt_count, 1);
+    let changed_identity = ToolCallIdentity {
+        idempotency_key_hash: "changed".to_owned(),
+        ..identity.clone()
+    };
+    assert_eq!(
+        repository
+            .finish_tool_call(&scope, changed_identity, ToolCallOutcome::Unknown)
+            .await
+            .expect_err("identity mismatch")
+            .code,
+        ErrorCode::Conflict
+    );
+    repository
+        .cancel_turn(&scope, acceptance.turn.id)
+        .await
+        .expect("cancel");
+    let result = repository
+        .finish_tool_call(&scope, identity.clone(), ToolCallOutcome::Unknown)
+        .await
+        .expect("late result");
+    assert_eq!(result.outcome, ToolCallOutcome::Unknown);
+    assert_eq!(result.attempt_count, 1);
+    assert_eq!(
+        PgAgentRepository::new(pool.clone())
+            .finish_tool_call(&scope, identity.clone(), ToolCallOutcome::Unknown)
+            .await
+            .expect("restart replay"),
+        result
+    );
+    assert!(
+        !repository
+            .attempt_tool_call(&scope, identity.clone())
+            .await
+            .expect("no second attempt")
+    );
+    assert_eq!(
+        repository
+            .finish_tool_call(&scope, identity.clone(), ToolCallOutcome::Succeeded)
+            .await
+            .expect_err("unknown must remain unknown")
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        repository
+            .begin_tool_call(&scope, input)
+            .await
+            .expect("replay after cancel"),
+        result
+    );
+    assert_eq!(
+        repository
+            .finish_tool_call(&sibling, identity, ToolCallOutcome::Unknown)
+            .await
+            .expect_err("cross scope")
+            .code,
+        ErrorCode::NotFound
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn agent_rust_tool_cancellation_before_attempt_rejects_new_side_effects() {
+    let database = connect().await;
+    let repository = PgAgentRepository::from_database(&database);
+    let scope = seed_scope(database.pool(), "rust-tool-cancel").await;
+    let conversation = create_conversation(&repository, &scope).await;
+    let acceptance = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("hello"),
+            "rust-cancel-key".to_owned(),
+            "rust-cancel-body".to_owned(),
+            RuntimeCapability::available("test", None),
+        )
+        .await
+        .expect("accept");
+    let run_id = acceptance.run.id;
+    repository
+        .begin_run(&scope, run_id)
+        .await
+        .expect("claim run");
+    let input = rust_tool_intent(run_id, "call-before-cancel");
+    repository
+        .begin_tool_call(&scope, input.clone())
+        .await
+        .expect("intent");
+    repository
+        .cancel_turn(&scope, acceptance.turn.id)
+        .await
+        .expect("cancel");
+    assert_eq!(
+        repository
+            .attempt_tool_call(&scope, ToolCallIdentity::from_record(&input))
+            .await
+            .expect_err("cannot start after cancel")
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        repository
+            .begin_tool_call(&scope, rust_tool_intent(run_id, "call-after-cancel"))
+            .await
+            .expect_err("no new intent")
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        repository
+            .finish_tool_call(
+                &scope,
+                ToolCallIdentity::from_record(&input),
+                ToolCallOutcome::Failed
+            )
+            .await
+            .expect_err("cannot finish unattempted call")
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        repository
+            .list_tool_calls(&scope, run_id)
+            .await
+            .expect("unchanged")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn agent_rust_tool_attempt_respects_stored_denied_decisions_and_legacy_unknown() {
+    let database = connect().await;
+    let repository = PgAgentRepository::from_database(&database);
+    let scope = seed_scope(database.pool(), "rust-tool-denied").await;
+    let conversation = create_conversation(&repository, &scope).await;
+    let acceptance = repository
+        .append_message(
+            &scope,
+            conversation.id,
+            message("hello"),
+            "rust-denied-key".to_owned(),
+            "rust-denied-body".to_owned(),
+            RuntimeCapability::available("test", None),
+        )
+        .await
+        .expect("accept");
+    let run_id = acceptance.run.id;
+    repository.begin_run(&scope, run_id).await.expect("running");
+    for (tool_id, permission, budget) in [
+        (
+            "permission-denied",
+            ToolCallDecision::Denied,
+            ToolCallDecision::Allowed,
+        ),
+        (
+            "budget-denied",
+            ToolCallDecision::Allowed,
+            ToolCallDecision::Denied,
+        ),
+    ] {
+        let input = RecordToolCall {
+            permission,
+            budget,
+            ..rust_tool_intent(run_id, tool_id)
+        };
+        repository
+            .begin_tool_call(&scope, input.clone())
+            .await
+            .expect("denied intent");
+        assert_eq!(
+            repository
+                .attempt_tool_call(&scope, ToolCallIdentity::from_record(&input))
+                .await
+                .expect_err("must not claim a denied attempt")
+                .code,
+            ErrorCode::Forbidden
+        );
+    }
+    let legacy_denied = RecordToolCall {
+        permission: ToolCallDecision::Denied,
+        cost_minor: Some(4),
+        ..rust_tool_intent(run_id, "legacy-denied")
+    };
+    repository
+        .append_tool_call(&scope, legacy_denied.clone())
+        .await
+        .expect("legacy denied");
+    assert_eq!(
+        repository
+            .attempt_tool_call(&scope, ToolCallIdentity::from_record(&legacy_denied))
+            .await
+            .expect_err("legacy denied attempt")
+            .code,
+        ErrorCode::Forbidden
+    );
+    let legacy_unknown = RecordToolCall {
+        attempt_count: 1,
+        outcome: ToolCallOutcome::Unknown,
+        ..rust_tool_intent(run_id, "legacy-unknown")
+    };
+    repository
+        .append_tool_call(&scope, legacy_unknown.clone())
+        .await
+        .expect("legacy unknown");
+    assert!(
+        !repository
+            .attempt_tool_call(&scope, ToolCallIdentity::from_record(&legacy_unknown))
+            .await
+            .expect("unknown is not claimable")
+    );
+    assert!(
+        repository
+            .list_tool_calls(&scope, run_id)
+            .await
+            .expect("ledger")
+            .iter()
+            .all(|entry| entry.outcome != ToolCallOutcome::Attempted)
     );
 }
 

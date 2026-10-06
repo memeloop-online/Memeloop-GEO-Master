@@ -117,11 +117,10 @@ pub(crate) fn assemble_with_provider(
     let source: &'static str = Box::leak(source.into_boxed_str());
     let bundle: &'static [(&'static str, &'static str)] =
         Box::leak(Box::new([(BUNDLE_SPECIFIER, source)]));
-    Ok(Arc::new(EmbeddedAgentRuntime::with_bundle(
-        bundle,
-        BUNDLE_SPECIFIER,
-        Arc::new(capabilities),
-    )))
+    Ok(Arc::new(
+        EmbeddedAgentRuntime::with_bundle(bundle, BUNDLE_SPECIFIER, Arc::new(capabilities))
+            .with_tool_call_repository(state.agent_repository()),
+    ))
 }
 
 pub(crate) fn configure_content_workflow(state: &AppState) -> Result<(), AssemblyError> {
@@ -181,13 +180,15 @@ fn provider_bridge<T: Transport + 'static>(
 mod tests {
     use super::*;
     use geo_api::ModelProviderBridge;
-    use geo_domain::{AgentRuntime, TenantScope, TurnInput};
+    use geo_domain::{
+        AgentRuntime, AppendMessage, CreateConversation, RuntimeCapability, TenantScope,
+    };
     use geo_provider::{RequestControl, TransportRequest, TransportResponse};
     use geo_worker::ModelCompletionRequest;
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct FakeTransport(Mutex<usize>);
+    struct FakeTransport(Mutex<usize>, bool);
 
     #[async_trait]
     impl Transport for FakeTransport {
@@ -198,10 +199,17 @@ mod tests {
         ) -> Result<TransportResponse, ProviderError> {
             assert_eq!(request.bearer_token(), "fake-test-only-secret");
             assert_eq!(request.url, "http://127.0.0.1:1/v1/chat/completions");
-            *self.0.lock().unwrap() += 1;
+            let mut calls = self.0.lock().unwrap();
+            *calls += 1;
+            let model_asks_for_search = self.1 && *calls == 1;
             Ok(TransportResponse {
                 status: 200,
-                body: r#"{"id":"local-request","model":"local-model","choices":[{"message":{"content":"local answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#.into(),
+                body: (if model_asks_for_search {
+                    r#"{"id":"tool-request","model":"local-model","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"knowledge_search","arguments":"{\"query\":\"public example\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#
+                } else {
+                    r#"{"id":"local-request","model":"local-model","choices":[{"message":{"content":"local answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#
+                })
+                .into(),
             })
         }
     }
@@ -282,32 +290,69 @@ mod tests {
             bundle_path: path.to_string_lossy().into_owned(),
             bundle_sha256: hex::encode(Sha256::digest(source)),
         };
-        let transport = Arc::new(FakeTransport::default());
-        let runtime =
-            assemble_with_transport(&AppState::development(), &ai, Arc::clone(&transport))
-                .expect("generated bundle must pass size, encoding, and digest validation");
-        let answer = runtime
-            .run_turn(
-                &TenantScope::new(
-                    uuid::Uuid::from_u128(1).into(),
-                    uuid::Uuid::from_u128(2).into(),
-                    None,
-                ),
-                TurnInput {
-                    conversation_id: uuid::Uuid::new_v4().into(),
-                    message_id: uuid::Uuid::new_v4().into(),
-                    turn_id: uuid::Uuid::new_v4().into(),
-                    run_id: uuid::Uuid::new_v4().into(),
-                    prompt: "question".into(),
+        let transport = Arc::new(FakeTransport(Mutex::new(0), true));
+        let state = AppState::development();
+        let runtime = assemble_with_transport(&state, &ai, Arc::clone(&transport))
+            .expect("generated bundle must pass size, encoding, and digest validation");
+        let repository = state.agent_repository();
+        let run_scope = TenantScope::new(
+            uuid::Uuid::from_u128(1).into(),
+            uuid::Uuid::from_u128(2).into(),
+            Some(uuid::Uuid::from_u128(3).into()),
+        );
+        let conversation = repository
+            .create_conversation(&run_scope, None, CreateConversation::default())
+            .await
+            .expect("conversation");
+        let accepted = repository
+            .append_message(
+                &run_scope,
+                conversation.id,
+                AppendMessage {
+                    content: "question".into(),
                     attachments: Vec::new(),
-                    history: Vec::new(),
-                    history_omitted_turns: 0,
+                    metadata: serde_json::Value::Null,
                 },
+                "bundle-turn".into(),
+                "bundle-request".into(),
+                RuntimeCapability::available("test", None),
             )
+            .await
+            .expect("run acceptance");
+        repository
+            .begin_run(&run_scope, accepted.run.id)
+            .await
+            .expect("begin")
+            .expect("queued run must be claimed before invoking any host capability");
+        let input = repository
+            .load_turn_input(&run_scope, conversation.id, accepted.run.id)
+            .await
+            .expect("repository owns run input");
+        let answer = runtime
+            .run_turn(&run_scope, input)
             .await
             .expect("MemeLoop bundle must report a completed answer");
         assert_eq!(answer.content, "local answer");
         assert_eq!(answer.metadata["model"], "local-model");
-        assert_eq!(*transport.0.lock().unwrap(), 1);
+        assert_eq!(*transport.0.lock().unwrap(), 2);
+        let entries = repository
+            .list_tool_calls(&run_scope, accepted.run.id)
+            .await
+            .expect("real host invocations");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.tool_name == "model.complete.v1")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.tool_name == "knowledge.search.v1")
+        );
+        assert!(entries.iter().all(|entry| {
+            entry.outcome == geo_domain::ToolCallOutcome::Succeeded
+                && entry.attempt_count == 1
+                && entry.cost_minor.is_none()
+        }));
     }
 }

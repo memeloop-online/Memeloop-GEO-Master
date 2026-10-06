@@ -53,7 +53,7 @@ pub async fn op_host_content_items_read_v1(
         )));
     }
     let result = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .content_items_read(bridge.scope(), request)
@@ -82,7 +82,7 @@ macro_rules! content_step_op {
             }
             let requested_item = request.item_id;
             let result = bridge
-                .invoke(op, |bridge| async move {
+                .invoke_recorded(op, &request.clone(), |bridge| async move {
                     bridge.capabilities().$method(bridge.scope(), request).await
                 })
                 .await?;
@@ -121,7 +121,7 @@ pub async fn op_host_content_close_v1(
         )));
     }
     let result = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .content_close(bridge.scope(), request)
@@ -147,7 +147,7 @@ pub async fn op_host_content_start_v1(
         )));
     }
     let result = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .content_start(bridge.scope(), request)
@@ -173,7 +173,7 @@ pub async fn op_host_content_execution_read_v1(
         )));
     }
     let result = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .content_execution_read(bridge.scope(), request)
@@ -197,7 +197,7 @@ macro_rules! distribution_op {
             ($check)(&request)
                 .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
             let result = bridge
-                .invoke(op, |bridge| async move {
+                .invoke_recorded(op, &request.clone(), |bridge| async move {
                     bridge.capabilities().$method(bridge.scope(), request).await
                 })
                 .await?;
@@ -272,7 +272,7 @@ pub async fn op_host_channel_discover_v1(
         .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
     let requested = request.clone();
     let page = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .channel_discover(bridge.scope(), request)
@@ -298,7 +298,7 @@ pub async fn op_host_channel_plan_v1(
         .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
     let requested = request.clone();
     let receipt = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .channel_plan(bridge.scope(), request)
@@ -325,7 +325,7 @@ pub async fn op_host_channel_manifest_read_v1(
         .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
     let requested = request.clone();
     let page = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .channel_manifest_read(bridge.scope(), request)
@@ -351,7 +351,7 @@ pub async fn op_host_channel_target_execute_v1(
         .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
     let target_id = request.target_id;
     let result = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .channel_target_execute(bridge.scope(), request)
@@ -422,7 +422,7 @@ pub async fn op_host_model_complete_v1(
     let bridge = bridge(&state.borrow())?;
     let request = parse_request::<ModelCompletionRequest>(op, &request)?;
     let completion = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .model_complete(bridge.scope(), request)
@@ -446,7 +446,7 @@ pub async fn op_host_knowledge_import_attachments_v1(
     let request = parse_request::<KnowledgeImportAttachmentsRequest>(op, &request)?;
     request.validate(bridge.attachments())?;
     let result = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .knowledge_import_attachments(bridge.scope(), request, bridge.attachments())
@@ -477,7 +477,7 @@ pub async fn op_host_knowledge_search_v1(
         )));
     }
     let result = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .knowledge_search(bridge.scope(), request)
@@ -518,7 +518,7 @@ pub async fn op_host_manifest_read_v2(
     }
     let requested = request.clone();
     let page = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .manifest_read(bridge.scope(), request)
@@ -548,7 +548,7 @@ pub async fn op_host_publish_submit_v2(
         return Err(js_error(HostOpError::invalid_request(op, reason)));
     }
     let receipt = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .publish_submit(bridge.scope(), request)
@@ -576,7 +576,7 @@ pub async fn op_host_measure_sample_v2(
     }
     let requested = request.clone();
     let sample = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .measure_sample(bridge.scope(), request)
@@ -606,7 +606,7 @@ pub async fn op_host_report_get_v1(
         )));
     }
     let report = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .report_get(bridge.scope(), request)
@@ -635,7 +635,7 @@ pub async fn op_host_report_reduce_v1(
         )));
     }
     let report = bridge
-        .invoke(op, |bridge| async move {
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
                 .capabilities()
                 .report_reduce(bridge.scope(), request)

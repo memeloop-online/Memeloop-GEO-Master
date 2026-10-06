@@ -32,10 +32,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AgentRuntime, AppError, AttachmentReference, ChannelOutcomeStatus, DistributionManifest,
-    DistributionTarget, DocumentManifestItemState, DocumentManifestState, ErrorCode, ImportItem,
-    ImportStatus, KnowledgeRepository, RUNTIME_NOT_CONFIGURED, ReportSnapshot, RuntimeCapability,
-    SourceKind, TenantScope, TurnInput, TurnReport,
+    AgentRepository, AgentRuntime, AppError, AttachmentReference, ChannelOutcomeStatus,
+    DistributionManifest, DistributionTarget, DocumentManifestItemState, DocumentManifestState,
+    ErrorCode, ImportItem, ImportStatus, KnowledgeRepository, RUNTIME_NOT_CONFIGURED,
+    RecordToolCall, ReportSnapshot, RuntimeCapability, SourceKind, TenantScope, ToolCallDecision,
+    TurnInput, TurnReport,
 };
 use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryPage, ChannelExecutionResult, ChannelManifestPage,
@@ -48,7 +49,7 @@ use geo_worker::{
     HostRuntime, ManifestCoverage, ManifestItem, ManifestKind, ManifestPage, ManifestPlanningState,
     ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
     PublishReceipt, PublishRequest, ReportGetRequest, ReportReduceRequest, TURN_COMPLETION_TOPIC,
-    WorkerError,
+    ToolCallIdentity, ToolCallOutcome, ToolCallRecorder, WorkerError,
 };
 use serde_json::{Value, json};
 
@@ -66,6 +67,7 @@ struct Configured {
     bundle: &'static [(&'static str, &'static str)],
     entry: &'static str,
     capabilities: Arc<dyn HostOps>,
+    tool_call_repository: Option<Arc<dyn AgentRepository>>,
     v8_heap_limit_bytes: usize,
 }
 
@@ -187,9 +189,23 @@ impl EmbeddedAgentRuntime {
                 bundle,
                 entry,
                 capabilities,
+                tool_call_repository: None,
                 v8_heap_limit_bytes,
             }),
         }
+    }
+
+    /// Attach the scoped repository that records actual Rust host invocations.
+    ///
+    /// Install this on every application-assembled runtime. The direct `start`
+    /// seam and legacy isolated test bundles remain untracked, but can never
+    /// manufacture persisted calls from their JavaScript completion payload.
+    /// Only `run_turn` binds the trusted accepted run ID to the recorder.
+    pub fn with_tool_call_repository(mut self, repository: Arc<dyn AgentRepository>) -> Self {
+        if let Some(configured) = self.configured.as_mut() {
+            configured.tool_call_repository = Some(repository);
+        }
+        self
     }
 
     fn validate_v8_heap_limit(v8_heap_limit_bytes: usize) -> Result<(), WorkerError> {
@@ -291,6 +307,8 @@ impl EmbeddedAgentRuntime {
         let bundle = configured.bundle;
         let entry = configured.entry;
         let capabilities = Arc::clone(&configured.capabilities);
+        let tool_call_repository = configured.tool_call_repository.clone();
+        let run_id = input.run_id;
         let v8_heap_limit_bytes = configured.v8_heap_limit_bytes;
         let run_scope = scope.clone();
         let attachments = input.attachments.clone();
@@ -313,10 +331,20 @@ impl EmbeddedAgentRuntime {
                     WorkerError::new("runtime", format!("an isolate thread was refused: {error}"))
                 })?;
             engine.block_on(async {
-                let bridge = HostBridge::new(capabilities, run_scope, application)
+                let mut bridge = HostBridge::new(capabilities, run_scope.clone(), application)
                     .with_attachments(attachments)
                     .with_cancellation(Arc::clone(&worker_cancellation))
                     .with_budgets(HostOpBudgets::default());
+                if let Some(repository) = tool_call_repository {
+                    bridge = bridge.with_recorder(
+                        run_id,
+                        Arc::new(RepositoryToolCallRecorder {
+                            repository,
+                            scope: run_scope,
+                            run_id,
+                        }),
+                    );
+                }
                 let mut runtime = Self::new_host_runtime(bundle, bridge, v8_heap_limit_bytes)?;
                 let isolate_handle = runtime.thread_safe_handle();
                 let (stop, stopped) = std::sync::mpsc::channel();
@@ -396,6 +424,107 @@ impl EmbeddedAgentRuntime {
             content,
             metadata: payload,
         })
+    }
+}
+
+/// Per-turn ledger adapter. Scope and run ownership come from the repository
+/// input, never the script. The worker supplies a digest of the actual parsed
+/// host request, and only an allowlisted op name is eligible for recording.
+struct RepositoryToolCallRecorder {
+    repository: Arc<dyn AgentRepository>,
+    scope: TenantScope,
+    run_id: geo_domain::RunId,
+}
+
+impl RepositoryToolCallRecorder {
+    fn op(&self, identity: &ToolCallIdentity) -> Result<HostOp, HostOpError> {
+        let op = HostOp::ALL
+            .iter()
+            .copied()
+            .find(|op| op.name() == identity.tool_name)
+            .ok_or_else(|| {
+                HostOpError::invalid_request(HostOp::ModelComplete, "unknown ledger host op")
+            })?;
+        if identity.run_id != self.run_id {
+            return Err(HostOpError::invalid_request(
+                op,
+                "ledger run binding does not match",
+            ));
+        }
+        Ok(op)
+    }
+}
+
+/// Do not echo a repository error into JavaScript: it may contain SQL, scoped
+/// identifiers, or provider data. Preserve only the error class needed to stop
+/// dispatch, while the repository remains authoritative for the actual state.
+fn ledger_error(op: HostOp, error: AppError) -> HostOpError {
+    match error.code {
+        ErrorCode::NotFound => HostOpError::not_found(op, "host invocation run unavailable"),
+        ErrorCode::InvalidRequest => {
+            HostOpError::invalid_request(op, "host invocation ledger rejected the request")
+        }
+        ErrorCode::Forbidden | ErrorCode::Unauthorized => {
+            HostOpError::denied(op, "host invocation scope denied")
+        }
+        ErrorCode::Conflict => {
+            HostOpError::idempotency_conflict(op, "host invocation cannot be claimed")
+        }
+        _ => HostOpError::failed(op, "host invocation ledger unavailable"),
+    }
+}
+
+#[async_trait]
+impl ToolCallRecorder for RepositoryToolCallRecorder {
+    async fn begin(&self, identity: &ToolCallIdentity) -> Result<bool, HostOpError> {
+        let op = self.op(identity)?;
+        self.repository
+            .begin_tool_call(
+                &self.scope,
+                RecordToolCall {
+                    run_id: self.run_id,
+                    tool_call_id: identity.tool_call_id.clone(),
+                    tool_name: op.name().to_owned(),
+                    arguments_hash: identity.arguments_hash.clone(),
+                    idempotency_key_hash: identity.idempotency_key_hash.clone(),
+                    permission: ToolCallDecision::Allowed,
+                    budget: ToolCallDecision::Allowed,
+                    // An op label is Rust-defined, not copied from prompts,
+                    // requests, sessions, environment, or JS metadata.
+                    intent: json!({"kind": "host_op"}),
+                    attempt_count: 0,
+                    result_ref: None,
+                    outcome: ToolCallOutcome::Intent,
+                    cost_minor: None,
+                    currency: None,
+                },
+            )
+            .await
+            .map_err(|error| ledger_error(op, error))?;
+        // begin is idempotent; the atomic attempt claim is the sole permission
+        // to actually invoke the capability, including for repeated intents.
+        Ok(true)
+    }
+
+    async fn attempt(&self, identity: &ToolCallIdentity) -> Result<bool, HostOpError> {
+        let op = self.op(identity)?;
+        self.repository
+            .attempt_tool_call(&self.scope, identity.clone())
+            .await
+            .map_err(|error| ledger_error(op, error))
+    }
+
+    async fn finish(
+        &self,
+        identity: &ToolCallIdentity,
+        outcome: ToolCallOutcome,
+    ) -> Result<(), HostOpError> {
+        let op = self.op(identity)?;
+        self.repository
+            .finish_tool_call(&self.scope, identity.clone(), outcome)
+            .await
+            .map_err(|error| ledger_error(op, error))?;
+        Ok(())
     }
 }
 

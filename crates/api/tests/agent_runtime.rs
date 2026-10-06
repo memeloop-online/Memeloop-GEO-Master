@@ -20,8 +20,9 @@ use axum::{
 };
 use geo_api::{AppState, CSRF_HEADER, EmbeddedAgentRuntime, RepositoryHostOps, router};
 use geo_domain::{
-    AgentRuntime, DEVELOPMENT_TENANT_ID, KnowledgePurpose, KnowledgeSearchRequest,
-    MemoryKnowledgeRepository, TenantScope,
+    AgentRepository, AgentRuntime, AppendMessage, CreateConversation, DEVELOPMENT_TENANT_ID,
+    KnowledgePurpose, KnowledgeSearchRequest, MemoryAgentRepository, MemoryKnowledgeRepository,
+    RunStatus, RuntimeCapability, TenantScope, ToolCallOutcome,
 };
 use geo_worker::{
     HOST_LOOP_JS, HOST_MAIN_MODULE, HOST_OPS_JS, HOST_OPS_VERSION, HostOp, HostOpBudgets,
@@ -231,6 +232,235 @@ fn search_request(query: &str) -> KnowledgeSearchRequest {
         limit: 5,
         knowledge_release_id: None,
     }
+}
+
+/// Native host calls carry a real repository-owned run. A JavaScript event may
+/// claim arbitrary tool calls, but it cannot add them to this ledger.
+const LEDGER_MODULE: &str = "memeloop://bundle/ledger.js";
+const LEDGER_JS: &str = r#"
+import { hostOps } from "./host-ops.js";
+export async function main({ prompt }) {
+  const completion = await hostOps.modelComplete({ prompt });
+  await hostOps.knowledgeSearch({ query: "public example" });
+  await Deno.core.ops.op_host_emit("loop.completed", JSON.stringify({
+    answer: completion.text,
+    tool_calls: [{ tool_call_id: "forged-by-script", outcome: "succeeded" }]
+  }));
+}
+"#;
+static LEDGER_BUNDLE: &[(&str, &str)] = &[
+    ("memeloop://bundle/host-ops.js", HOST_OPS_JS),
+    (LEDGER_MODULE, LEDGER_JS),
+];
+const MODEL_FAILURE_MODULE: &str = "memeloop://bundle/model-failure.js";
+const MODEL_FAILURE_JS: &str = r#"
+import { hostOps } from "./host-ops.js";
+export async function main({ prompt }) {
+  await hostOps.modelComplete({ prompt });
+  await Deno.core.ops.op_host_emit("loop.completed", JSON.stringify({ answer: "invalid" }));
+}
+"#;
+static MODEL_FAILURE_BUNDLE: &[(&str, &str)] = &[
+    ("memeloop://bundle/host-ops.js", HOST_OPS_JS),
+    (MODEL_FAILURE_MODULE, MODEL_FAILURE_JS),
+];
+
+async fn accepted_ledger_turn(
+    repository: &MemoryAgentRepository,
+    run_scope: &TenantScope,
+) -> geo_domain::TurnInput {
+    let conversation = repository
+        .create_conversation(run_scope, None, CreateConversation::default())
+        .await
+        .expect("create conversation");
+    let acceptance = repository
+        .append_message(
+            run_scope,
+            conversation.id,
+            AppendMessage {
+                content: "example question".into(),
+                attachments: vec![],
+                metadata: Value::Null,
+            },
+            "ledger-turn".into(),
+            "ledger-request".into(),
+            RuntimeCapability::available("ledger-test", None),
+        )
+        .await
+        .expect("accepted turn");
+    assert_eq!(acceptance.run.status, RunStatus::Queued);
+    repository
+        .begin_run(run_scope, acceptance.run.id)
+        .await
+        .expect("begin run")
+        .expect("queued run can be claimed");
+    repository
+        .load_turn_input(run_scope, conversation.id, acceptance.run.id)
+        .await
+        .expect("trusted persisted turn input")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_model_and_knowledge_invocations_are_scoped_and_recorded_once() {
+    let repository = Arc::new(MemoryAgentRepository::default());
+    let recorder = Arc::new(Recorder::new());
+    let runtime = EmbeddedAgentRuntime::with_bundle(LEDGER_BUNDLE, LEDGER_MODULE, recorder.clone())
+        .with_tool_call_repository(repository.clone());
+    let run_scope = scope();
+    let input = accepted_ledger_turn(&repository, &run_scope).await;
+    let answer = runtime
+        .run_turn(&run_scope, input.clone())
+        .await
+        .expect("real native host calls succeed");
+    assert!(answer.content.starts_with("bridge:"));
+    assert_eq!(recorder.seen().len(), 2);
+    let entries = repository
+        .list_tool_calls(&run_scope, input.run_id)
+        .await
+        .expect("scoped ledger");
+    assert_eq!(entries.len(), 2);
+    for entry in &entries {
+        assert_eq!(entry.run_id, input.run_id);
+        assert_eq!(entry.scope(), run_scope);
+        assert_eq!(entry.outcome, ToolCallOutcome::Succeeded);
+        assert_eq!(entry.attempt_count, 1);
+        assert_eq!(entry.permission, geo_domain::ToolCallDecision::Allowed);
+        assert_eq!(entry.budget, geo_domain::ToolCallDecision::Allowed);
+        assert_eq!(entry.result_ref, None);
+        assert_eq!(entry.cost_minor, None);
+        assert_eq!(entry.currency, None);
+        assert_eq!(entry.intent, serde_json::json!({"kind": "host_op"}));
+        assert_ne!(entry.tool_call_id, "forged-by-script");
+        assert_eq!(entry.arguments_hash.len(), 64);
+        assert_eq!(entry.idempotency_key_hash.len(), 64);
+    }
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.tool_name == "model.complete.v1")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.tool_name == "knowledge.search.v1")
+    );
+    assert!(
+        repository
+            .list_tool_calls(
+                &TenantScope::new(
+                    run_scope.operator_id,
+                    run_scope.tenant_id,
+                    Some(uuid::Uuid::new_v4().into())
+                ),
+                input.run_id
+            )
+            .await
+            .is_err(),
+        "ledger never leaks through another project"
+    );
+
+    // Re-entering with the same claimed run is not a recovery protocol:
+    // repeating the first host invocation must be refused before dispatch.
+    let duplicate = runtime.run_turn(&run_scope, input.clone()).await;
+    assert!(duplicate.is_err(), "a claimed host call cannot be replayed");
+    assert_eq!(recorder.seen().len(), 2);
+    let entries_after = repository
+        .list_tool_calls(&run_scope, input.run_id)
+        .await
+        .unwrap();
+    assert_eq!(entries_after, entries);
+
+    let other_scope = TenantScope::new(
+        run_scope.operator_id,
+        run_scope.tenant_id,
+        Some(uuid::Uuid::new_v4().into()),
+    );
+    let other_input = accepted_ledger_turn(&repository, &other_scope).await;
+    assert_ne!(other_input.run_id, input.run_id);
+    assert!(
+        repository
+            .list_tool_calls(&other_scope, other_input.run_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        runtime.run_turn(&other_scope, input).await.is_err(),
+        "trusted run ID cannot be used in a different scope"
+    );
+    assert_eq!(recorder.seen().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_model_capability_records_failure_without_a_synthetic_result() {
+    let repository = Arc::new(MemoryAgentRepository::default());
+    let runtime = EmbeddedAgentRuntime::with_bundle(
+        MODEL_FAILURE_BUNDLE,
+        MODEL_FAILURE_MODULE,
+        Arc::new(RepositoryHostOps::new(Arc::new(
+            MemoryKnowledgeRepository::default(),
+        ))),
+    )
+    .with_tool_call_repository(repository.clone());
+    let run_scope = scope();
+    let input = accepted_ledger_turn(&repository, &run_scope).await;
+    let error = runtime
+        .run_turn(&run_scope, input.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, geo_domain::ErrorCode::CapabilityMissing);
+    let entries = repository
+        .list_tool_calls(&run_scope, input.run_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].tool_name, "model.complete.v1");
+    assert_eq!(entries[0].outcome, ToolCallOutcome::Failed);
+    assert_eq!(entries[0].attempt_count, 1);
+    assert!(entries[0].result_ref.is_none());
+    assert!(entries[0].cost_minor.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_run_cannot_create_a_tool_intent_or_invoke_a_capability() {
+    let repository = Arc::new(MemoryAgentRepository::default());
+    let capabilities = Arc::new(Recorder::new());
+    let runtime =
+        EmbeddedAgentRuntime::with_bundle(LEDGER_BUNDLE, LEDGER_MODULE, capabilities.clone())
+            .with_tool_call_repository(repository.clone());
+    let run_scope = scope();
+    let conversation = repository
+        .create_conversation(&run_scope, None, CreateConversation::default())
+        .await
+        .unwrap();
+    let queued = repository
+        .append_message(
+            &run_scope,
+            conversation.id,
+            AppendMessage {
+                content: "question".into(),
+                attachments: vec![],
+                metadata: Value::Null,
+            },
+            "unclaimed".into(),
+            "unclaimed-request".into(),
+            RuntimeCapability::available("ledger-test", None),
+        )
+        .await
+        .unwrap();
+    let input = repository
+        .load_turn_input(&run_scope, conversation.id, queued.run.id)
+        .await
+        .unwrap();
+    assert!(runtime.run_turn(&run_scope, input).await.is_err());
+    assert!(capabilities.seen().is_empty());
+    assert!(
+        repository
+            .list_tool_calls(&run_scope, queued.run.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 async fn login(app: &Router) -> (String, String) {

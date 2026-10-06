@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,6 +34,116 @@ use geo_domain::{
     ReportSnapshot,
 };
 pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
+pub use geo_domain::{ToolCallIdentity, ToolCallOutcome};
+
+/// A scoped, durable sink installed by Rust for one authorised run. `begin`
+/// confirms that an intent exists (including idempotent replay); `attempt`
+/// returns `true` only for the unique caller that atomically claims dispatch.
+#[async_trait]
+pub trait ToolCallRecorder: Send + Sync {
+    async fn begin(&self, identity: &ToolCallIdentity) -> Result<bool, HostOpError>;
+    async fn attempt(&self, identity: &ToolCallIdentity) -> Result<bool, HostOpError>;
+    async fn finish(
+        &self,
+        identity: &ToolCallIdentity,
+        outcome: ToolCallOutcome,
+    ) -> Result<(), HostOpError>;
+}
+
+// Validate inside the application-runtime task before writing Succeeded. No
+// raw response, question, publication body or provider output reaches the
+// ledger; failed conversion also has a static, non-sensitive error.
+fn validate_recorded_return(
+    op: HostOp,
+    request: &serde_json::Value,
+    result: &serde_json::Value,
+) -> Result<bool, HostOpError> {
+    fn typed<T: serde::de::DeserializeOwned>(
+        op: HostOp,
+        value: &serde_json::Value,
+    ) -> Result<T, HostOpError> {
+        serde_json::from_value(value.clone()).map_err(|_| {
+            if matches!(
+                op,
+                HostOp::Publish | HostOp::Measure | HostOp::ChannelTargetExecute
+            ) {
+                HostOpError::unknown_result(op, "external result is malformed")
+            } else {
+                HostOpError::internal(op, "typed host result is malformed")
+            }
+        })
+    }
+    let invalid = |_: String| HostOpError::internal(op, "typed host result does not match request");
+    match op {
+        HostOp::KnowledgeSearch => {
+            let response: KnowledgeSearchResult = typed(op, result)?;
+            if response.capability_missing.is_some() {
+                return Err(HostOpError::capability_missing(
+                    op,
+                    "knowledge retrieval capability is unavailable",
+                ));
+            }
+        }
+        HostOp::ManifestRead => {
+            let requested: ManifestReadRequest = typed(op, request)?;
+            let page: ManifestPage = typed(op, result)?;
+            page.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::ChannelDiscover => {
+            let requested: ChannelDiscoverRequest = typed(op, request)?;
+            let page: ChannelDiscoveryPage = typed(op, result)?;
+            page.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::ChannelPlan => {
+            let requested: ChannelPlanRequest = typed(op, request)?;
+            let receipt: ChannelPlanReceipt = typed(op, result)?;
+            receipt.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::ChannelManifestRead => {
+            let requested: ChannelManifestReadRequest = typed(op, request)?;
+            let page: ChannelManifestPage = typed(op, result)?;
+            page.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::ChannelTargetExecute => {
+            let requested: ChannelTargetExecuteRequest = typed(op, request)?;
+            let response: ChannelExecutionResult = typed(op, result)?;
+            response.validate_for(requested.target_id).map_err(|_| {
+                HostOpError::unknown_result(op, "channel execution result is invalid")
+            })?;
+            if matches!(response.state, ChannelExecutionState::UnknownResult) {
+                return Ok(true);
+            }
+        }
+        HostOp::Publish => {
+            let response: PublishReceipt = typed(op, result)?;
+            response
+                .validate()
+                .map_err(|_| HostOpError::unknown_result(op, "publication receipt is invalid"))?;
+            if matches!(response.state, PublishState::UnknownResult) {
+                return Ok(true);
+            }
+        }
+        HostOp::Measure => {
+            let requested: MeasureRequest = typed(op, request)?;
+            let response: MeasureSample = typed(op, result)?;
+            response
+                .validate_for(&requested)
+                .map_err(|_| HostOpError::unknown_result(op, "measurement sample is invalid"))?;
+        }
+        HostOp::ContentPrepare
+        | HostOp::ContentGenerate
+        | HostOp::ContentCheck
+        | HostOp::ContentRepair => {
+            let requested: ContentStepRequest = typed(op, request)?;
+            let response: ContentItemRef = typed(op, result)?;
+            if requested.item_id != response.item_id || response.branch_key.is_empty() {
+                return Err(HostOpError::internal(op, "step returned an unrelated item"));
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
 
 /// The version of the host-op surface this crate registers.
 ///
@@ -1894,6 +2004,8 @@ pub struct HostBridge {
     meter: Arc<HostOpMeter>,
     cancellation: Arc<AtomicBool>,
     executor: tokio::runtime::Handle,
+    recorder: Option<(geo_domain::RunId, Arc<dyn ToolCallRecorder>)>,
+    invocation_sequence: Arc<AtomicU64>,
 }
 
 impl HostBridge {
@@ -1928,7 +2040,20 @@ impl HostBridge {
             meter: Arc::new(HostOpMeter::default()),
             cancellation: Arc::new(AtomicBool::new(false)),
             executor,
+            recorder: None,
+            invocation_sequence: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Binds a durable recorder to the Rust-owned run; scripts cannot choose
+    /// either this run identity or the sequence assigned to their invocations.
+    pub fn with_recorder(
+        mut self,
+        run_id: geo_domain::RunId,
+        recorder: Arc<dyn ToolCallRecorder>,
+    ) -> Self {
+        self.recorder = Some((run_id, recorder));
+        self
     }
 
     pub fn with_budgets(mut self, budgets: HostOpBudgets) -> Self {
@@ -2007,6 +2132,167 @@ impl HostBridge {
             .map_err(|error| {
                 HostOpError::internal(op, format!("the op's work did not finish: {error}"))
             })?
+    }
+
+    /// Production entry point: all recorder transitions, capability work and
+    /// typed return validation run on the application's I/O runtime. This
+    /// spawned task owns finalization even if the isolate drops its await.
+    pub async fn invoke_recorded<R, T, F, W>(
+        &self,
+        op: HostOp,
+        request: &R,
+        work: F,
+    ) -> Result<T, HostOpError>
+    where
+        R: Serialize,
+        T: Serialize + Send + 'static,
+        F: FnOnce(HostBridge) -> W + Send + 'static,
+        W: Future<Output = Result<T, HostOpError>> + Send + 'static,
+    {
+        let limits = self.budgets.limits(op);
+        let canonical = serde_json::to_value(request)
+            .and_then(|value| serde_json::to_vec(&value))
+            .map_err(|_| HostOpError::invalid_request(op, "request cannot be encoded"))?;
+        let request_value: serde_json::Value = serde_json::from_slice(&canonical)
+            .map_err(|_| HostOpError::invalid_request(op, "request cannot be encoded"))?;
+        // Standalone content execution and compatibility probes predate the
+        // Agent run ledger and have their own persistence boundary. The Agent
+        // assembler installs the recorder on its per-run bridge.
+        let Some((run_id, recorder)) = self.recorder.as_ref() else {
+            return self
+                .invoke(op, move |bridge| async move {
+                    let value = work(bridge).await?;
+                    let actual = serde_json::to_value(&value).map_err(|_| {
+                        HostOpError::internal(op, "capability response cannot be encoded")
+                    })?;
+                    validate_recorded_return(op, &request_value, &actual)?;
+                    Ok(value)
+                })
+                .await;
+        };
+        self.meter.reserve(op, limits)?;
+        if self.cancellation.load(Ordering::SeqCst) {
+            return Err(HostOpError::cancelled(op));
+        }
+        let sequence = self.invocation_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let call_id = format!("rust:{sequence}");
+        let idempotency_material = format!("geo.tool_call.v1|{run_id}|{call_id}");
+        let identity = ToolCallIdentity {
+            run_id: *run_id,
+            tool_call_id: call_id,
+            tool_name: op.name().to_owned(),
+            arguments_hash: geo_domain::sha256_hex(&canonical),
+            idempotency_key_hash: geo_domain::sha256_hex(idempotency_material.as_bytes()),
+        };
+        let recorder = Arc::clone(recorder);
+        let bridge = self.clone();
+        let cancellation = Arc::clone(&self.cancellation);
+        self.executor
+            .spawn(async move {
+                let deadline = tokio::time::Instant::now() + limits.timeout();
+                if cancellation.load(Ordering::SeqCst) {
+                    return Err(HostOpError::cancelled(op));
+                }
+                let created = tokio::time::timeout_at(deadline, recorder.begin(&identity))
+                    .await
+                    .map_err(|_| HostOpError::deadline_exceeded(op, limits.timeout_ms))??;
+                if !created {
+                    return Err(HostOpError::idempotency_conflict(
+                        op,
+                        "tool-call identity already exists; reconcile instead of re-executing",
+                    ));
+                }
+                if cancellation.load(Ordering::SeqCst) {
+                    return Err(HostOpError::cancelled(op));
+                }
+                let attempted = tokio::time::timeout_at(deadline, recorder.attempt(&identity))
+                    .await
+                    .map_err(|_| HostOpError::deadline_exceeded(op, limits.timeout_ms))??;
+                if !attempted {
+                    return Err(HostOpError::unknown_result(
+                        op,
+                        "tool-call already attempted; reconcile instead of re-executing",
+                    ));
+                }
+                if cancellation.load(Ordering::SeqCst) || tokio::time::Instant::now() >= deadline {
+                    tokio::time::timeout(
+                        limits.timeout(),
+                        recorder.finish(&identity, ToolCallOutcome::Unknown),
+                    )
+                    .await
+                    .map_err(|_| {
+                        HostOpError::unknown_result(op, "tool-call outcome write timed out")
+                    })??;
+                    return Err(HostOpError::unknown_result(
+                        op,
+                        "invocation expired or cancelled after attempt claim",
+                    ));
+                }
+                // A nested task catches capability panics without aborting the
+                // outer ledger-finalization task. Abort it when the deadline
+                // or cancellation wins, then persist the uncertain result.
+                let mut capability = tokio::spawn(async move { work(bridge).await });
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let execution = under_budget(
+                    op,
+                    HostOpLimits::new(
+                        remaining.as_millis().try_into().unwrap_or(u64::MAX),
+                        limits.max_calls,
+                    ),
+                    cancellation,
+                    async {
+                        (&mut capability).await.map_err(|_| {
+                            HostOpError::unknown_result(op, "capability panicked after attempt")
+                        })?
+                    },
+                )
+                .await;
+                if !capability.is_finished() {
+                    capability.abort();
+                }
+                let validated = execution.and_then(|value| {
+                    let actual = serde_json::to_value(&value).map_err(|_| {
+                        if matches!(
+                            op,
+                            HostOp::Publish | HostOp::Measure | HostOp::ChannelTargetExecute
+                        ) {
+                            HostOpError::unknown_result(
+                                op,
+                                "external capability response cannot be encoded",
+                            )
+                        } else {
+                            HostOpError::internal(op, "capability response cannot be encoded")
+                        }
+                    })?;
+                    let unknown = validate_recorded_return(op, &request_value, &actual)?;
+                    Ok((value, unknown))
+                });
+                let outcome = match &validated {
+                    Ok((_, true)) => ToolCallOutcome::Unknown,
+                    Ok((_, false)) => ToolCallOutcome::Succeeded,
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            HostOpErrorCode::UnknownResult
+                                | HostOpErrorCode::DeadlineExceeded
+                                | HostOpErrorCode::Cancelled
+                        ) =>
+                    {
+                        ToolCallOutcome::Unknown
+                    }
+                    Err(_) => ToolCallOutcome::Failed,
+                };
+                // The capability's deadline must not consume the time needed
+                // to persist Unknown after an attempted external effect.
+                tokio::time::timeout(limits.timeout(), recorder.finish(&identity, outcome))
+                    .await
+                    .map_err(|_| {
+                        HostOpError::unknown_result(op, "tool-call outcome write timed out")
+                    })??;
+                validated.map(|(value, _)| value)
+            })
+            .await
+            .map_err(|_| HostOpError::unknown_result(op, "tool-call recorder task stopped"))?
     }
 }
 
