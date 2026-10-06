@@ -1542,6 +1542,14 @@ impl ProjectRepository for MemoryProjectRepository {
             &predecessor.settings.report_schedule,
             predecessor.view.report_window_end_at,
         )?;
+        let mut successor_settings = predecessor.settings.clone();
+        successor_settings.distribution_scope = project.settings.distribution_scope.clone();
+        let config_revision_id = if successor_settings != predecessor.settings {
+            successor_settings = successor_settings.validate_start()?;
+            Uuid::new_v4()
+        } else {
+            predecessor.config_revision_id
+        };
         let cycle_id = Uuid::new_v4();
         let view = CycleReportView {
             project_id,
@@ -1570,14 +1578,14 @@ impl ProjectRepository for MemoryProjectRepository {
             MemoryCycleRecord {
                 project_id,
                 previous_cycle_id: Some(predecessor_cycle_id),
-                config_revision_id: predecessor.config_revision_id,
-                settings: predecessor.settings,
+                config_revision_id,
+                settings: successor_settings,
                 view: view.clone(),
             },
         );
         let project = state.projects.get_mut(&project_id).expect("project locked");
         project.current_cycle_id = Some(cycle_id);
-        project.current_config_revision_id = Some(predecessor.config_revision_id);
+        project.current_config_revision_id = Some(config_revision_id);
         project.revision += 1;
         project.updated_at = now;
         Ok(view)
@@ -2092,8 +2100,22 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let original_cycle = repository
+            .state
+            .read()
+            .await
+            .cycles
+            .get(&acceptance.cycle_id)
+            .unwrap()
+            .clone();
+        let first_scope = super::DistributionScope {
+            mode: super::DistributionScopeMode::Explicit,
+            included_platform_ids: vec!["channel-one".to_owned()],
+            ..Default::default()
+        };
         let patch = super::ProjectPatch {
             report_timezone: Some("America/New_York".to_owned()),
+            distribution_scope: Some(first_scope.clone()),
             ..Default::default()
         };
         let revision = repository
@@ -2118,6 +2140,64 @@ mod tests {
             start.cutoff_at + chrono::Duration::days(7)
         );
         assert!(successor.cutoff_at < now);
+        let first_successor_record = repository
+            .state
+            .read()
+            .await
+            .cycles
+            .get(&successor.cycle_id)
+            .unwrap()
+            .clone();
+        assert_ne!(
+            first_successor_record.config_revision_id,
+            original_cycle.config_revision_id
+        );
+        assert_eq!(
+            first_successor_record.settings.distribution_scope,
+            first_scope
+        );
+        assert_eq!(
+            first_successor_record.settings.report_timezone,
+            original_cycle.settings.report_timezone
+        );
+        assert_eq!(
+            first_successor_record.settings.report_schedule,
+            original_cycle.settings.report_schedule
+        );
+        assert_eq!(
+            repository
+                .state
+                .read()
+                .await
+                .cycles
+                .get(&acceptance.cycle_id)
+                .unwrap()
+                .settings,
+            original_cycle.settings
+        );
+        let second_scope = super::DistributionScope {
+            mode: super::DistributionScopeMode::Explicit,
+            included_platform_ids: vec!["channel-two".to_owned()],
+            ..Default::default()
+        };
+        let revision = repository
+            .get(&scope, project.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+        repository
+            .update(
+                &scope,
+                project.id,
+                revision,
+                super::ProjectPatch {
+                    distribution_scope: Some(second_scope.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("later edit");
         assert_eq!(
             repository
                 .schedule_next_cycle(
@@ -2130,12 +2210,45 @@ mod tests {
                 .unwrap(),
             successor
         );
+        let third = repository
+            .schedule_next_cycle(&scope, project.id, successor.cycle_id, now)
+            .await
+            .expect("third cycle");
+        assert_eq!(third.report_timezone, original_cycle.view.report_timezone);
+        let state = repository.state.read().await;
+        assert_eq!(
+            state
+                .cycles
+                .get(&third.cycle_id)
+                .unwrap()
+                .settings
+                .distribution_scope,
+            second_scope
+        );
+        assert_eq!(
+            state
+                .cycles
+                .get(&successor.cycle_id)
+                .unwrap()
+                .settings
+                .distribution_scope,
+            first_scope
+        );
+        assert_eq!(
+            state
+                .cycles
+                .get(&successor.cycle_id)
+                .unwrap()
+                .config_revision_id,
+            first_successor_record.config_revision_id
+        );
+        drop(state);
         assert_eq!(
             repository
                 .get_current_cycle(&scope, project.id)
                 .await
                 .unwrap(),
-            Some(successor.clone())
+            Some(third.clone())
         );
         assert_eq!(
             repository
@@ -2162,8 +2275,8 @@ mod tests {
                     .schedule_next_cycle(
                         &scope,
                         project.id,
-                        successor.cycle_id,
-                        successor.cutoff_at + chrono::Duration::seconds(1),
+                        third.cycle_id,
+                        third.cutoff_at + chrono::Duration::seconds(1),
                     )
                     .await
                     .is_err()

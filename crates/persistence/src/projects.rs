@@ -927,8 +927,8 @@ impl ProjectRepository for PgProjectRepository {
         crate::scope::set_local_scope(&mut tx, scope)
             .await
             .map_err(map_database_error)?;
-        let project: Option<(String, Option<Uuid>)> = sqlx::query_as(
-            "SELECT status, current_cycle_id FROM projects
+        let project: Option<(String, Option<Uuid>, i64, Value)> = sqlx::query_as(
+            "SELECT status, current_cycle_id, revision, project_settings FROM projects
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 FOR UPDATE",
         )
         .bind(scope.operator_id.as_uuid())
@@ -937,7 +937,7 @@ impl ProjectRepository for PgProjectRepository {
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_database_error)?;
-        let (status, current_id) =
+        let (status, current_id, project_revision, current_settings_value) =
             project.ok_or_else(|| AppError::not_found("project not found"))?;
         let predecessor: Option<(String, DateTime<Utc>, DateTime<Utc>, Uuid, Value, String)> =
             sqlx::query_as(
@@ -962,9 +962,9 @@ impl ProjectRepository for PgProjectRepository {
             timezone,
             predecessor_end,
             predecessor_cutoff,
-            config_id,
+            predecessor_config_id,
             settings_value,
-            settings_hash,
+            predecessor_settings_hash,
         ) = predecessor.ok_or_else(|| AppError::not_found("predecessor cycle not found"))?;
         let existing: Option<Uuid> = sqlx::query_scalar(
             "SELECT cycle_id FROM optimization_cycles
@@ -1002,10 +1002,15 @@ impl ProjectRepository for PgProjectRepository {
                 "predecessor report cutoff has not passed",
             ));
         }
-        let settings: ProjectSettings =
+        let predecessor_settings: ProjectSettings =
             serde_json::from_value(settings_value).map_err(serialization_error)?;
-        let (start, end, cutoff) =
-            next_calendar_week_window(&timezone, &settings.report_schedule, predecessor_end)?;
+        let current_settings: ProjectSettings =
+            serde_json::from_value(current_settings_value).map_err(serialization_error)?;
+        let (start, end, cutoff) = next_calendar_week_window(
+            &timezone,
+            &predecessor_settings.report_schedule,
+            predecessor_end,
+        )?;
         let cycle_id = Uuid::new_v4();
         let document_id = Uuid::new_v4();
         let distribution_id = Uuid::new_v4();
@@ -1014,6 +1019,33 @@ impl ProjectRepository for PgProjectRepository {
             scope.tenant_id.as_uuid(),
             project_id.as_uuid(),
         );
+        let mut settings = predecessor_settings.clone();
+        settings.distribution_scope = current_settings.distribution_scope;
+        let (config_id, config_hash) = if settings != predecessor_settings {
+            settings = settings.validate_start()?;
+            let config_id = Uuid::new_v4();
+            let config_hash = settings_hash(&settings)?;
+            sqlx::query(
+                "INSERT INTO project_config_revisions
+                 (config_revision_id,operator_id,tenant_id,project_id,project_revision,
+                  settings,source_refs,settings_hash,estimate_snapshot)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL)",
+            )
+            .bind(config_id)
+            .bind(keys.0)
+            .bind(keys.1)
+            .bind(keys.2)
+            .bind(project_revision)
+            .bind(serde_json::to_value(&settings).map_err(serialization_error)?)
+            .bind(serde_json::to_value(&settings.initial_sources).map_err(serialization_error)?)
+            .bind(&config_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_database_error)?;
+            (config_id, config_hash)
+        } else {
+            (predecessor_config_id, predecessor_settings_hash)
+        };
         sqlx::query(
             "INSERT INTO optimization_cycles
              (cycle_id,operator_id,tenant_id,project_id,config_revision_id,previous_cycle_id,
@@ -1044,7 +1076,7 @@ impl ProjectRepository for PgProjectRepository {
         .bind(keys.1)
         .bind(keys.2)
         .bind(cycle_id)
-        .bind(&settings_hash)
+        .bind(&config_hash)
         .bind(
             json!({"config_revision_id":config_id,"source_refs":settings.initial_sources,
                      "document_scope":settings.document_scope}),
@@ -1059,7 +1091,7 @@ impl ProjectRepository for PgProjectRepository {
              VALUES ($1,$2,$3,$4,$5,$6,1,'awaiting_documents',false,NULL,$7,$8)",
         )
         .bind(distribution_id).bind(keys.0).bind(keys.1).bind(keys.2)
-        .bind(cycle_id).bind(document_id).bind(&settings_hash)
+        .bind(cycle_id).bind(document_id).bind(&config_hash)
         .bind(json!({"document_manifest_id":document_id,"distribution_scope":settings.distribution_scope}))
         .execute(&mut *tx).await.map_err(map_database_error)?;
         sqlx::query(

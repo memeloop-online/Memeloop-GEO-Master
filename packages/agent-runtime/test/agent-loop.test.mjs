@@ -603,6 +603,78 @@ test("chat onboarding calls scoped project tools and preserves acceptance semant
   }
 });
 
+test("recommendations tool reads scoped optimization-safe channel suggestions", async () => {
+  const calls = [];
+  let modelCalls = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async sourceRecommendations(request) {
+      calls.push(request);
+      return {
+        scope: "returned_plans_only",
+        rule_version: "source-channel-rules.v1",
+        items: [
+          {
+            platform_id: "zhihu",
+            source_hosts: ["www.zhihu.com"],
+            citing_answers: 1,
+            publication: {
+              connector_availability: "unavailable",
+              account_ready: false,
+            },
+          },
+        ],
+      };
+    },
+    async modelComplete(request) {
+      modelCalls++;
+      if (modelCalls === 1) {
+        const schema = request.tools.find(
+          ({ function: tool }) =>
+            tool.name === "source_channel_recommendations",
+        ).function.parameters;
+        assert.equal(schema.additionalProperties, false);
+        assert.equal(schema.properties.project_id, undefined);
+        return {
+          ...finalModelAnswer(""),
+          finish_reason: "tool_calls",
+          tool_calls: [
+            {
+              id: "recommendation-read",
+              type: "function",
+              function: {
+                name: "source_channel_recommendations",
+                arguments: '{"limit":2}',
+              },
+            },
+          ],
+        };
+      }
+      assert.match(
+        request.messages.at(-1).content,
+        /"connector_availability":"unavailable"/u,
+      );
+      return finalModelAnswer("Observed, not ready to publish.");
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?recommendations=${Date.now()}`
+    );
+    const result = await main({
+      ...historyTurn,
+      prompt: "Inspect publication opportunities.",
+    });
+    assert.equal(result.answer, "Observed, not ready to publish.");
+    assert.deepEqual(calls, [{ limit: 2 }]);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
 test("report reduction and immutable read are exposed as separate scoped host tools", async () => {
   const cycleId = "00000000-0000-4000-8000-000000000031";
   const reportId = "00000000-0000-4000-8000-000000000032";
@@ -683,6 +755,7 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "report_get",
         "report_preview",
         "report_reduce",
+        "source_channel_recommendations",
         "project_current",
         "project_revise",
         "project_estimate",
@@ -907,6 +980,7 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "report_get",
         "report_preview",
         "report_reduce",
+        "source_channel_recommendations",
         "project_current",
         "project_revise",
         "project_estimate",

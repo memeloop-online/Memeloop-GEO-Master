@@ -8,10 +8,13 @@ import {
   MessageBar,
   MessageBarBody,
   Select,
+  Tab,
+  TabList,
   Textarea,
 } from "@fluentui/react-components";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { useAuth } from "../auth/AuthProvider";
 import { membershipForTenant, queryScopeFor } from "../auth/types";
 import { ApiError } from "../api/client";
@@ -29,6 +32,7 @@ import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { CitationInsightsPanel } from "./CitationInsightsPanel";
 import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
 import { TopicQuestionGenerator } from "./TopicQuestionGenerator";
+import "./measurementMessages";
 import "./QuestionSetsPage.css";
 
 const purposeLabel = {
@@ -37,6 +41,72 @@ const purposeLabel = {
 } as const;
 
 type EditableQuestion = QuestionDraft & { localId: string };
+type RevisionDraft = {
+  baseVersionId: string;
+  name: string;
+  questions: EditableQuestion[];
+  key: string;
+};
+type StoredDrafts = {
+  name: string;
+  lines: string;
+  creating: boolean;
+  createKey: string;
+  drafts: Record<string, RevisionDraft>;
+};
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const isKey = (value: unknown): value is string =>
+  typeof value === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+const isEditableQuestion = (value: unknown): value is EditableQuestion =>
+  isRecord(value) &&
+  typeof value.localId === "string" &&
+  (value.question_id === undefined || typeof value.question_id === "string") &&
+  typeof value.text === "string" &&
+  typeof value.intent === "string" &&
+  typeof value.market === "string" &&
+  typeof value.language === "string" &&
+  Array.isArray(value.product_refs) &&
+  value.product_refs.every((item) => typeof item === "string") &&
+  isRecord(value.source) &&
+  [
+    "user_provided",
+    "sales_consultation",
+    "product",
+    "faq",
+    "generated",
+  ].includes(String(value.source.kind)) &&
+  (value.source.reference_id === undefined ||
+    typeof value.source.reference_id === "string") &&
+  typeof value.weight === "number" &&
+  Number.isFinite(value.weight);
+const isRevisionDraft = (value: unknown): value is RevisionDraft =>
+  isRecord(value) &&
+  typeof value.baseVersionId === "string" &&
+  typeof value.name === "string" &&
+  isKey(value.key) &&
+  Array.isArray(value.questions) &&
+  value.questions.every(isEditableQuestion);
+const readStoredDrafts = (value: unknown): StoredDrafts | null => {
+  if (!isRecord(value)) return null;
+  if (value.name !== undefined && typeof value.name !== "string") return null;
+  if (value.lines !== undefined && typeof value.lines !== "string") return null;
+  if (value.creating !== undefined && typeof value.creating !== "boolean")
+    return null;
+  if (value.drafts !== undefined && !isRecord(value.drafts)) return null;
+  const drafts = value.drafts ?? {};
+  if (!Object.values(drafts).every(isRevisionDraft)) return null;
+  return {
+    name: value.name ?? "",
+    lines: value.lines ?? "",
+    creating: value.creating ?? false,
+    createKey: isKey(value.createKey) ? value.createKey : newId(),
+    drafts: drafts as Record<string, RevisionDraft>,
+  };
+};
+const tabs = ["measure", "records", "insights", "sets"] as const;
+type MeasurementTab = (typeof tabs)[number];
 const toDraft = (text: string, localId: string): EditableQuestion => ({
   localId,
   text,
@@ -83,6 +153,30 @@ const errorText = (error: unknown) =>
   error instanceof Error ? error.message : "请求失败，请重试。";
 
 export function QuestionSetsPage() {
+  const { t } = useTranslation("measurement");
+  const [params, setParams] = useSearchParams();
+  const tab: MeasurementTab = tabs.includes(params.get("tab") as MeasurementTab)
+    ? (params.get("tab") as MeasurementTab)
+    : params.has("record") || params.has("planId")
+      ? "records"
+      : params.has("set") || params.has("questionSetId")
+        ? "sets"
+        : "measure";
+  const setId = params.get("set") ?? params.get("questionSetId") ?? "";
+  const requestedVersionId =
+    params.get("version") ?? params.get("versionId") ?? "";
+  const updateSelection = (values: Record<string, string | null>) => {
+    setParams((previous) => {
+      const next = new URLSearchParams(previous);
+      for (const [key, value] of Object.entries(values)) {
+        if (key === "set") next.delete("questionSetId");
+        if (key === "version") next.delete("versionId");
+        if (value) next.set(key, value);
+        else next.delete(key);
+      }
+      return next;
+    });
+  };
   const { tenantId, projectId } = useParams();
   const { session } = useAuth();
   const client = useQueryClient();
@@ -101,14 +195,13 @@ export function QuestionSetsPage() {
     tenantId,
     projectId,
   ];
+  const draftStorageKey = `measurement-drafts:${scope?.userId}:${scope?.operatorId}:${tenantId}:${projectId}`;
   const sets = useQuery({
     queryKey: baseKey,
     queryFn: () => listAllQuestionSets(tenantId!, projectId!),
     enabled: Boolean(scope),
     retry: false,
   });
-  const [setId, setSetId] = useState("");
-  const [versionId, setVersionId] = useState("");
   const versions = useQuery({
     queryKey: [...baseKey, "versions", setId],
     queryFn: () => listAllQuestionSetVersions(tenantId!, projectId!, setId),
@@ -116,9 +209,7 @@ export function QuestionSetsPage() {
     retry: false,
   });
   const selectedSet = sets.data?.items.find((item) => item.id === setId);
-  useEffect(() => {
-    if (selectedSet && !versionId) setVersionId(selectedSet.current_version_id);
-  }, [selectedSet, versionId]);
+  const versionId = requestedVersionId || selectedSet?.current_version_id || "";
   const version = useQuery({
     queryKey: [...baseKey, "version", setId, versionId],
     queryFn: () =>
@@ -128,11 +219,50 @@ export function QuestionSetsPage() {
   });
   const [name, setName] = useState("");
   const [lines, setLines] = useState("");
-  const [editing, setEditing] = useState(false);
-  const [draftName, setDraftName] = useState("");
-  const [draft, setDraft] = useState<EditableQuestion[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, RevisionDraft>>({});
+  const activeDraft = drafts[setId];
+  const [creating, setCreating] = useState(false);
   const [createKey, setCreateKey] = useState(newId);
-  const [editKey, setEditKey] = useState(newId);
+  const [loadedDraftScope, setLoadedDraftScope] = useState("");
+  useEffect(() => {
+    if (!scope || loadedDraftScope === draftStorageKey) return;
+    try {
+      const saved = readStoredDrafts(
+        JSON.parse(sessionStorage.getItem(draftStorageKey) ?? "{}"),
+      );
+      setName(saved?.name ?? "");
+      setLines(saved?.lines ?? "");
+      setCreating(saved?.creating ?? false);
+      setCreateKey(saved?.createKey ?? newId());
+      setDrafts(saved?.drafts ?? {});
+    } catch {
+      setName("");
+      setLines("");
+      setCreating(false);
+      setCreateKey(newId());
+      setDrafts({});
+    }
+    setLoadedDraftScope(draftStorageKey);
+  }, [scope, draftStorageKey, loadedDraftScope]);
+  useEffect(() => {
+    if (loadedDraftScope !== draftStorageKey) return;
+    try {
+      sessionStorage.setItem(
+        draftStorageKey,
+        JSON.stringify({ name, lines, creating, createKey, drafts }),
+      );
+    } catch {
+      // Private browsing and storage quotas must not prevent editing.
+    }
+  }, [
+    draftStorageKey,
+    loadedDraftScope,
+    name,
+    lines,
+    creating,
+    createKey,
+    drafts,
+  ]);
   const createLines = lines
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -150,41 +280,59 @@ export function QuestionSetsPage() {
       setName("");
       setLines("");
       setCreateKey(newId());
-      setSetId(saved.question_set_id);
-      setVersionId(saved.id);
+      setCreating(false);
+      updateSelection({
+        tab: "sets",
+        set: saved.question_set_id,
+        version: saved.id,
+      });
       void client.invalidateQueries({ queryKey: baseKey });
     },
   });
   const revise = useMutation({
     mutationFn: () =>
       reviseQuestionSet(tenantId!, projectId!, setId, {
-        idempotency_key: editKey,
-        base_version_id: versionId,
-        name: draftName.trim(),
-        questions: draft.map(serverDraft),
+        idempotency_key: activeDraft.key,
+        base_version_id: activeDraft.baseVersionId,
+        name: activeDraft.name.trim(),
+        questions: activeDraft.questions.map(serverDraft),
       }),
     onSuccess: (saved) => {
-      setVersionId(saved.id);
-      setEditing(false);
-      setEditKey(newId());
+      updateSelection({ version: saved.id });
+      setDrafts((items) => {
+        const next = { ...items };
+        delete next[setId];
+        return next;
+      });
       void client.invalidateQueries({ queryKey: baseKey });
     },
   });
   const startEdit = () => {
     if (!version.data || version.data.id !== selectedSet?.current_version_id)
       return;
-    setDraft(editableFrom(version.data));
-    setDraftName(version.data.name);
-    setEditKey(newId());
-    setEditing(true);
+    setDrafts((items) => ({
+      ...items,
+      [setId]: {
+        baseVersionId: version.data!.id,
+        name: version.data!.name,
+        questions: editableFrom(version.data!),
+        key: newId(),
+      },
+    }));
   };
+  const patchRevision = (update: (previous: RevisionDraft) => RevisionDraft) =>
+    setDrafts((items) => ({
+      ...items,
+      [setId]: update(items[setId]),
+    }));
   const patchDraft = (localId: string, update: Partial<EditableQuestion>) => {
-    setEditKey(newId());
-    setDraft((items) =>
-      items.map((item) =>
+    patchRevision((previous) => ({
+      ...previous,
+      key: newId(),
+      questions: previous.questions.map((item) =>
         item.localId === localId ? { ...item, ...update } : item,
       ),
-    );
+    }));
   };
   if (!tenantId || !projectId)
     return <ErrorState title="缺少项目" detail="请从项目内进入问题集。" />;
@@ -194,323 +342,416 @@ export function QuestionSetsPage() {
         <div>
           <p className="eyebrow">独立测量</p>
           <h1>测量与洞察</h1>
-          <p>选择账号并提出任意问题即可独立测量，无需企业资料或优化周期。</p>
+          <p>{t("pageIntro")}</p>
         </div>
         <Link to={`/app/${tenantId}/${projectId}/publications`}>
           查看发布目标
         </Link>
       </section>
-      <TopicQuestionGenerator
-        tenantId={tenantId}
-        projectId={projectId}
-        canWrite={canWrite}
-      />
-      <StandaloneMeasurementPanel
-        key={`${tenantId}/${projectId}`}
-        tenantId={tenantId}
-        projectId={projectId}
-        canWrite={canWrite}
-      />
-      <CitationInsightsPanel
-        key={`${tenantId}/${projectId}/citations`}
-        tenantId={tenantId}
-        projectId={projectId}
-      />
-      <section aria-label="问题集与版本">
-        <h2>问题集与版本</h2>
-        <p>保存常用问题，按版本查看和调整；独立评估问题不会用于内容优化。</p>
-      </section>
-      {sets.isPending ? (
-        <LoadingState label="正在读取问题集" />
-      ) : sets.isError ? (
-        <ErrorState
-          title="问题集无法读取"
-          detail={errorText(sets.error)}
-          onRetry={() => void sets.refetch()}
+      <nav aria-label="测量页面" className="measurement-tabs">
+        <TabList
+          aria-label="测量页面"
+          selectedValue={tab}
+          onTabSelect={(_, data) =>
+            updateSelection({ tab: String(data.value) })
+          }
+        >
+          {tabs.map((entry) => (
+            <Tab id={`measurement-tab-${entry}`} key={entry} value={entry}>
+              {t(entry)}
+            </Tab>
+          ))}
+        </TabList>
+      </nav>
+      <section
+        role="tabpanel"
+        aria-labelledby="measurement-tab-measure"
+        hidden={tab !== "measure"}
+        aria-label={t("measure")}
+      >
+        <StandaloneMeasurementPanel
+          key={`${tenantId}/${projectId}`}
+          tenantId={tenantId}
+          projectId={projectId}
+          canWrite={canWrite}
         />
-      ) : !sets.data?.items.length ? (
-        <EmptyState
-          title="尚无问题集"
-          detail="创建一个命名问题集，逐行添加要测量的问题。"
-        />
-      ) : null}
-      {sets.data?.items.length ? (
-        <section aria-label="已有问题集">
-          <Field label="选择问题集">
-            <Select
-              value={setId}
-              onChange={(_, data) => {
-                setSetId(data.value);
-                setVersionId("");
-                setEditing(false);
-              }}
-            >
-              <option value="">选择一个问题集</option>
-              {sets.data.items.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name} · v{item.current_revision}
-                </option>
-              ))}
-            </Select>
-          </Field>
-        </section>
-      ) : null}
-      {canWrite && (
-        <Card style={{ maxWidth: "100%", marginTop: 16 }}>
-          <h2>创建问题集</h2>
-          <Field label="问题集名称">
-            <Input
-              value={name}
-              maxLength={200}
-              onChange={(_, data) => {
-                setName(data.value);
-                setCreateKey(newId());
-              }}
-            />
-          </Field>
-          <Field
-            label="每行一个问题"
-            hint="可粘贴多行；保存后仍可创建新版本调整问题。"
-          >
-            <Textarea
-              rows={6}
-              value={lines}
-              onChange={(_, data) => {
-                setLines(data.value);
-                setCreateKey(newId());
-              }}
-            />
-          </Field>
-          <Button
-            appearance="primary"
-            disabled={
-              !name.trim() ||
-              !createLines.length ||
-              createLines.length > 100 ||
-              create.isPending
-            }
-            onClick={() => create.mutate()}
-          >
-            {create.isPending ? "正在创建…" : "创建并封存 v1"}
-          </Button>
-          {create.isError && (
-            <ErrorState
-              title="问题集创建失败"
-              detail={errorText(create.error)}
-            />
-          )}
-        </Card>
-      )}
-      {!canWrite && (
-        <p role="status">
-          当前角色为只读；可以查看版本，但不能创建或修订问题集。
-        </p>
-      )}
-      {setId &&
-        (versions.isPending ? (
-          <LoadingState label="正在读取版本历史" compact />
-        ) : versions.isError ? (
-          <ErrorState
-            title="版本历史无法读取"
-            detail={errorText(versions.error)}
-            onRetry={() => void versions.refetch()}
+        <details className="measurement-prediction">
+          <summary>{t("prediction")}</summary>
+          <TopicQuestionGenerator
+            tenantId={tenantId}
+            projectId={projectId}
+            canWrite={canWrite}
           />
-        ) : (
-          <section aria-label="版本历史">
-            <h2>版本历史</h2>
-            <Field label="选择不可变版本">
+        </details>
+      </section>
+      <section
+        role="tabpanel"
+        aria-labelledby="measurement-tab-records"
+        hidden={tab !== "records"}
+        aria-label={t("records")}
+      >
+        <StandaloneMeasurementPanel
+          key={`${tenantId}/${projectId}/records`}
+          tenantId={tenantId}
+          projectId={projectId}
+          canWrite={canWrite}
+          recordsOnly
+        />
+      </section>
+      <section
+        role="tabpanel"
+        aria-labelledby="measurement-tab-insights"
+        hidden={tab !== "insights"}
+        aria-label={t("insights")}
+      >
+        <CitationInsightsPanel
+          key={`${tenantId}/${projectId}/citations`}
+          tenantId={tenantId}
+          projectId={projectId}
+        />
+      </section>
+      <section
+        role="tabpanel"
+        aria-labelledby="measurement-tab-sets"
+        hidden={tab !== "sets"}
+        aria-label={t("sets")}
+      >
+        <section aria-label="问题集与版本">
+          <h2>{t("questionsHeading")}</h2>
+          <p>{t("questionsIntro")}</p>
+        </section>
+        {sets.isPending ? (
+          <LoadingState label="正在读取问题集" />
+        ) : sets.isError ? (
+          <ErrorState
+            title="问题集无法读取"
+            detail={errorText(sets.error)}
+            onRetry={() => void sets.refetch()}
+          />
+        ) : !sets.data?.items.length ? (
+          <EmptyState
+            title="尚无问题集"
+            detail="需要重复测量这些问题时，可以新建问题集。"
+          />
+        ) : null}
+        {sets.data?.items.length ? (
+          <section aria-label="已有问题集">
+            <Field label="选择问题集">
               <Select
-                value={versionId}
+                value={setId}
                 onChange={(_, data) => {
-                  setVersionId(data.value);
-                  setEditing(false);
+                  updateSelection({
+                    tab: "sets",
+                    set: data.value,
+                    version: null,
+                  });
                 }}
               >
-                <option value="">选择版本</option>
-                {versions.data?.items.map((item) => (
+                <option value="">选择一个问题集</option>
+                {sets.data.items.map((item) => (
                   <option key={item.id} value={item.id}>
-                    v{item.revision} · {item.name}
+                    {item.name} · v{item.current_revision}
                   </option>
                 ))}
               </Select>
             </Field>
           </section>
-        ))}
-      {versionId &&
-        (version.isPending ? (
-          <LoadingState label="正在读取不可变版本" compact />
-        ) : version.isError ? (
-          <ErrorState
-            title="版本详情无法读取"
-            detail={errorText(version.error)}
-            onRetry={() => void version.refetch()}
-          />
-        ) : (
-          version.data && (
-            <section aria-label="问题集版本详情">
-              <h2>
-                {version.data.name} · v{version.data.revision}
-              </h2>
-              <p>
-                优化 {version.data.optimization_count} · 冻结评估{" "}
-                {version.data.evaluation_count}
-                {" · "}划分规则 {version.data.split_policy_version} · 创建于{" "}
-                {new Date(version.data.created_at).toLocaleString("zh-CN")}
-              </p>
-              {version.data.optimization_count === 0 && (
-                <p role="status">
-                  当前版本没有优化问题；冻结评估问题不进入内容优化。
-                </p>
-              )}
-              {version.data.id !== selectedSet?.current_version_id && (
-                <p role="status">
-                  这是历史不可变版本；要编辑请切换到当前版本。
-                </p>
-              )}
-              <ul style={{ paddingLeft: 24, overflowWrap: "anywhere" }}>
-                {version.data.questions.map((item) => (
-                  <li key={item.id}>
-                    <strong>{item.text}</strong>{" "}
-                    <Badge appearance="outline">
-                      {purposeLabel[item.purpose]}
-                    </Badge>
-                    <p>
-                      意图 {item.intent} · 产品引用{" "}
-                      {item.product_refs.join("、") || "无"} · 市场{" "}
-                      {item.market} · 语言 {item.language} · 来源{" "}
-                      {item.source.kind} · 权重 {item.weight}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-              {canWrite &&
-                version.data.id === selectedSet?.current_version_id &&
-                !editing && (
-                  <Button onClick={startEdit}>基于当前版本修订</Button>
-                )}
-              {editing && (
-                <Card style={{ maxWidth: "100%" }}>
-                  <h3>修订为下一版本</h3>
-                  <Field label="下一版本名称">
-                    <Input
-                      value={draftName}
-                      onChange={(_, data) => {
-                        setDraftName(data.value);
-                        setEditKey(newId());
-                      }}
-                    />
-                  </Field>
-                  {draft.map((item, index) => (
-                    <div key={item.localId} className="question-sets-edit-row">
-                      <Field label={`问题 ${index + 1}`}>
-                        <Textarea
-                          value={item.text}
-                          onChange={(_, data) =>
-                            patchDraft(item.localId, { text: data.value })
-                          }
-                        />
-                      </Field>
-                      <Field label={`问题 ${index + 1} 意图`}>
-                        <Input
-                          value={item.intent}
-                          onChange={(_, data) =>
-                            patchDraft(item.localId, { intent: data.value })
-                          }
-                        />
-                      </Field>
-                      <Field label={`问题 ${index + 1} 市场`}>
-                        <Input
-                          value={item.market}
-                          onChange={(_, data) =>
-                            patchDraft(item.localId, { market: data.value })
-                          }
-                        />
-                      </Field>
-                      <Field label={`问题 ${index + 1} 语言`}>
-                        <Input
-                          value={item.language}
-                          onChange={(_, data) =>
-                            patchDraft(item.localId, { language: data.value })
-                          }
-                        />
-                      </Field>
-                      <Field label={`问题 ${index + 1} 权重`}>
-                        <Input
-                          type="number"
-                          min={1}
-                          value={String(item.weight)}
-                          onChange={(_, data) =>
-                            patchDraft(item.localId, {
-                              weight: Number(data.value),
-                            })
-                          }
-                        />
-                      </Field>
-                      <Button
-                        onClick={() => {
-                          setEditKey(newId());
-                          setDraft((items) =>
-                            items.filter(
-                              (entry) => entry.localId !== item.localId,
-                            ),
-                          );
-                        }}
-                      >
-                        移除问题 {index + 1}
-                      </Button>
-                    </div>
+        ) : null}
+        {canWrite && (
+          <Button onClick={() => setCreating((open) => !open)}>
+            {creating ? t("hideNewSet") : t("newSet")}
+          </Button>
+        )}
+        {canWrite && creating && (
+          <Card style={{ maxWidth: "100%", marginTop: 16 }}>
+            <h2>创建问题集</h2>
+            <Field label="问题集名称">
+              <Input
+                value={name}
+                maxLength={200}
+                onChange={(_, data) => {
+                  setName(data.value);
+                  setCreateKey(newId());
+                }}
+              />
+            </Field>
+            <Field
+              label="每行一个问题"
+              hint="可粘贴多行；保存后仍可创建新版本调整问题。"
+            >
+              <Textarea
+                rows={6}
+                value={lines}
+                onChange={(_, data) => {
+                  setLines(data.value);
+                  setCreateKey(newId());
+                }}
+              />
+            </Field>
+            <Button
+              appearance="primary"
+              disabled={
+                !name.trim() ||
+                !createLines.length ||
+                createLines.length > 100 ||
+                create.isPending
+              }
+              onClick={() => create.mutate()}
+            >
+              {create.isPending ? t("creatingSet") : t("createSet")}
+            </Button>
+            {create.isError && (
+              <ErrorState
+                title="问题集创建失败"
+                detail={errorText(create.error)}
+              />
+            )}
+          </Card>
+        )}
+        {!canWrite && (
+          <p role="status">
+            当前角色为只读；可以查看版本，但不能创建或修订问题集。
+          </p>
+        )}
+        {setId &&
+          (versions.isPending ? (
+            <LoadingState label="正在读取版本历史" compact />
+          ) : versions.isError ? (
+            <ErrorState
+              title="版本历史无法读取"
+              detail={errorText(versions.error)}
+              onRetry={() => void versions.refetch()}
+            />
+          ) : (
+            <section aria-label="版本历史">
+              <h2>版本历史</h2>
+              <Field label="选择不可变版本">
+                <Select
+                  value={versionId}
+                  onChange={(_, data) => {
+                    updateSelection({ tab: "sets", version: data.value });
+                  }}
+                >
+                  <option value="">选择版本</option>
+                  {versions.data?.items.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      v{item.revision} · {item.name}
+                    </option>
                   ))}
-                  <Button
-                    disabled={draft.length >= 100}
-                    onClick={() => {
-                      setEditKey(newId());
-                      setDraft((items) => [...items, toDraft("", newId())]);
-                    }}
-                  >
-                    添加问题
-                  </Button>
-                  <Button
-                    appearance="primary"
-                    disabled={
-                      !draftName.trim() ||
-                      draft.some((item) => !validDraft(item)) ||
-                      revise.isPending
-                    }
-                    onClick={() => revise.mutate()}
-                  >
-                    {revise.isPending ? "正在保存…" : "保存为新版本"}
-                  </Button>
-                  <Button
-                    onClick={() => {
-                      setEditing(false);
-                      revise.reset();
-                    }}
-                  >
-                    取消修订
-                  </Button>
-                  {revise.isError && (
-                    <MessageBar intent="error">
-                      <MessageBarBody>
-                        {revise.error instanceof ApiError &&
-                        revise.error.status === 409
-                          ? "版本已变化或问题身份冲突；草稿已保留。刷新版本历史后核对，再选择如何修改。"
-                          : `修订失败：${errorText(revise.error)}。草稿已保留。`}
+                </Select>
+              </Field>
+            </section>
+          ))}
+        {versionId &&
+          (version.isPending ? (
+            <LoadingState label="正在读取不可变版本" compact />
+          ) : version.isError ? (
+            <ErrorState
+              title="版本详情无法读取"
+              detail={errorText(version.error)}
+              onRetry={() => void version.refetch()}
+            />
+          ) : (
+            version.data && (
+              <section aria-label="问题集版本详情">
+                <h2>
+                  {version.data.name} · v{version.data.revision}
+                </h2>
+                <p>
+                  优化 {version.data.optimization_count} · 冻结评估{" "}
+                  {version.data.evaluation_count}
+                  {" · "}创建于{" "}
+                  {new Date(version.data.created_at).toLocaleString("zh-CN")}
+                </p>
+                {version.data.optimization_count === 0 && (
+                  <p role="status">
+                    当前版本没有优化问题；冻结评估问题不进入内容优化。
+                  </p>
+                )}
+                {version.data.id !== selectedSet?.current_version_id && (
+                  <p role="status">
+                    这是历史不可变版本；要编辑请切换到当前版本。
+                  </p>
+                )}
+                <ul style={{ paddingLeft: 24, overflowWrap: "anywhere" }}>
+                  {version.data.questions.map((item) => (
+                    <li key={item.id}>
+                      <strong>{item.text}</strong>{" "}
+                      <Badge appearance="outline">
+                        {purposeLabel[item.purpose]}
+                      </Badge>
+                      <p>
+                        意图 {item.intent} · 产品引用{" "}
+                        {item.product_refs.join("、") || "无"} · 市场{" "}
+                        {item.market} · 语言 {item.language} · 来源{" "}
+                        {item.source.kind} · 权重 {item.weight}
+                      </p>
+                    </li>
+                  ))}
+                </ul>
+                {canWrite &&
+                  version.data.id === selectedSet?.current_version_id &&
+                  !activeDraft && (
+                    <Button onClick={startEdit}>基于当前版本修订</Button>
+                  )}
+                {activeDraft && (
+                  <Card style={{ maxWidth: "100%" }}>
+                    <h3>修订为下一版本</h3>
+                    <Field label="下一版本名称">
+                      <Input
+                        value={activeDraft.name}
+                        onChange={(_, data) => {
+                          patchRevision((previous) => ({
+                            ...previous,
+                            name: data.value,
+                            key: newId(),
+                          }));
+                        }}
+                      />
+                    </Field>
+                    {activeDraft.questions.map((item, index) => (
+                      <div
+                        key={item.localId}
+                        className="question-sets-edit-row"
+                      >
+                        <Field label={`问题 ${index + 1}`}>
+                          <Textarea
+                            value={item.text}
+                            onChange={(_, data) =>
+                              patchDraft(item.localId, { text: data.value })
+                            }
+                          />
+                        </Field>
+                        <details className="question-sets-more-settings">
+                          <summary
+                            aria-label={`${t("moreSettings")} ${index + 1}`}
+                          >
+                            {t("moreSettings")}
+                          </summary>
+                          <div className="question-sets-secondary-fields">
+                            <Field label={`问题 ${index + 1} 意图`}>
+                              <Input
+                                value={item.intent}
+                                onChange={(_, data) =>
+                                  patchDraft(item.localId, {
+                                    intent: data.value,
+                                  })
+                                }
+                              />
+                            </Field>
+                            <Field label={`问题 ${index + 1} 市场`}>
+                              <Input
+                                value={item.market}
+                                onChange={(_, data) =>
+                                  patchDraft(item.localId, {
+                                    market: data.value,
+                                  })
+                                }
+                              />
+                            </Field>
+                            <Field label={`问题 ${index + 1} 语言`}>
+                              <Input
+                                value={item.language}
+                                onChange={(_, data) =>
+                                  patchDraft(item.localId, {
+                                    language: data.value,
+                                  })
+                                }
+                              />
+                            </Field>
+                            <Field label={`问题 ${index + 1} 权重`}>
+                              <Input
+                                type="number"
+                                min={1}
+                                value={String(item.weight)}
+                                onChange={(_, data) =>
+                                  patchDraft(item.localId, {
+                                    weight: Number(data.value),
+                                  })
+                                }
+                              />
+                            </Field>
+                          </div>
+                        </details>
                         <Button
                           onClick={() => {
-                            void sets.refetch();
-                            void versions.refetch();
+                            patchRevision((previous) => ({
+                              ...previous,
+                              key: newId(),
+                              questions: previous.questions.filter(
+                                (entry) => entry.localId !== item.localId,
+                              ),
+                            }));
                           }}
                         >
-                          刷新版本历史
+                          移除问题 {index + 1}
                         </Button>
-                      </MessageBarBody>
-                    </MessageBar>
-                  )}
-                </Card>
-              )}
-            </section>
-          )
-        ))}
+                      </div>
+                    ))}
+                    <Button
+                      disabled={activeDraft.questions.length >= 100}
+                      onClick={() => {
+                        patchRevision((previous) => ({
+                          ...previous,
+                          key: newId(),
+                          questions: [
+                            ...previous.questions,
+                            toDraft("", newId()),
+                          ],
+                        }));
+                      }}
+                    >
+                      添加问题
+                    </Button>
+                    <Button
+                      appearance="primary"
+                      disabled={
+                        !activeDraft.name.trim() ||
+                        activeDraft.questions.some(
+                          (item) => !validDraft(item),
+                        ) ||
+                        revise.isPending
+                      }
+                      onClick={() => revise.mutate()}
+                    >
+                      {revise.isPending ? "正在保存…" : "保存为新版本"}
+                    </Button>
+                    <Button
+                      onClick={() => {
+                        setDrafts((items) => {
+                          const next = { ...items };
+                          delete next[setId];
+                          return next;
+                        });
+                        revise.reset();
+                      }}
+                    >
+                      取消修订
+                    </Button>
+                    {revise.isError && (
+                      <MessageBar intent="error">
+                        <MessageBarBody>
+                          {revise.error instanceof ApiError &&
+                          revise.error.status === 409
+                            ? "版本已变化或问题身份冲突；草稿已保留。刷新版本历史后核对，再选择如何修改。"
+                            : `修订失败：${errorText(revise.error)}。草稿已保留。`}
+                          <Button
+                            onClick={() => {
+                              void sets.refetch();
+                              void versions.refetch();
+                            }}
+                          >
+                            刷新版本历史
+                          </Button>
+                        </MessageBarBody>
+                      </MessageBar>
+                    )}
+                  </Card>
+                )}
+              </section>
+            )
+          ))}
+      </section>
     </main>
   );
 }

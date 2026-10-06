@@ -940,6 +940,23 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
 
 #[async_trait]
 impl HostOps for RepositoryHostOps {
+    async fn source_recommendations(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::SourceRecommendationsRequest,
+    ) -> Result<geo_domain::SourceChannelRecommendationPage, HostOpError> {
+        let op = HostOp::SourceRecommendations;
+        crate::source_channel_recommendations::read(
+            self.content_state(op)?,
+            scope,
+            request.after,
+            request.limit,
+            geo_domain::RecommendationAudience::Optimization,
+        )
+        .await
+        .map_err(|error| worker_error(op, error))
+    }
+
     async fn project_current(
         &self,
         scope: &TenantScope,

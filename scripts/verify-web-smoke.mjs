@@ -419,9 +419,26 @@ async function main() {
   await page
     .getByRole("heading", { name: "测量与洞察", exact: true })
     .waitFor();
+  await screenshot(page, runDir, "p13-start-narrow", {
+    width: 390,
+    height: 844,
+  });
+  const measureTab = page.getByRole("tab", { name: "开始测量", exact: true });
+  await measureTab.focus();
+  await page.keyboard.press("ArrowRight");
+  assert(
+    await page
+      .getByRole("tab", { name: "测量记录", exact: true })
+      .evaluate((element) => element === document.activeElement),
+    "Measurement tabs did not move keyboard focus",
+  );
+  await page.keyboard.press("Enter");
+  await page.waitForURL((url) => url.searchParams.get("tab") === "records");
+  await page.getByRole("tab", { name: "问题集", exact: true }).click();
   await page
     .getByRole("heading", { name: "问题集与版本", exact: true })
     .waitFor();
+  await page.getByRole("button", { name: "新建问题集", exact: true }).click();
   await page
     .getByRole("textbox", { name: "问题集名称", exact: true })
     .fill("Synthetic questions");
@@ -439,7 +456,7 @@ async function main() {
       response.request().method() === "POST" &&
       response.status() < 300,
   );
-  await page.getByRole("button", { name: "创建并封存 v1" }).click();
+  await page.getByRole("button", { name: "创建并保存问题集" }).click();
   const questionVersion = await (await createdResponse).json();
   assert(
     questionVersion.optimization_count === 4 &&

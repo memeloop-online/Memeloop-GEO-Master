@@ -13,6 +13,8 @@ mod channel_jobs;
 pub use channel_jobs::*;
 mod citation_insights;
 pub use citation_insights::*;
+mod source_channel_recommendations;
+pub use source_channel_recommendations::*;
 mod channels;
 pub use channels::*;
 mod connector_capabilities;

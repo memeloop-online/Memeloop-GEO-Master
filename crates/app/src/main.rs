@@ -149,18 +149,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
             membership.tenant_slug = "local-workspace".to_owned();
             membership.tenant_display_name = display_name;
-            let mut hosts = vec![
-                "localhost",
-                "localhost:5173",
-                "localhost:8080",
-                "127.0.0.1",
-                "127.0.0.1:5173",
-                "127.0.0.1:8080",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-            hosts.extend(local_origin_hosts(&config.allowed_origins));
+            let hosts = local_development_hosts(&config.allowed_origins);
             repository.insert_operator(operator, &hosts).await?;
             repository.insert_user(user).await?;
             repository.insert_membership(membership).await?;
@@ -211,6 +200,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 // The explicitly configured in-memory development identity may be served on
 // isolated local test ports. Do not bind it to non-loopback tenant domains.
+fn local_development_hosts(origins: &[String]) -> Vec<String> {
+    let mut hosts = [
+        "localhost",
+        "localhost:5173",
+        "localhost:8080",
+        "127.0.0.1",
+        "127.0.0.1:5173",
+        "127.0.0.1:8080",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    hosts.extend(local_origin_hosts(origins));
+    // The memory auth repository intentionally rejects duplicate host
+    // assignments. AppConfig's default origins overlap these seeded hosts;
+    // deduplicate *within this identity* using the repository's exact
+    // normalization, without weakening conflicts across operators.
+    let mut seen = std::collections::HashSet::new();
+    hosts.retain(|host| seen.insert(geo_domain::normalize_host(host)));
+    hosts
+}
+
 fn local_origin_hosts(origins: &[String]) -> Vec<String> {
     origins
         .iter()
@@ -310,6 +320,30 @@ fn spawn_due_report_scanner(
 
 #[cfg(test)]
 mod local_host_tests {
+    #[test]
+    fn configured_origins_deduplicate_seeded_hosts_for_default_and_mixed_ports() {
+        let hosts = super::local_development_hosts(&[
+            "http://127.0.0.1:5173".to_owned(),
+            "http://127.0.0.1:8080".to_owned(),
+            "http://127.0.0.1:15173".to_owned(),
+            "http://127.0.0.1:8080".to_owned(),
+            "http://localhost:18080".to_owned(),
+        ]);
+        assert_eq!(
+            hosts,
+            [
+                "localhost",
+                "localhost:5173",
+                "localhost:8080",
+                "127.0.0.1",
+                "127.0.0.1:5173",
+                "127.0.0.1:8080",
+                "127.0.0.1:15173",
+                "localhost:18080"
+            ]
+        );
+    }
+
     #[test]
     fn isolated_development_ports_only_extend_loopback_identity_hosts() {
         assert_eq!(

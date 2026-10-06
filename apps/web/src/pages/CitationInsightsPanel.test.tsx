@@ -5,7 +5,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { AuthProvider } from "../auth/AuthProvider";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
-import type { CitationInsightsPage } from "../api/citationInsights";
+import type {
+  CitationInsightsPage,
+  SourceChannelRecommendationsPage,
+} from "../api/citationInsights";
 import { CitationInsightsPanel } from "./CitationInsightsPanel";
 
 const reply = (body: unknown, status = 200) =>
@@ -83,13 +86,85 @@ const populatedPage: CitationInsightsPage = {
     },
   ],
 };
+const recommendedPage: SourceChannelRecommendationsPage = {
+  scope: "returned_plans_only",
+  plan_ids: ["plan-1", "plan-2"],
+  next_after: "plan-2",
+  rule_version: "v1",
+  coverage: populatedPage.coverage,
+  items: [
+    {
+      source_hosts: ["example.org", "blog.example.org"],
+      platform_id: "platform-a",
+      placement_slot: "article",
+      rule_ids: ["rule-1", "rule-2"],
+      host_relationships: ["first_party_article"],
+      citing_answers: 2,
+      samples: [sample],
+      publication: {
+        connector_availability: "unavailable",
+        account_ready: false,
+        reason: "connector_unavailable",
+      },
+      targeted: false,
+    },
+    {
+      source_hosts: ["unmapped.example"],
+      platform_id: null,
+      placement_slot: null,
+      rule_ids: [],
+      host_relationships: [],
+      citing_answers: 1,
+      samples: [sample],
+      publication: {
+        connector_availability: "unmapped",
+        account_ready: false,
+        reason: "source_not_mapped_to_publishing_channel",
+      },
+      targeted: false,
+    },
+  ],
+};
 
-function mockApi(pages: CitationInsightsPage[], failFirst = false) {
+function projectForRecommendations(mode: "all_eligible" | "explicit") {
+  return {
+    id: "project-1",
+    revision: 7,
+    settings: {
+      distribution_scope: {
+        mode,
+        included_platform_ids: mode === "explicit" ? ["platform-b"] : [],
+        excluded_platform_ids: ["platform-a", "platform-c"],
+        resource_pool_ids: ["pool-a"],
+        replication_policy: "one_account_per_platform",
+      },
+    },
+  };
+}
+
+function mockApi(
+  pages: CitationInsightsPage[],
+  failFirst = false,
+  options?: {
+    recommendations: SourceChannelRecommendationsPage;
+    mode: "all_eligible" | "explicit";
+    conflict?: boolean;
+    conflictAfterSave?: boolean;
+    failFirstUpdate?: boolean;
+  },
+) {
   const calls: string[] = [];
+  const patchKeys: Array<string | null> = [];
+  const patches: Array<{
+    revision: number;
+    settings: Record<string, unknown>;
+  }> = [];
+  let project = options ? projectForRecommendations(options.mode) : null;
   let failed = false;
+  let failedUpdate = false;
   vi.stubGlobal(
     "fetch",
-    vi.fn((request: RequestInfo | URL) => {
+    vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(request), "http://localhost");
       calls.push(url.toString());
       if (url.pathname.endsWith("/auth/session"))
@@ -110,7 +185,7 @@ function mockApi(pages: CitationInsightsPage[], failFirst = false) {
                 tenant_id: "tenant-1",
                 tenant_slug: "tenant",
                 tenant_display_name: "Tenant",
-                role: "viewer",
+                role: options ? "member" : "viewer",
               },
             ],
             expires_at: "2026-10-01T00:00:00Z",
@@ -127,6 +202,35 @@ function mockApi(pages: CitationInsightsPage[], failFirst = false) {
         return Promise.resolve(
           reply(url.searchParams.has("after") ? pages[1] : pages[0]),
         );
+      }
+      if (url.pathname.endsWith("/source-channel-recommendations"))
+        return Promise.resolve(
+          options
+            ? reply(options.recommendations)
+            : reply({ code: "not_found" }, 404),
+        );
+      if (url.pathname.endsWith("/projects/project-1") && project) {
+        if (init?.method === "PATCH") {
+          patches.push(JSON.parse(String(init.body)));
+          patchKeys.push(new Headers(init.headers).get("Idempotency-Key"));
+          if (options?.failFirstUpdate && !failedUpdate) {
+            failedUpdate = true;
+            return Promise.reject(new TypeError("Uncertain connection"));
+          }
+          if (options?.conflict)
+            return Promise.resolve(reply({ code: "conflict" }, 409));
+          project = {
+            ...project,
+            revision: project.revision + 1,
+            settings: {
+              ...project.settings,
+              ...patches.at(-1)!.settings,
+            },
+          } as typeof project;
+          if (options?.conflictAfterSave)
+            return Promise.resolve(reply({ code: "conflict" }, 409));
+        }
+        return Promise.resolve(reply(project));
       }
       if (url.pathname.endsWith("/channel-targets/target-1"))
         return Promise.resolve(
@@ -148,7 +252,7 @@ function mockApi(pages: CitationInsightsPage[], failFirst = false) {
       );
     }),
   );
-  return calls;
+  return { calls, patches, patchKeys };
 }
 
 function panel(projectId: string) {
@@ -178,8 +282,114 @@ afterEach(() => {
 });
 
 describe("citation insights", () => {
+  it.each(["all_eligible", "explicit"] as const)(
+    "adds a mapped target in %s mode without losing exclusions, pools or other targets",
+    async (mode) => {
+      const { calls, patches } = mockApi([populatedPage], false, {
+        recommendations: recommendedPage,
+        mode,
+      });
+      const user = userEvent.setup();
+      renderPanel();
+      expect(
+        await screen.findByText("example.org · blog.example.org"),
+      ).toBeInTheDocument();
+      expect(screen.getByText("尚未归类的信源")).toBeInTheDocument();
+      expect(screen.getByText(/发布连接方式尚不可用/)).toBeInTheDocument();
+      expect(
+        screen.getByText("依据当前 2 个测量计划的回答"),
+      ).toBeInTheDocument();
+      expect(screen.getByText(/尚无可用发布连接方式/)).toBeInTheDocument();
+      expect(
+        screen.queryAllByRole("button", { name: "列入后续发布目标" }),
+      ).toHaveLength(1);
+      await user.click(
+        screen.getByRole("button", { name: "列入后续发布目标" }),
+      );
+      expect(
+        await screen.findByText("已保存并核对项目目标；后续周期会采用新设置。"),
+      ).toBeInTheDocument();
+      expect(patches).toHaveLength(1);
+      expect(patches[0].revision).toBe(7);
+      expect(patches[0].settings).toEqual({
+        distribution_scope: {
+          mode,
+          included_platform_ids:
+            mode === "explicit" ? ["platform-b", "platform-a"] : [],
+          excluded_platform_ids: ["platform-c"],
+          resource_pool_ids: ["pool-a"],
+          replication_policy: "one_account_per_platform",
+        },
+      });
+      expect(
+        calls.filter((call) => call.includes("/projects/project-1?")),
+      ).toHaveLength(4);
+    },
+  );
+
+  it("preserves the user's selection on a project revision conflict", async () => {
+    const { patches } = mockApi([populatedPage], false, {
+      recommendations: recommendedPage,
+      mode: "explicit",
+      conflict: true,
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByText("example.org · blog.example.org");
+    await user.click(screen.getByRole("button", { name: "列入后续发布目标" }));
+    expect(
+      await screen.findByText("项目设置已在其他位置更新；请重新查看后再选择。"),
+    ).toBeInTheDocument();
+    expect(patches).toHaveLength(1);
+    expect(
+      screen.getByRole("button", { name: "列入后续发布目标" }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByText("已保存并核对项目目标；后续周期会采用新设置。"),
+    ).toBeNull();
+  });
+
+  it("retries an uncertain update with the same revision, scope and key", async () => {
+    const { patches, patchKeys } = mockApi([populatedPage], false, {
+      recommendations: recommendedPage,
+      mode: "explicit",
+      failFirstUpdate: true,
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByText("example.org · blog.example.org");
+    await user.click(screen.getByRole("button", { name: "列入后续发布目标" }));
+    expect(
+      await screen.findByText("未能保存目标；请重试。"),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "列入后续发布目标" }));
+    expect(
+      await screen.findByText("已保存并核对项目目标；后续周期会采用新设置。"),
+    ).toBeInTheDocument();
+    expect(patches).toHaveLength(2);
+    expect(patches[1]).toEqual(patches[0]);
+    expect(patchKeys[0]).toBeTruthy();
+    expect(patchKeys[1]).toBe(patchKeys[0]);
+  });
+
+  it("reconciles an ambiguous conflict with the persisted project scope", async () => {
+    const { patches } = mockApi([populatedPage], false, {
+      recommendations: recommendedPage,
+      mode: "all_eligible",
+      conflictAfterSave: true,
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByText("example.org · blog.example.org");
+    await user.click(screen.getByRole("button", { name: "列入后续发布目标" }));
+    expect(
+      await screen.findByText("已保存并核对项目目标；后续周期会采用新设置。"),
+    ).toBeInTheDocument();
+    expect(patches).toHaveLength(1);
+  });
+
   it("explains an empty batch without implying missing measurements had no citations", async () => {
-    const calls = mockApi([emptyPage]);
+    const { calls } = mockApi([emptyPage]);
     renderPanel();
     expect(
       await screen.findByText(
@@ -225,7 +435,7 @@ describe("citation insights", () => {
   });
 
   it("moves between batches without presenting the first page's totals as global", async () => {
-    const calls = mockApi([populatedPage, emptyPage]);
+    const { calls } = mockApi([populatedPage, emptyPage]);
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText("计划测量 9 项");
@@ -238,7 +448,7 @@ describe("citation insights", () => {
   });
 
   it("starts at the first batch when the project scope changes", async () => {
-    const calls = mockApi([populatedPage, emptyPage]);
+    const { calls } = mockApi([populatedPage, emptyPage]);
     const user = userEvent.setup();
     const view = renderPanel();
     await screen.findByText("计划测量 9 项");
@@ -255,7 +465,7 @@ describe("citation insights", () => {
   });
 
   it("shows a recoverable error without inventing source records", async () => {
-    const calls = mockApi([emptyPage], true);
+    const { calls } = mockApi([emptyPage], true);
     const user = userEvent.setup();
     renderPanel();
     const heading = await screen.findByText("引用信源暂时无法读取");

@@ -333,7 +333,25 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v13";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v14";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRecommendationsRequest {
+    pub after: Option<Uuid>,
+    pub limit: Option<usize>,
+}
+
+impl SourceRecommendationsRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.after.is_some_and(|id| id.is_nil())
+            || self.limit.is_some_and(|limit| !(1..=10).contains(&limit))
+        {
+            return Err("invalid recommendation cursor or page size".into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -526,6 +544,7 @@ pub enum HostOp {
     DistributionResume,
     DistributionTargetsRead,
     ProjectCurrent,
+    SourceRecommendations,
     ProjectRevise,
     ProjectEstimate,
     ProjectStart,
@@ -533,7 +552,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 38;
+    pub const COUNT: usize = 39;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -572,6 +591,7 @@ impl HostOp {
         Self::DistributionResume,
         Self::DistributionTargetsRead,
         Self::ProjectCurrent,
+        Self::SourceRecommendations,
         Self::ProjectRevise,
         Self::ProjectEstimate,
         Self::ProjectStart,
@@ -615,6 +635,7 @@ impl HostOp {
             Self::DistributionResume => "distribution.resume.v1",
             Self::DistributionTargetsRead => "distribution.targets.read.v1",
             Self::ProjectCurrent => "project.current.v1",
+            Self::SourceRecommendations => "source.channel.recommendations.v1",
             Self::ProjectRevise => "project.revise.v1",
             Self::ProjectEstimate => "project.estimate.v1",
             Self::ProjectStart => "project.start.v1",
@@ -659,6 +680,7 @@ impl HostOp {
             Self::DistributionResume => "op_host_distribution_resume_v1",
             Self::DistributionTargetsRead => "op_host_distribution_targets_read_v1",
             Self::ProjectCurrent => "op_host_project_current_v1",
+            Self::SourceRecommendations => "op_host_source_recommendations_v1",
             Self::ProjectRevise => "op_host_project_revise_v1",
             Self::ProjectEstimate => "op_host_project_estimate_v1",
             Self::ProjectStart => "op_host_project_start_v1",
@@ -763,6 +785,7 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(120_000, 32), // bounded expansion/revisit
                 HostOpLimits::new(15_000, 128), // paged target reads
                 HostOpLimits::new(15_000, 16),  // project read
+                HostOpLimits::new(30_000, 16),  // optimization-only recommendation page
                 HostOpLimits::new(30_000, 8),   // project revision
                 HostOpLimits::new(15_000, 16),  // project estimate
                 HostOpLimits::new(60_000, 4),   // project start acceptance
@@ -1143,6 +1166,17 @@ pub trait HostOps: Send + Sync {
         Err(HostOpError::capability_missing(
             HostOp::ProjectCurrent,
             "project onboarding is not configured",
+        ))
+    }
+
+    async fn source_recommendations(
+        &self,
+        _scope: &TenantScope,
+        _request: SourceRecommendationsRequest,
+    ) -> Result<geo_domain::SourceChannelRecommendationPage, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::SourceRecommendations,
+            "source recommendations are not configured",
         ))
     }
 

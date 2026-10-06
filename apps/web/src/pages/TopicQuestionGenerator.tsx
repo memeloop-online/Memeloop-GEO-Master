@@ -14,6 +14,7 @@ import { createIdempotencyKey } from "../api/client";
 import { useProjectQuery } from "../api/projects";
 import "../i18n";
 import "./topicQuestionMessages";
+import "./measurementMessages";
 
 interface PendingPrediction {
   conversationKey: string;
@@ -32,6 +33,7 @@ export function TopicQuestionGenerator({
   canWrite: boolean;
 }) {
   const { t } = useTranslation("topicQuestions");
+  const { t: measureT } = useTranslation("measurement");
   const navigate = useNavigate();
   const project = useProjectQuery(tenantId, projectId);
   const [topic, setTopic] = useState("");
@@ -116,22 +118,25 @@ export function TopicQuestionGenerator({
               onChange={(_, data) => setTopic(data.value)}
             />
           </Field>
-          <Field label={t("market")} hint={t("marketHint")}>
-            <Input
-              value={market}
-              maxLength={80}
-              disabled={busy || Boolean(pending.current)}
-              onChange={(_, data) => setMarket(data.value)}
-            />
-          </Field>
-          <Field label={t("language")} hint={t("languageHint")}>
-            <Input
-              value={language}
-              maxLength={80}
-              disabled={busy || Boolean(pending.current)}
-              onChange={(_, data) => setLanguage(data.value)}
-            />
-          </Field>
+          <details>
+            <summary>{measureT("optionalRegion")}</summary>
+            <Field label={t("market")} hint={t("marketHint")}>
+              <Input
+                value={market}
+                maxLength={80}
+                disabled={busy || Boolean(pending.current)}
+                onChange={(_, data) => setMarket(data.value)}
+              />
+            </Field>
+            <Field label={t("language")} hint={t("languageHint")}>
+              <Input
+                value={language}
+                maxLength={80}
+                disabled={busy || Boolean(pending.current)}
+                onChange={(_, data) => setLanguage(data.value)}
+              />
+            </Field>
+          </details>
           <Button
             appearance="primary"
             disabled={!topic.trim() || busy}

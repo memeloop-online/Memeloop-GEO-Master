@@ -104,30 +104,39 @@ pub async fn get_citation_insights(
     let result = async {
         let _ = (query.tenant_id, query.project_id);
         let scope = crate::channel_jobs::scope(&state, &tenant, project_id).await?;
-        let limit = query.limit.unwrap_or(5);
-        if !(1..=10).contains(&limit) {
-            return Err(AppError::invalid_request("limit must be 1 to 10"));
-        }
-        let repository = state.channel_job_repository();
-        let mut plans = repository
-            .list_measurement_plans(&scope, query.after, limit + 1)
-            .await?;
-        let has_more = plans.len() > limit;
-        plans.truncate(limit);
-        let next_after = has_more.then(|| plans.last().expect("nonempty page").plan_id);
-        let mut inputs: Vec<(StandaloneMeasurementPlan, Vec<ChannelTargetView>)> =
-            Vec::with_capacity(plans.len());
-        for plan in plans {
-            let mut views = Vec::with_capacity(plan.targets.len());
-            for target in &plan.targets {
-                views.push(repository.get_target(&scope, target.target_id).await?);
-            }
-            inputs.push((plan, views));
-        }
-        summarize_citations(&scope, &inputs, next_after, accepted_live_search)
+        read_citation_page(&state, &scope, query.after, query.limit).await
     }
     .await;
     result
         .map(Json)
         .map_err(|error| api_error(error, context.request_id))
+}
+
+pub(crate) async fn read_citation_page(
+    state: &AppState,
+    scope: &TenantScope,
+    after: Option<Uuid>,
+    limit: Option<usize>,
+) -> Result<CitationInsightPage, AppError> {
+    let limit = limit.unwrap_or(5);
+    if !(1..=10).contains(&limit) {
+        return Err(AppError::invalid_request("limit must be 1 to 10"));
+    }
+    let repository = state.channel_job_repository();
+    let mut plans = repository
+        .list_measurement_plans(scope, after, limit + 1)
+        .await?;
+    let has_more = plans.len() > limit;
+    plans.truncate(limit);
+    let next_after = has_more.then(|| plans.last().expect("nonempty page").plan_id);
+    let mut inputs: Vec<(StandaloneMeasurementPlan, Vec<ChannelTargetView>)> =
+        Vec::with_capacity(plans.len());
+    for plan in plans {
+        let mut views = Vec::with_capacity(plan.targets.len());
+        for target in &plan.targets {
+            views.push(repository.get_target(scope, target.target_id).await?);
+        }
+        inputs.push((plan, views));
+    }
+    summarize_citations(scope, &inputs, next_after, accepted_live_search)
 }

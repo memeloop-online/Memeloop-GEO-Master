@@ -12,6 +12,37 @@
   overflow-wrap: anywhere;
 }
 
+.question-sets-page [hidden] {
+  display: none !important;
+}
+
+.measurement-tabs {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: thin;
+  padding-bottom: 4px;
+}
+
+.measurement-tabs .fui-Tab {
+  flex: 0 0 auto;
+}
+
+.question-sets-page > section:not(.page-hero) {
+  min-width: 0;
+}
+
+.measurement-prediction {
+  margin-top: 16px;
+}
+
+.measurement-prediction summary,
+.question-sets-page details summary {
+  cursor: pointer;
+}
+
 .question-sets-page .fui-Input,
 .question-sets-page .fui-Textarea,
 .question-sets-page .fui-Select {
@@ -29,6 +60,18 @@
 
 .question-sets-edit-row > .fui-Field:first-child {
   grid-column: 1 / -1;
+}
+
+.question-sets-more-settings {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.question-sets-secondary-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 8px;
+  padding-block: 8px;
 }
 
 @media (max-width: 600px) {

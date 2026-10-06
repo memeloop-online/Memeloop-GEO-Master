@@ -266,6 +266,29 @@ async fn paged_denominator_and_cross_project_isolation_are_explicit() {
     assert_eq!(first["observed_sources"][0]["citing_answers"], 1);
     assert_eq!(first["plan_ids"], json!(&plan_ids[..2]));
     assert_eq!(first["next_after"], json!(plan_ids[1]));
+    let recommendations_path = format!(
+        "/api/v1/projects/{}/source-channel-recommendations?limit=2",
+        scope.project_id.unwrap()
+    );
+    let recommendations = app
+        .clone()
+        .oneshot(request(&recommendations_path, Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(recommendations.status(), StatusCode::OK);
+    let recommendations = response_body(recommendations).await;
+    assert_eq!(recommendations["scope"], "returned_plans_only");
+    assert_eq!(recommendations["coverage"]["planned"], 2);
+    assert_eq!(
+        recommendations["items"][0]["source_hosts"],
+        json!(["example.org"])
+    );
+    assert_eq!(recommendations["items"][0]["platform_id"], Value::Null);
+    assert_eq!(recommendations["items"][0]["citing_answers"], 1);
+    assert_eq!(
+        recommendations["items"][0]["publication"]["connector_availability"],
+        "unmapped"
+    );
     let second = app
         .clone()
         .oneshot(request(

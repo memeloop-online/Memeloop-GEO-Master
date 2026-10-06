@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
 import {
@@ -60,7 +60,11 @@ const plan = {
   created_at: "2026-10-01T00:00:00Z",
   targets: [],
 };
-function renderPanel(canWrite = true) {
+function UrlState() {
+  const location = useLocation();
+  return <output data-testid="measurement-url">{location.search}</output>;
+}
+function renderPanel(canWrite = true, recordsOnly = false) {
   return render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider
@@ -78,7 +82,9 @@ function renderPanel(canWrite = true) {
             tenantId="tenant-1"
             projectId="project-1"
             canWrite={canWrite}
+            recordsOnly={recordsOnly}
           />
+          <UrlState />
         </MemoryRouter>
       </QueryClientProvider>
     </FluentProvider>,
@@ -144,6 +150,9 @@ describe("standalone arbitrary-topic measurement", () => {
     expect(input).not.toHaveProperty("cycle_id");
     expect(input).not.toHaveProperty("source_id");
     expect(await screen.findByText(/测量计划已受理/)).toBeInTheDocument();
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "tab=records&record=measurement-1",
+    );
   });
   it("replays the exact timestamp and idempotency key after an uncertain submission", async () => {
     vi.mocked(createMeasurementPlan)
@@ -197,7 +206,7 @@ describe("standalone arbitrary-topic measurement", () => {
           : { items: [plan], next_after: "measurement-1" },
     );
     const user = userEvent.setup();
-    renderPanel(false);
+    renderPanel(false, true);
     await user.click(
       await screen.findByRole("button", { name: /自定义问题测量/ }),
     );

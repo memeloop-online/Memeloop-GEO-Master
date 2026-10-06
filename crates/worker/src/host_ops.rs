@@ -67,6 +67,13 @@ project_op!(
     |_: &ProjectCurrentRequest| Ok::<(), String>(())
 );
 project_op!(
+    op_host_source_recommendations_v1,
+    SourceRecommendations,
+    crate::host::SourceRecommendationsRequest,
+    source_recommendations,
+    crate::host::SourceRecommendationsRequest::validate
+);
+project_op!(
     op_host_project_estimate_v1,
     ProjectEstimate,
     ProjectEstimateRequest,
@@ -990,6 +997,7 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::MeasurementPlanCreate.op_name(),
     HostOp::MeasurementPlanRead.op_name(),
     HostOp::ProjectCurrent.op_name(),
+    HostOp::SourceRecommendations.op_name(),
     HostOp::ProjectRevise.op_name(),
     HostOp::ProjectEstimate.op_name(),
     HostOp::ProjectStart.op_name(),

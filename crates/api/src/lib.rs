@@ -14,6 +14,7 @@ pub mod content_runtime;
 mod content_tools;
 mod desktop_gateway;
 pub mod distribution;
+mod source_channel_recommendations;
 pub use content::ContentService;
 mod context;
 mod cycles;
@@ -2034,6 +2035,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/projects/{project_id}/citation-insights",
             get(citation_insights::get_citation_insights),
+        )
+        .route(
+            "/projects/{project_id}/source-channel-recommendations",
+            get(source_channel_recommendations::get),
         )
         .route(
             "/projects/{project_id}/cycles/{cycle_id}/channel-plan",

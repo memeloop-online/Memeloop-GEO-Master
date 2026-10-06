@@ -3,7 +3,13 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from "react-router-dom";
 import { AuthProvider } from "../auth/AuthProvider";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
 import { QuestionSetsPage } from "./QuestionSetsPage";
@@ -55,11 +61,13 @@ function mockApi({
   role = "tenant_admin",
   conflict = false,
   listError = false,
+  createErrorOnce = false,
 }: {
   existing?: boolean;
   role?: string;
   conflict?: boolean;
   listError?: boolean;
+  createErrorOnce?: boolean;
 } = {}) {
   const calls: {
     path: string;
@@ -68,6 +76,7 @@ function mockApi({
     headers: Headers;
   }[] = [];
   let exists = existing;
+  let rejectCreate = createErrorOnce;
   let current = { ...version, parent_version_id: null as string | null };
   vi.stubGlobal(
     "fetch",
@@ -103,6 +112,12 @@ function mockApi({
         );
       if (path.endsWith("/projects/project-1/question-sets")) {
         if (method === "POST") {
+          if (rejectCreate) {
+            rejectCreate = false;
+            return Promise.resolve(
+              reply({ code: "unavailable", message: "Connection lost" }, 503),
+            );
+          }
           exists = true;
           current = {
             ...version,
@@ -199,7 +214,18 @@ function mockApi({
   return calls;
 }
 
-function renderPage() {
+function NavigationState() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="measurement-url">{location.search}</output>
+      <button onClick={() => navigate(-1)}>浏览器返回</button>
+    </>
+  );
+}
+
+function renderPage(initialEntry = "/app/tenant-1/project-1/measurement") {
   return render(
     <QueryClientProvider
       client={
@@ -213,13 +239,16 @@ function renderPage() {
     >
       <FluentProvider theme={webLightTheme}>
         <AuthProvider>
-          <MemoryRouter
-            initialEntries={["/app/tenant-1/project-1/measurement"]}
-          >
+          <MemoryRouter initialEntries={[initialEntry]}>
             <Routes>
               <Route
                 path="/app/:tenantId/:projectId/measurement"
-                element={<QuestionSetsPage />}
+                element={
+                  <>
+                    <QuestionSetsPage />
+                    <NavigationState />
+                  </>
+                }
               />
             </Routes>
           </MemoryRouter>
@@ -230,6 +259,7 @@ function renderPage() {
 }
 
 afterEach(() => {
+  sessionStorage.clear();
   vi.unstubAllGlobals();
   setCsrfToken(undefined);
   setUnauthorizedHandler(undefined);
@@ -240,13 +270,15 @@ describe("P13 versioned question sets", () => {
     const calls = mockApi();
     const user = userEvent.setup();
     renderPage();
+    await user.click(screen.getByRole("tab", { name: "问题集" }));
     expect(await screen.findByText("尚无问题集")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "新建问题集" }));
     await user.type(screen.getByLabelText("问题集名称"), "基础问题");
     await user.type(
       screen.getByLabelText("每行一个问题"),
       "怎样选型？{enter}如何维护？",
     );
-    await user.click(screen.getByRole("button", { name: "创建并封存 v1" }));
+    await user.click(screen.getByRole("button", { name: "创建并保存问题集" }));
     expect(await screen.findByText(/冻结评估 1/)).toBeInTheDocument();
     const creation = calls.find(
       (call) =>
@@ -301,6 +333,7 @@ describe("P13 versioned question sets", () => {
     const calls = mockApi({ existing: true, conflict: true });
     const user = userEvent.setup();
     renderPage();
+    await user.click(screen.getByRole("tab", { name: "问题集" }));
     await user.selectOptions(
       await screen.findByLabelText("选择问题集"),
       "set-1",
@@ -324,12 +357,59 @@ describe("P13 versioned question sets", () => {
     ).toBe("version-1");
   });
 
+  it("keeps per-question details collapsed until requested and saves edited metadata", async () => {
+    const calls = mockApi({ existing: true });
+    const user = userEvent.setup();
+    renderPage("/app/tenant-1/project-1/measurement?tab=sets&set=set-1");
+    await screen.findByRole("heading", { name: "基础问题 · v1" });
+    expect(
+      screen.queryByText(/project_registry_nfkc_v1/),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "基于当前版本修订" }));
+    const questionRow = screen
+      .getByLabelText("问题 1")
+      .closest(".question-sets-edit-row") as HTMLElement;
+    const details = within(questionRow)
+      .getByText("更多设置")
+      .closest("details") as HTMLDetailsElement;
+    expect(details).not.toHaveAttribute("open");
+    expect(
+      within(details).getByRole("textbox", { name: "问题 1 意图" }),
+    ).toHaveValue("general");
+    await user.click(within(questionRow).getByText("更多设置"));
+    await user.clear(screen.getByRole("textbox", { name: "问题 1 意图" }));
+    await user.type(
+      screen.getByRole("textbox", { name: "问题 1 意图" }),
+      "compare",
+    );
+    await user.click(within(questionRow).getByText("更多设置"));
+    expect(details).not.toHaveAttribute("open");
+    await user.click(screen.getByRole("button", { name: "保存为新版本" }));
+    await screen.findByRole("heading", { name: "基础问题 · v2" });
+    const revision = calls.find(
+      ({ method, path }) =>
+        method === "POST" && path.endsWith("/question-sets/set-1/versions"),
+    );
+    expect(revision?.body).toMatchObject({
+      questions: [
+        {
+          text: "怎样选型？",
+          intent: "compare",
+          market: "CN",
+          language: "zh-CN",
+          weight: 1,
+        },
+      ],
+    });
+  });
+
   it("supports a read-only project and recoverable list failure", async () => {
     mockApi({ existing: true, role: "viewer" });
     renderPage();
+    await userEvent.setup().click(screen.getByRole("tab", { name: "问题集" }));
     expect(await screen.findByText(/当前角色为只读/)).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "创建并封存 v1" }),
+      screen.queryByRole("button", { name: "创建并保存问题集" }),
     ).not.toBeInTheDocument();
     const user = userEvent.setup();
     await user.selectOptions(
@@ -345,6 +425,7 @@ describe("P13 versioned question sets", () => {
   it("shows a retriable error when list access fails", async () => {
     const calls = mockApi({ listError: true });
     renderPage();
+    await userEvent.setup().click(screen.getByRole("tab", { name: "问题集" }));
     expect(await screen.findByText("问题集无法读取")).toBeInTheDocument();
     expect(
       within(
@@ -356,5 +437,151 @@ describe("P13 versioned question sets", () => {
         (item) => item.path.endsWith("/question-sets") && item.method === "GET",
       ),
     ).toHaveLength(1);
+  });
+
+  it("opens a version deep link, follows browser history, and keeps an unsaved revision across tabs and version browsing", async () => {
+    mockApi({ existing: true });
+    const user = userEvent.setup();
+    renderPage(
+      "/app/tenant-1/project-1/measurement?tab=sets&set=set-1&version=version-1",
+    );
+    await screen.findByRole("heading", { name: "基础问题 · v1" });
+    await user.click(screen.getByRole("button", { name: "基于当前版本修订" }));
+    await user.clear(screen.getByLabelText("问题 1"));
+    await user.type(screen.getByLabelText("问题 1"), "未保存的修订");
+    await user.click(screen.getByRole("tab", { name: "信源洞察" }));
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "tab=insights",
+    );
+    await user.click(screen.getByRole("button", { name: "浏览器返回" }));
+    expect(screen.getByLabelText("问题 1")).toHaveValue("未保存的修订");
+    await user.click(screen.getByRole("tab", { name: "开始测量" }));
+    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    expect(screen.getByLabelText("问题 1")).toHaveValue("未保存的修订");
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "set=set-1",
+    );
+  });
+
+  it("holds a new-set draft when tabs switch and opens creation only on request", async () => {
+    mockApi();
+    const user = userEvent.setup();
+    renderPage();
+    expect(screen.queryByLabelText("问题集名称")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await user.click(screen.getByRole("button", { name: "新建问题集" }));
+    await user.type(screen.getByLabelText("问题集名称"), "未保存的问题集");
+    await user.click(screen.getByRole("button", { name: "收起新建" }));
+    await user.click(screen.getByRole("button", { name: "新建问题集" }));
+    expect(screen.getByLabelText("问题集名称")).toHaveValue("未保存的问题集");
+    await user.click(screen.getByRole("tab", { name: "测量记录" }));
+    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    expect(screen.getByLabelText("问题集名称")).toHaveValue("未保存的问题集");
+  });
+
+  it("uses keyboard-accessible tabs and keeps the starting view focused on measuring", async () => {
+    mockApi();
+    const user = userEvent.setup();
+    renderPage();
+    expect(screen.getByRole("tab", { name: "开始测量" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(
+      await screen.findByRole("textbox", { name: "要测量的问题" }),
+    ).toBeInTheDocument();
+    screen.getByRole("tab", { name: "测量记录" }).focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("tab", { name: "测量记录" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "tab=records",
+    );
+  });
+
+  it("restores unsaved edits after leaving and returning to the same project page", async () => {
+    const calls = mockApi({ existing: true });
+    const user = userEvent.setup();
+    const page = renderPage(
+      "/app/tenant-1/project-1/measurement?tab=sets&set=set-1",
+    );
+    await user.click(
+      await screen.findByRole("button", { name: "基于当前版本修订" }),
+    );
+    await user.clear(screen.getByLabelText("问题 1"));
+    await user.type(screen.getByLabelText("问题 1"), "返回后继续编辑");
+    const stored = JSON.parse(
+      sessionStorage.getItem(
+        "measurement-drafts:user-1:operator-1:tenant-1:project-1",
+      )!,
+    ) as { drafts: Record<string, { key: string }> };
+    const revisionKey = stored.drafts["set-1"].key;
+    page.unmount();
+    renderPage("/app/tenant-1/project-1/measurement?tab=sets&set=set-1");
+    expect(await screen.findByLabelText("问题 1")).toHaveValue(
+      "返回后继续编辑",
+    );
+    await user.click(screen.getByRole("button", { name: "保存为新版本" }));
+    await screen.findByRole("heading", { name: "基础问题 · v2" });
+    const revision = calls.find(
+      ({ path, method }) =>
+        method === "POST" && path.endsWith("/question-sets/set-1/versions"),
+    );
+    expect(revision?.body).toMatchObject({ idempotency_key: revisionKey });
+  });
+
+  it("reuses the same create request after an uncertain response and route return", async () => {
+    const calls = mockApi({ createErrorOnce: true });
+    const user = userEvent.setup();
+    const page = renderPage();
+    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await user.click(await screen.findByRole("button", { name: "新建问题集" }));
+    await user.type(screen.getByLabelText("问题集名称"), "待确认问题");
+    await user.type(screen.getByLabelText("每行一个问题"), "如何选择？");
+    await user.click(screen.getByRole("button", { name: "创建并保存问题集" }));
+    await screen.findByText("问题集创建失败");
+    const attempts = () =>
+      calls.filter(
+        ({ path, method }) =>
+          method === "POST" &&
+          path.endsWith("/projects/project-1/question-sets"),
+      );
+    const first = attempts()[0];
+    expect(first).toBeDefined();
+    page.unmount();
+    renderPage("/app/tenant-1/project-1/measurement?tab=sets");
+    expect(await screen.findByLabelText("问题集名称")).toHaveValue(
+      "待确认问题",
+    );
+    expect(screen.getByLabelText("每行一个问题")).toHaveValue("如何选择？");
+    await user.click(screen.getByRole("button", { name: "创建并保存问题集" }));
+    await screen.findByRole("heading", { name: "待确认问题 · v1" });
+    expect(attempts()).toHaveLength(2);
+    expect(attempts()[1].body).toEqual(first.body);
+    expect(attempts()[1].headers.get("Idempotency-Key")).toBe(
+      first.headers.get("Idempotency-Key"),
+    );
+  });
+
+  it("discards malformed stored drafts without breaking measurement or editing", async () => {
+    sessionStorage.setItem(
+      "measurement-drafts:user-1:operator-1:tenant-1:project-1",
+      JSON.stringify({
+        name: 12,
+        creating: true,
+        drafts: { "set-1": { name: "broken", questions: {} } },
+      }),
+    );
+    mockApi({ existing: true });
+    const user = userEvent.setup();
+    renderPage("/app/tenant-1/project-1/measurement?tab=sets&set=set-1");
+    await screen.findByRole("heading", { name: "基础问题 · v1" });
+    expect(screen.queryByLabelText("问题集名称")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "新建问题集" }));
+    expect(screen.getByLabelText("问题集名称")).toHaveValue("");
+    await user.click(screen.getByRole("button", { name: "基于当前版本修订" }));
+    expect(screen.getByLabelText("问题 1")).toHaveValue("怎样选型？");
   });
 });

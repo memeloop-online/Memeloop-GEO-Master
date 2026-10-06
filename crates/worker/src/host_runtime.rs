@@ -27,6 +27,7 @@ use crate::host_ops::{
     op_host_project_revise_v1, op_host_project_start_v1, op_host_publish_submit_v2,
     op_host_question_create_v1, op_host_question_discover_v1, op_host_question_revise_v1,
     op_host_report_get_v1, op_host_report_preview_v1, op_host_report_reduce_v1,
+    op_host_source_recommendations_v1,
 };
 use crate::ops::{HostState, op_host_checkpoint, op_host_emit};
 use crate::runtime::{EmbeddedIsolate, WorkerError};
@@ -55,6 +56,7 @@ deno_core::extension!(
         op_host_measurement_plan_create_v1,
         op_host_measurement_plan_read_v1,
         op_host_project_current_v1,
+        op_host_source_recommendations_v1,
         op_host_project_revise_v1,
         op_host_project_estimate_v1,
         op_host_project_start_v1,

@@ -62,8 +62,9 @@ pub use host::{
     ProjectCurrentResult, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
     PublishReceipt, PublishRequest, PublishState, QuestionDiscoverRequest, QuestionDiscoveryItem,
     QuestionDiscoveryPage, QuestionReference, QuestionReviseRequest, QuestionWriteReceipt,
-    ReportGetRequest, ReportPreviewRequest, ReportReduceRequest, ReviseQuestionSet, TenantScope,
-    ToolCallIdentity, ToolCallOutcome, ToolCallRecorder, redact_secrets,
+    ReportGetRequest, ReportPreviewRequest, ReportReduceRequest, ReviseQuestionSet,
+    SourceRecommendationsRequest, TenantScope, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder,
+    redact_secrets,
 };
 pub use host_runtime::HostRuntime;
 pub use loader::InMemoryModuleLoader;

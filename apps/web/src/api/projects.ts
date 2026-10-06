@@ -169,6 +169,7 @@ export interface UpdateProjectInput {
   revision: number;
   display_name?: string;
   settings?: Partial<ProjectSettings>;
+  idempotencyKey?: string;
 }
 
 export interface ProjectOverview {
@@ -312,11 +313,13 @@ export function updateProject(
   projectId: string,
   input: UpdateProjectInput,
 ): Promise<Project> {
+  const { idempotencyKey, ...body } = input;
   return apiFetch<Project>(`/projects/${encodeURIComponent(projectId)}`, {
     method: "PATCH",
-    body: input,
+    body,
     headers: { "If-Match": String(input.revision) },
     tenantId,
+    idempotencyKey,
   });
 }
 

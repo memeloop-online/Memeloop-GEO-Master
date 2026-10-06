@@ -1,7 +1,7 @@
 use geo_domain::{
-    InitialSource, InitialSourceKind, InitialSourceVisibility, ProjectCreate, ProjectPatch,
-    ProjectRepository, ProjectSettings, ProjectStartCommand, TenantScope, hash_idempotency_key,
-    settings_hash, start_request_hash,
+    DistributionScope, DistributionScopeMode, InitialSource, InitialSourceKind,
+    InitialSourceVisibility, ProjectCreate, ProjectPatch, ProjectRepository, ProjectSettings,
+    ProjectStartCommand, TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{Database, DatabaseConfig, PgProjectRepository};
 use uuid::Uuid;
@@ -10,7 +10,7 @@ use uuid::Uuid;
 #[ignore = "requires disposable GEO_TEST_DATABASE_URL"]
 async fn successor_is_atomic_scoped_frozen_and_recoverable() {
     let url = std::env::var("GEO_TEST_DATABASE_URL").expect("disposable database URL");
-    let database = Database::connect_and_migrate(&DatabaseConfig::from_url(url).unwrap())
+    let database = Database::connect_and_migrate(&DatabaseConfig::from_url(url.clone()).unwrap())
         .await
         .expect("migrations");
     let pool = database.pool();
@@ -75,6 +75,24 @@ async fn successor_is_atomic_scoped_frozen_and_recoverable() {
         .await
         .unwrap();
     let original = repo.get_start(&scope, project.id).await.unwrap().unwrap();
+    let original_snapshot: (Uuid, String, String, String) = sqlx::query_as(
+        "SELECT cycle.config_revision_id, config.settings::text,
+                document.input_refs::text, distribution.input_refs::text
+         FROM optimization_cycles cycle
+         JOIN project_config_revisions config ON config.config_revision_id=cycle.config_revision_id
+         JOIN document_manifests document ON document.cycle_id=cycle.cycle_id
+         JOIN distribution_manifests distribution ON distribution.cycle_id=cycle.cycle_id
+         WHERE cycle.cycle_id=$1",
+    )
+    .bind(accepted.cycle_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let first_scope = DistributionScope {
+        mode: DistributionScopeMode::Explicit,
+        included_platform_ids: vec!["channel-one".to_owned()],
+        ..Default::default()
+    };
     let earlier = original.cutoff_at - chrono::Duration::seconds(1);
     assert!(
         repo.schedule_next_cycle(&scope, project.id, accepted.cycle_id, earlier)
@@ -93,6 +111,7 @@ async fn successor_is_atomic_scoped_frozen_and_recoverable() {
         revision,
         ProjectPatch {
             report_timezone: Some("America/New_York".to_owned()),
+            distribution_scope: Some(first_scope.clone()),
             ..Default::default()
         },
     )
@@ -191,16 +210,120 @@ async fn successor_is_atomic_scoped_frozen_and_recoverable() {
     assert!(successor.cutoff_at < now);
     assert!(!successor.document_manifest.as_ref().unwrap().sealed);
     assert!(!successor.distribution_manifest.as_ref().unwrap().sealed);
+    let mut expected_settings = frozen.clone();
+    expected_settings.distribution_scope = first_scope.clone();
     assert_eq!(
         repo.get_cycle_settings(&scope, project.id, successor.cycle_id)
             .await
             .unwrap(),
-        Some(frozen),
-        "new cycle carries its predecessor's frozen configuration"
+        Some(expected_settings.clone())
+    );
+    let successor_config: (Uuid, i64, String, String, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT config.config_revision_id, config.project_revision, config.settings_hash,
+                    config.settings::text, config.estimate_snapshot
+             FROM project_config_revisions config
+             JOIN optimization_cycles cycle ON cycle.config_revision_id=config.config_revision_id
+             WHERE cycle.cycle_id=$1",
+    )
+    .bind(successor.cycle_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_ne!(successor_config.0, original_snapshot.0);
+    assert_eq!(successor_config.1, revision + 1);
+    assert_eq!(
+        successor_config.2,
+        settings_hash(&expected_settings).unwrap()
+    );
+    assert_eq!(
+        serde_json::from_str::<ProjectSettings>(&successor_config.3).unwrap(),
+        expected_settings
+    );
+    assert_eq!(
+        successor_config.4, None,
+        "old estimate cannot describe new targets"
+    );
+    let successor_manifest: (String, serde_json::Value) = sqlx::query_as(
+        "SELECT scope_hash, input_refs FROM distribution_manifests WHERE cycle_id=$1",
+    )
+    .bind(successor.cycle_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(successor_manifest.0, successor_config.2);
+    assert_eq!(
+        successor_manifest.1["distribution_scope"],
+        serde_json::to_value(&first_scope).unwrap()
+    );
+    let original_after: (Uuid, String, String, String) = sqlx::query_as(
+        "SELECT cycle.config_revision_id, config.settings::text,
+                document.input_refs::text, distribution.input_refs::text
+         FROM optimization_cycles cycle
+         JOIN project_config_revisions config ON config.config_revision_id=cycle.config_revision_id
+         JOIN document_manifests document ON document.cycle_id=cycle.cycle_id
+         JOIN distribution_manifests distribution ON distribution.cycle_id=cycle.cycle_id
+         WHERE cycle.cycle_id=$1",
+    )
+    .bind(accepted.cycle_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(original_after, original_snapshot);
+    let next_scope = DistributionScope {
+        mode: DistributionScopeMode::Explicit,
+        included_platform_ids: vec!["channel-two".to_owned()],
+        ..Default::default()
+    };
+    let latest_revision = repo
+        .get(&scope, project.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    repo.update(
+        &scope,
+        project.id,
+        latest_revision,
+        ProjectPatch {
+            distribution_scope: Some(next_scope.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    drop(repo);
+    drop(database);
+    let database = Database::connect_and_migrate(&DatabaseConfig::from_url(url).unwrap())
+        .await
+        .expect("reconnect");
+    let repo = PgProjectRepository::from_database(&database);
+    assert_eq!(
+        repo.schedule_next_cycle(&scope, project.id, accepted.cycle_id, now)
+            .await
+            .unwrap(),
+        successor
+    );
+    let third = repo
+        .schedule_next_cycle(&scope, project.id, successor.cycle_id, now)
+        .await
+        .unwrap();
+    let mut third_settings = expected_settings.clone();
+    third_settings.distribution_scope = next_scope;
+    assert_eq!(
+        repo.get_cycle_settings(&scope, project.id, third.cycle_id)
+            .await
+            .unwrap(),
+        Some(third_settings)
+    );
+    assert_eq!(
+        repo.get_cycle_settings(&scope, project.id, successor.cycle_id)
+            .await
+            .unwrap(),
+        Some(expected_settings)
     );
     assert_eq!(
         repo.get_current_cycle(&scope, project.id).await.unwrap(),
-        Some(successor.clone())
+        Some(third.clone())
     );
     assert_eq!(
         repo.get_start(&scope, project.id).await.unwrap(),
