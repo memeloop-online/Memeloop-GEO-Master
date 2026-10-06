@@ -47,6 +47,9 @@ disclaimer text that follows:
 
     // Copyright Joyent, Inc. and other Node contributors.
 
+       * base64-arraybuffer
+       * https://github.com/niklasvh/base64-arraybuffer
+       *
        * Copyright (c) 2012 Niklas von Hertzen
        * Licensed under the MIT license.
 
