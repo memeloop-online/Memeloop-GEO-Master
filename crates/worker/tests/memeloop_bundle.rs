@@ -209,6 +209,7 @@ impl HostOps for RecordingHostOps {
                 .enumerate()
                 .map(|(index, item)| KnowledgeImportAttachmentResultItem {
                     attachment_id: item.attachment_id,
+                    import_job_id: None,
                     status: if index == 0 {
                         ImportStatus::Succeeded
                     } else {

@@ -34,9 +34,9 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AgentRepository, AgentRuntime, AppError, AttachmentReference, ChannelOutcomeStatus,
     DistributionManifest, DistributionTarget, DocumentManifestItemState, DocumentManifestState,
-    ErrorCode, ImportItem, ImportStatus, KnowledgeRepository, RUNTIME_NOT_CONFIGURED,
-    RecordToolCall, ReportSnapshot, RuntimeCapability, SourceKind, TenantScope, ToolCallDecision,
-    TurnInput, TurnReport,
+    ErrorCode, ImportItem, ImportStatus, KnowledgeImportProgress, KnowledgeRepository,
+    RUNTIME_NOT_CONFIGURED, RecordToolCall, ReportSnapshot, RuntimeCapability, SourceKind,
+    TenantScope, ToolCallDecision, TurnInput, TurnReport,
 };
 use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryPage, ChannelExecutionResult, ChannelManifestPage,
@@ -1279,6 +1279,7 @@ impl HostOps for RepositoryHostOps {
             .await;
             let mut item = geo_worker::KnowledgeImportAttachmentResultItem {
                 attachment_id: requested.attachment_id,
+                import_job_id: None,
                 status: ImportStatus::Failed,
                 source_id: None,
                 source_version_id: None,
@@ -1288,12 +1289,17 @@ impl HostOps for RepositoryHostOps {
             match result {
                 Ok(receipt) => {
                     item.status = receipt.status;
+                    item.import_job_id = receipt.import_job.map(|job| job.import_job_id);
                     item.source_id = receipt.source.map(|source| source.source_id);
-                    item.source_version_id = receipt
-                        .source_version
-                        .map(|version| version.source_version_id);
-                    item.knowledge_release_id =
-                        receipt.release.map(|release| release.knowledge_release_id);
+                    // A queued PDF can have a staging version, but no usable
+                    // evidence until its release is actually persisted.
+                    if matches!(item.status, ImportStatus::Succeeded | ImportStatus::Partial) {
+                        item.source_version_id = receipt
+                            .source_version
+                            .map(|version| version.source_version_id);
+                        item.knowledge_release_id =
+                            receipt.release.map(|release| release.knowledge_release_id);
+                    }
                     item.error = receipt.error;
                 }
                 Err(error) => item.error = Some(error),
@@ -1301,6 +1307,19 @@ impl HostOps for RepositoryHostOps {
             items.push(item);
         }
         Ok(geo_worker::KnowledgeImportAttachmentsResult { items })
+    }
+
+    async fn knowledge_import_status(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::KnowledgeImportStatusRequest,
+    ) -> Result<KnowledgeImportProgress, HostOpError> {
+        let op = HostOp::KnowledgeImportStatus;
+        self.knowledge
+            .get_import_progress(scope, request.import_job_id, request.purpose)
+            .await
+            .map_err(|error| worker_error(op, error))?
+            .ok_or_else(|| HostOpError::not_found(op, "import job not found"))
     }
 
     async fn model_complete(

@@ -97,6 +97,93 @@ pub enum ImportStatus {
     Cancelled,
 }
 
+/// Bounded, non-sensitive import state for polling and receipt reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeImportProgress {
+    pub import_job_id: Option<Uuid>,
+    pub status: ImportStatus,
+    pub stage: Option<ImportStage>,
+    pub source_id: Option<Uuid>,
+    pub source_version_id: Option<Uuid>,
+    pub knowledge_release_id: Option<Uuid>,
+    pub completed_units: i32,
+    pub failed_units: i32,
+    /// Total errors, including entries omitted from the bounded `errors` list.
+    pub error_count: u32,
+    pub errors: Vec<KnowledgeImportProgressError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeImportProgressError {
+    pub code: String,
+    pub page: Option<u32>,
+}
+
+/// Never reflect arbitrary parser or operation messages into progress reads.
+pub fn knowledge_import_progress_error(value: &Value) -> KnowledgeImportProgressError {
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|code| {
+            matches!(
+                *code,
+                "capability_missing"
+                    | "invalid_request"
+                    | "not_found"
+                    | "conflict"
+                    | "dependency_unavailable"
+                    | "invalid_pdf"
+                    | "encrypted_pdf"
+                    | "parse_failed"
+                    | "page_limit"
+                    | "ocr_required"
+                    | "empty_text"
+            )
+        })
+        .unwrap_or("import_failed");
+    KnowledgeImportProgressError {
+        code: code.to_owned(),
+        page: value
+            .get("page")
+            .and_then(Value::as_u64)
+            .and_then(|page| u32::try_from(page).ok())
+            .filter(|page| *page > 0),
+    }
+}
+
+pub fn knowledge_import_progress_errors(
+    values: &[Value],
+) -> (u32, Vec<KnowledgeImportProgressError>) {
+    (
+        u32::try_from(values.len()).unwrap_or(u32::MAX),
+        values
+            .iter()
+            .take(100)
+            .map(knowledge_import_progress_error)
+            .collect(),
+    )
+}
+
+pub fn knowledge_import_progress_app_error(error: &AppError) -> KnowledgeImportProgressError {
+    let code = match error.code {
+        ErrorCode::InvalidRequest => "invalid_request",
+        ErrorCode::Unauthorized => "unauthorized",
+        ErrorCode::Forbidden => "forbidden",
+        ErrorCode::NotFound => "not_found",
+        ErrorCode::Conflict => "conflict",
+        ErrorCode::NotReady => "not_ready",
+        ErrorCode::CapabilityMissing => "capability_missing",
+        ErrorCode::DependencyUnavailable => "dependency_unavailable",
+        ErrorCode::Internal => "import_failed",
+    };
+    KnowledgeImportProgressError {
+        code: code.to_owned(),
+        page: None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ChunkKind {
@@ -846,6 +933,27 @@ pub struct KnowledgeOverview {
 #[async_trait]
 pub trait KnowledgeRepository: Send + Sync {
     async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError>;
+    /// Read a single original job; PDF retry successors are never followed implicitly.
+    async fn get_import_progress(
+        &self,
+        _scope: &TenantScope,
+        _job_id: Uuid,
+        _purpose: KnowledgePurpose,
+    ) -> Result<Option<KnowledgeImportProgress>, AppError> {
+        Err(AppError::capability_missing(
+            "import progress is not configured",
+        ))
+    }
+    /// Resolve only the original scoped receipt for this exact import request.
+    async fn resolve_import_receipt(
+        &self,
+        _scope: &TenantScope,
+        _expected: &ImportItem,
+    ) -> Result<Option<KnowledgeImportProgress>, AppError> {
+        Err(AppError::capability_missing(
+            "import receipt lookup is not configured",
+        ))
+    }
     /// A strict `(created_at, job_id)` cursor, not an offset into an unstable queue.
     async fn pdf_parse_candidates(
         &self,
@@ -1048,6 +1156,135 @@ struct MemoryState {
 }
 
 impl MemoryKnowledgeRepository {
+    fn progress_for_job_locked(
+        state: &MemoryState,
+        scope: &TenantScope,
+        job: &ImportJob,
+        purpose: KnowledgePurpose,
+    ) -> Result<Option<KnowledgeImportProgress>, AppError> {
+        let Some(source) = state
+            .sources
+            .get(&job.source_id)
+            .filter(|source| Self::in_scope(scope, *source))
+            .filter(|source| {
+                source.state == SourceState::Active
+                    && (purpose == KnowledgePurpose::Internal
+                        || source.purpose == KnowledgePurpose::Public)
+            })
+        else {
+            return Ok(None);
+        };
+        let (error_count, errors) = knowledge_import_progress_errors(&job.errors);
+        let mut progress = KnowledgeImportProgress {
+            import_job_id: Some(job.import_job_id),
+            status: job.status,
+            stage: Some(job.stage),
+            source_id: Some(source.source_id),
+            source_version_id: None,
+            knowledge_release_id: None,
+            completed_units: job.completed_units,
+            failed_units: job.failed_units,
+            error_count,
+            errors,
+        };
+        if matches!(job.status, ImportStatus::Succeeded | ImportStatus::Partial) {
+            if job.stage != ImportStage::Release {
+                return Err(AppError::conflict("import completion is inconsistent"));
+            }
+            let version_id = job
+                .source_version_id
+                .ok_or_else(|| AppError::conflict("import version is missing"))?;
+            let version = state
+                .versions
+                .get(&version_id)
+                .filter(|version| Self::in_scope(scope, *version))
+                .filter(|version| version.source_id == job.source_id)
+                .filter(|version| version.content_sha256 == job.input_hash)
+                .ok_or_else(|| AppError::conflict("import version is inconsistent"))?;
+            let operation = state
+                .operations
+                .get(&job.operation_id)
+                .filter(|operation| operation.scope == *scope)
+                .filter(|operation| operation.status == OperationStatus::Succeeded)
+                .ok_or_else(|| AppError::conflict("import operation is inconsistent"))?;
+            let result = operation
+                .result
+                .as_ref()
+                .ok_or_else(|| AppError::conflict("import result is missing"))?;
+            if result.get("source_id").and_then(Value::as_str)
+                != Some(source.source_id.to_string().as_str())
+                || result.get("source_version_id").and_then(Value::as_str)
+                    != Some(version.source_version_id.to_string().as_str())
+            {
+                return Err(AppError::conflict("import result is inconsistent"));
+            }
+            let release_id = result
+                .get("knowledge_release_id")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .ok_or_else(|| AppError::conflict("import release is missing"))?;
+            let release = state
+                .releases
+                .get(&release_id)
+                .filter(|release| Self::in_scope(scope, *release))
+                .filter(|release| release.source_version_refs.contains(&version_id))
+                .ok_or_else(|| AppError::conflict("import release is inconsistent"))?;
+            if let Some(pdf) = state.pdf_jobs.get(&job.import_job_id) {
+                state
+                    .stored_objects
+                    .get(&pdf.object_id)
+                    .filter(|object| Self::in_scope(scope, *object))
+                    .filter(|object| object.sha256 == job.input_hash)
+                    .filter(|object| {
+                        version.object_id == Some(object.object_id)
+                            && version.object_version == Some(object.object_version)
+                    })
+                    .ok_or_else(|| AppError::conflict("import object is inconsistent"))?;
+                let final_acceptance = pdf
+                    .acceptance
+                    .as_ref()
+                    .ok_or_else(|| AppError::conflict("PDF final receipt is missing"))?;
+                if final_acceptance.status != job.status
+                    || final_acceptance
+                        .import_job
+                        .as_ref()
+                        .map(|accepted| accepted.import_job_id)
+                        != Some(job.import_job_id)
+                    || final_acceptance
+                        .source
+                        .as_ref()
+                        .map(|accepted| accepted.source_id)
+                        != Some(source.source_id)
+                    || final_acceptance
+                        .source_version
+                        .as_ref()
+                        .map(|accepted| accepted.source_version_id)
+                        != Some(version_id)
+                    || final_acceptance
+                        .release
+                        .as_ref()
+                        .map(|accepted| accepted.knowledge_release_id)
+                        != Some(release_id)
+                {
+                    return Err(AppError::conflict("PDF final receipt is inconsistent"));
+                }
+            } else if let Some(object_id) = version.object_id {
+                state
+                    .stored_objects
+                    .get(&object_id)
+                    .filter(|object| Self::in_scope(scope, *object))
+                    .filter(|object| {
+                        object.sha256 == job.input_hash
+                            && version.object_version == Some(object.object_version)
+                    })
+                    .ok_or_else(|| AppError::conflict("import object is inconsistent"))?;
+            }
+            progress.source_version_id = Some(version_id);
+            progress.knowledge_release_id = Some(release.knowledge_release_id);
+        }
+        Ok(Some(progress))
+    }
+
     pub fn with_pdf_parser_profile(profile: String) -> Self {
         Self {
             state: RwLock::new(MemoryState::default()),
@@ -1307,6 +1544,7 @@ impl MemoryKnowledgeRepository {
             "source_version_id": version.source_version_id,
             "knowledge_release_id": release.knowledge_release_id
         }));
+        state.operations.insert(operation.id, operation.clone());
         Ok(ImportAcceptance {
             client_item_id: item.client_item_id.clone(),
             status: ImportStatus::Succeeded,
@@ -1556,6 +1794,103 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 .push("OCR for scanned PDFs is not configured".to_owned());
         }
         Ok(capability)
+    }
+
+    async fn get_import_progress(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+        purpose: KnowledgePurpose,
+    ) -> Result<Option<KnowledgeImportProgress>, AppError> {
+        Self::require_project(scope)?;
+        let state = self.state.read().await;
+        let Some(job) = state
+            .jobs
+            .get(&job_id)
+            .filter(|job| Self::in_scope(scope, *job))
+        else {
+            return Ok(None);
+        };
+        Self::progress_for_job_locked(&state, scope, job, purpose)
+    }
+
+    async fn resolve_import_receipt(
+        &self,
+        scope: &TenantScope,
+        expected: &ImportItem,
+    ) -> Result<Option<KnowledgeImportProgress>, AppError> {
+        Self::require_project(scope)?;
+        let state = self.state.read().await;
+        let key = (
+            scope.storage_key(),
+            expected.client_item_id.trim().to_owned(),
+        );
+        let Some((hash, receipt)) = state.import_items.get(&key) else {
+            return Ok(None);
+        };
+        if *hash != import_item_hash(expected)? {
+            return Err(AppError::conflict(
+                "client_item_id was already used with different input",
+            ));
+        }
+        if let Some(job) = &receipt.import_job {
+            let current = state
+                .jobs
+                .get(&job.import_job_id)
+                .filter(|current| Self::in_scope(scope, *current))
+                .ok_or_else(|| AppError::conflict("import receipt job is inconsistent"))?;
+            if job.source_id != current.source_id
+                || job.operation_id != current.operation_id
+                || receipt.source.as_ref().map(|source| source.source_id) != Some(current.source_id)
+            {
+                return Err(AppError::conflict("import receipt job is inconsistent"));
+            }
+            if state.sources.get(&current.source_id).is_none_or(|source| {
+                !Self::in_scope(scope, source)
+                    || source.state != SourceState::Active
+                    || source.purpose != expected.purpose
+            }) {
+                return Ok(None);
+            }
+            return Self::progress_for_job_locked(&state, scope, current, expected.purpose);
+        }
+        if receipt.status != ImportStatus::Failed
+            || receipt.source_version.is_some()
+            || receipt.release.is_some()
+        {
+            return Err(AppError::conflict("import receipt is inconsistent"));
+        }
+        if let Some(source) = receipt.source.as_ref() {
+            let Some(current) = state
+                .sources
+                .get(&source.source_id)
+                .filter(|current| Self::in_scope(scope, *current))
+                .filter(|current| {
+                    current.state == SourceState::Active && current.purpose == expected.purpose
+                })
+            else {
+                return Ok(None);
+            };
+            if source.source_id != current.source_id {
+                return Err(AppError::conflict("import receipt source is inconsistent"));
+            }
+        }
+        let error = receipt
+            .error
+            .as_ref()
+            .map(knowledge_import_progress_app_error);
+        Ok(Some(KnowledgeImportProgress {
+            import_job_id: None,
+            status: ImportStatus::Failed,
+            stage: None,
+            source_id: receipt.source.as_ref().map(|source| source.source_id),
+            source_version_id: None,
+            knowledge_release_id: None,
+            completed_units: 0,
+            failed_units: 0,
+            error_count: u32::from(error.is_some()),
+            errors: error.into_iter().collect(),
+        }))
     }
 
     async fn pdf_parse_candidates(
@@ -4175,6 +4510,382 @@ mod tests {
             crate::ErrorCode::CapabilityMissing
         );
         assert_eq!(repository.list_sources(&scope).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn import_progress_errors_are_bounded_and_never_reflect_raw_input() {
+        let input = (0..104)
+            .map(|page| {
+                serde_json::json!({
+                    "code": format!("filename-private-{page}"),
+                    "page":page + 1,
+                    "text":"confidential extracted bytes",
+                    "locator":"private resource"
+                })
+            })
+            .collect::<Vec<_>>();
+        let (count, errors) = super::knowledge_import_progress_errors(&input);
+        assert_eq!(count, 104);
+        assert_eq!(errors.len(), 100);
+        assert_eq!(errors[0].code, "import_failed");
+        assert_eq!(errors[0].page, Some(1));
+        let encoded = serde_json::to_string(&errors).unwrap();
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("confidential"));
+        assert_eq!(
+            super::knowledge_import_progress_error(
+                &serde_json::json!({"code":"ocr_required","page":4294967296_u64})
+            )
+            .page,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_progress_reads_original_live_job_and_rechecks_source_and_release() {
+        let repo = MemoryKnowledgeRepository::with_pdf_parser_profile("test-parser-v1".to_owned());
+        let scope = scope();
+        let bytes = b"%PDF-1.7\nverified original bytes".to_vec();
+        let session = repo
+            .create_upload_session(
+                &scope,
+                UploadSessionCommand {
+                    filename: "input.pdf".to_owned(),
+                    declared_media_type: "application/pdf".to_owned(),
+                    expected_size: bytes.len() as u64,
+                    expected_sha256: sha256_hex(&bytes),
+                    purpose: KnowledgePurpose::Public,
+                },
+            )
+            .await
+            .unwrap();
+        repo.put_upload_content(&scope, session.upload_session_id, bytes)
+            .await
+            .unwrap();
+        let (object, name) = repo
+            .complete_attachment_upload(&scope, session.upload_session_id, "attachment")
+            .await
+            .unwrap();
+        let item = ImportItem {
+            client_item_id: "safe-receipt".to_owned(),
+            kind: SourceKind::Object,
+            name,
+            purpose: KnowledgePurpose::Public,
+            text: None,
+            url: None,
+            object_id: Some(object.object_id),
+            knowledge_release_id: None,
+        };
+        assert!(
+            repo.resolve_import_receipt(&scope, &item)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let receipt = repo
+            .import_batch(&scope, vec![item.clone()])
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+        let job_id = receipt.import_job.as_ref().unwrap().import_job_id;
+        assert_eq!(receipt.status, ImportStatus::Queued);
+        let queued = repo
+            .resolve_import_receipt(&scope, &item)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.import_job_id, Some(job_id));
+        assert_eq!(queued.status, ImportStatus::Queued);
+        assert!(queued.source_version_id.is_none());
+        let cross_project = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        assert!(
+            repo.get_import_progress(&cross_project, job_id, item.purpose)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.resolve_import_receipt(&cross_project, &item)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = item.clone();
+        changed.name = "different.pdf".to_owned();
+        assert_eq!(
+            repo.resolve_import_receipt(&scope, &changed)
+                .await
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::Conflict
+        );
+        let lease = repo
+            .claim_pdf_parse(&scope, job_id, Uuid::new_v4(), 30)
+            .await
+            .unwrap()
+            .unwrap();
+        let input = repo.pdf_parse_input(&scope, &lease).await.unwrap();
+        repo.record_pdf_manifest(
+            &scope,
+            &lease,
+            PdfDocumentManifest {
+                schema_version: PDF_PARSE_SCHEMA_VERSION.to_owned(),
+                input_sha256: input.input_sha256,
+                parser_version: input.parser_profile,
+                page_count: 2,
+            },
+        )
+        .await
+        .unwrap();
+        repo.record_pdf_page(
+            &scope,
+            &lease,
+            PdfPageResult::Success {
+                page: 1,
+                text: "Good searchable text".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        repo.record_pdf_page(
+            &scope,
+            &lease,
+            PdfPageResult::Failure {
+                page: 2,
+                code: "ocr_required".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let running = repo
+            .get_import_progress(&scope, job_id, item.purpose)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, ImportStatus::Running);
+        assert_eq!((running.completed_units, running.failed_units), (1, 1));
+        assert!(running.source_version_id.is_none());
+        let completed = repo.finish_pdf_parse(&scope, &lease).await.unwrap();
+        assert_eq!(completed.status, ImportStatus::Partial);
+        assert_eq!(receipt.status, ImportStatus::Queued); // immutable receipt
+        let partial = repo
+            .resolve_import_receipt(&scope, &item)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.status, ImportStatus::Partial);
+        assert_eq!(
+            repo.get_import_progress(&scope, job_id, KnowledgePurpose::Internal)
+                .await
+                .unwrap()
+                .unwrap(),
+            partial
+        );
+        assert_eq!(
+            partial.source_version_id,
+            completed
+                .source_version
+                .as_ref()
+                .map(|v| v.source_version_id)
+        );
+        assert_eq!(
+            partial.knowledge_release_id,
+            completed.release.as_ref().map(|r| r.knowledge_release_id)
+        );
+        assert_eq!(partial.errors[0].code, "ocr_required");
+        let retry = repo.retry_pdf_parse(&scope, job_id).await.unwrap();
+        assert_ne!(retry.import_job_id, job_id);
+        let retry_lease = repo
+            .claim_pdf_parse(&scope, retry.import_job_id, Uuid::new_v4(), 30)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.record_pdf_page(
+            &scope,
+            &retry_lease,
+            PdfPageResult::Success {
+                page: 2,
+                text: "Recovered text".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let retried = repo.finish_pdf_parse(&scope, &retry_lease).await.unwrap();
+        assert_eq!(retried.status, ImportStatus::Succeeded);
+        assert_ne!(
+            retried.release.as_ref().unwrap().knowledge_release_id,
+            partial.knowledge_release_id.unwrap()
+        );
+        assert_eq!(
+            repo.resolve_import_receipt(&scope, &item)
+                .await
+                .unwrap()
+                .unwrap(),
+            partial
+        );
+        {
+            let mut state = repo.state.write().await;
+            state
+                .sources
+                .get_mut(&partial.source_id.unwrap())
+                .unwrap()
+                .purpose = KnowledgePurpose::Internal;
+        }
+        assert!(
+            repo.resolve_import_receipt(&scope, &item)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_import_progress(&scope, job_id, KnowledgePurpose::Public)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_import_progress(&scope, job_id, KnowledgePurpose::Internal)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        {
+            let mut state = repo.state.write().await;
+            state
+                .sources
+                .get_mut(&partial.source_id.unwrap())
+                .unwrap()
+                .purpose = KnowledgePurpose::Public;
+            state
+                .releases
+                .get_mut(&partial.knowledge_release_id.unwrap())
+                .unwrap()
+                .source_version_refs
+                .clear();
+        }
+        assert_eq!(
+            repo.get_import_progress(&scope, job_id, item.purpose)
+                .await
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::Conflict
+        );
+        {
+            let mut state = repo.state.write().await;
+            state
+                .releases
+                .get_mut(&partial.knowledge_release_id.unwrap())
+                .unwrap()
+                .source_version_refs
+                .push(partial.source_version_id.unwrap());
+            state
+                .stored_objects
+                .get_mut(&object.object_id)
+                .unwrap()
+                .sha256 = "mismatched".to_owned();
+        }
+        assert_eq!(
+            repo.get_import_progress(&scope, job_id, item.purpose)
+                .await
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_failure_and_synchronous_success_have_live_safe_progress() {
+        let repo = MemoryKnowledgeRepository::default();
+        let scope = scope();
+        let failed = ImportItem {
+            client_item_id: "failed".to_owned(),
+            kind: SourceKind::Object,
+            name: "unavailable".to_owned(),
+            purpose: KnowledgePurpose::Internal,
+            text: None,
+            url: None,
+            object_id: Some(Uuid::new_v4()),
+            knowledge_release_id: None,
+        };
+        let acceptance = repo
+            .import_batch(&scope, vec![failed.clone()])
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+        assert!(acceptance.import_job.is_none());
+        let progress = repo
+            .resolve_import_receipt(&scope, &failed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.status, ImportStatus::Failed);
+        assert_eq!(progress.import_job_id, None);
+        assert_eq!(progress.error_count, 1);
+        assert_eq!(progress.errors[0].code, "not_found");
+        let success = ImportItem {
+            client_item_id: "success".to_owned(),
+            kind: SourceKind::Text,
+            name: "generic".to_owned(),
+            purpose: KnowledgePurpose::Public,
+            text: Some("evidence text".to_owned()),
+            url: None,
+            object_id: None,
+            knowledge_release_id: None,
+        };
+        let acceptance = repo
+            .import_batch(&scope, vec![success.clone()])
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+        let progress = repo
+            .resolve_import_receipt(&scope, &success)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.status, ImportStatus::Succeeded);
+        assert_eq!(
+            progress.source_version_id,
+            acceptance
+                .source_version
+                .as_ref()
+                .map(|v| v.source_version_id)
+        );
+        assert_eq!(
+            progress.knowledge_release_id,
+            acceptance.release.as_ref().map(|r| r.knowledge_release_id)
+        );
+        assert_eq!(
+            repo.get_import_progress(
+                &scope,
+                acceptance.import_job.unwrap().import_job_id,
+                success.purpose
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            progress
+        );
+        {
+            let mut state = repo.state.write().await;
+            state
+                .sources
+                .get_mut(&progress.source_id.unwrap())
+                .unwrap()
+                .state = super::SourceState::Removed;
+        }
+        assert!(
+            repo.resolve_import_receipt(&scope, &success)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

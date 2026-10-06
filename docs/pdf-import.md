@@ -12,9 +12,11 @@
 
 ### P00 自动接续：下一实施切片，尚未完成
 
-当前 `agent_runtime.rs` 的附件导入投影没有返回解析 job ID，worker 结果 DTO 也尚无该引用。后台解析完成不能据此自动恢复正在等待的 MemeLoop 阶段；直接 runner 没有 phase-resume 入口。
+当前附件导入投影返回真实 `import_job_id`，排队或运行时不返回临时知识版本或 release。后台解析完成仍不能自动恢复正在等待的 MemeLoop 阶段；直接 runner 没有 phase-resume 入口。
 
-不依赖上游修改的下一最小切片是明确标识的“资料完成后自动后续回答”，不是原 Run 中途恢复：
+进一步核验锁定上游代码发现：`startAgentToolLoopTurn` 无条件构造 `role: "user"`，`createAgentToolLoopRunner` 每次都会调用它；预置系统消息或在 metadata 标记自动来源均不能避免新增用户消息。此前假设可仅在 GEO 新增系统 turn 的方案尚不成立。必须先取得上游正式系统刺激入口（或验证现有正式编排入口支持它），不能伪造用户发言或复制 Agent 循环。上游修改授权已请求，尚未取得。
+
+正确的后续切片目标是明确标识的“资料完成后自动后续回答”，不是原 Run 中途恢复：
 
 - 在显式导入边界保存原 message/turn/run、工具调用、job 集合及回答目标；与入队原子保存，或先保存可对账意图，避免任务先完成而关联丢失。
 - 复用解析完成事务中的 ready/partial/failed outbox，并增加分页补偿扫描。按稳定依赖身份去重，只创建一次后续 queued run。
@@ -22,6 +24,17 @@
 - 创建 continuation、run 和会话事件同事务；沿用会话串行。原请求取消抑制关联接续，部分成功/全失败按实际结果回答，不伪造引用。
 
 实施接缝为 `crates/api/src/agent_runtime.rs`、`crates/worker/src/host.rs`、Agent 仓储/dispatcher、PDF 完成 outbox 及 P00 事件呈现。验收须覆盖页面关闭、完成早于关联、乱序重复事件、多副本、事务边界重启、取消竞争和跨租户隔离。该方案解决后续任务入队恢复，不解决新 Run 的 running 阶段崩溃；完整同 Run 恢复仍按 `agent-tool-ledger.md` 的依赖推进。
+
+已接入的前置能力是：导入结果返回真实 job ID、作用域内只读查询实时进度、按原始收据键核对任务、返回实际最终 release/version。验证状态以工作日志为准。这些前置能力不等于自动接续已经交付。
+
+### 实时进度读取契约
+
+- HTTP：`GET /api/v1/knowledge/import-jobs/{id}?project_id=<uuid>&purpose=internal`。沿用会话及项目可见性，`purpose` 可取 `public` 或 `internal`，省略时为 `internal`；不存在或当前不可见返回 404，空 UUID 返回 400。
+- P00：`knowledge_import_status` 调用 Rust `knowledge.import_status.v1`，只接受 `import_job_id` 和 `purpose`，不接受调用方指定租户。宿主面升级为 `geo.hostops.v8`，部署必须同步重新生成的 bundle 及摘要。
+- 返回实际状态、阶段、成功/失败单元数、固定错误码和原始任务引用。错误最多返回 100 项，`error_count` 保留总数；不读取正文、原件或返回解析器异常。`internal` 可见公共与内部资料，`public` 仅可见公共资料。
+- 仅 `succeeded` / `partial` 返回经过任务、原件摘要、操作结果及不可变 release 成员核对的版本和 release；其余状态没有可用证据引用。重试不把旧任务偷偷替换为后继任务。
+- 仓储 `resolve_import_receipt` 按原始 `client_item_id` 和完整导入输入摘要核对原收据，再读取原任务实时状态；当前用途改变或资料撤销时不可作为原依赖的有效结果。此方法仅供可信后台协调，不暴露新的写接口。
+- 查询不重新导入、不重试、不等待解析完成。模型应说明排队或部分成功的实际状态，不以无限轮询代替尚未实现的系统接续。
 
 ## 存储与调度
 

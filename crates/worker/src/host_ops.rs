@@ -27,8 +27,9 @@ use crate::host::{
     ContentItemsReadRequest, ContentStartRequest, ContentStepRequest, DistributionReadRequest,
     DistributionResumeRequest, DistributionStartRequest, DistributionTargetsReadRequest,
     HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
-    KnowledgeSearchRequest, KnowledgeSearchResult, ManifestReadRequest, MeasureRequest,
-    ModelCompletionRequest, PublishRequest, ReportGetRequest, ReportReduceRequest,
+    KnowledgeImportStatusRequest, KnowledgeSearchRequest, KnowledgeSearchResult,
+    ManifestReadRequest, MeasureRequest, ModelCompletionRequest, PublishRequest, ReportGetRequest,
+    ReportReduceRequest,
 };
 
 #[op2]
@@ -456,6 +457,34 @@ pub async fn op_host_knowledge_import_attachments_v1(
     Ok(encode(op, &result)?)
 }
 
+/// Reads exactly one bound-scope job; completion references come from the
+/// repository and are validated before recording a successful tool outcome.
+#[op2]
+#[string]
+pub async fn op_host_knowledge_import_status_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::KnowledgeImportStatus;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<KnowledgeImportStatusRequest>(op, &request)?;
+    if request.import_job_id.is_nil() {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "import job reference must be non-zero",
+        )));
+    }
+    let progress = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .knowledge_import_status(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &progress)?)
+}
+
 /// Evidence retrieval restricted to the run's frozen knowledge release.
 ///
 /// A bridge that reports the retrieval capability as missing fails the op: an
@@ -652,6 +681,7 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ModelComplete.op_name(),
     HostOp::KnowledgeSearch.op_name(),
     HostOp::KnowledgeImportAttachments.op_name(),
+    HostOp::KnowledgeImportStatus.op_name(),
     HostOp::ManifestRead.op_name(),
     HostOp::Publish.op_name(),
     HostOp::Measure.op_name(),

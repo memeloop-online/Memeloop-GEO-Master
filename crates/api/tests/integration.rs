@@ -150,6 +150,31 @@ async fn knowledge_release_plans_a_scoped_sealed_document_manifest() {
     let start: Value =
         serde_json::from_slice(&to_bytes(start.into_body(), 64 * 1024).await.unwrap()).unwrap();
     let selector = format!("tenant_id={tenant_id}&project_id={project_id}");
+    let missing_job = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!(
+                "/api/v1/knowledge/import-jobs/{}?{selector}",
+                Uuid::new_v4()
+            ),
+            &viewer_cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_job.status(), StatusCode::NOT_FOUND);
+    let invalid_job = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/knowledge/import-jobs/{}?{selector}", Uuid::nil()),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_job.status(), StatusCode::BAD_REQUEST);
     let manifest_id = start["document_manifest"]["manifest_id"].as_str().unwrap();
     let read_uri = format!("/api/v1/knowledge/document-manifests/{manifest_id}?{selector}");
     let pending = app
@@ -175,6 +200,32 @@ async fn knowledge_release_plans_a_scoped_sealed_document_manifest() {
     assert_eq!(imported.status(), StatusCode::ACCEPTED);
     let imported: Value =
         serde_json::from_slice(&to_bytes(imported.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let job_id = imported["items"][0]["import_job"]["import_job_id"]
+        .as_str()
+        .unwrap();
+    let status = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            &format!("/api/v1/knowledge/import-jobs/{job_id}?{selector}&purpose=public"),
+            &viewer_cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: Value =
+        serde_json::from_slice(&to_bytes(status.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(status["import_job_id"], job_id);
+    assert_eq!(status["status"], "succeeded");
+    assert_eq!(
+        status["knowledge_release_id"],
+        imported["items"][0]["release"]["knowledge_release_id"]
+    );
+    assert_eq!(
+        status["source_version_id"],
+        imported["items"][0]["source_version"]["source_version_id"]
+    );
     let input = json!({
         "manifest_id": start["document_manifest"]["manifest_id"],
         "knowledge_release_id": imported["items"][0]["release"]["knowledge_release_id"]

@@ -9,9 +9,9 @@ use axum::{
 use geo_domain::{
     AppError, CurrentKnowledgeRelease, DocumentManifest, DocumentManifestPlanRequest,
     ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, InitialSourceKind,
-    KnowledgeAskResult, KnowledgeCapability, KnowledgeSearchRequest, KnowledgeSearchResult,
-    MAX_UPLOAD_BYTES, Product, ProjectId, Source, SourceDetail, SourceVersion, TenantScope,
-    UploadSession, UploadSessionCommand,
+    KnowledgeAskResult, KnowledgeCapability, KnowledgeImportProgress, KnowledgePurpose,
+    KnowledgeSearchRequest, KnowledgeSearchResult, MAX_UPLOAD_BYTES, Product, ProjectId, Source,
+    SourceDetail, SourceVersion, TenantScope, UploadSession, UploadSessionCommand,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -435,6 +435,58 @@ pub(crate) async fn get_source(
         .ok_or_else(|| api_error(AppError::not_found("source not found"), context.request_id))
 }
 
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportStatusQuery {
+    pub project_id: ProjectId,
+    #[serde(default = "default_import_status_purpose")]
+    pub purpose: KnowledgePurpose,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tenant_id: Option<String>,
+}
+
+fn default_import_status_purpose() -> KnowledgePurpose {
+    KnowledgePurpose::Internal
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/import-jobs/{id}",
+    security(("sessionCookie" = [])),
+    params(("id" = Uuid, Path), ("project_id" = ProjectId, Query), ("purpose" = Option<KnowledgePurpose>, Query)),
+    responses((status = 200, body = KnowledgeImportProgress), (status = 404, body = ErrorResponse))
+)]
+pub(crate) async fn get_import_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ImportStatusQuery>,
+    Extension(tenant_scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<KnowledgeImportProgress>, ApiError> {
+    if id.is_nil() {
+        return Err(api_error(
+            AppError::invalid_request("invalid import job ID"),
+            context.request_id,
+        ));
+    }
+    let scope = knowledge_scope(&state, &tenant_scope, query.project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    state
+        .knowledge_repository()
+        .get_import_progress(&scope, id, query.purpose)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .map(Json)
+        .ok_or_else(|| {
+            api_error(
+                AppError::not_found("import job not found"),
+                context.request_id,
+            )
+        })
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/knowledge/import-jobs/{id}/retry",
@@ -745,6 +797,7 @@ pub(crate) fn routes() -> Router<AppState> {
             post(materialize_initial_sources),
         )
         .route("/knowledge/sources", get(list_sources))
+        .route("/knowledge/import-jobs/{id}", get(get_import_job))
         .route("/knowledge/import-jobs/{id}/retry", post(retry_import_job))
         .route("/knowledge/sources/{id}", get(get_source))
         .route(

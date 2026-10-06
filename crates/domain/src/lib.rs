@@ -62,13 +62,15 @@ pub use knowledge::{
     DocumentManifestPlanRequest, DocumentManifestState, EvidenceRef, Fact, FactStatus,
     ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, ImportStage, ImportStatus,
     KnowledgeAnswerStatus, KnowledgeAskResult, KnowledgeCapability, KnowledgeCoverage,
-    KnowledgeEvidence, KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
-    KnowledgeSearchRequest, KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES,
-    MemoryKnowledgeRepository, Product, ProductState, Source, SourceDetail, SourceKind,
-    SourceState, SourceVersion, StoredObject, StoredObjectState, UPLOAD_SESSION_TTL_SECONDS,
-    UploadSession, UploadSessionCommand, UploadSessionState, deterministic_chunks,
-    is_supported_knowledge_media_type, knowledge_parser_version, parsed_knowledge_chunks,
-    plan_document_manifest, sha256_hex,
+    KnowledgeEvidence, KnowledgeImportProgress, KnowledgeImportProgressError, KnowledgeOverview,
+    KnowledgePurpose, KnowledgeRelease, KnowledgeRepository, KnowledgeSearchRequest,
+    KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES, MemoryKnowledgeRepository,
+    Product, ProductState, Source, SourceDetail, SourceKind, SourceState, SourceVersion,
+    StoredObject, StoredObjectState, UPLOAD_SESSION_TTL_SECONDS, UploadSession,
+    UploadSessionCommand, UploadSessionState, deterministic_chunks,
+    is_supported_knowledge_media_type, knowledge_import_progress_app_error,
+    knowledge_import_progress_error, knowledge_import_progress_errors, knowledge_parser_version,
+    parsed_knowledge_chunks, plan_document_manifest, sha256_hex,
 };
 pub use operation::{Operation, OperationStatus};
 pub use project::{

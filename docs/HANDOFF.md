@@ -2,7 +2,7 @@
 
 更新时间：2026-10-06
 
-最新完整绿色基线：`718fdea` / Actions `37396649272`，Linux/Windows、前端、显式 V8、Java 21 与 PostgreSQL 全部通过。已读取 Linux 日志确认 PDF 实库三项以及 `actual_pdf_pages_are_imported_as_searchable_source_evidence` 实际为 `ok`，验证了 Rust 上传 → 真实解析服务 → 可检索原页码证据，不是默认忽略后的通过。后续内联图片分类、打包许可证和失租补测仍须独立 CI；当前验证状态见 `WORKLOG.md`。
+最新完整绿色基线：`a687374` / Actions `37397875938`，Linux/Windows、前端、显式 V8、Java 21 与 PostgreSQL 全部通过，含内联/嵌套图片分类、打包许可证及失租补测。已读取 Linux 日志确认 PDF 实库三项、`ShadedLicenseIT` 以及 `actual_pdf_pages_are_imported_as_searchable_source_evidence` 实际通过；验证了 Rust 上传 → 真实解析服务 → 可检索原页码证据，不是默认忽略后的通过。后续实时导入状态工具与收据核对为独立增量，当前验证状态见 `WORKLOG.md`。
 
 该绿色基线包含：P00 正文分发工具读取跨周期原发送目标及查回摘要；网页搜索修正乱序聊天关联、无效引用回退，支持同回答多次搜索及原始字节初始化超时。CSV v2 对超长记录保存独立生成证据及精确单元格范围，完整原记录不变、普通知识检索不重复返回分片；新增 PostgreSQL 持久分片/检索回归已通过。真实登录、发布/搜索、P04/P12 实机视觉、旧 CSV 版本补建与完整项目验收仍缺。
 
@@ -100,7 +100,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 安全 Host Ops
 
-- 封闭且带版本的 op 面（当前批次 `geo.hostops.v7`）：保留原有八项、四项 `channel.*.v1` 和四项 `distribution.*.v1`，内容操作增至八项，新增 `content.repair.v1`。部署须同步新 bundle 及摘要。附件导入只接受 Rust 已绑定到当前回合的对象；业务工具只传受限资源引用，JS 无法取得 session、代理凭据、SQL、任意网络、文件、进程或环境变量。
+- 封闭且带版本的 op 面（当前批次 `geo.hostops.v8`）：保留既有 24 项，新增只读 `knowledge.import_status.v1`，共 25 项。部署须同步新 bundle 及摘要。附件导入只接受 Rust 已绑定到当前回合的对象；业务工具只传受限资源引用，JS 无法取得 session、代理凭据、SQL、任意网络、文件、进程或环境变量。
 - 边界方向为 `geo-api → geo-worker`，worker 从不反向依赖 API。请求 DTO 全部 `#[serde(deny_unknown_fields)]` 且不携带 tenant/project 选择器，作用域只能来自 Rust 侧 bridge。预算、单次调用截止与取消统一在 `HostBridge::invoke` 施加。
 - `RepositoryHostOps` 已实现知识检索/附件导入、文档清单读取、报告及渠道工具和可注入的模型调用；内容工具另由受限 Rust 服务执行。本地开发模型装配见第 5 节。清单读取保留规划状态、阻断原因及覆盖分母，不把规划项 ID 冒充正文版本；正式文档×平台展开和正文分发工具已接入，真实发布与测量验收仍缺失。
 
@@ -170,7 +170,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - **running 重启对账**：已接 `GEO_SINGLE_PROCESS_EXECUTOR=true` 启动扫描，只适用于整个数据库严格单执行进程，默认关闭。滚动部署、多副本不得启用；running 租约和优雅关闭仍未实现。此旧对账测试已由 CI 独立 schema 验收，不能替代新 queued 扫描验证。
 - **回合进行中的实时取消**：当前整合批次已接隔离体及模型等待中断，独立回合取消状态不复用；生产多副本与在途外部结果核对仍须补验，见上方当前批次说明。
 - **隔离体基础保护**：64 MiB V8 堆、near-heap 终止、独立墙钟和 Rust 输出预算均已回归通过。不设固定隔离体并发准入门槛；高吞吐调度和进程资源观测仍需真实容量验收。
-- **checkpoint 与 tool-call ledger**：executor 已写完成结果存档；本批将 24 项 host op 接入 Rust 调用侧 intent/attempt/outcome，内存与 PostgreSQL 共享生命周期，应用按实际 Run 注入仓储。本地全量、Clippy 与显式 V8 通过，新增 PostgreSQL 回归待 CI，验证状态见 `WORKLOG.md`；这不是中途恢复，跨副本 running 租约、稳定重入位置和可重放结果仍缺。边界见 [`agent-tool-ledger.md`](agent-tool-ledger.md)。
+- **checkpoint 与 tool-call ledger**：executor 已写完成结果存档；既有 24 项 host op 的 Rust 调用侧 intent/attempt/outcome 已通过本地及 CI，内存与 PostgreSQL 共享生命周期，应用按实际 Run 注入仓储。本批第 25 项只读进度工具沿用账本并在保存成功前核对返回结果，独立验证状态见 `WORKLOG.md`；这不是中途恢复，跨副本 running 租约、稳定重入位置和可重放结果仍缺。边界见 [`agent-tool-ledger.md`](agent-tool-ledger.md)。
 - Token Center HTTP 适配及持久租户/项目路由已装配，配置撤销和凭据 generation 在调用时重新校验；正式权益/费用记账、流式模型事件及真实部署验证仍未完成。本地单模型配置保持仅限内存开发模式。
 - 对话 registry 已注册渠道计划/执行、第一层内容启动/查询及第二层分发启动/读取/恢复/分页工具；后者复用 `DistributionService`，不允许模型自报正文或平台能力。周期自动贯穿两次 fan-out 的原生工作流、真实搜索测量仍待补齐，不能以工具存在代替无人值守全周期运行。
 - P00 非 TXT/Markdown 解析、媒体/表格与跨回合附件使用；当前存储为内存或 PostgreSQL blob，非正式对象存储服务。回合输入可由持久 Message 重建，但这不等于完整自动恢复执行。

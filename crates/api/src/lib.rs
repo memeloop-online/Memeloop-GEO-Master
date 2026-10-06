@@ -1722,6 +1722,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         knowledge::materialize_initial_sources,
         knowledge::list_sources,
         knowledge::get_source,
+        knowledge::get_import_job,
         knowledge::retry_import_job,
         knowledge::get_source_version,
         knowledge::list_products,

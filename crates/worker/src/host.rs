@@ -84,6 +84,11 @@ fn validate_recorded_return(
                 ));
             }
         }
+        HostOp::KnowledgeImportStatus => {
+            let requested: KnowledgeImportStatusRequest = typed(op, request)?;
+            let response: geo_domain::KnowledgeImportProgress = typed(op, result)?;
+            validate_import_status(&response, requested.import_job_id).map_err(invalid)?;
+        }
         HostOp::ManifestRead => {
             let requested: ManifestReadRequest = typed(op, request)?;
             let page: ManifestPage = typed(op, result)?;
@@ -145,11 +150,63 @@ fn validate_recorded_return(
     Ok(false)
 }
 
+fn validate_import_status(
+    response: &geo_domain::KnowledgeImportProgress,
+    requested_job_id: Uuid,
+) -> Result<(), String> {
+    if response.import_job_id != Some(requested_job_id)
+        || response.completed_units < 0
+        || response.failed_units < 0
+        || response.errors.len() > 100
+        || usize::try_from(response.error_count).unwrap_or(usize::MAX) < response.errors.len()
+        || response.errors.iter().any(|error| {
+            !matches!(
+                error.code.as_str(),
+                "capability_missing"
+                    | "invalid_request"
+                    | "not_found"
+                    | "conflict"
+                    | "dependency_unavailable"
+                    | "invalid_pdf"
+                    | "encrypted_pdf"
+                    | "parse_failed"
+                    | "page_limit"
+                    | "ocr_required"
+                    | "empty_text"
+                    | "import_failed"
+            ) || error.page == Some(0)
+        })
+    {
+        return Err("job identity or bounded progress is invalid".into());
+    }
+    match response.status {
+        ImportStatus::Queued | ImportStatus::Running => {
+            if response.source_version_id.is_some() || response.knowledge_release_id.is_some() {
+                return Err("pending import cannot expose ready evidence".into());
+            }
+        }
+        ImportStatus::Succeeded | ImportStatus::Partial => {
+            if response.source_id.is_none()
+                || response.source_version_id.is_none()
+                || response.knowledge_release_id.is_none()
+            {
+                return Err("completed import lacks exact evidence references".into());
+            }
+        }
+        ImportStatus::Failed | ImportStatus::Cancelled => {
+            if response.source_version_id.is_some() || response.knowledge_release_id.is_some() {
+                return Err("unsuccessful import cannot expose ready evidence".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The version of the host-op surface this crate registers.
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v7";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v8";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -185,6 +242,8 @@ pub enum HostOp {
     KnowledgeSearch,
     /// Explicitly import attachments bound to this run into project knowledge.
     KnowledgeImportAttachments,
+    /// Read one scoped import job's actual persisted progress.
+    KnowledgeImportStatus,
     /// Read a page of a frozen document or distribution manifest.
     ManifestRead,
     /// Submit one document revision to one platform target.
@@ -215,13 +274,14 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 24;
+    pub const COUNT: usize = 25;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::ModelComplete,
         Self::KnowledgeSearch,
         Self::KnowledgeImportAttachments,
+        Self::KnowledgeImportStatus,
         Self::ManifestRead,
         Self::Publish,
         Self::Measure,
@@ -251,6 +311,7 @@ impl HostOp {
             Self::ModelComplete => "model.complete.v1",
             Self::KnowledgeSearch => "knowledge.search.v1",
             Self::KnowledgeImportAttachments => "knowledge.import_attachments.v1",
+            Self::KnowledgeImportStatus => "knowledge.import_status.v1",
             Self::ManifestRead => "manifest.read.v2",
             Self::Publish => "publish.submit.v2",
             Self::Measure => "measure.sample.v2",
@@ -281,6 +342,7 @@ impl HostOp {
             Self::ModelComplete => "op_host_model_complete_v1",
             Self::KnowledgeSearch => "op_host_knowledge_search_v1",
             Self::KnowledgeImportAttachments => "op_host_knowledge_import_attachments_v1",
+            Self::KnowledgeImportStatus => "op_host_knowledge_import_status_v1",
             Self::ManifestRead => "op_host_manifest_read_v2",
             Self::Publish => "op_host_publish_submit_v2",
             Self::Measure => "op_host_measure_sample_v2",
@@ -348,6 +410,7 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(120_000, 32),
+                HostOpLimits::new(15_000, 16), // one bounded job read per call
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(60_000, 16),
                 HostOpLimits::new(120_000, 32),
@@ -623,6 +686,17 @@ pub trait HostOps: Send + Sync {
         Err(HostOpError::capability_missing(
             HostOp::KnowledgeImportAttachments,
             "attachment knowledge import is not configured",
+        ))
+    }
+
+    async fn knowledge_import_status(
+        &self,
+        _scope: &TenantScope,
+        _request: KnowledgeImportStatusRequest,
+    ) -> Result<geo_domain::KnowledgeImportProgress, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::KnowledgeImportStatus,
+            "knowledge import status is not configured",
         ))
     }
 
@@ -1519,6 +1593,13 @@ pub struct KnowledgeImportAttachmentsRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct KnowledgeImportStatusRequest {
+    pub import_job_id: Uuid,
+    pub purpose: KnowledgePurpose,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgeImportAttachmentItem {
     pub attachment_id: Uuid,
     pub purpose: KnowledgePurpose,
@@ -1566,6 +1647,8 @@ pub struct KnowledgeImportAttachmentsResult {
 #[serde(deny_unknown_fields)]
 pub struct KnowledgeImportAttachmentResultItem {
     pub attachment_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_job_id: Option<Uuid>,
     pub status: ImportStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<Uuid>,
@@ -2352,6 +2435,39 @@ async fn wait_for_cancellation(cancellation: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_progress_never_admits_unready_release_or_incomplete_success() {
+        let job = Uuid::new_v4();
+        let mut progress = geo_domain::KnowledgeImportProgress {
+            import_job_id: Some(job),
+            status: ImportStatus::Queued,
+            stage: None,
+            source_id: Some(Uuid::new_v4()),
+            source_version_id: None,
+            knowledge_release_id: None,
+            completed_units: 0,
+            failed_units: 0,
+            error_count: 0,
+            errors: vec![],
+        };
+        assert!(validate_import_status(&progress, job).is_ok());
+        assert!(validate_import_status(&progress, Uuid::new_v4()).is_err());
+        progress.knowledge_release_id = Some(Uuid::new_v4());
+        for status in [
+            ImportStatus::Queued,
+            ImportStatus::Running,
+            ImportStatus::Failed,
+            ImportStatus::Cancelled,
+        ] {
+            progress.status = status;
+            assert!(validate_import_status(&progress, job).is_err());
+        }
+        progress.status = ImportStatus::Partial;
+        assert!(validate_import_status(&progress, job).is_err());
+        progress.source_version_id = Some(Uuid::new_v4());
+        assert!(validate_import_status(&progress, job).is_ok());
+    }
     use std::collections::HashMap;
 
     #[test]

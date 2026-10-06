@@ -14,15 +14,16 @@ use async_trait::async_trait;
 use chrono::Utc;
 use geo_domain::{
     AttachmentId, AttachmentReference, ChunkLocator, ImportStatus, KnowledgeEvidence,
-    KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope,
+    KnowledgeImportProgress, KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope,
 };
 use geo_worker::{
     HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
     HostOpError, HostOpErrorCode, HostOpLimits, HostOps, HostRuntime, HostState,
     KnowledgeImportAttachmentResultItem, KnowledgeImportAttachmentsRequest,
-    KnowledgeImportAttachmentsResult, ManifestItem, ManifestPage, ManifestReadRequest,
-    MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
-    PublishRequest, PublishState, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder,
+    KnowledgeImportAttachmentsResult, KnowledgeImportStatusRequest, ManifestItem, ManifestPage,
+    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
+    PublishReceipt, PublishRequest, PublishState, ToolCallIdentity, ToolCallOutcome,
+    ToolCallRecorder,
 };
 use serde_json::Value;
 
@@ -46,6 +47,7 @@ struct Behaviour {
     /// The message carried by every failure, so a test can show that the
     /// isolate boundary redacts what a bridge hands it.
     failure_message: Option<String>,
+    import_status: Option<KnowledgeImportProgress>,
 }
 
 /// Records what the bridge was asked for and answers from `behaviour`.
@@ -104,6 +106,30 @@ impl FakeHostOps {
 
 #[async_trait]
 impl HostOps for FakeHostOps {
+    async fn knowledge_import_status(
+        &self,
+        scope: &TenantScope,
+        request: KnowledgeImportStatusRequest,
+    ) -> Result<KnowledgeImportProgress, HostOpError> {
+        let progress = self
+            .behaviour
+            .import_status
+            .clone()
+            .unwrap_or(KnowledgeImportProgress {
+                import_job_id: Some(request.import_job_id),
+                status: ImportStatus::Queued,
+                stage: None,
+                source_id: None,
+                source_version_id: None,
+                knowledge_release_id: None,
+                completed_units: 0,
+                failed_units: 0,
+                error_count: 0,
+                errors: vec![],
+            });
+        self.answer(HostOp::KnowledgeImportStatus, scope, progress)
+            .await
+    }
     async fn model_complete(
         &self,
         scope: &TenantScope,
@@ -179,6 +205,7 @@ impl HostOps for FakeHostOps {
                     .into_iter()
                     .map(|item| KnowledgeImportAttachmentResultItem {
                         attachment_id: item.attachment_id,
+                        import_job_id: None,
                         status: ImportStatus::Succeeded,
                         source_id: Some(uuid::Uuid::new_v4()),
                         source_version_id: Some(uuid::Uuid::new_v4()),
@@ -620,6 +647,138 @@ async fn attachment_import_rejects_unbound_and_cross_run_ids_before_capability()
     assert_eq!(
         ops.imported_bindings(),
         vec![vec![OTHER_ATTACHMENT.parse::<uuid::Uuid>().unwrap()]]
+    );
+}
+
+#[tokio::test]
+async fn import_status_rejects_invalid_input_and_unrelated_or_unready_results_before_success() {
+    let job = uuid::Uuid::new_v4();
+    let other_job = uuid::Uuid::new_v4();
+    let ops = Arc::new(FakeHostOps::with(Behaviour {
+        import_status: Some(KnowledgeImportProgress {
+            import_job_id: Some(other_job),
+            status: ImportStatus::Succeeded,
+            stage: Some(geo_domain::ImportStage::Release),
+            source_id: Some(uuid::Uuid::new_v4()),
+            source_version_id: Some(uuid::Uuid::new_v4()),
+            knowledge_release_id: Some(uuid::Uuid::new_v4()),
+            completed_units: 1,
+            failed_units: 0,
+            error_count: 0,
+            errors: vec![],
+        }),
+        ..Behaviour::default()
+    }));
+    let script = format!(
+        r#"
+        import {{ attempt }} from "./host-ops.js";
+        const call = (payload) => Deno.core.ops.op_host_knowledge_import_status_v1(JSON.stringify(payload));
+        await attempt("missing", () => call({{import_job_id:"{job}",purpose:"internal",tenant_id:"forged"}}));
+        await attempt("nil", () => call({{import_job_id:"00000000-0000-0000-0000-000000000000",purpose:"internal"}}));
+        await attempt("mismatch", () => call({{import_job_id:"{job}",purpose:"internal"}}));
+        "#
+    );
+    let mut runtime = runtime(Box::leak(script.into_boxed_str()), bridge(Arc::clone(&ops)));
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for topic in ["missing", "nil"] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "invalid_request",
+            "knowledge_import_status",
+        );
+    }
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "mismatch"),
+        "internal",
+        "knowledge_import_status",
+    );
+    assert_eq!(ops.seen(), vec![HostOp::KnowledgeImportStatus]);
+    assert_eq!(runtime.op_calls(HostOp::KnowledgeImportStatus), 1);
+}
+
+#[tokio::test]
+async fn import_status_returns_scoped_queued_state_but_missing_adapter_fails_closed() {
+    let ops = Arc::new(FakeHostOps::new());
+    let job = uuid::Uuid::new_v4();
+    let script = format!(
+        r#"
+        import {{ hostOps, attempt }} from "./host-ops.js";
+        await attempt("queued", () => hostOps.knowledgeImportStatus({{import_job_id:"{job}",purpose:"internal"}}));
+        "#
+    );
+    let mut queued_runtime = runtime(Box::leak(script.into_boxed_str()), bridge(Arc::clone(&ops)));
+    queued_runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    let progress = assert_success(&outcome(&queued_runtime.host_state(), "queued"));
+    assert_eq!(progress["status"], "queued");
+    assert_eq!(progress["import_job_id"], job.to_string());
+    assert!(progress["knowledge_release_id"].is_null());
+    assert_eq!(ops.seen(), vec![HostOp::KnowledgeImportStatus]);
+
+    struct Missing;
+    #[async_trait]
+    impl HostOps for Missing {
+        async fn model_complete(
+            &self,
+            _: &TenantScope,
+            _: ModelCompletionRequest,
+        ) -> Result<ModelCompletion, HostOpError> {
+            unreachable!()
+        }
+        async fn knowledge_search(
+            &self,
+            _: &TenantScope,
+            _: KnowledgeSearchRequest,
+        ) -> Result<KnowledgeSearchResult, HostOpError> {
+            unreachable!()
+        }
+        async fn manifest_read(
+            &self,
+            _: &TenantScope,
+            _: ManifestReadRequest,
+        ) -> Result<ManifestPage, HostOpError> {
+            unreachable!()
+        }
+        async fn publish_submit(
+            &self,
+            _: &TenantScope,
+            _: PublishRequest,
+        ) -> Result<PublishReceipt, HostOpError> {
+            unreachable!()
+        }
+        async fn measure_sample(
+            &self,
+            _: &TenantScope,
+            _: MeasureRequest,
+        ) -> Result<MeasureSample, HostOpError> {
+            unreachable!()
+        }
+    }
+    let missing_bridge = HostBridge::new(
+        Arc::new(Missing),
+        scope(),
+        tokio::runtime::Handle::current(),
+    );
+    let missing_script = format!(
+        r#"
+        import {{ hostOps, attempt }} from "./host-ops.js";
+        await attempt("missing", () => hostOps.knowledgeImportStatus({{import_job_id:"{job}",purpose:"internal"}}));
+        "#
+    );
+    let mut missing = runtime(Box::leak(missing_script.into_boxed_str()), missing_bridge);
+    missing
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_typed_error(
+        &outcome(&missing.host_state(), "missing"),
+        "capability_missing",
+        "knowledge_import_status",
     );
 }
 

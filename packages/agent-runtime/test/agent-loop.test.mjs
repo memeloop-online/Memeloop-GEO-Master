@@ -468,6 +468,7 @@ test("report reduction and immutable read are exposed as separate scoped host to
       requests[0].tools.map((tool) => tool.function.name),
       [
         "knowledge_search",
+        "knowledge_import_status",
         "report_get",
         "report_reduce",
         "channel_discover",
@@ -602,6 +603,7 @@ test("attachment-only turn imports bound items, searches its release, and answer
       modelRequests[0].tools.map((tool) => tool.function.name),
       [
         "knowledge_import_attachments",
+        "knowledge_import_status",
         "knowledge_search",
         "report_get",
         "report_reduce",
@@ -645,6 +647,117 @@ test("attachment-only turn imports bound items, searches its release, and answer
     assert.match(modelRequests[2].messages.at(-1).content, /Two years/u);
     assert.equal(completion.turn_id, "turn-import-0001");
     assert.match(completion.answer, /Guide/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("queued attachment uses a later exact job status and release before citing evidence", async () => {
+  const attachmentId = "00000000-0000-4000-8000-000000000011";
+  const jobId = "00000000-0000-4000-8000-000000000012";
+  const releaseId = "00000000-0000-4000-8000-000000000013";
+  const seen = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeImportAttachments() {
+      return {
+        items: [
+          {
+            attachment_id: attachmentId,
+            import_job_id: jobId,
+            status: "queued",
+          },
+        ],
+      };
+    },
+    async knowledgeImportStatus(request) {
+      assert.deepEqual(request, { import_job_id: jobId, purpose: "internal" });
+      return {
+        import_job_id: jobId,
+        status: "partial",
+        stage: "release",
+        source_id: "00000000-0000-4000-8000-000000000014",
+        source_version_id: "00000000-0000-4000-8000-000000000015",
+        knowledge_release_id: releaseId,
+        completed_units: 1,
+        failed_units: 1,
+        error_count: 1,
+        errors: [{ code: "parse_failed", page: 2 }],
+      };
+    },
+    async knowledgeSearch(request) {
+      assert.equal(request.knowledge_release_id, releaseId);
+      return {
+        knowledge_release_id: releaseId,
+        evidence: [{ quote: "A scoped statement", page: 1 }],
+      };
+    },
+    async modelComplete(request) {
+      const index = seen.push(request);
+      if (index === 4)
+        return finalModelAnswer(
+          "Page 1 supports the statement; page 2 failed.",
+        );
+      const argumentsByStep = [
+        { items: [{ attachment_id: attachmentId, purpose: "internal" }] },
+        { import_job_id: jobId, purpose: "internal" },
+        {
+          query: "statement",
+          knowledge_release_id: releaseId,
+          purpose: "internal",
+        },
+      ];
+      const names = [
+        "knowledge_import_attachments",
+        "knowledge_import_status",
+        "knowledge_search",
+      ];
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          {
+            id: `job-${index}`,
+            type: "function",
+            function: {
+              name: names[index - 1],
+              arguments: JSON.stringify(argumentsByStep[index - 1]),
+            },
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?jobStatus=${Date.now()}`);
+    const result = await main({
+      conversation_id: "conversation-status",
+      message_id: "message-status",
+      turn_id: "turn-status",
+      run_id: "run-status",
+      prompt: "",
+      attachments: [
+        {
+          attachment_id: attachmentId,
+          object_id: "object-status",
+          filename: "guide.pdf",
+          media_type: "application/pdf",
+          size_bytes: 10,
+          sha256: "a".repeat(64),
+        },
+      ],
+    });
+    assert.equal(
+      result.answer,
+      "Page 1 supports the statement; page 2 failed.",
+    );
+    assert.match(seen[1].messages.at(-1).content, /"status":"queued"/u);
+    assert.doesNotMatch(
+      seen[1].messages.at(-1).content,
+      /knowledge_release_id/u,
+    );
+    assert.match(seen[2].messages.at(-1).content, /"knowledge_release_id"/u);
+    assert.match(seen[3].messages.at(-1).content, /A scoped statement/u);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

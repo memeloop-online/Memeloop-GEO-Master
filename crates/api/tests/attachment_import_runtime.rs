@@ -16,7 +16,8 @@ use geo_domain::{
 };
 use geo_worker::{
     HostOpError, HostOps, KnowledgeImportAttachmentItem, KnowledgeImportAttachmentsRequest,
-    ModelCompletion, ModelCompletionRequest, ModelToolCall, ModelToolFunctionCall,
+    KnowledgeImportStatusRequest, ModelCompletion, ModelCompletionRequest, ModelToolCall,
+    ModelToolFunctionCall,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -379,4 +380,56 @@ async fn direct_host_import_rejects_unbound_cross_scope_and_tampered_metadata_pe
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn queued_attachment_receipt_exposes_actual_job_without_premature_evidence() {
+    let repository = Arc::new(MemoryKnowledgeRepository::with_pdf_parser_profile(
+        "test-parser-v1".to_owned(),
+    ));
+    let run_scope = scope();
+    let (reference, _) = upload(
+        &repository,
+        &run_scope,
+        "pending.pdf",
+        "application/pdf",
+        b"%PDF-1.7\nunparsed original",
+    )
+    .await;
+    let ops = RepositoryHostOps::new(repository);
+    let accepted = ops
+        .knowledge_import_attachments(
+            &run_scope,
+            import_request(std::slice::from_ref(&reference)),
+            std::slice::from_ref(&reference),
+        )
+        .await
+        .unwrap();
+    let receipt = &accepted.items[0];
+    assert_eq!(receipt.status, ImportStatus::Queued);
+    let job_id = receipt.import_job_id.expect("actual queued job ID");
+    assert!(receipt.source_id.is_some());
+    assert!(receipt.source_version_id.is_none());
+    assert!(receipt.knowledge_release_id.is_none());
+    let request = KnowledgeImportStatusRequest {
+        import_job_id: job_id,
+        purpose: KnowledgePurpose::Internal,
+    };
+    let progress = ops
+        .knowledge_import_status(&run_scope, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(progress.import_job_id, Some(job_id));
+    assert_eq!(progress.status, ImportStatus::Queued);
+    assert!(progress.knowledge_release_id.is_none());
+    let foreign = TenantScope::new(
+        run_scope.operator_id,
+        run_scope.tenant_id,
+        Some(Uuid::new_v4().into()),
+    );
+    let error = ops
+        .knowledge_import_status(&foreign, request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, geo_worker::HostOpErrorCode::NotFound);
 }

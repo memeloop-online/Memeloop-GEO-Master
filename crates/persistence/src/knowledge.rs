@@ -24,6 +24,8 @@ use uuid::Uuid;
 
 use crate::{Database, set_local_scope};
 
+#[path = "import_progress.rs"]
+mod import_progress;
 #[path = "pdf_parse.rs"]
 mod pdf_parse;
 
@@ -958,6 +960,23 @@ impl PgKnowledgeRepository {
 
 #[async_trait]
 impl KnowledgeRepository for PgKnowledgeRepository {
+    async fn get_import_progress(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+        purpose: KnowledgePurpose,
+    ) -> Result<Option<geo_domain::KnowledgeImportProgress>, AppError> {
+        import_progress::get(self, scope, job_id, purpose).await
+    }
+
+    async fn resolve_import_receipt(
+        &self,
+        scope: &TenantScope,
+        expected: &ImportItem,
+    ) -> Result<Option<geo_domain::KnowledgeImportProgress>, AppError> {
+        import_progress::resolve(self, scope, expected).await
+    }
+
     async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError> {
         Self::project_id(scope)?;
         let mut capabilities = KnowledgeCapability::durable_text_only();
