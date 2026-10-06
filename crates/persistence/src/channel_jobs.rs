@@ -295,6 +295,27 @@ impl ChannelJobRepository for PgChannelJobRepository {
         rows.into_iter().map(decode).collect()
     }
 
+    async fn list_optimization_measurement_plans(
+        &self,
+        scope: &TenantScope,
+        after_plan_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<StandaloneMeasurementPlan>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid measurement page size"));
+        }
+        // The keyset predicate and LIMIT apply to eligible plans, not to a
+        // raw page which could consist entirely of frozen/unknown purposes.
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND ($4::uuid IS NULL OR plan_id>$4) \
+             AND EXISTS (SELECT 1 FROM jsonb_array_elements(plan->'targets') AS target \
+               WHERE target->'input'->>'kind'='measure' AND target->'input'->'question_binding'->>'purpose'='optimization') \
+             ORDER BY plan_id LIMIT $5"
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+            .bind(after_plan_id).bind(limit as i64).fetch_all(&self.pool).await.map_err(db)?;
+        rows.into_iter().map(decode).collect()
+    }
+
     async fn materialize_pending_commands(
         &self,
         after_command_id: Option<Uuid>,

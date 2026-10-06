@@ -437,6 +437,14 @@ pub trait ChannelJobRepository: Send + Sync {
         after_plan_id: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<StandaloneMeasurementPlan>, AppError>;
+    /// Ascending keyset page of plans containing an immutable target bound to
+    /// optimization. Excluded-only plan IDs must never become AI cursors.
+    async fn list_optimization_measurement_plans(
+        &self,
+        scope: &TenantScope,
+        after_plan_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<StandaloneMeasurementPlan>, AppError>;
     /// Atomically insert durable targets and mark their outbox commands materialized.
     /// This does not reserve an account, claim an attempt, or send externally.
     async fn materialize_pending_commands(
@@ -838,6 +846,42 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
             .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
             .filter_map(|(_, entry)| entry.measurement.as_ref())
             .filter(|plan| after_plan_id.is_none_or(|after| plan.plan_id > after))
+            .cloned()
+            .collect();
+        plans.sort_unstable_by_key(|plan| plan.plan_id);
+        plans.truncate(limit);
+        Ok(plans)
+    }
+    async fn list_optimization_measurement_plans(
+        &self,
+        scope: &TenantScope,
+        after_plan_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<StandaloneMeasurementPlan>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid measurement page size"));
+        }
+        let key = scope_key(scope)?;
+        let all = self.0.lock().await;
+        let mut plans: Vec<_> = all
+            .iter()
+            .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
+            .filter_map(|(_, entry)| entry.measurement.as_ref())
+            .filter(|plan| after_plan_id.is_none_or(|after| plan.plan_id > after))
+            .filter(|plan| {
+                plan.targets.iter().any(|target| {
+                    matches!(
+                        &target.input,
+                        ChannelTargetInput::Measure {
+                            question_binding: Some(FrozenQuestionBinding {
+                                purpose: QuestionPurpose::Optimization,
+                                ..
+                            }),
+                            ..
+                        }
+                    )
+                })
+            })
             .cloned()
             .collect();
         plans.sort_unstable_by_key(|plan| plan.plan_id);

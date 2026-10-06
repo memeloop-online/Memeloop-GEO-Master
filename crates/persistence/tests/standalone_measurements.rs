@@ -1,7 +1,8 @@
 //! Requires a disposable database; no external account or measurement is used.
 use chrono::Utc;
 use geo_domain::{
-    ChannelJobRepository, ChannelTarget, ChannelTargetInput, StandaloneMeasurementPlan, TenantScope,
+    ChannelJobRepository, ChannelTarget, ChannelTargetInput, FrozenQuestionBinding,
+    QuestionPurpose, QuestionReference, StandaloneMeasurementPlan, TenantScope,
 };
 use geo_persistence::{Database, DatabaseConfig, PgChannelJobRepository};
 use uuid::Uuid;
@@ -98,6 +99,79 @@ async fn standalone_measurement_draft_concurrency_restart_and_owner_constraints(
             .unwrap()
             .is_empty()
     );
+    assert!(
+        restarted
+            .list_optimization_measurement_plans(&scope, None, 2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let base = Uuid::new_v4().as_u128() & !0xff;
+    let version = Uuid::new_v4();
+    let mut eligible_ids = Vec::new();
+    for (offset, purpose) in [
+        (1, Some(QuestionPurpose::FrozenEvaluation)),
+        (2, None),
+        (3, Some(QuestionPurpose::Optimization)),
+        (4, Some(QuestionPurpose::FrozenEvaluation)),
+        (5, None),
+        (6, Some(QuestionPurpose::Optimization)),
+    ] {
+        let mut candidate = saved.clone();
+        candidate.plan_id = Uuid::from_u128(base + offset);
+        candidate.input_hash = candidate.plan_id.to_string();
+        candidate.targets[0].target_id = Uuid::new_v4();
+        if let ChannelTargetInput::Measure {
+            question_set_version,
+            question_binding,
+            ..
+        } = &mut candidate.targets[0].input
+        {
+            *question_set_version = version.to_string();
+            *question_binding = purpose.map(|purpose| FrozenQuestionBinding {
+                reference: QuestionReference {
+                    question_set_id: Uuid::new_v4(),
+                    question_set_version_id: version,
+                    question_id: Uuid::new_v4(),
+                    question_revision_id: Uuid::new_v4(),
+                },
+                purpose,
+                split_policy_version: "synthetic_v1".into(),
+            });
+        }
+        if purpose == Some(QuestionPurpose::Optimization) {
+            eligible_ids.push(candidate.plan_id);
+        }
+        restarted
+            .create_measurement_plan(
+                &scope,
+                &candidate.plan_id.to_string(),
+                &candidate.plan_id.to_string(),
+                candidate,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        restarted
+            .list_optimization_measurement_plans(&scope, Some(Uuid::from_u128(base)), 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|plan| plan.plan_id)
+            .collect::<Vec<_>>(),
+        eligible_ids[..1]
+    );
+    assert_eq!(
+        restarted
+            .list_optimization_measurement_plans(&scope, Some(eligible_ids[0]), 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|plan| plan.plan_id)
+            .collect::<Vec<_>>(),
+        eligible_ids[1..]
+    );
     let other = TenantScope::new(
         scope.operator_id,
         scope.tenant_id,
@@ -109,6 +183,13 @@ async fn standalone_measurement_draft_concurrency_restart_and_owner_constraints(
             .await
             .unwrap()
             .is_none()
+    );
+    assert!(
+        restarted
+            .list_optimization_measurement_plans(&other, None, 2)
+            .await
+            .unwrap()
+            .is_empty()
     );
     assert!(
         restarted

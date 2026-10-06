@@ -5,7 +5,7 @@ use axum::{
     http::{Request, StatusCode, header::SET_COOKIE},
 };
 use chrono::{Duration, Utc};
-use geo_api::{AppState, CSRF_HEADER, router};
+use geo_api::{AppState, CSRF_HEADER, RepositoryHostOps, router};
 use geo_domain::{
     ChannelOutcome, ChannelOutcomeStatus, ChannelTarget, ChannelTargetInput,
     DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, FrozenQuestionBinding, InitialSource,
@@ -13,6 +13,7 @@ use geo_domain::{
     ProjectStartCommand, QuestionPurpose, QuestionReference, StandaloneMeasurementPlan,
     TenantScope, hash_idempotency_key, settings_hash, sha256_hex, start_request_hash,
 };
+use geo_worker::{HostOps, SourceRecommendationsRequest};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -72,12 +73,20 @@ async fn login(app: &Router) -> (String, String) {
     (cookie, csrf)
 }
 
-async fn accepted_search(state: &AppState, scope: &TenantScope) {
+async fn accepted_search(
+    state: &AppState,
+    scope: &TenantScope,
+    plan_id: Uuid,
+    purpose: Option<QuestionPurpose>,
+    citation: &str,
+    mixed_frozen: bool,
+) {
+    let answer = match purpose {
+        Some(QuestionPurpose::Optimization) => "Synthetic optimization answer",
+        Some(QuestionPurpose::FrozenEvaluation) => "SYNTHETIC_EXCLUDED_FROZEN_ANSWER",
+        None => "SYNTHETIC_EXCLUDED_UNKNOWN_ANSWER",
+    };
     let claimed = Utc::now();
-    let observed = claimed + Duration::milliseconds(100);
-    let completed = claimed + Duration::milliseconds(200);
-    let received = claimed + Duration::milliseconds(300);
-    let attempt_id = Uuid::new_v4();
     let question_set_version_id = Uuid::new_v4();
     let target = ChannelTarget {
         target_id: Uuid::new_v4(),
@@ -94,18 +103,80 @@ async fn accepted_search(state: &AppState, scope: &TenantScope) {
             language: "en".into(),
             scheduled_at: claimed,
             sample_ordinal: 0,
-            question_binding: Some(FrozenQuestionBinding {
+            question_binding: purpose.map(|purpose| FrozenQuestionBinding {
                 reference: QuestionReference {
                     question_set_id: Uuid::new_v4(),
                     question_set_version_id,
                     question_id: Uuid::new_v4(),
                     question_revision_id: Uuid::new_v4(),
                 },
-                purpose: QuestionPurpose::Optimization,
+                purpose,
                 split_policy_version: "synthetic_v1".into(),
             }),
         },
     };
+    let frozen_target = mixed_frozen.then(|| {
+        let mut frozen = target.clone();
+        frozen.target_id = Uuid::new_v4();
+        if let ChannelTargetInput::Measure {
+            question,
+            question_binding,
+            ..
+        } = &mut frozen.input
+        {
+            *question = "SYNTHETIC_EXCLUDED_FROZEN_QUESTION".into();
+            question_binding
+                .as_mut()
+                .expect("bound optimization target")
+                .purpose = QuestionPurpose::FrozenEvaluation;
+        }
+        frozen
+    });
+    let mut targets = vec![target.clone()];
+    targets.extend(frozen_target.iter().cloned());
+    state
+        .channel_job_repository()
+        .create_measurement_plan(
+            scope,
+            &plan_id.to_string(),
+            &plan_id.to_string(),
+            StandaloneMeasurementPlan {
+                plan_id,
+                project_id: scope.project_id.unwrap(),
+                title: "Synthetic topic".into(),
+                input_hash: plan_id.to_string(),
+                revision: 1,
+                created_at: claimed,
+                targets,
+            },
+        )
+        .await
+        .unwrap();
+    finish_accepted_search(state, scope, &target, citation, answer).await;
+    if let Some(frozen_target) = frozen_target.as_ref() {
+        finish_accepted_search(
+            state,
+            scope,
+            frozen_target,
+            "https://excluded-mixed.invalid/SYNTHETIC_EXCLUDED_MIXED_CITATION",
+            "SYNTHETIC_EXCLUDED_MIXED_ANSWER",
+        )
+        .await;
+    }
+}
+
+async fn finish_accepted_search(
+    state: &AppState,
+    scope: &TenantScope,
+    target: &ChannelTarget,
+    citation: &str,
+    answer: &str,
+) {
+    let claimed = Utc::now();
+    let observed = claimed + Duration::milliseconds(100);
+    let completed = claimed + Duration::milliseconds(200);
+    let received = claimed + Duration::milliseconds(300);
+    let attempt_id = Uuid::new_v4();
     let ChannelTargetInput::Measure {
         account_id,
         provider,
@@ -124,25 +195,6 @@ async fn accepted_search(state: &AppState, scope: &TenantScope) {
     else {
         unreachable!()
     };
-    let plan_id = Uuid::new_v4();
-    state
-        .channel_job_repository()
-        .create_measurement_plan(
-            scope,
-            &plan_id.to_string(),
-            &plan_id.to_string(),
-            StandaloneMeasurementPlan {
-                plan_id,
-                project_id: scope.project_id.unwrap(),
-                title: "Synthetic topic".into(),
-                input_hash: plan_id.to_string(),
-                revision: 1,
-                created_at: claimed,
-                targets: vec![target.clone()],
-            },
-        )
-        .await
-        .unwrap();
     state
         .channel_job_repository()
         .claim(scope, target.target_id, attempt_id, claimed)
@@ -150,7 +202,7 @@ async fn accepted_search(state: &AppState, scope: &TenantScope) {
         .unwrap();
     // The exact same receipt acceptance checks are used by the recommendation
     // read; no external account, search, or publishing service is invoked.
-    let citations = vec!["https://medium.com/generic-test-article".to_owned()];
+    let citations = vec![citation.to_owned()];
     let evidence = json!({
         "kind":"official_search_observation",
         "schema_version":"geo.measure.official_search.v1",
@@ -170,7 +222,7 @@ async fn accepted_search(state: &AppState, scope: &TenantScope) {
         "connector_version":"connector-v1",
         "provenance":"live",
         "disposition":"observed",
-        "raw_answer":"Synthetic answer",
+        "raw_answer":answer,
         "citations":citations,
         "search_event":{
             "kind":"official_search_event",
@@ -199,7 +251,7 @@ async fn accepted_search(state: &AppState, scope: &TenantScope) {
                 status: ChannelOutcomeStatus::Observed,
                 detail: None,
                 occurred_at: completed,
-                raw_answer: Some("Synthetic answer".into()),
+                raw_answer: Some(answer.into()),
                 citations,
                 public_url: None,
                 screenshot_ref: None,
@@ -211,6 +263,176 @@ async fn accepted_search(state: &AppState, scope: &TenantScope) {
         )
         .await
         .unwrap();
+}
+
+async fn pending_optimization_plan(state: &AppState, scope: &TenantScope, plan_id: Uuid) {
+    let version = Uuid::new_v4();
+    let plan = StandaloneMeasurementPlan {
+        plan_id,
+        project_id: scope.project_id.unwrap(),
+        title: "Synthetic pending topic".into(),
+        input_hash: plan_id.to_string(),
+        revision: 1,
+        created_at: Utc::now(),
+        targets: vec![ChannelTarget {
+            target_id: Uuid::new_v4(),
+            input: ChannelTargetInput::Measure {
+                account_id: Uuid::new_v4(),
+                provider: "synthetic-provider".into(),
+                model: "synthetic-model".into(),
+                surface: "consumer_web".into(),
+                search_mode: "web_search".into(),
+                protocol_version: "v1".into(),
+                question_set_version: version.to_string(),
+                question: "Synthetic pending question".into(),
+                market: "generic".into(),
+                language: "en".into(),
+                scheduled_at: Utc::now(),
+                sample_ordinal: 0,
+                question_binding: Some(FrozenQuestionBinding {
+                    reference: QuestionReference {
+                        question_set_id: Uuid::new_v4(),
+                        question_set_version_id: version,
+                        question_id: Uuid::new_v4(),
+                        question_revision_id: Uuid::new_v4(),
+                    },
+                    purpose: QuestionPurpose::Optimization,
+                    split_policy_version: "synthetic_v1".into(),
+                }),
+            },
+        }],
+    };
+    state
+        .channel_job_repository()
+        .create_measurement_plan(scope, &plan_id.to_string(), &plan_id.to_string(), plan)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn optimization_cursor_skips_excluded_only_pages_without_exposing_evaluation_evidence() {
+    let state = AppState::development_with_password("synthetic-recommendation-test");
+    let tenant = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
+    let project = state
+        .project_repository()
+        .create(
+            &tenant,
+            ProjectCreate {
+                slug: None,
+                display_name: "Synthetic project".into(),
+                settings: ProjectSettings::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let scope = TenantScope::new(tenant.operator_id, tenant.tenant_id, Some(project.id));
+    let first = Uuid::from_u128(0x100);
+    let pending = Uuid::from_u128(0x180);
+    let second = Uuid::from_u128(0x200);
+    let mut excluded = Vec::new();
+    for id in 1..=30u128 {
+        let purpose = if id % 2 == 0 {
+            Some(QuestionPurpose::FrozenEvaluation)
+        } else {
+            None
+        };
+        let plan_id = Uuid::from_u128(if id <= 15 { id } else { 0x100 + id - 15 });
+        accepted_search(
+            &state,
+            &scope,
+            plan_id,
+            purpose,
+            if purpose.is_some() {
+                "https://excluded-frozen.invalid/SYNTHETIC_EXCLUDED_FROZEN_CITATION"
+            } else {
+                "https://excluded-unknown.invalid/SYNTHETIC_EXCLUDED_UNKNOWN_CITATION"
+            },
+            false,
+        )
+        .await;
+        excluded.push(plan_id);
+        if id == 15 {
+            accepted_search(
+                &state,
+                &scope,
+                first,
+                Some(QuestionPurpose::Optimization),
+                "https://medium.com/synthetic-eligible-first",
+                true,
+            )
+            .await;
+        }
+    }
+    pending_optimization_plan(&state, &scope, pending).await;
+    accepted_search(
+        &state,
+        &scope,
+        second,
+        Some(QuestionPurpose::Optimization),
+        "https://medium.com/synthetic-eligible-second",
+        false,
+    )
+    .await;
+    let ops = RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone());
+    let page = ops
+        .source_recommendations(
+            &scope,
+            SourceRecommendationsRequest {
+                after: None,
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.plan_ids, vec![first]);
+    assert_eq!(page.next_after, Some(first));
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].citing_answers, 1);
+    let serialized = serde_json::to_string(&page).unwrap();
+    assert!(!serialized.contains("SYNTHETIC_EXCLUDED"));
+    assert!(!serialized.contains("excluded-frozen.invalid"));
+    assert!(!serialized.contains("excluded-unknown.invalid"));
+    assert!(!serialized.contains("excluded-mixed.invalid"));
+    assert!(!serialized.contains("\"coverage\""));
+    for id in &excluded {
+        assert!(!serialized.contains(&id.to_string()));
+    }
+    let page = ops
+        .source_recommendations(
+            &scope,
+            SourceRecommendationsRequest {
+                after: page.next_after,
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.plan_ids, vec![pending]);
+    assert_eq!(page.next_after, Some(pending));
+    assert!(page.items.is_empty());
+    let serialized = serde_json::to_string(&page).unwrap();
+    assert!(!serialized.contains("SYNTHETIC_EXCLUDED"));
+    for id in &excluded {
+        assert!(!serialized.contains(&id.to_string()));
+    }
+    let page = ops
+        .source_recommendations(
+            &scope,
+            SourceRecommendationsRequest {
+                after: page.next_after,
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.plan_ids, vec![second]);
+    assert_eq!(page.next_after, None);
+    assert_eq!(page.items[0].citing_answers, 1);
+    let serialized = serde_json::to_string(&page).unwrap();
+    assert!(!serialized.contains("SYNTHETIC_EXCLUDED"));
+    for id in &excluded {
+        assert!(!serialized.contains(&id.to_string()));
+    }
 }
 
 #[tokio::test]
@@ -264,7 +486,15 @@ async fn accepted_recommendation_updates_only_future_cycle_distribution_configur
         .await
         .unwrap()
         .unwrap();
-    accepted_search(&state, &scope).await;
+    accepted_search(
+        &state,
+        &scope,
+        Uuid::new_v4(),
+        Some(QuestionPurpose::Optimization),
+        "https://medium.com/generic-test-article",
+        false,
+    )
+    .await;
     let app = router(state.clone());
     let auth = login(&app).await;
     let path = format!("/api/v1/projects/{}", project.id);

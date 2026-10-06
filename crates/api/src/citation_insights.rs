@@ -118,14 +118,39 @@ pub(crate) async fn read_citation_page(
     after: Option<Uuid>,
     limit: Option<usize>,
 ) -> Result<CitationInsightPage, AppError> {
+    read_page(state, scope, after, limit, false).await
+}
+
+pub(crate) async fn read_optimization_citation_page(
+    state: &AppState,
+    scope: &TenantScope,
+    after: Option<Uuid>,
+    limit: Option<usize>,
+) -> Result<CitationInsightPage, AppError> {
+    read_page(state, scope, after, limit, true).await
+}
+
+async fn read_page(
+    state: &AppState,
+    scope: &TenantScope,
+    after: Option<Uuid>,
+    limit: Option<usize>,
+    optimization_only: bool,
+) -> Result<CitationInsightPage, AppError> {
     let limit = limit.unwrap_or(5);
     if !(1..=10).contains(&limit) {
         return Err(AppError::invalid_request("limit must be 1 to 10"));
     }
     let repository = state.channel_job_repository();
-    let mut plans = repository
-        .list_measurement_plans(scope, after, limit + 1)
-        .await?;
+    let mut plans = if optimization_only {
+        repository
+            .list_optimization_measurement_plans(scope, after, limit + 1)
+            .await?
+    } else {
+        repository
+            .list_measurement_plans(scope, after, limit + 1)
+            .await?
+    };
     let has_more = plans.len() > limit;
     plans.truncate(limit);
     let next_after = has_more.then(|| plans.last().expect("nonempty page").plan_id);

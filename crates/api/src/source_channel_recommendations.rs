@@ -28,7 +28,19 @@ pub(crate) async fn read(
         .get(scope, project_id)
         .await?
         .ok_or_else(|| AppError::not_found("project not found"))?;
-    let citations = citation_insights::read_citation_page(state, scope, after, limit).await?;
+    let citations = match audience {
+        RecommendationAudience::Human => {
+            citation_insights::read_citation_page(state, scope, after, limit).await?
+        }
+        RecommendationAudience::Optimization => {
+            citation_insights::read_optimization_citation_page(state, scope, after, limit).await?
+        }
+    };
+    // The filtered repository guarantees these IDs belong to plans containing
+    // an immutable optimization-bound target. Even a plan without accepted
+    // citations is a safe cursor; it must not falsely terminate pagination.
+    let safe_cursor = citations.next_after;
+    let safe_plan_ids = citations.plan_ids.clone();
     let connectors = crate::connector_capabilities::deployed_versions(state).await;
     let channels = &state.channel_service().repository;
     let mut accounts = channels.list_accounts(scope).await?;
@@ -81,7 +93,7 @@ pub(crate) async fn read(
             },
         );
     }
-    Ok(recommend_sources(
+    let mut result = recommend_sources(
         citations,
         &project.settings.distribution_scope,
         audience,
@@ -91,7 +103,12 @@ pub(crate) async fn read(
                 .cloned()
                 .expect("mapped rule has status")
         },
-    ))
+    );
+    if matches!(audience, RecommendationAudience::Optimization) {
+        result.next_after = safe_cursor;
+        result.plan_ids = safe_plan_ids;
+    }
+    Ok(result)
 }
 
 pub async fn get(
