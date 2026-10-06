@@ -2,7 +2,7 @@
 
 更新时间：2026-10-06
 
-最新完整绿色基线：`7f31f7a` / Actions `37401072990`，Linux/Windows、前端、显式 V8、Java 21 与 PostgreSQL 全部通过，包含实时导入进度、原始收据核对、P00 只读状态工具及 HTTP 查询。已读取 Linux 日志确认新增 `import_progress` 两项实库测试以及 `actual_pdf_pages_are_imported_as_searchable_source_evidence` 实际通过，不是默认忽略后的通过。PDF 内联/嵌套图片分类、许可证与失租验证来自此前绿色基线并继续通过。本批报告预览及浏览器验收为独立增量，不能沿用该绿色结论。
+最新完整绿色基线：`44f22ff` / Actions `37405615406`，Linux/Windows、前端、显式 V8、Java 21、PostgreSQL 和真实本地浏览器冒烟全部通过，包含报告只读预览、实时导入进度及原始收据核对。已读取 Linux 日志确认 `import_progress` 两项、`actual_pdf_pages_are_imported_as_searchable_source_evidence` 与 P14 临时预览/零写入浏览器检查实际通过，不是默认忽略后的通过。截图采用合成资料，不包含外部账号或真实发布/搜索验收。后续持久本地登录环境为独立工作，不能沿用该绿色结论。
 
 该绿色基线包含：P00 正文分发工具读取跨周期原发送目标及查回摘要；网页搜索修正乱序聊天关联、无效引用回退，支持同回答多次搜索及原始字节初始化超时。CSV v2 对超长记录保存独立生成证据及精确单元格范围，完整原记录不变、普通知识检索不重复返回分片；新增 PostgreSQL 持久分片/检索回归已通过。真实登录、发布/搜索、P04/P12 实机视觉、旧 CSV 版本补建与完整项目验收仍缺。
 
@@ -183,6 +183,8 @@ PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍
 ## 5. 本地启动
 
 数据库首次身份初始化、持久租户模型路由和独立原生内容 bundle 的新增部署入口见 [`runtime-deployment.md`](runtime-deployment.md)。相关能力处于本批集成，精确验证状态以工作日志为准；不能沿用下面旧开发路径的测试结论替代持久部署验收。
+
+持久本地接入辅助脚本见 [`local-workspace.md`](local-workspace.md)：监督专用 PostgreSQL、Rust API、浏览器 runner 与 Vite，私有配置必须位于仓库外。`--check` 使用真实浏览器检查首次软件登录和 Secure Cookie，`--interactive` 为用户保留可操作窗口；不添加产品认证旁路、不记录外部登录截图或凭据。当前非 Docker 单元测试已通过，实际持久启动和外部账号验收状态仍以工作日志为准。
 
 ### 可选：启用本地 P00 模型单回合
 

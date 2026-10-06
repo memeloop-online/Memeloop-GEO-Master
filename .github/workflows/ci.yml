@@ -95,6 +95,7 @@ jobs:
         run: |
           set -o pipefail
           pnpm format:check 2>&1 | tee logs/pnpm-format.log
+          node --test scripts/local-workspace.test.mjs 2>&1 | tee logs/local-workspace-unit.log
           pnpm typecheck 2>&1 | tee logs/pnpm-typecheck.log
           pnpm test 2>&1 | tee logs/pnpm-test.log
           pnpm build 2>&1 | tee logs/pnpm-build.log
@@ -223,6 +224,15 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Node for private local workspace checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test private local workspace configuration
+        shell: pwsh
+        run: node --test scripts/local-workspace.test.mjs
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
