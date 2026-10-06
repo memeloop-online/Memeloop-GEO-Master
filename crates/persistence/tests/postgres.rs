@@ -1700,6 +1700,46 @@ async fn agent_checkpoints_survive_a_restart_and_reject_a_changed_input() {
     assert_eq!(refreshed.version, 2);
     assert_eq!(refreshed.state, json!({"cursor": 4}));
 
+    let mut without_reference = checkpoint("digest-empty", 1);
+    without_reference.step_key = "no-reference".to_owned();
+    without_reference.result_ref = None;
+    let no_reference = repository
+        .store_checkpoint(&scope, run_id, without_reference.clone())
+        .await
+        .expect("checkpoint without object reference");
+    assert!(no_reference.result_ref.is_none());
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT result_ref IS NULL FROM agent_checkpoints WHERE checkpoint_id=$1",
+        )
+        .bind(no_reference.id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    );
+    sqlx::query("UPDATE agent_checkpoints SET result_ref='null'::jsonb WHERE checkpoint_id=$1")
+        .bind(no_reference.id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        restarted
+            .load_checkpoint(&scope, run_id, "loop", "no-reference")
+            .await
+            .unwrap()
+            .unwrap()
+            .result_ref
+            .is_none()
+    );
+    assert!(
+        restarted
+            .store_checkpoint(&scope, run_id, without_reference)
+            .await
+            .unwrap()
+            .result_ref
+            .is_none()
+    );
+
     let conflict = restarted
         .store_checkpoint(&scope, run_id, checkpoint("digest-b", 5))
         .await
@@ -2161,10 +2201,27 @@ async fn agent_rust_tool_attempt_respects_stored_denied_decisions_and_legacy_unk
         outcome: ToolCallOutcome::Unknown,
         ..rust_tool_intent(run_id, "legacy-unknown")
     };
-    repository
+    let legacy_entry = repository
         .append_tool_call(&scope, legacy_unknown.clone())
         .await
         .expect("legacy unknown");
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT result_ref IS NULL FROM agent_tool_call_ledger WHERE ledger_entry_id=$1",
+        )
+        .bind(legacy_entry.id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap()
+    );
+    // Simulate the previous writer's JSON null without rewriting other history.
+    sqlx::query(
+        "UPDATE agent_tool_call_ledger SET result_ref='null'::jsonb WHERE ledger_entry_id=$1",
+    )
+    .bind(legacy_entry.id.as_uuid())
+    .execute(database.pool())
+    .await
+    .unwrap();
     assert!(
         !repository
             .attempt_tool_call(&scope, ToolCallIdentity::from_record(&legacy_unknown))

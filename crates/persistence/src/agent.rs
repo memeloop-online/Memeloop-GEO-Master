@@ -1282,7 +1282,7 @@ impl AgentRepository for PgAgentRepository {
                               project_id, checkpoint_scope, step_key, input_hash, result_ref,
                               version, state, created_at, updated_at"#,
                 )
-                .bind(serde_json::to_value(&checkpoint.result_ref).map_err(serialization_error)?)
+                .bind(encode_optional_object_ref(checkpoint.result_ref.as_ref())?)
                 .bind(checkpoint.state)
                 .bind(Utc::now())
                 .bind(existing.checkpoint_id)
@@ -1320,7 +1320,7 @@ impl AgentRepository for PgAgentRepository {
             .bind(&checkpoint.checkpoint_scope)
             .bind(&checkpoint.step_key)
             .bind(&checkpoint.input_hash)
-            .bind(serde_json::to_value(&checkpoint.result_ref).map_err(serialization_error)?)
+            .bind(encode_optional_object_ref(checkpoint.result_ref.as_ref())?)
             .bind(checkpoint.state)
             .bind(Utc::now())
             .fetch_one(&mut *transaction)
@@ -1436,7 +1436,7 @@ impl AgentRepository for PgAgentRepository {
         .bind(tool_call_decision_text(input.budget))
         .bind(input.intent)
         .bind(counter_i64(input.attempt_count)?)
-        .bind(serde_json::to_value(&input.result_ref).map_err(serialization_error)?)
+        .bind(encode_optional_object_ref(input.result_ref.as_ref())?)
         .bind(tool_call_outcome_text(input.outcome))
         .bind(input.cost_minor)
         .bind(input.currency.as_deref())
@@ -2253,10 +2253,7 @@ impl TryFrom<CheckpointRow> for AgentCheckpoint {
             checkpoint_scope: row.checkpoint_scope,
             step_key: row.step_key,
             input_hash: row.input_hash,
-            result_ref: row
-                .result_ref
-                .map(|result_ref| serde_json::from_value(result_ref).map_err(serialization_error))
-                .transpose()?,
+            result_ref: decode_optional_object_ref(row.result_ref)?,
             version: counter_u64(row.version)?,
             state: row.state,
             created_at: row.created_at,
@@ -2310,16 +2307,46 @@ impl TryFrom<ToolCallRow> for ToolCallLedgerEntry {
             budget: tool_call_decision_from_text(&row.budget)?,
             intent: row.intent,
             attempt_count: counter_u64(row.attempt_count)?,
-            result_ref: row
-                .result_ref
-                .map(|result_ref| serde_json::from_value(result_ref).map_err(serialization_error))
-                .transpose()?,
+            result_ref: decode_optional_object_ref(row.result_ref)?,
             outcome: tool_call_outcome_from_text(&row.outcome)?,
             cost_minor: row.cost_minor,
             currency: row.currency,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
+    }
+}
+
+fn encode_optional_object_ref(
+    reference: Option<&geo_domain::ObjectRef>,
+) -> Result<Option<Value>, AppError> {
+    reference
+        .map(|reference| serde_json::to_value(reference).map_err(serialization_error))
+        .transpose()
+}
+
+fn decode_optional_object_ref(
+    value: Option<Value>,
+) -> Result<Option<geo_domain::ObjectRef>, AppError> {
+    // Older writers encoded Option::None as JSON null instead of SQL NULL.
+    // Both represent absence; malformed non-null references must still fail.
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value).map_err(serialization_error))
+        .transpose()
+}
+
+#[cfg(test)]
+mod optional_result_reference_tests {
+    use super::*;
+
+    #[test]
+    fn absent_references_accept_both_null_encodings_but_write_sql_null() {
+        assert_eq!(encode_optional_object_ref(None).unwrap(), None);
+        assert_eq!(decode_optional_object_ref(None).unwrap(), None);
+        assert_eq!(decode_optional_object_ref(Some(Value::Null)).unwrap(), None);
+        assert!(decode_optional_object_ref(Some(json!({"unexpected": true}))).is_err());
+        assert!(decode_optional_object_ref(Some(json!("not-an-object"))).is_err());
     }
 }
 
