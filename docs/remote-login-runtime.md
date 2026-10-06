@@ -39,6 +39,14 @@ RFB 绕过现有逐动作登录控制守卫，必须重新验证会话输入生�
 
 ## 交付验证
 
+### CI 镜像交付
+
+独立桌面 workflow 在容器内合成验收成功后导出同一个已测镜像，不在开发机重复构建。产物 `interactive-desktop-image-<commit>` 包含 `image.tar.zst`、`image-inspect.json`、`source-commit.txt` 和 `SHA256SUMS`，保留七天；镜像标签绑定完整提交。测试失败时仅保存合成诊断，不产生新的已验证镜像。
+
+下载前核对 Actions 的仓库、分支、提交和成功状态；解压 artifact 后执行 `sha256sum -c SHA256SUMS`，再使用 `zstd -dc image.tar.zst | docker load` 导入。该镜像为 CI Linux 架构，不是 Windows 原生程序；需要兼容的 Linux Docker/containerd 执行环境。k3s 部署应通过受控镜像仓库或管理员维护的 containerd 导入流程，不为导入镜像给测试 Pod 增加宿主挂载或特权权限。镜像不包含登录态和环境密钥；运行凭据另由私有 Secret 注入。已有会话所在的服务切换须保留加密密钥和持久数据库，不能启动第二个执行器争抢同一批任务。
+
+该交付步骤的实际产物与运行验收状态见工作日志；workflow 配置存在不代表镜像已构建或部署。
+
 必须分别验证 Linux 无物理显示环境、生产 ingress WebSocket 和 Windows 客户端：
 
 - 中文输入、剪贴板、滚动、触屏、窄屏、分辨率与焦点；

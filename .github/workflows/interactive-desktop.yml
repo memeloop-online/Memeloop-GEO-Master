@@ -27,6 +27,26 @@ jobs:
           set -o pipefail
           mkdir -p logs
           bash packages/browser-runner/smoke/verify-container.sh 2>&1 | tee logs/interactive-desktop.log
+      - name: Export verified desktop image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop-image
+          docker tag geo-interactive-smoke:local "geo-interactive:${GITHUB_SHA}"
+          docker save "geo-interactive:${GITHUB_SHA}" | zstd -T2 -3 -o desktop-image/image.tar.zst
+          docker image inspect "geo-interactive:${GITHUB_SHA}" \
+            --format '{{json .}}' > desktop-image/image-inspect.json
+          printf '%s\n' "${GITHUB_SHA}" > desktop-image/source-commit.txt
+          cd desktop-image
+          sha256sum image.tar.zst image-inspect.json source-commit.txt > SHA256SUMS
+      - name: Preserve verified desktop image
+        uses: actions/upload-artifact@v4
+        with:
+          name: interactive-desktop-image-${{ github.sha }}
+          path: desktop-image/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
       - name: Preserve synthetic runtime diagnostics
         if: always()
         uses: actions/upload-artifact@v4
