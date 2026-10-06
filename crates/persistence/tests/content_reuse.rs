@@ -651,6 +651,15 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             .await
             .is_err()
     );
+    let before_revoke = restarted
+        .get_item(&scope, execution.execution_id, item.item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The edit/recheck above replaced the original producer fence. Revocation
+    // must preserve that current state, not restore the first Prepare token.
+    assert_ne!(recheck.token, lease.token);
+    assert_eq!(before_revoke.reuse_reservation_token, Some(recheck.token));
     sqlx::query("UPDATE knowledge_sources SET purpose='internal' WHERE source_id=$1")
         .bind(source)
         .execute(database.pool())
@@ -662,8 +671,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             .get_item(&scope, execution.execution_id, item.item_id)
             .await
             .unwrap()
-            .unwrap()
-            .reuse_reservation_token,
-        Some(lease.token)
+            .unwrap(),
+        before_revoke
     );
 }
