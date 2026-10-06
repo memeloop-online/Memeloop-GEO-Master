@@ -2336,20 +2336,6 @@ fn decode_optional_object_ref(
         .transpose()
 }
 
-#[cfg(test)]
-mod optional_result_reference_tests {
-    use super::*;
-
-    #[test]
-    fn absent_references_accept_both_null_encodings_but_write_sql_null() {
-        assert_eq!(encode_optional_object_ref(None).unwrap(), None);
-        assert_eq!(decode_optional_object_ref(None).unwrap(), None);
-        assert_eq!(decode_optional_object_ref(Some(Value::Null)).unwrap(), None);
-        assert!(decode_optional_object_ref(Some(json!({"unexpected": true}))).is_err());
-        assert!(decode_optional_object_ref(Some(json!("not-an-object"))).is_err());
-    }
-}
-
 fn conversation_status_text(status: ConversationStatus) -> &'static str {
     match status {
         ConversationStatus::Active => "active",
@@ -2510,4 +2496,18 @@ fn serialization_error(error: impl std::fmt::Display) -> AppError {
         geo_domain::ErrorCode::Internal,
         format!("agent serialization failed: {error}"),
     )
+}
+
+#[cfg(test)]
+mod optional_result_reference_tests {
+    use super::*;
+
+    #[test]
+    fn absent_references_accept_both_null_encodings_but_write_sql_null() {
+        assert_eq!(encode_optional_object_ref(None).unwrap(), None);
+        assert_eq!(decode_optional_object_ref(None).unwrap(), None);
+        assert_eq!(decode_optional_object_ref(Some(Value::Null)).unwrap(), None);
+        assert!(decode_optional_object_ref(Some(json!({"unexpected": true}))).is_err());
+        assert!(decode_optional_object_ref(Some(json!("not-an-object"))).is_err());
+    }
 }
