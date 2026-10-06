@@ -4,9 +4,15 @@
 //! framework.  They are the stable boundary used by the modular monolith.
 
 mod agent;
+mod appearance;
+pub use appearance::{
+    DEFAULT_LOCALE, DEFAULT_PRIMARY_COLOR, OperatorAppearance, UpdateOperatorAppearance,
+};
 mod auth;
 mod channel_jobs;
 pub use channel_jobs::*;
+mod citation_insights;
+pub use citation_insights::*;
 mod channels;
 pub use channels::*;
 mod connector_capabilities;
@@ -72,9 +78,10 @@ pub use knowledge::{
     KnowledgeEvidence, KnowledgeImportProgress, KnowledgeImportProgressError, KnowledgeOverview,
     KnowledgePurpose, KnowledgeRelease, KnowledgeRepository, KnowledgeSearchRequest,
     KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES, MemoryKnowledgeRepository,
-    Product, ProductState, Source, SourceDetail, SourceKind, SourceState, SourceVersion,
-    StoredObject, StoredObjectState, UPLOAD_SESSION_TTL_SECONDS, UploadSession,
-    UploadSessionCommand, UploadSessionState, deterministic_chunks,
+    Product, ProductState, ReviseSourceTextCommand, Source, SourceDetail, SourceKind, SourceState,
+    SourceTextBasis, SourceTextRevisionReceipt, SourceVersion, SourceVersionContent,
+    SourceVersionRepresentation, StoredObject, StoredObjectState, UPLOAD_SESSION_TTL_SECONDS,
+    UploadSession, UploadSessionCommand, UploadSessionState, deterministic_chunks,
     is_supported_knowledge_media_type, knowledge_import_progress_app_error,
     knowledge_import_progress_error, knowledge_import_progress_errors, knowledge_parser_version,
     parsed_knowledge_chunks, plan_document_manifest, sha256_hex,

@@ -106,6 +106,7 @@ function mockApi(
   initialAccounts: unknown[] = [],
   operator = false,
   connector = unverifiedCapability,
+  operatorRole = "resource_admin",
 ) {
   const requests: { path: string; method: string; body?: unknown; url: URL }[] =
     [];
@@ -122,7 +123,7 @@ function mockApi(
             ? {
                 ...session,
                 memberships: [
-                  { ...session.memberships[0], role: "resource_admin" },
+                  { ...session.memberships[0], role: operatorRole },
                 ],
               }
             : session,
@@ -543,6 +544,21 @@ describe("account page", () => {
 });
 
 describe("operator pool", () => {
+  it("offers appearance settings to OEM admins", async () => {
+    mockApi([], true, unverifiedCapability, "oem_admin");
+    renderOperator();
+    expect(
+      await screen.findByRole("link", { name: "工作区外观" }),
+    ).toHaveAttribute("href", "/ops/appearance");
+  });
+  it("does not offer appearance settings to resource admins", async () => {
+    mockApi([], true);
+    renderOperator();
+    await screen.findByRole("heading", { name: "账号资源池" });
+    expect(
+      screen.queryByRole("link", { name: "工作区外观" }),
+    ).not.toBeInTheDocument();
+  });
   it("labels article wire format without changing its saved capability key", async () => {
     const { requests } = mockApi([], true, {
       ...verifiedCapability,

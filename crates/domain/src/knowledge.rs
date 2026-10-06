@@ -45,6 +45,165 @@ pub enum KnowledgePurpose {
     Internal,
 }
 
+#[cfg(test)]
+mod text_revision_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn authored_revisions_preserve_original_and_replay_immutable_receipts() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let repository = MemoryKnowledgeRepository::default();
+        let original = repository
+            .import_batch(
+                &scope,
+                vec![ImportItem {
+                    client_item_id: "original".to_owned(),
+                    kind: SourceKind::Text,
+                    name: "Synthetic source".to_owned(),
+                    purpose: KnowledgePurpose::Public,
+                    text: Some("Original evidence".to_owned()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+        let source = original.source.unwrap();
+        let base = original.source_version.unwrap();
+        let first = ReviseSourceTextCommand {
+            base_version_id: base.source_version_id,
+            media_type: "text/markdown".to_owned(),
+            text: "  中文标题\n\n- original evidence\n".to_owned(),
+        };
+        let receipt = repository
+            .revise_source_text(
+                &scope,
+                source.source_id,
+                source.revision,
+                "first",
+                first.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.source_version.version, base.version + 1);
+        assert_eq!(
+            receipt.source_version.parent_version_id,
+            Some(base.source_version_id)
+        );
+        assert_eq!(receipt.source_version.object_id, None);
+        {
+            let mut state = repository.state.write().await;
+            let mut unpublished = receipt.source_version.clone();
+            unpublished.source_version_id = Uuid::new_v4();
+            unpublished.version += 1;
+            unpublished.representation = SourceVersionRepresentation::Original;
+            state
+                .versions
+                .insert(unpublished.source_version_id, unpublished);
+        }
+        let next = repository
+            .revise_source_text(
+                &scope,
+                source.source_id,
+                receipt.source.revision,
+                "second",
+                ReviseSourceTextCommand {
+                    base_version_id: receipt.source_version.source_version_id,
+                    media_type: "text/plain".to_owned(),
+                    text: "Another revision".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next.source_version.version,
+            receipt.source_version.version + 2
+        );
+        assert_eq!(
+            repository
+                .revise_source_text(
+                    &scope,
+                    source.source_id,
+                    source.revision,
+                    "first",
+                    first.clone(),
+                )
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_ne!(
+            receipt.knowledge_release.knowledge_release_id,
+            next.knowledge_release.knowledge_release_id
+        );
+        assert_eq!(
+            repository
+                .get_source_version_content(
+                    &scope,
+                    source.source_id,
+                    receipt.source_version.source_version_id
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .text,
+            first.text
+        );
+        assert_eq!(
+            repository
+                .get_source_version_content(&scope, source.source_id, base.source_version_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .text_basis,
+            SourceTextBasis::Extracted
+        );
+        assert!(
+            repository
+                .revise_source_text(
+                    &scope,
+                    source.source_id,
+                    source.revision,
+                    "first",
+                    ReviseSourceTextCommand {
+                        text: "different".to_owned(),
+                        ..first.clone()
+                    },
+                )
+                .await
+                .unwrap_err()
+                .details
+                .unwrap()
+                .to_string()
+                .contains("idempotency_conflict")
+        );
+        assert!(
+            repository
+                .revise_source_text(&scope, source.source_id, source.revision, "stale", first)
+                .await
+                .unwrap_err()
+                .details
+                .unwrap()
+                .to_string()
+                .contains("source_revision_conflict")
+        );
+        assert!(
+            repository
+                .get_source_version_content(&scope, Uuid::new_v4(), base.source_version_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadSessionState {
@@ -381,6 +540,8 @@ pub struct SourceVersion {
     pub project_id: ProjectId,
     pub source_id: Uuid,
     pub version: i64,
+    #[serde(default)]
+    pub representation: SourceVersionRepresentation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -394,6 +555,61 @@ pub struct SourceVersion {
     pub parser_version: String,
     pub extraction_version: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVersionRepresentation {
+    #[default]
+    Original,
+    AuthoredText,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTextBasis {
+    Exact,
+    Extracted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SourceVersionContent {
+    pub source_version_id: Uuid,
+    pub representation: SourceVersionRepresentation,
+    pub media_type: String,
+    pub text: String,
+    pub text_basis: SourceTextBasis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviseSourceTextCommand {
+    pub base_version_id: Uuid,
+    pub media_type: String,
+    pub text: String,
+}
+
+impl ReviseSourceTextCommand {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !matches!(self.media_type.as_str(), "text/plain" | "text/markdown") {
+            return Err(AppError::invalid_request(
+                "media_type must be text/plain or text/markdown",
+            ));
+        }
+        if self.text.trim().is_empty() || self.text.len() > MAX_INLINE_TEXT_BYTES {
+            return Err(AppError::invalid_request(
+                "text must be nonblank and no more than 256 KiB",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct SourceTextRevisionReceipt {
+    pub source: Source,
+    pub source_version: SourceVersion,
+    pub knowledge_release: KnowledgeRelease,
 }
 
 /// P04 source-detail read model.  It contains only scoped, traceable rows;
@@ -990,6 +1206,20 @@ pub struct KnowledgeOverview {
 
 #[async_trait]
 pub trait KnowledgeRepository: Send + Sync {
+    async fn get_source_version_content(
+        &self,
+        scope: &TenantScope,
+        source_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<SourceVersionContent>, AppError>;
+    async fn revise_source_text(
+        &self,
+        scope: &TenantScope,
+        source_id: Uuid,
+        expected_revision: i64,
+        idempotency_key: &str,
+        command: ReviseSourceTextCommand,
+    ) -> Result<SourceTextRevisionReceipt, AppError>;
     /// Validate the precise frozen content branches while holding the memory
     /// source read lock until the caller's content transaction has committed.
     /// A PostgreSQL implementation explicitly opts into the transactional
@@ -1356,6 +1586,8 @@ struct MemoryState {
     object_bytes: HashMap<Uuid, Vec<u8>>,
     sources: HashMap<Uuid, Source>,
     versions: HashMap<Uuid, SourceVersion>,
+    authored_text: HashMap<Uuid, (String, String)>,
+    revision_receipts: HashMap<(String, Uuid, String), (String, SourceTextRevisionReceipt)>,
     jobs: HashMap<Uuid, ImportJob>,
     pdf_jobs: HashMap<Uuid, MemoryPdfState>,
     office_jobs: HashMap<Uuid, MemoryOfficeState>,
@@ -1839,6 +2071,7 @@ impl MemoryKnowledgeRepository {
             project_id,
             source_id,
             version: 1,
+            representation: SourceVersionRepresentation::Original,
             object_id: object.map(|value| value.object_id),
             object_version: object.map(|value| value.object_version),
             content_sha256: content_hash,
@@ -2156,6 +2389,183 @@ scoped_knowledge!(
 
 #[async_trait]
 impl KnowledgeRepository for MemoryKnowledgeRepository {
+    async fn get_source_version_content(
+        &self,
+        scope: &TenantScope,
+        source_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<SourceVersionContent>, AppError> {
+        Self::require_project(scope)?;
+        let state = self.state.read().await;
+        let Some(version) = state
+            .versions
+            .get(&version_id)
+            .filter(|version| version.source_id == source_id && Self::in_scope(scope, *version))
+        else {
+            return Ok(None);
+        };
+        if let Some((media_type, text)) = state.authored_text.get(&version_id) {
+            return Ok(Some(SourceVersionContent {
+                source_version_id: version_id,
+                representation: SourceVersionRepresentation::AuthoredText,
+                media_type: media_type.clone(),
+                text: text.clone(),
+                text_basis: SourceTextBasis::Exact,
+            }));
+        }
+        if let Some(object_id) = version.object_id
+            && let (Some(object), Some(bytes)) = (
+                state.stored_objects.get(&object_id),
+                state.object_bytes.get(&object_id),
+            )
+            && matches!(
+                object.detected_media_type.as_str(),
+                "text/plain" | "text/markdown"
+            )
+            && object.object_version == version.object_version.unwrap_or_default()
+            && bytes.len() as u64 == object.actual_size
+            && sha256_hex(bytes) == object.sha256
+            && object.sha256 == version.content_sha256
+            && let Ok(text) = String::from_utf8(bytes.clone())
+        {
+            return Ok(Some(SourceVersionContent {
+                source_version_id: version_id,
+                representation: SourceVersionRepresentation::Original,
+                media_type: object.detected_media_type.clone(),
+                text,
+                text_basis: SourceTextBasis::Exact,
+            }));
+        }
+        let mut chunks = state.chunks.get(&version_id).cloned().unwrap_or_default();
+        chunks.sort_by_key(|chunk| chunk.ordinal);
+        Ok(Some(SourceVersionContent {
+            source_version_id: version_id,
+            representation: SourceVersionRepresentation::Original,
+            media_type: "text/plain".to_owned(),
+            text: chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            text_basis: SourceTextBasis::Extracted,
+        }))
+    }
+
+    async fn revise_source_text(
+        &self,
+        scope: &TenantScope,
+        source_id: Uuid,
+        expected_revision: i64,
+        idempotency_key: &str,
+        command: ReviseSourceTextCommand,
+    ) -> Result<SourceTextRevisionReceipt, AppError> {
+        let project_id = Self::require_project(scope)?;
+        command.validate()?;
+        if idempotency_key.is_empty() {
+            return Err(AppError::invalid_request(
+                "Idempotency-Key must not be empty",
+            ));
+        }
+        let fingerprint = sha256_hex(
+            &serde_json::to_vec(&(expected_revision, &command))
+                .map_err(|_| AppError::invalid_request("invalid revision request"))?,
+        );
+        let receipt_key = (
+            scope.storage_key(),
+            source_id,
+            sha256_hex(idempotency_key.as_bytes()),
+        );
+        let mut state = self.state.write().await;
+        if let Some((stored_hash, receipt)) = state.revision_receipts.get(&receipt_key) {
+            return if stored_hash == &fingerprint {
+                Ok(receipt.clone())
+            } else {
+                Err(
+                    AppError::conflict("idempotency key reused for a different request")
+                        .with_details(json!({"reason":"idempotency_conflict"})),
+                )
+            };
+        }
+        let source = state
+            .sources
+            .get(&source_id)
+            .filter(|source| Self::in_scope(scope, *source))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("knowledge source not found"))?;
+        let base = state
+            .versions
+            .get(&command.base_version_id)
+            .filter(|version| version.source_id == source_id && Self::in_scope(scope, *version))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("source version not found"))?;
+        if source.state != SourceState::Active
+            || source.revision != expected_revision
+            || source.current_version_id != Some(base.source_version_id)
+        {
+            return Err(AppError::conflict("knowledge source revision changed")
+                .with_details(json!({"reason":"source_revision_conflict"})));
+        }
+        if state.jobs.values().any(|job| {
+            job.source_id == source_id
+                && Self::in_scope(scope, job)
+                && matches!(job.status, ImportStatus::Queued | ImportStatus::Running)
+                && (state.pdf_jobs.contains_key(&job.import_job_id)
+                    || state.office_jobs.contains_key(&job.import_job_id))
+        }) {
+            return Err(AppError::conflict("source parse in progress")
+                .with_details(json!({"reason":"source_parse_in_progress"})));
+        }
+        let next_version = state
+            .versions
+            .values()
+            .filter(|version| version.source_id == source_id && Self::in_scope(scope, *version))
+            .map(|version| version.version)
+            .max()
+            .unwrap_or(base.version)
+            + 1;
+        let now = Utc::now();
+        let version_id = Uuid::new_v4();
+        let chunks =
+            parsed_knowledge_chunks(scope, version_id, &command.text, &command.media_type)?;
+        let version = SourceVersion {
+            source_version_id: version_id,
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id,
+            source_id,
+            version: next_version,
+            representation: SourceVersionRepresentation::AuthoredText,
+            object_id: None,
+            object_version: None,
+            content_sha256: sha256_hex(command.text.as_bytes()),
+            captured_at: now,
+            original_url: None,
+            parent_version_id: Some(base.source_version_id),
+            parser_version: knowledge_parser_version(&command.media_type).to_owned(),
+            extraction_version: "authored-text-v1".to_owned(),
+            created_at: now,
+        };
+        let mut source = source;
+        source.revision += 1;
+        source.current_version_id = Some(version_id);
+        state.versions.insert(version_id, version.clone());
+        state.chunks.insert(version_id, chunks);
+        state
+            .authored_text
+            .insert(version_id, (command.media_type, command.text));
+        state.sources.insert(source_id, source.clone());
+        let knowledge_release = Self::make_release_locked(&mut state, scope)?;
+        let receipt = SourceTextRevisionReceipt {
+            source,
+            source_version: version,
+            knowledge_release,
+        };
+        state
+            .revision_receipts
+            .insert(receipt_key, (fingerprint, receipt.clone()));
+        Ok(receipt)
+    }
+
     async fn hold_content_evidence<'a>(
         &'a self,
         scope: &TenantScope,
@@ -2701,6 +3111,15 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
         if source.state != SourceState::Active {
             return Err(AppError::conflict("Office source was removed"));
         }
+        if source.current_version_id.is_some_and(|id| {
+            state.versions.get(&id).is_some_and(|version| {
+                version.representation == SourceVersionRepresentation::AuthoredText
+            })
+        }) {
+            return Err(AppError::conflict(
+                "Office source has a newer authored version",
+            ));
+        }
         let object = state
             .stored_objects
             .get(&office.object_id)
@@ -2744,6 +3163,7 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 version: parent_id
                     .and_then(|id| state.versions.get(&id))
                     .map_or(1, |parent| parent.version + 1),
+                representation: SourceVersionRepresentation::Original,
                 object_id: Some(object.object_id),
                 object_version: Some(object.object_version),
                 content_sha256: object.sha256.clone(),
@@ -2952,6 +3372,11 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
         if source.state != SourceState::Active {
             return Err(AppError::conflict("Office source was removed"));
         }
+        if source.current_version_id != prior.source_version_id {
+            return Err(AppError::conflict(
+                "Office source has a newer current version",
+            ));
+        }
         let operation = Operation::queued("knowledge.import", scope.clone());
         let next = ImportJob {
             import_job_id: Uuid::new_v4(),
@@ -3023,6 +3448,15 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
         if source.state != SourceState::Active {
             return Err(AppError::conflict("PDF source was removed"));
         }
+        if source.current_version_id.is_some_and(|id| {
+            state.versions.get(&id).is_some_and(|version| {
+                version.representation == SourceVersionRepresentation::AuthoredText
+            })
+        }) {
+            return Err(AppError::conflict(
+                "PDF source has a newer authored version",
+            ));
+        }
         let object = state
             .stored_objects
             .get(&pdf.object_id)
@@ -3071,6 +3505,7 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 version: parent_id
                     .and_then(|id| state.versions.get(&id))
                     .map_or(1, |parent| parent.version + 1),
+                representation: SourceVersionRepresentation::Original,
                 object_id: Some(object.object_id),
                 object_version: Some(object.object_version),
                 content_sha256: object.sha256.clone(),
@@ -3251,6 +3686,9 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             .ok_or_else(|| AppError::not_found("PDF source not found"))?;
         if source.state != SourceState::Active {
             return Err(AppError::conflict("PDF source was removed"));
+        }
+        if source.current_version_id != prior.source_version_id {
+            return Err(AppError::conflict("PDF source has a newer current version"));
         }
         let operation = Operation::queued("knowledge.import", scope.clone());
         let next = ImportJob {

@@ -1,9 +1,10 @@
 import { createRoot } from "react-dom/client";
-import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter } from "react-router-dom";
 import { AppRoutes } from "./app";
+import { AppearanceProvider } from "./appearance/AppearanceProvider";
 import { AuthProvider } from "./auth/AuthProvider";
+import "./i18n";
 import "./styles.css";
 
 const queryClient = new QueryClient({
@@ -13,7 +14,7 @@ const queryClient = new QueryClient({
 });
 
 createRoot(document.getElementById("root")!).render(
-  <FluentProvider theme={webLightTheme}>
+  <AppearanceProvider>
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
         <BrowserRouter>
@@ -21,5 +22,5 @@ createRoot(document.getElementById("root")!).render(
         </BrowserRouter>
       </AuthProvider>
     </QueryClientProvider>
-  </FluentProvider>,
+  </AppearanceProvider>,
 );

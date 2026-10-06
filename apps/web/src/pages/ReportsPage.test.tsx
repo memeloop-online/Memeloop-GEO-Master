@@ -273,8 +273,13 @@ describe("P14 immutable reports", () => {
       within(previewSection).getByText("资料不足的文档分支"),
     ).toBeInTheDocument();
     expect(within(previewSection).getByText("生成时间")).toBeInTheDocument();
-    expect(within(previewSection).getByText("证据水位")).toBeInTheDocument();
-    expect(within(previewSection).getByText("冻结截止")).toBeInTheDocument();
+    expect(within(previewSection).getByText("数据更新至")).toBeInTheDocument();
+    expect(
+      within(previewSection).getByText("本期截止时间"),
+    ).toBeInTheDocument();
+    expect(
+      within(previewSection).queryByText(/证据水位|计划分母|Reduce 版本/),
+    ).not.toBeInTheDocument();
     expect(
       within(previewSection).getByText("2026/09/27 20:01"),
     ).toBeInTheDocument();
@@ -288,7 +293,7 @@ describe("P14 immutable reports", () => {
       .getByRole("heading", { name: "AI 渠道测量覆盖" })
       .closest(".report-panel")!;
     expect(
-      within(measurement as HTMLElement).getByText(/计划分母 4/),
+      within(measurement as HTMLElement).getByText(/计划总数 4/),
     ).toBeInTheDocument();
     expect(
       within(measurement as HTMLElement).getByText("缺测"),
@@ -374,10 +379,10 @@ describe("P14 immutable reports", () => {
     const fetchMock = mockApi();
     const user = userEvent.setup();
     renderPage();
-    expect(await screen.findByText(/显式更正版本，原报告/)).toBeInTheDocument();
+    expect(await screen.findByText(/更正版本，原报告/)).toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: /2026.*2026/ }));
     expect(await screen.findByText("report-original")).toBeInTheDocument();
-    expect(screen.getByText(/后续证据不会静默改写本版本/)).toBeInTheDocument();
+    expect(screen.getByText(/后续更新将另存为新版本/)).toBeInTheDocument();
     const reportCalls = fetchMock.mock.calls.filter(([request]) =>
       String(request).includes("/reports"),
     );
@@ -399,8 +404,8 @@ describe("P14 immutable reports", () => {
     expect(await screen.findByText("一个分支仍需资料")).toBeInTheDocument();
     const coverage = screen.getByRole("region", { name: "三类独立覆盖" });
     expect(within(coverage).getAllByText(/尚无封存输入/)).toHaveLength(2);
-    expect(within(coverage).getAllByText(/计划分母 未知/)).toHaveLength(2);
-    expect(screen.getByText(/不能推断提及、引用或趋势/)).toBeInTheDocument();
+    expect(within(coverage).getAllByText(/计划总数 未知/)).toHaveLength(2);
+    expect(screen.getByText(/暂无 AI 渠道测量数据/)).toBeInTheDocument();
     expect(screen.queryByText(/GEO 总分/)).not.toBeInTheDocument();
     const link = screen.getByRole("link", { name: /查看快照证据/ });
     expect(link).toHaveAttribute("href", "#evidence-evidence-1");
@@ -648,7 +653,7 @@ describe("P14 immutable reports", () => {
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/查回发现资产不证明原发送成功/),
+      screen.getByText(/发现公开资产后，原发送结果仍可能待核对/),
     ).toBeInTheDocument();
     expect(screen.getByText("结果未知")).toBeInTheDocument();
     const csv = reportSnapshotCsv(report);

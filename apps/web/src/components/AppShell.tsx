@@ -1,4 +1,5 @@
-import { useState, type ReactElement } from "react";
+import { useEffect, useState, type ReactElement } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Avatar,
   Button,
@@ -15,7 +16,6 @@ import {
   ChatRegular,
   ChevronDownRegular,
   DataUsageRegular,
-  DocumentDataRegular,
   PanelLeftContractRegular,
   PanelLeftExpandRegular,
   SettingsRegular,
@@ -33,6 +33,8 @@ import { useAuth } from "../auth/AuthProvider";
 import { membershipForTenant } from "../auth/types";
 import { useProjectsQuery } from "../api/projects";
 import { ErrorState, LoadingState } from "./AsyncState";
+import { Brand } from "./Brand";
+import { LanguageSelect } from "./LanguageSelect";
 
 type NavGroup = {
   id: string;
@@ -51,31 +53,30 @@ const navGroups: NavGroup[] = [
     children: [{ to: "overview", label: "项目总览" }],
   },
   {
-    id: "knowledge",
-    to: "knowledge",
-    label: "企业知识",
-    icon: <BookInformationRegular />,
-    children: [],
+    id: "measurement",
+    to: "measurement",
+    label: "测量与洞察",
+    icon: <DataUsageRegular />,
+    children: [
+      { to: "measurement", label: "独立测量与问题集" },
+      { to: "reports", label: "效果报告" },
+    ],
   },
   {
     id: "content",
     to: "content",
-    label: "内容与计划",
+    label: "内容与发布",
     icon: <TextBulletListSquareRegular />,
-    children: [{ to: "campaigns/current", label: "当前计划与动作" }],
+    children: [
+      { to: "campaigns/current", label: "当前计划与动作" },
+      { to: "publications", label: "发布目标与执行" },
+    ],
   },
   {
-    id: "measurement",
-    to: "publications",
-    label: "发布与测量",
-    icon: <DataUsageRegular />,
-    children: [{ to: "measurement", label: "问题集与分析" }],
-  },
-  {
-    id: "reports",
-    to: "reports",
-    label: "效果报告",
-    icon: <DocumentDataRegular />,
+    id: "knowledge",
+    to: "knowledge",
+    label: "企业知识",
+    icon: <BookInformationRegular />,
     children: [],
   },
   {
@@ -89,28 +90,49 @@ const navGroups: NavGroup[] = [
     ],
   },
 ];
+const childLabelKeys: Record<string, string> = {
+  overview: "overview",
+  measurement: "standalone",
+  reports: "reports",
+  "campaigns/current": "campaigns",
+  publications: "publications",
+  setup: "setup",
+  channels: "channels",
+};
 
 function groupForPath(pathname: string): string | undefined {
   const section = pathname.split("/")[4];
   if (!section || section === "chat" || section === "overview") return "chat";
   if (section === "knowledge" || section === "ask") return "knowledge";
   if (section === "content" || section === "campaigns") return "content";
-  if (section === "measurement" || section === "publications")
-    return "measurement";
-  if (section === "reports") return "reports";
+  if (section === "publications") return "content";
+  if (section === "measurement" || section === "reports") return "measurement";
   if (["settings", "setup", "channels", "billing"].includes(section))
     return "settings";
   return undefined;
 }
 
 export function AppShell() {
+  const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState(
-    () => window.matchMedia?.("(max-width: 767px)").matches ?? false,
+    () => window.matchMedia?.("(max-width: 767px)")?.matches ?? false,
   );
   const [loggingOut, setLoggingOut] = useState(false);
   const navigate = useNavigate();
   const { pathname } = useLocation();
   const activeGroup = groupForPath(pathname);
+  useEffect(() => {
+    const narrow = window.matchMedia?.("(max-width: 767px)");
+    if (!narrow) return;
+    const onChange = (event: MediaQueryListEvent) => {
+      if (event.matches) setCollapsed(true);
+    };
+    narrow.addEventListener?.("change", onChange);
+    return () => narrow.removeEventListener?.("change", onChange);
+  }, []);
+  useEffect(() => {
+    if (window.matchMedia?.("(max-width: 767px)")?.matches) setCollapsed(true);
+  }, [pathname]);
   const { tenantId, projectId } = useParams();
   const { session, logout } = useAuth();
   const {
@@ -124,9 +146,9 @@ export function AppShell() {
     (project) => project.id === projectId,
   );
   const projectLabel = isPending
-    ? "正在加载项目"
+    ? t("shell.projectLoading")
     : (currentProject?.display_name ??
-      (isError ? "项目列表暂时不可用" : "未找到项目"));
+      (isError ? t("shell.projectUnavailable") : t("shell.projectMissing")));
   const projectMeta = currentProject
     ? `${currentProject.settings.market} · ${currentProject.settings.language}`
     : (membership?.tenant_display_name ?? tenantId);
@@ -143,59 +165,76 @@ export function AppShell() {
 
   return (
     <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
-      <aside className="sidebar" aria-label="主导航">
-        <div className="brand">
-          <div className="brand-mark">M</div>
-          {!collapsed && (
-            <span>
-              Memeloop <b>GEO</b>
-            </span>
-          )}
-        </div>
+      {!collapsed && (
+        <button
+          type="button"
+          className="sidebar-dismiss"
+          aria-label={t("shell.closeNavigation")}
+          onClick={() => setCollapsed(true)}
+        />
+      )}
+      <aside className="sidebar" aria-label={t("shell.navigation")}>
+        <Brand collapsed={collapsed} />
         <nav className="side-nav">
-          {navGroups.map((group) => (
-            <div className="nav-group" key={group.id}>
-              <Tooltip
-                content={group.label}
-                relationship="label"
-                positioning="after"
-                visible={collapsed ? undefined : false}
+          {navGroups.map((group) => {
+            const groupLabel = t(`navigation.${group.id}`, {
+              defaultValue: group.label,
+            });
+            const groupLink = (
+              <Link
+                to={group.to}
+                className={`nav-link${activeGroup === group.id ? " active" : ""}`}
+                aria-current={activeGroup === group.id ? "location" : undefined}
+                aria-label={groupLabel}
               >
-                <Link
-                  to={group.to}
-                  className={`nav-link${activeGroup === group.id ? " active" : ""}`}
-                  aria-current={
-                    activeGroup === group.id ? "location" : undefined
-                  }
-                  aria-label={group.label}
-                >
-                  <span className="nav-icon">{group.icon}</span>
-                  {!collapsed && <span>{group.label}</span>}
-                </Link>
-              </Tooltip>
-              {!collapsed &&
-                activeGroup === group.id &&
-                group.children.length > 0 && (
-                  <div
-                    className="nav-children"
-                    aria-label={`${group.label}详情`}
+                <span className="nav-icon">{group.icon}</span>
+                {!collapsed && <span>{groupLabel}</span>}
+              </Link>
+            );
+            return (
+              <div className="nav-group" key={group.id}>
+                {collapsed ? (
+                  <Tooltip
+                    content={groupLabel}
+                    relationship="label"
+                    positioning="after"
                   >
-                    {group.children.map((child) => (
-                      <NavLink
-                        key={child.to}
-                        to={child.to}
-                        end
-                        className={({ isActive }) =>
-                          `nav-child-link${isActive ? " active" : ""}`
-                        }
-                      >
-                        {child.label}
-                      </NavLink>
-                    ))}
-                  </div>
+                    {groupLink}
+                  </Tooltip>
+                ) : (
+                  groupLink
                 )}
-            </div>
-          ))}
+                {!collapsed &&
+                  activeGroup === group.id &&
+                  group.children.length > 0 && (
+                    <div
+                      className="nav-children"
+                      aria-label={t("shell.groupDetails", {
+                        group: groupLabel,
+                      })}
+                    >
+                      {group.children.map((child) => (
+                        <NavLink
+                          key={child.to}
+                          to={child.to}
+                          end
+                          className={({ isActive }) =>
+                            `nav-child-link${isActive ? " active" : ""}`
+                          }
+                        >
+                          {t(
+                            `navigation.${childLabelKeys[child.to] ?? child.to}`,
+                            {
+                              defaultValue: child.label,
+                            },
+                          )}
+                        </NavLink>
+                      ))}
+                    </div>
+                  )}
+              </div>
+            );
+          })}
         </nav>
         <Button
           className="collapse-button"
@@ -208,7 +247,11 @@ export function AppShell() {
             )
           }
           onClick={() => setCollapsed((value) => !value)}
-          aria-label={collapsed ? "展开导航栏" : "折叠导航栏"}
+          aria-label={
+            collapsed
+              ? t("shell.expandNavigation")
+              : t("shell.collapseNavigation")
+          }
         />
       </aside>
       <header className="topbar">
@@ -229,7 +272,9 @@ export function AppShell() {
           </MenuTrigger>
           <MenuPopover>
             <MenuList>
-              {isPending && <MenuItem disabled>正在加载项目…</MenuItem>}
+              {isPending && (
+                <MenuItem disabled>{t("shell.loadingProjects")}</MenuItem>
+              )}
               {projects?.items.map((project) => (
                 <MenuItem
                   key={project.id}
@@ -238,42 +283,45 @@ export function AppShell() {
                   }
                 >
                   {project.display_name}
-                  {project.id === projectId ? "（当前）" : ""}
+                  {project.id === projectId ? t("shell.current") : ""}
                 </MenuItem>
               ))}
               {!isPending && !isError && projects?.items.length === 0 && (
-                <MenuItem disabled>当前工作区还没有项目</MenuItem>
+                <MenuItem disabled>{t("shell.noProjects")}</MenuItem>
               )}
               {projects?.next_cursor && (
-                <MenuItem disabled>仅显示前 50 个项目</MenuItem>
+                <MenuItem disabled>{t("shell.firstFifty")}</MenuItem>
               )}
               {isError && (
-                <MenuItem onClick={() => void refetch()}>重新加载项目</MenuItem>
+                <MenuItem onClick={() => void refetch()}>
+                  {t("shell.reloadProjects")}
+                </MenuItem>
               )}
               <MenuItem
                 onClick={() => navigate(`/setup?tenant_id=${tenantId}`)}
               >
-                创建项目
+                {t("shell.createProject")}
               </MenuItem>
               <MenuItem onClick={() => navigate("/workspaces")}>
-                切换工作区
+                {t("shell.switchWorkspace")}
               </MenuItem>
             </MenuList>
           </MenuPopover>
         </Menu>
         <div className="topbar-actions">
-          <Button appearance="subtle">帮助</Button>
+          <LanguageSelect />
+          <Button appearance="subtle">{t("shell.help")}</Button>
           <Menu>
             <MenuTrigger disableButtonEnhancement>
               <Button
                 appearance="subtle"
                 icon={
                   <Avatar
-                    name={session?.user.display_name ?? "用户"}
+                    name={session?.user.display_name ?? t("shell.user")}
                     color="colorful"
                   />
                 }
-                aria-label="用户菜单"
+                aria-label={t("shell.userMenu")}
               >
                 <span className="user-menu-name">
                   {session?.user.display_name}
@@ -284,14 +332,14 @@ export function AppShell() {
               <MenuList>
                 <MenuItem disabled>{session?.user.login_name}</MenuItem>
                 <MenuItem onClick={() => navigate("/workspaces")}>
-                  切换工作区
+                  {t("shell.switchWorkspace")}
                 </MenuItem>
                 <MenuItem
                   icon={<ArrowExitRegular />}
                   disabled={loggingOut}
                   onClick={() => void handleLogout()}
                 >
-                  {loggingOut ? "正在退出…" : "退出登录"}
+                  {loggingOut ? t("shell.loggingOut") : t("shell.logout")}
                 </MenuItem>
               </MenuList>
             </MenuPopover>
@@ -301,13 +349,15 @@ export function AppShell() {
       <main className="page-content">
         {isError && (
           <ErrorState
-            title="项目切换列表暂时不可用"
-            detail="当前页面仍可使用；请重试以切换项目。"
+            title={t("shell.projectSwitchUnavailable")}
+            detail={t("shell.projectSwitchDetail")}
             onRetry={() => void refetch()}
             intent="warning"
           />
         )}
-        {isPending && <LoadingState compact label="正在加载项目工作区" />}
+        {isPending && (
+          <LoadingState compact label={t("shell.loadingWorkspace")} />
+        )}
         <Outlet />
       </main>
     </div>

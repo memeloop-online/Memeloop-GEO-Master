@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     body::to_bytes,
     extract::{Extension, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::IF_MATCH},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -10,8 +10,9 @@ use geo_domain::{
     AppError, CurrentKnowledgeRelease, DocumentManifest, DocumentManifestPlanRequest,
     ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, InitialSourceKind,
     KnowledgeAskResult, KnowledgeCapability, KnowledgeImportProgress, KnowledgePurpose,
-    KnowledgeSearchRequest, KnowledgeSearchResult, MAX_UPLOAD_BYTES, Product, ProjectId, Source,
-    SourceDetail, SourceVersion, TenantScope, UploadSession, UploadSessionCommand,
+    KnowledgeSearchRequest, KnowledgeSearchResult, MAX_UPLOAD_BYTES, Product, ProjectId,
+    ReviseSourceTextCommand, Source, SourceDetail, SourceTextRevisionReceipt, SourceVersion,
+    SourceVersionContent, TenantScope, UploadSession, UploadSessionCommand,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -73,6 +74,32 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<String, AppError> {
         ));
     }
     Ok(value)
+}
+
+fn required_source_revision(headers: &HeaderMap) -> Result<i64, AppError> {
+    let value = headers
+        .get(IF_MATCH)
+        .ok_or_else(|| AppError::invalid_request("If-Match header is required"))?
+        .to_str()
+        .map_err(|_| AppError::invalid_request("invalid If-Match header"))?
+        .trim();
+    let value = value.strip_prefix("W/").unwrap_or(value).trim();
+    let value = if value.starts_with('"') || value.ends_with('"') {
+        value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or_else(|| AppError::invalid_request("invalid If-Match header"))?
+    } else {
+        value
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(AppError::invalid_request(
+            "If-Match must contain a numeric source revision",
+        ));
+    }
+    value
+        .parse::<i64>()
+        .map_err(|_| AppError::invalid_request("If-Match must contain a numeric source revision"))
 }
 
 async fn record_acceptance(
@@ -575,6 +602,80 @@ pub(crate) async fn get_source_version(
 }
 
 #[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/sources/{id}/versions",
+    security(("sessionCookie" = [])),
+    params(
+        ("id" = Uuid, Path, description = "Source ID"),
+        ("project_id" = ProjectId, Query, description = "Project resource selector"),
+        ("If-Match" = String, Header, description = "Current source revision"),
+        ("Idempotency-Key" = String, Header, description = "Stable key for this revision request")
+    ),
+    request_body = ReviseSourceTextCommand,
+    responses(
+        (status = 201, body = SourceTextRevisionReceipt),
+        (status = 400, body = ErrorResponse),
+        (status = 404, body = ErrorResponse),
+        (status = 409, body = ErrorResponse)
+    )
+)]
+pub(crate) async fn revise_source_text(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<KnowledgeProjectQuery>,
+    headers: HeaderMap,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Json(command): Json<ReviseSourceTextCommand>,
+) -> Result<(StatusCode, Json<SourceTextRevisionReceipt>), ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
+    let revision =
+        required_source_revision(&headers).map_err(|error| api_error(error, context.request_id))?;
+    let key =
+        required_idempotency_key(&headers).map_err(|error| api_error(error, context.request_id))?;
+    let scope = knowledge_scope(&state, &auth.scope, query.project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    state
+        .knowledge_repository()
+        .revise_source_text(&scope, id, revision, &key, command)
+        .await
+        .map(|receipt| (StatusCode::CREATED, Json(receipt)))
+        .map_err(|error| api_error(error, context.request_id))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/sources/{id}/versions/{version_id}/content",
+    security(("sessionCookie" = [])),
+    params(("id" = Uuid, Path), ("version_id" = Uuid, Path), ("project_id" = ProjectId, Query)),
+    responses((status = 200, body = SourceVersionContent), (status = 404, body = ErrorResponse))
+)]
+pub(crate) async fn get_source_version_content(
+    State(state): State<AppState>,
+    Path((id, version_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<KnowledgeProjectQuery>,
+    Extension(tenant_scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<SourceVersionContent>, ApiError> {
+    let scope = knowledge_scope(&state, &tenant_scope, query.project_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?;
+    state
+        .knowledge_repository()
+        .get_source_version_content(&scope, id, version_id)
+        .await
+        .map_err(|error| api_error(error, context.request_id))?
+        .map(Json)
+        .ok_or_else(|| {
+            api_error(
+                AppError::not_found("source version content not found"),
+                context.request_id,
+            )
+        })
+}
+
+#[utoipa::path(
     get,
     path = "/api/v1/knowledge/products",
     security(("sessionCookie" = [])),
@@ -818,9 +919,14 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/knowledge/import-jobs/{id}", get(get_import_job))
         .route("/knowledge/import-jobs/{id}/retry", post(retry_import_job))
         .route("/knowledge/sources/{id}", get(get_source))
+        .route("/knowledge/sources/{id}/versions", post(revise_source_text))
         .route(
             "/knowledge/sources/{id}/versions/{version_id}",
             get(get_source_version),
+        )
+        .route(
+            "/knowledge/sources/{id}/versions/{version_id}/content",
+            get(get_source_version_content),
         )
         .route("/knowledge/products", get(list_products))
         .route("/knowledge/facts", get(list_facts))

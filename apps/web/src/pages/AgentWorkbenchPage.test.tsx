@@ -278,7 +278,7 @@ describe("P00 AI workbench routing", () => {
       await screen.findByTestId("memeloop-agent-chat"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Rust JS Agent Runtime 尚未配置，本次未生成 AI 回复。"),
+      screen.getByText("AI 服务未启用，请联系管理员完成配置。"),
     ).toBeInTheDocument();
     expect(screen.getByText("从你的资料或想法开始")).toBeInTheDocument();
     expect(

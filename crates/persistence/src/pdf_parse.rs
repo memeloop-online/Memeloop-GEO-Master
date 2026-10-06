@@ -580,7 +580,7 @@ pub(super) async fn finish(
     ).bind(source_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
     .bind(project.as_uuid()).fetch_one(&mut *tx).await.map_err(database_error)?;
     let version_row = sqlx::query(
-        "SELECT source_version_id,source_id,version,object_id,object_version,content_sha256,captured_at,
+        "SELECT source_version_id,source_id,version,representation,object_id,object_version,content_sha256,captured_at,
                 original_url,parent_version_id,parser_version,extraction_version,created_at
          FROM knowledge_source_versions WHERE source_version_id=$1",
     ).bind(version_id).fetch_one(&mut *tx).await.map_err(database_error)?;
@@ -717,8 +717,11 @@ pub(super) async fn retry(
     let source_id: Uuid = old.get("source_id");
     let prior_version: Uuid = old.get("source_version_id");
     if old.get::<Option<Uuid>, _>("current_version_id") != Some(prior_version) {
-        // A zero-success failed version may have never become current. It is
-        // still retryable when no successor attempt has been created.
+        // Only a never-published failed parse with no current version may
+        // retry. A later authored/current child must never be overwritten.
+        if old.get::<Option<Uuid>, _>("current_version_id").is_some() {
+            return Err(AppError::conflict("PDF source has a newer current version"));
+        }
         let newer: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM knowledge_import_jobs WHERE source_id=$1 AND resumed_from=$2)",
         ).bind(source_id).bind(job_id).fetch_one(&mut *tx).await.map_err(database_error)?;

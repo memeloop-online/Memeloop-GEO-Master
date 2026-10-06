@@ -118,7 +118,7 @@ export function PublicationLookupPanel({
         </Button>
       </div>
       <p>
-        这里只记录只读观察；即使发现资产，也不能证明原发送成功。原发布结果仍为未知，系统不会因此重发。
+        原发送结果待核对，系统不会重复发布。查回发现的公开资产将单独列出，不代表原发送已确认成功。
       </p>
       {lookup.isPending && <p role="status">正在读取查回记录…</p>}
       {lookup.isError && !first && (
@@ -151,7 +151,7 @@ export function PublicationLookupPanel({
                 return (
                   <li key={item.execution_id}>
                     {item.finding === "asset_observed"
-                      ? "观察到公开资产（非原发送成功凭据）"
+                      ? "已发现公开资产，原发送仍待核对"
                       : "本次未能确认资产"}
                     {" · "}观察 {dateTime(item.observed_at)} · 收到{" "}
                     {dateTime(item.received_at)}

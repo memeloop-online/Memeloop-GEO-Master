@@ -6,6 +6,7 @@
 //! runtime through configuration; they are never embedded in this crate.
 
 mod agent;
+mod appearance;
 mod auth;
 pub mod bootstrap;
 mod channel_jobs;

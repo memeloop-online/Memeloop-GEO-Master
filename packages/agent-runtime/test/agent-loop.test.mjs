@@ -1454,6 +1454,153 @@ test("standalone measurement discovers live models, accepts one ad-hoc question 
   }
 });
 
+test("topic prediction offers real model tools and only a saved question-set receipt supports a link", async () => {
+  const requests = [];
+  const calls = [];
+  const setId = "00000000-0000-4000-8000-000000000501";
+  const generated = {
+    idempotency_key: "candidate-request-1",
+    name: "Suggested questions about home batteries",
+    questions: [
+      {
+        text: "How do home batteries work?",
+        intent: "explore",
+        product_refs: [],
+        market: "CN",
+        language: "en",
+        source: { kind: "generated" },
+        weight: 1,
+      },
+      {
+        text: "How do home batteries compare with portable power stations?",
+        intent: "compare",
+        product_refs: [],
+        market: "CN",
+        language: "en",
+        source: { kind: "generated" },
+        weight: 1,
+      },
+    ],
+  };
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("unexpected knowledge search");
+    },
+    async questionCreate(command) {
+      calls.push(command);
+      return {
+        question_set_id: setId,
+        id: "00000000-0000-4000-8000-000000000502",
+        question_count: 2,
+        optimization_count: 1,
+        evaluation_count: 1,
+      };
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      return requests.length === 1
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: "candidate-create-1",
+                type: "function",
+                function: {
+                  name: "question_create",
+                  arguments: JSON.stringify(generated),
+                },
+              },
+            ],
+          }
+        : finalModelAnswer(`Saved suggestions: ${setId}`);
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?topic=${Date.now()}`);
+    const result = await main({
+      conversation_id: "candidate-conversation",
+      prompt: "Suggest questions from home batteries, market CN, language en",
+      run_id: "candidate-run",
+      turn_id: "candidate-turn",
+    });
+    assert.match(requests[0].system, /seed topic/u);
+    assert.match(requests[0].system, /question_create/u);
+    assert.match(requests[0].system, /not as real user queries/u);
+    assert.deepEqual(calls, [generated]);
+    assert.match(requests[1].messages.at(-1).content, /question_set_id/u);
+    assert.match(result.answer, new RegExp(setId, "u"));
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("a failed candidate-question write never completes as a saved prediction", async () => {
+  const events = [];
+  let modelCalls = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(topic, payload) {
+      events.push([topic, payload]);
+    },
+    async knowledgeSearch() {
+      throw new Error("unexpected knowledge search");
+    },
+    async questionCreate() {
+      throw new Error("capability_missing: question sets unavailable");
+    },
+    async modelComplete() {
+      modelCalls++;
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          {
+            id: "failed-candidate-create",
+            type: "function",
+            function: {
+              name: "question_create",
+              arguments: JSON.stringify({
+                idempotency_key: "failed-request",
+                name: "Suggested questions",
+                questions: [
+                  {
+                    text: "What is this?",
+                    intent: "explore",
+                    market: "CN",
+                    language: "en",
+                    product_refs: [],
+                    source: { kind: "generated" },
+                    weight: 1,
+                  },
+                ],
+              }),
+            },
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?topicFailure=${Date.now()}`
+    );
+    await assert.rejects(
+      main({
+        conversation_id: "failed-candidates",
+        prompt: "Suggest questions",
+        run_id: "failed-candidates-run",
+        turn_id: "failed-candidates-turn",
+      }),
+      /capability_missing/u,
+    );
+    assert.equal(modelCalls, 1);
+    assert.deepEqual(events, []);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
 test("content start accepts a reference-only current cycle and reads durable coverage", async () => {
   const executionId = "00000000-0000-4000-8000-000000000301";
   const calls = [];

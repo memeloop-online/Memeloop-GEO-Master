@@ -124,9 +124,9 @@ describe("publication lookup observation", () => {
     const user = userEvent.setup();
     renderPanel();
     expect(
-      await screen.findByText(/观察到公开资产（非原发送成功凭据）/),
+      await screen.findByText(/已发现公开资产，原发送仍待核对/),
     ).toBeInTheDocument();
-    expect(screen.getByText(/原发布结果仍为未知/)).toBeInTheDocument();
+    expect(screen.getByText(/原发送结果待核对/)).toBeInTheDocument();
     expect(
       screen.queryByRole("link", { name: "查看公开资产" }),
     ).not.toBeInTheDocument();
@@ -135,9 +135,9 @@ describe("publication lookup observation", () => {
       await screen.findByRole("link", { name: "查看公开资产" }),
     ).toHaveAttribute("href", "https://www.zhihu.com/p/123");
     expect(requests).toHaveLength(2);
-    expect(
-      screen.getAllByText(/观察到公开资产（非原发送成功凭据）/),
-    ).toHaveLength(2);
+    expect(screen.getAllByText(/已发现公开资产，原发送仍待核对/)).toHaveLength(
+      2,
+    );
     expect(requests[1].pathname).toBe(
       "/api/v1/projects/project-1/channel-targets/target-1/publication-lookup",
     );
@@ -172,7 +172,7 @@ describe("publication lookup observation", () => {
     expect(screen.getByText("暂无公开资产观察记录。")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "刷新查回" }));
     expect(
-      await screen.findByText(/观察到公开资产（非原发送成功凭据）/),
+      await screen.findByText(/已发现公开资产，原发送仍待核对/),
     ).toBeInTheDocument();
     expect(count).toBe(2);
   });
@@ -196,16 +196,16 @@ describe("publication lookup observation", () => {
     );
     const user = userEvent.setup();
     renderPanel();
-    await screen.findByText(/观察到公开资产（非原发送成功凭据）/);
+    await screen.findByText(/已发现公开资产，原发送仍待核对/);
     await user.click(screen.getByRole("button", { name: "加载更早记录" }));
     expect(await screen.findByText("更早的记录无法读取")).toBeInTheDocument();
     expect(
-      screen.getByText(/观察到公开资产（非原发送成功凭据）/),
+      screen.getByText(/已发现公开资产，原发送仍待核对/),
     ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "重试" }));
     await waitFor(() =>
       expect(
-        screen.getAllByText(/观察到公开资产（非原发送成功凭据）/),
+        screen.getAllByText(/已发现公开资产，原发送仍待核对/),
       ).toHaveLength(2),
     );
   });
@@ -239,7 +239,7 @@ describe("publication lookup observation", () => {
       await screen.findByText("更新查回记录失败，仍显示已读取记录"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/观察到公开资产（非原发送成功凭据）/),
+      screen.getByText(/已发现公开资产，原发送仍待核对/),
     ).toBeInTheDocument();
   });
 
@@ -261,7 +261,7 @@ describe("publication lookup observation", () => {
     await waitFor(() => expect(resolveOld).toBeDefined());
     view.changeScope("target-2", "project-2");
     expect(
-      await screen.findByText(/观察到公开资产（非原发送成功凭据）/),
+      await screen.findByText(/已发现公开资产，原发送仍待核对/),
     ).toBeInTheDocument();
     resolveOld?.(response(page([observation("old-target")], null, null)));
     await waitFor(() =>

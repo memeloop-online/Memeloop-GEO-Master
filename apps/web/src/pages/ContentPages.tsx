@@ -176,9 +176,9 @@ function ItemCard({
         ) : item?.asset_id ? (
           <Link to={encodeURIComponent(item.asset_id)}>查看正文与版本</Link>
         ) : executionState === "loading" || executionState === "unavailable" ? (
-          <p>正文资产状态待读取；此项仍计入冻结清单分母。</p>
+          <p>正在读取内容状态。</p>
         ) : (
-          <p>尚无持久正文资产；此项仍计入冻结清单分母。</p>
+          <p>这篇内容尚未生成。</p>
         )}
       </Card>
     </li>
@@ -270,7 +270,7 @@ function AssetsContent({
     <div className="workbench-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">P08 · 内容资产</p>
+          <p className="eyebrow">内容资产</p>
           <h1>本轮内容分支</h1>
           <p>
             周期 {cycleId} ·
@@ -316,7 +316,7 @@ function AssetsContent({
       {manifestId && !manifest.isPending && !manifest.isError && !plan && (
         <EmptyState
           title="清单尚未规划"
-          detail="当前只有清单句柄，规划尚未保存；不能将其当作零篇正文。"
+          detail="尚未生成内容计划，可在 AI 工作台描述你希望覆盖的话题。"
           action={<Link to="../campaigns/current">规划文档清单</Link>}
         />
       )}
@@ -789,7 +789,7 @@ function AssetContent({
     return (
       <EmptyState
         title="没有可编辑的持久正文"
-        detail="缺少当前版本或历史记录；不会从清单项编造正文。"
+        detail="暂时无法读取正文，请刷新重试。"
         action={<Link to="../content">返回内容资产</Link>}
       />
     );
@@ -797,7 +797,7 @@ function AssetContent({
     <div className="workbench-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">P09 · 内容编辑</p>
+          <p className="eyebrow">内容编辑</p>
           <h1>{current.document.title}</h1>
           <p>
             资产 {assetId} · 当前持久版本 v{current.revision}
@@ -928,17 +928,14 @@ function AssetContent({
                 ))}
               </ul>
             ) : (
-              <p>
-                无持久检查发现记录；这不代表所有事实、格式或渠道适配均已通过。
-              </p>
+              <p>暂无检查结果。</p>
             )}
           </Card>
         </>
       )}
       <MessageBar intent="info">
         <MessageBarBody>
-          当前可所见即所得地编辑标题、段落与列表纯文本；字体样式、
-          媒体、表格和渠道预览尚未接入结构化正文版本。
+          支持编辑标题、段落和列表；暂不支持文字样式、图片和表格。
         </MessageBarBody>
       </MessageBar>
     </div>

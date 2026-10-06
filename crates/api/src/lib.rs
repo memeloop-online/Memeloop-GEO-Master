@@ -2,10 +2,12 @@
 
 mod agent;
 mod agent_runtime;
+mod appearance;
 mod browser_bridge;
 mod channel_jobs;
 mod channel_tools;
 mod channels;
+mod citation_insights;
 mod connector_capabilities;
 mod content;
 pub mod content_runtime;
@@ -1717,6 +1719,9 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         auth_login,
         auth_session,
         auth_logout,
+        appearance::public,
+        appearance::current,
+        appearance::update,
         list_projects,
         create_project,
         get_project,
@@ -1741,6 +1746,8 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         knowledge::get_import_job,
         knowledge::retry_import_job,
         knowledge::get_source_version,
+        knowledge::revise_source_text,
+        knowledge::get_source_version_content,
         knowledge::list_products,
         knowledge::list_facts,
         knowledge::current_release,
@@ -1766,6 +1773,8 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         LoginRequest,
         AuthConfigResponse,
         AuthSessionResponse,
+        geo_domain::OperatorAppearance,
+        geo_domain::UpdateOperatorAppearance,
         UserView,
         OperatorView,
         MembershipView,
@@ -1813,6 +1822,11 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::Source,
         geo_domain::SourceDetail,
         geo_domain::SourceVersion,
+        geo_domain::SourceVersionRepresentation,
+        geo_domain::SourceVersionContent,
+        geo_domain::SourceTextBasis,
+        geo_domain::ReviseSourceTextCommand,
+        geo_domain::SourceTextRevisionReceipt,
         geo_domain::Chunk,
         geo_domain::ChunkLocator,
         geo_domain::ImportJob,
@@ -2014,6 +2028,10 @@ pub fn router(state: AppState) -> Router {
             get(standalone_measurements::get_plan),
         )
         .route(
+            "/projects/{project_id}/citation-insights",
+            get(citation_insights::get_citation_insights),
+        )
+        .route(
             "/projects/{project_id}/cycles/{cycle_id}/channel-plan",
             get(channel_jobs::get_plan).post(channel_jobs::submit_plan),
         )
@@ -2144,6 +2162,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1",
             Router::new()
                 .route("/openapi.json", get(openapi_json))
+                .merge(appearance::routes())
                 .merge(auth_routes)
                 .merge(estimate_routes)
                 .merge(start_routes)

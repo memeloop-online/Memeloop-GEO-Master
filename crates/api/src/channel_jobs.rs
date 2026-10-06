@@ -559,7 +559,7 @@ struct MeasurementEvidence {
     search_event: SearchEvent,
 }
 
-fn measurement_observation(
+pub(crate) fn measurement_observation(
     result: &crate::browser_bridge::BrowserExecution,
     target: &ChannelTarget,
     claimed_at: DateTime<Utc>,

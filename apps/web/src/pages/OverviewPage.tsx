@@ -71,7 +71,7 @@ function knowledgeIsReadyForPlanning(overview: ProjectOverview) {
 
 function knowledgePhaseText(overview: ProjectOverview) {
   if (knowledgeIsReadyForPlanning(overview)) {
-    return "知识版本已形成，等待文档覆盖规划/清单封存";
+    return "资料已就绪，等待规划内容";
   }
   if (overview.knowledge.status === "importing") {
     return "资料正在处理";
@@ -79,7 +79,7 @@ function knowledgePhaseText(overview: ProjectOverview) {
   if (overview.cycle.awaiting_knowledge) {
     return "等待知识处理";
   }
-  return "等待文档覆盖规划/清单封存";
+  return "等待规划内容";
 }
 
 function buildLoop(overview: ProjectOverview): LoopStep[] {
@@ -98,10 +98,7 @@ function buildLoop(overview: ProjectOverview): LoopStep[] {
           }
         : {
             state: "queued" as const,
-            detail:
-              savedSources > 0
-                ? `已冻结 ${savedSources} 个来源，W03 才会导入`
-                : "—",
+            detail: savedSources > 0 ? `${savedSources} 个来源待导入` : "—",
           };
   const benchmark =
     overview.benchmark.status === "ready"
@@ -231,18 +228,18 @@ export function OverviewPage() {
         }
       : data.next_action;
   const sourceNotice = knowledgeReadyForPlanning
-    ? `知识版本已形成，包含 ${data.knowledge.source_count} 个来源和 ${data.knowledge.fact_count} 条事实。等待文档覆盖规划与清单封存；基线、计划和发布尚未开始。`
+    ? `资料已就绪：${data.knowledge.source_count} 个来源，${data.knowledge.fact_count} 条事实。可查看企业知识，或规划本轮内容。`
     : data.knowledge.status === "empty" && savedSources > 0
-      ? `已保存并冻结 ${savedSources} 个知识来源；W03 才会开始导入资料，目前没有已解析资料。`
+      ? `已保存 ${savedSources} 个来源，尚未完成导入。请到企业知识查看处理状态。`
       : data.knowledge.status === "empty"
-        ? "还没有企业知识。导入产品资料、官网内容或常见问题，系统将提取可追溯事实。"
+        ? "还没有企业知识。可导入产品资料或常见问题，供内容生成与知识问答使用。"
         : null;
 
   return (
     <div className="overview-page">
       <section className="page-hero overview-hero">
         <div>
-          <p className="eyebrow">P02 · 项目总览</p>
+          <p className="eyebrow">项目总览</p>
           <h1>{data.project.display_name}</h1>
           <p>
             {data.project.settings.market} · {data.project.settings.language} ·{" "}
@@ -279,14 +276,10 @@ export function OverviewPage() {
       {startAcceptance && (
         <MessageBar intent="success" className="persistent-notice">
           <MessageBarBody>
-            项目已启动（受理操作 {startAcceptance.operation_id}
-            ）。文档与分发清单骨架已创建，
+            项目启动请求已受理。
             {knowledgeReadyForPlanning
-              ? "知识版本已形成，仍等待文档覆盖规划与文档清单封存；这不代表基线已经建立或计划正在运行。"
-              : "尚未封存并等待知识处理；这不代表资料已经解析、基线已经建立或计划正在运行。"}
-            配置修订 {startAcceptance.config_revision_id} · 文档清单{" "}
-            {startAcceptance.document_manifest.manifest_id} · 分发清单{" "}
-            {startAcceptance.distribution_manifest.manifest_id}
+              ? "资料已就绪，内容计划待生成。"
+              : "请在企业知识中查看资料处理状态。"}
           </MessageBarBody>
         </MessageBar>
       )}
@@ -333,7 +326,11 @@ export function OverviewPage() {
             {data.benchmark.planned_samples}
           </strong>
           <small>
-            {baselineNotStarted ? "尚未建立" : data.benchmark.status}
+            {baselineNotStarted
+              ? "尚未建立"
+              : data.benchmark.status === "running"
+                ? "测量中"
+                : "已完成"}
           </small>
         </Card>
         <Card className="metric-card">
@@ -362,7 +359,7 @@ export function OverviewPage() {
               header={
                 <div>
                   <h2>基线与测量</h2>
-                  <p>按有效样本展示；缺测始终显示为“—”，不会按 0 计算。</p>
+                  <p>查看计划样本、有效样本和测量进度。</p>
                 </div>
               }
               action={
@@ -392,7 +389,11 @@ export function OverviewPage() {
               <div>
                 <span>状态</span>
                 <strong>
-                  {baselineNotStarted ? "尚未建立" : data.benchmark.status}
+                  {baselineNotStarted
+                    ? "尚未建立"
+                    : data.benchmark.status === "running"
+                      ? "测量中"
+                      : "已完成"}
                 </strong>
               </div>
             </div>
@@ -401,8 +402,8 @@ export function OverviewPage() {
             <CardHeader
               header={
                 <div>
-                  <h2>当前闭环状态</h2>
-                  <p>只显示当前服务已返回的动作与状态。</p>
+                  <h2>当前进度</h2>
+                  <p>查看项目状态与下一步操作。</p>
                 </div>
               }
               action={cyclePill(data)}
@@ -426,7 +427,7 @@ export function OverviewPage() {
               <div className="overview-empty-state">
                 <strong>
                   {knowledgeReadyForPlanning
-                    ? "等待文档覆盖规划/清单封存"
+                    ? "等待规划内容"
                     : baselineNotStarted
                       ? knowledgePhaseText(data)
                       : "暂无可执行动作"}
@@ -442,7 +443,7 @@ export function OverviewPage() {
               header={
                 <div>
                   <h2>项目配置</h2>
-                  <p>已保存的真实项目元数据。</p>
+                  <p>当前项目的产品、资源与预算设置。</p>
                 </div>
               }
             />

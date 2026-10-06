@@ -132,6 +132,18 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 30,
         description: "standalone measurements",
     },
+    MigrationMetadata {
+        version: 31,
+        description: "knowledge text revisions",
+    },
+    MigrationMetadata {
+        version: 32,
+        description: "operator appearance",
+    },
+    MigrationMetadata {
+        version: 33,
+        description: "authored text invariants",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

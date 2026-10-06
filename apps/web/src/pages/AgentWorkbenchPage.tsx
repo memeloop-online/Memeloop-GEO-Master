@@ -44,6 +44,7 @@ import {
 } from "../api/agent";
 import { createIdempotencyKey } from "../api/client";
 import { ErrorState, LoadingState } from "../components/AsyncState";
+import { useAppearance } from "../appearance/AppearanceProvider";
 
 // A composer projection only, never saved or presented as a server conversation.
 const emptyConversation: AgentConversationDetail = {
@@ -59,16 +60,6 @@ const emptyConversation: AgentConversationDetail = {
   turns: [],
   runs: [],
 };
-
-const agentTheme = createTheme({
-  palette: {
-    primary: { main: "#0f6cbd" },
-    background: { default: "#ffffff", paper: "#ffffff" },
-  },
-  typography: {
-    fontFamily: '"Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif',
-  },
-});
 
 function projectMessage(
   message: AgentMessage,
@@ -118,13 +109,9 @@ function unavailableRuntimeNotice(runs: readonly AgentRun[]) {
       ["missing", "unavailable"].includes(run.capability.status),
   );
   if (!failedRun) return undefined;
-  const runtime =
-    failedRun.capability.runtime === "deno_core"
-      ? "Rust JS Agent Runtime"
-      : failedRun.capability.runtime;
   return failedRun.capability.status === "missing"
-    ? `${runtime} 尚未配置，本次未生成 AI 回复。`
-    : `${runtime} 当前不可用，本次未生成 AI 回复。`;
+    ? "AI 服务未启用，请联系管理员完成配置。"
+    : "AI 服务暂时不可用，请稍后重试。";
 }
 
 interface PendingAttachment {
@@ -170,7 +157,7 @@ function ConversationList({
     <aside className="agent-conversation-list" aria-label="AI 对话列表">
       <div className="agent-conversation-list-heading">
         <div>
-          <p className="eyebrow">P00</p>
+          <p className="eyebrow">AI 工作台</p>
           <h2>AI 工作台</h2>
         </div>
         {(activeConversationId || items.length > 0) && (
@@ -232,6 +219,20 @@ function AgentChat({
   onRefresh: () => Promise<void>;
   onFirstMessage?: (conversationId: string) => void;
 }) {
+  const { appearance } = useAppearance();
+  const agentTheme = useMemo(
+    () =>
+      createTheme({
+        palette: {
+          primary: { main: appearance.primary_color },
+          background: { default: "#ffffff", paper: "#ffffff" },
+        },
+        typography: {
+          fontFamily: '"Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif',
+        },
+      }),
+    [appearance.primary_color],
+  );
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState<string>();
   const [localTurnId, setLocalTurnId] = useState<string>();
@@ -426,13 +427,11 @@ function AgentChat({
           );
           if (references.length) {
             setRuntimeNotice(
-              "附件已提交。可在对话中要求导入 TXT / Markdown / UTF-8 CSV 并依据原文回答；上传不代表已阅读。",
+              "附件已上传。告诉 AI 你想了解什么，或将资料加入企业知识。",
             );
           }
           if (acceptance.error?.code === "capability_missing") {
-            setRuntimeNotice(
-              "Rust JS Agent Runtime 尚未配置，本次未生成 AI 回复。",
-            );
+            setRuntimeNotice("AI 服务未启用，请联系管理员完成配置。");
           }
           if (!onFirstMessage) await onRefresh();
           pendingSubmission.current = undefined;
@@ -497,7 +496,7 @@ function AgentChat({
     >
       <div className="agent-chat-titlebar">
         <div>
-          <p className="eyebrow">P00 · AI 工作台</p>
+          <p className="eyebrow">AI 工作台</p>
           <h1>{conversationName(conversation.conversation)}</h1>
         </div>
         {activeTurnId && (

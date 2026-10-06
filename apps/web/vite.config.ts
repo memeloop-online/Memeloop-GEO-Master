@@ -44,6 +44,9 @@ export default defineConfig(({ mode }) => {
       },
     },
     test: {
+      // Keep heavyweight jsdom/font suites from starving one another on CI.
+      // This affects test workers only, not application or agent concurrency.
+      maxWorkers: process.env.CI ? 2 : undefined,
       environment: "jsdom",
       globals: true,
       setupFiles: "./src/test/setup.ts",

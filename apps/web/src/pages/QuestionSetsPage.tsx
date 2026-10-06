@@ -26,6 +26,9 @@ import {
   type QuestionSetVersion,
 } from "../api/questions";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
+import { CitationInsightsPanel } from "./CitationInsightsPanel";
+import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
+import { TopicQuestionGenerator } from "./TopicQuestionGenerator";
 import "./QuestionSetsPage.css";
 
 const purposeLabel = {
@@ -189,13 +192,33 @@ export function QuestionSetsPage() {
     <main className="workbench-page question-sets-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">P13 · 问题与测量</p>
-          <h1>问题集</h1>
-          <p>问题用途由服务端分配；历史版本和冻结评估身份不会被编辑覆盖。</p>
+          <p className="eyebrow">独立测量</p>
+          <h1>测量与洞察</h1>
+          <p>选择账号并提出任意问题即可独立测量，无需企业资料或优化周期。</p>
         </div>
         <Link to={`/app/${tenantId}/${projectId}/publications`}>
-          前往测量计划
+          查看发布目标
         </Link>
+      </section>
+      <TopicQuestionGenerator
+        tenantId={tenantId}
+        projectId={projectId}
+        canWrite={canWrite}
+      />
+      <StandaloneMeasurementPanel
+        key={`${tenantId}/${projectId}`}
+        tenantId={tenantId}
+        projectId={projectId}
+        canWrite={canWrite}
+      />
+      <CitationInsightsPanel
+        key={`${tenantId}/${projectId}/citations`}
+        tenantId={tenantId}
+        projectId={projectId}
+      />
+      <section aria-label="问题集与版本">
+        <h2>问题集与版本</h2>
+        <p>保存常用问题，按版本查看和调整；独立评估问题不会用于内容优化。</p>
       </section>
       {sets.isPending ? (
         <LoadingState label="正在读取问题集" />
@@ -247,7 +270,7 @@ export function QuestionSetsPage() {
           </Field>
           <Field
             label="每行一个问题"
-            hint="可粘贴多行；每题默认使用用户提供来源、通用意图、CN 市场、zh-CN 语言和权重 1，后续可创建新版本修订元数据。"
+            hint="可粘贴多行；保存后仍可创建新版本调整问题。"
           >
             <Textarea
               rows={6}

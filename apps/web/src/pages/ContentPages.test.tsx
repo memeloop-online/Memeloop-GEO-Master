@@ -540,7 +540,7 @@ describe("P08 content assets", () => {
     expect(
       within(list).getAllByText("资料不足", { exact: false }),
     ).toHaveLength(2);
-    expect(within(list).getByText(/尚无持久正文资产/)).toBeInTheDocument();
+    expect(within(list).getByText("这篇内容尚未生成。")).toBeInTheDocument();
     await userEvent.click(
       screen.getByRole("checkbox", { name: "仅看未就绪项" }),
     );
@@ -1148,6 +1148,25 @@ describe("P09 content revision", () => {
     expect(within(body).getByText("原始正文")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "重做" }));
     expect(within(body).getByText("原始正文新")).toBeInTheDocument();
+  });
+
+  it("does not append a second revision when saving toggles the editor read-only", async () => {
+    const requests = mockApi();
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    await userEvent.type(
+      await screen.findByRole("textbox", { name: "标题" }),
+      "修订",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    const writes = () =>
+      requests.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      );
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 1350));
+    expect(writes()).toHaveLength(1);
   });
 
   it("preserves unsaved draft after an optimistic conflict", async () => {

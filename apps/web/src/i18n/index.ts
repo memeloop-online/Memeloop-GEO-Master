@@ -1,0 +1,193 @@
+import i18n from "i18next";
+import { initReactI18next } from "react-i18next";
+import type { UiLocale } from "../api/appearance";
+
+export const resources = {
+  "zh-CN": {
+    translation: {
+      login: {
+        checking: "正在确认登录状态",
+        unavailableTitle: "身份服务暂时不可用",
+        unavailableDetail: "无法连接到身份服务。",
+        invalidCredentials: "用户名或密码不正确。",
+        retry: "登录服务暂时不可用，请重试。",
+        failed: "无法登录，请稍后重试。",
+        welcome: "欢迎回来",
+        title: "登录工作区",
+        description: "使用分配给你的软件账号登录。",
+        username: "用户名",
+        password: "密码",
+        submit: "登录",
+        submitting: "正在登录…",
+        help: "无法登录？请联系工作区管理员。",
+      },
+      appearance: {
+        title: "工作区外观",
+        description: "设置此运营方域名显示的名称、主题色和默认界面语言。",
+        name: "显示名称",
+        color: "主题色",
+        locale: "默认界面语言",
+        save: "保存外观",
+        saving: "正在保存…",
+        saved: "外观已更新。",
+        conflict: "外观已由其他人更新，请重新载入后再保存。",
+        unavailable: "目前无法载入外观设置。",
+        loading: "正在加载外观设置",
+        invalidColor: "请输入六位十六进制颜色，例如 #2563EB。",
+        reload: "重新载入",
+        back: "返回运营账号",
+        zh: "简体中文",
+        en: "English",
+      },
+      language: { label: "界面语言", zh: "简体中文", en: "English" },
+      shell: {
+        projectLoading: "正在加载项目",
+        projectUnavailable: "项目列表暂时不可用",
+        projectMissing: "未找到项目",
+        closeNavigation: "关闭导航栏",
+        navigation: "主导航",
+        groupDetails: "{{group}}详情",
+        expandNavigation: "展开导航栏",
+        collapseNavigation: "折叠导航栏",
+        loadingProjects: "正在加载项目…",
+        current: "（当前）",
+        noProjects: "当前工作区还没有项目",
+        firstFifty: "仅显示前 50 个项目",
+        reloadProjects: "重新加载项目",
+        createProject: "创建项目",
+        switchWorkspace: "切换工作区",
+        help: "帮助",
+        user: "用户",
+        userMenu: "用户菜单",
+        loggingOut: "正在退出…",
+        logout: "退出登录",
+        projectSwitchUnavailable: "项目切换列表暂时不可用",
+        projectSwitchDetail: "当前页面仍可使用；请重试以切换项目。",
+        loadingWorkspace: "正在加载项目工作区",
+      },
+      navigation: {
+        chat: "AI 工作台",
+        overview: "项目总览",
+        measurement: "测量与洞察",
+        standalone: "独立测量与问题集",
+        reports: "效果报告",
+        content: "内容与发布",
+        campaigns: "当前计划与动作",
+        publications: "发布目标与执行",
+        knowledge: "企业知识",
+        settings: "项目设置",
+        setup: "项目配置",
+        channels: "渠道账号",
+      },
+    },
+  },
+  en: {
+    translation: {
+      login: {
+        checking: "Checking your session",
+        unavailableTitle: "Sign-in service is unavailable",
+        unavailableDetail: "Cannot connect to the sign-in service.",
+        invalidCredentials: "Incorrect username or password.",
+        retry: "Sign-in is temporarily unavailable. Please try again.",
+        failed: "Unable to sign in. Please try again later.",
+        welcome: "Welcome back",
+        title: "Sign in to your workspace",
+        description: "Use the account assigned to you to sign in.",
+        username: "Username",
+        password: "Password",
+        submit: "Sign in",
+        submitting: "Signing in…",
+        help: "Having trouble signing in? Contact your workspace administrator.",
+      },
+      appearance: {
+        title: "Workspace appearance",
+        description:
+          "Set the name, theme color, and default interface language for this operator domain.",
+        name: "Display name",
+        color: "Theme color",
+        locale: "Default interface language",
+        save: "Save appearance",
+        saving: "Saving…",
+        saved: "Appearance updated.",
+        conflict:
+          "Someone else changed the appearance. Reload it before saving.",
+        unavailable: "Appearance settings are unavailable.",
+        loading: "Loading appearance settings",
+        invalidColor: "Enter a six-digit hex color, such as #2563EB.",
+        reload: "Reload",
+        back: "Back to operator accounts",
+        zh: "简体中文",
+        en: "English",
+      },
+      language: { label: "Interface language", zh: "简体中文", en: "English" },
+      shell: {
+        projectLoading: "Loading projects",
+        projectUnavailable: "Project list is temporarily unavailable",
+        projectMissing: "Project not found",
+        closeNavigation: "Close navigation",
+        navigation: "Main navigation",
+        groupDetails: "{{group}} details",
+        expandNavigation: "Expand navigation",
+        collapseNavigation: "Collapse navigation",
+        loadingProjects: "Loading projects…",
+        current: " (current)",
+        noProjects: "This workspace has no projects yet",
+        firstFifty: "Showing the first 50 projects",
+        reloadProjects: "Reload projects",
+        createProject: "Create project",
+        switchWorkspace: "Switch workspace",
+        help: "Help",
+        user: "User",
+        userMenu: "User menu",
+        loggingOut: "Signing out…",
+        logout: "Sign out",
+        projectSwitchUnavailable: "Project switcher is temporarily unavailable",
+        projectSwitchDetail:
+          "You can continue on this page. Retry to switch projects.",
+        loadingWorkspace: "Loading project workspace",
+      },
+      navigation: {
+        chat: "AI workspace",
+        overview: "Project overview",
+        measurement: "Measurement & insights",
+        standalone: "Measurements & question sets",
+        reports: "Reports",
+        content: "Content & publishing",
+        campaigns: "Current plans & actions",
+        publications: "Publishing targets & activity",
+        knowledge: "Company knowledge",
+        settings: "Project settings",
+        setup: "Project configuration",
+        channels: "Channel accounts",
+      },
+    },
+  },
+} as const;
+
+void i18n.use(initReactI18next).init({
+  resources,
+  lng: "zh-CN",
+  fallbackLng: "zh-CN",
+  supportedLngs: ["zh-CN", "en"],
+  interpolation: { escapeValue: false },
+  returnNull: false,
+  initAsync: false,
+});
+
+export function formatUiDate(
+  value: Date | string,
+  locale: UiLocale = i18n.language as UiLocale,
+) {
+  return new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(
+    new Date(value),
+  );
+}
+
+export function formatUiNumber(
+  value: number,
+  locale: UiLocale = i18n.language as UiLocale,
+) {
+  return new Intl.NumberFormat(locale).format(value);
+}
+
+export default i18n;

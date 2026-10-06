@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -346,7 +346,11 @@ describe("P13 versioned question sets", () => {
     const calls = mockApi({ listError: true });
     renderPage();
     expect(await screen.findByText("问题集无法读取")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /重试/ })).toBeInTheDocument();
+    expect(
+      within(
+        screen.getByText("问题集无法读取").closest(".fui-MessageBar")!,
+      ).getByRole("button", { name: /重试/ }),
+    ).toBeInTheDocument();
     expect(
       calls.filter(
         (item) => item.path.endsWith("/question-sets") && item.method === "GET",

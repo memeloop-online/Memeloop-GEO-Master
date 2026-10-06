@@ -233,7 +233,7 @@ describe("knowledge workbench", () => {
     }
   });
 
-  it("renders typed P04 PDF locators and leaves unimplemented commands disabled", async () => {
+  it("renders typed source PDF locators without dead-end commands", async () => {
     vi.stubGlobal(
       "fetch",
       requestHandler({
@@ -269,9 +269,13 @@ describe("knowledge workbench", () => {
     expect(
       await screen.findByText(/PDF 第 12 页 · 原文区域坐标 10, 20, 30, 40/),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "替换文件" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "重试失败部分" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "移除来源" })).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: "替换文件" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "移除来源" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("返回资料中心").closest("a")).toHaveAttribute(
       "href",
       "/app/tenant-a/project-a/knowledge",

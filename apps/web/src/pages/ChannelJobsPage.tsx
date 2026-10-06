@@ -38,7 +38,6 @@ import { useChannelData } from "../api/channels";
 import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { DistributionPanel } from "./DistributionPanel";
-import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
 import {
   PublicationLookupPanel,
   safeOriginalPublicUrl,
@@ -313,7 +312,7 @@ function FrozenPlan({
 }) {
   return (
     <section className="channel-jobs-section">
-      <h2>来源版本渠道计划（旧链路）</h2>
+      <h2>来源版本发布计划</h2>
       <p>
         版本 {plan.revision} · {dateTime(plan.created_at)} ·{" "}
         {plan.targets.length}
@@ -604,7 +603,7 @@ export function ChannelJobsPage() {
     <main className="channel-jobs-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">P12 · 发布记录</p>
+          <p className="eyebrow">发布执行</p>
           <h1>发布目标与执行记录</h1>
           <p>
             按本轮冻结的来源版本、账号和平台查看执行记录。账号可选或连接器支持某平台，
@@ -621,12 +620,6 @@ export function ChannelJobsPage() {
           </Link>
         </div>
       </section>
-      <StandaloneMeasurementPanel
-        key={`${tenantId}/${projectId}`}
-        tenantId={tenantId}
-        projectId={projectId}
-        canWrite={canWrite}
-      />
       {currentCycle.isPending ? (
         <LoadingState label="正在读取当前项目周期" />
       ) : currentCycle.isError ? (
@@ -666,7 +659,7 @@ export function ChannelJobsPage() {
             />
           ) : (
             <section className="channel-jobs-section">
-              <h2>建立来源版本渠道计划（旧链路）</h2>
+              <h2>建立来源版本发布计划</h2>
               <MessageBar intent="warning">
                 <MessageBarBody>
                   提交将一次性封存本轮所有发布目标，之后不能追加、替换来源版本或账号。
@@ -752,7 +745,7 @@ export function ChannelJobsPage() {
                             <Link
                               to={`/app/${tenantId}/${projectId}/measurement`}
                             >
-                              P13 问题集
+                              问题集
                             </Link>
                             创建版本。
                           </p>

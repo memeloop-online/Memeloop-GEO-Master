@@ -118,12 +118,36 @@ export interface SourceVersion {
   source_version_id: string;
   source_id: string;
   version: number;
+  representation?: "original" | "authored_text";
   content_sha256?: string | null;
   captured_at?: string | null;
   original_url?: string | null;
   parser_version?: string | null;
   extraction_version?: string | null;
   created_at?: string | null;
+}
+
+export interface SourceVersionContent {
+  source_version_id: string;
+  representation: "original" | "authored_text";
+  media_type: string;
+  text: string;
+  text_basis: "exact" | "extracted";
+}
+
+export interface SaveSourceTextInput {
+  sourceId: string;
+  revision: number;
+  baseVersionId: string;
+  mediaType: "text/plain" | "text/markdown";
+  text: string;
+  idempotencyKey: string;
+}
+
+export interface SaveSourceTextReceipt {
+  source: SourceSummary;
+  source_version: SourceVersion;
+  knowledge_release: KnowledgeRelease;
 }
 
 export interface SourceChunk {
@@ -411,6 +435,14 @@ export const knowledgeQueryKeys = {
       "source",
       ...scopeKey(scope),
       sourceId,
+    ] as const,
+  versionContent: (scope: QueryScope, sourceId: string, versionId: string) =>
+    [
+      ...knowledgeQueryKeys.all,
+      "source-version-content",
+      ...scopeKey(scope),
+      sourceId,
+      versionId,
     ] as const,
   products: (scope: QueryScope) =>
     [...knowledgeQueryKeys.all, "products", ...scopeKey(scope)] as const,
@@ -709,6 +741,39 @@ export async function getSource(
       `/knowledge/sources/${encodeURIComponent(sourceId)}`,
       scopedOptions(tenantId, projectId),
     ),
+  );
+}
+
+export function getSourceVersionContent(
+  tenantId: string,
+  projectId: string,
+  sourceId: string,
+  versionId: string,
+): Promise<SourceVersionContent> {
+  return apiFetch<SourceVersionContent>(
+    `/knowledge/sources/${encodeURIComponent(sourceId)}/versions/${encodeURIComponent(versionId)}/content`,
+    scopedOptions(tenantId, projectId),
+  );
+}
+
+export function saveSourceText(
+  tenantId: string,
+  projectId: string,
+  input: SaveSourceTextInput,
+): Promise<SaveSourceTextReceipt> {
+  return apiFetch<SaveSourceTextReceipt>(
+    `/knowledge/sources/${encodeURIComponent(input.sourceId)}/versions`,
+    {
+      ...scopedOptions(tenantId, projectId),
+      method: "POST",
+      headers: { "If-Match": String(input.revision) },
+      idempotencyKey: input.idempotencyKey,
+      body: {
+        base_version_id: input.baseVersionId,
+        media_type: input.mediaType,
+        text: input.text,
+      },
+    },
   );
 }
 
@@ -1035,6 +1100,40 @@ export function useSourceQuery(
       )
         ? 2500
         : false,
+  });
+}
+
+export function useSourceVersionContentQuery(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+  sourceId: string | undefined,
+  versionId: string | undefined,
+) {
+  const scope = useScope(tenantId, projectId);
+  return useQuery({
+    queryKey:
+      scope && sourceId && versionId
+        ? knowledgeQueryKeys.versionContent(scope, sourceId, versionId)
+        : [...knowledgeQueryKeys.all, "source-version-content", "anonymous"],
+    queryFn: () =>
+      getSourceVersionContent(tenantId!, projectId!, sourceId!, versionId!),
+    enabled: Boolean(scope && sourceId && versionId),
+    retry: false,
+  });
+}
+
+export function useSaveSourceTextMutation(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+) {
+  const queryClient = useQueryClient();
+  const scope = useScope(tenantId, projectId);
+  return useMutation({
+    mutationFn: (input: SaveSourceTextInput) => {
+      if (!tenantId || !projectId) throw new Error("请先选择项目。");
+      return saveSourceText(tenantId, projectId, input);
+    },
+    onSuccess: () => invalidateKnowledge(queryClient, scope),
   });
 }
 

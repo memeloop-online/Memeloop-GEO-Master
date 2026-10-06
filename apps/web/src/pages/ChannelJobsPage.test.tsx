@@ -578,24 +578,25 @@ describe("P12 channel jobs", () => {
     const requests = mockApi({ currentCycleId: null });
     renderPage();
     expect(await screen.findByText("尚无周期发布计划")).toBeInTheDocument();
-    expect(screen.getByLabelText("要测量的问题")).toBeInTheDocument();
-    expect(
-      screen.getByRole("link", { name: "登录或连接 Kimi 账号" }),
-    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("要测量的问题")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "管理问题集" })).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/measurement",
+    );
     expect(requests.some((item) => item.path.includes("/channel-plan"))).toBe(
       false,
     );
   });
 
-  it("keeps standalone measurement usable when current-cycle loading fails", async () => {
+  it("keeps the independent measurement deep link when current-cycle loading fails", async () => {
     mockApi({ cycleError: true, sources: [], accounts: [measurementAccount] });
-    const user = userEvent.setup();
     renderPage();
     expect(await screen.findByText("无法读取当前项目周期")).toBeInTheDocument();
-    await user.type(screen.getByLabelText("要测量的问题"), "任何主题");
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "开始测量" })).toBeEnabled(),
+    expect(screen.getByRole("link", { name: "管理问题集" })).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/measurement",
     );
+    expect(screen.queryByLabelText("要测量的问题")).not.toBeInTheDocument();
   });
 
   it("does not seal without a source or account and explains the missing resource", async () => {

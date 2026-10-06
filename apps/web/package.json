@@ -28,10 +28,12 @@
     "@tiptap/pm": "3.31.4",
     "@tiptap/react": "3.31.4",
     "@tiptap/starter-kit": "3.31.4",
+    "i18next": "26.4.2",
     "memeloop": "0.3.3",
     "pdf-lib": "1.17.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-i18next": "17.0.16",
     "react-router-dom": "^7.3.0"
   },
   "devDependencies": {

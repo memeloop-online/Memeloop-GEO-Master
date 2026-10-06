@@ -201,9 +201,10 @@ describe("P07 document planning", () => {
     expect(await screen.findByText("source-version-1")).toBeInTheDocument();
     expect(screen.getByText("无公开来源版本")).toBeInTheDocument();
     expect(screen.getByText(/待生成 1 · 阻断 1/)).toBeInTheDocument();
+    expect(screen.queryByText(/P07|清单句柄|规划器/)).not.toBeInTheDocument();
     expect(
-      screen.getAllByText(/此规划项不包含内容版本或发布结果/),
-    ).toHaveLength(2);
+      screen.getByText(/此处显示内容计划，正文与生成进度请查看内容资产/),
+    ).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "查看本轮内容资产与执行" }),
     ).toHaveAttribute(
@@ -248,9 +249,7 @@ describe("P07 document planning", () => {
     });
     renderPage();
     expect(await screen.findByText("source-version-1")).toBeInTheDocument();
-    expect(
-      screen.getByText(/知识版本 release-1 · 范围指纹/),
-    ).toBeInTheDocument();
+    expect(screen.getByText("知识版本 release-1")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "刷新文档清单" }),
     ).toBeInTheDocument();
@@ -311,7 +310,7 @@ describe("P07 document planning", () => {
     );
     expect(await screen.findByText("规划输入冲突")).toBeInTheDocument();
     expect(screen.getByText(/已有清单不会被覆盖/)).toBeInTheDocument();
-    expect(screen.queryByText("覆盖账目")).not.toBeInTheDocument();
+    expect(screen.queryByText("内容计划概览")).not.toBeInTheDocument();
   });
 
   it("does not send a planning request for a different cycle or unauthorized tenant", async () => {

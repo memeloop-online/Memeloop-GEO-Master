@@ -545,7 +545,7 @@ describe("project setup workflow", () => {
     await user.click(screen.getByRole("button", { name: "启动项目" }));
     await screen.findByRole("heading", { name: "从你的资料或想法开始" });
     await user.click(screen.getByRole("link", { name: "项目总览" }));
-    await screen.findByText(/项目已启动（受理操作 operation-a）/);
+    await screen.findByText(/项目启动请求已受理/);
     const startReadsBeforeRefresh = fetchMock.mock.calls.filter(
       ([request, init]) =>
         pathFor(request) === "/api/v1/projects/project-a/start" &&

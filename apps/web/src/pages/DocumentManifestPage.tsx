@@ -66,7 +66,7 @@ function PlanContent({
     return (
       <EmptyState
         title="项目尚未启动"
-        detail="启动项目后会创建本轮文档清单句柄；当前没有可规划的清单。"
+        detail="启动项目后，可在这里规划和查看本轮内容。"
       />
     );
   }
@@ -98,7 +98,7 @@ function PlanContent({
     <div className="workbench-page document-manifest-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">P07 · 当前计划</p>
+          <p className="eyebrow">当前计划</p>
           <h1>文档覆盖清单</h1>
           <p>
             本轮 {start.data.cycle_id} · 清单 {manifestHandle.manifest_id} ·
@@ -140,7 +140,7 @@ function PlanContent({
           </MessageBarBody>
         </MessageBar>
       )}
-      {manifest.isPending && <Spinner label="正在读取持久文档清单" />}
+      {manifest.isPending && <Spinner label="正在读取文档清单" />}
       {manifest.isError && (
         <ErrorState
           title="无法读取文档清单"
@@ -158,7 +158,7 @@ function PlanContent({
       {!release.isPending && !release.isError && !currentRelease && !result && (
         <EmptyState
           title="尚无可用知识版本"
-          detail="请先导入并处理公开资料。知识版本形成后，才能规划此轮文档分支。"
+          detail="请先导入可公开使用的资料，处理完成后即可规划本轮内容。"
         />
       )}
       {currentRelease &&
@@ -169,9 +169,7 @@ function PlanContent({
         !plan.isError && (
           <MessageBar intent="info">
             <MessageBarBody>
-              启动时创建了清单句柄（{manifestHandle.state}，修订
-              {manifestHandle.revision}）。点击规划才会提交当前知识版本；
-              此处不会生成正文。
+              资料已就绪。点击“规划文档清单”确定本轮内容范围，正文生成进度可在内容资产中查看。
             </MessageBarBody>
           </MessageBar>
         )}
@@ -210,8 +208,7 @@ function PlanContent({
           <MessageBar intent="success">
             <MessageBarBody>
               清单修订 {result.revision} · {result.sealed ? "已封存" : "未封存"}{" "}
-              · 规划器 {result.planner_version}
-              。这是冻结的分支规划；正文执行状态在内容资产页单独记录。
+              。此处显示内容计划，正文与生成进度请查看内容资产。
             </MessageBarBody>
           </MessageBar>
           <p>
@@ -223,7 +220,7 @@ function PlanContent({
           </p>
           <Card className="panel-card">
             <CardHeader
-              header={<h2>覆盖账目</h2>}
+              header={<h2>内容计划概览</h2>}
               description={`计划总数 ${result.expected_count ?? "未知"} · 实际条目 ${result.coverage.total}`}
             />
             <p>
@@ -231,15 +228,12 @@ function PlanContent({
               · 延后 {result.coverage.deferred} · 不适用{" "}
               {result.coverage.not_applicable}
             </p>
-            <p>
-              知识版本 {result.knowledge_release_id} · 范围指纹{" "}
-              {result.scope_hash}
-            </p>
+            <p>知识版本 {result.knowledge_release_id}</p>
           </Card>
           <section aria-label="文档分支" className="manifest-items">
-            <h2>内容生产 · 全部分支</h2>
+            <h2>全部计划内容</h2>
             {result.items.length === 0 ? (
-              <p>清单没有文档分支。请核对项目的文档范围配置。</p>
+              <p>暂无计划内容，请检查项目的内容范围设置。</p>
             ) : (
               <ul>
                 {result.items.map((item) => (
@@ -261,12 +255,10 @@ function PlanContent({
                         {item.product_id ?? "项目级"}
                       </p>
                       <dl>
-                        <dt>分支 ID</dt>
+                        <dt>计划项编号</dt>
                         <dd>{item.document_manifest_item_id}</dd>
-                        <dt>文档键</dt>
+                        <dt>文档标识</dt>
                         <dd>{item.document_key}</dd>
-                        <dt>依赖指纹</dt>
-                        <dd>{item.dependency_hash}</dd>
                         <dt>来源版本 ID</dt>
                         <dd>
                           {item.source_version_refs.length
@@ -280,9 +272,6 @@ function PlanContent({
                           </>
                         )}
                       </dl>
-                      <p>
-                        此规划项不包含内容版本或发布结果；请到内容资产查看执行与正文。
-                      </p>
                     </Card>
                   </li>
                 ))}

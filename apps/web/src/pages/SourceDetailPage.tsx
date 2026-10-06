@@ -11,8 +11,6 @@ import {
 import {
   ArrowLeftRegular,
   ArrowSyncRegular,
-  DeleteRegular,
-  DocumentArrowUpRegular,
   OpenRegular,
 } from "@fluentui/react-icons";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -27,6 +25,7 @@ import { ErrorState, EmptyState, LoadingState } from "../components/AsyncState";
 import { KnowledgeLocator } from "../components/KnowledgeLocator";
 import { CsvEvidenceTable } from "../components/CsvEvidenceTable";
 import { OfficeEvidenceTable } from "../components/OfficeEvidenceTable";
+import { SourceTextRevisionPanel } from "../components/SourceTextRevisionPanel";
 import { StatusPill, type StatusKind } from "../components/StatusPill";
 
 function statusKind(value: string | null | undefined): StatusKind {
@@ -195,7 +194,7 @@ export function SourceDetailPage() {
     <div className="source-detail-page">
       <section className="page-hero source-detail-hero">
         <div>
-          <p className="eyebrow">P04 · 资料详情</p>
+          <p className="eyebrow">资料详情</p>
           <Link className="back-link" to={knowledgePath}>
             <ArrowLeftRegular /> 返回资料中心
           </Link>
@@ -216,14 +215,6 @@ export function SourceDetailPage() {
         <div className="source-action-group">
           <Button
             appearance="secondary"
-            icon={<DocumentArrowUpRegular />}
-            disabled
-            title="替换文件端点尚未接入；系统不会假装已创建新版本。"
-          >
-            替换文件
-          </Button>
-          <Button
-            appearance="secondary"
             icon={<ArrowSyncRegular />}
             disabled={!mayRetry || retryJob.isPending}
             title={
@@ -242,14 +233,6 @@ export function SourceDetailPage() {
             }}
           >
             {retryJob.isPending ? "正在受理重试…" : "重试失败部分"}
-          </Button>
-          <Button
-            appearance="secondary"
-            icon={<DeleteRegular />}
-            disabled
-            title="移除端点尚未接入；系统不会假装已删除来源。"
-          >
-            移除来源
           </Button>
         </div>
       </section>
@@ -376,9 +359,7 @@ export function SourceDetailPage() {
             selectedVersionId !== source.current_version_id && (
               <p>正在查看已保存的历史证据；新的解析不会覆盖这个版本。</p>
             )}
-          {detail.original_text && !isPdf && !isDocx && !isXlsx ? (
-            <pre className="source-original-text">{detail.original_text}</pre>
-          ) : visibleChunks.length === 0 ? (
+          {visibleChunks.length === 0 ? (
             <EmptyState
               title="原文尚未可用"
               detail="资料正在获取或解析；不会以空白内容冒充已解析原文。"
@@ -411,6 +392,20 @@ export function SourceDetailPage() {
             </ol>
           )}
         </Card>
+        {activeVersionId && tenantId && projectId && (
+          <SourceTextRevisionPanel
+            tenantId={tenantId}
+            projectId={projectId}
+            source={source}
+            selectedVersionId={activeVersionId}
+            canEdit={Boolean(canRetry)}
+            onViewLatest={() => {
+              setSelectedVersionId(null);
+              setSelectedChunkId(null);
+              void sourceQuery.refetch();
+            }}
+          />
+        )}
         <Card className="source-extraction-panel" style={{ minWidth: 0 }}>
           <div className="knowledge-panel-heading">
             <div>

@@ -332,7 +332,7 @@ describe("formal distribution coverage", () => {
       await user.click(screen.getByRole("button", { name: "下一页" }));
       await screen.findByText(
         reusedStatus === "reused_unknown"
-          ? "复用既有未知结果，禁止重发"
+          ? "沿用历史记录，结果待核对"
           : "复用已有验证记录",
       );
       await user.click(
@@ -373,9 +373,7 @@ describe("formal distribution coverage", () => {
     await user.click(
       await screen.findByRole("button", { name: "查看执行记录与查回" }),
     );
-    expect(
-      await screen.findByText(/尚无发布意图或原发送目标/),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/尚未创建发送任务/)).toBeInTheDocument();
     expect(
       requests.some((item) => item.path.includes("/channel-targets/")),
     ).toBe(false);
@@ -400,14 +398,12 @@ describe("formal distribution coverage", () => {
     expect(await screen.findByText(/尚未展开 1 项/)).toBeInTheDocument();
     expect(screen.getByText(/原因：account_unassigned/)).toBeInTheDocument();
     expect(screen.queryByText("已发布（未公开验证）")).not.toBeInTheDocument();
-    expect(
-      screen.getByText(/登记或排队不等于发送、发布或公开验证/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/发布任务/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "下一页" }));
-    const second = await screen.findByText(/复用既有未知结果，禁止重发/);
+    const second = await screen.findByText(/沿用历史记录，结果待核对/);
     expect(
       within(second.closest(".channel-job-target") as HTMLElement).getByText(
-        /不会另建新意图盲目重发/,
+        /不会重复发布/,
       ),
     ).toBeInTheDocument();
     expect(
@@ -437,8 +433,8 @@ describe("formal distribution coverage", () => {
     const requests = mockApi({ initialManifest: null });
     const user = userEvent.setup();
     renderPanel();
-    await screen.findByText("尚未冻结正式分发清单");
-    await user.click(screen.getByRole("button", { name: "冻结正式分发清单" }));
+    await screen.findByText("尚未创建分发计划");
+    await user.click(screen.getByRole("button", { name: "创建分发计划" }));
     expect(await screen.findByText(/尚未展开 2 项/)).toBeInTheDocument();
     await user.click(
       screen.getByRole("button", { name: "继续展开／检查延后项" }),
@@ -469,7 +465,7 @@ describe("formal distribution coverage", () => {
     const view = renderPanel();
     await screen.findByText(/尚未展开 1 项/);
     await user.click(screen.getByRole("button", { name: "下一页" }));
-    await screen.findByText(/复用既有未知结果，禁止重发/);
+    await screen.findByText(/沿用历史记录，结果待核对/);
     await user.click(
       screen.getByRole("button", {
         name: "继续展开／复查当前页起的延后项",
@@ -485,7 +481,7 @@ describe("formal distribution coverage", () => {
       expect(post?.body).toBeUndefined();
     });
     view.rerenderCycle("cycle-2");
-    expect(await screen.findByText("尚未冻结正式分发清单")).toBeInTheDocument();
+    expect(await screen.findByText("尚未创建分发计划")).toBeInTheDocument();
     view.rerenderCycle("cycle-1");
     await screen.findByText(/尚未展开 0 项/);
     expect(screen.getByText("第 1 页")).toBeInTheDocument();
@@ -506,10 +502,10 @@ describe("formal distribution coverage", () => {
   it("shows a missing manifest without offering write controls to a viewer", async () => {
     const requests = mockApi({ initialManifest: null, role: "viewer" });
     renderPanel(false);
-    expect(await screen.findByText("尚未冻结正式分发清单")).toBeInTheDocument();
+    expect(await screen.findByText("尚未创建分发计划")).toBeInTheDocument();
     expect(screen.getByText(/当前角色仅可查看/)).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "冻结正式分发清单" }),
+      screen.queryByRole("button", { name: "创建分发计划" }),
     ).not.toBeInTheDocument();
     expect(requests.some((item) => item.method === "POST")).toBe(false);
   });
@@ -536,8 +532,8 @@ describe("formal distribution coverage", () => {
   it.each([
     ["blocked", "已阻断"],
     ["not_applicable", "不适用"],
-    ["ready", "就绪（非已发布）"],
-    ["reused_unknown", "复用既有未知结果，禁止重发"],
+    ["ready", "已准备"],
+    ["reused_unknown", "沿用历史记录，结果待核对"],
   ] as const)(
     "renders %s as %s without claiming publication",
     async (status, label) => {

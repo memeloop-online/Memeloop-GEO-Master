@@ -334,7 +334,8 @@ export function StructuredContentEditor({
   });
 
   useEffect(() => {
-    editor?.setEditable(!readonly);
+    if (editor && editor.isEditable === readonly)
+      editor.setEditable(!readonly, false);
   }, [editor, readonly]);
 
   const toParagraph = () => {

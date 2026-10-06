@@ -99,15 +99,14 @@ function CoveragePanel({
           : coverage.availability === "unsealed"
             ? "未封存"
             : "不可用"}
-        {" · "}计划分母{" "}
+        {" · "}计划总数{" "}
         {coverage.expected_count === null ? "未知" : coverage.expected_count}
         {" · "}已观察 {coverage.observed_count}
       </p>
       {!available && (
         <MessageBar intent="warning">
           <MessageBarBody>
-            {coverage.reason || "输入尚未形成可用于此快照的封存清单。"}
-            本报告不将缺失输入计为失败、未提及或零分。
+            {coverage.reason || "本期计划尚未确定，暂无法统计完整覆盖情况。"}
           </MessageBarBody>
         </MessageBar>
       )}
@@ -129,7 +128,7 @@ function CoveragePanel({
           </tbody>
         </table>
       ) : (
-        <p className="report-muted">此输入没有可展示的分类计数。</p>
+        <p className="report-muted">暂无分类统计。</p>
       )}
     </Card>
   );
@@ -230,7 +229,7 @@ function SnapshotDetail({
         <>
           <section className="page-hero">
             <div>
-              <p className="eyebrow">P14 · 不可变周报快照</p>
+              <p className="eyebrow">正式周报</p>
               <h1>
                 周报 ·{" "}
                 {dateTime(
@@ -282,7 +281,7 @@ function SnapshotDetail({
               {snapshot.status === "partial" ? "部分覆盖" : "完整覆盖"}
               ：这是截止{" "}
               {dateTime(snapshot.cutoff_at, snapshot.report_timezone)}{" "}
-              的固定快照，后续证据不会静默改写本版本。生成于{" "}
+              的报告，后续更新将另存为新版本。生成于{" "}
               {dateTime(snapshot.generated_at, snapshot.report_timezone)}。
             </MessageBarBody>
           </MessageBar>
@@ -303,23 +302,23 @@ function SnapshotDetail({
             <MessageBarBody>
               临时预览 · 未保存为正式周报（
               {snapshot.status === "partial" ? "部分覆盖" : "完整覆盖"}
-              ）。完整计划分母仍按冻结清单展示；仅纳入当前证据水位之前的证据，刷新可能变化。
+              ）。按本期计划与已收集的数据统计，刷新后可能变化。
             </MessageBarBody>
           </MessageBar>
           <dl className="report-metadata">
             <dt>生成时间</dt>
             <dd>{dateTime(snapshot.generated_at, snapshot.report_timezone)}</dd>
-            <dt>证据水位</dt>
+            <dt>数据更新至</dt>
             <dd>
               {dateTime(snapshot.evidence_as_of, snapshot.report_timezone)}
             </dd>
-            <dt>冻结截止</dt>
+            <dt>本期截止时间</dt>
             <dd>{dateTime(snapshot.cutoff_at, snapshot.report_timezone)}</dd>
           </dl>
         </>
       )}
       <Card className="report-panel">
-        <h2>{savedSnapshot ? "快照范围与版本" : "预览范围与输入版本"}</h2>
+        <h2>{savedSnapshot ? "报告范围与版本" : "预览范围与版本"}</h2>
         <p>
           {dateTime(snapshot.report_window_start_at, snapshot.report_timezone)}{" "}
           — {dateTime(snapshot.report_window_end_at, snapshot.report_timezone)}
@@ -342,20 +341,16 @@ function SnapshotDetail({
               <dd>{savedSnapshot.correction_of ?? "无"}</dd>
             </>
           )}
-          <dt>Reduce 版本</dt>
-          <dd>{snapshot.reducer_version}</dd>
-          <dt>输入摘要</dt>
-          <dd>{snapshot.input_hash}</dd>
           {savedSnapshot && (
             <>
-              <dt>证据水位</dt>
+              <dt>数据更新至</dt>
               <dd>
                 {dateTime(snapshot.evidence_as_of, snapshot.report_timezone)}
               </dd>
             </>
           )}
         </dl>
-        <h3>输入清单版本</h3>
+        <h3>本期计划版本</h3>
         {snapshot.input_manifest_versions.length ? (
           <ul>
             {snapshot.input_manifest_versions.map((item) => (
@@ -367,28 +362,28 @@ function SnapshotDetail({
             ))}
           </ul>
         ) : (
-          <p>未提供输入清单版本；不能将覆盖范围视为完整。</p>
+          <p>缺少计划版本信息，覆盖范围待确认。</p>
         )}
       </Card>
       <section className="report-coverage" aria-label="三类独立覆盖">
         <CoveragePanel
           title="文档覆盖与资料缺口"
           coverage={snapshot.documents}
-          note="规划分支不等于已生成主文档。阻断与延后保留在计划分母内。"
+          note="显示本期计划内容及未完成原因，包含受阻和延后项。"
         />
         <CoveragePanel
           title="发布目标覆盖"
           coverage={snapshot.publications}
-          note="发布回执、公开验证与独立资产查回分开呈现；查回发现资产不证明原发送成功，结果未知仍保留。"
+          note="分别查看发布结果、公开验证和查回记录；发现公开资产后，原发送结果仍可能待核对。"
         />
         <CoveragePanel
           title="AI 渠道测量覆盖"
           coverage={snapshot.measurements}
-          note="采集失败、拒答与未提及不同。不同问题集、平台、观测面和市场不能合并成趋势。"
+          note="有效回答、缺测和拒答分别统计；缺测不计为未提及。"
         />
       </section>
       <section className="report-section" aria-label="平台与测量比较组">
-        <h2>独立覆盖组</h2>
+        <h2>分平台与测量口径</h2>
         <div className="report-coverage">
           <Card className="report-panel">
             <h3>发布平台</h3>
@@ -414,7 +409,7 @@ function SnapshotDetail({
                 </div>
               ))
             ) : (
-              <p>没有可展示的逐平台发布组；不能推断各平台的状态。</p>
+              <p>暂无分平台发布数据。</p>
             )}
           </Card>
           <Card className="report-panel">
@@ -449,13 +444,12 @@ function SnapshotDetail({
                 </div>
               ))
             ) : (
-              <p>没有可展示的独立 AI 渠道组；不能推断提及、引用或趋势。</p>
+              <p>暂无 AI 渠道测量数据。</p>
             )}
           </Card>
         </div>
         <p>
-          比较组仅按冻结口径分别呈现，不跨问题集、平台、观测面、市场或采样协议汇总为趋势。
-          本周无全量复测时，也不将旧样本标为本周结果。
+          测量结果按问题集、平台、观测面、市场和采样协议分别展示。历史样本保留原测量时间。
         </p>
       </section>
       <section className="report-section" aria-label="结论">
@@ -488,7 +482,7 @@ function SnapshotDetail({
                       ))}
                     </ul>
                   ) : (
-                    <p>此结论没有证据引用；不将其作为已验证效果。</p>
+                    <p>此结论暂无来源支持，效果待验证。</p>
                   )}
                 </Card>
               </li>
@@ -497,7 +491,7 @@ function SnapshotDetail({
         ) : (
           <p>
             本{savedSnapshot ? "快照" : "预览"}
-            没有可追溯的结论；不推断效果变化。
+            暂无可用结论。
           </p>
         )}
       </section>
@@ -529,7 +523,7 @@ function SnapshotDetail({
         <MessageBar intent="info">
           <MessageBarBody>
             CSV 和 PDF
-            仅导出快照已有的覆盖、结论与证据。独立查回只陈述资产存在，不证明原发送成功。资产明细、费用及下一轮动作尚未由此接口提供；页面不会生成替代数据或将本快照称作完整商业报告。
+            包含本版报告的覆盖统计、结论与证据，暂不包含费用、资产明细和下一轮计划。
           </MessageBarBody>
         </MessageBar>
       )}
@@ -555,9 +549,9 @@ function ReportListPage({
     <div className="workbench-page reports-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">P14 · 效果报告</p>
+          <p className="eyebrow">效果报告</p>
           <h1>每周报告</h1>
-          <p>按生成时的输入与数据截止封存；迟到证据需显式更正版本。</p>
+          <p>查看本期进展预览与历史周报，下载覆盖统计和来源证据。</p>
         </div>
         <Button
           icon={<ArrowSyncRegular />}
@@ -640,7 +634,7 @@ function ReportListPage({
         ) : query.data.items.length === 0 ? (
           <EmptyState
             title="尚无周报快照"
-            detail="截至目前没有已生成的报告。周期截止或输入到齐后，系统才会保存固定快照；这里不会用演示数据填充。"
+            detail="周期截止或数据收集完成后，将生成正式周报。你可以先查看上方预览。"
           />
         ) : (
           <ul className="report-list">
@@ -675,9 +669,7 @@ function ReportListPage({
                     {dateTime(snapshot.cutoff_at, snapshot.report_timezone)}
                   </p>
                   {snapshot.correction_of && (
-                    <p>
-                      显式更正版本，原报告 {snapshot.correction_of} 仍保留。
-                    </p>
+                    <p>更正版本，原报告 {snapshot.correction_of} 仍可查看。</p>
                   )}
                 </Card>
               </li>

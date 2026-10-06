@@ -268,6 +268,34 @@ impl KnowledgeRepository for RevokingKnowledge {
             .get_source_version(scope, source_id, version_id)
             .await
     }
+    async fn get_source_version_content(
+        &self,
+        scope: &TenantScope,
+        source_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<geo_domain::SourceVersionContent>, AppError> {
+        self.inner
+            .get_source_version_content(scope, source_id, version_id)
+            .await
+    }
+    async fn revise_source_text(
+        &self,
+        scope: &TenantScope,
+        source_id: Uuid,
+        expected_revision: i64,
+        idempotency_key: &str,
+        command: geo_domain::ReviseSourceTextCommand,
+    ) -> Result<geo_domain::SourceTextRevisionReceipt, AppError> {
+        self.inner
+            .revise_source_text(
+                scope,
+                source_id,
+                expected_revision,
+                idempotency_key,
+                command,
+            )
+            .await
+    }
     async fn list_products(&self, scope: &TenantScope) -> Result<Vec<Product>, AppError> {
         self.inner.list_products(scope).await
     }

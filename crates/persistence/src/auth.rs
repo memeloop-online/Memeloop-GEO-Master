@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use chrono::Duration;
 use geo_domain::{
-    AppError, AuthRepository, LoginIdentity, Membership, Operator, OperatorId, Role, Session,
-    SessionCredentials, SessionId, User, UserId, hash_token, normalize_email, normalize_host,
+    AppError, AuthRepository, LoginIdentity, Membership, Operator, OperatorAppearance, OperatorId,
+    Role, Session, SessionCredentials, SessionId, UpdateOperatorAppearance, User, UserId,
+    hash_token, normalize_email, normalize_host,
 };
 use sqlx::{PgPool, Row, postgres::PgRow};
 use uuid::Uuid;
@@ -40,6 +41,22 @@ impl AuthRepository for PgAuthRepository {
         .await
         .map_err(database_unavailable)?;
         row.map(operator_from_row).transpose()
+    }
+
+    async fn operator_appearance(
+        &self,
+        operator_id: OperatorId,
+    ) -> Result<Option<OperatorAppearance>, AppError> {
+        crate::appearance::get(&self.pool, operator_id).await
+    }
+
+    async fn update_operator_appearance(
+        &self,
+        operator_id: OperatorId,
+        expected_revision: i64,
+        update: UpdateOperatorAppearance,
+    ) -> Result<OperatorAppearance, AppError> {
+        crate::appearance::update(&self.pool, operator_id, expected_revision, update).await
     }
 
     async fn authenticate(

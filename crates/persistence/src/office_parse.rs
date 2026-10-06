@@ -769,7 +769,7 @@ pub(super) async fn finish(
     .await
     .map_err(database_error)?;
     let version_row = sqlx::query(
-        "SELECT source_version_id,source_id,version,object_id,object_version,content_sha256,captured_at,
+        "SELECT source_version_id,source_id,version,representation,object_id,object_version,content_sha256,captured_at,
                 original_url,parent_version_id,parser_version,extraction_version,created_at
          FROM knowledge_source_versions WHERE source_version_id=$1",
     )

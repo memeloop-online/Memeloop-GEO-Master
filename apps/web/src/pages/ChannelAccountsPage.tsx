@@ -13,6 +13,8 @@ import {
 } from "@fluentui/react-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
+import "../i18n";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor } from "../auth/types";
 import { ApiError } from "../api/client";
@@ -1235,12 +1237,12 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
 
 export function OperatorAccountsPage() {
   const { session } = useAuth();
+  const { t } = useTranslation();
   const client = useQueryClient();
   const allowed = Boolean(
     session?.memberships.some(
       (membership) =>
-        membership.role === "operator_admin" ||
-        membership.role === "resource_admin",
+        membership.role === "oem_admin" || membership.role === "resource_admin",
     ),
   );
   const ownerKey = [session?.user.id, session?.operator.id];
@@ -1385,6 +1387,9 @@ export function OperatorAccountsPage() {
           <p>
             总部连接并维护共享账号，再明确分配给客户项目。客户不能重新登录或修改总部账号。
           </p>
+          {session?.memberships.some(
+            (membership) => membership.role === "oem_admin",
+          ) && <Link to="/ops/appearance">{t("appearance.title")}</Link>}
         </div>
       </section>
       {error && <ErrorState title="操作未完成" detail={error} />}

@@ -13,10 +13,12 @@ use geo_domain::{
     KnowledgeAskResult, KnowledgeCapability, KnowledgeCoverage, KnowledgeEvidence,
     KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
     KnowledgeSearchRequest, KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES,
-    Operation, OperationStatus, Product, Source, SourceDetail, SourceKind, SourceState,
-    SourceVersion, StoredObject, StoredObjectState, TenantScope, UPLOAD_SESSION_TTL_SECONDS,
-    UploadSession, UploadSessionCommand, UploadSessionState, is_supported_knowledge_media_type,
-    knowledge_parser_version, parsed_knowledge_chunks, plan_document_manifest, sha256_hex,
+    Operation, OperationStatus, Product, ReviseSourceTextCommand, Source, SourceDetail, SourceKind,
+    SourceState, SourceTextRevisionReceipt, SourceVersion, SourceVersionContent,
+    SourceVersionRepresentation, StoredObject, StoredObjectState, TenantScope,
+    UPLOAD_SESSION_TTL_SECONDS, UploadSession, UploadSessionCommand, UploadSessionState,
+    is_supported_knowledge_media_type, knowledge_parser_version, parsed_knowledge_chunks,
+    plan_document_manifest, sha256_hex,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -26,6 +28,8 @@ use crate::{Database, set_local_scope};
 
 #[path = "import_progress.rs"]
 mod import_progress;
+#[path = "knowledge_revision.rs"]
+mod knowledge_revision;
 #[path = "office_parse.rs"]
 mod office_parse;
 #[path = "pdf_parse.rs"]
@@ -606,6 +610,7 @@ impl PgKnowledgeRepository {
             project_id,
             source_id,
             version: 1,
+            representation: SourceVersionRepresentation::Original,
             object_id: object.as_ref().map(|value| value.object_id),
             object_version: object.as_ref().map(|value| value.object_version),
             content_sha256: content_hash.clone(),
@@ -827,6 +832,7 @@ impl PgKnowledgeRepository {
             project_id,
             source_id,
             version: 1,
+            representation: SourceVersionRepresentation::Original,
             object_id: Some(object.object_id),
             object_version: Some(object.object_version),
             content_sha256: object.sha256.clone(),
@@ -1029,6 +1035,32 @@ impl PgKnowledgeRepository {
 
 #[async_trait]
 impl KnowledgeRepository for PgKnowledgeRepository {
+    async fn get_source_version_content(
+        &self,
+        scope: &TenantScope,
+        source_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<SourceVersionContent>, AppError> {
+        knowledge_revision::content(self, scope, source_id, version_id).await
+    }
+    async fn revise_source_text(
+        &self,
+        scope: &TenantScope,
+        source_id: Uuid,
+        expected_revision: i64,
+        idempotency_key: &str,
+        command: ReviseSourceTextCommand,
+    ) -> Result<SourceTextRevisionReceipt, AppError> {
+        knowledge_revision::revise(
+            self,
+            scope,
+            source_id,
+            expected_revision,
+            idempotency_key,
+            command,
+        )
+        .await
+    }
     async fn hold_content_evidence<'a>(
         &'a self,
         _scope: &TenantScope,
@@ -1948,7 +1980,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         };
         let project_id = Self::project_id(scope)?;
         let mut transaction = self.transaction(scope).await?;
-        let version_rows=sqlx::query("SELECT source_version_id,source_id,version,object_id,object_version,content_sha256,captured_at,original_url,parent_version_id,parser_version,extraction_version,created_at FROM knowledge_source_versions WHERE source_id=$1 AND operator_id=$2 AND tenant_id=$3 AND project_id=$4 ORDER BY version")
+        let version_rows=sqlx::query("SELECT source_version_id,source_id,version,representation,object_id,object_version,content_sha256,captured_at,original_url,parent_version_id,parser_version,extraction_version,created_at FROM knowledge_source_versions WHERE source_id=$1 AND operator_id=$2 AND tenant_id=$3 AND project_id=$4 ORDER BY version")
             .bind(id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project_id.as_uuid()).fetch_all(&mut *transaction).await.map_err(database_error)?;
         let versions = version_rows
             .iter()
@@ -1984,7 +2016,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
     ) -> Result<Option<SourceVersion>, AppError> {
         let project_id = Self::project_id(scope)?;
         let mut transaction = self.transaction(scope).await?;
-        let row=sqlx::query("SELECT source_version_id,source_id,version,object_id,object_version,content_sha256,captured_at,original_url,parent_version_id,parser_version,extraction_version,created_at FROM knowledge_source_versions WHERE source_version_id=$1 AND source_id=$2 AND operator_id=$3 AND tenant_id=$4 AND project_id=$5")
+        let row=sqlx::query("SELECT source_version_id,source_id,version,representation,object_id,object_version,content_sha256,captured_at,original_url,parent_version_id,parser_version,extraction_version,created_at FROM knowledge_source_versions WHERE source_version_id=$1 AND source_id=$2 AND operator_id=$3 AND tenant_id=$4 AND project_id=$5")
             .bind(version_id).bind(source_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project_id.as_uuid()).fetch_optional(&mut *transaction).await.map_err(database_error)?;
         transaction.commit().await.map_err(database_error)?;
         row.map(|row| version_from_row(&row, scope, project_id))
@@ -2500,6 +2532,11 @@ fn version_from_row(
         project_id,
         source_id: row.get("source_id"),
         version: row.get("version"),
+        representation: match row.get::<String, _>("representation").as_str() {
+            "original" => SourceVersionRepresentation::Original,
+            "authored_text" => SourceVersionRepresentation::AuthoredText,
+            _ => return Err(AppError::conflict("unknown source representation")),
+        },
         object_id: row.get("object_id"),
         object_version: row.get("object_version"),
         content_sha256: row.get("content_sha256"),

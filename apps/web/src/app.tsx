@@ -21,6 +21,7 @@ import { ReportsPage } from "./pages/ReportsPage";
 import { ChannelJobsPage } from "./pages/ChannelJobsPage";
 import { QuestionSetsPage } from "./pages/QuestionSetsPage";
 import { ContentAssetPage, ContentAssetsPage } from "./pages/ContentPages";
+import { OperatorAppearancePage } from "./pages/OperatorAppearancePage";
 
 export function AppRoutes() {
   return (
@@ -30,6 +31,7 @@ export function AppRoutes() {
         <Route path="/" element={<Navigate replace to="/workspaces" />} />
         <Route path="/workspaces" element={<WorkspacePage />} />
         <Route path="/ops/channels" element={<OperatorAccountsPage />} />
+        <Route path="/ops/appearance" element={<OperatorAppearancePage />} />
         <Route path="/setup" element={<SetupEntry />} />
         <Route element={<RequireMembership />}>
           <Route path="/app/:tenantId/:projectId" element={<AppShell />}>
