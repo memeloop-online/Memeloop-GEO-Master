@@ -35,9 +35,11 @@ import {
   type SourceVisibility,
   useCreateProjectMutation,
   useProjectEstimateQuery,
+  useProjectQuery,
   useStartProjectMutation,
   useUpdateProjectMutation,
 } from "../api/projects";
+import { ErrorState, LoadingState } from "../components/AsyncState";
 
 const DEFAULT_OBJECTIVE = "提升产品在购买决策问题中的可见度";
 const weekDays = [
@@ -439,46 +441,109 @@ function EstimatePanel({ estimate }: { estimate: ProjectEstimate }) {
 }
 
 export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
-  const navigate = useNavigate();
-  const { tenantId: paramTenantId } = useParams();
+  const { tenantId: paramTenantId, projectId } = useParams();
   const [searchParams] = useSearchParams();
   const tenantId =
     routeTenantId ??
     paramTenantId ??
     searchParams.get("tenant_id") ??
     undefined;
+  const project = useProjectQuery(tenantId, projectId);
+  if (projectId && project.isPending)
+    return <LoadingState label="正在读取项目配置" />;
+  if (projectId && (project.isError || !project.data)) {
+    return (
+      <ErrorState
+        title="无法读取项目配置"
+        detail="未创建新项目，请重试读取当前项目。"
+        onRetry={() => void project.refetch()}
+      />
+    );
+  }
+  return (
+    <SetupForm
+      key={`${tenantId}:${projectId ?? "new"}`}
+      tenantId={tenantId}
+      initialProject={projectId ? project.data : undefined}
+    />
+  );
+}
+
+function SetupForm({
+  tenantId,
+  initialProject,
+}: {
+  tenantId?: string;
+  initialProject?: Project;
+}) {
+  const navigate = useNavigate();
+  const settings = initialProject?.settings;
   const createProject = useCreateProjectMutation(tenantId);
   const startProject = useStartProjectMutation(tenantId);
   const [current, setCurrent] = useState(0);
-  const [brandName, setBrandName] = useState("");
-  const [sources, setSources] = useState<SourceDraft[]>([
-    {
-      kind: "auto",
-      value: "",
-      visibility: "public",
-      versionRef: "",
-      contentHash: "",
-    },
-  ]);
+  const [brandName, setBrandName] = useState(settings?.brand_name ?? "");
+  const [sources, setSources] = useState<SourceDraft[]>(
+    settings?.initial_sources.length
+      ? settings.initial_sources.map((source) => ({
+          kind: source.kind,
+          value: source.value,
+          visibility: source.visibility,
+          versionRef: source.version_ref ?? "",
+          contentHash: source.content_hash ?? "",
+        }))
+      : [
+          {
+            kind: "auto",
+            value: "",
+            visibility: "public",
+            versionRef: "",
+            contentHash: "",
+          },
+        ],
+  );
   const [files, setFiles] = useState<SetupFile[]>([]);
   const [filePurpose, setFilePurpose] = useState<KnowledgePurpose>("public");
-  const [productName, setProductName] = useState("");
-  const [market, setMarket] = useState("中国大陆");
-  const [language, setLanguage] = useState("简体中文");
-  const [targetAudience, setTargetAudience] = useState("");
-  const [objective, setObjective] = useState(DEFAULT_OBJECTIVE);
-  const [competitorsText, setCompetitorsText] = useState("");
-  const [resourceMode, setResourceMode] = useState<ResourceMode>("mixed");
-  const [budgetCurrency, setBudgetCurrency] = useState("CNY");
-  const [monthlyBudget, setMonthlyBudget] = useState("0");
-  const [reservePercent, setReservePercent] = useState("20");
-  const [reportTimezone, setReportTimezone] = useState(defaultTimezone);
-  const [reportWeekday, setReportWeekday] = useState("monday");
-  const [reportLocalTime, setReportLocalTime] = useState("09:00");
-  const [cutoffWeekday, setCutoffWeekday] = useState("sunday");
-  const [cutoffLocalTime, setCutoffLocalTime] = useState("23:59");
+  const [productName, setProductName] = useState(settings?.product_name ?? "");
+  const [market, setMarket] = useState(settings?.market ?? "中国大陆");
+  const [language, setLanguage] = useState(settings?.language ?? "简体中文");
+  const [targetAudience, setTargetAudience] = useState(
+    settings?.target_audience ?? "",
+  );
+  const [objective, setObjective] = useState(
+    settings?.objective ?? DEFAULT_OBJECTIVE,
+  );
+  const [competitorsText, setCompetitorsText] = useState(
+    settings?.competitors.join("\n") ?? "",
+  );
+  const [resourceMode, setResourceMode] = useState<ResourceMode>(
+    settings?.resource_mode ?? "mixed",
+  );
+  const [budgetCurrency, setBudgetCurrency] = useState(
+    settings?.budget_currency ?? "CNY",
+  );
+  const [monthlyBudget, setMonthlyBudget] = useState(
+    String((settings?.monthly_budget_minor ?? 0) / 100),
+  );
+  const [reservePercent, setReservePercent] = useState(
+    String(settings?.monitoring_reserve_percent ?? 20),
+  );
+  const [reportTimezone, setReportTimezone] = useState(
+    settings?.report_timezone ?? defaultTimezone,
+  );
+  const [reportWeekday, setReportWeekday] = useState(
+    settings?.report_schedule.report_weekday ?? "monday",
+  );
+  const [reportLocalTime, setReportLocalTime] = useState(
+    settings?.report_schedule.report_local_time ?? "09:00",
+  );
+  const [cutoffWeekday, setCutoffWeekday] = useState(
+    settings?.report_schedule.cutoff_weekday ?? "sunday",
+  );
+  const [cutoffLocalTime, setCutoffLocalTime] = useState(
+    settings?.report_schedule.cutoff_local_time ?? "23:59",
+  );
   const [errors, setErrors] = useState<FieldErrors>({});
-  const [draft, setDraft] = useState<Project | null>(null);
+  const [draft, setDraft] = useState<Project | null>(initialProject ?? null);
   const [createSubmissionKey, setCreateSubmissionKey] = useState<string | null>(
     null,
   );
@@ -495,7 +560,7 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
   >([]);
   const updateProject = useUpdateProjectMutation(tenantId, draft?.id ?? "");
   const uploadFiles = useUploadFilesMutation(tenantId, draft?.id);
-  const draftRef = useRef<Project | null>(null);
+  const draftRef = useRef<Project | null>(initialProject ?? null);
   const persistedFingerprintRef = useRef<string | null>(null);
   const saveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
 
@@ -538,7 +603,7 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
           cutoff_local_time: cutoffLocalTime,
           period_policy: "previous_calendar_week",
         },
-        document_scope: {
+        document_scope: settings?.document_scope ?? {
           all_active_products: true,
           excluded_product_ids: [],
           markets: market.trim() ? [market.trim()] : [],
@@ -546,7 +611,7 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
           content_types: ["product_page", "faq"],
           question_clusters: [],
         },
-        distribution_scope: {
+        distribution_scope: settings?.distribution_scope ?? {
           mode: "all_eligible",
           included_platform_ids: [],
           excluded_platform_ids: [],
@@ -573,9 +638,15 @@ export function SetupPage({ tenantId: routeTenantId }: { tenantId?: string }) {
     reservePercent,
     resourceMode,
     sources,
+    settings,
     targetAudience,
   ]);
   const inputFingerprint = draftInput ? JSON.stringify(draftInput) : null;
+  const initialFingerprintSet = useRef(false);
+  if (!initialFingerprintSet.current) {
+    initialFingerprintSet.current = true;
+    if (initialProject) persistedFingerprintRef.current = inputFingerprint;
+  }
 
   function errorsForStep(step: number): FieldErrors {
     const nextErrors: FieldErrors = {};

@@ -124,6 +124,14 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 28,
         description: "question sets",
     },
+    MigrationMetadata {
+        version: 29,
+        description: "office parse",
+    },
+    MigrationMetadata {
+        version: 30,
+        description: "standalone measurements",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

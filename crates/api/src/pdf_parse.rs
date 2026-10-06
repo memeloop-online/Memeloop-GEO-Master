@@ -75,6 +75,12 @@ struct HealthResponse {
     schema_version: String,
     parser_version: String,
     capacity: usize,
+    #[serde(default)]
+    office_schema_version: Option<String>,
+    #[serde(default)]
+    office_parser_version: Option<String>,
+    #[serde(default)]
+    office_capacity: Option<usize>,
 }
 
 enum ParserFailure {
@@ -141,6 +147,22 @@ impl PdfParserClient {
         if health.schema_version != PDF_PARSE_SCHEMA_VERSION
             || health.parser_version != PDF_PARSER_PROFILE
             || !(1..=64).contains(&health.capacity)
+            || !matches!(
+                (
+                    health.office_schema_version.as_deref(),
+                    health.office_parser_version.as_deref(),
+                    health.office_capacity,
+                ),
+                (None, None, None)
+                    | (
+                        Some(geo_domain::OFFICE_PARSE_SCHEMA_VERSION),
+                        Some(crate::OFFICE_PARSER_PROFILE),
+                        Some(1..=64)
+                    )
+            )
+            || health
+                .office_capacity
+                .is_some_and(|capacity| capacity != health.capacity)
         {
             return Err(parser_error());
         }
@@ -784,6 +806,35 @@ mod tests {
                     .await
                     .is_err()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_service_office_health_fields_are_strict_but_optional() {
+        for (profile, expected) in [
+            (crate::OFFICE_PARSER_PROFILE, true),
+            ("wrong-office-profile", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new().route(
+                "/health",
+                axum::routing::get(move || async move {
+                    Json(json!({
+                        "schema_version":PDF_PARSE_SCHEMA_VERSION,
+                        "parser_version":PDF_PARSER_PROFILE,
+                        "capacity":1,
+                        "office_schema_version":geo_domain::OFFICE_PARSE_SCHEMA_VERSION,
+                        "office_parser_version":profile,
+                        "office_capacity":1
+                    }))
+                }),
+            );
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result = PdfParserClient::new(&endpoint).unwrap().check_ready().await;
+            assert_eq!(result.is_ok(), expected);
         }
     }
 

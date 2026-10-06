@@ -38,6 +38,7 @@ import { useChannelData } from "../api/channels";
 import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { DistributionPanel } from "./DistributionPanel";
+import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
 import {
   PublicationLookupPanel,
   safeOriginalPublicUrl,
@@ -78,7 +79,7 @@ function validText(value: string, maxBytes: number) {
   );
 }
 
-function TargetCard({
+export function TargetCard({
   target,
   tenantId,
   projectId,
@@ -110,7 +111,7 @@ function TargetCard({
         ? "优化问题"
         : input.question_binding?.purpose === "frozen_evaluation"
           ? "冻结评估（不进入优化）"
-          : "旧数据未分类（不进入优化）"
+          : "自定义问题（不进入优化）"
       : null;
   const status = resultStatus(view);
   const attempted = Boolean(view?.attempts.length);
@@ -246,7 +247,7 @@ function TargetCard({
   );
 }
 
-function PlannedTarget({
+export function PlannedTarget({
   target,
   tenantId,
   projectId,
@@ -271,6 +272,8 @@ function PlannedTarget({
     queryKey: key,
     queryFn: () => getChannelTarget(tenantId, projectId, target.target_id),
     retry: false,
+    refetchInterval: (query) =>
+      query.state.data?.attempts.at(-1)?.outcome ? false : 3000,
   });
   const execution = useMutation({
     mutationFn: () =>
@@ -618,6 +621,12 @@ export function ChannelJobsPage() {
           </Link>
         </div>
       </section>
+      <StandaloneMeasurementPanel
+        key={`${tenantId}/${projectId}`}
+        tenantId={tenantId}
+        projectId={projectId}
+        canWrite={canWrite}
+      />
       {currentCycle.isPending ? (
         <LoadingState label="正在读取当前项目周期" />
       ) : currentCycle.isError ? (
@@ -628,8 +637,8 @@ export function ChannelJobsPage() {
         />
       ) : !cycleId ? (
         <EmptyState
-          title="项目尚未启动"
-          detail="启动项目后，当前周期才能创建发布计划。"
+          title="尚无周期发布计划"
+          detail="上方可直接进行独立测量；内容发布计划会在启动自动运营后显示。"
         />
       ) : (
         <>

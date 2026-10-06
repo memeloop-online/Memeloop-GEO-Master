@@ -17,10 +17,16 @@ mod cycles;
 mod error;
 mod idempotency;
 mod knowledge;
+mod office_parse;
+pub use office_parse::{
+    OFFICE_PARSER_PROFILE, OfficeParserClient, dispatch_office_parse_job,
+    spawn_office_parse_scanner,
+};
 mod pdf_parse;
 pub use pdf_parse::{
     PDF_PARSER_PROFILE, PdfParserClient, dispatch_pdf_parse_job, spawn_pdf_parse_scanner,
 };
+mod project_tools;
 mod provider_bridge;
 mod publication_lookup;
 pub use publication_lookup::dispatch_publication_lookup;
@@ -29,7 +35,10 @@ mod questions_tools;
 mod reports;
 mod run_executor;
 pub use run_executor::dispatch_queued;
+mod standalone_measurements;
 mod storage;
+pub use standalone_measurements::{MeasurementPlanRequest, create_measurement_plan};
+mod measurement_options;
 
 use axum::{
     Json, Router,
@@ -50,9 +59,8 @@ use geo_domain::{
     KnowledgeRepository, Membership, MemoryAgentRepository, MemoryAuthRepository,
     MemoryConnectorCapabilityRepository, MemoryKnowledgeRepository, MissingAgentRuntime, Operation,
     Operator, Project, ProjectCreate, ProjectId, ProjectOverview, ProjectPage, ProjectPatch,
-    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
-    ReportRepository, ReportSchedule, ResourceMode, Role, TenantId, TenantScope, User,
-    hash_idempotency_key, settings_hash, start_request_hash,
+    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ReportRepository, ReportSchedule,
+    ResourceMode, Role, TenantId, TenantScope, User, settings_hash,
 };
 use geo_persistence::{
     Database, PgAuthRepository, PgIdempotencyStore, PgKnowledgeRepository, PgProjectRepository,
@@ -174,10 +182,31 @@ impl AppState {
         }
     }
 
+    /// Replace the identity store during explicit local application assembly.
+    pub fn with_auth_repository(mut self, repository: SharedAuthRepository) -> Self {
+        self.auth_repository = repository;
+        self
+    }
+
     pub fn development_with_pdf_parser_profile(password: &str, profile: String) -> Self {
+        Self::development_with_parser_profiles(password, Some(profile), None)
+    }
+
+    pub fn development_with_office_parser_profile(password: &str, profile: String) -> Self {
+        Self::development_with_parser_profiles(password, None, Some(profile))
+    }
+
+    pub fn development_with_parser_profiles(
+        password: &str,
+        pdf_profile: Option<String>,
+        office_profile: Option<String>,
+    ) -> Self {
         let mut state = Self::development_with_password(password);
-        state.knowledge_repository =
-            Arc::new(MemoryKnowledgeRepository::with_pdf_parser_profile(profile));
+        state.knowledge_repository = Arc::new(MemoryKnowledgeRepository::with_parser_profiles(
+            pdf_profile,
+            office_profile.clone(),
+            office_profile,
+        ));
         state
     }
 
@@ -334,10 +363,23 @@ impl AppState {
     }
 
     pub fn from_database_with_pdf_parser_profile(database: &Database, profile: String) -> Self {
+        Self::from_database_with_parser_profiles(database, Some(profile), None)
+    }
+
+    pub fn from_database_with_parser_profiles(
+        database: &Database,
+        pdf_profile: Option<String>,
+        office_profile: Option<String>,
+    ) -> Self {
         let mut state = Self::from_database(database);
-        state.knowledge_repository = Arc::new(
-            PgKnowledgeRepository::from_database(database).with_pdf_parser_profile(profile),
-        );
+        let mut repository = PgKnowledgeRepository::from_database(database);
+        if let Some(profile) = pdf_profile {
+            repository = repository.with_pdf_parser_profile(profile);
+        }
+        if let Some(profile) = office_profile {
+            repository = repository.with_office_parser_profile(profile);
+        }
+        state.knowledge_repository = Arc::new(repository);
         state
     }
 
@@ -1550,61 +1592,14 @@ async fn start_project(
         ));
     }
     let operation_scope = TenantScope::new(auth.scope.operator_id, auth.scope.tenant_id, Some(id));
-    let operation_id = project_start_operation_id(&operation_scope, &idempotency_key);
-    let project = state
-        .project_repository
-        .get(&auth.scope, id)
-        .await
-        .map_err(|error| api_error(error, context.request_id))?
-        .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
-
-    let normalized_settings = project
-        .settings
-        .clone()
-        .validate_draft()
-        .map_err(|error| api_error(error, context.request_id))?;
-    let frozen_settings_hash = settings_hash(&normalized_settings)
-        .map_err(|error| api_error(error, context.request_id))?;
-    let command = ProjectStartCommand {
-        expected_revision: input.expected_revision,
-        idempotency_key_hash: hash_idempotency_key(&idempotency_key),
-        request_hash: start_request_hash(id, input.expected_revision, &frozen_settings_hash),
-        settings_hash: frozen_settings_hash,
-        operation_id,
-    };
-    let acceptance = state
-        .project_repository
-        .start(&auth.scope, id, command)
-        .await
-        .map_err(|error| api_error(error, context.request_id))?;
-    // PostgreSQL writes this operation in the same start transaction. The
-    // in-memory adapter mirrors it in the existing operation store so normal
-    // operation lookup remains available in development and tests.
-    if !state.durable_storage() {
-        let mut operation = Operation::queued("project.start", operation_scope.clone());
-        operation.id = acceptance.operation_id;
-        operation.result = Some(serde_json::to_value(&acceptance).map_err(|error| {
-            api_error(
-                AppError::new(
-                    geo_domain::ErrorCode::Internal,
-                    format!("start acceptance cannot be serialized: {error}"),
-                ),
-                context.request_id,
-            )
-        })?);
-        state
-            .operation_store
-            .save(operation)
-            .await
-            .map_err(|error| api_error(error, context.request_id))?;
-        state.publish_event(EventEnvelope::new(
-            "cycle.created",
-            operation_scope,
-            acceptance.cycle_id,
-            1,
-            acceptance.operation_id,
-        ));
-    }
+    let acceptance = project_tools::start(
+        &state,
+        &operation_scope,
+        input.expected_revision,
+        &idempotency_key,
+    )
+    .await
+    .map_err(|error| api_error(error, context.request_id))?;
     Ok((StatusCode::ACCEPTED, Json(acceptance)).into_response())
 }
 
@@ -2006,6 +2001,18 @@ pub fn router(state: AppState) -> Router {
     // Login actions can contain transient credentials. Never put these
     // requests through the generic idempotency cache.
     let channel_routes = channels::customer_routes()
+        .route(
+            "/projects/{project_id}/channel-accounts/{account_id}/measurement-options",
+            get(measurement_options::get_options),
+        )
+        .route(
+            "/projects/{project_id}/measurement-plans",
+            get(standalone_measurements::list_plans).post(standalone_measurements::submit_plan),
+        )
+        .route(
+            "/projects/{project_id}/measurement-plans/{plan_id}",
+            get(standalone_measurements::get_plan),
+        )
         .route(
             "/projects/{project_id}/cycles/{cycle_id}/channel-plan",
             get(channel_jobs::get_plan).post(channel_jobs::submit_plan),

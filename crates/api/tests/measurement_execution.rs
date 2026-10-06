@@ -185,6 +185,10 @@ async fn runner(
 }
 
 async fn run(case: Receipt) -> geo_domain::ChannelOutcome {
+    run_with_plan(case, false).await
+}
+
+async fn run_with_plan(case: Receipt, standalone: bool) -> geo_domain::ChannelOutcome {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -263,37 +267,69 @@ async fn run(case: Receipt) -> geo_domain::ChannelOutcome {
     let target_id = Uuid::new_v4();
     let scheduled_at = Utc::now() - Duration::minutes(1);
     let repo = state.channel_job_repository();
-    repo.create_plan(
-        &scope,
-        ChannelPlan {
-            plan_id: Uuid::new_v4(),
-            project_id: project.id,
-            cycle_id: Uuid::new_v4(),
-            input_hash: target_id.to_string(),
-            revision: 1,
-            created_at: Utc::now(),
-            targets: vec![ChannelTarget {
-                target_id,
-                input: ChannelTargetInput::Measure {
-                    account_id,
-                    provider: "kimi".into(),
-                    model: "frozen-model".into(),
-                    surface: "consumer_web".into(),
-                    search_mode: "web_search".into(),
-                    protocol_version: "protocol-v1".into(),
-                    question_set_version: "questions-v1".into(),
-                    question: "Frozen question?".into(),
-                    market: "CN".into(),
-                    language: "en".into(),
-                    scheduled_at,
-                    sample_ordinal: 3,
-                    question_binding: None,
-                },
-            }],
-        },
-    )
-    .await
-    .unwrap();
+    let plan = ChannelPlan {
+        plan_id: Uuid::new_v4(),
+        project_id: project.id,
+        cycle_id: Uuid::new_v4(),
+        input_hash: target_id.to_string(),
+        revision: 1,
+        created_at: Utc::now(),
+        targets: vec![ChannelTarget {
+            target_id,
+            input: ChannelTargetInput::Measure {
+                account_id,
+                provider: "kimi".into(),
+                model: "frozen-model".into(),
+                surface: "consumer_web".into(),
+                search_mode: "web_search".into(),
+                protocol_version: "protocol-v1".into(),
+                question_set_version: "questions-v1".into(),
+                question: "Frozen question?".into(),
+                market: "CN".into(),
+                language: "en".into(),
+                scheduled_at,
+                sample_ordinal: 3,
+                question_binding: None,
+            },
+        }],
+    };
+    if standalone {
+        repo.create_measurement_plan(
+            &scope,
+            "standalone-fixture",
+            &plan.input_hash,
+            geo_domain::StandaloneMeasurementPlan {
+                plan_id: plan.plan_id,
+                project_id: plan.project_id,
+                title: "Independent topic".into(),
+                input_hash: plan.input_hash.clone(),
+                revision: 1,
+                created_at: plan.created_at,
+                targets: plan.targets,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .project_repository()
+                .get(&tenant, project.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_cycle_id
+                .is_none()
+        );
+        assert_eq!(
+            repo.scan_pending(None, Utc::now(), 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    } else {
+        repo.create_plan(&scope, plan).await.unwrap();
+    }
     let ChannelDispatchResult::Executed(view) = execute_channel_target(&state, &scope, target_id)
         .await
         .unwrap()
@@ -311,6 +347,13 @@ async fn run(case: Receipt) -> geo_domain::ChannelOutcome {
     );
     server.abort();
     outcome
+}
+
+#[tokio::test]
+async fn standalone_due_target_reuses_execution_and_does_not_promote_fixture_to_observed() {
+    let outcome = run_with_plan(Receipt::Fixture, true).await;
+    assert_eq!(outcome.status, ChannelOutcomeStatus::Missing);
+    assert!(outcome.fixture);
 }
 
 #[tokio::test]

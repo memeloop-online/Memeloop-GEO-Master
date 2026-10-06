@@ -399,6 +399,31 @@ export function createRunner(options = {}) {
     return { identity, storage_state: await record.context.storageState() };
   }
 
+  async function measurementOptions(id) {
+    const record = session(id);
+    if (record.busy) throw new RunnerError(409, "session_busy");
+    if (!record.completed) throw new RunnerError(409, "login_required");
+    if (!record.adapter.inspectMeasurementOptions)
+      throw new RunnerError(422, "measurement_options_unavailable");
+    record.busy = true;
+    try {
+      const identity = await record.adapter.identify(record.page);
+      if (
+        !validateIdentity(identity) ||
+        identity.platform_account_id !== record.identity.platform_account_id
+      )
+        throw new RunnerError(409, "account_mismatch");
+      const result = await record.adapter.inspectMeasurementOptions(
+        record.page,
+      );
+      if (!result)
+        throw new RunnerError(422, "measurement_options_unavailable");
+      return result;
+    } finally {
+      record.busy = false;
+    }
+  }
+
   async function execute(input) {
     if (
       !fields(input, ["execution_id", "session_id", "operation", "payload"]) ||
@@ -556,6 +581,7 @@ export function createRunner(options = {}) {
     snapshot,
     action,
     complete,
+    measurementOptions,
     execute,
     close,
     shutdown,

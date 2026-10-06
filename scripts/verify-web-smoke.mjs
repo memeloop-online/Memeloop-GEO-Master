@@ -284,25 +284,46 @@ async function main() {
   );
   console.log("First-party login: real local API accepted");
 
-  // A fresh in-memory service starts empty, so create and start via the UI.
+  // First-use entry must open a real draft conversation without a setup form.
   await page.getByRole("button", { name: "创建项目" }).first().click();
+  await page.waitForURL(/\/app\/[^/]+\/[^/]+\/chat$/);
+  await page.getByTestId("agent-workbench-page").waitFor();
+  assert(
+    (await page.getByRole("textbox", { name: "品牌名称" }).count()) === 0,
+    "First-use entry must not require a brand form",
+  );
+  const match = /^\/app\/([^/]+)\/([^/]+)\/chat$/.exec(
+    new URL(page.url()).pathname,
+  );
+  assert(match, "Project creation did not reach its empty composer");
+  const [, tenantId, projectId] = match;
+  const base = `${webUrl}/app/${tenantId}/${projectId}`;
+  await screenshot(page, runDir, "p00-chat-first-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  // Optional detail editing supplies synthetic fixtures for later page checks.
+  // This is not the default onboarding path or a model-start acceptance test.
+  await page.goto(`${base}/setup`);
   await page.getByRole("textbox", { name: "品牌名称" }).fill("Synthetic Acme");
   await page
     .getByRole("textbox", { name: "初始资料（可选）" })
     .fill("Synthetic Acme makes a fictional sample product for local testing.");
   await page.getByRole("button", { name: "下一步" }).click();
   await page.getByRole("heading", { name: "目标与市场" }).waitFor();
+  await page.getByRole("textbox", { name: "市场", exact: true }).fill("中国");
+  await page.getByRole("textbox", { name: "语言", exact: true }).fill("zh-CN");
   await page.getByRole("button", { name: "下一步" }).click();
   await page.getByRole("heading", { name: "发布资源与预算" }).waitFor();
   await page.getByRole("button", { name: "启动项目" }).click();
   await page.waitForURL(/\/app\/[^/]+\/[^/]+\/chat$/);
-  const match = /^\/app\/([^/]+)\/([^/]+)\/chat$/.exec(
-    new URL(page.url()).pathname,
+  assert(
+    page.url() === `${base}/chat`,
+    "Optional setup changed the project identity",
   );
-  assert(match, "Project start did not reach its project route");
-  const [, tenantId, projectId] = match;
-  const base = `${webUrl}/app/${tenantId}/${projectId}`;
-  console.log("Synthetic project: created and started through browser UI");
+  console.log(
+    "Chat-first draft entry and optional same-project setup verified",
+  );
 
   await page.goto(`${base}/knowledge`);
   await page

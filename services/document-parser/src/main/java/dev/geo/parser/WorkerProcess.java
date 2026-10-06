@@ -24,7 +24,11 @@ final class WorkerProcess {
     private WorkerProcess() {}
 
     static Outcome execute(byte[] pdf, Integer page) {
-        return launch(pdf, page, DEADLINE_MS, MAIN_CLASS, null, null);
+        return launch(pdf, page, DEADLINE_MS, MAIN_CLASS, null, null, null);
+    }
+
+    static Outcome executeOffice(byte[] bytes, String mediaType, Integer unit) {
+        return launch(bytes, unit, DEADLINE_MS, MAIN_CLASS, null, null, mediaType);
     }
 
     // Test-only entry point: a fixed helper class, never derived from HTTP data.
@@ -32,15 +36,16 @@ final class WorkerProcess {
         if (!List.of("hang", "oversize", "exit", "env").contains(fixedMode))
             throw new IllegalArgumentException("invalid test mode");
         return launch(new byte[0], null, timeoutMs,
-                "dev.geo.parser.WorkerProcessProbe", fixedMode, pid);
+                "dev.geo.parser.WorkerProcessProbe", fixedMode, pid, null);
     }
 
     private static Outcome launch(byte[] pdf, Integer page, long timeoutMs,
-            String mainClass, String testMode, AtomicLong observedPid) {
+            String mainClass, String testMode, AtomicLong observedPid, String officeMediaType) {
         List<String> command = new ArrayList<>();
         command.add(Path.of(System.getProperty("java.home"), "bin",
                 isWindows() ? "java.exe" : "java").toString());
         command.add("-Xmx256m");
+        command.add("-Dlog4j2.statusLoggerLevel=OFF");
         command.add("-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"));
         command.add("-Duser.home=" + System.getProperty("java.io.tmpdir"));
         command.add("-cp");
@@ -48,8 +53,10 @@ final class WorkerProcess {
         command.add(mainClass);
         if (testMode == null) {
             command.add("--worker");
-            command.add(page == null ? "inspect" : "page");
+            command.add(officeMediaType == null ? (page == null ? "inspect" : "page")
+                    : (page == null ? "office-inspect" : "office-unit"));
             if (page != null) command.add(Integer.toString(page));
+            if (officeMediaType != null) command.add(officeMediaType);
         } else {
             command.add(testMode);
         }
@@ -149,13 +156,23 @@ final class WorkerProcess {
     static void runWorker(String[] args) {
         if (!(args.length == 2 && args[0].equals("--worker") && args[1].equals("inspect"))
                 && !(args.length == 3 && args[0].equals("--worker") && args[1].equals("page")
-                    && args[2].matches("[1-9][0-9]{0,8}"))) {
+                    && args[2].matches("[1-9][0-9]{0,8}"))
+                && !(args.length == 3 && args[0].equals("--worker") && args[1].equals("office-inspect")
+                    && officeMedia(args[2]))
+                && !(args.length == 4 && args[0].equals("--worker") && args[1].equals("office-unit")
+                    && args[2].matches("(0|[1-9][0-9]{0,4})") && officeMedia(args[3]))) {
             System.exit(3);
         }
         try {
             byte[] pdf = System.in.readNBytes(PdfDocumentParser.MAX_INPUT + 1);
             if (pdf.length > PdfDocumentParser.MAX_INPUT) {
                 output("ERR\ninput_too_large");
+            } else if (args[1].equals("office-inspect")) {
+                output("OK\n" + OfficeDocumentParser.inspectJson(
+                        OfficeDocumentParser.inspect(pdf, args[2])));
+            } else if (args[1].equals("office-unit")) {
+                output("OK\n" + OfficeDocumentParser.unitJson(
+                        OfficeDocumentParser.parseUnit(pdf, args[3], Integer.parseInt(args[2]))));
             } else if (args[1].equals("inspect")) {
                 output("OK\n" + PdfServer.inspectJson(PdfDocumentParser.inspect(pdf)));
             } else {
@@ -166,10 +183,17 @@ final class WorkerProcess {
         } catch (PdfDocumentParser.ParseFailure ex) {
             output("ERR\n" + ex.code());
             System.exit(0);
+        } catch (OfficeDocumentParser.Failure ex) {
+            output("ERR\n" + ex.code());
+            System.exit(0);
         } catch (Throwable ex) {
             // No document data, exception details or stack traces leave this worker.
             System.exit(3);
         }
+    }
+
+    private static boolean officeMedia(String value) {
+        return OfficeDocumentParser.DOCX.equals(value) || OfficeDocumentParser.XLSX.equals(value);
     }
 
     private static void output(String text) {
@@ -181,7 +205,9 @@ final class WorkerProcess {
     private static boolean isParserCode(String code) {
         return switch (code) {
             case "invalid_pdf", "encrypted_pdf", "page_out_of_range",
-                    "page_limit_exceeded", "input_too_large", "output_too_large" -> true;
+                    "page_limit_exceeded", "input_too_large", "output_too_large",
+                    "invalid_docx", "invalid_xlsx", "encrypted_office",
+                    "unit_limit", "unit_out_of_range", "unsupported_content" -> true;
             default -> false;
         };
     }
@@ -197,7 +223,7 @@ final class WorkerProcess {
                 throw new IllegalStateException("invalid parser artifact");
             }
         }
-        return System.getProperty("java.class.path");
+        return System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
     }
 
     private static boolean isWindows() {

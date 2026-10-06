@@ -451,10 +451,10 @@ function RemoteLogin({
               </Button>
               <Field
                 label="向当前焦点输入文字"
-                hint="本机输入默认掩码，仅发送到当前远程会话并立即清空；不要输入到聊天中。"
+                hint="发送到远程页面当前输入框，发送后清空。"
               >
                 <Input
-                  type="password"
+                  type="text"
                   value={text}
                   onChange={(_, data) => setText(data.value)}
                   onKeyDown={(event) => {

@@ -828,4 +828,325 @@ describe("knowledge workbench", () => {
     expect(screen.getByRole("button", { name: "重试失败部分" })).toBeDisabled();
     expect(screen.queryByText("private stack trace")).not.toBeInTheDocument();
   });
+
+  it("shows DOCX heading, paragraph and actual table spans without creating missing cells", async () => {
+    vi.stubGlobal(
+      "fetch",
+      requestHandler({
+        sourceDetail: {
+          source: {
+            ...source,
+            name: "manual.docx",
+            current_version_id: "docx-v2",
+            import_status: "partial",
+          },
+          versions: [
+            { source_version_id: "docx-v1", source_id: "source-a", version: 1 },
+            { source_version_id: "docx-v2", source_id: "source-a", version: 2 },
+          ],
+          chunks: [
+            {
+              chunk_id: "old",
+              source_version_id: "docx-v1",
+              ordinal: 0,
+              kind: "paragraph",
+              text: "旧证据仍可查看",
+              product_ids: [],
+              locator: { kind: "docx", heading_path: [], paragraph_index: 0 },
+            },
+            {
+              chunk_id: "heading",
+              source_version_id: "docx-v2",
+              ordinal: 0,
+              kind: "paragraph",
+              text: "规格说明",
+              product_ids: [],
+              locator: {
+                kind: "docx",
+                heading_path: ["第二章", "规格"],
+                paragraph_index: 2,
+              },
+            },
+            {
+              chunk_id: "cell-a",
+              source_version_id: "docx-v2",
+              ordinal: 1,
+              kind: "table",
+              text: "型号",
+              product_ids: [],
+              locator: {
+                kind: "docx",
+                heading_path: ["第二章"],
+                paragraph_index: 4,
+                body_element_index: 4,
+                table_index: 0,
+                table_row: 0,
+                table_column: 0,
+                table_row_span: 2,
+                table_col_span: 1,
+                table_merged: true,
+              },
+            },
+            {
+              chunk_id: "cell-b",
+              source_version_id: "docx-v2",
+              ordinal: 2,
+              kind: "table",
+              text: "A-100",
+              product_ids: [],
+              locator: {
+                kind: "docx",
+                heading_path: ["第二章"],
+                paragraph_index: 4,
+                body_element_index: 4,
+                table_index: 0,
+                table_row: 0,
+                table_column: 1,
+                table_row_span: 1,
+                table_col_span: 1,
+                table_merged: false,
+              },
+            },
+          ],
+          facts: [],
+          import_jobs: [
+            {
+              import_job_id: "docx-job",
+              source_id: "source-a",
+              status: "partial",
+              stage: "release",
+              completed_units: 2,
+              failed_units: 1,
+              errors: [
+                {
+                  unit_id: 2,
+                  format: "docx",
+                  code: "parse_failed",
+                  message: "private parser details",
+                },
+              ],
+            },
+          ],
+          impact: {},
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
+    expect(
+      (await screen.findAllByText(/已完成 2 个正文区块，失败 1 个正文区块/))
+        .length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText(/解析单元 3：该解析单元失败/)).toBeInTheDocument();
+    expect(
+      screen.queryByText("private parser details"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/第二章 › 规格 · 段落 3/)).toBeInTheDocument();
+    expect(screen.queryByText("旧证据仍可查看")).not.toBeInTheDocument();
+    await user.click(screen.getByText("型号"));
+    const cell = screen.getByRole("cell", { name: "第 1 行第 1 列" });
+    expect(cell).toHaveAttribute("rowspan", "2");
+    expect(
+      screen.getByRole("cell", { name: "第 1 行第 2 列" }),
+    ).toHaveTextContent("A-100");
+    expect(
+      screen.queryByRole("cell", { name: "第 2 行第 1 列" }),
+    ).not.toBeInTheDocument();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "查看证据版本" }),
+      "docx-v1",
+    );
+    expect(screen.getByText("旧证据仍可查看")).toBeInTheDocument();
+    expect(screen.queryByText("规格说明")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/历史证据；新的解析不会覆盖这个版本/),
+    ).toBeInTheDocument();
+  });
+
+  it("shows XLSX worksheet A1 values, cached formula missing, and real metadata only", async () => {
+    const formula = '=HYPERLINK("https://example.invalid","open")';
+    vi.stubGlobal(
+      "fetch",
+      requestHandler({
+        sourceDetail: {
+          source: {
+            ...source,
+            name: "data.xlsx",
+            current_version_id: "xlsx-v1",
+            import_status: "succeeded",
+          },
+          versions: [
+            { source_version_id: "xlsx-v1", source_id: "source-a", version: 1 },
+          ],
+          chunks: [
+            {
+              chunk_id: "xlsx-a",
+              source_version_id: "xlsx-v1",
+              ordinal: 0,
+              kind: "table",
+              text: "001",
+              product_ids: [],
+              locator: {
+                kind: "xlsx",
+                sheet: "Prices",
+                range: "A12",
+                cell_kind: "string",
+              },
+            },
+            {
+              chunk_id: "xlsx-b",
+              source_version_id: "xlsx-v1",
+              ordinal: 1,
+              kind: "table",
+              text: formula,
+              product_ids: [],
+              locator: {
+                kind: "xlsx",
+                sheet: "Prices",
+                range: "B12",
+                cell_kind: "formula_cached",
+                formula,
+              },
+            },
+            {
+              chunk_id: "xlsx-c",
+              source_version_id: "xlsx-v1",
+              ordinal: 2,
+              kind: "table",
+              text: "12.50",
+              product_ids: [],
+              locator: {
+                kind: "xlsx",
+                sheet: "Prices",
+                range: "C12",
+                cell_kind: "number",
+                display_value: "$12.50",
+              },
+            },
+          ],
+          facts: [],
+          import_jobs: [
+            {
+              import_job_id: "xlsx-job",
+              source_id: "source-a",
+              stage: "release",
+              status: "succeeded",
+              completed_units: 1,
+              failed_units: 0,
+              errors: [],
+            },
+          ],
+          impact: {},
+        },
+      }),
+    );
+    renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
+    expect(
+      await screen.findByText(/已完成 1 个工作表行区块/),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByText("12.50"));
+    expect(screen.getByRole("table")).toHaveTextContent("A12");
+    expect(screen.getByRole("table")).toHaveTextContent("原值：001");
+    expect(screen.getByRole("table")).toHaveTextContent("显示值：$12.50");
+    expect(screen.getByRole("table")).toHaveTextContent(
+      "缓存结果：缺失（未重新计算）",
+    );
+    expect(screen.getByRole("table")).toHaveTextContent("原值：（无缓存原值）");
+    expect(screen.getByRole("table")).not.toHaveTextContent(`原值：${formula}`);
+    expect(screen.getByRole("table")).toHaveTextContent(formula);
+    expect(screen.getByRole("table")).not.toHaveTextContent("实际表头范围");
+    expect(
+      screen.queryByRole("link", { name: "open" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("accepts Office upload as queued evidence, not an already released document", async () => {
+    const pending = {
+      ...source,
+      name: "manual.docx",
+      import_status: "queued",
+      current_version_id: null,
+      chunk_count: 0,
+    };
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const path = routePath(request);
+        if (
+          path.endsWith("/knowledge/upload-sessions") &&
+          init?.method === "POST"
+        ) {
+          expect(JSON.parse(String(init.body)).declared_media_type).toBe(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          );
+          return Promise.resolve(
+            response({ upload_session_id: "office-upload", state: "created" }),
+          );
+        }
+        if (path.endsWith("/office-upload/content") && init?.method === "PUT")
+          return Promise.resolve(response(undefined, 204));
+        if (path.endsWith("/office-upload/complete") && init?.method === "POST")
+          return Promise.resolve(
+            response(
+              {
+                status: "queued",
+                source: pending,
+                source_version: null,
+                release: null,
+                import_job: {
+                  import_job_id: "office-job",
+                  source_id: "source-a",
+                  stage: "parse",
+                  status: "queued",
+                  completed_units: 0,
+                  failed_units: 0,
+                },
+              },
+              202,
+            ),
+          );
+        return requestHandler({
+          sourceItems: [pending],
+          capabilities: {
+            ...defaultCapabilities({ ocr: false }),
+            docx_parser: true,
+            xlsx_parser: false,
+            supported_media_types: [
+              "text/plain",
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ],
+          },
+        })(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("crypto", {
+      randomUUID: () => "office-request",
+      subtle: { digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer) },
+    });
+    renderPath("/app/tenant-a/project-a/knowledge");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "导入资料" }),
+    );
+    expect(
+      screen.getByText(/DOCX 按标题、段落及真实表格单元格定位/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/XLSX 解析未配置；上传不等于资料可用/),
+    ).toBeInTheDocument();
+    const file = new File(["synthetic"], "manual.docx", { type: "" });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: vi
+        .fn()
+        .mockResolvedValue(new TextEncoder().encode("synthetic").buffer),
+    });
+    await userEvent.upload(screen.getByLabelText("选择资料文件"), file);
+    await userEvent.click(screen.getByRole("button", { name: "开始导入" }));
+    expect(await screen.findByText("已受理，等待解析")).toBeInTheDocument();
+    expect(screen.queryByText("解析完成")).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([request]) =>
+        routePath(request).endsWith("/office-upload/complete"),
+      ),
+    ).toBe(true);
+  });
 });

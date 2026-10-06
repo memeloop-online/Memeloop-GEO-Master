@@ -1,7 +1,10 @@
 // Fixed platform URLs and source-derived selectors. This connector version is
 // not live-verified: no authenticated account was used to prove these flows.
 import { createHash } from "node:crypto";
-import { observeKimiConnectSearch } from "./kimi-connect-search.mjs";
+import {
+  observeKimiConnectSearch,
+  inspectKimiMeasurementOptions,
+} from "./kimi-connect-search.mjs";
 
 export const CONNECTOR_VERSION = "live_unverified.source_derived.v1";
 
@@ -1105,6 +1108,7 @@ export const adapters = Object.freeze({
     },
   }),
   kimi: Object.freeze({
+    inspectMeasurementOptions: inspectKimiMeasurementOptions,
     connectorVersion: CONNECTOR_VERSION,
     origin: "https://www.kimi.com",
     entry: "https://www.kimi.com/",

@@ -48,6 +48,8 @@ import { StatusPill, type StatusKind } from "../components/StatusPill";
 
 const capabilityLabels: Record<CapabilityName, string> = {
   pdf_parser: "PDF 文本解析",
+  docx_parser: "DOCX 结构解析",
+  xlsx_parser: "XLSX 工作表解析",
   ocr: "OCR 扫描识别",
   vector: "向量检索",
   llm: "LLM 问答",
@@ -166,6 +168,10 @@ export function KnowledgeCapabilitiesNotice({
             .map((name) => {
               if (name === "pdf_parser")
                 return "PDF 文本解析未配置；PDF 上传受理不表示可解析";
+              if (name === "docx_parser")
+                return "DOCX 结构解析未配置；上传受理不表示可解析";
+              if (name === "xlsx_parser")
+                return "XLSX 工作表解析未配置；上传受理不表示可解析";
               const detail = capabilities[name].reason;
               return `${capabilityLabels[name]}${detail ? `：${detail}` : ""}`;
             })
@@ -456,6 +462,12 @@ function ImportSidebar({
               : !capabilities.data.ocr.available
                 ? " PDF 仅支持有文字层的页面；扫描页需 OCR，当前未配置。"
                 : " PDF 解析与 OCR 是独立能力；只有实际处理完成的页面才可引用。"}
+            {!capabilities.data?.docx_parser.available
+              ? " DOCX 解析未配置；上传不等于资料可用。"
+              : " DOCX 按标题、段落及真实表格单元格定位。"}
+            {!capabilities.data?.xlsx_parser.available
+              ? " XLSX 解析未配置；上传不等于资料可用。"
+              : " XLSX 按工作表及实际单元格定位；不会执行公式。"}
             {acceptedMediaTypes.length > 0
               ? ` 当前可接收：${acceptedMediaTypes.join("、")}。`
               : ""}

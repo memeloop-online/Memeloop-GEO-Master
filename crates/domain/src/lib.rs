@@ -22,6 +22,8 @@ mod event;
 mod idempotency;
 mod knowledge;
 mod knowledge_csv;
+mod office_parse;
+pub use office_parse::*;
 mod pdf_parse;
 pub use pdf_parse::{
     PDF_MAX_DOCUMENT_TEXT_BYTES, PDF_MAX_PAGE_TEXT_BYTES, PDF_MAX_PAGES, PDF_PARSE_SCHEMA_VERSION,

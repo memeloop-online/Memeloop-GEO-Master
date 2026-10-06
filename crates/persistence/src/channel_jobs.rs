@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelAttempt, ChannelCycleInputs, ChannelDispatchCandidate, ChannelJobRepository,
     ChannelOutcome, ChannelPlan, ChannelSecret, ChannelTarget, ChannelTargetInput,
-    ChannelTargetView, ErrorCode, OperatorId, ProjectId, TenantId, TenantScope,
-    frozen_cycle_inputs,
+    ChannelTargetView, ErrorCode, OperatorId, ProjectId, StandaloneMeasurementPlan, TenantId,
+    TenantScope, frozen_cycle_inputs,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -197,6 +197,104 @@ fn owned_verified_readback(input: &ChannelTargetInput, outcome: &ChannelOutcome)
 
 #[async_trait]
 impl ChannelJobRepository for PgChannelJobRepository {
+    async fn replay_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<Option<StandaloneMeasurementPlan>, AppError> {
+        let prior: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT request_hash,plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND idempotency_key=$4"
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+            .bind(key).fetch_optional(&self.pool).await.map_err(db)?;
+        match prior {
+            Some((hash, json)) if hash == request_hash => decode(json).map(Some),
+            Some(_) => Err(AppError::conflict("measurement idempotency key differs")),
+            None => Ok(None),
+        }
+    }
+
+    async fn create_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        request_hash: &str,
+        plan: StandaloneMeasurementPlan,
+    ) -> Result<StandaloneMeasurementPlan, AppError> {
+        plan.validate(scope)?;
+        if key.trim().is_empty() || request_hash.is_empty() {
+            return Err(AppError::invalid_request(
+                "measurement idempotency identity required",
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        // Serialize first inserts as well as retries; locking a missing plan row
+        // cannot protect concurrent uses of the same idempotency key.
+        let exists: Option<Uuid> = sqlx::query_scalar(
+            "SELECT project_id FROM projects WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 FOR UPDATE"
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+            .fetch_optional(&mut *tx).await.map_err(db)?;
+        if exists.is_none() {
+            return Err(AppError::not_found("project not found"));
+        }
+        let prior: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT request_hash,plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND idempotency_key=$4"
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+            .bind(key).fetch_optional(&mut *tx).await.map_err(db)?;
+        if let Some((hash, json)) = prior {
+            return if hash == request_hash {
+                decode(json)
+            } else {
+                Err(AppError::conflict("measurement idempotency key differs"))
+            };
+        }
+        sqlx::query(
+            "INSERT INTO measurement_execution_plans (plan_id,operator_id,tenant_id,project_id,idempotency_key,request_hash,input_hash,revision,plan,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
+        ).bind(plan.plan_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
+            .bind(project(scope)?).bind(key).bind(request_hash).bind(&plan.input_hash)
+            .bind(plan.revision).bind(encode(&plan)?).bind(plan.created_at)
+            .execute(&mut *tx).await.map_err(db)?;
+        for (ordinal, target) in plan.targets.iter().enumerate() {
+            let ordinal = i32::try_from(ordinal)
+                .map_err(|_| AppError::invalid_request("too many targets"))?;
+            sqlx::query(
+                "INSERT INTO channel_execution_targets (target_id,operator_id,tenant_id,project_id,measurement_plan_id,kind,frozen_input,ordinal) VALUES ($1,$2,$3,$4,$5,'measure',$6,$7)"
+            ).bind(target.target_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
+                .bind(project(scope)?).bind(plan.plan_id).bind(encode(target)?).bind(ordinal)
+                .execute(&mut *tx).await.map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(plan)
+    }
+
+    async fn get_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        plan_id: Uuid,
+    ) -> Result<Option<StandaloneMeasurementPlan>, AppError> {
+        let json: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND plan_id=$4"
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+            .bind(plan_id).fetch_optional(&self.pool).await.map_err(db)?;
+        json.map(decode).transpose()
+    }
+
+    async fn list_measurement_plans(
+        &self,
+        scope: &TenantScope,
+        after_plan_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<StandaloneMeasurementPlan>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid measurement page size"));
+        }
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND ($4::uuid IS NULL OR plan_id>$4) ORDER BY plan_id LIMIT $5"
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+            .bind(after_plan_id).bind(limit as i64).fetch_all(&self.pool).await.map_err(db)?;
+        rows.into_iter().map(decode).collect()
+    }
+
     async fn materialize_pending_commands(
         &self,
         after_command_id: Option<Uuid>,

@@ -31,6 +31,12 @@ before(async () => {
     entry: url,
     operations: ["publish", "measure", "lookup"],
     allowLoginControl: (current) => current.origin === new URL(url).origin,
+    async inspectMeasurementOptions() {
+      return {
+        models: [{ id: "fixture-model", label: "Fixture model" }],
+        selected_model: null,
+      };
+    },
     async identify(page) {
       const name = await page.locator("body").getAttribute("data-connected");
       return name
@@ -258,6 +264,23 @@ test("pixel-controlled login, verified identity, server-only state, and executio
     display_name: "Fixture user",
   });
   assert.ok(Array.isArray(completed.body.storage_state.cookies));
+  const options = await request("/v1/sessions/connected/measurement-options");
+  assert.equal(options.status, 200);
+  assert.deepEqual(options.body, {
+    models: [{ id: "fixture-model", label: "Fixture model" }],
+    selected_model: null,
+  });
+  assert.equal(
+    (
+      await request(
+        "/v1/sessions/connected/measurement-options",
+        "GET",
+        undefined,
+        "wrong",
+      )
+    ).status,
+    401,
+  );
   assert.equal(
     (
       await request("/v1/sessions/connected/actions", "POST", {

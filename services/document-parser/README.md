@@ -1,6 +1,6 @@
-# Isolated PDF text adapter
+# Isolated PDF and Office document adapter
 
-This service processes caller-supplied PDF bytes only. It cannot fetch URLs or
+This service processes caller-supplied PDF, DOCX and XLSX bytes only. It cannot fetch URLs or
 read host documents. Keep it on an internal network; the Rust application owns
 authentication, authorization, upload verification, durable jobs and evidence.
 The Java adapter never performs OCR. Deploy with a read-only root filesystem,
@@ -28,6 +28,48 @@ slot; increase the container memory limit accordingly.
 
 Pinned parser profile: `tika-3.2.3_pdfbox-3.0.5_text-v1`. The Apache Tika
 3.2.3 parent POM pins Apache PDFBox 3.0.5.
+
+Pinned Office profile: `poi-5.4.1_ooxml-struct-v1` with Apache POI OOXML 5.4.1.
+The original PDF routes and profile remain unchanged. Both formats share the
+same bounded request semaphore and disposable worker process, 20-second
+deadline, 100 MiB upload limit, and 32 MiB child stdout limit. The Office
+worker validates OPC package structure and declared format, rejects external
+package relationships, suspicious archive entries and expanded ZIP data over
+256 MiB. It does not run formulas, macros, URL fetching, external relationships
+or file-path resolution. An unreadable document returns a fixed error code,
+never an exception, document text, filename or path.
+
+`POST /v1/office/inspect` accepts raw bytes with the exact DOCX or XLSX OOXML
+Content-Type (not a multipart body). It returns a `geo.office.parse.v1`
+manifest with `input_sha256` of the original bytes, `parser_version`,
+`media_type`, and a format-tagged `document` with deterministic `units`.
+DOCX units cover at most 64 top-level body elements each; body indices are
+zero-based. XLSX units cover at most 128 original worksheet row numbers each;
+row coordinates and worksheet identity are one-based and zero-based
+respectively. Sparse row ranges do not synthesize absent rows. The manifest
+permits at most 20,000 units.
+
+`POST /v1/office/units/{unit_id}/parse` with exactly the same original bytes
+returns the same identity fields and `result`, tagged `docx_success`,
+`xlsx_success`, or `failure` with a static unit-level code. DOCX paragraphs
+carry their heading path and original body/paragraph indices; DOCX tables
+preserve document order, row/column indices, cell text and verified merge
+spans. XLSX cells carry worksheet row and A1 reference, raw stored value,
+declared number-format display, typed kind, explicit merged range if present,
+and formula source plus cached type/value only when a stored cache exists.
+No numeric zero is inferred for formulas with absent caches. `header_range`
+comes only from actual workbook table metadata, never first-row guessing.
+Unsupported or oversized units fail independently; one failed unit does not
+discard successful units. This path never fabricates PDF page or OCR locators.
+
+`GET /health` retains its original PDF fields and adds
+`office_schema_version`, `office_parser_version`, `office_capacity`. Capacity
+reports configured concurrent parser slots, not currently free slots.
+Malformed OOXML, encrypted packages and package/extraction limits return
+static non-retryable error codes, while exhausted local capacity and child
+deadline/crash retain retryable `parser_busy`, `parser_timeout`,
+`parser_failed`. Shaded distribution retains Apache POI and dependency
+LICENSE/NOTICE texts, checked by package integration tests.
 
 `POST /v1/pdf/inspect` with raw `application/pdf` bytes (at most 100 MiB):
 

@@ -10,133 +10,107 @@ import {
   Tooltip,
 } from "@fluentui/react-components";
 import {
-  AddCircleRegular,
   ArrowExitRegular,
   BookInformationRegular,
-  CalendarLtrRegular,
   ChatRegular,
   ChevronDownRegular,
   DataUsageRegular,
-  DocumentBulletListRegular,
   DocumentDataRegular,
-  HomeRegular,
-  LightbulbRegular,
-  MoneyRegular,
   PanelLeftContractRegular,
   PanelLeftExpandRegular,
-  PlugConnectedRegular,
-  SearchRegular,
-  SendRegular,
   SettingsRegular,
   TextBulletListSquareRegular,
 } from "@fluentui/react-icons";
-import { NavLink, Outlet, useNavigate, useParams } from "react-router-dom";
+import {
+  Link,
+  NavLink,
+  Outlet,
+  useLocation,
+  useNavigate,
+  useParams,
+} from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 import { membershipForTenant } from "../auth/types";
 import { useProjectsQuery } from "../api/projects";
 import { ErrorState, LoadingState } from "./AsyncState";
 
-type NavItem = { to: string; label: string; code: string; icon: ReactElement };
+type NavGroup = {
+  id: string;
+  to: string;
+  label: string;
+  icon: ReactElement;
+  children: { to: string; label: string }[];
+};
 
-const navItems: NavItem[] = [
+const navGroups: NavGroup[] = [
   {
+    id: "chat",
     to: "chat",
     label: "AI 工作台",
-    code: "P00",
     icon: <ChatRegular />,
+    children: [{ to: "overview", label: "项目总览" }],
   },
   {
-    to: "setup",
-    label: "项目设置向导",
-    code: "P01",
-    icon: <SettingsRegular />,
-  },
-  { to: "overview", label: "项目总览", code: "P02", icon: <HomeRegular /> },
-  {
+    id: "knowledge",
     to: "knowledge",
-    label: "企业知识库",
-    code: "P03",
+    label: "企业知识",
     icon: <BookInformationRegular />,
+    children: [],
   },
   {
-    to: "knowledge/sources/demo-source",
-    label: "来源与证据",
-    code: "P04",
-    icon: <DocumentDataRegular />,
-  },
-  {
-    to: "knowledge/ask",
-    label: "企业问答",
-    code: "P05",
-    icon: <SearchRegular />,
-  },
-  {
-    to: "campaigns",
-    label: "优化计划",
-    code: "P06",
-    icon: <LightbulbRegular />,
-  },
-  {
-    to: "campaigns/current",
-    label: "计划与动作",
-    code: "P07",
-    icon: <CalendarLtrRegular />,
-  },
-  {
+    id: "content",
     to: "content",
-    label: "内容资产",
-    code: "P08",
+    label: "内容与计划",
     icon: <TextBulletListSquareRegular />,
+    children: [{ to: "campaigns/current", label: "当前计划与动作" }],
   },
   {
-    to: "content/demo-content",
-    label: "内容编辑器",
-    code: "P09",
-    icon: <DocumentBulletListRegular />,
-  },
-  {
-    to: "channels",
-    label: "渠道与资源",
-    code: "P10",
-    icon: <PlugConnectedRegular />,
-  },
-  {
-    to: "channels/connect",
-    label: "批量接入",
-    code: "P11",
-    icon: <AddCircleRegular />,
-  },
-  {
+    id: "measurement",
     to: "publications",
-    label: "发布与验证",
-    code: "P12",
-    icon: <SendRegular />,
-  },
-  {
-    to: "measurement",
-    label: "基线与测量",
-    code: "P13",
+    label: "发布与测量",
     icon: <DataUsageRegular />,
+    children: [{ to: "measurement", label: "问题集与分析" }],
   },
   {
+    id: "reports",
     to: "reports",
     label: "效果报告",
-    code: "P14",
     icon: <DocumentDataRegular />,
+    children: [],
   },
-  { to: "billing", label: "预算与账本", code: "P15", icon: <MoneyRegular /> },
   {
+    id: "settings",
     to: "settings",
     label: "项目设置",
-    code: "P16",
-    icon: <CalendarLtrRegular />,
+    icon: <SettingsRegular />,
+    children: [
+      { to: "setup", label: "项目配置" },
+      { to: "channels", label: "渠道账号" },
+    ],
   },
 ];
 
+function groupForPath(pathname: string): string | undefined {
+  const section = pathname.split("/")[4];
+  if (!section || section === "chat" || section === "overview") return "chat";
+  if (section === "knowledge" || section === "ask") return "knowledge";
+  if (section === "content" || section === "campaigns") return "content";
+  if (section === "measurement" || section === "publications")
+    return "measurement";
+  if (section === "reports") return "reports";
+  if (["settings", "setup", "channels", "billing"].includes(section))
+    return "settings";
+  return undefined;
+}
+
 export function AppShell() {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(
+    () => window.matchMedia?.("(max-width: 767px)").matches ?? false,
+  );
   const [loggingOut, setLoggingOut] = useState(false);
   const navigate = useNavigate();
+  const { pathname } = useLocation();
+  const activeGroup = groupForPath(pathname);
   const { tenantId, projectId } = useParams();
   const { session, logout } = useAuth();
   const {
@@ -179,30 +153,48 @@ export function AppShell() {
           )}
         </div>
         <nav className="side-nav">
-          {navItems.map((item) => (
-            <Tooltip
-              key={item.to}
-              content={`${item.code} · ${item.label}`}
-              relationship="label"
-              positioning="after"
-              visible={collapsed ? undefined : false}
-            >
-              <NavLink
-                to={item.to}
-                className={({ isActive }) =>
-                  `nav-link${isActive ? " active" : ""}`
-                }
-                end={item.to === "overview"}
+          {navGroups.map((group) => (
+            <div className="nav-group" key={group.id}>
+              <Tooltip
+                content={group.label}
+                relationship="label"
+                positioning="after"
+                visible={collapsed ? undefined : false}
               >
-                <span className="nav-icon">{item.icon}</span>
-                {!collapsed && (
-                  <>
-                    <span>{item.label}</span>
-                    <small>{item.code}</small>
-                  </>
+                <Link
+                  to={group.to}
+                  className={`nav-link${activeGroup === group.id ? " active" : ""}`}
+                  aria-current={
+                    activeGroup === group.id ? "location" : undefined
+                  }
+                  aria-label={group.label}
+                >
+                  <span className="nav-icon">{group.icon}</span>
+                  {!collapsed && <span>{group.label}</span>}
+                </Link>
+              </Tooltip>
+              {!collapsed &&
+                activeGroup === group.id &&
+                group.children.length > 0 && (
+                  <div
+                    className="nav-children"
+                    aria-label={`${group.label}详情`}
+                  >
+                    {group.children.map((child) => (
+                      <NavLink
+                        key={child.to}
+                        to={child.to}
+                        end
+                        className={({ isActive }) =>
+                          `nav-child-link${isActive ? " active" : ""}`
+                        }
+                      >
+                        {child.label}
+                      </NavLink>
+                    ))}
+                  </div>
                 )}
-              </NavLink>
-            </Tooltip>
+            </div>
           ))}
         </nav>
         <Button

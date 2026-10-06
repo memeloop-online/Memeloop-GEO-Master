@@ -207,6 +207,29 @@ impl BrowserBridge {
         Self::response(response).await
     }
 
+    pub async fn measurement_options(&self, id: Uuid) -> Result<MeasurementOptions, AppError> {
+        let response = self
+            .client
+            .get(self.endpoint(id, "/measurement-options"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser model discovery unavailable; retry when the connection is restored",
+                )
+            })?;
+        if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+            return Err(AppError::capability_missing(
+                "website model menu is unavailable; reconnect or retry later",
+            ));
+        }
+        let options: MeasurementOptions = Self::response(response).await?;
+        options.validate()?;
+        Ok(options)
+    }
+
     pub async fn close(&self, id: Uuid) -> Result<(), AppError> {
         let response = self
             .client
@@ -267,6 +290,49 @@ impl BrowserBridge {
 #[derive(Debug, Deserialize)]
 pub struct RunnerCapabilities {
     pub connectors: Vec<RunnerConnector>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeasurementModel {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeasurementOptions {
+    pub models: Vec<MeasurementModel>,
+    pub selected_model: Option<String>,
+}
+
+impl MeasurementOptions {
+    fn validate(&self) -> Result<(), AppError> {
+        let mut ids = std::collections::HashSet::new();
+        if self.models.is_empty()
+            || self.models.len() > 64
+            || self.models.iter().any(|model| {
+                model.id.is_empty()
+                    || model.id.len() > 128
+                    || !model
+                        .id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+                    || model.label.trim().is_empty()
+                    || model.label.chars().count() > 200
+                    || model.label.chars().any(char::is_control)
+                    || !ids.insert(&model.id)
+            })
+            || self
+                .selected_model
+                .as_ref()
+                .is_some_and(|id| !ids.contains(id))
+        {
+            return Err(AppError::new(
+                ErrorCode::DependencyUnavailable,
+                "website model menu response invalid",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,4 +463,35 @@ impl Serialize for BrowserAction {
 pub struct VerifiedBrowserSession {
     pub identity: BrowserIdentity,
     pub storage_state: serde_json::Value,
+}
+
+#[cfg(test)]
+mod measurement_options_tests {
+    use super::*;
+
+    #[test]
+    fn model_menu_rejects_unobserved_selection_and_duplicate_or_unsafe_ids() {
+        let mut options = MeasurementOptions {
+            models: vec![MeasurementModel {
+                id: "observed-model".into(),
+                label: "Observed model".into(),
+            }],
+            selected_model: None,
+        };
+        assert!(options.validate().is_ok());
+        options.selected_model = Some("invented-default".into());
+        assert!(options.validate().is_err());
+        options.selected_model = Some("observed-model".into());
+        assert!(options.validate().is_ok());
+        options.models.push(MeasurementModel {
+            id: "observed-model".into(),
+            label: "Duplicate".into(),
+        });
+        assert!(options.validate().is_err());
+        options.models.pop();
+        options.models[0].id = "../invalid".into();
+        assert!(options.validate().is_err());
+        options.models.clear();
+        assert!(options.validate().is_err());
+    }
 }

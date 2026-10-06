@@ -12,7 +12,7 @@ use geo_domain::{
     KnowledgePurpose, ProjectId, ProjectStatus, QuestionReference, SourceState, TenantScope,
     sha256_hex,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -37,7 +37,7 @@ pub struct PublicationRequest {
     pub account_id: Uuid,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeasurementRequest {
     pub account_id: Uuid,
@@ -55,7 +55,7 @@ pub struct MeasurementRequest {
 }
 
 /// No caller-controlled question text, market, language, purpose or split.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoundMeasurementRequest {
     pub account_id: Uuid,
@@ -878,7 +878,7 @@ async fn publication_input(
     })
 }
 
-async fn measurement_input(
+pub(crate) async fn measurement_input(
     state: &AppState,
     scope: &TenantScope,
     request: MeasurementRequest,
@@ -930,7 +930,7 @@ async fn measurement_input(
     })
 }
 
-async fn bound_measurement_input(
+pub(crate) async fn bound_measurement_input(
     state: &AppState,
     scope: &TenantScope,
     request: BoundMeasurementRequest,

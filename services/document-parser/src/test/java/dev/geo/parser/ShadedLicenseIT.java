@@ -22,6 +22,10 @@ class ShadedLicenseIT {
             assertContains(jar, "META-INF/LICENSES/Bouncy-Castle.txt",
                     "The Legion of the Bouncy Castle");
             assertContains(jar, "META-INF/NOTICE", "Apache Tika");
+            assertContains(jar, "META-INF/NOTICE", "Apache POI");
+            assertContains(jar, "META-INF/NOTICE", "Apache Log4j API");
+            assertContains(jar, "META-INF/NOTICE", "BEA Systems");
+            assertContains(jar, "META-INF/LICENSE", "Apache License");
             assertContains(jar, "META-INF/NOTICE.md", "Eclipse Angus");
             assertContains(jar, "META-INF/NOTICE.txt", "Apache Commons IO");
         }

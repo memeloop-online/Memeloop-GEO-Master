@@ -3,11 +3,12 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import type { AuthSession } from "../auth/types";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
+import { SetupPage } from "./SetupPage";
 
 const session: AuthSession = {
   user: {
@@ -228,7 +229,7 @@ function response(body: unknown, status = 200) {
   });
 }
 
-function renderSetup() {
+function renderSetup(path = "/setup?tenant_id=tenant-a") {
   return render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider
@@ -239,8 +240,14 @@ function renderSetup() {
         }
       >
         <AuthProvider>
-          <MemoryRouter initialEntries={["/setup?tenant_id=tenant-a"]}>
-            <AppRoutes />
+          <MemoryRouter initialEntries={[path]}>
+            <Routes>
+              <Route
+                path="/setup"
+                element={<SetupPage tenantId="tenant-a" />}
+              />
+              <Route path="*" element={<AppRoutes />} />
+            </Routes>
           </MemoryRouter>
         </AuthProvider>
       </QueryClientProvider>
@@ -343,6 +350,61 @@ afterEach(() => {
 });
 
 describe("project setup workflow", () => {
+  it("loads the scoped draft and edits it without creating a replacement project", async () => {
+    const base = requestHandler();
+    const existing = projectForRevision(7);
+    existing.settings.document_scope.content_types = ["custom_faq"];
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          pathFor(request).endsWith("/projects/project-a") &&
+          (!init?.method || init.method === "GET")
+        ) {
+          return Promise.resolve(response(existing));
+        }
+        return base(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderSetup("/app/tenant-a/project-a/setup");
+    const brand = await screen.findByRole("textbox", { name: "品牌名称" });
+    expect(brand).toHaveValue("Northstar AI");
+    expect(patchCalls(fetchMock)).toHaveLength(0);
+    await user.clear(brand);
+    await user.type(brand, "Updated Brand");
+    await user.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() =>
+      expect(patchCalls(fetchMock).length).toBeGreaterThan(0),
+    );
+    const patch = patchCalls(fetchMock)[0];
+    expect(pathFor(patch[0])).toBe("/api/v1/projects/project-a");
+    const body = JSON.parse(String(patch[1]?.body));
+    expect(body.revision).toBe(7);
+    expect(body.settings.document_scope.content_types).toEqual(["custom_faq"]);
+    expect(
+      postCalls(fetchMock).filter(
+        ([request]) => pathFor(request) === "/api/v1/projects",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("fails closed when the scoped project cannot be loaded", async () => {
+    const base = requestHandler();
+    const fetchMock = vi.fn((request: RequestInfo | URL, init?: RequestInit) =>
+      pathFor(request).endsWith("/projects/project-a")
+        ? Promise.resolve(response({ error: { code: "unavailable" } }, 503))
+        : base(request, init),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderSetup("/app/tenant-a/project-a/setup");
+    expect(await screen.findByText("无法读取项目配置")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: "品牌名称" }),
+    ).not.toBeInTheDocument();
+    expect(postCalls(fetchMock)).toHaveLength(0);
+  });
+
   it("uses three steps and permits optional product and target audience", async () => {
     const fetchMock = requestHandler();
     vi.stubGlobal("fetch", fetchMock);
@@ -409,7 +471,7 @@ describe("project setup workflow", () => {
     await user.click(screen.getByRole("button", { name: "启动项目" }));
 
     expect(
-      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
+      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
     ).toBeInTheDocument();
     expect(
       postCalls(fetchMock).filter(
@@ -450,7 +512,7 @@ describe("project setup workflow", () => {
     ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "重试启动" }));
     expect(
-      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
+      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
     ).toBeInTheDocument();
 
     const starts = postCalls(fetchMock).filter(
@@ -481,8 +543,8 @@ describe("project setup workflow", () => {
 
     await advanceToLaunch(user);
     await user.click(screen.getByRole("button", { name: "启动项目" }));
-    await screen.findByRole("heading", { name: "从一个项目任务开始" });
-    await user.click(screen.getByRole("link", { name: "P02 · 项目总览" }));
+    await screen.findByRole("heading", { name: "从你的资料或想法开始" });
+    await user.click(screen.getByRole("link", { name: "项目总览" }));
     await screen.findByText(/项目已启动（受理操作 operation-a）/);
     const startReadsBeforeRefresh = fetchMock.mock.calls.filter(
       ([request, init]) =>
@@ -708,7 +770,7 @@ describe("project setup workflow", () => {
     await screen.findByRole("heading", { name: "发布资源与预算" });
     await screen.findByRole("heading", { name: "资源与预算估算" });
     await user.click(screen.getByRole("button", { name: "启动项目" }));
-    await screen.findByRole("heading", { name: "从一个项目任务开始" });
+    await screen.findByRole("heading", { name: "从你的资料或想法开始" });
 
     const sourcePatch = fetchMock.mock.calls.find(([request, init]) => {
       if (
@@ -841,7 +903,7 @@ describe("project setup workflow", () => {
     await user.click(screen.getByRole("button", { name: "启动项目" }));
 
     expect(
-      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
+      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
     ).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(

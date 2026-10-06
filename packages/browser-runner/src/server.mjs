@@ -60,6 +60,14 @@ export function createRunnerServer({
         parts.length === 4 &&
         parts[0] === "v1" &&
         parts[1] === "sessions" &&
+        parts[3] === "measurement-options" &&
+        request.method === "GET"
+      ) {
+        send(response, 200, await runner.measurementOptions(parts[2]));
+      } else if (
+        parts.length === 4 &&
+        parts[0] === "v1" &&
+        parts[1] === "sessions" &&
         parts[3] === "snapshot" &&
         request.method === "GET"
       ) {

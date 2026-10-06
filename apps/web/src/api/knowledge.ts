@@ -26,10 +26,18 @@ export interface Capability {
 }
 
 export type CapabilityName =
-  "pdf_parser" | "ocr" | "vector" | "llm" | "url_fetch";
+  | "pdf_parser"
+  | "docx_parser"
+  | "xlsx_parser"
+  | "ocr"
+  | "vector"
+  | "llm"
+  | "url_fetch";
 
 export interface KnowledgeCapabilities {
   pdf_parser: Capability;
+  docx_parser: Capability;
+  xlsx_parser: Capability;
   ocr: Capability;
   vector: Capability;
   llm: Capability;
@@ -51,10 +59,23 @@ export interface SourceLocator {
   ocr?: boolean | null;
   heading_path?: string[] | null;
   paragraph_index?: number | null;
+  body_element_index?: number | null;
+  table_index?: number | null;
+  table_row?: number | null;
+  table_column?: number | null;
+  table_row_span?: number | null;
+  table_col_span?: number | null;
+  table_merged?: boolean | null;
   table?: { row?: number; column?: number } | null;
   sheet?: string | null;
   range?: string | null;
   header_range?: string | null;
+  merged_range?: string | null;
+  cell_kind?: string | null;
+  display_value?: string | null;
+  formula?: string | null;
+  cached_kind?: string | null;
+  cached_value?: string | null;
   header_row?: number | null;
   snapshot_object_id?: string | null;
   original_url?: string | null;
@@ -176,7 +197,10 @@ export interface ImportJob {
     page?: number;
     message?: string;
     unit?: string;
+    unit_id?: number;
+    format?: "docx" | "xlsx";
   }> | null;
+  resumed_from?: string | null;
   updated_at?: string | null;
 }
 
@@ -438,6 +462,8 @@ function normalizeCapabilities(value: unknown): KnowledgeCapabilities {
   const values = asRecord(root.capabilities ?? root);
   return {
     pdf_parser: capability(values.pdf_parser),
+    docx_parser: capability(values.docx_parser),
+    xlsx_parser: capability(values.xlsx_parser),
     ocr: capability(values.ocr),
     vector: capability(values.vector ?? values.vector_search),
     llm: capability(values.llm ?? values.llm_answering),

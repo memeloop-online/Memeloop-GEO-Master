@@ -1,10 +1,11 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import {
   Badge,
   Button,
   Card,
   MessageBar,
   MessageBarBody,
+  Select,
   Spinner,
 } from "@fluentui/react-components";
 import {
@@ -25,6 +26,7 @@ import { membershipForTenant } from "../auth/types";
 import { ErrorState, EmptyState, LoadingState } from "../components/AsyncState";
 import { KnowledgeLocator } from "../components/KnowledgeLocator";
 import { CsvEvidenceTable } from "../components/CsvEvidenceTable";
+import { OfficeEvidenceTable } from "../components/OfficeEvidenceTable";
 import { StatusPill, type StatusKind } from "../components/StatusPill";
 
 function statusKind(value: string | null | undefined): StatusKind {
@@ -60,7 +62,30 @@ const pdfFailureReasons: Record<string, string> = {
   encrypted_pdf: "PDF 已加密，无法解析",
 };
 
-function safeFailure(error: NonNullable<ImportJob["errors"]>[number]) {
+const officeFailureReasons: Record<string, string> = {
+  invalid_docx: "DOCX 文件无效或无法读取",
+  invalid_xlsx: "XLSX 文件无效或无法读取",
+  encrypted_office: "Office 文件已加密，无法解析",
+  parse_failed: "该解析单元失败",
+  unit_limit: "解析单元超过限制",
+  unsupported_content: "该解析单元含不支持的内容",
+  empty_text: "该解析单元没有可提取文字",
+};
+
+type SourceFormat = "pdf" | "docx" | "xlsx" | "other";
+
+function safeFailure(
+  error: NonNullable<ImportJob["errors"]>[number],
+  format: SourceFormat,
+) {
+  if (format === "docx" || format === "xlsx") {
+    const id =
+      Number.isInteger(error.unit_id) && (error.unit_id ?? -1) >= 0
+        ? `解析单元 ${(error.unit_id ?? 0) + 1}：`
+        : "";
+    return `${id}${officeFailureReasons[error.code ?? ""] ?? "Office 解析失败；请检查该单元或文件"}`;
+  }
+  if (format !== "pdf") return "解析失败；请检查该单元或文件";
   const unit = typeof error.unit === "string" ? error.unit : "";
   const unitPage = /^page[:_ -]?([1-9]\d{0,5})$/.exec(unit);
   const page =
@@ -102,11 +127,10 @@ export function SourceDetailPage() {
       ? `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/knowledge`
       : "../knowledge";
   const [selectedChunkId, setSelectedChunkId] = useState<string | null>(null);
-  const detail = sourceQuery.data;
-  const selectedChunk = useMemo(
-    () => detail?.chunks.find((chunk) => chunk.chunk_id === selectedChunkId),
-    [detail?.chunks, selectedChunkId],
+  const [selectedVersionId, setSelectedVersionId] = useState<string | null>(
+    null,
   );
+  const detail = sourceQuery.data;
 
   if (sourceQuery.isPending && !detail) {
     return <LoadingState label="正在加载来源详情" />;
@@ -132,11 +156,34 @@ export function SourceDetailPage() {
   const { source, versions, chunks, facts, import_jobs: jobs, impact } = detail;
   const latestJob = jobs.at(-1);
   const isPdf = source.name.toLowerCase().endsWith(".pdf");
-  const unitLabel = isPdf ? "页" : "个单元";
+  const isDocx = source.name.toLowerCase().endsWith(".docx");
+  const isXlsx = source.name.toLowerCase().endsWith(".xlsx");
+  const format: SourceFormat = isPdf
+    ? "pdf"
+    : isDocx
+      ? "docx"
+      : isXlsx
+        ? "xlsx"
+        : "other";
+  const unitLabel = isPdf
+    ? "页"
+    : isDocx
+      ? "个正文区块"
+      : isXlsx
+        ? "个工作表行区块"
+        : "个单元";
   const currentVersion =
     versions.find(
       (version) => version.source_version_id === source.current_version_id,
     ) ?? (source.current_version_id ? undefined : versions.at(-1));
+  const activeVersionId =
+    selectedVersionId ?? currentVersion?.source_version_id;
+  const visibleChunks = activeVersionId
+    ? chunks.filter((chunk) => chunk.source_version_id === activeVersionId)
+    : chunks;
+  const selectedChunk = visibleChunks.find(
+    (chunk) => chunk.chunk_id === selectedChunkId,
+  );
   const isParsing =
     latestJob?.status === "queued" || latestJob?.status === "running";
   const mayRetry =
@@ -184,7 +231,7 @@ export function SourceDetailPage() {
                 ? "当前成员只有读取权限。"
                 : !mayRetry
                   ? "只有部分完成或失败的最新任务可以重试。"
-                  : "仅重试失败的单元；不会删除已完成的页或旧版本。"
+                  : "仅重试失败的解析单元；不会删除已完成的证据或旧版本。"
             }
             onClick={() => {
               if (latestJob && mayRetry) {
@@ -223,7 +270,7 @@ export function SourceDetailPage() {
       {retryJob.isSuccess && (
         <MessageBar intent="info">
           <MessageBarBody>
-            重试已受理；只会补处理失败单元，已有页和历史证据保持不变。
+            重试已受理；只会补处理失败单元，已有证据和历史版本保持不变。
           </MessageBarBody>
         </MessageBar>
       )}
@@ -232,7 +279,8 @@ export function SourceDetailPage() {
           <MessageBarBody>
             {latestJob.status === "queued" ? "已受理，等待解析" : "正在解析"}。
             当前已完成 {latestJob.completed_units ?? 0} {unitLabel}，失败{" "}
-            {latestJob.failed_units ?? 0} {unitLabel}；完成前不代表全文已可用。
+            {latestJob.failed_units ?? 0} {unitLabel}
+            ；完成前不代表全文已可用，知识版本只在实际发布后更新。
           </MessageBarBody>
         </MessageBar>
       )}
@@ -266,40 +314,78 @@ export function SourceDetailPage() {
           </MessageBarBody>
         </MessageBar>
       )}
+      {latestJob?.status === "succeeded" && (isDocx || isXlsx) && (
+        <MessageBar intent="success">
+          <MessageBarBody>
+            {isDocx ? "DOCX 正文结构" : "XLSX 工作表单元格"}解析完成，共{" "}
+            {latestJob.completed_units ?? 0} {unitLabel}
+            。证据可按结构化位置查看； 不提供 Office 原件预览或原文高亮。
+          </MessageBarBody>
+        </MessageBar>
+      )}
       {latestJob?.errors && latestJob.errors.length > 0 && (
-        <section aria-label="失败页面与原因">
-          <b>失败页面与原因</b>
+        <section aria-label={isPdf ? "失败页面与原因" : "失败解析单元与原因"}>
+          <b>{isPdf ? "失败页面与原因" : "失败解析单元与原因"}</b>
           <ul>
             {latestJob.errors.map((error, index) => (
               <li key={`${error.unit ?? "unit"}-${index}`}>
-                {safeFailure(error)}
+                {safeFailure(error, error.format ?? format)}
               </li>
             ))}
           </ul>
         </section>
       )}
       <section className="source-detail-workbench">
-        <Card className="source-original-panel">
+        <Card className="source-original-panel" style={{ minWidth: 0 }}>
           <div className="knowledge-panel-heading">
             <div>
               <h2>原文与快照</h2>
               <p>
-                点击片段可查看它的结构化定位；可能包含此前版本的已保存证据。
-                当前只显示提取文字，不提供 PDF 原件预览或区域高亮。
+                点击片段可查看结构化定位；按来源版本分别浏览证据。
+                当前只显示提取内容，不提供原件预览或区域高亮。
               </p>
             </div>
-            <Badge appearance="tint">{chunks.length} 个片段</Badge>
+            <Badge appearance="tint">{visibleChunks.length} 个片段</Badge>
           </div>
-          {detail.original_text ? (
+          {versions.length > 0 && (
+            <label>
+              查看证据版本{" "}
+              <Select
+                aria-label="查看证据版本"
+                value={activeVersionId ?? ""}
+                onChange={(_, data) => {
+                  setSelectedVersionId(data.value);
+                  setSelectedChunkId(null);
+                }}
+              >
+                {versions.map((version) => (
+                  <option
+                    key={version.source_version_id}
+                    value={version.source_version_id}
+                  >
+                    v{version.version}
+                    {version.source_version_id === source.current_version_id
+                      ? "（当前）"
+                      : "（历史不可变版本）"}
+                  </option>
+                ))}
+              </Select>
+            </label>
+          )}
+          {selectedVersionId &&
+            selectedVersionId !== source.current_version_id && (
+              <p>正在查看已保存的历史证据；新的解析不会覆盖这个版本。</p>
+            )}
+          {detail.original_text && !isPdf && !isDocx && !isXlsx ? (
             <pre className="source-original-text">{detail.original_text}</pre>
-          ) : chunks.length === 0 ? (
+          ) : visibleChunks.length === 0 ? (
             <EmptyState
               title="原文尚未可用"
               detail="资料正在获取或解析；不会以空白内容冒充已解析原文。"
             />
           ) : (
             <ol className="source-chunk-list">
-              {chunks.map((chunk) => (
+              {visibleChunks.map((chunk) => (
                 <li key={chunk.chunk_id}>
                   <button
                     type="button"
@@ -315,7 +401,9 @@ export function SourceDetailPage() {
                         ? " · 生成证据分片"
                         : ""}
                     </small>
-                    <span>{chunk.text}</span>
+                    <span style={{ overflowWrap: "anywhere" }}>
+                      {chunk.text}
+                    </span>
                     <KnowledgeLocator locator={chunk.locator} />
                   </button>
                 </li>
@@ -323,11 +411,11 @@ export function SourceDetailPage() {
             </ol>
           )}
         </Card>
-        <Card className="source-extraction-panel">
+        <Card className="source-extraction-panel" style={{ minWidth: 0 }}>
           <div className="knowledge-panel-heading">
             <div>
               <h2>提取结果</h2>
-              <p>事实和片段均绑定当前来源版本。</p>
+              <p>证据按所选的不可变来源版本查看；事实保留服务端记录。</p>
             </div>
             {isParsing && <Spinner size="tiny" label="正在处理" />}
           </div>
@@ -346,6 +434,13 @@ export function SourceDetailPage() {
                   "deterministic_csv_evidence_v1" && (
                   <CsvEvidenceTable text={selectedChunk.text} />
                 )}
+              {(selectedChunk.locator?.kind === "docx" ||
+                selectedChunk.locator?.kind === "xlsx") && (
+                <OfficeEvidenceTable
+                  selected={selectedChunk}
+                  chunks={visibleChunks}
+                />
+              )}
               {selectedChunk.extraction_method ===
                 "deterministic_csv_evidence_v1" && (
                 <p>
@@ -396,7 +491,7 @@ export function SourceDetailPage() {
             </ul>
           )}
         </Card>
-        <Card className="source-impact-panel">
+        <Card className="source-impact-panel" style={{ minWidth: 0 }}>
           <h2>版本、用途与影响</h2>
           <dl className="source-metadata">
             <div>

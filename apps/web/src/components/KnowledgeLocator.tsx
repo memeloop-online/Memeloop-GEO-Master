@@ -14,10 +14,22 @@ export function formatLocator(locator: SourceLocator | null | undefined) {
     case "docx":
       return [
         "DOCX",
-        locator.heading_path?.join(" › "),
-        locator.paragraph_index !== undefined &&
-        locator.paragraph_index !== null
-          ? `段落 ${locator.paragraph_index + 1}`
+        locator.heading_path?.length ? locator.heading_path.join(" › ") : null,
+        locator.table_index != null
+          ? `表格 ${locator.table_index + 1}${locator.table_row != null ? ` · 第 ${locator.table_row + 1} 行` : ""}${locator.table_column != null ? ` · 第 ${locator.table_column + 1} 列` : ""}`
+          : locator.paragraph_index !== undefined &&
+              locator.paragraph_index !== null
+            ? `段落 ${locator.paragraph_index + 1}`
+            : null,
+        locator.table_row_span != null && locator.table_row_span > 1
+          ? `跨 ${locator.table_row_span} 行`
+          : null,
+        locator.table_col_span != null && locator.table_col_span > 1
+          ? `跨 ${locator.table_col_span} 列`
+          : null,
+        locator.table_merged ? "合并单元格" : null,
+        locator.start_char != null && locator.end_char != null
+          ? `字符 ${locator.start_char}–${locator.end_char}（从 0 开始，不含结束位置）`
           : null,
       ]
         .filter(Boolean)
@@ -26,8 +38,12 @@ export function formatLocator(locator: SourceLocator | null | undefined) {
       return [
         "XLSX",
         locator.sheet ? `工作表 ${locator.sheet}` : null,
-        locator.range ? `范围 ${locator.range}` : null,
+        locator.range ? `单元格 ${locator.range}` : null,
         locator.header_range ? `表头 ${locator.header_range}` : null,
+        locator.merged_range ? `合并范围 ${locator.merged_range}` : null,
+        locator.start_char != null && locator.end_char != null
+          ? `字符 ${locator.start_char}–${locator.end_char}（从 0 开始，不含结束位置）`
+          : null,
       ]
         .filter(Boolean)
         .join(" · ");

@@ -88,6 +88,13 @@ export interface CreateProjectInput {
   settings: ProjectSettings;
 }
 
+/** Drafts may omit unknown settings; only starting requires complete input. */
+export interface CreateProjectDraftInput {
+  slug?: string;
+  display_name: string;
+  settings: Partial<ProjectSettings>;
+}
+
 export interface CountEstimate {
   state: "unknown" | "estimated" | "frozen";
   value: number | null;
@@ -242,7 +249,7 @@ export function getProject(
 
 export function createProject(
   tenantId: string,
-  input: CreateProjectInput,
+  input: CreateProjectDraftInput,
   idempotencyKey?: ApiRequestOptions["idempotencyKey"],
 ): Promise<Project> {
   return apiFetch<Project>("/projects", {

@@ -38,7 +38,26 @@ GEO_PRODUCTION_AGENT_BUNDLE_SHA256
 
 这项映射是明确配置的模型调用能力，不等于套餐、余额、预算或费用结算已实现。Token Center 的普通推理也不等于消费端官方搜索或引用测量。
 
-本地 `GEO_AI_*` 进程共享 key 仍仅允许 loopback 内存模式，不能用于 PostgreSQL 多租户部署。
+本地 `GEO_AI_*` 默认仍仅允许 loopback 内存模式；它不是生产多租户凭据路由。
+
+### 可选：持久本地开发 AI
+
+开发演示可以保留 PostgreSQL 数据，不必为了直接推理 Key 改回内存。显式设置：
+
+```text
+GEO_DEV_PERSISTENT_AI=true
+GEO_DEV_AI_OPERATOR_ID=<已初始化运营商 UUID>
+GEO_DEV_AI_TENANT_ID=<已初始化租户 UUID>
+GEO_DEV_AI_PROJECT_ID=<可选：只允许某个项目 UUID>
+```
+
+同时设置 `DATABASE_URL`、回环 `GEO_BIND_ADDR` 和既有五项
+`GEO_AI_BASE_URL`、`GEO_AI_API_KEY`、`GEO_AI_MODEL`、
+`GEO_AGENT_BUNDLE_PATH`、`GEO_AGENT_BUNDLE_SHA256`。这些是服务端部署变量，不从聊天、浏览器或请求参数取得。
+
+该模式在凭据解析或模型请求之前核对固定运营商/租户/可选项目，其他作用域拒绝调用；不与 `GEO_PRODUCTION_AI_*` / Token Center 配置混用。数据库、Secure Cookie、工具账本及 bundle 摘要校验保持原行为，故障不回退到内存。普通推理 Key 不能作为 `GEO_TOKEN_CENTER_TOKEN` 使用。
+
+目前配置与作用域测试、注入模型的原生 bundle 测试通过；真实持久环境模型调用与重启验收仍待完成。这是明确的本地开发能力，不代表生产权益/计费、Token Center 租户路由或官方搜索通过。
 
 ## 原生内容工作流
 

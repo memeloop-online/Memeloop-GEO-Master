@@ -47,7 +47,9 @@ use geo_worker::{
     DistributionTargetsPage, DistributionTargetsReadRequest, HOST_BUNDLE, HOST_MAIN_MODULE,
     HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOps,
     HostRuntime, ManifestCoverage, ManifestItem, ManifestKind, ManifestPage, ManifestPlanningState,
-    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
+    ManifestReadRequest, MeasureRequest, MeasureSample, MeasurementOptionsRequest,
+    MeasurementOptionsResult, MeasurementPlanCreateRequest, MeasurementPlanReadRequest,
+    MeasurementPlanReceipt, MeasurementPlanStatus, ModelCompletion, ModelCompletionRequest,
     PublishReceipt, PublishRequest, QuestionDiscoverRequest, QuestionDiscoveryPage,
     QuestionReviseRequest, QuestionWriteReceipt, ReportGetRequest, ReportPreviewRequest,
     ReportReduceRequest, TURN_COMPLETION_TOPIC, ToolCallIdentity, ToolCallOutcome,
@@ -938,6 +940,58 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
 
 #[async_trait]
 impl HostOps for RepositoryHostOps {
+    async fn project_current(
+        &self,
+        scope: &TenantScope,
+        _request: geo_worker::ProjectCurrentRequest,
+    ) -> Result<geo_worker::ProjectCurrentResult, HostOpError> {
+        let op = HostOp::ProjectCurrent;
+        crate::project_tools::current(self.content_state(op)?, scope)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn project_revise(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ProjectReviseRequest,
+    ) -> Result<geo_worker::ProjectCurrentResult, HostOpError> {
+        let op = HostOp::ProjectRevise;
+        crate::project_tools::revise(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn project_estimate(
+        &self,
+        scope: &TenantScope,
+        _request: geo_worker::ProjectEstimateRequest,
+    ) -> Result<Value, HostOpError> {
+        let op = HostOp::ProjectEstimate;
+        crate::project_tools::estimate(self.content_state(op)?, scope)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn project_start(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ProjectStartRequest,
+    ) -> Result<geo_domain::ProjectStartAcceptance, HostOpError> {
+        let op = HostOp::ProjectStart;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        crate::project_tools::start(
+            self.content_state(op)?,
+            scope,
+            request.expected_revision,
+            &request.idempotency_key,
+        )
+        .await
+        .map_err(|error| worker_error(op, error))
+    }
+
     async fn distribution_start(
         &self,
         scope: &TenantScope,
@@ -1258,6 +1312,39 @@ impl HostOps for RepositoryHostOps {
             ));
         }
         Ok(result)
+    }
+
+    async fn measurement_options(
+        &self,
+        scope: &TenantScope,
+        request: MeasurementOptionsRequest,
+    ) -> Result<MeasurementOptionsResult, HostOpError> {
+        let op = HostOp::MeasurementOptions;
+        crate::standalone_measurements::agent_options(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn measurement_plan_create(
+        &self,
+        scope: &TenantScope,
+        request: MeasurementPlanCreateRequest,
+    ) -> Result<MeasurementPlanReceipt, HostOpError> {
+        let op = HostOp::MeasurementPlanCreate;
+        crate::standalone_measurements::create_agent_plan(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn measurement_plan_read(
+        &self,
+        scope: &TenantScope,
+        request: MeasurementPlanReadRequest,
+    ) -> Result<MeasurementPlanStatus, HostOpError> {
+        let op = HostOp::MeasurementPlanRead;
+        crate::standalone_measurements::read_agent_plan(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
     }
 
     async fn channel_manifest_read(

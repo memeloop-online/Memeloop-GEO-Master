@@ -26,6 +26,8 @@ use crate::{Database, set_local_scope};
 
 #[path = "import_progress.rs"]
 mod import_progress;
+#[path = "office_parse.rs"]
+mod office_parse;
 #[path = "pdf_parse.rs"]
 mod pdf_parse;
 
@@ -33,6 +35,7 @@ mod pdf_parse;
 pub struct PgKnowledgeRepository {
     pool: PgPool,
     pdf_parser_profile: Option<String>,
+    office_parser_profile: Option<String>,
 }
 
 impl PgKnowledgeRepository {
@@ -40,6 +43,7 @@ impl PgKnowledgeRepository {
         Self {
             pool,
             pdf_parser_profile: None,
+            office_parser_profile: None,
         }
     }
 
@@ -49,6 +53,11 @@ impl PgKnowledgeRepository {
 
     pub fn with_pdf_parser_profile(mut self, parser_profile: String) -> Self {
         self.pdf_parser_profile = Some(parser_profile);
+        self
+    }
+
+    pub fn with_office_parser_profile(mut self, parser_profile: String) -> Self {
+        self.office_parser_profile = Some(parser_profile);
         self
     }
 
@@ -174,6 +183,20 @@ impl PgKnowledgeRepository {
         .fetch_one(&mut **transaction)
         .await
         .map_err(database_error)?;
+        let failed_office_units: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(job.failed_units),0)::bigint
+             FROM knowledge_import_jobs job
+             JOIN knowledge_office_parse_tasks task ON task.import_job_id=job.import_job_id
+             JOIN knowledge_sources source ON source.source_id=job.source_id
+             WHERE job.operator_id=$1 AND job.tenant_id=$2 AND job.project_id=$3
+               AND job.source_version_id=source.current_version_id AND job.status='partial'",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(database_error)?;
         let content_hash = sha256_hex(
             versions
                 .iter()
@@ -186,11 +209,14 @@ impl PgKnowledgeRepository {
             source_version_count: versions.len() as u64,
             chunk_count: chunk_count as u64,
             failed_source_count: failed_source_count as u64,
-            blocked_reasons: if failed_pdf_pages > 0 {
-                vec![format!("pdf_failed_pages:{failed_pdf_pages}")]
-            } else {
-                Vec::new()
-            },
+            blocked_reasons: [
+                (failed_pdf_pages > 0).then(|| format!("pdf_failed_pages:{failed_pdf_pages}")),
+                (failed_office_units > 0)
+                    .then(|| format!("office_failed_units:{failed_office_units}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         };
         let parsers = sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT parser_version FROM knowledge_source_versions
@@ -316,6 +342,7 @@ impl PgKnowledgeRepository {
         scope: &TenantScope,
         item: &ImportItem,
         pdf_parser_profile: Option<&str>,
+        office_parser_profile: Option<&str>,
     ) -> Result<ImportAcceptance, AppError> {
         let project_id = Self::project_id(scope)?;
         let object_id = item
@@ -325,7 +352,11 @@ impl PgKnowledgeRepository {
             "SELECT object.object_version,object.backend,object.opaque_key,
                     object.actual_size,object.detected_media_type,object.sha256,object.created_at,
                     session.filename,
-                    CASE WHEN object.detected_media_type='application/pdf' AND $5::boolean
+                    CASE WHEN ((object.detected_media_type='application/pdf' AND $5::boolean)
+                          OR (object.detected_media_type IN (
+                           'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                          ) AND $6::boolean))
                          THEN NULL ELSE blob.content END AS content,
                     blob.actual_size AS blob_size,blob.sha256 AS blob_hash
              FROM knowledge_stored_objects object
@@ -343,6 +374,7 @@ impl PgKnowledgeRepository {
         .bind(scope.tenant_id.as_uuid())
         .bind(project_id.as_uuid())
         .bind(pdf_parser_profile.is_some())
+        .bind(office_parser_profile.is_some())
         .fetch_optional(&mut **transaction)
         .await
         .map_err(database_error)?
@@ -370,9 +402,11 @@ impl PgKnowledgeRepository {
         let bytes: Option<Vec<u8>> = row.get("content");
         let queued_pdf =
             object.detected_media_type == "application/pdf" && pdf_parser_profile.is_some();
+        let queued_office = office_parser_profile.is_some()
+            && office_parse::is_office_media_type(&object.detected_media_type);
         if row.get::<i64, _>("blob_size") as u64 != object.actual_size
             || row.get::<String, _>("blob_hash") != object.sha256
-            || (!queued_pdf
+            || (!(queued_pdf || queued_office)
                 && bytes.as_ref().is_none_or(|bytes| {
                     bytes.len() as u64 != object.actual_size || sha256_hex(bytes) != object.sha256
                 }))
@@ -385,13 +419,29 @@ impl PgKnowledgeRepository {
             object.detected_media_type == "application/pdf",
             pdf_parser_profile,
         ) {
-            return Self::queue_pdf_in_transaction(
+            return Self::queue_document_in_transaction(
                 transaction,
                 scope,
                 item,
                 object,
                 false,
                 profile,
+                false,
+            )
+            .await;
+        }
+        if let (true, Some(profile)) = (
+            office_parse::is_office_media_type(&object.detected_media_type),
+            office_parser_profile,
+        ) {
+            return Self::queue_document_in_transaction(
+                transaction,
+                scope,
+                item,
+                object,
+                false,
+                profile,
+                true,
             )
             .await;
         }
@@ -652,16 +702,17 @@ impl PgKnowledgeRepository {
         })
     }
 
-    async fn queue_pdf_in_transaction(
+    async fn queue_document_in_transaction(
         transaction: &mut Transaction<'_, Postgres>,
         scope: &TenantScope,
         item: &ImportItem,
         object: StoredObject,
         insert_object: bool,
         profile: &str,
+        office: bool,
     ) -> Result<ImportAcceptance, AppError> {
         if profile.is_empty() || profile.len() > 200 {
-            return Err(AppError::invalid_request("invalid PDF parser profile"));
+            return Err(AppError::invalid_request("invalid document parser profile"));
         }
         let project_id = Self::project_id(scope)?;
         let now = Utc::now();
@@ -717,15 +768,33 @@ impl PgKnowledgeRepository {
         .bind(job_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
         .bind(project_id.as_uuid()).bind(operation_id).bind(source_id)
         .bind(version_id).bind(&object.sha256).execute(&mut **transaction).await.map_err(database_error)?;
-        sqlx::query(
+        let task_query = if office {
+            "INSERT INTO knowledge_office_parse_tasks
+             (import_job_id,operator_id,tenant_id,project_id,source_id,source_version_id,object_id,object_version,input_sha256,parser_profile,media_type)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"
+        } else {
             "INSERT INTO knowledge_pdf_parse_tasks
              (import_job_id,operator_id,tenant_id,project_id,source_id,source_version_id,object_id,object_version,input_sha256,parser_profile)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-        )
-        .bind(job_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
-        .bind(project_id.as_uuid()).bind(source_id).bind(version_id).bind(object.object_id)
-        .bind(object.object_version).bind(&object.sha256).bind(profile)
-        .execute(&mut **transaction).await.map_err(database_error)?;
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
+        };
+        let mut insert_task = sqlx::query(task_query)
+            .bind(job_id)
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project_id.as_uuid())
+            .bind(source_id)
+            .bind(version_id)
+            .bind(object.object_id)
+            .bind(object.object_version)
+            .bind(&object.sha256)
+            .bind(profile);
+        if office {
+            insert_task = insert_task.bind(&object.detected_media_type);
+        }
+        insert_task
+            .execute(&mut **transaction)
+            .await
+            .map_err(database_error)?;
         sqlx::query(
             "INSERT INTO outbox_events
              (event_id,event_type,schema_version,operator_id,tenant_id,project_id,aggregate_id,aggregate_version,occurred_at,correlation_id,payload)
@@ -999,6 +1068,16 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                 .accepted_unparsed_media_types
                 .retain(|media_type| media_type != "application/pdf");
         }
+        if self.office_parser_profile.is_some() {
+            capabilities.docx_parser = true;
+            capabilities.xlsx_parser = true;
+            for media in office_parse::OFFICE_MEDIA_TYPES {
+                capabilities.supported_media_types.push(media.to_owned());
+                capabilities
+                    .accepted_unparsed_media_types
+                    .retain(|m| m != media);
+            }
+        }
         Ok(capabilities)
     }
 
@@ -1086,6 +1165,92 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         job_id: Uuid,
     ) -> Result<Option<Operation>, AppError> {
         pdf_parse::operation(self, scope, job_id).await
+    }
+
+    async fn office_parse_candidates(
+        &self,
+        after: Option<geo_domain::OfficeParseCursor>,
+        limit: usize,
+    ) -> Result<Vec<geo_domain::OfficeParseJobRef>, AppError> {
+        office_parse::candidates(self, after, limit).await
+    }
+
+    async fn claim_office_parse(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+        lease_id: Uuid,
+        lease_seconds: i64,
+    ) -> Result<Option<geo_domain::OfficeParseLease>, AppError> {
+        office_parse::claim(self, scope, job_id, lease_id, lease_seconds).await
+    }
+
+    async fn renew_office_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &geo_domain::OfficeParseLease,
+        lease_seconds: i64,
+    ) -> Result<Option<geo_domain::OfficeParseLease>, AppError> {
+        office_parse::renew(self, scope, lease, lease_seconds).await
+    }
+
+    async fn office_parse_input(
+        &self,
+        scope: &TenantScope,
+        lease: &geo_domain::OfficeParseLease,
+    ) -> Result<geo_domain::OfficeParseInput, AppError> {
+        office_parse::input(self, scope, lease).await
+    }
+
+    async fn record_office_manifest(
+        &self,
+        scope: &TenantScope,
+        lease: &geo_domain::OfficeParseLease,
+        manifest: geo_domain::OfficeDocumentManifest,
+    ) -> Result<(), AppError> {
+        office_parse::manifest(self, scope, lease, manifest).await
+    }
+
+    async fn record_office_unit(
+        &self,
+        scope: &TenantScope,
+        lease: &geo_domain::OfficeParseLease,
+        result: geo_domain::OfficeUnitResult,
+    ) -> Result<(), AppError> {
+        office_parse::unit(self, scope, lease, result).await
+    }
+
+    async fn finish_office_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &geo_domain::OfficeParseLease,
+    ) -> Result<ImportAcceptance, AppError> {
+        office_parse::finish(self, scope, lease, None).await
+    }
+
+    async fn fail_office_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &geo_domain::OfficeParseLease,
+        code: &str,
+    ) -> Result<ImportAcceptance, AppError> {
+        office_parse::finish(self, scope, lease, Some(code)).await
+    }
+
+    async fn retry_office_parse(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+    ) -> Result<ImportJob, AppError> {
+        office_parse::retry(self, scope, job_id).await
+    }
+
+    async fn office_parse_operation(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+    ) -> Result<Option<Operation>, AppError> {
+        office_parse::operation(self, scope, job_id).await
     }
 
     async fn create_upload_session(
@@ -1261,13 +1426,18 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         }
         let row = sqlx::query(
             "SELECT session.filename,session.declared_media_type,session.expected_size,session.expected_sha256,session.purpose,session.state,session.expires_at,
-                    CASE WHEN session.declared_media_type='application/pdf' AND $5::boolean
+                    CASE WHEN ((session.declared_media_type='application/pdf' AND $5::boolean)
+                         OR (session.declared_media_type IN (
+                           'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                         ) AND $6::boolean))
                          THEN NULL ELSE blob.content END AS content,
                     blob.actual_size,blob.sha256
              FROM knowledge_upload_sessions session LEFT JOIN knowledge_upload_blobs blob ON blob.upload_session_id=session.upload_session_id
              WHERE session.upload_session_id=$1 AND session.operator_id=$2 AND session.tenant_id=$3 AND session.project_id=$4 FOR UPDATE OF session",
         ).bind(id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project_id.as_uuid())
         .bind(self.pdf_parser_profile.is_some())
+        .bind(self.office_parser_profile.is_some())
         .fetch_optional(&mut *transaction).await.map_err(database_error)?
         .ok_or_else(|| AppError::not_found("upload session not found"))?;
         let state: String = row.get("state");
@@ -1294,7 +1464,9 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         let expected_hash: String = row.get("expected_sha256");
         let queued_pdf = self.pdf_parser_profile.is_some()
             && row.get::<String, _>("declared_media_type") == "application/pdf";
-        if (!queued_pdf && content.is_none())
+        let queued_office = self.office_parser_profile.is_some()
+            && office_parse::is_office_media_type(&row.get::<String, _>("declared_media_type"));
+        if (!(queued_pdf || queued_office) && content.is_none())
             || actual_size != Some(expected_size)
             || actual_hash.as_deref() != Some(expected_hash.as_str())
         {
@@ -1340,8 +1512,30 @@ impl KnowledgeRepository for PgKnowledgeRepository {
             object.detected_media_type == "application/pdf",
             self.pdf_parser_profile.as_deref(),
         ) {
-            Self::queue_pdf_in_transaction(&mut transaction, scope, &item, object, true, profile)
-                .await?
+            Self::queue_document_in_transaction(
+                &mut transaction,
+                scope,
+                &item,
+                object,
+                true,
+                profile,
+                false,
+            )
+            .await?
+        } else if let (true, Some(profile)) = (
+            office_parse::is_office_media_type(&object.detected_media_type),
+            self.office_parser_profile.as_deref(),
+        ) {
+            Self::queue_document_in_transaction(
+                &mut transaction,
+                scope,
+                &item,
+                object,
+                true,
+                profile,
+                true,
+            )
+            .await?
         } else if !is_supported_knowledge_media_type(&object.detected_media_type) {
             Self::failed_adapter_in_transaction(
                 &mut transaction,
@@ -1681,6 +1875,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                     scope,
                     &item,
                     self.pdf_parser_profile.as_deref(),
+                    self.office_parser_profile.as_deref(),
                 )
                 .await
             } else if item.kind == SourceKind::Url {

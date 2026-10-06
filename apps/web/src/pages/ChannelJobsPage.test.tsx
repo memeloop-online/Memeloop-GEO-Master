@@ -106,6 +106,7 @@ function mockApi({
   executeError = false,
   role = "tenant_admin",
   currentCycleId = cycleId,
+  cycleError = false,
   measurementSupported = true,
   planConflict = false,
   questionSets = [],
@@ -118,6 +119,7 @@ function mockApi({
   executeError?: boolean;
   role?: string;
   currentCycleId?: string | null;
+  cycleError?: boolean;
   measurementSupported?: boolean;
   planConflict?: boolean;
   questionSets?: unknown[];
@@ -168,6 +170,15 @@ function mockApi({
         return Promise.resolve(
           response({ items: questionSets, next_cursor: null }),
         );
+      if (path.endsWith("/measurement-plans"))
+        return Promise.resolve(response({ items: [], next_after: null }));
+      if (path.endsWith("/measurement-options"))
+        return Promise.resolve(
+          response({
+            models: [{ id: "visible-model", label: "网页模型" }],
+            selected_model: "visible-model",
+          }),
+        );
       if (path.endsWith("/question-sets/set-1/versions"))
         return Promise.resolve(
           response({
@@ -191,18 +202,20 @@ function mockApi({
         return Promise.resolve(response(questionVersion));
       if (path.endsWith("/projects/project-1/cycles/current"))
         return Promise.resolve(
-          currentCycleId
-            ? response({
-                project_id: "project-1",
-                cycle_id: currentCycleId,
-                report_timezone: "Asia/Shanghai",
-                report_window_start_at: "2026-10-01T00:00:00Z",
-                report_window_end_at: "2026-10-08T00:00:00Z",
-                cutoff_at: "2026-10-09T00:00:00Z",
-                document_manifest: null,
-                distribution_manifest: null,
-              })
-            : response({ code: "not_found", message: "no cycle" }, 404),
+          cycleError
+            ? response({ code: "internal", message: "cycle unavailable" }, 503)
+            : currentCycleId
+              ? response({
+                  project_id: "project-1",
+                  cycle_id: currentCycleId,
+                  report_timezone: "Asia/Shanghai",
+                  report_window_start_at: "2026-10-01T00:00:00Z",
+                  report_window_end_at: "2026-10-08T00:00:00Z",
+                  cutoff_at: "2026-10-09T00:00:00Z",
+                  document_manifest: null,
+                  distribution_manifest: null,
+                })
+              : response({ code: "not_found", message: "no cycle" }, 404),
         );
       if (path.endsWith(`/cycles/${currentCycleId}/channel-plan`)) {
         if (method === "POST") {
@@ -414,7 +427,7 @@ describe("P12 channel jobs", () => {
     });
     renderPage();
     expect(
-      await screen.findByText(/用途 旧数据未分类（不进入优化）/),
+      await screen.findByText(/用途 自定义问题（不进入优化）/),
     ).toBeInTheDocument();
   });
 
@@ -564,9 +577,24 @@ describe("P12 channel jobs", () => {
   it("shows the unstarted state when no current cycle exists", async () => {
     const requests = mockApi({ currentCycleId: null });
     renderPage();
-    expect(await screen.findByText("项目尚未启动")).toBeInTheDocument();
+    expect(await screen.findByText("尚无周期发布计划")).toBeInTheDocument();
+    expect(screen.getByLabelText("要测量的问题")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "登录或连接 Kimi 账号" }),
+    ).toBeInTheDocument();
     expect(requests.some((item) => item.path.includes("/channel-plan"))).toBe(
       false,
+    );
+  });
+
+  it("keeps standalone measurement usable when current-cycle loading fails", async () => {
+    mockApi({ cycleError: true, sources: [], accounts: [measurementAccount] });
+    const user = userEvent.setup();
+    renderPage();
+    expect(await screen.findByText("无法读取当前项目周期")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("要测量的问题"), "任何主题");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "开始测量" })).toBeEnabled(),
     );
   });
 

@@ -7,8 +7,6 @@ import {
   Input,
   MessageBar,
   MessageBarBody,
-  Select,
-  Textarea,
 } from "@fluentui/react-components";
 import {
   Link,
@@ -18,7 +16,6 @@ import {
 } from "react-router-dom";
 import { ApiError } from "../api/client";
 import {
-  type ContentBlock,
   type ContentItem,
   type ContentRevision,
   type StructuredDocument,
@@ -36,6 +33,7 @@ import { useDocumentManifestQuery } from "../api/documentManifests";
 import { useAuth } from "../auth/AuthProvider";
 import { membershipForTenant } from "../auth/types";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
+import { StructuredContentEditor } from "../components/StructuredContentEditor";
 
 const stateLabels: Record<ContentItem["status"], string> = {
   pending: "等待准备",
@@ -505,10 +503,6 @@ function locatorText(locator: { kind: string; [key: string]: unknown }) {
   return `${locator.kind} · ${fields.join(" · ")}`;
 }
 
-function newId() {
-  return globalThis.crypto.randomUUID();
-}
-
 function RevisionEditor({
   revision,
   tenantId,
@@ -532,6 +526,8 @@ function RevisionEditor({
   const [dirty, setDirty] = useState(false);
   const [conflicted, setConflicted] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [editorEpoch, setEditorEpoch] = useState(0);
+  const [editorError, setEditorError] = useState<string | null>(null);
   const append = useAppendContentRevisionMutation(tenantId, projectId, assetId);
   const fork = useForkReusedContentItemMutation(
     tenantId,
@@ -549,13 +545,17 @@ function RevisionEditor({
     if (saved && revision.revision_id === baseId) setSaved(false);
   }, [baseId, dirty, revision, saved]);
 
-  const update = (next: StructuredDocument) => {
+  const update = (
+    next:
+      | StructuredDocument
+      | ((current: StructuredDocument) => StructuredDocument),
+  ) => {
     setDraft(next);
     setDirty(true);
     setSaved(false);
   };
   const save = () => {
-    if (!dirty || mutation.isPending || conflicted) return;
+    if (!dirty || mutation.isPending || conflicted || editorError) return;
     mutation.mutate(
       { baseRevisionId: baseId, document: draft },
       {
@@ -577,12 +577,13 @@ function RevisionEditor({
     );
   };
   useEffect(() => {
-    if (!dirty || conflicted || readonly || mutation.isPending) return;
+    if (!dirty || conflicted || editorError || readonly || mutation.isPending)
+      return;
     const timer = window.setTimeout(save, 1000);
     return () => window.clearTimeout(timer);
     // The timeout restarts on every local edit; it submits the exact draft seen by this render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, dirty, conflicted, readonly, mutation.isPending]);
+  }, [draft, dirty, conflicted, editorError, readonly, mutation.isPending]);
 
   return (
     <Card className="panel-card">
@@ -590,6 +591,11 @@ function RevisionEditor({
       <p>
         当前基线 v{revision.revision} · {baseId}。每次保存追加不可变版本，
         不覆盖已发布内容；编辑后需要重新检查。
+      </p>
+      <p>
+        所见即所得编辑仅覆盖现有结构化正文的段落、小标题与列表纯文本；
+        粗体、链接、表格及媒体尚无可持久化字段，粘贴时只接收纯文本。
+        引用片段与检查结果仍以服务端版本为准。
       </p>
       {forkContext && (
         <p>
@@ -604,99 +610,39 @@ function RevisionEditor({
           onChange={(_, data) => update({ ...draft, title: data.value })}
         />
       </Field>
-      {draft.blocks.map((block, index) => (
-        <fieldset
-          key={block.block_id}
-          disabled={readonly || mutation.isPending}
-        >
-          <legend>内容块 {index + 1}</legend>
-          <Field label={`类型 ${index + 1}`}>
-            <Select
-              value={block.kind}
-              onChange={(event) =>
-                update({
-                  ...draft,
-                  blocks: draft.blocks.map((entry) =>
-                    entry.block_id === block.block_id
-                      ? {
-                          ...entry,
-                          kind: event.target.value as ContentBlock["kind"],
-                          items:
-                            event.target.value === "list"
-                              ? entry.items.length
-                                ? entry.items
-                                : [""]
-                              : [],
-                        }
-                      : entry,
-                  ),
-                })
-              }
-            >
-              <option value="heading">小标题</option>
-              <option value="paragraph">段落</option>
-              <option value="list">列表</option>
-            </Select>
-          </Field>
-          <Field label={`正文 ${index + 1}`}>
-            <Textarea
-              value={block.text}
-              onChange={(_, data) =>
-                update({
-                  ...draft,
-                  blocks: draft.blocks.map((entry) =>
-                    entry.block_id === block.block_id
-                      ? { ...entry, text: data.value }
-                      : entry,
-                  ),
-                })
-              }
-            />
-          </Field>
-          {block.kind === "list" && (
-            <Field label={`列表项目 ${index + 1}（每行一项）`}>
-              <Textarea
-                value={block.items.join("\n")}
-                onChange={(_, data) =>
-                  update({
-                    ...draft,
-                    blocks: draft.blocks.map((entry) =>
-                      entry.block_id === block.block_id
-                        ? { ...entry, items: data.value.split("\n") }
-                        : entry,
-                    ),
-                  })
-                }
-              />
-            </Field>
-          )}
-          <p>引用片段 ID：{block.citation_ids.join("、") || "无"}</p>
-        </fieldset>
-      ))}
+      <StructuredContentEditor
+        key={`${baseId}/${editorEpoch}`}
+        document={draft}
+        readonly={readonly || mutation.isPending || conflicted}
+        onChange={(document, error) => {
+          setEditorError(error);
+          if (document)
+            update((current) => ({ ...document, title: current.title }));
+        }}
+      />
+      <p>
+        引用片段 ID：
+        {draft.blocks
+          .map(
+            (block) =>
+              `${block.block_id} · ${block.citation_ids.join("、") || "无"}`,
+          )
+          .join("；")}
+      </p>
+      {editorError && (
+        <MessageBar intent="warning">
+          <MessageBarBody>
+            {editorError} 本地编辑仍保留，不会提交旧草稿。
+          </MessageBarBody>
+        </MessageBar>
+      )}
       {!readonly && (
         <div>
           <Button
-            onClick={() =>
-              update({
-                ...draft,
-                blocks: [
-                  ...draft.blocks,
-                  {
-                    block_id: newId(),
-                    kind: "paragraph",
-                    text: "",
-                    citation_ids: [],
-                    items: [],
-                  },
-                ],
-              })
-            }
-          >
-            添加段落
-          </Button>{" "}
-          <Button
             appearance="primary"
-            disabled={!dirty || mutation.isPending || conflicted}
+            disabled={
+              !dirty || mutation.isPending || conflicted || Boolean(editorError)
+            }
             onClick={save}
           >
             {mutation.isPending
@@ -733,6 +679,8 @@ function RevisionEditor({
             setSaved(false);
             setDraft(structuredClone(revision.document));
             setBaseId(revision.revision_id);
+            setEditorError(null);
+            setEditorEpoch((epoch) => epoch + 1);
           }}
         >
           放弃本地草稿并加载所选版本
@@ -989,7 +937,8 @@ function AssetContent({
       )}
       <MessageBar intent="info">
         <MessageBarBody>
-          当前仅支持标题和类型化正文块修订；富文本、媒体、渠道预览及发布记录尚未接入本资产。
+          当前可所见即所得地编辑标题、段落与列表纯文本；字体样式、
+          媒体、表格和渠道预览尚未接入结构化正文版本。
         </MessageBarBody>
       </MessageBar>
     </div>

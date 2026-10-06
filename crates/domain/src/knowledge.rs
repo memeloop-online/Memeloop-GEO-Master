@@ -21,6 +21,11 @@ use crate::{
 };
 use crate::{DocumentScope, QuestionClusterState};
 use crate::{
+    OFFICE_MAX_DOCUMENT_TEXT_BYTES, OfficeDocumentManifest, OfficeFormat, OfficeParseCursor,
+    OfficeParseInput, OfficeParseJobRef, OfficeParseLease, OfficeUnitResult,
+    office_document_error_code, office_unit_chunks,
+};
+use crate::{
     PDF_MAX_DOCUMENT_TEXT_BYTES, PdfDocumentManifest, PdfPageResult, PdfPageText, PdfParseCursor,
     PdfParseInput, PdfParseJobRef, PdfParseLease, pdf_page_chunks,
 };
@@ -120,6 +125,10 @@ pub struct KnowledgeImportProgress {
 pub struct KnowledgeImportProgressError {
     pub code: String,
     pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<OfficeFormat>,
 }
 
 /// Never reflect arbitrary parser or operation messages into progress reads.
@@ -141,6 +150,11 @@ pub fn knowledge_import_progress_error(value: &Value) -> KnowledgeImportProgress
                     | "page_limit"
                     | "ocr_required"
                     | "empty_text"
+                    | "invalid_docx"
+                    | "invalid_xlsx"
+                    | "encrypted_office"
+                    | "unit_limit"
+                    | "unsupported_content"
             )
         })
         .unwrap_or("import_failed");
@@ -151,6 +165,13 @@ pub fn knowledge_import_progress_error(value: &Value) -> KnowledgeImportProgress
             .and_then(Value::as_u64)
             .and_then(|page| u32::try_from(page).ok())
             .filter(|page| *page > 0),
+        unit_id: value
+            .get("unit_id")
+            .and_then(Value::as_u64)
+            .and_then(|unit_id| u32::try_from(unit_id).ok()),
+        format: value
+            .get("format")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
     }
 }
 
@@ -182,6 +203,8 @@ pub fn knowledge_import_progress_app_error(error: &AppError) -> KnowledgeImportP
     KnowledgeImportProgressError {
         code: code.to_owned(),
         page: None,
+        unit_id: None,
+        format: None,
     }
 }
 
@@ -441,12 +464,46 @@ pub enum ChunkLocator {
     Docx {
         heading_path: Vec<String>,
         paragraph_index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body_element_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_row: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_column: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_row_span: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_col_span: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table_merged: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_char: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_char: Option<u32>,
     },
     Xlsx {
         sheet: String,
         range: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         header_range: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        formula: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        merged_range: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_char: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_char: Option<u32>,
     },
     Csv {
         start_row: u32,
@@ -1045,6 +1102,102 @@ pub trait KnowledgeRepository: Send + Sync {
     ) -> Result<Option<Operation>, AppError> {
         Ok(None)
     }
+    /// Office queue is independent from PDF pages and unavailable unless a
+    /// format-specific adapter profile is explicitly configured.
+    async fn office_parse_candidates(
+        &self,
+        _after: Option<OfficeParseCursor>,
+        _limit: usize,
+    ) -> Result<Vec<OfficeParseJobRef>, AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn claim_office_parse(
+        &self,
+        _scope: &TenantScope,
+        _job_id: Uuid,
+        _lease_id: Uuid,
+        _lease_seconds: i64,
+    ) -> Result<Option<OfficeParseLease>, AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn renew_office_parse(
+        &self,
+        _scope: &TenantScope,
+        _lease: &OfficeParseLease,
+        _lease_seconds: i64,
+    ) -> Result<Option<OfficeParseLease>, AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn office_parse_input(
+        &self,
+        _scope: &TenantScope,
+        _lease: &OfficeParseLease,
+    ) -> Result<OfficeParseInput, AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn record_office_manifest(
+        &self,
+        _scope: &TenantScope,
+        _lease: &OfficeParseLease,
+        _manifest: OfficeDocumentManifest,
+    ) -> Result<(), AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn record_office_unit(
+        &self,
+        _scope: &TenantScope,
+        _lease: &OfficeParseLease,
+        _result: OfficeUnitResult,
+    ) -> Result<(), AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn finish_office_parse(
+        &self,
+        _scope: &TenantScope,
+        _lease: &OfficeParseLease,
+    ) -> Result<ImportAcceptance, AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn fail_office_parse(
+        &self,
+        _scope: &TenantScope,
+        _lease: &OfficeParseLease,
+        _code: &str,
+    ) -> Result<ImportAcceptance, AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn retry_office_parse(
+        &self,
+        _scope: &TenantScope,
+        _job_id: Uuid,
+    ) -> Result<ImportJob, AppError> {
+        Err(AppError::capability_missing(
+            "Office parser is not configured",
+        ))
+    }
+    async fn office_parse_operation(
+        &self,
+        _scope: &TenantScope,
+        _job_id: Uuid,
+    ) -> Result<Option<Operation>, AppError> {
+        Ok(None)
+    }
     async fn create_upload_session(
         &self,
         scope: &TenantScope,
@@ -1165,6 +1318,8 @@ impl<'a> ContentKnowledgeGuard<'a> {
 pub struct MemoryKnowledgeRepository {
     state: RwLock<MemoryState>,
     pdf_parser_profile: Option<String>,
+    docx_parser_profile: Option<String>,
+    xlsx_parser_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1180,6 +1335,19 @@ struct MemoryPdfState {
     parent_job_id: Option<Uuid>,
 }
 
+#[derive(Debug, Clone)]
+struct MemoryOfficeState {
+    object_id: Uuid,
+    format: OfficeFormat,
+    parser_profile: String,
+    created_at: DateTime<Utc>,
+    manifest: Option<OfficeDocumentManifest>,
+    units: HashMap<u32, OfficeUnitResult>,
+    lease: Option<OfficeParseLease>,
+    fencing_token: i64,
+    acceptance: Option<ImportAcceptance>,
+}
+
 #[derive(Debug, Default)]
 struct MemoryState {
     upload_sessions: HashMap<Uuid, UploadSession>,
@@ -1190,6 +1358,7 @@ struct MemoryState {
     versions: HashMap<Uuid, SourceVersion>,
     jobs: HashMap<Uuid, ImportJob>,
     pdf_jobs: HashMap<Uuid, MemoryPdfState>,
+    office_jobs: HashMap<Uuid, MemoryOfficeState>,
     operations: HashMap<Uuid, Operation>,
     chunks: HashMap<Uuid, Vec<Chunk>>,
     products: HashMap<Uuid, Product>,
@@ -1315,6 +1484,40 @@ impl MemoryKnowledgeRepository {
                 {
                     return Err(AppError::conflict("PDF final receipt is inconsistent"));
                 }
+            } else if let Some(office) = state.office_jobs.get(&job.import_job_id) {
+                state
+                    .stored_objects
+                    .get(&office.object_id)
+                    .filter(|object| Self::in_scope(scope, *object))
+                    .filter(|object| {
+                        object.sha256 == job.input_hash
+                            && version.object_id == Some(object.object_id)
+                            && version.object_version == Some(object.object_version)
+                    })
+                    .ok_or_else(|| AppError::conflict("Office import object is inconsistent"))?;
+                let acceptance = office
+                    .acceptance
+                    .as_ref()
+                    .ok_or_else(|| AppError::conflict("Office final receipt is missing"))?;
+                if acceptance.status != job.status
+                    || acceptance
+                        .import_job
+                        .as_ref()
+                        .map(|accepted| accepted.import_job_id)
+                        != Some(job.import_job_id)
+                    || acceptance
+                        .source_version
+                        .as_ref()
+                        .map(|accepted| accepted.source_version_id)
+                        != Some(version_id)
+                    || acceptance
+                        .release
+                        .as_ref()
+                        .map(|accepted| accepted.knowledge_release_id)
+                        != Some(release_id)
+                {
+                    return Err(AppError::conflict("Office final receipt is inconsistent"));
+                }
             } else if let Some(object_id) = version.object_id {
                 state
                     .stored_objects
@@ -1336,9 +1539,144 @@ impl MemoryKnowledgeRepository {
         Self {
             state: RwLock::new(MemoryState::default()),
             pdf_parser_profile: (!profile.trim().is_empty()).then_some(profile),
+            docx_parser_profile: None,
+            xlsx_parser_profile: None,
         }
     }
 
+    pub fn with_office_parser_profiles(
+        docx_profile: Option<String>,
+        xlsx_profile: Option<String>,
+    ) -> Self {
+        Self::with_parser_profiles(None, docx_profile, xlsx_profile)
+    }
+
+    pub fn with_parser_profiles(
+        pdf_profile: Option<String>,
+        docx_profile: Option<String>,
+        xlsx_profile: Option<String>,
+    ) -> Self {
+        Self {
+            state: RwLock::new(MemoryState::default()),
+            pdf_parser_profile: pdf_profile.filter(|profile| !profile.trim().is_empty()),
+            docx_parser_profile: docx_profile.filter(|profile| !profile.trim().is_empty()),
+            xlsx_parser_profile: xlsx_profile.filter(|profile| !profile.trim().is_empty()),
+        }
+    }
+
+    fn office_profile(&self, format: OfficeFormat) -> Option<&str> {
+        match format {
+            OfficeFormat::Docx => self.docx_parser_profile.as_deref(),
+            OfficeFormat::Xlsx => self.xlsx_parser_profile.as_deref(),
+        }
+    }
+
+    fn queued_office_format(&self, media_type: &str) -> Option<OfficeFormat> {
+        [OfficeFormat::Docx, OfficeFormat::Xlsx]
+            .into_iter()
+            .find(|format| {
+                format.media_type() == media_type && self.office_profile(*format).is_some()
+            })
+    }
+
+    fn queue_office_locked(
+        &self,
+        state: &mut MemoryState,
+        scope: &TenantScope,
+        item: &ImportItem,
+        object: &StoredObject,
+        format: OfficeFormat,
+    ) -> ImportAcceptance {
+        let (mut source, _) = Self::source_and_version(
+            scope,
+            item.kind,
+            item.name.clone(),
+            item.purpose,
+            json!({"kind":"object","object_id":object.object_id,"object_version":object.object_version}),
+            Some(object),
+            object.sha256.clone(),
+        );
+        source.current_version_id = None;
+        let operation = Operation::queued("knowledge.import", scope.clone());
+        let job = ImportJob {
+            import_job_id: Uuid::new_v4(),
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id: source.project_id,
+            operation_id: operation.id,
+            source_id: source.source_id,
+            source_version_id: None,
+            stage: ImportStage::Parse,
+            status: ImportStatus::Queued,
+            attempt: 1,
+            lease_until: None,
+            input_hash: object.sha256.clone(),
+            stage_output_refs: Vec::new(),
+            completed_units: 0,
+            failed_units: 0,
+            errors: Vec::new(),
+            resumed_from: None,
+        };
+        state.office_jobs.insert(
+            job.import_job_id,
+            MemoryOfficeState {
+                object_id: object.object_id,
+                format,
+                parser_profile: self
+                    .office_profile(format)
+                    .expect("configured parser")
+                    .to_owned(),
+                created_at: operation.created_at,
+                manifest: None,
+                units: HashMap::new(),
+                lease: None,
+                fencing_token: 0,
+                acceptance: None,
+            },
+        );
+        state.operations.insert(operation.id, operation.clone());
+        state.sources.insert(source.source_id, source.clone());
+        state.jobs.insert(job.import_job_id, job.clone());
+        ImportAcceptance {
+            client_item_id: item.client_item_id.clone(),
+            status: ImportStatus::Queued,
+            source: Some(source),
+            source_version: None,
+            import_job: Some(job),
+            operation: Some(operation),
+            release: None,
+            error: None,
+        }
+    }
+
+    fn checked_office_lease<'a>(
+        state: &'a MemoryState,
+        scope: &TenantScope,
+        lease: &OfficeParseLease,
+    ) -> Result<(&'a ImportJob, &'a MemoryOfficeState), AppError> {
+        let job = state
+            .jobs
+            .get(&lease.job_id)
+            .filter(|job| Self::in_scope(scope, *job))
+            .ok_or_else(|| AppError::not_found("Office parse job not found"))?;
+        let office = state
+            .office_jobs
+            .get(&lease.job_id)
+            .ok_or_else(|| AppError::not_found("Office parse job not found"))?;
+        if job.status != ImportStatus::Running
+            || !office.lease.as_ref().is_some_and(|current| {
+                current.job_id == lease.job_id
+                    && current.lease_id == lease.lease_id
+                    && current.fencing_token == lease.fencing_token
+                    && current.expires_at > Utc::now()
+            })
+        {
+            return Err(AppError::conflict(
+                "Office parse lease is expired or fenced",
+            ));
+        }
+        Ok((job, office))
+    }
     fn queue_pdf_locked(
         &self,
         state: &mut MemoryState,
@@ -1961,6 +2299,29 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 .limitations
                 .push("OCR for scanned PDFs is not configured".to_owned());
         }
+        for format in [OfficeFormat::Docx, OfficeFormat::Xlsx] {
+            if self.office_profile(format).is_some() {
+                match format {
+                    OfficeFormat::Docx => capability.docx_parser = true,
+                    OfficeFormat::Xlsx => capability.xlsx_parser = true,
+                }
+                capability
+                    .supported_media_types
+                    .push(format.media_type().to_owned());
+                capability
+                    .accepted_unparsed_media_types
+                    .retain(|mime| mime != format.media_type());
+            }
+        }
+        if capability.docx_parser || capability.xlsx_parser {
+            capability.limitations.retain(|line| {
+                !line.contains("office/PDF parsing") && !line.contains("office parsing,")
+            });
+            capability.limitations.push(
+                "Office structural import does not execute formulas, fetch external resources, or infer headers; OCR, vector search and LLM answers are not configured"
+                    .to_owned(),
+            );
+        }
         Ok(capability)
     }
 
@@ -2315,6 +2676,328 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
         Ok(())
     }
 
+    async fn finish_office_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &OfficeParseLease,
+    ) -> Result<ImportAcceptance, AppError> {
+        let mut state = self.state.write().await;
+        let (job, office) = Self::checked_office_lease(&state, scope, lease)?;
+        let manifest = office
+            .manifest
+            .clone()
+            .ok_or_else(|| AppError::conflict("Office manifest not recorded"))?;
+        if office.units.len() != manifest.unit_count() {
+            return Err(AppError::conflict("Office units are incomplete"));
+        }
+        let job = job.clone();
+        let office = office.clone();
+        let mut source = state
+            .sources
+            .get(&job.source_id)
+            .filter(|source| Self::in_scope(scope, *source))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("Office source not found"))?;
+        if source.state != SourceState::Active {
+            return Err(AppError::conflict("Office source was removed"));
+        }
+        let object = state
+            .stored_objects
+            .get(&office.object_id)
+            .filter(|object| Self::in_scope(scope, *object))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("Office object not found"))?;
+        let bytes = state
+            .object_bytes
+            .get(&office.object_id)
+            .ok_or_else(|| AppError::not_found("Office bytes not found"))?;
+        if sha256_hex(bytes) != object.sha256
+            || bytes.len() as u64 != object.actual_size
+            || job.input_hash != object.sha256
+            || object.detected_media_type != office.format.media_type()
+        {
+            return Err(AppError::conflict("Office object changed during parsing"));
+        }
+        let success_count = office
+            .units
+            .values()
+            .filter(|result| result.is_success())
+            .count();
+        let failed_count = manifest.unit_count() - success_count;
+        let status = if success_count == 0 {
+            ImportStatus::Failed
+        } else if failed_count == 0 {
+            ImportStatus::Succeeded
+        } else {
+            ImportStatus::Partial
+        };
+        // Build all chunks and their bounded locators before modifying state;
+        // an invalid unit may not leave a half-published release behind.
+        let (version, chunks) = if success_count > 0 {
+            let parent_id = source.current_version_id;
+            let version = SourceVersion {
+                source_version_id: Uuid::new_v4(),
+                operator_id: scope.operator_id,
+                tenant_id: scope.tenant_id,
+                project_id: source.project_id,
+                source_id: source.source_id,
+                version: parent_id
+                    .and_then(|id| state.versions.get(&id))
+                    .map_or(1, |parent| parent.version + 1),
+                object_id: Some(object.object_id),
+                object_version: Some(object.object_version),
+                content_sha256: object.sha256.clone(),
+                captured_at: Utc::now(),
+                original_url: None,
+                parent_version_id: parent_id,
+                parser_version: office.parser_profile.clone(),
+                extraction_version: office.format.extraction_method().to_owned(),
+                created_at: Utc::now(),
+            };
+            let mut chunks = Vec::new();
+            for ordinal in 0..manifest.unit_count() {
+                let unit_id = manifest.unit_id(ordinal).expect("validated manifest");
+                let result = office
+                    .units
+                    .get(&unit_id)
+                    .expect("all Office units recorded");
+                if result.is_success() {
+                    chunks.extend(office_unit_chunks(
+                        scope,
+                        version.source_version_id,
+                        &manifest,
+                        result,
+                        chunks.len() as i32,
+                    )?);
+                }
+            }
+            if chunks.is_empty() {
+                return Err(AppError::conflict(
+                    "Office success has no usable source evidence",
+                ));
+            }
+            (Some(version), chunks)
+        } else {
+            (None, Vec::new())
+        };
+        if let Some(version) = &version {
+            source.current_version_id = Some(version.source_version_id);
+            state.sources.insert(source.source_id, source.clone());
+            state.chunks.insert(version.source_version_id, chunks);
+            state
+                .versions
+                .insert(version.source_version_id, version.clone());
+        }
+        let mut finished_job = job;
+        finished_job.status = status;
+        finished_job.stage = if version.is_some() {
+            ImportStage::Release
+        } else {
+            ImportStage::Parse
+        };
+        finished_job.source_version_id = version.as_ref().map(|value| value.source_version_id);
+        finished_job.completed_units = success_count as i32;
+        finished_job.failed_units = failed_count as i32;
+        finished_job.lease_until = None;
+        finished_job.errors = office
+            .units
+            .iter()
+            .filter_map(|(id, result)| match result {
+                OfficeUnitResult::Failure { code, .. } => {
+                    Some(json!({"unit_id":id,"format":office.format,"code":code}))
+                }
+                _ => None,
+            })
+            .collect();
+        finished_job
+            .errors
+            .sort_by_key(|entry| entry["unit_id"].as_u64());
+        finished_job.stage_output_refs = vec![
+            format!(
+                "office:{:?}:units:{}/{}",
+                office.format,
+                success_count,
+                manifest.unit_count()
+            )
+            .to_ascii_lowercase(),
+        ];
+        state
+            .jobs
+            .insert(finished_job.import_job_id, finished_job.clone());
+        let release = if version.is_some() {
+            Some(Self::make_release_locked(&mut state, scope)?)
+        } else {
+            None
+        };
+        let operation = state
+            .operations
+            .get_mut(&finished_job.operation_id)
+            .expect("queued operation");
+        operation.status = if version.is_some() {
+            OperationStatus::Succeeded
+        } else {
+            OperationStatus::Failed
+        };
+        operation.updated_at = Utc::now();
+        operation.result = Some(json!({
+            "source_id":source.source_id,
+            "source_version_id":version.as_ref().map(|v|v.source_version_id),
+            "knowledge_release_id":release.as_ref().map(|r|r.knowledge_release_id),
+            "completed_units":success_count,"failed_units":failed_count,
+            "total_units":manifest.unit_count(),"format":office.format
+        }));
+        if version.is_none() {
+            operation.error = Some(AppError::new(
+                ErrorCode::CapabilityMissing,
+                "no Office units could be parsed",
+            ));
+        }
+        let acceptance = ImportAcceptance {
+            client_item_id: format!("office:{}", finished_job.import_job_id),
+            status,
+            source: Some(source),
+            source_version: version,
+            import_job: Some(finished_job),
+            operation: Some(operation.clone()),
+            release,
+            error: operation.error.clone(),
+        };
+        let office = state.office_jobs.get_mut(&lease.job_id).expect("checked");
+        office.lease = None;
+        office.acceptance = Some(acceptance.clone());
+        Ok(acceptance)
+    }
+
+    async fn fail_office_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &OfficeParseLease,
+        code: &str,
+    ) -> Result<ImportAcceptance, AppError> {
+        if !office_document_error_code(code) {
+            return Err(AppError::invalid_request(
+                "unknown Office document failure code",
+            ));
+        }
+        let mut state = self.state.write().await;
+        let (job, office) = Self::checked_office_lease(&state, scope, lease)?;
+        if office.manifest.is_some() || !office.units.is_empty() {
+            return Err(AppError::conflict("Office unit results already recorded"));
+        }
+        let mut job = job.clone();
+        let format = office.format;
+        job.status = ImportStatus::Failed;
+        job.lease_until = None;
+        job.failed_units = 1;
+        job.errors = vec![json!({"code":code,"format":format})];
+        let source = state.sources.get(&job.source_id).cloned();
+        let operation = state
+            .operations
+            .get_mut(&job.operation_id)
+            .expect("queued operation");
+        operation.status = OperationStatus::Failed;
+        operation.updated_at = Utc::now();
+        operation.error = Some(
+            AppError::invalid_request("Office document could not be parsed")
+                .with_details(json!({"reason":code})),
+        );
+        let acceptance = ImportAcceptance {
+            client_item_id: format!("office:{}", job.import_job_id),
+            status: ImportStatus::Failed,
+            source,
+            source_version: None,
+            import_job: Some(job.clone()),
+            operation: Some(operation.clone()),
+            release: None,
+            error: operation.error.clone(),
+        };
+        state.jobs.insert(job.import_job_id, job);
+        let office = state.office_jobs.get_mut(&lease.job_id).expect("checked");
+        office.lease = None;
+        office.acceptance = Some(acceptance.clone());
+        Ok(acceptance)
+    }
+
+    async fn retry_office_parse(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+    ) -> Result<ImportJob, AppError> {
+        let mut state = self.state.write().await;
+        let prior = state
+            .jobs
+            .get(&job_id)
+            .filter(|job| Self::in_scope(scope, *job))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("Office parse job not found"))?;
+        if !matches!(prior.status, ImportStatus::Failed | ImportStatus::Partial) {
+            return Err(AppError::conflict("Office parse job is not retryable"));
+        }
+        let old_office = state
+            .office_jobs
+            .get(&job_id)
+            .ok_or_else(|| AppError::not_found("Office parse job not found"))?
+            .clone();
+        if let Some(existing) = state
+            .jobs
+            .values()
+            .find(|job| job.resumed_from == Some(job_id))
+        {
+            return Ok(existing.clone());
+        }
+        let source = state
+            .sources
+            .get(&prior.source_id)
+            .ok_or_else(|| AppError::not_found("Office source not found"))?;
+        if source.state != SourceState::Active {
+            return Err(AppError::conflict("Office source was removed"));
+        }
+        let operation = Operation::queued("knowledge.import", scope.clone());
+        let next = ImportJob {
+            import_job_id: Uuid::new_v4(),
+            operation_id: operation.id,
+            status: ImportStatus::Queued,
+            attempt: prior.attempt + 1,
+            stage: ImportStage::Parse,
+            source_version_id: None,
+            lease_until: None,
+            stage_output_refs: Vec::new(),
+            completed_units: old_office
+                .units
+                .values()
+                .filter(|unit| unit.is_success())
+                .count() as i32,
+            failed_units: 0,
+            errors: Vec::new(),
+            resumed_from: Some(job_id),
+            ..prior
+        };
+        let mut office = old_office;
+        office.created_at = operation.created_at;
+        office.lease = None;
+        office.acceptance = None;
+        office.units.retain(|_, result| result.is_success());
+        state.operations.insert(operation.id, operation);
+        state.office_jobs.insert(next.import_job_id, office);
+        state.jobs.insert(next.import_job_id, next.clone());
+        Ok(next)
+    }
+
+    async fn office_parse_operation(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+    ) -> Result<Option<Operation>, AppError> {
+        Self::require_project(scope)?;
+        let state = self.state.read().await;
+        Ok(state
+            .jobs
+            .get(&job_id)
+            .filter(|job| Self::in_scope(scope, *job) && state.office_jobs.contains_key(&job_id))
+            .and_then(|job| state.operations.get(&job.operation_id))
+            .cloned())
+    }
+
     async fn finish_pdf_parse(
         &self,
         scope: &TenantScope,
@@ -2617,6 +3300,268 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             .cloned())
     }
 
+    async fn office_parse_candidates(
+        &self,
+        after: Option<OfficeParseCursor>,
+        limit: usize,
+    ) -> Result<Vec<OfficeParseJobRef>, AppError> {
+        if self.docx_parser_profile.is_none() && self.xlsx_parser_profile.is_none() {
+            return Err(AppError::capability_missing(
+                "Office parser is not configured",
+            ));
+        }
+        let state = self.state.read().await;
+        let mut candidates = state
+            .office_jobs
+            .iter()
+            .filter_map(|(job_id, office)| {
+                let job = state.jobs.get(job_id)?;
+                let eligible = self.office_profile(office.format).is_some()
+                    && (job.status == ImportStatus::Queued
+                        || (job.status == ImportStatus::Running
+                            && office
+                                .lease
+                                .as_ref()
+                                .is_none_or(|lease| lease.expires_at <= Utc::now())));
+                let after_cursor = after.is_none_or(|cursor| {
+                    (office.created_at, *job_id) > (cursor.created_at, cursor.job_id)
+                });
+                (eligible && after_cursor).then_some(OfficeParseJobRef {
+                    scope: TenantScope::new(job.operator_id, job.tenant_id, Some(job.project_id)),
+                    job_id: *job_id,
+                    created_at: office.created_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| (candidate.created_at, candidate.job_id));
+        candidates.truncate(limit.min(1000));
+        Ok(candidates)
+    }
+
+    async fn claim_office_parse(
+        &self,
+        scope: &TenantScope,
+        job_id: Uuid,
+        lease_id: Uuid,
+        lease_seconds: i64,
+    ) -> Result<Option<OfficeParseLease>, AppError> {
+        Self::require_project(scope)?;
+        if !(1..=3600).contains(&lease_seconds) || lease_id.is_nil() {
+            return Err(AppError::invalid_request(
+                "invalid Office lease duration or ID",
+            ));
+        }
+        let mut state = self.state.write().await;
+        let Some(job) = state
+            .jobs
+            .get(&job_id)
+            .filter(|job| Self::in_scope(scope, *job))
+        else {
+            return Ok(None);
+        };
+        if !matches!(job.status, ImportStatus::Queued | ImportStatus::Running) {
+            return Ok(None);
+        }
+        let Some(office) = state.office_jobs.get_mut(&job_id) else {
+            return Ok(None);
+        };
+        if office
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at > Utc::now())
+        {
+            return Ok(None);
+        }
+        office.fencing_token += 1;
+        let lease = OfficeParseLease {
+            job_id,
+            lease_id,
+            fencing_token: office.fencing_token,
+            expires_at: Utc::now() + Duration::seconds(lease_seconds),
+        };
+        office.lease = Some(lease.clone());
+        let job = state.jobs.get_mut(&job_id).expect("scoped job");
+        job.status = ImportStatus::Running;
+        job.lease_until = Some(lease.expires_at);
+        let operation_id = job.operation_id;
+        if let Some(operation) = state.operations.get_mut(&operation_id) {
+            operation.status = OperationStatus::Running;
+            operation.updated_at = Utc::now();
+        }
+        Ok(Some(lease))
+    }
+
+    async fn renew_office_parse(
+        &self,
+        scope: &TenantScope,
+        lease: &OfficeParseLease,
+        lease_seconds: i64,
+    ) -> Result<Option<OfficeParseLease>, AppError> {
+        if !(1..=3600).contains(&lease_seconds) {
+            return Err(AppError::invalid_request("invalid Office lease duration"));
+        }
+        let mut state = self.state.write().await;
+        if Self::checked_office_lease(&state, scope, lease).is_err() {
+            return Ok(None);
+        }
+        let renewed = OfficeParseLease {
+            expires_at: Utc::now() + Duration::seconds(lease_seconds),
+            ..lease.clone()
+        };
+        state
+            .office_jobs
+            .get_mut(&lease.job_id)
+            .expect("checked")
+            .lease = Some(renewed.clone());
+        state
+            .jobs
+            .get_mut(&lease.job_id)
+            .expect("checked")
+            .lease_until = Some(renewed.expires_at);
+        Ok(Some(renewed))
+    }
+
+    async fn office_parse_input(
+        &self,
+        scope: &TenantScope,
+        lease: &OfficeParseLease,
+    ) -> Result<OfficeParseInput, AppError> {
+        let state = self.state.read().await;
+        let (job, office) = Self::checked_office_lease(&state, scope, lease)?;
+        let object = state
+            .stored_objects
+            .get(&office.object_id)
+            .filter(|object| Self::in_scope(scope, *object))
+            .ok_or_else(|| AppError::not_found("Office object not found"))?;
+        let bytes = state
+            .object_bytes
+            .get(&office.object_id)
+            .ok_or_else(|| AppError::not_found("Office bytes not found"))?;
+        if object.actual_size != bytes.len() as u64
+            || sha256_hex(bytes) != object.sha256
+            || job.input_hash != object.sha256
+            || object.detected_media_type != office.format.media_type()
+        {
+            return Err(AppError::conflict(
+                "Office original bytes or media type changed",
+            ));
+        }
+        let mut successful_units = office
+            .units
+            .iter()
+            .filter_map(|(id, result)| result.is_success().then_some(*id))
+            .collect::<Vec<_>>();
+        successful_units.sort_unstable();
+        Ok(OfficeParseInput {
+            bytes: bytes.clone(),
+            input_sha256: object.sha256.clone(),
+            media_type: object.detected_media_type.clone(),
+            parser_profile: office.parser_profile.clone(),
+            successful_units,
+            manifest: office.manifest.clone(),
+        })
+    }
+
+    async fn record_office_manifest(
+        &self,
+        scope: &TenantScope,
+        lease: &OfficeParseLease,
+        manifest: OfficeDocumentManifest,
+    ) -> Result<(), AppError> {
+        let mut state = self.state.write().await;
+        let (job, office) = Self::checked_office_lease(&state, scope, lease)?;
+        manifest.validate(&job.input_hash, &office.parser_profile)?;
+        if manifest.format() != office.format
+            || office.manifest.as_ref().is_some_and(|old| old != &manifest)
+        {
+            return Err(AppError::conflict(
+                "Office format or manifest changed across retries",
+            ));
+        }
+        state
+            .office_jobs
+            .get_mut(&lease.job_id)
+            .expect("checked")
+            .manifest = Some(manifest);
+        Ok(())
+    }
+
+    async fn record_office_unit(
+        &self,
+        scope: &TenantScope,
+        lease: &OfficeParseLease,
+        result: OfficeUnitResult,
+    ) -> Result<(), AppError> {
+        let mut state = self.state.write().await;
+        let (_, office) = Self::checked_office_lease(&state, scope, lease)?;
+        let manifest = office
+            .manifest
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("Office manifest not recorded"))?;
+        result.validate(manifest)?;
+        if let Some(old) = office.units.get(&result.unit_id()) {
+            if old == &result {
+                return Ok(());
+            }
+            if old.is_success() {
+                return Err(AppError::conflict(
+                    "successful Office unit cannot be overwritten",
+                ));
+            }
+        }
+        let total = office
+            .units
+            .iter()
+            .filter(|(id, unit)| **id != result.unit_id() && unit.is_success())
+            .filter_map(|(_, unit)| serde_json::to_vec(unit).ok().map(|value| value.len()))
+            .sum::<usize>()
+            .saturating_add(if result.is_success() {
+                serde_json::to_vec(&result)
+                    .map_err(|_| AppError::invalid_request("invalid Office unit"))?
+                    .len()
+            } else {
+                0
+            });
+        let empty = result.is_success()
+            && office_unit_chunks(scope, Uuid::nil(), manifest, &result, 0)?.is_empty();
+        let result = if empty {
+            OfficeUnitResult::Failure {
+                unit_id: result.unit_id(),
+                code: "empty_text".to_owned(),
+            }
+        } else if result.is_success() && total > OFFICE_MAX_DOCUMENT_TEXT_BYTES {
+            OfficeUnitResult::Failure {
+                unit_id: result.unit_id(),
+                code: "unit_limit".to_owned(),
+            }
+        } else {
+            result
+        };
+        let office = state.office_jobs.get_mut(&lease.job_id).expect("checked");
+        office.units.insert(result.unit_id(), result);
+        let completed = office
+            .units
+            .values()
+            .filter(|unit| unit.is_success())
+            .count() as i32;
+        let mut errors = office
+            .units
+            .iter()
+            .filter_map(|(id, result)| match result {
+                OfficeUnitResult::Failure { code, .. } => {
+                    Some(json!({"unit_id":id,"format":office.format,"code":code}))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        errors.sort_by_key(|entry| entry["unit_id"].as_u64());
+        let job = state.jobs.get_mut(&lease.job_id).expect("checked");
+        job.completed_units = completed;
+        job.failed_units = errors.len() as i32;
+        job.errors = errors;
+        Ok(())
+    }
+
     async fn create_upload_session(
         &self,
         scope: &TenantScope,
@@ -2783,6 +3728,11 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 .stored_objects
                 .insert(object.object_id, object.clone());
             self.queue_pdf_locked(&mut state, scope, &item, &object)
+        } else if let Some(format) = self.queued_office_format(&session.declared_media_type) {
+            state
+                .stored_objects
+                .insert(object.object_id, object.clone());
+            self.queue_office_locked(&mut state, scope, &item, &object, format)
         } else {
             let result = Self::failed_missing_adapter(scope, &item, "document_parser");
             if let Some(source) = &result.source {
@@ -3083,6 +4033,12 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                             && self.pdf_parser_profile.is_some()
                         {
                             return Ok(self.queue_pdf_locked(&mut state, scope, &item, &object));
+                        }
+                        if let Some(format) = self.queued_office_format(&object.detected_media_type)
+                        {
+                            return Ok(
+                                self.queue_office_locked(&mut state, scope, &item, &object, format)
+                            );
                         }
                         if !is_supported_knowledge_media_type(&object.detected_media_type) {
                             return Err(AppError::capability_missing(

@@ -77,6 +77,22 @@ fn validate_recorded_return(
     }
     let invalid = |_: String| HostOpError::internal(op, "typed host result does not match request");
     match op {
+        HostOp::ProjectCurrent | HostOp::ProjectRevise => {
+            let response: ProjectCurrentResult = typed(op, result)?;
+            response.validate_for(scope).map_err(invalid)?;
+        }
+        HostOp::ProjectStart => {
+            let response: geo_domain::ProjectStartAcceptance = typed(op, result)?;
+            if response.operation_id.is_nil()
+                || response.cycle_id.is_nil()
+                || response.config_revision_id.is_nil()
+            {
+                return Err(HostOpError::internal(
+                    op,
+                    "project acceptance lacks durable references",
+                ));
+            }
+        }
         HostOp::KnowledgeSearch => {
             let response: KnowledgeSearchResult = typed(op, result)?;
             if response.capability_missing.is_some() {
@@ -125,6 +141,21 @@ fn validate_recorded_return(
                     "question revision returned another set",
                 ));
             }
+        }
+        HostOp::MeasurementOptions => {
+            let requested: MeasurementOptionsRequest = typed(op, request)?;
+            let options: MeasurementOptionsResult = typed(op, result)?;
+            options.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::MeasurementPlanCreate => {
+            let requested: MeasurementPlanCreateRequest = typed(op, request)?;
+            let receipt: MeasurementPlanReceipt = typed(op, result)?;
+            receipt.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::MeasurementPlanRead => {
+            let requested: MeasurementPlanReadRequest = typed(op, request)?;
+            let status: MeasurementPlanStatus = typed(op, result)?;
+            status.validate_for(&requested).map_err(invalid)?;
         }
         HostOp::ChannelManifestRead => {
             let requested: ChannelManifestReadRequest = typed(op, request)?;
@@ -248,7 +279,81 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v10";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v12";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectCurrentRequest {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectEstimateRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectCurrentResult {
+    pub project: geo_domain::Project,
+    pub missing_fields: Vec<String>,
+    pub initial_sources_redacted: bool,
+    pub initial_source_count: usize,
+}
+
+impl ProjectCurrentResult {
+    pub fn validate_for(&self, scope: &TenantScope) -> Result<(), String> {
+        if self.project.scope() != *scope || self.project.revision < 1 {
+            return Err("project result has invalid scope or revision".into());
+        }
+        if !self.project.settings.initial_sources.is_empty()
+            || self.initial_sources_redacted != (self.initial_source_count > 0)
+        {
+            return Err("project source inputs must be redacted with explicit coverage".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectReviseRequest {
+    pub expected_revision: i64,
+    pub idempotency_key: String,
+    pub patch: serde_json::Value,
+    #[serde(default)]
+    pub source_version_ids: Vec<Uuid>,
+}
+
+impl ProjectReviseRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_project_command(self.expected_revision, &self.idempotency_key)?;
+        if !self.patch.is_object()
+            || self.source_version_ids.len() > 100
+            || self.source_version_ids.iter().any(Uuid::is_nil)
+        {
+            return Err("invalid project patch or source references".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectStartRequest {
+    pub expected_revision: i64,
+    pub idempotency_key: String,
+}
+
+impl ProjectStartRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_project_command(self.expected_revision, &self.idempotency_key)
+    }
+}
+
+fn validate_project_command(revision: i64, key: &str) -> Result<(), String> {
+    if revision < 1 || key.trim().is_empty() || key.len() > 200 {
+        return Err("positive revision and bounded idempotency key are required".into());
+    }
+    Ok(())
+}
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -303,6 +408,9 @@ pub enum HostOp {
     QuestionDiscover,
     QuestionCreate,
     QuestionRevise,
+    MeasurementOptions,
+    MeasurementPlanCreate,
+    MeasurementPlanRead,
     ChannelManifestRead,
     ChannelTargetExecute,
     ContentItemsRead,
@@ -317,11 +425,15 @@ pub enum HostOp {
     DistributionRead,
     DistributionResume,
     DistributionTargetsRead,
+    ProjectCurrent,
+    ProjectRevise,
+    ProjectEstimate,
+    ProjectStart,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 29;
+    pub const COUNT: usize = 36;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -340,6 +452,9 @@ impl HostOp {
         Self::QuestionDiscover,
         Self::QuestionCreate,
         Self::QuestionRevise,
+        Self::MeasurementOptions,
+        Self::MeasurementPlanCreate,
+        Self::MeasurementPlanRead,
         Self::ChannelManifestRead,
         Self::ChannelTargetExecute,
         Self::ContentItemsRead,
@@ -354,6 +469,10 @@ impl HostOp {
         Self::DistributionRead,
         Self::DistributionResume,
         Self::DistributionTargetsRead,
+        Self::ProjectCurrent,
+        Self::ProjectRevise,
+        Self::ProjectEstimate,
+        Self::ProjectStart,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -374,6 +493,9 @@ impl HostOp {
             Self::QuestionDiscover => "question.discover.v1",
             Self::QuestionCreate => "question.create.v1",
             Self::QuestionRevise => "question.revise.v1",
+            Self::MeasurementOptions => "measurement.options.v1",
+            Self::MeasurementPlanCreate => "measurement.plan.create.v1",
+            Self::MeasurementPlanRead => "measurement.plan.read.v1",
             Self::ChannelManifestRead => "channel.manifest.read.v1",
             Self::ChannelTargetExecute => "channel.target.execute.v1",
             Self::ContentItemsRead => "content.items.read.v1",
@@ -388,6 +510,10 @@ impl HostOp {
             Self::DistributionRead => "distribution.read.v1",
             Self::DistributionResume => "distribution.resume.v1",
             Self::DistributionTargetsRead => "distribution.targets.read.v1",
+            Self::ProjectCurrent => "project.current.v1",
+            Self::ProjectRevise => "project.revise.v1",
+            Self::ProjectEstimate => "project.estimate.v1",
+            Self::ProjectStart => "project.start.v1",
         }
     }
 
@@ -409,6 +535,9 @@ impl HostOp {
             Self::QuestionDiscover => "op_host_question_discover_v1",
             Self::QuestionCreate => "op_host_question_create_v1",
             Self::QuestionRevise => "op_host_question_revise_v1",
+            Self::MeasurementOptions => "op_host_measurement_options_v1",
+            Self::MeasurementPlanCreate => "op_host_measurement_plan_create_v1",
+            Self::MeasurementPlanRead => "op_host_measurement_plan_read_v1",
             Self::ChannelManifestRead => "op_host_channel_manifest_read_v1",
             Self::ChannelTargetExecute => "op_host_channel_target_execute_v1",
             Self::ContentItemsRead => "op_host_content_items_read_v1",
@@ -423,6 +552,10 @@ impl HostOp {
             Self::DistributionRead => "op_host_distribution_read_v1",
             Self::DistributionResume => "op_host_distribution_resume_v1",
             Self::DistributionTargetsRead => "op_host_distribution_targets_read_v1",
+            Self::ProjectCurrent => "op_host_project_current_v1",
+            Self::ProjectRevise => "op_host_project_revise_v1",
+            Self::ProjectEstimate => "op_host_project_estimate_v1",
+            Self::ProjectStart => "op_host_project_start_v1",
         }
     }
 
@@ -459,7 +592,30 @@ impl HostOpLimits {
 /// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostOpBudgets {
+    #[serde(with = "host_op_limits_array")]
     limits: [HostOpLimits; HostOp::COUNT],
+}
+
+// Serde's built-in fixed-array implementations stop at 32 entries. Keep the
+// existing array-shaped wire contract and reject truncated/extra budgets.
+mod host_op_limits_array {
+    use super::{HostOp, HostOpLimits};
+    use serde::{Deserialize, Serialize};
+
+    pub fn serialize<S: serde::Serializer>(
+        limits: &[HostOpLimits; HostOp::COUNT],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        limits.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[HostOpLimits; HostOp::COUNT], D::Error> {
+        Vec::<HostOpLimits>::deserialize(deserializer)?
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("host-op budget count does not match version"))
+    }
 }
 
 impl Default for HostOpBudgets {
@@ -481,6 +637,9 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(15_000, 64), // metadata-only question discovery
                 HostOpLimits::new(60_000, 16), // scoped question-set creation
                 HostOpLimits::new(60_000, 16), // optimistic question-set revision
+                HostOpLimits::new(60_000, 16), // live model menu and saved identity
+                HostOpLimits::new(120_000, 16), // scoped durable standalone scheduling
+                HostOpLimits::new(15_000, 64), // actual persisted target status
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 128), // paged content reads
@@ -495,6 +654,10 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(15_000, 64),  // manifest state
                 HostOpLimits::new(120_000, 32), // bounded expansion/revisit
                 HostOpLimits::new(15_000, 128), // paged target reads
+                HostOpLimits::new(15_000, 16),  // project read
+                HostOpLimits::new(30_000, 8),   // project revision
+                HostOpLimits::new(15_000, 16),  // project estimate
+                HostOpLimits::new(60_000, 4),   // project start acceptance
             ],
         }
     }
@@ -836,6 +999,50 @@ pub trait HostOps: Send + Sync {
         ))
     }
 
+    async fn project_current(
+        &self,
+        _scope: &TenantScope,
+        _request: ProjectCurrentRequest,
+    ) -> Result<ProjectCurrentResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ProjectCurrent,
+            "project onboarding is not configured",
+        ))
+    }
+
+    async fn project_revise(
+        &self,
+        _scope: &TenantScope,
+        _request: ProjectReviseRequest,
+    ) -> Result<ProjectCurrentResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ProjectRevise,
+            "project onboarding is not configured",
+        ))
+    }
+
+    async fn project_estimate(
+        &self,
+        _scope: &TenantScope,
+        _request: ProjectEstimateRequest,
+    ) -> Result<serde_json::Value, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ProjectEstimate,
+            "project onboarding is not configured",
+        ))
+    }
+
+    async fn project_start(
+        &self,
+        _scope: &TenantScope,
+        _request: ProjectStartRequest,
+    ) -> Result<geo_domain::ProjectStartAcceptance, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ProjectStart,
+            "project onboarding is not configured",
+        ))
+    }
+
     async fn question_discover(
         &self,
         _scope: &TenantScope,
@@ -866,6 +1073,39 @@ pub trait HostOps: Send + Sync {
         Err(HostOpError::capability_missing(
             HostOp::QuestionRevise,
             "question-set revision is not configured",
+        ))
+    }
+
+    async fn measurement_options(
+        &self,
+        _scope: &TenantScope,
+        _request: MeasurementOptionsRequest,
+    ) -> Result<MeasurementOptionsResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::MeasurementOptions,
+            "website model discovery is not configured",
+        ))
+    }
+
+    async fn measurement_plan_create(
+        &self,
+        _scope: &TenantScope,
+        _request: MeasurementPlanCreateRequest,
+    ) -> Result<MeasurementPlanReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::MeasurementPlanCreate,
+            "standalone measurement planning is not configured",
+        ))
+    }
+
+    async fn measurement_plan_read(
+        &self,
+        _scope: &TenantScope,
+        _request: MeasurementPlanReadRequest,
+    ) -> Result<MeasurementPlanStatus, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::MeasurementPlanRead,
+            "standalone measurement reads are not configured",
         ))
     }
 
@@ -1330,6 +1570,183 @@ pub struct QuestionWriteReceipt {
     pub revision: u32,
     pub optimization_count: u32,
     pub evaluation_count: u32,
+}
+
+/// An account reference is resolved against the Rust-bound project and its
+/// saved browser identity. No provider endpoint or session reaches the isolate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementOptionsRequest {
+    pub account_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementModelOption {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementOptionsResult {
+    pub account_id: Uuid,
+    pub models: Vec<MeasurementModelOption>,
+    pub selected_model: Option<String>,
+}
+
+impl MeasurementOptionsResult {
+    pub fn validate_for(&self, request: &MeasurementOptionsRequest) -> Result<(), String> {
+        let mut ids = HashSet::new();
+        if self.account_id != request.account_id
+            || self.models.is_empty()
+            || self.models.len() > 64
+            || self.models.iter().any(|model| {
+                model.id.is_empty()
+                    || model.id.len() > 128
+                    || !model
+                        .id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+                    || model.label.trim().is_empty()
+                    || model.label.chars().count() > 200
+                    || model.label.chars().any(char::is_control)
+                    || !ids.insert(&model.id)
+            })
+            || self
+                .selected_model
+                .as_ref()
+                .is_some_and(|id| !ids.contains(id))
+        {
+            return Err("measurement options are not a scoped observed model menu".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementPlanCreateRequest {
+    pub account_id: Uuid,
+    pub question: String,
+    pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl MeasurementPlanCreateRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.account_id.is_nil()
+            || self.question.trim().is_empty()
+            || self.question.len() > 4000
+            || self.idempotency_key.trim().is_empty()
+            || self.idempotency_key.len() > 200
+            || self
+                .model
+                .as_ref()
+                .is_some_and(|model| model.is_empty() || model.len() > 128)
+        {
+            return Err("measurement account, bounded question and stable key are required".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementPlanReceipt {
+    pub plan_id: Uuid,
+    pub target_id: Uuid,
+    pub account_id: Uuid,
+    pub model: String,
+    pub state: String,
+}
+
+impl MeasurementPlanReceipt {
+    pub fn validate_for(&self, request: &MeasurementPlanCreateRequest) -> Result<(), String> {
+        if self.plan_id.is_nil()
+            || self.target_id.is_nil()
+            || self.account_id != request.account_id
+            || self.model.is_empty()
+            || self.state != "accepted"
+            || request
+                .model
+                .as_ref()
+                .is_some_and(|model| model != &self.model)
+        {
+            return Err("measurement plan acceptance lacks matching durable references".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementPlanReadRequest {
+    pub plan_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementTargetStatus {
+    pub target_id: Uuid,
+    pub state: String,
+    pub surface: String,
+    pub outcome_status: Option<geo_domain::ChannelOutcomeStatus>,
+    pub fixture: Option<bool>,
+    pub received_at: Option<DateTime<Utc>>,
+    /// Exact live, ad-hoc answer when it fits in the bounded tool response.
+    /// Otherwise the target ID points to the full scoped result detail.
+    pub answer: Option<String>,
+    pub answer_available: bool,
+    pub citations: Vec<String>,
+    pub citations_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementPlanStatus {
+    pub plan_id: Uuid,
+    pub targets: Vec<MeasurementTargetStatus>,
+}
+
+impl MeasurementPlanStatus {
+    pub fn validate_for(&self, request: &MeasurementPlanReadRequest) -> Result<(), String> {
+        let mut ids = HashSet::new();
+        if self.plan_id != request.plan_id
+            || self.targets.is_empty()
+            || self.targets.len() > 100
+            || self.targets.iter().any(|target| {
+                target.target_id.is_nil()
+                    || !ids.insert(target.target_id)
+                    || !matches!(target.state.as_str(), "queued" | "attempting" | "completed")
+                    || target.surface != "consumer_web"
+                    || (target.state == "completed") != target.outcome_status.is_some()
+                    || target.outcome_status.is_some() != target.fixture.is_some()
+                    || target.outcome_status.is_some() != target.received_at.is_some()
+                    || target
+                        .answer
+                        .as_ref()
+                        .is_some_and(|answer| answer.len() > 16 * 1024)
+                    || target.answer.is_some() && !target.answer_available
+                    || !target.citations.is_empty() && !target.citations_available
+                    || target.citations.len() > 50
+                    || target.citations.iter().any(|url| url.len() > 2048)
+                    || (target.answer_available || target.citations_available)
+                        && (target.fixture != Some(false)
+                            || !matches!(
+                                target.outcome_status,
+                                Some(
+                                    geo_domain::ChannelOutcomeStatus::Observed
+                                        | geo_domain::ChannelOutcomeStatus::Refused
+                                )
+                            ))
+            })
+        {
+            return Err("measurement plan status is invalid or unrelated".into());
+        }
+        Ok(())
+    }
 }
 
 impl QuestionDiscoverRequest {
@@ -2770,6 +3187,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn standalone_measurement_surface_rejects_protocol_injection_and_false_success() {
+        let account_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let command = MeasurementPlanCreateRequest {
+            account_id,
+            question: "How do rain gauges work?".into(),
+            idempotency_key: "stable-question".into(),
+            model: None,
+        };
+        assert!(command.validate().is_ok());
+        let mut injected = serde_json::to_value(&command).unwrap();
+        injected["cycle_id"] = serde_json::json!(Uuid::new_v4());
+        assert!(serde_json::from_value::<MeasurementPlanCreateRequest>(injected).is_err());
+        let receipt = MeasurementPlanReceipt {
+            plan_id,
+            target_id,
+            account_id,
+            model: "observed-model".into(),
+            state: "accepted".into(),
+        };
+        assert!(receipt.validate_for(&command).is_ok());
+        let mut forged = receipt.clone();
+        forged.state = "succeeded".into();
+        assert!(forged.validate_for(&command).is_err());
+        let requested = MeasurementPlanReadRequest { plan_id };
+        let status = MeasurementPlanStatus {
+            plan_id,
+            targets: vec![MeasurementTargetStatus {
+                target_id,
+                state: "queued".into(),
+                surface: "consumer_web".into(),
+                outcome_status: None,
+                fixture: None,
+                received_at: None,
+                answer: None,
+                answer_available: false,
+                citations: vec![],
+                citations_available: false,
+            }],
+        };
+        assert!(status.validate_for(&requested).is_ok());
+        let mut forged_status = status.clone();
+        forged_status.targets[0].outcome_status = Some(geo_domain::ChannelOutcomeStatus::Observed);
+        assert!(forged_status.validate_for(&requested).is_err());
+        let mut evidence_pointer = status.clone();
+        evidence_pointer.targets[0].state = "completed".into();
+        evidence_pointer.targets[0].outcome_status =
+            Some(geo_domain::ChannelOutcomeStatus::Observed);
+        evidence_pointer.targets[0].fixture = Some(false);
+        evidence_pointer.targets[0].received_at = Some(Utc::now());
+        evidence_pointer.targets[0].answer_available = true;
+        assert!(evidence_pointer.validate_for(&requested).is_ok());
+        evidence_pointer.targets[0].fixture = Some(true);
+        assert!(evidence_pointer.validate_for(&requested).is_err());
+        let mut leaked = serde_json::to_value(status).unwrap();
+        leaked["targets"][0]["raw_answer"] = serde_json::json!("evaluation text");
+        assert!(serde_json::from_value::<MeasurementPlanStatus>(leaked).is_err());
+    }
+
+    #[test]
     fn import_progress_never_admits_unready_release_or_incomplete_success() {
         let job = Uuid::new_v4();
         let mut progress = geo_domain::KnowledgeImportProgress {
@@ -2820,6 +3298,16 @@ mod tests {
         assert_eq!(names.len(), HostOp::COUNT);
         assert_eq!(op_names.len(), HostOp::COUNT);
         assert_eq!(slots.len(), HostOp::COUNT);
+    }
+
+    #[test]
+    fn expanded_host_budgets_round_trip_and_reject_missing_slots() {
+        let budgets = HostOpBudgets::default();
+        let mut value = serde_json::to_value(budgets).unwrap();
+        let restored: HostOpBudgets = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.limits(HostOp::ProjectStart).max_calls, 4);
+        value["limits"].as_array_mut().unwrap().pop();
+        assert!(serde_json::from_value::<HostOpBudgets>(value).is_err());
     }
 
     #[test]

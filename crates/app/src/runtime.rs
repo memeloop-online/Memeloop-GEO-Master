@@ -1,15 +1,18 @@
-//! Opt-in local development runtime assembly. A process-wide key must never
-//! become a tenant-aware Token Center substitute in a durable deployment.
+//! Opt-in local development runtime assembly. Persistent development use
+//! checks the exact server-owned scope before a process-wide key is resolved.
 
 use std::{fmt, io::Read, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use geo_api::{
-    AppState, EmbeddedAgentRuntime, ProviderClientBridge, RepositoryHostOps, SharedModelProvider,
+    AppState, EmbeddedAgentRuntime, ModelProviderBridge, ProviderClientBridge, RepositoryHostOps,
+    SharedModelProvider,
 };
+use geo_domain::TenantScope;
 use geo_provider::{
     HttpTransport, ProviderClient, ProviderError, ResolvedToken, SecretRef, TokenCenter, Transport,
 };
+use geo_worker::{HostOp, HostOpError, ModelCompletion, ModelCompletionRequest};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -37,6 +40,32 @@ pub enum AssemblyError {
 
 struct LocalTokenCenter {
     token: ResolvedToken,
+}
+
+/// This wrapper is attached only to the opt-in PostgreSQL development path.
+/// Authorization happens before the inner bridge can resolve its secret or
+/// touch the HTTP transport. A missing project in the pin permits all projects
+/// within the pinned operator and tenant; a present project must match exactly.
+struct PinnedDevelopmentProvider {
+    scope: TenantScope,
+    inner: SharedModelProvider,
+}
+
+#[async_trait]
+impl ModelProviderBridge for PinnedDevelopmentProvider {
+    async fn complete(
+        &self,
+        scope: &TenantScope,
+        request: &ModelCompletionRequest,
+    ) -> Result<ModelCompletion, HostOpError> {
+        if !self.scope.contains(scope) {
+            return Err(HostOpError::denied(
+                HostOp::ModelComplete,
+                "development model unavailable for this scope",
+            ));
+        }
+        self.inner.complete(scope, request).await
+    }
 }
 
 impl fmt::Debug for LocalTokenCenter {
@@ -78,6 +107,32 @@ fn assemble_with_transport<T: Transport + 'static>(
 ) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
     let bridge = provider_bridge(ai, transport)?;
     assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, Arc::new(bridge))
+}
+
+pub fn assemble_persistent(
+    state: &AppState,
+    ai: &DevelopmentAiConfig,
+    scope: &TenantScope,
+) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
+    assemble_persistent_with_transport(
+        state,
+        ai,
+        scope,
+        Arc::new(HttpTransport::new().map_err(|_| AssemblyError::ProviderConfiguration)?),
+    )
+}
+
+fn assemble_persistent_with_transport<T: Transport + 'static>(
+    state: &AppState,
+    ai: &DevelopmentAiConfig,
+    scope: &TenantScope,
+    transport: Arc<T>,
+) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
+    let provider = Arc::new(PinnedDevelopmentProvider {
+        scope: scope.clone(),
+        inner: Arc::new(provider_bridge(ai, transport)?),
+    });
+    assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, provider)
 }
 
 pub(crate) fn load_verified_bundle(path: &str, sha256: &str) -> Result<String, AssemblyError> {
@@ -278,6 +333,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_dev_provider_denies_other_scopes_before_transport() {
+        let ai = DevelopmentAiConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "fake-test-only-secret".into(),
+            model: "local-model".into(),
+            bundle_path: String::new(),
+            bundle_sha256: String::new(),
+        };
+        let transport = Arc::new(FakeTransport::default());
+        let pinned = TenantScope::new(
+            uuid::Uuid::new_v4().into(),
+            uuid::Uuid::new_v4().into(),
+            Some(uuid::Uuid::new_v4().into()),
+        );
+        let bridge = PinnedDevelopmentProvider {
+            scope: pinned.clone(),
+            inner: Arc::new(provider_bridge(&ai, Arc::clone(&transport)).unwrap()),
+        };
+        let request = ModelCompletionRequest {
+            prompt: "question".into(),
+            system: None,
+            model: None,
+            max_output_tokens: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let denied = [
+            TenantScope::new(
+                uuid::Uuid::new_v4().into(),
+                pinned.tenant_id,
+                pinned.project_id,
+            ),
+            TenantScope::new(
+                pinned.operator_id,
+                uuid::Uuid::new_v4().into(),
+                pinned.project_id,
+            ),
+            TenantScope::new(pinned.operator_id, pinned.tenant_id, None),
+            TenantScope::new(
+                pinned.operator_id,
+                pinned.tenant_id,
+                Some(uuid::Uuid::new_v4().into()),
+            ),
+        ];
+        for scope in denied {
+            let error = bridge.complete(&scope, &request).await.unwrap_err();
+            assert_eq!(error.code, geo_worker::HostOpErrorCode::Denied);
+            assert_eq!(*transport.0.lock().unwrap(), 0);
+        }
+        assert_eq!(
+            bridge.complete(&pinned, &request).await.unwrap().text,
+            "local answer"
+        );
+        assert_eq!(*transport.0.lock().unwrap(), 1);
+        let tenant_wide = PinnedDevelopmentProvider {
+            scope: TenantScope::new(pinned.operator_id, pinned.tenant_id, None),
+            inner: Arc::new(provider_bridge(&ai, Arc::clone(&transport)).unwrap()),
+        };
+        tenant_wide.complete(&pinned, &request).await.unwrap();
+        assert_eq!(*transport.0.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
     #[ignore = "requires `pnpm agent:bundle`; generated ESM is intentionally not tracked"]
     async fn generated_bundle_runs_one_turn_through_assembled_provider() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -292,14 +410,15 @@ mod tests {
         };
         let transport = Arc::new(FakeTransport(Mutex::new(0), true));
         let state = AppState::development();
-        let runtime = assemble_with_transport(&state, &ai, Arc::clone(&transport))
-            .expect("generated bundle must pass size, encoding, and digest validation");
-        let repository = state.agent_repository();
         let run_scope = TenantScope::new(
             uuid::Uuid::from_u128(1).into(),
             uuid::Uuid::from_u128(2).into(),
             Some(uuid::Uuid::from_u128(3).into()),
         );
+        let runtime =
+            assemble_persistent_with_transport(&state, &ai, &run_scope, Arc::clone(&transport))
+                .expect("generated bundle must pass size, encoding, and digest validation");
+        let repository = state.agent_repository();
         let conversation = repository
             .create_conversation(&run_scope, None, CreateConversation::default())
             .await

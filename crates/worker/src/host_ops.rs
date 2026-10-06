@@ -28,10 +28,64 @@ use crate::host::{
     DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
     DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
     KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeSearchRequest,
-    KnowledgeSearchResult, ManifestReadRequest, MeasureRequest, ModelCompletionRequest,
+    KnowledgeSearchResult, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
+    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
+    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
     PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
     ReportPreviewRequest, ReportReduceRequest, validate_question_create,
 };
+
+macro_rules! project_op {
+    ($name:ident, $variant:ident, $request:ty, $method:ident, $validate:expr) => {
+        #[op2]
+        #[string]
+        pub async fn $name(
+            state: Rc<RefCell<OpState>>,
+            #[string] payload: String,
+        ) -> Result<String, JsErrorBox> {
+            let op = HostOp::$variant;
+            let bridge = bridge(&state.borrow())?;
+            let request = parse_request::<$request>(op, &payload)?;
+            ($validate)(&request)
+                .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+            let result = bridge
+                .invoke_recorded(op, &request.clone(), |bridge| async move {
+                    bridge.capabilities().$method(bridge.scope(), request).await
+                })
+                .await?;
+            Ok(encode(op, &result)?)
+        }
+    };
+}
+
+project_op!(
+    op_host_project_current_v1,
+    ProjectCurrent,
+    ProjectCurrentRequest,
+    project_current,
+    |_: &ProjectCurrentRequest| Ok::<(), String>(())
+);
+project_op!(
+    op_host_project_estimate_v1,
+    ProjectEstimate,
+    ProjectEstimateRequest,
+    project_estimate,
+    |_: &ProjectEstimateRequest| Ok::<(), String>(())
+);
+project_op!(
+    op_host_project_revise_v1,
+    ProjectRevise,
+    ProjectReviseRequest,
+    project_revise,
+    ProjectReviseRequest::validate
+);
+project_op!(
+    op_host_project_start_v1,
+    ProjectStart,
+    ProjectStartRequest,
+    project_start,
+    ProjectStartRequest::validate
+);
 
 #[op2]
 #[string]
@@ -395,6 +449,81 @@ pub async fn op_host_question_revise_v1(
         )));
     }
     Ok(encode(op, &receipt)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_measurement_options_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::MeasurementOptions;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<MeasurementOptionsRequest>(op, &payload)?;
+    if request.account_id.is_nil() {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "account ID must be non-zero",
+        )));
+    }
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .measurement_options(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_measurement_plan_create_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::MeasurementPlanCreate;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<MeasurementPlanCreateRequest>(op, &payload)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .measurement_plan_create(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_measurement_plan_read_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::MeasurementPlanRead;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<MeasurementPlanReadRequest>(op, &payload)?;
+    if request.plan_id.is_nil() {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "plan ID must be non-zero",
+        )));
+    }
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .measurement_plan_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
 }
 
 #[op2]
@@ -805,6 +934,13 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::QuestionDiscover.op_name(),
     HostOp::QuestionCreate.op_name(),
     HostOp::QuestionRevise.op_name(),
+    HostOp::MeasurementOptions.op_name(),
+    HostOp::MeasurementPlanCreate.op_name(),
+    HostOp::MeasurementPlanRead.op_name(),
+    HostOp::ProjectCurrent.op_name(),
+    HostOp::ProjectRevise.op_name(),
+    HostOp::ProjectEstimate.op_name(),
+    HostOp::ProjectStart.op_name(),
     HostOp::ChannelManifestRead.op_name(),
     HostOp::ChannelTargetExecute.op_name(),
     HostOp::ContentItemsRead.op_name(),

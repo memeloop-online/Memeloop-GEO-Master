@@ -449,6 +449,48 @@ fn assert_success(record: &Value) -> Value {
 // The closed surface
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn project_onboarding_rejects_scope_overrides_and_missing_capabilities() {
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("current", () => hostOps.projectCurrent({}));
+        await attempt("foreign", () => hostOps.projectCurrent({project_id:"00000000-0000-4000-8000-000000000001"}));
+        await attempt("revise", () => hostOps.projectRevise({expected_revision:1,idempotency_key:"draft",patch:{brand_name:"Example"}}));
+        await attempt("invalid", () => hostOps.projectStart({expected_revision:0,idempotency_key:"start"}));
+        await attempt("estimate", () => hostOps.projectEstimate({}));
+        await attempt("start", () => hostOps.projectStart({expected_revision:1,idempotency_key:"start"}));
+        "#,
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for (topic, op) in [
+        ("current", "project_current"),
+        ("revise", "project_revise"),
+        ("estimate", "project_estimate"),
+        ("start", "project_start"),
+    ] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "capability_missing",
+            op,
+        );
+    }
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "foreign"),
+        "invalid_request",
+        "project_current",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "invalid"),
+        "invalid_request",
+        "project_start",
+    );
+}
+
 /// The registered surface is exactly the declared set: a capability added
 /// without being declared, or declared without a registered body, fails here.
 #[tokio::test]

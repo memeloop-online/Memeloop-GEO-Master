@@ -16,6 +16,7 @@ public final class PdfServer {
     private final Semaphore slots;
     private final int capacity;
     private static final String PAGE_PREFIX = "/v1/pdf/pages/";
+    private static final String OFFICE_PREFIX = "/v1/office/units/";
 
     public PdfServer(InetSocketAddress address, int maxConcurrent) throws IOException {
         if (maxConcurrent < 1 || maxConcurrent > 64)
@@ -67,8 +68,15 @@ public final class PdfServer {
                 } else {
                     respond(exchange, 200, "{\"schema_version\":\"" + PdfDocumentParser.SCHEMA
                             + "\",\"parser_version\":\"" + PdfDocumentParser.VERSION
-                            + "\",\"capacity\":" + capacity + "}");
+                            + "\",\"capacity\":" + capacity
+                            + ",\"office_schema_version\":\"" + OfficeDocumentParser.SCHEMA
+                            + "\",\"office_parser_version\":\"" + OfficeDocumentParser.VERSION
+                            + "\",\"office_capacity\":" + capacity + "}");
                 }
+                return;
+            }
+            if (path.equals("/v1/office/inspect") || path.startsWith(OFFICE_PREFIX)) {
+                handleOffice(exchange, path);
                 return;
             }
             boolean inspect = path.equals("/v1/pdf/inspect");
@@ -141,6 +149,68 @@ public final class PdfServer {
             respond(exchange, 400, error("invalid_request"));
         } finally {
             exchange.close();
+        }
+    }
+
+    private void handleOffice(HttpExchange exchange, String path) throws IOException {
+        boolean inspect = path.equals("/v1/office/inspect");
+        String unitPart = path.startsWith(OFFICE_PREFIX)
+                ? path.substring(OFFICE_PREFIX.length()) : "";
+        if (!inspect && !unitPart.matches("(0|[1-9][0-9]{0,4})/parse")) {
+            respond(exchange, 404, error("not_found"));
+            return;
+        }
+        if (!exchange.getRequestMethod().equals("POST")) {
+            respond(exchange, 405, error("method_not_allowed"));
+            return;
+        }
+        String mediaType = exchange.getRequestHeaders().getFirst("Content-Type");
+        if (!OfficeDocumentParser.DOCX.equals(mediaType)
+                && !OfficeDocumentParser.XLSX.equals(mediaType)) {
+            respond(exchange, 415, error("unsupported_media_type"));
+            return;
+        }
+        if (!slots.tryAcquire()) {
+            respond(exchange, 503, error("parser_busy"));
+            return;
+        }
+        try {
+            String advertised = exchange.getRequestHeaders().getFirst("Content-Length");
+            if (advertised != null) {
+                long size;
+                try {
+                    size = Long.parseLong(advertised);
+                } catch (NumberFormatException ex) {
+                    respond(exchange, 400, error("invalid_request"));
+                    return;
+                }
+                if (size < 0 || size > PdfDocumentParser.MAX_INPUT) {
+                    respond(exchange, size < 0 ? 400 : 413,
+                            error(size < 0 ? "invalid_request" : "input_too_large"));
+                    return;
+                }
+            }
+            byte[] bytes = readBounded(exchange);
+            Integer unit = inspect ? null : Integer.parseInt(unitPart.substring(0, unitPart.indexOf('/')));
+            var result = WorkerProcess.executeOffice(bytes, mediaType, unit);
+            if (result.error() == null) {
+                respond(exchange, 200, result.json());
+            } else {
+                int status = switch (result.error()) {
+                    case "parser_timeout" -> 504;
+                    case "parser_failed" -> 502;
+                    case "input_too_large" -> 413;
+                    case "unit_out_of_range" -> 404;
+                    case "unsupported_media_type" -> 415;
+                    case "unit_limit" -> 422;
+                    default -> 400;
+                };
+                respond(exchange, status, error(result.error()));
+            }
+        } catch (PdfDocumentParser.ParseFailure ex) {
+            respond(exchange, 413, error(ex.code()));
+        } finally {
+            slots.release();
         }
     }
 

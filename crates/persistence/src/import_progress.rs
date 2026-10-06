@@ -175,6 +175,14 @@ async fn load(
                 task.source_version_id AS task_version_id,task.object_id AS task_object_id,
                 task.object_version AS task_object_version,task.input_sha256 AS task_hash,
                 task.released_id,
+                office.import_job_id AS office_task_id,
+                office.source_id AS office_source_id,
+                office.source_version_id AS office_version_id,
+                office.object_id AS office_object_id,
+                office.object_version AS office_object_version,
+                office.input_sha256 AS office_hash,
+                office.media_type AS office_media_type,
+                office.released_id AS office_released_id,
                 op.operation_id AS actual_operation_id,op.kind AS operation_kind,
                 op.status AS operation_status,op.result AS operation_result,
                 obj.object_id AS actual_object_id,obj.object_version AS actual_object_version,
@@ -190,6 +198,9 @@ async fn load(
          LEFT JOIN knowledge_pdf_parse_tasks task
            ON task.operator_id=job.operator_id AND task.tenant_id=job.tenant_id
           AND task.project_id=job.project_id AND task.import_job_id=job.import_job_id
+         LEFT JOIN knowledge_office_parse_tasks office
+           ON office.operator_id=job.operator_id AND office.tenant_id=job.tenant_id
+          AND office.project_id=job.project_id AND office.import_job_id=job.import_job_id
          LEFT JOIN operations op
            ON op.operator_id=job.operator_id AND op.tenant_id=job.tenant_id
           AND op.project_id=job.project_id AND op.operation_id=job.operation_id
@@ -305,8 +316,15 @@ async fn load(
         }
         let is_pdf =
             row.get::<Option<String>, _>("object_media_type").as_deref() == Some("application/pdf");
+        let is_office = row
+            .get::<Option<String>, _>("object_media_type")
+            .is_some_and(|media| super::office_parse::is_office_media_type(&media));
         let task_id: Option<Uuid> = row.get("task_id");
-        if is_pdf != task_id.is_some() {
+        let office_task_id: Option<Uuid> = row.get("office_task_id");
+        if is_pdf != task_id.is_some()
+            || is_office != office_task_id.is_some()
+            || (task_id.is_some() && office_task_id.is_some())
+        {
             return Err(broken());
         }
         if let Some(task_id) = task_id
@@ -320,7 +338,22 @@ async fn load(
         {
             return Err(broken());
         }
-    } else if row.get::<Option<Uuid>, _>("task_id").is_some() {
+        if let Some(task_id) = office_task_id
+            && (task_id != job_id
+                || row.get::<Option<Uuid>, _>("office_source_id") != Some(source_id)
+                || row.get::<Option<Uuid>, _>("office_version_id") != Some(version_id)
+                || row.get::<Option<Uuid>, _>("office_object_id") != object_id
+                || row.get::<Option<i64>, _>("office_object_version")
+                    != row.get::<Option<i64>, _>("version_object_version")
+                || row.get::<Option<String>, _>("office_hash").as_deref() != Some(hash.as_str())
+                || row.get::<Option<String>, _>("office_media_type")
+                    != row.get::<Option<String>, _>("object_media_type"))
+        {
+            return Err(broken());
+        }
+    } else if row.get::<Option<Uuid>, _>("task_id").is_some()
+        || row.get::<Option<Uuid>, _>("office_task_id").is_some()
+    {
         return Err(broken());
     }
     let ready = matches!(status, ImportStatus::Succeeded | ImportStatus::Partial);
@@ -339,8 +372,14 @@ async fn load(
         {
             return Err(broken());
         }
-        release_id = if row.get::<Option<Uuid>, _>("task_id").is_some() {
-            let task_release: Option<Uuid> = row.get("released_id");
+        release_id = if row.get::<Option<Uuid>, _>("task_id").is_some()
+            || row.get::<Option<Uuid>, _>("office_task_id").is_some()
+        {
+            let task_release: Option<Uuid> = if row.get::<Option<Uuid>, _>("task_id").is_some() {
+                row.get("released_id")
+            } else {
+                row.get("office_released_id")
+            };
             if result.get("knowledge_release_id").and_then(Value::as_str)
                 != task_release.map(|v| v.to_string()).as_deref()
             {
@@ -377,7 +416,9 @@ async fn load(
         if !included {
             return Err(broken());
         }
-    } else if row.get::<Option<Uuid>, _>("released_id").is_some() {
+    } else if row.get::<Option<Uuid>, _>("released_id").is_some()
+        || row.get::<Option<Uuid>, _>("office_released_id").is_some()
+    {
         return Err(broken());
     }
     if let Some(receipt) = receipt
@@ -389,7 +430,12 @@ async fn load(
     }
     let raw_errors: Value = row.get("errors");
     let raw_errors = raw_errors.as_array().ok_or_else(broken)?;
-    let (error_count, errors) = knowledge_import_progress_errors(raw_errors);
+    let (stored_error_count, errors) = knowledge_import_progress_errors(raw_errors);
+    let error_count = if row.get::<Option<Uuid>, _>("office_task_id").is_some() {
+        (row.get::<i32, _>("failed_units").max(0) as u32).max(stored_error_count)
+    } else {
+        stored_error_count
+    };
     Ok(Some(KnowledgeImportProgress {
         import_job_id: Some(job_id),
         status,

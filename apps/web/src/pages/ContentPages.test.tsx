@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -11,7 +11,12 @@ import type {
   ContentExecution,
   ContentItem,
   ContentRevision,
+  StructuredDocument,
 } from "../api/content";
+import {
+  documentToEditor,
+  editorToDocument,
+} from "../components/StructuredContentEditor";
 
 const session = {
   user: { id: "user-1", login_name: "user@example.test", display_name: "User" },
@@ -224,6 +229,7 @@ function mockApi({
   cancelStatus = 200,
   forkStatus = 201,
   sourceAdvanced = false,
+  documentOverride,
 }: {
   executionList?: ContentExecution[];
   itemList?: ContentItem[];
@@ -235,10 +241,14 @@ function mockApi({
   cancelStatus?: number;
   forkStatus?: number;
   sourceAdvanced?: boolean;
+  documentOverride?: StructuredDocument;
 } = {}) {
   let persistedExecutions = executionList;
   let persistedItems = itemList;
   let forkedRevision: ContentRevision | undefined;
+  const editingRevision = documentOverride
+    ? { ...revision, document: documentOverride }
+    : revision;
   const requests = vi.fn((url: RequestInfo | URL, init?: RequestInit) => {
     const path = new URL(String(url), "http://localhost").pathname;
     if (path.endsWith("/auth/session"))
@@ -361,7 +371,7 @@ function mockApi({
           editStatus === 201
             ? json(
                 {
-                  ...revision,
+                  ...editingRevision,
                   revision_id: "revision-2",
                   revision: 2,
                   base_revision_id: "revision-1",
@@ -376,16 +386,16 @@ function mockApi({
         json(
           sourceAdvanced
             ? [
-                revision,
+                editingRevision,
                 {
-                  ...revision,
+                  ...editingRevision,
                   revision_id: "revision-2",
                   revision: 2,
                   base_revision_id: "revision-1",
                   document: { ...revision.document, title: "原资产后续修订" },
                 },
               ]
-            : [revision],
+            : [editingRevision],
         ),
       );
     }
@@ -426,6 +436,32 @@ function renderPage(path: string) {
     </FluentProvider>,
   );
 }
+
+function putCaretAtEnd(element: Element) {
+  const selection = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  range.collapse(false);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+  document.dispatchEvent(new Event("selectionchange"));
+}
+
+beforeEach(() => {
+  // jsdom omits layout methods that ProseMirror uses to place the caret.
+  Object.defineProperty(document, "elementFromPoint", {
+    configurable: true,
+    value: () => document.activeElement ?? document.body,
+  });
+  Object.defineProperty(Range.prototype, "getClientRects", {
+    configurable: true,
+    value: () => [],
+  });
+  Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+    configurable: true,
+    value: () => new DOMRect(0, 0, 0, 0),
+  });
+});
 
 afterEach(() => {
   setCsrfToken(undefined);
@@ -648,6 +684,73 @@ describe("P08 content assets", () => {
 });
 
 describe("P09 content revision", () => {
+  it("round-trips list captions and citations without touching the source version", () => {
+    const original: StructuredDocument = {
+      title: "有来源的指南",
+      blocks: [
+        revision.document.blocks[0],
+        {
+          block_id: "block-list",
+          kind: "list",
+          text: "有来源的项目",
+          citation_ids: ["chunk-1"],
+          items: ["第一项", "第二项"],
+        },
+      ],
+    };
+    expect(editorToDocument(documentToEditor(original), original)).toEqual(
+      original,
+    );
+    const duplicated = documentToEditor(original);
+    duplicated.content?.splice(1, 0, { ...duplicated.content[0] });
+    const split = editorToDocument(duplicated, original);
+    expect(split.blocks[1].block_id).not.toBe("block-1");
+    expect(split.blocks[1].citation_ids).toEqual(["chunk-1"]);
+    expect(split.blocks[2]).toEqual(original.blocks[1]);
+  });
+
+  it("merges separately cited paragraphs into one list with both source refs", () => {
+    const original: StructuredDocument = {
+      title: "有来源的指南",
+      blocks: [
+        revision.document.blocks[0],
+        {
+          block_id: "block-2",
+          kind: "paragraph",
+          text: "第二个有不同引用的段落",
+          citation_ids: ["chunk-2"],
+          items: [],
+        },
+      ],
+    };
+    const source = documentToEditor(original);
+    const merged = editorToDocument(
+      {
+        type: "doc",
+        content: [
+          {
+            type: "bulletList",
+            attrs: { geoBlockId: null, geoCitations: [] },
+            content: source.content?.map((paragraph) => ({
+              type: "listItem",
+              content: [paragraph],
+            })),
+          },
+        ],
+      },
+      original,
+    );
+    expect(merged.blocks).toEqual([
+      {
+        block_id: "block-1",
+        kind: "list",
+        text: "",
+        citation_ids: ["chunk-1", "chunk-2"],
+        items: ["原始正文", "第二个有不同引用的段落"],
+      },
+    ]);
+  });
+
   it("shows source evidence and forks a reused item with an optimistic base", async () => {
     const requests = mockApi({ itemList: [reusedItem, items[1]] });
     renderPage(
@@ -794,6 +897,257 @@ describe("P09 content revision", () => {
         ),
       ).toBe(true),
     );
+  });
+
+  it("saves Tiptap paragraph edits without changing block or citation identities", async () => {
+    const requests = mockApi();
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const paragraph = await screen.findByRole("textbox", {
+      name: "结构化正文",
+    });
+    await userEvent.click(paragraph);
+    putCaretAtEnd(within(paragraph).getByText("原始正文"));
+    await userEvent.keyboard("延展");
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const save = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      );
+      expect(save).toBeDefined();
+      const payload = JSON.parse(String(save?.[1]?.body));
+      expect(payload.base_revision_id).toBe("revision-1");
+      expect(payload.document.blocks).toEqual([
+        {
+          block_id: "block-1",
+          kind: "paragraph",
+          text: "原始正文延展",
+          citation_ids: ["chunk-1"],
+          items: [],
+        },
+      ]);
+    });
+  });
+
+  it("edits actual list items while preserving caption, citations and list structure", async () => {
+    const requests = mockApi({
+      documentOverride: {
+        title: revision.document.title,
+        blocks: [
+          ...revision.document.blocks,
+          {
+            block_id: "block-list",
+            kind: "list",
+            text: "有来源的项目",
+            citation_ids: ["chunk-1"],
+            items: ["第一项", "第二项"],
+          },
+        ],
+      },
+    });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", {
+      name: "结构化正文",
+    });
+    const item = within(body).getByText("第一项");
+    await userEvent.click(item);
+    putCaretAtEnd(item);
+    await userEvent.keyboard("{Enter}补充");
+    expect(
+      Array.from(body.querySelectorAll("li")).map((entry) => entry.textContent),
+    ).toEqual(["第一项", "补充", "第二项"]);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "保存新版本" })).toBeEnabled(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const save = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      );
+      expect(save).toBeDefined();
+      expect(JSON.parse(String(save?.[1]?.body)).document.blocks[1]).toEqual({
+        block_id: "block-list",
+        kind: "list",
+        text: "有来源的项目",
+        citation_ids: ["chunk-1"],
+        items: ["第一项", "补充", "第二项"],
+      });
+    });
+  });
+
+  it("uses native list conversion while retaining the paragraph citation and identity", async () => {
+    const requests = mockApi();
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    await userEvent.click(within(body).getByText("原始正文"));
+    await userEvent.click(screen.getByRole("button", { name: "列表" }));
+    expect(body.querySelectorAll("li")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const save = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      );
+      expect(save).toBeDefined();
+      expect(JSON.parse(String(save?.[1]?.body)).document.blocks[0]).toEqual({
+        block_id: "block-1",
+        kind: "list",
+        text: "",
+        citation_ids: ["chunk-1"],
+        items: ["原始正文"],
+      });
+    });
+  });
+
+  it("wraps multiple cited paragraphs with native list commands and restores them on undo", async () => {
+    const requests = mockApi({
+      documentOverride: {
+        title: revision.document.title,
+        blocks: [
+          revision.document.blocks[0],
+          {
+            block_id: "block-2",
+            kind: "paragraph",
+            text: "第二段",
+            citation_ids: ["chunk-1"],
+            items: [],
+          },
+        ],
+      },
+    });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    const first = within(body).getByText("原始正文");
+    const second = within(body).getByText("第二段");
+    await userEvent.click(first);
+    const range = document.createRange();
+    range.setStart(first.firstChild!, 0);
+    range.setEnd(second.firstChild!, second.textContent!.length);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    await userEvent.click(screen.getByRole("button", { name: "列表" }));
+    expect(body.querySelectorAll("li")).toHaveLength(2);
+    await userEvent.click(screen.getByRole("button", { name: "撤销" }));
+    expect(body.querySelectorAll("li")).toHaveLength(0);
+    expect(
+      Array.from(body.querySelectorAll("p[data-geo-block-id]")).map(
+        (paragraph) => paragraph.getAttribute("data-geo-block-id"),
+      ),
+    ).toEqual(["block-1", "block-2"]);
+    await userEvent.click(screen.getByRole("button", { name: "重做" }));
+    expect(body.querySelectorAll("li")).toHaveLength(2);
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const save = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      );
+      expect(save).toBeDefined();
+      expect(JSON.parse(String(save?.[1]?.body)).document.blocks).toEqual([
+        {
+          block_id: "block-1",
+          kind: "list",
+          text: "",
+          citation_ids: ["chunk-1"],
+          items: ["原始正文", "第二段"],
+        },
+      ]);
+    });
+  });
+
+  it("unwraps a native list into paragraphs without discarding its citation", async () => {
+    const requests = mockApi({
+      documentOverride: {
+        title: revision.document.title,
+        blocks: [
+          revision.document.blocks[0],
+          {
+            block_id: "block-list",
+            kind: "list",
+            text: "",
+            citation_ids: ["chunk-1"],
+            items: ["第一项", "第二项"],
+          },
+        ],
+      },
+    });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    const firstItem = within(body).getByText("第一项");
+    await userEvent.click(firstItem);
+    putCaretAtEnd(firstItem);
+    await userEvent.click(screen.getByRole("button", { name: "段落" }));
+    expect(body.querySelectorAll("li")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const save = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      );
+      expect(save).toBeDefined();
+      const blocks = JSON.parse(String(save?.[1]?.body)).document.blocks;
+      expect(blocks[1]).toEqual({
+        block_id: "block-list",
+        kind: "paragraph",
+        text: "第一项",
+        citation_ids: ["chunk-1"],
+        items: [],
+      });
+      expect(blocks[2]).toMatchObject({
+        kind: "list",
+        text: "",
+        citation_ids: ["chunk-1"],
+        items: ["第二项"],
+      });
+      expect(blocks[2].block_id).not.toBe("block-list");
+    });
+  });
+
+  it("pastes unsupported markup as literal text instead of silently storing HTML", async () => {
+    const requests = mockApi();
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const paragraph = await screen.findByRole("textbox", {
+      name: "结构化正文",
+    });
+    await userEvent.click(paragraph);
+    putCaretAtEnd(within(paragraph).getByText("原始正文"));
+    await userEvent.paste("<b>仅纯文本</b>");
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const save = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      );
+      expect(save).toBeDefined();
+      expect(JSON.parse(String(save?.[1]?.body)).document.blocks[0].text).toBe(
+        "原始正文<b>仅纯文本</b>",
+      );
+    });
+  });
+
+  it("uses the editor's undo and redo history for body changes", async () => {
+    mockApi();
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", {
+      name: "结构化正文",
+    });
+    await userEvent.click(body);
+    putCaretAtEnd(within(body).getByText("原始正文"));
+    await userEvent.keyboard("新");
+    expect(within(body).getByText("原始正文新")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "撤销" }));
+    expect(within(body).getByText("原始正文")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "重做" }));
+    expect(within(body).getByText("原始正文新")).toBeInTheDocument();
   });
 
   it("preserves unsaved draft after an optimistic conflict", async () => {

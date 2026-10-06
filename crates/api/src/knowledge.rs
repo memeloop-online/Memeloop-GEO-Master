@@ -506,21 +506,39 @@ pub(crate) async fn retry_import_job(
         .await
         .map_err(|error| api_error(error, context.request_id))?;
     let repository = state.knowledge_repository();
-    let job = repository
-        .retry_pdf_parse(&scope, id)
-        .await
+    // Resolve the parser from the original scoped job, never from caller
+    // input. A retry creates a successor with only missing/failed units.
+    let is_office = match repository.office_parse_operation(&scope, id).await {
+        Ok(operation) => operation.is_some(),
+        // Older PDF-only installations have no Office adapter. Its absent
+        // capability must not block retries of an already accepted PDF job.
+        Err(error) if error.code == geo_domain::ErrorCode::CapabilityMissing => false,
+        Err(error) => return Err(api_error(error, context.request_id)),
+    };
+    let job = if is_office {
+        repository.retry_office_parse(&scope, id).await
+    } else {
+        repository.retry_pdf_parse(&scope, id).await
+    }
+    .map_err(|error| api_error(error, context.request_id))?;
+    if !state.durable_storage() {
+        let operation = if is_office {
+            repository
+                .office_parse_operation(&scope, job.import_job_id)
+                .await
+        } else {
+            repository
+                .pdf_parse_operation(&scope, job.import_job_id)
+                .await
+        }
         .map_err(|error| api_error(error, context.request_id))?;
-    if !state.durable_storage()
-        && let Some(operation) = repository
-            .pdf_parse_operation(&scope, job.import_job_id)
-            .await
-            .map_err(|error| api_error(error, context.request_id))?
-    {
-        state
-            .operation_store()
-            .save(operation)
-            .await
-            .map_err(|error| api_error(error, context.request_id))?;
+        if let Some(operation) = operation {
+            state
+                .operation_store()
+                .save(operation)
+                .await
+                .map_err(|error| api_error(error, context.request_id))?;
+        }
     }
     Ok((StatusCode::ACCEPTED, Json(job)))
 }

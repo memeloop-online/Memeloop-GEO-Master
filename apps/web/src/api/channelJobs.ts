@@ -176,6 +176,73 @@ export interface ChannelPlanRequest {
   bound_measurements?: BoundMeasurementRequest[];
 }
 
+export interface StandaloneMeasurementPlan {
+  plan_id: string;
+  project_id: string;
+  title: string;
+  created_at: string;
+  targets: ChannelTarget[];
+}
+
+export interface StandaloneMeasurementRequest {
+  idempotency_key: string;
+  title: string;
+  measurements: MeasurementRequest[];
+  bound_measurements?: BoundMeasurementRequest[];
+}
+
+export interface MeasurementOptions {
+  models: { id: string; label: string }[];
+  selected_model: string | null;
+}
+
+export function getMeasurementOptions(
+  tenantId: string,
+  projectId: string,
+  accountId: string,
+) {
+  return apiFetch<MeasurementOptions>(
+    `/projects/${encoded(projectId)}/channel-accounts/${encoded(accountId)}/measurement-options`,
+    scope(tenantId, projectId),
+  );
+}
+
+export function createMeasurementPlan(
+  tenantId: string,
+  projectId: string,
+  input: StandaloneMeasurementRequest,
+) {
+  return apiFetch<StandaloneMeasurementPlan>(
+    `/projects/${encoded(projectId)}/measurement-plans`,
+    { ...scope(tenantId, projectId), method: "POST", body: input },
+  );
+}
+
+export function listMeasurementPlans(
+  tenantId: string,
+  projectId: string,
+  after?: string,
+) {
+  return apiFetch<{
+    items: StandaloneMeasurementPlan[];
+    next_after: string | null;
+  }>(
+    `/projects/${encoded(projectId)}/measurement-plans?limit=20${after ? `&after=${encoded(after)}` : ""}`,
+    scope(tenantId, projectId),
+  );
+}
+
+export function getMeasurementPlan(
+  tenantId: string,
+  projectId: string,
+  planId: string,
+) {
+  return apiFetch<StandaloneMeasurementPlan>(
+    `/projects/${encoded(projectId)}/measurement-plans/${encoded(planId)}`,
+    scope(tenantId, projectId),
+  );
+}
+
 const encoded = (value: string) => encodeURIComponent(value);
 const scope = (tenantId: string, projectId: string) => ({
   tenantId,

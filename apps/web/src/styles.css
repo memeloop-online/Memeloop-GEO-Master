@@ -72,6 +72,10 @@ input {
   gap: 2px;
   overflow-y: auto;
 }
+.nav-group {
+  display: flex;
+  flex-direction: column;
+}
 .nav-link {
   display: grid;
   grid-template-columns: 24px minmax(0, 1fr) auto;
@@ -84,6 +88,27 @@ input {
   text-decoration: none;
   font-size: 14px;
   white-space: nowrap;
+}
+.nav-children {
+  display: flex;
+  flex-direction: column;
+  padding: 2px 0 6px 41px;
+  gap: 2px;
+}
+.nav-child-link {
+  padding: 7px 8px;
+  border-radius: 6px;
+  color: #4a4a4a;
+  font-size: 13px;
+  text-decoration: none;
+}
+.nav-child-link:hover,
+.nav-child-link.active {
+  background: #e8f2fc;
+  color: #0f6cbd;
+}
+.nav-child-link.active {
+  font-weight: 600;
 }
 .nav-link:hover {
   background: #f3f5f7;
@@ -112,7 +137,7 @@ input {
   place-items: center;
   padding: 8px 4px;
 }
-.collapse-button {
+.sidebar > .collapse-button {
   margin: auto 10px 12px;
   min-height: 36px;
 }
@@ -998,6 +1023,14 @@ input {
   .app-shell.sidebar-collapsed {
     --sidebar-width: 64px;
   }
+  .app-shell:not(.sidebar-collapsed) .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 20;
+    width: min(224px, calc(100vw - 64px));
+    height: 100vh;
+    box-shadow: 4px 0 16px rgb(0 0 0 / 15%);
+  }
   .topbar {
     padding: 0 12px;
   }
@@ -1079,9 +1112,6 @@ input {
   }
   .sidebar .brand {
     padding-left: 17px;
-  }
-  .collapse-button {
-    display: none;
   }
 }
 

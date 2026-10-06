@@ -394,6 +394,99 @@ test("native model call executes knowledge.search through the MemeLoop registry 
   }
 });
 
+test("chat onboarding calls scoped project tools and preserves acceptance semantics", async () => {
+  const requests = [];
+  const observed = [];
+  const commands = [
+    ["project_current", {}],
+    [
+      "project_revise",
+      {
+        expected_revision: 1,
+        idempotency_key: "draft-one",
+        patch: { brand_name: "Example", market: "global", language: "en" },
+        source_version_ids: [],
+      },
+    ],
+    ["project_estimate", {}],
+    ["project_start", { expected_revision: 2, idempotency_key: "start-one" }],
+  ];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async projectCurrent(request) {
+      observed.push(["project_current", request]);
+      return {
+        project: { revision: 1, status: "draft" },
+        missing_fields: ["brand_name"],
+      };
+    },
+    async projectRevise(request) {
+      observed.push(["project_revise", request]);
+      return { project: { revision: 2, status: "draft" }, missing_fields: [] };
+    },
+    async projectEstimate(request) {
+      observed.push(["project_estimate", request]);
+      return { blockers: [], costs: { state: "estimated" } };
+    },
+    async projectStart(request) {
+      observed.push(["project_start", request]);
+      return { status: "accepted", operation_id: "operation-reference" };
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      const next = commands[requests.length - 1];
+      return next
+        ? {
+            text: "",
+            model: "stub-model",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `onboarding-${requests.length}`,
+                type: "function",
+                function: { name: next[0], arguments: JSON.stringify(next[1]) },
+              },
+            ],
+          }
+        : finalModelAnswer("Startup accepted; background work is pending.");
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?onboarding=${Date.now()}`
+    );
+    const result = await main({
+      ...historyTurn,
+      prompt:
+        "Set up Example for global English content and start using my supplied settings.",
+    });
+    assert.deepEqual(observed, commands);
+    assert.match(result.answer, /accepted/u);
+    assert.match(requests[0].system, /only for missing information/u);
+    assert.match(requests[0].system, /invent.*budget/u);
+    assert.match(requests[4].messages.at(-1).content, /"status":"accepted"/u);
+    for (const tool of requests[0].tools.filter(({ function: fn }) =>
+      fn.name.startsWith("project_"),
+    )) {
+      assert.equal(tool.function.parameters.additionalProperties, false);
+      assert.equal(tool.function.parameters.properties.project_id, undefined);
+      assert.equal(tool.function.parameters.properties.tenant_id, undefined);
+    }
+    const revise = requests[0].tools.find(
+      ({ function: fn }) => fn.name === "project_revise",
+    ).function.parameters;
+    assert.equal(revise.properties.patch.additionalProperties, false);
+    assert.equal(revise.properties.patch.properties.initial_sources, undefined);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
 test("report reduction and immutable read are exposed as separate scoped host tools", async () => {
   const cycleId = "00000000-0000-4000-8000-000000000031";
   const reportId = "00000000-0000-4000-8000-000000000032";
@@ -472,6 +565,10 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "report_get",
         "report_preview",
         "report_reduce",
+        "project_current",
+        "project_revise",
+        "project_estimate",
+        "project_start",
         "channel_discover",
         "channel_plan",
         "channel_manifest_read",
@@ -479,6 +576,9 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "question_discover",
         "question_create",
         "question_revise",
+        "measurement_options",
+        "measurement_plan_create",
+        "measurement_plan_read",
         "content_start",
         "content_execution_read",
         "distribution_start",
@@ -687,6 +787,10 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "report_get",
         "report_preview",
         "report_reduce",
+        "project_current",
+        "project_revise",
+        "project_estimate",
+        "project_start",
         "channel_discover",
         "channel_plan",
         "channel_manifest_read",
@@ -694,6 +798,9 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "question_discover",
         "question_create",
         "question_revise",
+        "measurement_options",
+        "measurement_plan_create",
+        "measurement_plan_read",
         "content_start",
         "content_execution_read",
         "distribution_start",
@@ -1217,6 +1324,130 @@ test("native question-set tools return only safe references and freeze bound tar
       schemas.channel_plan.properties.bound_measurements.items.properties
         .question.properties.text,
       undefined,
+    );
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("standalone measurement discovers live models, accepts one ad-hoc question and reads durable state", async () => {
+  const account = "00000000-0000-4000-8000-000000000221";
+  const plan = "00000000-0000-4000-8000-000000000222";
+  const target = "00000000-0000-4000-8000-000000000223";
+  const commands = [
+    ["measurement_options", { account_id: account }],
+    [
+      "measurement_plan_create",
+      {
+        account_id: account,
+        question: "How do rain gauges work?",
+        idempotency_key: "user-request-1",
+      },
+    ],
+    ["measurement_plan_read", { plan_id: plan }],
+  ];
+  const seen = [];
+  const completions = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("unexpected search");
+    },
+    async measurementOptions(input) {
+      seen.push(["options", input]);
+      return {
+        account_id: account,
+        models: [{ id: "observed-model", label: "Observed" }],
+        selected_model: "observed-model",
+      };
+    },
+    async measurementPlanCreate(input) {
+      seen.push(["create", input]);
+      return {
+        plan_id: plan,
+        target_id: target,
+        account_id: account,
+        model: "observed-model",
+        state: "accepted",
+      };
+    },
+    async measurementPlanRead(input) {
+      seen.push(["read", input]);
+      return {
+        plan_id: plan,
+        targets: [
+          {
+            target_id: target,
+            state: "queued",
+            outcome_status: null,
+            fixture: null,
+            received_at: null,
+          },
+        ],
+      };
+    },
+    async modelComplete(request) {
+      completions.push(request);
+      const command = commands[completions.length - 1];
+      return command
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `measurement-${completions.length}`,
+                type: "function",
+                function: {
+                  name: command[0],
+                  arguments: JSON.stringify(command[1]),
+                },
+              },
+            ],
+          }
+        : finalModelAnswer("The question is queued, not yet measured.");
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?standalone=${Date.now()}`
+    );
+    const answer = await main({
+      conversation_id: "standalone-conversation",
+      prompt: "Measure an arbitrary topic",
+      run_id: "standalone-run",
+      turn_id: "standalone-turn",
+    });
+    assert.match(answer.answer, /queued/u);
+    assert.deepEqual(
+      seen.map(([name]) => name),
+      ["options", "create", "read"],
+    );
+    const schemas = Object.fromEntries(
+      completions[0].tools.map(({ function: tool }) => [
+        tool.name,
+        tool.parameters,
+      ]),
+    );
+    for (const name of commands.map(([tool]) => tool)) {
+      assert.equal(schemas[name].additionalProperties, false);
+    }
+    for (const field of [
+      "provider",
+      "protocol_version",
+      "cycle_id",
+      "search_mode",
+      "purpose",
+      "question_set_version",
+    ]) {
+      assert.equal(
+        schemas.measurement_plan_create.properties[field],
+        undefined,
+      );
+    }
+    assert.equal(
+      seen[1][1].model,
+      undefined,
+      "Rust chooses the observed default",
     );
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;

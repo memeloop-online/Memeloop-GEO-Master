@@ -276,6 +276,49 @@ export function reduceKimiConnectExchange(
   };
 }
 
+/** Read the authenticated website menu without submitting a conversation. */
+export async function inspectKimiMeasurementOptions(page) {
+  const models = [];
+  let selectedModel = null;
+  const trigger = page.getByTestId("model-select-trigger");
+  try {
+    await trigger.click({ timeout: 5_000 });
+    await page.getByTestId("model-option").first().waitFor({
+      state: "visible",
+      timeout: 5_000,
+    });
+    const options = await page.getByTestId("model-option").all();
+    if (options.length > 64) return null;
+    for (const option of options) {
+      if (!(await option.isVisible())) continue;
+      const id = await option.getAttribute("data-moon-key");
+      const label = (await option.innerText()).trim().replace(/\s+/gu, " ");
+      if (
+        !/^[\w.-]{1,128}$/u.test(id ?? "") ||
+        !label ||
+        label.length > 200 ||
+        models.some((model) => model.id === id)
+      )
+        return null;
+      models.push({ id, label });
+      const selected =
+        (await option.getAttribute("aria-selected")) === "true" ||
+        (await option.getAttribute("aria-checked")) === "true" ||
+        (await option.getAttribute("data-state")) === "checked";
+      if (selected) {
+        if (selectedModel !== null) return null;
+        selectedModel = id;
+      }
+    }
+    return models.length ? { models, selected_model: selectedModel } : null;
+  } catch (error) {
+    if (error?.name === "TimeoutError") return null;
+    throw error;
+  } finally {
+    await page.keyboard.press("Escape").catch(() => {});
+  }
+}
+
 async function configureKimiSearch(page, model) {
   const selector = page.getByTestId("model-select-trigger");
   await selector.click({ timeout: 5_000 });

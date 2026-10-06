@@ -478,6 +478,7 @@ describe("account page", () => {
     await screen.findByRole("img", { name: /远程登录页面截图/ });
     const remote = screen.getByLabelText("远程登录");
     const input = within(remote).getByLabelText(/向当前焦点输入文字/);
+    expect(input).toHaveAttribute("type", "text");
     await userEvent.type(input, "ordinary text");
     await userEvent.click(
       within(remote).getByRole("button", { name: "发送文字" }),

@@ -132,6 +132,9 @@ function WorkspaceCard({
           创建项目
         </Button>
       </div>
+      <p className="workspace-project-empty">
+        直接进入 AI 对话，上传资料或描述目标；无需先填写项目表单。
+      </p>
     </Card>
   );
 }

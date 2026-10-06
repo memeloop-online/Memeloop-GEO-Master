@@ -14,8 +14,9 @@ mod verification_dispatch;
 use axum::Router;
 use config::AppConfig;
 use geo_api::{
-    AppState, EmbeddedAgentRuntime, PDF_PARSER_PROFILE, PdfParserClient, reduce_cycle_report,
-    router, spawn_pdf_parse_scanner,
+    AppState, EmbeddedAgentRuntime, OFFICE_PARSER_PROFILE, OfficeParserClient, PDF_PARSER_PROFILE,
+    PdfParserClient, reduce_cycle_report, router, spawn_office_parse_scanner,
+    spawn_pdf_parse_scanner,
 };
 use geo_persistence::{Database, PgProjectRepository, PgReportRepository};
 use std::error::Error;
@@ -46,9 +47,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Some(parser)
         }
     };
+    let office_parser = match std::env::var_os("GEO_OFFICE_PARSER_URL") {
+        None => None,
+        Some(endpoint) => {
+            let endpoint = endpoint
+                .into_string()
+                .map_err(|_| "invalid Office parser configuration")?;
+            let parser = OfficeParserClient::new(&endpoint)?;
+            parser.check_ready().await?;
+            Some(parser)
+        }
+    };
     let durable_storage = AppConfig::database_url_configured();
-    config.validate_ai_mode(durable_storage)?;
     let production_ai = production_runtime::ProductionAiConfig::from_env()?;
+    config.validate_ai_mode(durable_storage, production_ai.is_some())?;
     if production_ai.is_some() && !durable_storage {
         return Err("production model configuration requires PostgreSQL".into());
     }
@@ -63,19 +75,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let cycle_scanner = PgProjectRepository::from_database(&database);
         let verification_scanner =
             geo_persistence::PgConnectorCapabilityRepository::from_database(&database);
-        let state = if pdf_parser.is_some() {
-            AppState::from_database_with_pdf_parser_profile(
-                &database,
-                PDF_PARSER_PROFILE.to_owned(),
-            )
-        } else {
-            AppState::from_database(&database)
-        };
+        let state = AppState::from_database_with_parser_profiles(
+            &database,
+            pdf_parser.as_ref().map(|_| PDF_PARSER_PROFILE.to_owned()),
+            office_parser
+                .as_ref()
+                .map(|_| OFFICE_PARSER_PROFILE.to_owned()),
+        );
         let state =
             channels::configure(state.with_allowed_origins(config.allowed_origins.clone()))?;
         let runtime = if let Some(ai) = production_ai.as_ref() {
             let provider = production_runtime::build_model_provider(&database, ai)?;
             runtime::assemble_with_provider(&state, &ai.bundle_path, &ai.bundle_sha256, provider)?
+        } else if let (Some(ai), Some(scope)) = (
+            config.development_ai.as_ref(),
+            config.persistent_dev_ai_scope.as_ref(),
+        ) {
+            runtime::assemble_persistent(&state, ai, scope)?
         } else {
             Arc::new(EmbeddedAgentRuntime::unconfigured())
         };
@@ -102,10 +118,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
     } else {
         let password = config.validate_for_memory_mode()?;
-        let state = if pdf_parser.is_some() {
-            AppState::development_with_pdf_parser_profile(password, PDF_PARSER_PROFILE.to_owned())
+        let state = AppState::development_with_parser_profiles(
+            password,
+            pdf_parser.as_ref().map(|_| PDF_PARSER_PROFILE.to_owned()),
+            office_parser
+                .as_ref()
+                .map(|_| OFFICE_PARSER_PROFILE.to_owned()),
+        );
+        let state = if let Ok(login_name) = std::env::var("GEO_DEV_LOGIN_NAME") {
+            let display_name = std::env::var("GEO_DEV_DISPLAY_NAME")
+                .unwrap_or_else(|_| "Local workspace".to_owned());
+            let repository = geo_domain::MemoryAuthRepository::new();
+            let operator = geo_domain::Operator::new(
+                geo_domain::DEVELOPMENT_OPERATOR_ID,
+                "local-workspace",
+                &display_name,
+            )?;
+            let user = geo_domain::User::new(
+                uuid::Uuid::from_u128(0x00000000000040008000000000000004).into(),
+                operator.id,
+                login_name,
+                &display_name,
+                password,
+            )?;
+            let mut membership = geo_domain::Membership::new(
+                user.id,
+                operator.id,
+                geo_domain::DEVELOPMENT_TENANT_ID,
+                geo_domain::Role::CustomerAdmin,
+            );
+            membership.tenant_slug = "local-workspace".to_owned();
+            membership.tenant_display_name = display_name;
+            let hosts = [
+                "localhost",
+                "localhost:5173",
+                "localhost:8080",
+                "127.0.0.1",
+                "127.0.0.1:5173",
+                "127.0.0.1:8080",
+            ]
+            .map(str::to_owned);
+            repository.insert_operator(operator, &hosts).await?;
+            repository.insert_user(user).await?;
+            repository.insert_membership(membership).await?;
+            state.with_auth_repository(std::sync::Arc::new(repository))
         } else {
-            AppState::development_with_password(password)
+            state
         };
         let state =
             channels::configure(state.with_allowed_origins(config.allowed_origins.clone()))?;
@@ -126,6 +184,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     runtime::configure_content_workflow(&state)?;
     if let Some(parser) = pdf_parser {
         spawn_pdf_parse_scanner(state.clone(), parser);
+    }
+    if let Some(parser) = office_parser {
+        spawn_office_parse_scanner(state.clone(), parser);
     }
     if let Some(scanner) = agent_scanner {
         agent_dispatch::spawn(state.clone(), scanner);

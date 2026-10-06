@@ -2,11 +2,13 @@
 
 更新时间：2026-10-06
 
-最新完整绿色基线：`0074397` / Actions `37428319862` 全绿。已读取实际日志，确认新增跨周期复用、分发提交来源撤销 PostgreSQL 回归实际为 `ok`，以及持久工作区双次登录、退出、配置/卷/身份和数据库会话保留通过；Windows 构建与测试也通过。本地 Docker 仍未恢复，不能宣称已准备好真实外部账号登录。
+最新完整绿色基线：`8170f63` / Actions `37438382741` 全绿。已核对终态及实际日志：问题集三项 PostgreSQL 回归、P13 创建/修订/历史浏览器路径、持久工作区重启和 Linux/Windows 均通过；堆独测/全串行/全并行各五轮通过。此前 V8 内部断言尚无确认根因，这次通过不代表已证明修复。本地 Docker 仍未恢复；本地登录环境现已通过原生 PostgreSQL 独立运行，Docker 不再是登录入口的前置条件，真实渠道登录与搜索仍须独立验收。
+
+当前集成增量：Office DOCX/XLSX 结构导入、首发才创建会话、六组导航、单文档 Tiptap 内容编辑、v11 项目工具、v12 独立话题测量及网页模型发现，以及固定作用域的持久本地开发 AI。前端 209 项、类型/构建/格式、Rust 默认全量/严格 Clippy、显式 bundle 13 项、实库 58 项及真实 Java 解析 3 项通过；新整批 CI 与真实模型/搜索仍待验收。临时内存演示已停用，改为本地原生 PostgreSQL 17 持久运行；实际 Chromium 已验证数据库及应用重启后原登录 Cookie 和项目可直接读回，不重新登录。运行时二进制与构建目录分离，更新不得擅自停止真实账号运行；身份、密钥和启动文件保存在仓库外，不是公开材料。新的真实渠道登录入口已打开，但尚无真实搜索通过证据。体验合并任务见 `ux-consolidation.md`；富文本标记/表格/媒体、知识修订写接口及成熟远程桌面替换仍未完成。
 
 跨周期正文复用已接领域/API/持久层/UI 及迁移 `0027`：保持原检查版本、独立本轮覆盖，编辑采用 copy-on-write。前端 155 项、默认全量、真实后继周期 API/原生工作流与 PostgreSQL 回归已通过首段 CI。内存项目/知识 guard 与数据库事务保护公开提交，分发物化在提交内复核来源；可证明历史分支重建和真实外部发布验收仍缺。契约见 [`content-reuse.md`](content-reuse.md)。
 
-问题集批次已推送为 `091f754`：契约见 [`question-sets.md`](question-sets.md)，迁移 `0028`，P13 问题集、P12 引用式测量和 P00 v10 工具已接线。前端 163 项、构建/格式、Node 编排 26 项、连接器夹具 72 项、Rust 默认全量与严格 Clippy 均通过；显式原生 bundle 6 项/渠道运行时 1 项及真实本地 P13 创建→修订→刷新→旧版本路径通过。Actions `37435387407` Linux 在已有 V8 probe 引擎内部断言崩溃，后续实库未执行，当前不能称为全绿；故障排查进行中。冻结评估身份不翻转，报告及 PDF/CSV 分开用途，但不代表 NextCycleAction 优化器或真实外部采样已完成。
+问题集批次已推送为 `091f754`，并在后继 `8170f63` CI 完成实库验证：契约见 [`question-sets.md`](question-sets.md)，迁移 `0028`，P13 问题集、P12 引用式测量和 P00 v10 工具已接线。前端 163 项、构建/格式、Node 编排 26 项、连接器夹具 72 项、Rust 默认全量与严格 Clippy 均通过；显式原生 bundle 6 项/渠道运行时 1 项及真实本地 P13 创建→修订→刷新→旧版本路径通过。历史 Actions `37435387407` 的 V8 probe 内部断言仍保留为未确认根因的问题。冻结评估身份不翻转，报告及 PDF/CSV 分开用途，但不代表 NextCycleAction 优化器或真实外部采样已完成。
 
 历史绿色基线：`44f22ff` / Actions `37405615406`，Linux/Windows、前端、显式 V8、Java 21、PostgreSQL 和真实本地浏览器冒烟全部通过，包含报告只读预览、实时导入进度及原始收据核对。已读取 Linux 日志确认 `import_progress` 两项、`actual_pdf_pages_are_imported_as_searchable_source_evidence` 与 P14 临时预览/零写入浏览器检查实际通过，不是默认忽略后的通过。截图采用合成资料，不包含外部账号或真实发布/搜索验收。
 
@@ -67,7 +69,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 - 上传会话、SHA-256 字节核验、批量导入、来源/版本、确定性文本分段、不可变 KnowledgeRelease、证据定位和 evidence-only 问答。
 - P01 已能物化文本、URL 引用和已上传对象；P03–P05 已接真实 API。
-- 已有基线支持 `text/plain`、`text/markdown` 与 UTF-8、逗号分隔、含表头 CSV，输入契约见 `csv-import.md`。本批增加可配置的 PDF 文字层解析：原件入队、独立 Tika/PDFBox 子进程、持久逐页进度、部分知识版本及失败页重试；P03/P04 和 P00 显式附件导入复用同一后台链路。启动设置、边界及测试入口见 [`pdf-import.md`](pdf-import.md)，最终实库及真实服务验证以工作日志为准。不配置解析服务时 PDF 仍明确不可用；DOCX、XLSX、网页抓取、OCR、原件高亮预览、向量检索、LLM 回答和结构化事实提取尚未完成。
+- 已有基线支持 `text/plain`、`text/markdown` 与 UTF-8、逗号分隔、含表头 CSV，输入契约见 `csv-import.md`。PDF 文字层解析支持原件入队、独立 Tika/PDFBox 子进程、持久逐页进度、部分知识版本及失败页重试；P03/P04 和 P00 显式附件导入复用同一后台链路。DOCX/XLSX 本批已接独立配置的 POI 结构解析、持久单元进度、版本/重试及证据表格，真实 Rust→Java 三种格式与新增实库测试通过；新 CI 仍待验证。启动设置及边界见 [`pdf-import.md`](pdf-import.md)、[`office-import.md`](office-import.md)。不配置对应解析服务时明确不可用；网页抓取、OCR、原件高亮预览、向量检索、LLM 知识回答和结构化事实提取尚未完成。
 
 ### P00 AI 工作台
 
@@ -106,7 +108,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 安全 Host Ops
 
-- 封闭且带版本的 op 面（当前批次 `geo.hostops.v10`）：保留既有 26 项，新增 `question.discover.v1`、`question.create.v1`、`question.revise.v1`，共 29 项；问题发现不返回冻结评估正文，写入回执只返回元数据。部署须同步新 bundle 及摘要。附件导入只接受 Rust 已绑定到当前回合的对象；业务工具只传受限资源引用，JS 无法取得 session、代理凭据、SQL、任意网络、文件、进程或环境变量。
+- 封闭且带版本的 op 面（当前集成批次 `geo.hostops.v12`，36 项）：v11 增加项目读取/修订/估算/启动，v12 增加独立测量模型发现/创建/读取。问题发现不返回冻结评估正文；独立测量仅对可验证来自专用临时问题命令的真实结果返回受限原始回答/引用，冻结评估、旧计划和夹具不暴露此投影。部署须同步新 bundle 及摘要，当前批次新 CI 尚待验证。附件导入只接受 Rust 已绑定到当前回合的对象；业务工具只传受限资源引用，JS 无法取得 session、代理凭据、SQL、任意网络、文件、进程或环境变量。
 - 边界方向为 `geo-api → geo-worker`，worker 从不反向依赖 API。请求 DTO 全部 `#[serde(deny_unknown_fields)]` 且不携带 tenant/project 选择器，作用域只能来自 Rust 侧 bridge。预算、单次调用截止与取消统一在 `HostBridge::invoke` 施加。
 - `RepositoryHostOps` 已实现知识检索/附件导入、文档清单读取、报告及渠道工具和可注入的模型调用；内容工具另由受限 Rust 服务执行。本地开发模型装配见第 5 节。清单读取保留规划状态、阻断原因及覆盖分母，不把规划项 ID 冒充正文版本；正式文档×平台展开和正文分发工具已接入，真实发布与测量验收仍缺失。
 
@@ -194,8 +196,9 @@ PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍
 
 ### 可选：启用本地 P00 模型单回合
 
-仅允许未配置 `DATABASE_URL` 且监听 loopback 的本地内存模式。
-正式租户 Token Center 接入另见 `token-center-integration.md`，不能使用此模式代替。
+默认路径为未配置 `DATABASE_URL` 且监听 loopback 的本地内存模式。
+持久本地演示另可显式启用固定运营商/租户的开发模式，具体变量和限制见 `runtime-deployment.md`；不必清空项目数据。
+正式租户 Token Center 接入另见 `token-center-integration.md`，不能使用开发模式代替。
 
 先运行 `pnpm agent:bundle`，再同时提供全部五项服务端环境变量：
 `GEO_AI_BASE_URL`、`GEO_AI_API_KEY`、`GEO_AI_MODEL`、
@@ -204,7 +207,7 @@ PostgreSQL 模式下 `PgAgentRepository` 已实现持久化，数据库故障仍
 产物路径为 `packages/agent-runtime/dist/memeloop-agent-loop.bundle.mjs`；
 摘要可用 `Get-FileHash -Algorithm SHA256` 计算。重新构建后需更新摘要。
 
-全部缺省时保持未配置；只提供部分配置、摘要错误、文件超过 8 MiB 或尝试用于数据库模式均拒绝启动。
+全部缺省时保持未配置；只提供部分配置、摘要错误、文件超过 8 MiB，或在数据库模式下未显式配置固定作用域开发模式时，均拒绝启动。
 模型路由固定为配置模型；该阶段仅证明真实 MemeLoop 单回合模型路径，
 已支持 TXT/Markdown 附件导入、知识检索工具循环及成功问答历史重建；发布与测量工具已有接线，但真实渠道尚未验收，中途 checkpoint 恢复仍缺。不设置固定两回合并发门禁，优先跑通应用功能。
 

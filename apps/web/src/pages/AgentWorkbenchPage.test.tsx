@@ -156,19 +156,21 @@ describe("P00 AI workbench routing", () => {
   );
 
   it("makes P00 the first/default project destination and renders an honest empty state", async () => {
-    const fetchMock = vi.fn((request: RequestInfo | URL) => {
-      const url = new URL(String(request), "http://localhost");
-      if (url.pathname.endsWith("/auth/session")) {
-        return Promise.resolve(response(session));
-      }
-      if (url.pathname.endsWith("/projects")) {
-        return Promise.resolve(response({ items: [], next_cursor: null }));
-      }
-      if (url.pathname.endsWith("/agent/conversations")) {
-        return Promise.resolve(response({ items: [], next_cursor: null }));
-      }
-      return Promise.resolve(response({}));
-    });
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, _init?: RequestInit) => {
+        const url = new URL(String(request), "http://localhost");
+        if (url.pathname.endsWith("/auth/session")) {
+          return Promise.resolve(response(session));
+        }
+        if (url.pathname.endsWith("/projects")) {
+          return Promise.resolve(response({ items: [], next_cursor: null }));
+        }
+        if (url.pathname.endsWith("/agent/conversations")) {
+          return Promise.resolve(response({ items: [], next_cursor: null }));
+        }
+        return Promise.resolve(response({}));
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp("/app/tenant-a/project-a");
@@ -176,13 +178,26 @@ describe("P00 AI workbench routing", () => {
     expect(
       await screen.findByTestId("agent-workbench-page"),
     ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "AI 工作台" })).toHaveAttribute(
+      "href",
+      "/app/tenant-a/project-a/chat",
+    );
     expect(
-      screen.getByRole("link", { name: "P00 · AI 工作台" }),
-    ).toHaveAttribute("href", "/app/tenant-a/project-a/chat");
-    expect(
-      screen.getByRole("heading", { name: "从一个项目任务开始" }),
+      screen.getByRole("heading", { name: "从你的资料或想法开始" }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/这里不会生成演示回复。/)).toBeInTheDocument();
+    expect(screen.getByLabelText("输入任务")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "新建对话" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^新建$/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([, options]) =>
+          (options as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
   });
 
   it("renders the MemeLoop chat shell and retains a missing-runtime notice", async () => {
@@ -265,8 +280,116 @@ describe("P00 AI workbench routing", () => {
     expect(
       screen.getByText("Rust JS Agent Runtime 尚未配置，本次未生成 AI 回复。"),
     ).toBeInTheDocument();
-    expect(screen.getByText("此对话还没有消息")).toBeInTheDocument();
+    expect(screen.getByText("从你的资料或想法开始")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "添加文件" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("输入任务")).toBeInTheDocument();
+    expect(
+      screen.getByText("无需先填表；可以在对话中逐步补充必要信息。"),
+    ).toBeInTheDocument();
   });
+
+  it.each(["conversation", "message"])(
+    "creates the conversation only on first send and retains keys/input after %s failure",
+    async (failure) => {
+      const requests: Array<{ path: string; init?: RequestInit }> = [];
+      let failed = false;
+      const conversation = {
+        id: "first-conversation",
+        title: null,
+        status: "active",
+        revision: 1,
+        created_at: "2026-09-19T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+      };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(request), "http://localhost").pathname;
+          requests.push({ path, init });
+          if (path.endsWith("/auth/session"))
+            return Promise.resolve(response(session));
+          if (init?.method === "POST") {
+            const isCreate = path.endsWith("/agent/conversations");
+            if (
+              !failed &&
+              ((failure === "conversation" && isCreate) ||
+                (failure === "message" && !isCreate))
+            ) {
+              failed = true;
+              return Promise.resolve(
+                response({ error: { code: "unavailable" } }, 503),
+              );
+            }
+            return Promise.resolve(
+              response(
+                isCreate
+                  ? conversation
+                  : {
+                      conversation_id: conversation.id,
+                      turn_id: "turn-first",
+                      run_status: "succeeded",
+                    },
+                201,
+              ),
+            );
+          }
+          if (path.endsWith(`/agent/conversations/${conversation.id}`))
+            return Promise.resolve(
+              response({
+                conversation,
+                messages: [],
+                turns: [],
+                runs: [],
+              }),
+            );
+          return Promise.resolve(response({ items: [], next_cursor: null }));
+        }),
+      );
+      renderApp("/app/tenant-a/project-a/chat");
+      const input = await screen.findByLabelText("输入任务");
+      expect(
+        requests.filter(({ init }) => init?.method === "POST"),
+      ).toHaveLength(0);
+      const user = userEvent.setup();
+      await user.type(input, "先整理我的产品资料");
+      const send = screen.getByRole("button", { name: "发送" });
+      fireEvent.click(send);
+      fireEvent.click(send);
+      await screen.findByText(/操作未完成。请确认/);
+      expect(screen.getByLabelText("输入任务")).toHaveValue(
+        "先整理我的产品资料",
+      );
+      await user.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() =>
+        expect(
+          requests.some(
+            ({ path, init }) =>
+              path.endsWith("/agent/conversations/first-conversation") &&
+              init?.method !== "POST",
+          ),
+        ).toBe(true),
+      );
+      const creates = requests.filter(
+        ({ path, init }) =>
+          path.endsWith("/agent/conversations") && init?.method === "POST",
+      );
+      const messages = requests.filter(
+        ({ path, init }) =>
+          path.endsWith("/messages") && init?.method === "POST",
+      );
+      expect(creates).toHaveLength(failure === "conversation" ? 2 : 1);
+      expect(messages).toHaveLength(failure === "message" ? 2 : 1);
+      const retried = failure === "conversation" ? creates : messages;
+      expect(new Headers(retried[0].init?.headers).get("Idempotency-Key")).toBe(
+        new Headers(retried[1].init?.headers).get("Idempotency-Key"),
+      );
+      expect(JSON.parse(String(messages.at(-1)?.init?.body)).content).toBe(
+        "先整理我的产品资料",
+      );
+    },
+  );
 
   it("keeps verified attachments after a partial failure, retries only the failed file, and submits references", async () => {
     const bytes = new Uint8Array([1, 2]);
@@ -327,7 +450,11 @@ describe("P00 AI workbench routing", () => {
           return Promise.resolve(response(detail));
         if (url.includes("/agent/conversations?"))
           return Promise.resolve(
-            response({ items: [detail.conversation], next_cursor: null }),
+            response(
+              init?.method === "POST"
+                ? detail.conversation
+                : { items: [], next_cursor: null },
+            ),
           );
         if (
           url.includes("/agent/attachments/upload-sessions/") &&
@@ -374,8 +501,11 @@ describe("P00 AI workbench routing", () => {
       },
     );
     vi.stubGlobal("fetch", fetchMock);
-    renderApp("/app/tenant-a/project-a/chat/conversation-a");
+    renderApp("/app/tenant-a/project-a/chat");
     await screen.findByTestId("memeloop-agent-chat");
+    expect(requests.filter(({ init }) => init?.method === "POST")).toHaveLength(
+      0,
+    );
     const fileInput = screen.getByTestId("agent-multi-file-input");
     const first = new File([bytes], "first.txt", { type: "text/plain" });
     const second = new File([bytes], "second.txt", { type: "text/plain" });
@@ -430,5 +560,11 @@ describe("P00 AI workbench routing", () => {
       requests.filter(({ url }) => url.includes("/session-second/content?")),
     ).toHaveLength(2);
     expect(requests.some(({ url }) => url.includes("/knowledge/"))).toBe(false);
+    expect(
+      requests.filter(
+        ({ url, init }) =>
+          url.includes("/agent/conversations?") && init?.method === "POST",
+      ),
+    ).toHaveLength(1);
   });
 });

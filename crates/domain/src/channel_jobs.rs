@@ -127,6 +127,47 @@ pub struct ChannelPlan {
     pub targets: Vec<ChannelTarget>,
 }
 
+/// Project-owned measurement, independent of knowledge or optimization cycles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandaloneMeasurementPlan {
+    pub plan_id: Uuid,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub input_hash: String,
+    pub revision: i32,
+    pub created_at: DateTime<Utc>,
+    pub targets: Vec<ChannelTarget>,
+}
+
+impl StandaloneMeasurementPlan {
+    pub fn validate(&self, scope: &TenantScope) -> Result<(), AppError> {
+        if scope.project_id != Some(self.project_id) {
+            return Err(AppError::forbidden("measurement plan outside project"));
+        }
+        if self.title.trim().is_empty()
+            || self.revision <= 0
+            || self.targets.is_empty()
+            || self
+                .targets
+                .iter()
+                .any(|target| !matches!(target.input, ChannelTargetInput::Measure { .. }))
+        {
+            return Err(AppError::invalid_request(
+                "invalid standalone measurement plan",
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        if self
+            .targets
+            .iter()
+            .any(|target| !ids.insert(target.target_id))
+        {
+            return Err(AppError::invalid_request("duplicate measurement target"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelOutcomeStatus {
@@ -371,6 +412,31 @@ pub fn optimization_eligible_projection(
 
 #[async_trait]
 pub trait ChannelJobRepository: Send + Sync {
+    async fn replay_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<Option<StandaloneMeasurementPlan>, AppError>;
+    async fn create_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        request_hash: &str,
+        plan: StandaloneMeasurementPlan,
+    ) -> Result<StandaloneMeasurementPlan, AppError>;
+    async fn get_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        plan_id: Uuid,
+    ) -> Result<Option<StandaloneMeasurementPlan>, AppError>;
+    /// Ascending UUID keyset page, with an exclusive cursor.
+    async fn list_measurement_plans(
+        &self,
+        scope: &TenantScope,
+        after_plan_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<StandaloneMeasurementPlan>, AppError>;
     /// Atomically insert durable targets and mark their outbox commands materialized.
     /// This does not reserve an account, claim an attempt, or send externally.
     async fn materialize_pending_commands(
@@ -623,13 +689,21 @@ pub struct MemoryChannelJobRepository(
     Arc<Mutex<HashMap<AccountReservationKey, AccountReservation>>>,
 );
 
-type ChannelScopeKey = (Uuid, Uuid, Uuid, Uuid);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ChannelOwner {
+    Cycle(Uuid),
+    Measurement(Uuid),
+}
+
+type ChannelScopeKey = (Uuid, Uuid, Uuid, ChannelOwner);
 type AccountReservationKey = (Uuid, Uuid);
 type AccountReservation = (Uuid, DateTime<Utc>);
 
 #[derive(Default)]
 struct MemoryCycle {
     plan: Option<ChannelPlan>,
+    measurement: Option<StandaloneMeasurementPlan>,
+    measurement_request: Option<(String, String)>,
     generated: HashMap<Uuid, ChannelTarget>,
     attempts: HashMap<Uuid, Vec<ChannelAttempt>>,
     publication_bindings: HashMap<Uuid, ChannelSecret>,
@@ -641,6 +715,11 @@ impl MemoryCycle {
             self.plan
                 .as_ref()
                 .and_then(|plan| plan.targets.iter().find(|target| target.target_id == id))
+                .or_else(|| {
+                    self.measurement
+                        .as_ref()
+                        .and_then(|plan| plan.targets.iter().find(|target| target.target_id == id))
+                })
         })
     }
 
@@ -648,11 +727,123 @@ impl MemoryCycle {
         self.generated
             .values()
             .chain(self.plan.iter().flat_map(|plan| plan.targets.iter()))
+            .chain(self.measurement.iter().flat_map(|plan| plan.targets.iter()))
     }
 }
 
 #[async_trait]
 impl ChannelJobRepository for MemoryChannelJobRepository {
+    async fn replay_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<Option<StandaloneMeasurementPlan>, AppError> {
+        let identity = scope_key(scope)?;
+        let all = self.0.lock().await;
+        for ((o, t, p, _), entry) in all.iter() {
+            if (*o, *t, *p) == identity
+                && let Some((existing_key, hash)) = &entry.measurement_request
+                && existing_key == key
+            {
+                return if hash == request_hash {
+                    Ok(entry.measurement.clone())
+                } else {
+                    Err(AppError::conflict("measurement idempotency key differs"))
+                };
+            }
+        }
+        Ok(None)
+    }
+    async fn create_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        request_hash: &str,
+        plan: StandaloneMeasurementPlan,
+    ) -> Result<StandaloneMeasurementPlan, AppError> {
+        plan.validate(scope)?;
+        if key.trim().is_empty() || request_hash.is_empty() {
+            return Err(AppError::invalid_request(
+                "measurement idempotency identity required",
+            ));
+        }
+        let (o, t, p) = scope_key(scope)?;
+        let mut all = self.0.lock().await;
+        for ((eo, et, ep, _), entry) in all.iter() {
+            if (*eo, *et, *ep) == (o, t, p)
+                && let Some((existing_key, hash)) = &entry.measurement_request
+                && existing_key == key
+            {
+                return if hash == request_hash {
+                    Ok(entry
+                        .measurement
+                        .as_ref()
+                        .expect("measurement owner")
+                        .clone())
+                } else {
+                    Err(AppError::conflict("measurement idempotency key differs"))
+                };
+            }
+        }
+        if all.contains_key(&(o, t, p, ChannelOwner::Measurement(plan.plan_id)))
+            || all.values().any(|entry| {
+                plan.targets
+                    .iter()
+                    .any(|target| entry.target(target.target_id).is_some())
+            })
+        {
+            return Err(AppError::conflict(
+                "measurement plan or target already exists",
+            ));
+        }
+        all.insert(
+            (o, t, p, ChannelOwner::Measurement(plan.plan_id)),
+            MemoryCycle {
+                measurement: Some(plan.clone()),
+                measurement_request: Some((key.to_owned(), request_hash.to_owned())),
+                ..Default::default()
+            },
+        );
+        Ok(plan)
+    }
+
+    async fn get_measurement_plan(
+        &self,
+        scope: &TenantScope,
+        plan_id: Uuid,
+    ) -> Result<Option<StandaloneMeasurementPlan>, AppError> {
+        let (o, t, p) = scope_key(scope)?;
+        Ok(self
+            .0
+            .lock()
+            .await
+            .get(&(o, t, p, ChannelOwner::Measurement(plan_id)))
+            .and_then(|entry| entry.measurement.clone()))
+    }
+
+    async fn list_measurement_plans(
+        &self,
+        scope: &TenantScope,
+        after_plan_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<StandaloneMeasurementPlan>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid measurement page size"));
+        }
+        let key = scope_key(scope)?;
+        let all = self.0.lock().await;
+        let mut plans: Vec<_> = all
+            .iter()
+            .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
+            .filter_map(|(_, entry)| entry.measurement.as_ref())
+            .filter(|plan| after_plan_id.is_none_or(|after| plan.plan_id > after))
+            .cloned()
+            .collect();
+        plans.sort_unstable_by_key(|plan| plan.plan_id);
+        plans.truncate(limit);
+        Ok(plans)
+    }
     async fn materialize_pending_commands(
         &self,
         _after_command_id: Option<Uuid>,
@@ -692,7 +883,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
                 Err(AppError::conflict("generated command target differs"))
             };
         }
-        all.entry((o, t, p, cycle_id))
+        all.entry((o, t, p, ChannelOwner::Cycle(cycle_id)))
             .or_default()
             .generated
             .insert(command_id, target.clone());
@@ -820,7 +1011,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
                 scope_key(scope)?.0,
                 scope_key(scope)?.1,
                 scope_key(scope)?.2,
-                plan.cycle_id,
+                ChannelOwner::Cycle(plan.cycle_id),
             ))
             .or_default();
         if let Some(existing) = &cycle.plan {
@@ -843,7 +1034,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
             .0
             .lock()
             .await
-            .get(&(o, t, p, cycle_id))
+            .get(&(o, t, p, ChannelOwner::Cycle(cycle_id)))
             .and_then(|cycle| cycle.plan.clone()))
     }
 
@@ -1064,7 +1255,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
     ) -> Result<ChannelCycleInputs, AppError> {
         let all = self.0.lock().await;
         let (o, t, p) = scope_key(scope)?;
-        let cycle = all.get(&(o, t, p, cycle_id));
+        let cycle = all.get(&(o, t, p, ChannelOwner::Cycle(cycle_id)));
         Ok(match cycle.and_then(|cycle| cycle.plan.as_ref()) {
             Some(plan) if plan.created_at <= as_of => {
                 frozen_cycle_inputs(plan, &cycle.expect("matched cycle").attempts, as_of)
@@ -1082,6 +1273,137 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
 mod tests {
     use super::*;
     use crate::{OperatorId, QuestionReference, TenantId};
+
+    #[tokio::test]
+    async fn standalone_measurements_replay_scope_dispatch_and_never_enter_cycle_reports() {
+        let repo = MemoryChannelJobRepository::default();
+        let scope = TenantScope::new(
+            OperatorId::new(Uuid::new_v4()),
+            TenantId::new(Uuid::new_v4()),
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let now = Utc::now();
+        let plan = StandaloneMeasurementPlan {
+            plan_id: Uuid::new_v4(),
+            project_id: scope.project_id.unwrap(),
+            title: "General topic".into(),
+            input_hash: "frozen".into(),
+            revision: 1,
+            created_at: now,
+            targets: vec![ChannelTarget {
+                target_id: Uuid::new_v4(),
+                input: ChannelTargetInput::Measure {
+                    account_id: Uuid::new_v4(),
+                    provider: "fixture".into(),
+                    model: "fixed".into(),
+                    surface: "consumer_web".into(),
+                    search_mode: "web_search".into(),
+                    protocol_version: "v1".into(),
+                    question_set_version: "ad-hoc".into(),
+                    question: "How are eclipses predicted?".into(),
+                    market: "global".into(),
+                    language: "en".into(),
+                    scheduled_at: now,
+                    sample_ordinal: 0,
+                    question_binding: None,
+                },
+            }],
+        };
+        assert_eq!(
+            repo.create_measurement_plan(&scope, "key", "request", plan.clone())
+                .await
+                .unwrap(),
+            plan
+        );
+        let mut retry = plan.clone();
+        retry.plan_id = Uuid::new_v4();
+        assert_eq!(
+            repo.create_measurement_plan(&scope, "key", "request", retry.clone())
+                .await
+                .unwrap(),
+            plan
+        );
+        assert_eq!(
+            repo.create_measurement_plan(&scope, "key", "different", retry)
+                .await
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::Conflict
+        );
+        assert_eq!(
+            repo.replay_measurement_plan(&scope, "key", "request")
+                .await
+                .unwrap(),
+            Some(plan.clone())
+        );
+        let other = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        assert!(
+            repo.get_measurement_plan(&other, plan.plan_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.replay_measurement_plan(&other, "key", "request")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repo.list_measurement_plans(&scope, None, 1).await.unwrap(),
+            vec![plan.clone()]
+        );
+        assert!(
+            repo.list_measurement_plans(&scope, Some(plan.plan_id), 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // An owner UUID collision cannot make standalone measurements appear in a cycle.
+        assert!(
+            repo.cycle_inputs(&scope, plan.plan_id, now)
+                .await
+                .unwrap()
+                .measurements
+                .is_none()
+        );
+        assert_eq!(repo.scan_pending(None, now, 10).await.unwrap().len(), 1);
+        let reservation = Uuid::new_v4();
+        repo.reserve_account(
+            &scope,
+            plan.targets[0].input.account_id(),
+            reservation,
+            now,
+            now + chrono::Duration::seconds(30),
+        )
+        .await
+        .unwrap();
+        let attempt = Uuid::new_v4();
+        repo.claim_reserved(&scope, plan.targets[0].target_id, attempt, reservation, now)
+            .await
+            .unwrap();
+        assert!(repo.scan_pending(None, now, 10).await.unwrap().is_empty());
+        assert_eq!(
+            repo.clone()
+                .get_target(&scope, plan.targets[0].target_id)
+                .await
+                .unwrap()
+                .attempts[0]
+                .attempt_id,
+            attempt
+        );
+        let mut invalid = plan;
+        invalid.targets.clear();
+        assert!(
+            repo.create_measurement_plan(&scope, "invalid", "request", invalid)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn legacy_measure_serialization_is_byte_stable_and_does_not_acquire_purpose() {
