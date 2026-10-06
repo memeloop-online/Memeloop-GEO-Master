@@ -1,7 +1,8 @@
 // Real local-memory API + real Vite + installed Chromium. No route interception,
 // external provider requests, account connections, or reusable credentials.
 // Set GEO_SMOKE_APP_BINARY and GEO_SMOKE_OUTPUT_DIR (outside the repository).
-// Optional: PLAYWRIGHT_BROWSERS_PATH, GEO_SMOKE_TMP_DIR; then run with Node.
+// Optional: PLAYWRIGHT_BROWSERS_PATH, GEO_SMOKE_TMP_DIR,
+// GEO_SMOKE_API_PORT, GEO_SMOKE_WEB_PORT; then run with Node.
 import { randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
@@ -13,8 +14,23 @@ import { fileURLToPath } from "node:url";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const webRoot = join(repository, "apps", "web");
-const apiUrl = "http://127.0.0.1:8080";
-const webUrl = "http://127.0.0.1:5173";
+function configuredPort(name, fallback) {
+  const value = process.env[name] ?? String(fallback);
+  const port = Number(value);
+  if (
+    !/^\d+$/.test(value) ||
+    !Number.isInteger(port) ||
+    port < 1 ||
+    port > 65535
+  )
+    throw new Error(`Invalid ${name}`);
+  return port;
+}
+const apiPort = configuredPort("GEO_SMOKE_API_PORT", 8080);
+const webPort = configuredPort("GEO_SMOKE_WEB_PORT", 5173);
+if (apiPort === webPort) throw new Error("Smoke API and web ports must differ");
+const apiUrl = `http://127.0.0.1:${apiPort}`;
+const webUrl = `http://127.0.0.1:${webPort}`;
 const browserCache = process.env.PLAYWRIGHT_BROWSERS_PATH;
 const scratch = resolve(process.env.GEO_SMOKE_TMP_DIR ?? tmpdir());
 const binary = process.env.GEO_SMOKE_APP_BINARY;
@@ -195,12 +211,12 @@ async function main() {
     "Set GEO_SMOKE_APP_BINARY and GEO_SMOKE_OUTPUT_DIR",
   );
   assert(
-    await portIsFree(8080),
-    "Port 8080 is occupied; refusing to touch another service",
+    await portIsFree(apiPort),
+    "Smoke API port is occupied; refusing to touch another service",
   );
   assert(
-    await portIsFree(5173),
-    "Port 5173 is occupied; refusing to touch another service",
+    await portIsFree(webPort),
+    "Smoke web port is occupied; refusing to touch another service",
   );
   const runDir = join(resolve(outputRoot), `run-${randomUUID()}`);
   screenshotsDirectory = runDir;
@@ -214,7 +230,9 @@ async function main() {
     repository,
     safeEnvironment({
       GEO_DEV_PASSWORD: password,
-      GEO_BIND_ADDR: "127.0.0.1:8080",
+      GEO_DEV_LOGIN_NAME: "demo@localhost",
+      GEO_BIND_ADDR: `127.0.0.1:${apiPort}`,
+      GEO_ALLOWED_ORIGINS: `${webUrl},${apiUrl}`,
     }),
   );
   await untilReady(`${apiUrl}/health/ready`, api, "Rust API");
@@ -225,9 +243,18 @@ async function main() {
   );
   const vite = ownedChild(
     process.execPath,
-    [viteCli, "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
+    [
+      viteCli,
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(webPort),
+      "--strictPort",
+      "--configLoader",
+      "runner",
+    ],
     webRoot,
-    safeEnvironment(),
+    safeEnvironment({ VITE_DEV_API_PROXY_TARGET: apiUrl }),
   );
   await untilReady(`${webUrl}/`, vite, "Vite");
 
@@ -273,7 +300,16 @@ async function main() {
   await page.goto(`${webUrl}/login`);
   await page.getByRole("textbox", { name: "用户名" }).fill("demo@localhost");
   await page.getByRole("textbox", { name: "密码" }).fill(password);
+  const loginResponse = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/v1/auth/login" &&
+      response.request().method() === "POST",
+  );
   await page.getByRole("button", { name: "登录", exact: true }).click();
+  assert(
+    (await loginResponse).status() === 200,
+    "Synthetic first-party login was rejected",
+  );
   await page.getByRole("heading", { name: "选择客户工作区" }).waitFor();
   assert(
     apiResponses.some(
@@ -380,7 +416,12 @@ async function main() {
   console.log("P04: actual CSV source and logical-record evidence visible");
 
   await page.goto(`${base}/measurement`);
-  await page.getByRole("heading", { name: "问题集", exact: true }).waitFor();
+  await page
+    .getByRole("heading", { name: "测量与洞察", exact: true })
+    .waitFor();
+  await page
+    .getByRole("heading", { name: "问题集与版本", exact: true })
+    .waitFor();
   await page
     .getByRole("textbox", { name: "问题集名称", exact: true })
     .fill("Synthetic questions");

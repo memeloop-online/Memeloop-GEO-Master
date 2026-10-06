@@ -628,7 +628,7 @@ fn error_code_for_host_op(code: HostOpErrorCode) -> ErrorCode {
         HostOpErrorCode::Denied => ErrorCode::Forbidden,
         HostOpErrorCode::NotFound => ErrorCode::NotFound,
         HostOpErrorCode::InvalidRequest => ErrorCode::InvalidRequest,
-        HostOpErrorCode::IdempotencyConflict => ErrorCode::Conflict,
+        HostOpErrorCode::IdempotencyConflict | HostOpErrorCode::Conflict => ErrorCode::Conflict,
         // Operational rather than a programming error: the run's own budget or
         // deadline ran out, or the bridge could not produce a trustworthy
         // result for an effect that may have happened.
@@ -1562,6 +1562,84 @@ impl HostOps for RepositoryHostOps {
             .search(scope, request)
             .await
             .map_err(|error| worker_error(HostOp::KnowledgeSearch, error))
+    }
+
+    async fn knowledge_text_read(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::KnowledgeTextReadRequest,
+    ) -> Result<geo_worker::KnowledgeTextReadResult, HostOpError> {
+        let op = HostOp::KnowledgeTextRead;
+        let missing = || HostOpError::not_found(op, "source version content not found");
+        let source = self
+            .knowledge
+            .get_source(scope, request.source_id)
+            .await
+            .map_err(|error| worker_error(op, error))?
+            .ok_or_else(missing)?;
+        let source_version = self
+            .knowledge
+            .get_source_version(scope, request.source_id, request.source_version_id)
+            .await
+            .map_err(|error| worker_error(op, error))?
+            .ok_or_else(missing)?;
+        let content = self
+            .knowledge
+            .get_source_version_content(scope, request.source_id, request.source_version_id)
+            .await
+            .map_err(|error| worker_error(op, error))?
+            .ok_or_else(missing)?;
+        Ok(geo_worker::KnowledgeTextReadResult {
+            source,
+            source_version,
+            content,
+        })
+    }
+
+    async fn knowledge_text_revise(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::KnowledgeTextReviseRequest,
+    ) -> Result<geo_domain::SourceTextRevisionReceipt, HostOpError> {
+        let op = HostOp::KnowledgeTextRevise;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        self.knowledge
+            .revise_source_text(
+                scope,
+                request.source_id,
+                request.expected_revision,
+                &request.idempotency_key,
+                geo_domain::ReviseSourceTextCommand {
+                    base_version_id: request.base_version_id,
+                    media_type: request.media_type,
+                    text: request.text,
+                },
+            )
+            .await
+            .map_err(|error| {
+                if error.code == ErrorCode::Conflict {
+                    let reason = error
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str);
+                    return match reason {
+                        Some("idempotency_conflict") => {
+                            HostOpError::idempotency_conflict(op, error.message)
+                        }
+                        Some("source_revision_conflict") => {
+                            HostOpError::conflict(op, "source_revision_conflict")
+                        }
+                        Some("source_parse_in_progress") => {
+                            HostOpError::conflict(op, "source_parse_in_progress")
+                        }
+                        _ => HostOpError::conflict(op, error.message),
+                    };
+                }
+                worker_error(op, error)
+            })
     }
 
     async fn manifest_read(

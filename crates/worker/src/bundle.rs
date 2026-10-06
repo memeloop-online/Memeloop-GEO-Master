@@ -66,11 +66,13 @@ pub const MAIN_MODULE: &str = "memeloop://bundle/geo-loop.js";
 /// are parsed once, so call sites never see a raw JSON string, and every
 /// failure is the structured `GeoHostOpError` the Rust side produced.
 pub const HOST_OPS_JS: &str = r#"
-export const HOST_OPS_VERSION = "geo.hostops.v12";
+export const HOST_OPS_VERSION = "geo.hostops.v13";
 
 const OPS = {
   modelComplete: "op_host_model_complete_v1",
   knowledgeSearch: "op_host_knowledge_search_v1",
+  knowledgeTextRead: "op_host_knowledge_text_read_v1",
+  knowledgeTextRevise: "op_host_knowledge_text_revise_v1",
   knowledgeImportStatus: "op_host_knowledge_import_status_v1",
   manifestRead: "op_host_manifest_read_v2",
   publishSubmit: "op_host_publish_submit_v2",
@@ -118,6 +120,8 @@ export const hostOps = {
   version: HOST_OPS_VERSION,
   modelComplete: (request) => callOp(OPS.modelComplete, request),
   knowledgeSearch: (request) => callOp(OPS.knowledgeSearch, request),
+  knowledgeTextRead: (request) => callOp(OPS.knowledgeTextRead, request),
+  knowledgeTextRevise: (request) => callOp(OPS.knowledgeTextRevise, request),
   knowledgeImportStatus: (request) => callOp(OPS.knowledgeImportStatus, request),
   manifestRead: (request) => callOp(OPS.manifestRead, request),
   publishSubmit: (request) => callOp(OPS.publishSubmit, request),

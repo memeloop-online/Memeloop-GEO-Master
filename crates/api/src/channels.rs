@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    extract::{Extension, OriginalUri, Path, Query, State, ws::WebSocketUpgrade},
+    http::{HeaderMap, StatusCode},
+    response::Response,
     routing::get,
 };
 use chrono::{Duration, Utc};
@@ -23,7 +24,9 @@ use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, AuthContext, RequestContext, api_error,
-    browser_bridge::{BrowserAction, BrowserBridge, BrowserProxy, BrowserSnapshot},
+    browser_bridge::{
+        BrowserAction, BrowserBridge, BrowserDesktopStatus, BrowserProxy, BrowserSnapshot,
+    },
     require_project_writer,
 };
 
@@ -1183,6 +1186,10 @@ pub async fn start_login(
         let _ = browser.close(session_id).await;
         return Err(err(error, context));
     }
+    state
+        .desktop_grants
+        .bind(session_id, &auth, &tenant.tenant_id.to_string())
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(LoginStarted {
@@ -1204,6 +1211,7 @@ async fn valid_login(
         .get_login(scope, id)
         .await?;
     if Utc::now() - session.created_at > Duration::minutes(20) {
+        state.desktop_grants.revoke(id).await;
         let _ = state.channel_service().browser()?.close(id).await;
         let _ = state
             .channel_service()
@@ -1236,6 +1244,132 @@ pub async fn snapshot(
         .await
         .map_err(|e| err(e, context))?;
     Ok(Json(image))
+}
+
+#[derive(Serialize)]
+pub struct DesktopAuthorization {
+    pub websocket_path: String,
+    pub protocol: String,
+}
+
+pub async fn desktop_authorization(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ChannelQuery>,
+    headers: HeaderMap,
+    Extension(tenant): Extension<TenantScope>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<DesktopAuthorization>, ApiError> {
+    writer(&auth, context)?;
+    let scope = scope(&state, &tenant, query.project_id)
+        .await
+        .map_err(|e| err(e, context))?;
+    valid_login(&state, &scope, id)
+        .await
+        .map_err(|e| err(e, context))?;
+    state
+        .channel_service()
+        .browser()
+        .map_err(|e| err(e, context))?
+        .desktop_status(id)
+        .await
+        .map_err(|e| err(e, context))?;
+    crate::desktop_gateway::validate_desktop_origin(&headers, state.origin_config())
+        .map_err(|e| err(e, context))?;
+    let origin = crate::desktop_gateway::request_origin(&headers).map_err(|e| err(e, context))?;
+    let protocol = state
+        .desktop_grants
+        .issue(id, &auth, &tenant.tenant_id.to_string(), origin)
+        .await
+        .map_err(|e| err(e, context))?;
+    Ok(Json(DesktopAuthorization {
+        websocket_path: format!(
+            "/api/v1/channel-login-sessions/{id}/desktop?project_id={}&tenant_id={}",
+            query.project_id, tenant.tenant_id
+        ),
+        protocol,
+    }))
+}
+
+// Axum extracts each independently authenticated request component here.
+#[allow(clippy::too_many_arguments)]
+pub async fn desktop_socket(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ChannelQuery>,
+    upgrade: WebSocketUpgrade,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Extension(tenant): Extension<TenantScope>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Response, ApiError> {
+    writer(&auth, context)?;
+    crate::desktop_gateway::validate_desktop_origin(&headers, state.origin_config())
+        .map_err(|e| err(e, context))?;
+    let scope = scope(&state, &tenant, query.project_id)
+        .await
+        .map_err(|e| err(e, context))?;
+    let session = valid_login(&state, &scope, id)
+        .await
+        .map_err(|e| err(e, context))?;
+    let browser = state
+        .channel_service()
+        .browser()
+        .map_err(|e| err(e, context))?
+        .clone();
+    let watch = crate::desktop_gateway::DesktopWatch {
+        repository: state.auth_repository(),
+        headers: headers.clone(),
+        uri,
+        customer: true,
+        tenant: tenant.tenant_id.to_string(),
+        expires_at: session.created_at + Duration::minutes(20),
+    };
+    crate::desktop_gateway::upgrade(
+        upgrade,
+        headers,
+        state.desktop_grants.clone(),
+        browser,
+        id,
+        &auth,
+        &tenant.tenant_id.to_string(),
+        context,
+        watch,
+    )
+    .await
+}
+
+pub async fn desktop_status(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ChannelQuery>,
+    Extension(tenant): Extension<TenantScope>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<BrowserDesktopStatus>, ApiError> {
+    writer(&auth, context)?;
+    let scope = scope(&state, &tenant, query.project_id)
+        .await
+        .map_err(|e| err(e, context))?;
+    valid_login(&state, &scope, id)
+        .await
+        .map_err(|e| err(e, context))?;
+    state
+        .desktop_grants
+        .verify(id, &auth, &tenant.tenant_id.to_string())
+        .await
+        .map_err(|e| err(e, context))?;
+    Ok(Json(
+        state
+            .channel_service()
+            .browser()
+            .map_err(|e| err(e, context))?
+            .desktop_status(id)
+            .await
+            .map_err(|e| err(e, context))?,
+    ))
 }
 
 pub async fn action(
@@ -1279,9 +1413,15 @@ pub async fn complete_login(
     let session = valid_login(&state, &scope, id)
         .await
         .map_err(|e| err(e, context))?;
+    state
+        .desktop_grants
+        .verify(id, &auth, &tenant.tenant_id.to_string())
+        .await
+        .map_err(|e| err(e, context))?;
     let service = state.channel_service();
     let browser = service.browser().map_err(|e| err(e, context))?;
     let verified = browser.complete(id).await.map_err(|e| err(e, context))?;
+    state.desktop_grants.revoke(id).await;
     if verified.identity.platform_account_id.trim().is_empty()
         || verified.identity.display_name.trim().is_empty()
     {
@@ -1356,6 +1496,12 @@ pub async fn cancel_login(
     valid_login(&state, &scope, id)
         .await
         .map_err(|e| err(e, context))?;
+    state
+        .desktop_grants
+        .verify(id, &auth, &tenant.tenant_id.to_string())
+        .await
+        .map_err(|e| err(e, context))?;
+    state.desktop_grants.revoke(id).await;
     state
         .channel_service()
         .browser()
@@ -1749,6 +1895,11 @@ pub async fn start_pool_login(
         let _ = browser.close(session_id).await;
         return Err(err(error, context));
     }
+    let pool_tenant = pool_tenant(service, &auth).map_err(|e| err(e, context))?;
+    state
+        .desktop_grants
+        .bind(session_id, &auth, &pool_tenant.to_string())
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(LoginStarted {
@@ -1771,6 +1922,7 @@ async fn valid_pool_login(
         .get_pool_login(auth.operator.id, id)
         .await?;
     if Utc::now() - session.created_at > Duration::minutes(20) {
+        state.desktop_grants.revoke(id).await;
         if let Ok(browser) = state.channel_service().browser() {
             let _ = browser.close(id).await;
         }
@@ -1799,6 +1951,108 @@ pub async fn pool_snapshot(
             .browser()
             .map_err(|e| err(e, context))?
             .snapshot(id)
+            .await
+            .map_err(|e| err(e, context))?,
+    ))
+}
+
+pub async fn pool_desktop_authorization(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<DesktopAuthorization>, ApiError> {
+    valid_pool_login(&state, &auth, id)
+        .await
+        .map_err(|e| err(e, context))?;
+    let browser = state
+        .channel_service()
+        .browser()
+        .map_err(|e| err(e, context))?;
+    browser
+        .desktop_status(id)
+        .await
+        .map_err(|e| err(e, context))?;
+    crate::desktop_gateway::validate_desktop_origin(&headers, state.origin_config())
+        .map_err(|e| err(e, context))?;
+    let origin = crate::desktop_gateway::request_origin(&headers).map_err(|e| err(e, context))?;
+    let tenant = crate::channels::pool_tenant(state.channel_service(), &auth)
+        .map_err(|e| err(e, context))?;
+    let protocol = state
+        .desktop_grants
+        .issue(id, &auth, &tenant.to_string(), origin)
+        .await
+        .map_err(|e| err(e, context))?;
+    Ok(Json(DesktopAuthorization {
+        websocket_path: format!("/api/v1/operator/channel-login-sessions/{id}/desktop"),
+        protocol,
+    }))
+}
+
+pub async fn pool_desktop_socket(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    upgrade: WebSocketUpgrade,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Response, ApiError> {
+    let session = valid_pool_login(&state, &auth, id)
+        .await
+        .map_err(|e| err(e, context))?;
+    crate::desktop_gateway::validate_desktop_origin(&headers, state.origin_config())
+        .map_err(|e| err(e, context))?;
+    let tenant = pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
+    let browser = state
+        .channel_service()
+        .browser()
+        .map_err(|e| err(e, context))?
+        .clone();
+    let watch = crate::desktop_gateway::DesktopWatch {
+        repository: state.auth_repository(),
+        headers: headers.clone(),
+        uri,
+        customer: false,
+        tenant: tenant.to_string(),
+        expires_at: session.created_at + Duration::minutes(20),
+    };
+    crate::desktop_gateway::upgrade(
+        upgrade,
+        headers,
+        state.desktop_grants.clone(),
+        browser,
+        id,
+        &auth,
+        &tenant.to_string(),
+        context,
+        watch,
+    )
+    .await
+}
+
+pub async fn pool_desktop_status(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<BrowserDesktopStatus>, ApiError> {
+    valid_pool_login(&state, &auth, id)
+        .await
+        .map_err(|e| err(e, context))?;
+    let tenant = pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
+    state
+        .desktop_grants
+        .verify(id, &auth, &tenant.to_string())
+        .await
+        .map_err(|e| err(e, context))?;
+    Ok(Json(
+        state
+            .channel_service()
+            .browser()
+            .map_err(|e| err(e, context))?
+            .desktop_status(id)
             .await
             .map_err(|e| err(e, context))?,
     ))
@@ -1839,10 +2093,17 @@ pub async fn complete_pool_login(
     let session = valid_pool_login(&state, &auth, id)
         .await
         .map_err(|e| err(e, context))?;
+    let owner_tenant = pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
+    state
+        .desktop_grants
+        .verify(id, &auth, &owner_tenant.to_string())
+        .await
+        .map_err(|e| err(e, context))?;
     let service = state.channel_service();
     let scope = trusted_pool_scope(service, &auth).map_err(|e| err(e, context))?;
     let browser = service.browser().map_err(|e| err(e, context))?;
     let verified = browser.complete(id).await.map_err(|e| err(e, context))?;
+    state.desktop_grants.revoke(id).await;
     if verified.identity.platform_account_id.trim().is_empty()
         || verified.identity.display_name.trim().is_empty()
     {
@@ -1914,6 +2175,13 @@ pub async fn cancel_pool_login(
     valid_pool_login(&state, &auth, id)
         .await
         .map_err(|e| err(e, context))?;
+    let owner_tenant = pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
+    state
+        .desktop_grants
+        .verify(id, &auth, &owner_tenant.to_string())
+        .await
+        .map_err(|e| err(e, context))?;
+    state.desktop_grants.revoke(id).await;
     state
         .channel_service()
         .browser()
@@ -1945,6 +2213,12 @@ pub fn customer_routes() -> Router<AppState> {
         )
         .route("/channel-login-sessions", axum::routing::post(start_login))
         .route("/channel-login-sessions/{id}/snapshot", get(snapshot))
+        .route("/channel-login-sessions/{id}/status", get(desktop_status))
+        .route(
+            "/channel-login-sessions/{id}/desktop-authorization",
+            axum::routing::post(desktop_authorization),
+        )
+        .route("/channel-login-sessions/{id}/desktop", get(desktop_socket))
         .route(
             "/channel-login-sessions/{id}/actions",
             axum::routing::post(action),
@@ -1991,6 +2265,18 @@ pub fn operator_routes() -> Router<AppState> {
         .route(
             "/operator/channel-login-sessions/{id}/snapshot",
             get(pool_snapshot),
+        )
+        .route(
+            "/operator/channel-login-sessions/{id}/status",
+            get(pool_desktop_status),
+        )
+        .route(
+            "/operator/channel-login-sessions/{id}/desktop-authorization",
+            axum::routing::post(pool_desktop_authorization),
+        )
+        .route(
+            "/operator/channel-login-sessions/{id}/desktop",
+            get(pool_desktop_socket),
         )
         .route(
             "/operator/channel-login-sessions/{id}/actions",

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -10,13 +10,13 @@ import {
   assignPoolAccount,
   createChannelAccount,
   createChannelGroup,
-  getChannelLoginSnapshot,
+  getChannelLoginStatus,
+  authorizeChannelDesktop,
   listOperatorConnectorCapabilities,
   listProjectConnectorCapabilities,
   listChannelAccounts,
   listChannelGroups,
   listPoolAccounts,
-  sendChannelLoginAction,
   unassignPoolAccount,
   updateChannelAccount,
   updateOperatorConnectorCapability,
@@ -26,6 +26,41 @@ import {
   ChannelAccountsPage,
   OperatorAccountsPage,
 } from "./ChannelAccountsPage";
+
+const desktopConnections = vi.hoisted(
+  () =>
+    [] as Array<{
+      url: string;
+      protocols: string[];
+      disconnect: ReturnType<typeof vi.fn>;
+      emit: (event: string) => void;
+    }>,
+);
+vi.mock("@novnc/novnc", () => ({
+  default: class {
+    scaleViewport = false;
+    resizeSession = false;
+    private handlers = new Map<string, (event: Event) => void>();
+    disconnect = vi.fn();
+    focus = vi.fn();
+    clipboardPasteFrom = vi.fn();
+    constructor(
+      _target: HTMLElement,
+      url: string,
+      options: { wsProtocols: string[] },
+    ) {
+      desktopConnections.push({
+        url,
+        protocols: options.wsProtocols,
+        disconnect: this.disconnect,
+        emit: (event: string) => this.handlers.get(event)?.(new Event(event)),
+      });
+    }
+    addEventListener(event: string, handler: (event: Event) => void) {
+      this.handlers.set(event, handler);
+    }
+  },
+}));
 
 const session = {
   user: { id: "user-1", login_name: "user@example.test", display_name: "User" },
@@ -74,10 +109,6 @@ const platforms = [
 ];
 const snapshot = {
   phase: "login_required",
-  url: "https://example.test/login",
-  width: 800,
-  height: 600,
-  screenshot_base64: "AA==",
   identity: null,
 };
 const unverifiedCapability: OperatorConnectorCapability = {
@@ -108,6 +139,7 @@ function mockApi(
   connector = unverifiedCapability,
   operatorRole = "resource_admin",
 ) {
+  let identityReady = false;
   const requests: { path: string; method: string; body?: unknown; url: URL }[] =
     [];
   const fetchMock = vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
@@ -185,17 +217,33 @@ function mockApi(
           phase: "login_required",
         }),
       );
-    if (path.endsWith("/channel-login-sessions/login-1/snapshot"))
-      return Promise.resolve(response(snapshot));
-    if (path.endsWith("/channel-login-sessions/login-1/actions"))
+    if (
+      path.endsWith("/channel-login-sessions/login-1/status") ||
+      path.endsWith("/operator/channel-login-sessions/login-1/status")
+    )
+      return Promise.resolve(
+        response(
+          identityReady
+            ? {
+                phase: "ready_to_complete",
+                identity: {
+                  display_name: "已识别账号",
+                  platform_account_id: "external-1",
+                },
+              }
+            : snapshot,
+        ),
+      );
+    if (
+      path.endsWith("/channel-login-sessions/login-1/desktop-authorization") ||
+      path.endsWith(
+        "/operator/channel-login-sessions/login-1/desktop-authorization",
+      )
+    )
       return Promise.resolve(
         response({
-          ...snapshot,
-          phase: "ready_to_complete",
-          identity: {
-            display_name: "已识别账号",
-            platform_account_id: "external-1",
-          },
+          websocket_path: `${path.replace("/desktop-authorization", "/desktop")}?tenant_id=tenant-1&project_id=project-1`,
+          protocol: "geo-desktop.test-grant",
         }),
       );
     if (path.endsWith("/channel-login-sessions/login-1/complete"))
@@ -207,7 +255,13 @@ function mockApi(
     );
   });
   vi.stubGlobal("fetch", fetchMock);
-  return { requests, fetchMock };
+  return {
+    requests,
+    fetchMock,
+    setIdentityReady: () => {
+      identityReady = true;
+    },
+  };
 }
 function renderPage(
   view: "channels" | "connect" | "settings" = "channels",
@@ -250,6 +304,7 @@ function renderOperator() {
 }
 
 afterEach(() => {
+  desktopConnections.length = 0;
   vi.unstubAllGlobals();
   setCsrfToken(undefined);
   setUnauthorizedHandler(undefined);
@@ -305,19 +360,15 @@ describe("channel API scope", () => {
     });
   });
 
-  it("sends proxy secrets only in write body and preserves exact remote action", async () => {
+  it("sends proxy secrets only in write body and authorizes a scoped desktop", async () => {
     const { requests } = mockApi();
     await createChannelAccount("tenant-1", "project-1", "zhihu", undefined, {
       server: "socks5://proxy.example.test:1080",
       username: "user",
       password: "placeholder",
     });
-    await sendChannelLoginAction("tenant-1", "project-1", "login-1", {
-      kind: "click",
-      x: 33,
-      y: 44,
-    });
-    await getChannelLoginSnapshot("tenant-1", "project-1", "login-1");
+    await authorizeChannelDesktop("tenant-1", "project-1", "login-1");
+    await getChannelLoginStatus("tenant-1", "project-1", "login-1");
     const write = requests.find(
       (item) =>
         item.path.endsWith("/channel-accounts") && item.method === "POST",
@@ -328,11 +379,12 @@ describe("channel API scope", () => {
     });
     expect(write.url.toString()).not.toContain("placeholder");
     expect(
-      requests.find((item) => item.path.endsWith("/actions"))?.body,
-    ).toEqual({ kind: "click", x: 33, y: 44 });
+      requests.find((item) => item.path.endsWith("/desktop-authorization"))
+        ?.body,
+    ).toBeUndefined();
     expect(
       requests
-        .find((item) => item.path.endsWith("/snapshot"))
+        .find((item) => item.path.endsWith("/status"))
         ?.url.searchParams.get("project_id"),
     ).toBe("project-1");
   });
@@ -399,7 +451,7 @@ describe("account page", () => {
     expect(await screen.findByText("已识别账号")).toBeTruthy();
     expect(screen.getByText("已连接")).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "重新连接" }));
-    await screen.findByRole("img", { name: /远程登录页面截图/ });
+    await screen.findByRole("group", { name: "远程浏览器画面" });
     expect(
       requests.some(
         (item) =>
@@ -427,32 +479,69 @@ describe("account page", () => {
     ).toEqual({ project_id: "project-1", name: "内容团队" });
   });
 
-  it("offers reconnect for expired accounts and keyboard-accessible pixel actions", async () => {
+  it("reconnects an expired account through noVNC, never screenshot actions", async () => {
     const { requests } = mockApi([{ ...account, status: "expired" }]);
     renderPage();
     expect(await screen.findByText("登录已失效")).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "登录并验证" }));
     const remote = await screen.findByLabelText("远程登录");
-    await userEvent.type(
-      within(remote).getByRole("spinbutton", { name: "点击横坐标" }),
-      "20",
+    await waitFor(() => expect(desktopConnections.length).toBeGreaterThan(0));
+    expect(desktopConnections.at(-1)?.url).toContain(
+      "/channel-login-sessions/login-1/desktop?",
     );
-    await userEvent.type(
-      within(remote).getByRole("spinbutton", { name: "点击纵坐标" }),
-      "40",
-    );
+    expect(desktopConnections.at(-1)?.protocols).toEqual([
+      "geo-desktop.test-grant",
+    ]);
+    expect(within(remote).queryByRole("spinbutton")).toBeNull();
+    expect(
+      requests.some(
+        (request) =>
+          request.path.endsWith("/actions") ||
+          request.path.endsWith("/snapshot"),
+      ),
+    ).toBe(false);
+    act(() => desktopConnections.at(-1)?.emit("disconnect"));
     await userEvent.click(
-      within(remote).getByRole("button", { name: "点击坐标" }),
+      await within(remote).findByRole("button", { name: "重新连接画面" }),
     );
     await waitFor(() =>
       expect(
-        requests.find(
-          (item) =>
-            item.path.endsWith("/actions") &&
-            (item.body as { kind: string }).kind === "click",
-        )?.body,
-      ).toEqual({ kind: "click", x: 20, y: 40 }),
+        requests.filter((request) =>
+          request.path.endsWith("/desktop-authorization"),
+        ),
+      ).toHaveLength(2),
     );
+  });
+
+  it("rejects an unexpected desktop target without falling back to screenshots", async () => {
+    const { fetchMock, requests } = mockApi([
+      { ...account, status: "expired" },
+    ]);
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((request, init) =>
+      String(request).includes("/desktop-authorization")
+        ? Promise.resolve(
+            response({
+              websocket_path: "//untrusted.example.test/desktop",
+              protocol: "geo-desktop.test-grant",
+            }),
+          )
+        : original(request, init),
+    );
+    renderPage();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "登录并验证" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "远程浏览器连接失败，请重新连接。",
+    );
+    expect(desktopConnections).toHaveLength(0);
+    expect(
+      requests.some(
+        (item) =>
+          item.path.endsWith("/snapshot") || item.path.endsWith("/actions"),
+      ),
+    ).toBe(false);
   });
 
   it("shows assigned shared accounts without customer login or configuration controls", async () => {
@@ -471,19 +560,21 @@ describe("account page", () => {
     expect(screen.queryByRole("button", { name: "配置" })).toBeNull();
   });
 
-  it("saves verified identity automatically after a remote action and clears typed text", async () => {
-    const { requests } = mockApi();
-    renderPage("connect");
+  it("saves verified identity from status and disconnects the desktop", async () => {
+    const { requests, setIdentityReady } = mockApi();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    renderPage("connect", client);
     await screen.findByRole("button", { name: "启动远程登录" });
     await userEvent.click(screen.getByRole("button", { name: "启动远程登录" }));
-    await screen.findByRole("img", { name: /远程登录页面截图/ });
+    await waitFor(() => expect(desktopConnections.length).toBeGreaterThan(0));
     const remote = screen.getByLabelText("远程登录");
-    const input = within(remote).getByLabelText(/向当前焦点输入文字/);
-    expect(input).toHaveAttribute("type", "text");
-    await userEvent.type(input, "ordinary text");
-    await userEvent.click(
-      within(remote).getByRole("button", { name: "发送文字" }),
-    );
+    expect(within(remote).queryByRole("img")).toBeNull();
+    setIdentityReady();
+    await client.invalidateQueries({
+      queryKey: ["channel-login", "tenant-1", "project-1", "login-1"],
+    });
     await waitFor(() =>
       expect(
         requests.some(
@@ -491,11 +582,11 @@ describe("account page", () => {
         ),
       ).toBe(true),
     );
-    expect((input as HTMLInputElement).value).toBe("");
     expect(await screen.findByText("已验证账号身份并保存连接。")).toBeTruthy();
+    expect(desktopConnections.at(-1)?.disconnect).toHaveBeenCalled();
   });
 
-  it("closes an already expired login and discards cached account screenshots", async () => {
+  it("closes an already expired login and discards cached account identity", async () => {
     const { fetchMock } = mockApi();
     const defaultFetch = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((request, init) => {
@@ -518,7 +609,7 @@ describe("account page", () => {
     await userEvent.click(
       await screen.findByRole("button", { name: "启动远程登录" }),
     );
-    await screen.findByRole("img", { name: /远程登录页面截图/ });
+    await waitFor(() => expect(desktopConnections.length).toBeGreaterThan(0));
     expect(
       client.getQueryData([
         "channel-login",
@@ -544,6 +635,26 @@ describe("account page", () => {
 });
 
 describe("operator pool", () => {
+  it("uses the same noVNC desktop for operator login", async () => {
+    const { requests } = mockApi([account], true);
+    renderOperator();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "重新登录" }),
+    );
+    await waitFor(() => expect(desktopConnections.length).toBeGreaterThan(0));
+    expect(desktopConnections.at(-1)?.url).toContain(
+      "/operator/channel-login-sessions/login-1/desktop?",
+    );
+    expect(
+      requests.some((item) =>
+        item.path.endsWith(
+          "/operator/channel-login-sessions/login-1/desktop-authorization",
+        ),
+      ),
+    ).toBe(true);
+    expect(requests.some((item) => item.path.endsWith("/actions"))).toBe(false);
+  });
+
   it("offers appearance settings to OEM admins", async () => {
     mockApi([], true, unverifiedCapability, "oem_admin");
     renderOperator();

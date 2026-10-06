@@ -4,8 +4,8 @@ use axum::{
     http::{Request, StatusCode, header::SET_COOKIE},
 };
 use geo_api::{
-    AppState, CSRF_HEADER, ChannelService, EventBus, MemoryIdempotencyStore, MemoryOperationStore,
-    router,
+    AppState, BrowserBridge, CSRF_HEADER, ChannelService, EventBus, MemoryIdempotencyStore,
+    MemoryOperationStore, router,
 };
 use geo_domain::{
     DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, Membership, MemoryAuthRepository,
@@ -167,6 +167,211 @@ async fn json_body(response: axum::response::Response) -> Value {
             .unwrap(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn desktop_authorization_is_same_origin_and_cookie_session_bound() {
+    use axum::{
+        Json,
+        extract::Path,
+        routing::{get, post},
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let ready = Arc::new(AtomicBool::new(true));
+    let status_ready = ready.clone();
+    let runner = Router::new()
+        .route(
+            "/v1/sessions",
+            post(|Json(input): Json<Value>| async move {
+                Json(json!({"session_id": input["session_id"]}))
+            }),
+        )
+        .route(
+            "/v1/sessions/{id}/status",
+            get(move || {
+                let ready = status_ready.clone();
+                async move {
+                    if ready.load(Ordering::SeqCst) {
+                        (StatusCode::OK, Json(json!({"phase": "login_required"})))
+                    } else {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error":"unavailable"})),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/sessions/{id}",
+            axum::routing::delete(|Path(_id): Path<String>| async {
+                Json(json!({"closed": true}))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, runner).await.unwrap();
+    });
+    let state = AppState::development_with_password("desktop-fixture").with_channel_service(
+        ChannelService::development().with_browser(
+            BrowserBridge::new(format!("http://{address}"), "runner-fixture-token".into()).unwrap(),
+        ),
+    );
+    let scope = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
+    let project = state
+        .project_repository()
+        .create(
+            &scope,
+            ProjectCreate {
+                slug: Some("desktop-fixture".into()),
+                display_name: "Desktop fixture".into(),
+                settings: ProjectSettings::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let app = router(state);
+    let login = |app: Router| async move {
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/api/v1/auth/login",
+                None,
+                None,
+                json!({"login_name":"demo@localhost","password":"desktop-fixture"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let body = json_body(response).await;
+        (cookie, body["csrf_token"].as_str().unwrap().to_owned())
+    };
+    let (cookie, csrf) = login(app.clone()).await;
+    let (other_cookie, other_csrf) = login(app.clone()).await;
+    let account = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/v1/channel-accounts",
+            Some(&cookie),
+            Some(&csrf),
+            json!({"project_id":project.id,"platform":"zhihu"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(account.status(), StatusCode::CREATED);
+    let account = json_body(account).await;
+    let started = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/v1/channel-login-sessions",
+            Some(&cookie),
+            Some(&csrf),
+            json!({"project_id":project.id,"account_id":account["account_id"]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::CREATED);
+    let started = json_body(started).await;
+    let url = format!(
+        "/api/v1/channel-login-sessions/{}/desktop-authorization?project_id={}",
+        started["session_id"].as_str().unwrap(),
+        project.id
+    );
+    let authorize = |cookie: &str, csrf: &str, origin: &str, tenant: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(&url)
+            .header("host", "localhost:8080")
+            .header("origin", origin)
+            .header("x-tenant-selector", tenant)
+            .header("cookie", cookie)
+            .header(CSRF_HEADER, csrf)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let cross_origin = app
+        .clone()
+        .oneshot(authorize(
+            &cookie,
+            &csrf,
+            "http://localhost:5173",
+            &DEVELOPMENT_TENANT_ID.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+    let other = app
+        .clone()
+        .oneshot(authorize(
+            &other_cookie,
+            &other_csrf,
+            "http://localhost:8080",
+            &DEVELOPMENT_TENANT_ID.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::FORBIDDEN);
+    let foreign_tenant = app
+        .clone()
+        .oneshot(authorize(
+            &cookie,
+            &csrf,
+            "http://localhost:8080",
+            &Uuid::new_v4().to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_tenant.status(), StatusCode::FORBIDDEN);
+    let authorized = app
+        .clone()
+        .oneshot(authorize(
+            &cookie,
+            &csrf,
+            "http://localhost:8080",
+            &DEVELOPMENT_TENANT_ID.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body = json_body(authorized).await;
+    assert!(
+        body["protocol"]
+            .as_str()
+            .unwrap()
+            .starts_with("geo-desktop.")
+    );
+    assert_eq!(
+        body["websocket_path"],
+        format!(
+            "/api/v1/channel-login-sessions/{}/desktop?project_id={}&tenant_id={}",
+            started["session_id"].as_str().unwrap(),
+            project.id,
+            DEVELOPMENT_TENANT_ID
+        )
+    );
+    ready.store(false, Ordering::SeqCst);
+    let unavailable = app
+        .oneshot(authorize(
+            &cookie,
+            &csrf,
+            "http://localhost:8080",
+            &DEVELOPMENT_TENANT_ID.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    task.abort();
 }
 
 #[tokio::test]

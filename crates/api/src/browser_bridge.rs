@@ -14,6 +14,38 @@ pub struct BrowserBridge {
 }
 
 impl BrowserBridge {
+    pub(crate) fn desktop_connection(&self, id: Uuid) -> Result<(String, String), AppError> {
+        let mut url = reqwest::Url::parse(&self.endpoint(id, "/desktop"))
+            .map_err(|_| AppError::new(ErrorCode::Internal, "browser runner URL invalid"))?;
+        url.set_scheme(match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            _ => {
+                return Err(AppError::new(
+                    ErrorCode::Internal,
+                    "browser runner URL invalid",
+                ));
+            }
+        })
+        .map_err(|_| AppError::new(ErrorCode::Internal, "browser runner URL invalid"))?;
+        Ok((url.to_string(), self.token.clone()))
+    }
+
+    pub async fn desktop_status(&self, id: Uuid) -> Result<BrowserDesktopStatus, AppError> {
+        let response = self
+            .client
+            .get(self.endpoint(id, "/status"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser runner unavailable",
+                )
+            })?;
+        Self::response(response).await
+    }
     /// Discover only the version advertised by the authenticated running
     /// adapter. This is not publication verification or an enablement claim.
     pub async fn capabilities(&self) -> Result<RunnerCapabilities, AppError> {
@@ -416,6 +448,13 @@ pub struct BrowserSnapshot {
     pub height: u32,
     pub screenshot_base64: String,
     #[serde(default)]
+    pub identity: Option<BrowserIdentity>,
+}
+
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+pub struct BrowserDesktopStatus {
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<BrowserIdentity>,
 }
 

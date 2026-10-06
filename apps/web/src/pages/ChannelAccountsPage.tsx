@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type MouseEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Badge,
   Button,
@@ -30,16 +30,16 @@ import {
   createChannelAccount,
   createChannelGroup,
   deleteChannelGroup,
-  getPoolLoginSnapshot,
-  getChannelLoginSnapshot,
+  getPoolLoginStatus,
+  getChannelLoginStatus,
+  authorizePoolDesktop,
+  authorizeChannelDesktop,
   listPoolAccounts,
   listPoolAssignments,
   listPoolGroups,
   listOperatorConnectorCapabilities,
   listProjectConnectorCapabilities,
   listChannelPlatforms,
-  sendPoolLoginAction,
-  sendChannelLoginAction,
   startPoolLogin,
   startChannelLogin,
   unassignPoolAccount,
@@ -52,12 +52,11 @@ import {
   type ChannelAccount,
   type ChannelPlatformId,
   type ConnectorAvailability,
-  type LoginAction,
-  type LoginSnapshot,
   type OperatorConnectorCapability,
   type ProxyInput,
 } from "../api/channels";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
+import { RemoteDesktop } from "../components/RemoteDesktop";
 import "./ChannelAccountsPage.css";
 
 type View = "channels" | "connect" | "settings";
@@ -238,19 +237,19 @@ function RemoteLogin({
   onDone: () => void;
   onClose: () => void;
 }) {
-  const client = useQueryClient();
+  const { t } = useTranslation();
   const queryKey =
     mode === "operator"
       ? ["operator-channel-login", sessionId]
       : ["channel-login", tenantId, projectId, sessionId];
-  const getSnapshot = () =>
+  const getStatus = () =>
     mode === "operator"
-      ? getPoolLoginSnapshot(sessionId)
-      : getChannelLoginSnapshot(tenantId!, projectId!, sessionId);
-  const sendAction = (value: LoginAction) =>
+      ? getPoolLoginStatus(sessionId)
+      : getChannelLoginStatus(tenantId!, projectId!, sessionId);
+  const authorize = () =>
     mode === "operator"
-      ? sendPoolLoginAction(sessionId, value)
-      : sendChannelLoginAction(tenantId!, projectId!, sessionId, value);
+      ? authorizePoolDesktop(sessionId)
+      : authorizeChannelDesktop(tenantId!, projectId!, sessionId);
   const complete = () =>
     mode === "operator"
       ? completePoolLogin(sessionId)
@@ -261,14 +260,10 @@ function RemoteLogin({
       : cancelChannelLogin(tenantId!, projectId!, sessionId);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [text, setText] = useState("");
-  const [key, setKey] = useState("Enter");
-  const [clickX, setClickX] = useState("");
-  const [clickY, setClickY] = useState("");
   const completionAttempted = useRef(false);
   const snapshot = useQuery({
     queryKey,
-    queryFn: getSnapshot,
+    queryFn: getStatus,
     refetchInterval: (query) =>
       busy ||
       terminalPhases.has(query.state.data?.phase ?? "") ||
@@ -278,7 +273,7 @@ function RemoteLogin({
         : 2000,
     refetchIntervalInBackground: false,
     retry: false,
-    // Account screenshots and identity must not linger in an inactive cache.
+    // Account identity must not linger in an inactive cache.
     gcTime: 0,
   });
   const screen = snapshot.data;
@@ -304,41 +299,6 @@ function RemoteLogin({
     mode,
     onDone,
   ]);
-
-  async function action(value: LoginAction) {
-    setBusy(true);
-    setError("");
-    if (value.kind === "type") setText("");
-    try {
-      const next = await sendAction(value);
-      client.setQueryData<LoginSnapshot>(queryKey, next);
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function clickScreen(event: MouseEvent<HTMLImageElement>) {
-    if (!screen || busy || terminalPhases.has(screen.phase)) return;
-    const rect = event.currentTarget.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const x = Math.max(
-      0,
-      Math.min(
-        screen.width - 1,
-        Math.floor(((event.clientX - rect.left) / rect.width) * screen.width),
-      ),
-    );
-    const y = Math.max(
-      0,
-      Math.min(
-        screen.height - 1,
-        Math.floor(((event.clientY - rect.top) / rect.height) * screen.height),
-      ),
-    );
-    void action({ kind: "click", x, y });
-  }
 
   async function finish() {
     setBusy(true);
@@ -390,129 +350,16 @@ function RemoteLogin({
       {screen && (
         <>
           <div className="channel-row">
-            <Badge appearance="tint">{screen.phase}</Badge>
+            <Badge appearance="tint">
+              {t(`remoteDesktop.phase.${screen.phase}`, {
+                defaultValue: t("remoteDesktop.phase.pending"),
+              })}
+            </Badge>
             {snapshot.isFetching && (
-              <Spinner size="tiny" label="正在更新截图" />
+              <Spinner size="tiny" label="正在确认登录状态" />
             )}
           </div>
-          {screen.screenshot_base64 && (
-            <div
-              className="channel-screen"
-              role="group"
-              aria-label="远程浏览器画面"
-            >
-              <img
-                src={`data:image/png;base64,${screen.screenshot_base64}`}
-                width={screen.width}
-                height={screen.height}
-                alt="远程登录页面截图；可点击画面，或使用下方键盘操作"
-                onClick={clickScreen}
-                draggable={false}
-              />
-            </div>
-          )}
-          {!ended && (
-            <div className="channel-controls">
-              <Field label="点击横坐标">
-                <Input
-                  type="number"
-                  min={0}
-                  max={screen.width - 1}
-                  value={clickX}
-                  onChange={(_, data) => setClickX(data.value)}
-                />
-              </Field>
-              <Field label="点击纵坐标">
-                <Input
-                  type="number"
-                  min={0}
-                  max={screen.height - 1}
-                  value={clickY}
-                  onChange={(_, data) => setClickY(data.value)}
-                />
-              </Field>
-              <Button
-                disabled={
-                  busy ||
-                  clickX === "" ||
-                  clickY === "" ||
-                  Number(clickX) < 0 ||
-                  Number(clickX) >= screen.width ||
-                  Number(clickY) < 0 ||
-                  Number(clickY) >= screen.height
-                }
-                onClick={() =>
-                  void action({
-                    kind: "click",
-                    x: Number(clickX),
-                    y: Number(clickY),
-                  })
-                }
-              >
-                点击坐标
-              </Button>
-              <Field
-                label="向当前焦点输入文字"
-                hint="发送到远程页面当前输入框，发送后清空。"
-              >
-                <Input
-                  type="text"
-                  value={text}
-                  onChange={(_, data) => setText(data.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && text && !busy) {
-                      event.preventDefault();
-                      void action({ kind: "type", text });
-                    }
-                  }}
-                  autoComplete="off"
-                />
-              </Field>
-              <Button
-                disabled={!text || busy}
-                onClick={() => void action({ kind: "type", text })}
-              >
-                发送文字
-              </Button>
-              <Field label="按键">
-                <Select
-                  value={key}
-                  onChange={(event) => setKey(event.target.value)}
-                >
-                  {[
-                    "Enter",
-                    "Tab",
-                    "Escape",
-                    "Backspace",
-                    "ArrowUp",
-                    "ArrowDown",
-                  ].map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-              <Button
-                disabled={busy}
-                onClick={() => void action({ kind: "key", key })}
-              >
-                发送按键
-              </Button>
-              <Button
-                disabled={busy}
-                onClick={() => void action({ kind: "scroll", delta_y: 550 })}
-              >
-                向下滚动
-              </Button>
-              <Button
-                disabled={busy}
-                onClick={() => void action({ kind: "scroll", delta_y: -550 })}
-              >
-                向上滚动
-              </Button>
-            </div>
-          )}
+          <RemoteDesktop authorize={authorize} active={!ended && !busy} />
           {screen.identity && (
             <p>
               检测到账号：

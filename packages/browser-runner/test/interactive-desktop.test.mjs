@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import { createRunner } from "../src/runner.mjs";
 
@@ -38,7 +39,7 @@ function harness({
         page,
         endpoint() {
           events.push("endpoint");
-          return { host: "127.0.0.1", port: 65432, password: "internal-only" };
+          return { host: "127.0.0.1", port: 65432 };
         },
         async closeInput() {
           events.push("closeInput");
@@ -97,8 +98,13 @@ test("interactive login pending retains input, then revokes input before final i
     assert.deepEqual(runner.desktopEndpoint("desktop"), {
       host: "127.0.0.1",
       port: 65432,
-      password: "internal-only",
     });
+    const connection = new EventEmitter();
+    connection.terminate = () => {
+      events.push("websocketTerminated");
+      connection.emit("close");
+    };
+    runner.attachDesktopClient("desktop", connection);
     await assert.rejects(
       runner.complete("desktop"),
       (e) => e.code === "login_required",
@@ -108,8 +114,9 @@ test("interactive login pending retains input, then revokes input before final i
     const receipt = await runner.complete("desktop");
     assert.equal(receipt.identity.platform_account_id, "synthetic");
     assert.equal(receipt.storage_state, state);
-    assert.deepEqual(events.filter((e) => typeof e === "string").slice(-4), [
+    assert.deepEqual(events.filter((e) => typeof e === "string").slice(-5), [
       "identify",
+      "websocketTerminated",
       "closeInput",
       "identify",
       "storageState",
@@ -140,8 +147,17 @@ test("idle reap, close, failed navigation and shutdown dispose isolated desktops
   const { runner, events } = harness({ clock: () => now, sessionIdleMs: 100 });
   try {
     await runner.create({ session_id: "expire", platform: "fixture" });
+    const connection = new EventEmitter();
+    connection.terminate = () => {
+      events.push("websocketTerminated");
+      connection.emit("close");
+    };
+    runner.attachDesktopClient("expire", connection);
     now = 101;
     await runner.reap();
+    assert.ok(
+      events.indexOf("websocketTerminated") < events.indexOf("desktopClose"),
+    );
     assert.equal(events.filter((e) => e === "desktopClose").length, 1);
     assert.throws(
       () => runner.desktopEndpoint("expire"),

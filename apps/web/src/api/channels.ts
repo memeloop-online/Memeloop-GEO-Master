@@ -84,18 +84,13 @@ export interface ProxyInput {
 
 export interface LoginSnapshot {
   phase: string;
-  url: string;
-  width: number;
-  height: number;
-  screenshot_base64: string;
   identity?: { display_name?: string; platform_account_id?: string } | null;
 }
 
-export type LoginAction =
-  | { kind: "click"; x: number; y: number }
-  | { kind: "type"; text: string }
-  | { kind: "key"; key: string }
-  | { kind: "scroll"; delta_y: number };
+export interface DesktopAuthorization {
+  websocket_path: string;
+  protocol: string;
+}
 
 const scope = (tenantId: string, projectId: string) => ({
   tenantId,
@@ -256,18 +251,25 @@ export const getChannelLoginSnapshot = (
     `/channel-login-sessions/${encoded(sessionId)}/snapshot`,
     scope(tenantId, projectId),
   );
-export const sendChannelLoginAction = (
+export const getChannelLoginStatus = (
   tenantId: string,
   projectId: string,
   sessionId: string,
-  action: LoginAction,
 ) =>
   apiFetch<LoginSnapshot>(
-    `/channel-login-sessions/${encoded(sessionId)}/actions`,
+    `/channel-login-sessions/${encoded(sessionId)}/status`,
+    scope(tenantId, projectId),
+  );
+export const authorizeChannelDesktop = (
+  tenantId: string,
+  projectId: string,
+  sessionId: string,
+) =>
+  apiFetch<DesktopAuthorization>(
+    `/channel-login-sessions/${encoded(sessionId)}/desktop-authorization`,
     {
       ...scope(tenantId, projectId),
       method: "POST",
-      body: action,
     },
   );
 export const completeChannelLogin = (
@@ -357,10 +359,14 @@ export const getPoolLoginSnapshot = (sessionId: string) =>
   apiFetch<LoginSnapshot>(
     `/operator/channel-login-sessions/${encoded(sessionId)}/snapshot`,
   );
-export const sendPoolLoginAction = (sessionId: string, action: LoginAction) =>
+export const getPoolLoginStatus = (sessionId: string) =>
   apiFetch<LoginSnapshot>(
-    `/operator/channel-login-sessions/${encoded(sessionId)}/actions`,
-    { method: "POST", body: action },
+    `/operator/channel-login-sessions/${encoded(sessionId)}/status`,
+  );
+export const authorizePoolDesktop = (sessionId: string) =>
+  apiFetch<DesktopAuthorization>(
+    `/operator/channel-login-sessions/${encoded(sessionId)}/desktop-authorization`,
+    { method: "POST" },
   );
 export const completePoolLogin = (sessionId: string) =>
   apiFetch<{ account: PoolAccount }>(

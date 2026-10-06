@@ -1019,6 +1019,60 @@ async fn knowledge_search_reports_a_missing_capability_as_a_typed_error() {
 }
 
 #[tokio::test]
+async fn knowledge_text_ops_are_scoped_strict_and_fail_closed_without_an_adapter() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        const source_id = "00000000-0000-4000-8000-000000000041";
+        const source_version_id = "00000000-0000-4000-8000-000000000042";
+        await attempt("read-foreign", () => hostOps.knowledgeTextRead({
+          source_id, source_version_id,
+          project_id: "00000000-0000-4000-8000-000000000099"
+        }));
+        await attempt("read", () => hostOps.knowledgeTextRead({ source_id, source_version_id }));
+        await attempt("revise-missing-base", () => hostOps.knowledgeTextRevise({
+          source_id, expected_revision: 1, idempotency_key: "same-operation",
+          media_type: "text/plain", text: "Updated"
+        }));
+        await attempt("revise", () => hostOps.knowledgeTextRevise({
+          source_id, expected_revision: 1, idempotency_key: "same-operation",
+          base_version_id: source_version_id, media_type: "text/plain", text: "Updated"
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the knowledge op scenario evaluates");
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "read-foreign"),
+        "invalid_request",
+        "knowledge_text_read",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "read"),
+        "capability_missing",
+        "knowledge_text_read",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "revise-missing-base"),
+        "invalid_request",
+        "knowledge_text_revise",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "revise"),
+        "capability_missing",
+        "knowledge_text_revise",
+    );
+    assert!(
+        ops.seen().is_empty(),
+        "unconfigured writes must never hit another op"
+    );
+}
+
+#[tokio::test]
 async fn manifest_read_returns_the_frozen_manifest_state() {
     let ops = Arc::new(FakeHostOps::new());
     let mut runtime = runtime(

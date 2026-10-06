@@ -21,14 +21,16 @@ use axum::{
 use geo_api::{AppState, CSRF_HEADER, EmbeddedAgentRuntime, RepositoryHostOps, router};
 use geo_domain::{
     AgentRepository, AgentRuntime, AppendMessage, CreateConversation, DEVELOPMENT_TENANT_ID,
-    KnowledgePurpose, KnowledgeSearchRequest, MemoryAgentRepository, MemoryKnowledgeRepository,
-    RunStatus, RuntimeCapability, TenantScope, ToolCallOutcome,
+    ImportItem, KnowledgePurpose, KnowledgeRepository, KnowledgeSearchRequest,
+    MemoryAgentRepository, MemoryKnowledgeRepository, RunStatus, RuntimeCapability, SourceKind,
+    TenantScope, ToolCallOutcome,
 };
 use geo_worker::{
     HOST_LOOP_JS, HOST_MAIN_MODULE, HOST_OPS_JS, HOST_OPS_VERSION, HostOp, HostOpBudgets,
-    HostOpError, HostOpErrorCode, HostOps, KnowledgeSearchResult, ManifestKind, ManifestPage,
-    ManifestReadRequest, MeasureRequest, MeasureSample, MeasurementSurface, ModelCompletion,
-    ModelCompletionRequest, PublishReceipt, PublishRequest,
+    HostOpError, HostOpErrorCode, HostOps, KnowledgeSearchResult, KnowledgeTextReadRequest,
+    KnowledgeTextReviseRequest, ManifestKind, ManifestPage, ManifestReadRequest, MeasureRequest,
+    MeasureSample, MeasurementSurface, ModelCompletion, ModelCompletionRequest, PublishReceipt,
+    PublishRequest,
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -966,6 +968,111 @@ async fn knowledge_search_delegates_to_the_repository_and_types_its_failures() {
         .await
         .expect_err("a search without a project must be refused");
     assert_eq!(refused.code, HostOpErrorCode::InvalidRequest, "{refused:?}");
+}
+
+#[tokio::test]
+async fn knowledge_text_tools_share_the_existing_revision_repository_and_scope() {
+    let knowledge = Arc::new(MemoryKnowledgeRepository::default());
+    let run_scope = scope();
+    let imported = knowledge
+        .import_batch(
+            &run_scope,
+            vec![ImportItem {
+                client_item_id: "knowledge-tool-test".into(),
+                kind: SourceKind::Text,
+                name: "Reference".into(),
+                purpose: KnowledgePurpose::Internal,
+                text: Some("Original text".into()),
+                url: None,
+                object_id: None,
+                knowledge_release_id: None,
+            }],
+        )
+        .await
+        .expect("existing knowledge import");
+    let item = &imported.items[0];
+    let source = item.source.as_ref().expect("source");
+    let version = item.source_version.as_ref().expect("version");
+    let ops = RepositoryHostOps::new(knowledge.clone());
+    let read = ops
+        .knowledge_text_read(
+            &run_scope,
+            KnowledgeTextReadRequest {
+                source_id: source.source_id,
+                source_version_id: version.source_version_id,
+            },
+        )
+        .await
+        .expect("scoped original read");
+    assert_eq!(read.content.text, "Original text");
+    assert_eq!(
+        read.source.current_version_id,
+        Some(version.source_version_id)
+    );
+    let command = KnowledgeTextReviseRequest {
+        source_id: source.source_id,
+        expected_revision: source.revision,
+        idempotency_key: "knowledge-tool-retry".into(),
+        base_version_id: version.source_version_id,
+        media_type: "text/markdown".into(),
+        text: "# Revised\n\nExact 中文".into(),
+    };
+    let receipt = ops
+        .knowledge_text_revise(&run_scope, command.clone())
+        .await
+        .expect("persisted revision");
+    let replay = ops
+        .knowledge_text_revise(&run_scope, command.clone())
+        .await
+        .expect("same request replays the original receipt");
+    assert_eq!(receipt, replay);
+    assert_eq!(
+        receipt.source_version.parent_version_id,
+        Some(version.source_version_id)
+    );
+    let current = ops
+        .knowledge_text_read(
+            &run_scope,
+            KnowledgeTextReadRequest {
+                source_id: source.source_id,
+                source_version_id: receipt.source_version.source_version_id,
+            },
+        )
+        .await
+        .expect("read persisted text");
+    assert_eq!(current.content.text, command.text);
+    assert_eq!(
+        current.content.text_basis,
+        geo_domain::SourceTextBasis::Exact
+    );
+    let stale = ops
+        .knowledge_text_revise(
+            &run_scope,
+            KnowledgeTextReviseRequest {
+                idempotency_key: "new-operation".into(),
+                ..command
+            },
+        )
+        .await
+        .expect_err("new operation on stale revision conflicts");
+    assert_eq!(stale.code, HostOpErrorCode::Conflict);
+    assert_eq!(stale.message, "source_revision_conflict");
+    let foreign = TenantScope::new(
+        run_scope.operator_id,
+        run_scope.tenant_id,
+        Some(uuid::Uuid::new_v4().into()),
+    );
+    let denied = ops
+        .knowledge_text_read(
+            &foreign,
+            KnowledgeTextReadRequest {
+                source_id: source.source_id,
+                source_version_id: receipt.source_version.source_version_id,
+            },
+        )
+        .await
+        .expect_err("foreign project cannot read source");
+    assert_eq!(denied.code, HostOpErrorCode::NotFound);
 }
 
 // ---------------------------------------------------------------------------

@@ -16,3 +16,8 @@ image. TigerVNC and Openbox include GPL-family code; publishing the image
 requires meeting their corresponding source distribution obligations.
 Playwright's npm lock records its Apache-2.0 license. Validate the final
 image's actual package records and licenses before external distribution.
+
+The private WebSocket relay uses `ws` 8.21.3, MIT licensed, from
+<https://github.com/websockets/ws>. Its copyright and complete license remain
+in `node_modules/ws/LICENSE` in the distributed image. The runner's standalone
+npm lock and workspace pnpm lock both pin this dependency.

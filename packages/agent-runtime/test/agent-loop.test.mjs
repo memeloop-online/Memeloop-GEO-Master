@@ -394,6 +394,122 @@ test("native model call executes knowledge.search through the MemeLoop registry 
   }
 });
 
+test("knowledge text tools read a scoped exact version and return the persisted revision receipt", async () => {
+  const sourceId = "00000000-0000-4000-8000-000000000041";
+  const baseVersionId = "00000000-0000-4000-8000-000000000042";
+  const nextVersionId = "00000000-0000-4000-8000-000000000043";
+  const releaseId = "00000000-0000-4000-8000-000000000044";
+  const reads = [];
+  const writes = [];
+  const requests = [];
+  const command = {
+    source_id: sourceId,
+    expected_revision: 2,
+    idempotency_key: "stable-text-revision",
+    base_version_id: baseVersionId,
+    media_type: "text/markdown",
+    text: "# Updated\n\nExact text.",
+  };
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async knowledgeTextRead(request) {
+      reads.push(request);
+      return {
+        source: {
+          source_id: sourceId,
+          revision: 2,
+          current_version_id: baseVersionId,
+        },
+        source_version: { source_version_id: baseVersionId },
+        content: {
+          source_version_id: baseVersionId,
+          text_basis: "exact",
+          text: "# Original",
+        },
+      };
+    },
+    async knowledgeTextRevise(request) {
+      writes.push(request);
+      return {
+        source: {
+          source_id: sourceId,
+          revision: 3,
+          current_version_id: nextVersionId,
+        },
+        source_version: {
+          source_version_id: nextVersionId,
+          parent_version_id: baseVersionId,
+        },
+        knowledge_release: { knowledge_release_id: releaseId },
+      };
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      const calls = [
+        [
+          "knowledge_text_read",
+          { source_id: sourceId, source_version_id: baseVersionId },
+        ],
+        ["knowledge_text_revise", command],
+      ];
+      if (requests.length > calls.length) return finalModelAnswer("Saved.");
+      const [name, argumentsValue] = calls[requests.length - 1];
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          {
+            id: `text-${requests.length}`,
+            type: "function",
+            function: { name, arguments: JSON.stringify(argumentsValue) },
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?textRevision=${Date.now()}`
+    );
+    assert.equal(
+      (
+        await main({
+          conversation_id: "conversation-text-revision",
+          prompt: "Update the source",
+          run_id: "run-text-revision",
+          turn_id: "turn-text-revision",
+        })
+      ).answer,
+      "Saved.",
+    );
+    assert.deepEqual(reads, [
+      { source_id: sourceId, source_version_id: baseVersionId },
+    ]);
+    assert.deepEqual(writes, [command]);
+    assert.match(requests[1].messages.at(-1).content, /"text_basis":"exact"/u);
+    assert.match(
+      requests[2].messages.at(-1).content,
+      new RegExp(releaseId, "u"),
+    );
+    const writeTool = requests[0].tools.find(
+      ({ function: tool }) => tool.name === "knowledge_text_revise",
+    );
+    assert.deepEqual(
+      writeTool.function.parameters.required,
+      Object.keys(command),
+    );
+    assert.equal(
+      writeTool.function.parameters.properties.text.maxLength,
+      262144,
+    );
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
 test("chat onboarding calls scoped project tools and preserves acceptance semantics", async () => {
   const requests = [];
   const observed = [];
@@ -561,6 +677,8 @@ test("report reduction and immutable read are exposed as separate scoped host to
       requests[0].tools.map((tool) => tool.function.name),
       [
         "knowledge_search",
+        "knowledge_text_read",
+        "knowledge_text_revise",
         "knowledge_import_status",
         "report_get",
         "report_preview",
@@ -784,6 +902,8 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "knowledge_import_attachments",
         "knowledge_import_status",
         "knowledge_search",
+        "knowledge_text_read",
+        "knowledge_text_revise",
         "report_get",
         "report_preview",
         "report_reduce",
@@ -901,6 +1021,8 @@ test("queued attachment uses a later exact job status and release before citing 
         "knowledge_import_attachments",
         "knowledge_import_status",
         "knowledge_search",
+        "knowledge_text_read",
+        "knowledge_text_revise",
       ];
       return {
         ...finalModelAnswer(""),

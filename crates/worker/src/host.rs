@@ -102,6 +102,60 @@ fn validate_recorded_return(
                 ));
             }
         }
+        HostOp::KnowledgeTextRead => {
+            let requested: KnowledgeTextReadRequest = typed(op, request)?;
+            let response: KnowledgeTextReadResult = typed(op, result)?;
+            if response.source.operator_id != scope.operator_id
+                || response.source.tenant_id != scope.tenant_id
+                || Some(response.source.project_id) != scope.project_id
+                || response.source.source_id != requested.source_id
+                || response.source_version.operator_id != scope.operator_id
+                || response.source_version.tenant_id != scope.tenant_id
+                || Some(response.source_version.project_id) != scope.project_id
+                || response.source_version.source_id != requested.source_id
+                || response.source_version.source_version_id != requested.source_version_id
+                || response.content.source_version_id != requested.source_version_id
+                || response.content.representation != response.source_version.representation
+            {
+                return Err(HostOpError::internal(
+                    op,
+                    "knowledge text read returned another source",
+                ));
+            }
+        }
+        HostOp::KnowledgeTextRevise => {
+            let requested: KnowledgeTextReviseRequest = typed(op, request)?;
+            let response: geo_domain::SourceTextRevisionReceipt = typed(op, result)?;
+            if response.source.operator_id != scope.operator_id
+                || response.source.tenant_id != scope.tenant_id
+                || Some(response.source.project_id) != scope.project_id
+                || response.source.source_id != requested.source_id
+                || response.source.revision != requested.expected_revision + 1
+                || response.source.current_version_id
+                    != Some(response.source_version.source_version_id)
+                || response.source_version.source_id != requested.source_id
+                || response.source_version.operator_id != scope.operator_id
+                || response.source_version.tenant_id != scope.tenant_id
+                || Some(response.source_version.project_id) != scope.project_id
+                || response.source_version.parent_version_id != Some(requested.base_version_id)
+                || response.source_version.representation
+                    != geo_domain::SourceVersionRepresentation::AuthoredText
+                || response.source_version.content_sha256
+                    != geo_domain::sha256_hex(requested.text.as_bytes())
+                || Some(response.knowledge_release.project_id) != scope.project_id
+                || response.knowledge_release.operator_id != scope.operator_id
+                || response.knowledge_release.tenant_id != scope.tenant_id
+                || !response
+                    .knowledge_release
+                    .source_version_refs
+                    .contains(&response.source_version.source_version_id)
+            {
+                return Err(HostOpError::internal(
+                    op,
+                    "knowledge text revision returned an unrelated receipt",
+                ));
+            }
+        }
         HostOp::KnowledgeImportStatus => {
             let requested: KnowledgeImportStatusRequest = typed(op, request)?;
             let response: geo_domain::KnowledgeImportProgress = typed(op, result)?;
@@ -279,11 +333,55 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v12";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v13";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectCurrentRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeTextReadRequest {
+    pub source_id: Uuid,
+    pub source_version_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeTextReadResult {
+    pub source: geo_domain::Source,
+    pub source_version: geo_domain::SourceVersion,
+    pub content: geo_domain::SourceVersionContent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeTextReviseRequest {
+    pub source_id: Uuid,
+    pub expected_revision: i64,
+    pub idempotency_key: String,
+    pub base_version_id: Uuid,
+    pub media_type: String,
+    pub text: String,
+}
+
+impl KnowledgeTextReviseRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.source_id.is_nil() || self.base_version_id.is_nil() {
+            return Err("source and base version IDs must be non-zero".into());
+        }
+        validate_project_command(self.expected_revision, &self.idempotency_key)?;
+        if self.expected_revision == i64::MAX {
+            return Err("revision cannot advance beyond the supported range".into());
+        }
+        geo_domain::ReviseSourceTextCommand {
+            base_version_id: self.base_version_id,
+            media_type: self.media_type.clone(),
+            text: self.text.clone(),
+        }
+        .validate()
+        .map_err(|error| error.message)
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -387,6 +485,8 @@ pub enum HostOp {
     ModelComplete,
     /// Evidence retrieval restricted to the run's frozen knowledge release.
     KnowledgeSearch,
+    KnowledgeTextRead,
+    KnowledgeTextRevise,
     /// Explicitly import attachments bound to this run into project knowledge.
     KnowledgeImportAttachments,
     /// Read one scoped import job's actual persisted progress.
@@ -433,12 +533,14 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 36;
+    pub const COUNT: usize = 38;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::ModelComplete,
         Self::KnowledgeSearch,
+        Self::KnowledgeTextRead,
+        Self::KnowledgeTextRevise,
         Self::KnowledgeImportAttachments,
         Self::KnowledgeImportStatus,
         Self::ManifestRead,
@@ -480,6 +582,8 @@ impl HostOp {
         match self {
             Self::ModelComplete => "model.complete.v1",
             Self::KnowledgeSearch => "knowledge.search.v1",
+            Self::KnowledgeTextRead => "knowledge.text.read.v1",
+            Self::KnowledgeTextRevise => "knowledge.text.revise.v1",
             Self::KnowledgeImportAttachments => "knowledge.import_attachments.v1",
             Self::KnowledgeImportStatus => "knowledge.import_status.v1",
             Self::ManifestRead => "manifest.read.v2",
@@ -522,6 +626,8 @@ impl HostOp {
         match self {
             Self::ModelComplete => "op_host_model_complete_v1",
             Self::KnowledgeSearch => "op_host_knowledge_search_v1",
+            Self::KnowledgeTextRead => "op_host_knowledge_text_read_v1",
+            Self::KnowledgeTextRevise => "op_host_knowledge_text_revise_v1",
             Self::KnowledgeImportAttachments => "op_host_knowledge_import_attachments_v1",
             Self::KnowledgeImportStatus => "op_host_knowledge_import_status_v1",
             Self::ManifestRead => "op_host_manifest_read_v2",
@@ -624,6 +730,8 @@ impl Default for HostOpBudgets {
             limits: [
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 64),
+                HostOpLimits::new(15_000, 32), // scoped exact text read
+                HostOpLimits::new(60_000, 16), // durable optimistic text revision
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 16), // one bounded job read per call
                 HostOpLimits::new(15_000, 64),
@@ -700,6 +808,8 @@ pub enum HostOpErrorCode {
     /// The same stable business idempotency key was used with a different
     /// payload.  This is a caller conflict, never a safe retry.
     IdempotencyConflict,
+    /// A stale source revision or an in-progress parse prevents this revision.
+    Conflict,
     /// The bridge could not produce a trustworthy result.
     Internal,
 }
@@ -784,6 +894,10 @@ impl HostOpError {
 
     pub fn idempotency_conflict(op: HostOp, message: impl Into<String>) -> Self {
         Self::new(op, HostOpErrorCode::IdempotencyConflict, message)
+    }
+
+    pub fn conflict(op: HostOp, message: impl Into<String>) -> Self {
+        Self::new(op, HostOpErrorCode::Conflict, message)
     }
 
     pub fn budget_exceeded(op: HostOp, max_calls: u32) -> Self {
@@ -902,6 +1016,28 @@ pub trait HostOps: Send + Sync {
         scope: &TenantScope,
         request: KnowledgeSearchRequest,
     ) -> Result<KnowledgeSearchResult, HostOpError>;
+
+    async fn knowledge_text_read(
+        &self,
+        _scope: &TenantScope,
+        _request: KnowledgeTextReadRequest,
+    ) -> Result<KnowledgeTextReadResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::KnowledgeTextRead,
+            "knowledge text read is not configured",
+        ))
+    }
+
+    async fn knowledge_text_revise(
+        &self,
+        _scope: &TenantScope,
+        _request: KnowledgeTextReviseRequest,
+    ) -> Result<geo_domain::SourceTextRevisionReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::KnowledgeTextRevise,
+            "knowledge text revision is not configured",
+        ))
+    }
 
     async fn knowledge_import_attachments(
         &self,

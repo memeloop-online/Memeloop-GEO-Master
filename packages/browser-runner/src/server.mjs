@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import WebSocket, { WebSocketServer } from "ws";
 import { createRunner, RunnerError } from "./runner.mjs";
 
 function authorized(header, token) {
@@ -60,6 +61,14 @@ export function createRunnerServer({
         parts.length === 4 &&
         parts[0] === "v1" &&
         parts[1] === "sessions" &&
+        parts[3] === "status" &&
+        request.method === "GET"
+      ) {
+        send(response, 200, await runner.status(parts[2]));
+      } else if (
+        parts.length === 4 &&
+        parts[0] === "v1" &&
+        parts[1] === "sessions" &&
         parts[3] === "measurement-options" &&
         request.method === "GET"
       ) {
@@ -110,6 +119,61 @@ export function createRunnerServer({
         error: error instanceof RunnerError ? error.code : "runner_unavailable",
       });
     }
+  });
+  const upgrades = new WebSocketServer({
+    noServer: true,
+    maxPayload: 8 * 1024 * 1024,
+  });
+  server.on("upgrade", (request, socket, head) => {
+    const path = new URL(request.url, "http://localhost").pathname;
+    const match = /^\/v1\/sessions\/([a-zA-Z0-9_-]{1,128})\/desktop$/.exec(
+      path,
+    );
+    if (!match || !authorized(request.headers.authorization, token)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    let endpoint;
+    try {
+      endpoint = runner.desktopEndpoint(match[1]);
+    } catch {
+      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    upgrades.handleUpgrade(request, socket, head, (client) => {
+      try {
+        runner.attachDesktopClient(match[1], client);
+      } catch {
+        client.terminate();
+        return;
+      }
+      const upstream = new WebSocket(`ws://127.0.0.1:${endpoint.port}/`, {
+        maxPayload: 8 * 1024 * 1024,
+      });
+      // Fail closed on either end closing; no password or target in client frames.
+      const close = () => {
+        client.terminate();
+        upstream.terminate();
+      };
+      client.on("message", (payload, isBinary) => {
+        if (upstream.readyState === WebSocket.OPEN)
+          upstream.send(payload, { binary: isBinary }, (error) => {
+            if (error) close();
+          });
+      });
+      upstream.on("message", (payload, isBinary) => {
+        if (client.readyState === WebSocket.OPEN)
+          client.send(payload, { binary: isBinary }, (error) => {
+            if (error) close();
+          });
+      });
+      client.on("close", close);
+      upstream.on("close", close);
+      client.on("error", close);
+      upstream.on("error", close);
+    });
   });
   return server;
 }

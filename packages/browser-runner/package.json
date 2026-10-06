@@ -13,6 +13,7 @@
     "format:check": "prettier --check \"**/*.{json,mjs,md}\""
   },
   "dependencies": {
-    "playwright": "1.63.0"
+    "playwright": "1.63.0",
+    "ws": "8.21.3"
   }
 }

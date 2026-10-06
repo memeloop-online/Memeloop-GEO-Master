@@ -103,7 +103,6 @@ export function createLinuxDesktopRuntime({
       const directory = await mkdtemp(join(tmpdir(), "geo-desktop-"));
       await chmod(directory, 0o700);
       const authority = join(directory, "authority");
-      const passwordFile = join(directory, "vnc-password");
       const home = join(directory, "home");
       const configHome = join(home, ".config");
       const cacheHome = join(home, ".cache");
@@ -127,7 +126,6 @@ export function createLinuxDesktopRuntime({
         return {
           host: "127.0.0.1",
           port: websocketPort,
-          password: vncPassword,
         };
       };
       const closeInput = async () => {
@@ -161,7 +159,6 @@ export function createLinuxDesktopRuntime({
         return closePromise;
       };
       let websocketPort;
-      let vncPassword;
       try {
         // Chromium's crashpad database and Openbox config must be writable
         // even when the container root filesystem (including /home) is RO.
@@ -188,14 +185,8 @@ export function createLinuxDesktopRuntime({
         }
         if (!displayLock) throw new Error("desktop_display_exhausted");
         const cookie = randomBytes(16).toString("hex");
-        vncPassword = randomBytes(18).toString("base64url");
-        // TigerVNC VncAuth uses only the first eight password bytes.
-        const encoded = await runWithInput(
-          "tigervncpasswd",
-          ["-f"],
-          `${vncPassword}\n`,
-        );
-        await writeFile(passwordFile, encoded, { mode: 0o600, flag: "wx" });
+        // RFB remains private to this display's loopback and the authenticated
+        // runner relay; a VNC credential is never needed in browser code.
         await runWithInput(
           "xauth",
           ["-f", authority],
@@ -227,9 +218,7 @@ export function createLinuxDesktopRuntime({
             "-nolisten",
             "tcp",
             "-SecurityTypes",
-            "VncAuth",
-            "-rfbauth",
-            passwordFile,
+            "None",
             "-rfbport",
             String(vncPort),
             "-auth",

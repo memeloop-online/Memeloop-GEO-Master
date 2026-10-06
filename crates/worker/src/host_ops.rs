@@ -28,11 +28,12 @@ use crate::host::{
     DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
     DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
     KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeSearchRequest,
-    KnowledgeSearchResult, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
-    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
-    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
-    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
-    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
+    KnowledgeSearchResult, KnowledgeTextReadRequest, KnowledgeTextReviseRequest,
+    ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest, MeasurementPlanCreateRequest,
+    MeasurementPlanReadRequest, ModelCompletionRequest, ProjectCurrentRequest,
+    ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest, PublishRequest,
+    QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest, ReportPreviewRequest,
+    ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -740,6 +741,55 @@ pub async fn op_host_knowledge_search_v1(
     )?)
 }
 
+#[op2]
+#[string]
+pub async fn op_host_knowledge_text_read_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::KnowledgeTextRead;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<KnowledgeTextReadRequest>(op, &payload)?;
+    if request.source_id.is_nil() || request.source_version_id.is_nil() {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "source and version IDs must be non-zero",
+        )));
+    }
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .knowledge_text_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_knowledge_text_revise_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::KnowledgeTextRevise;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<KnowledgeTextReviseRequest>(op, &payload)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .knowledge_text_revise(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
 /// Reads one page of a frozen document or distribution manifest.
 #[op2]
 #[string]
@@ -921,6 +971,8 @@ pub async fn op_host_report_reduce_v1(
 pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ModelComplete.op_name(),
     HostOp::KnowledgeSearch.op_name(),
+    HostOp::KnowledgeTextRead.op_name(),
+    HostOp::KnowledgeTextRevise.op_name(),
     HostOp::KnowledgeImportAttachments.op_name(),
     HostOp::KnowledgeImportStatus.op_name(),
     HostOp::ManifestRead.op_name(),

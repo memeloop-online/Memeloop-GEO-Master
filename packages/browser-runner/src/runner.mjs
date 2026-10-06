@@ -152,6 +152,8 @@ export function createRunner(options = {}) {
   let reapingPromise;
 
   function dispose(record) {
+    for (const client of record.desktopClients) client.terminate();
+    record.desktopClients.clear();
     return record.desktop ? record.desktop.close() : record.context.close();
   }
 
@@ -339,6 +341,7 @@ export function createRunner(options = {}) {
         context,
         page,
         desktop: desktopSession,
+        desktopClients: new Set(),
         proxy,
         identity: null,
         completed: false,
@@ -437,6 +440,8 @@ export function createRunner(options = {}) {
         )
           throw new RunnerError(409, "account_mismatch");
         revokingInput = true;
+        for (const client of record.desktopClients) client.terminate();
+        record.desktopClients.clear();
         await record.desktop.closeInput();
         const finalIdentity = await record.adapter.identify(record.page);
         if (
@@ -484,6 +489,22 @@ export function createRunner(options = {}) {
     } catch {
       throw new RunnerError(409, "desktop_unavailable");
     }
+  }
+
+  function attachDesktopClient(id, client) {
+    const endpoint = desktopEndpoint(id);
+    const record = session(id);
+    record.desktopClients.add(client);
+    client.once("close", () => record.desktopClients.delete(client));
+    return endpoint;
+  }
+
+  async function status(id) {
+    const record = session(id);
+    return {
+      phase: await phase(record),
+      ...(record.identity ? { identity: record.identity } : {}),
+    };
   }
 
   async function measurementOptions(id) {
@@ -650,6 +671,8 @@ export function createRunner(options = {}) {
     const record = session(id);
     if (record.busy) throw new RunnerError(409, "session_busy");
     sessions.delete(id);
+    for (const client of record.desktopClients) client.terminate();
+    record.desktopClients.clear();
     await dispose(record);
   }
 
@@ -658,6 +681,10 @@ export function createRunner(options = {}) {
     const records = [...sessions.values()];
     sessions.clear();
     executions.clear();
+    for (const record of records) {
+      for (const client of record.desktopClients) client.terminate();
+      record.desktopClients.clear();
+    }
     await Promise.allSettled(records.map((record) => dispose(record)));
     if (browserPromise) await (await browserPromise).close();
   }
@@ -666,6 +693,8 @@ export function createRunner(options = {}) {
     executionProvenance: provenance,
     create,
     desktopEndpoint,
+    attachDesktopClient,
+    status,
     snapshot,
     action,
     complete,

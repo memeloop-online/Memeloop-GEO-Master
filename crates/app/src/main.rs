@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
             membership.tenant_slug = "local-workspace".to_owned();
             membership.tenant_display_name = display_name;
-            let hosts = [
+            let mut hosts = vec![
                 "localhost",
                 "localhost:5173",
                 "localhost:8080",
@@ -157,7 +157,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "127.0.0.1:5173",
                 "127.0.0.1:8080",
             ]
-            .map(str::to_owned);
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+            hosts.extend(local_origin_hosts(&config.allowed_origins));
             repository.insert_operator(operator, &hosts).await?;
             repository.insert_user(user).await?;
             repository.insert_membership(membership).await?;
@@ -204,6 +207,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// The explicitly configured in-memory development identity may be served on
+// isolated local test ports. Do not bind it to non-loopback tenant domains.
+fn local_origin_hosts(origins: &[String]) -> Vec<String> {
+    origins
+        .iter()
+        .filter_map(|origin| origin.parse::<axum::http::Uri>().ok())
+        .filter(|uri| matches!(uri.scheme_str(), Some("http" | "https")))
+        .filter(|uri| matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]")))
+        .filter_map(|uri| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_owned())
+        })
+        .collect()
 }
 
 /// PostgreSQL is authoritative for due-cycle enumeration. Each candidate is
@@ -288,4 +306,20 @@ fn spawn_due_report_scanner(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod local_host_tests {
+    #[test]
+    fn isolated_development_ports_only_extend_loopback_identity_hosts() {
+        assert_eq!(
+            super::local_origin_hosts(&[
+                "http://127.0.0.1:15173".to_owned(),
+                "https://localhost:18080".to_owned(),
+                "https://tenant.example.invalid".to_owned(),
+                "invalid".to_owned(),
+            ]),
+            ["127.0.0.1:15173", "localhost:18080"]
+        );
+    }
 }

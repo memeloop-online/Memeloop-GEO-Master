@@ -12,6 +12,7 @@ mod connector_capabilities;
 mod content;
 pub mod content_runtime;
 mod content_tools;
+mod desktop_gateway;
 pub mod distribution;
 pub use content::ContentService;
 mod context;
@@ -131,6 +132,7 @@ pub struct AppState {
     report_repository: Arc<dyn ReportRepository>,
     connector_capability_repository: Arc<dyn ConnectorCapabilityRepository>,
     channel_service: ChannelService,
+    desktop_grants: desktop_gateway::DesktopGrants,
     channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
     publication_lookup_repository: Option<Arc<dyn geo_domain::PublicationLookupRepository>>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
@@ -169,6 +171,7 @@ impl AppState {
                 MemoryConnectorCapabilityRepository::default(),
             ),
             channel_service: ChannelService::development(),
+            desktop_grants: desktop_gateway::DesktopGrants::default(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             publication_lookup_repository: None,
             content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
@@ -288,6 +291,7 @@ impl AppState {
                 MemoryConnectorCapabilityRepository::default(),
             ),
             channel_service: ChannelService::development(),
+            desktop_grants: desktop_gateway::DesktopGrants::default(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             publication_lookup_repository: None,
             content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
