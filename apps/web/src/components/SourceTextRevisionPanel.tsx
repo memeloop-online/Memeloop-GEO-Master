@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Button,
   Card,
@@ -6,9 +7,6 @@ import {
   MessageBarBody,
   Spinner,
 } from "@fluentui/react-components";
-import { type JSONContent } from "@tiptap/core";
-import { EditorContent, useEditor } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
 import {
   type SourceSummary,
   type SourceVersionContent,
@@ -16,59 +14,8 @@ import {
   useSourceVersionContentQuery,
 } from "../api/knowledge";
 import { ApiError, createIdempotencyKey } from "../api/client";
+import { MarkdownSourceEditor } from "./MarkdownSourceEditor";
 import "./StructuredContentEditor.css";
-
-// Source Markdown is edited as literal UTF-8 text. Formatting it as rich text
-// and back would discard syntax not represented by the document block schema.
-const extensions = [
-  StarterKit.configure({
-    blockquote: false,
-    bold: false,
-    code: false,
-    codeBlock: false,
-    dropcursor: false,
-    gapcursor: false,
-    hardBreak: false,
-    heading: false,
-    horizontalRule: false,
-    italic: false,
-    link: false,
-    bulletList: false,
-    orderedList: false,
-    listItem: false,
-    strike: false,
-    trailingNode: false,
-    underline: false,
-  }),
-];
-
-export function textToEditorContent(value: string): JSONContent {
-  return {
-    type: "doc",
-    content: value.split("\n").map((line) => ({
-      type: "paragraph",
-      content: line ? [{ type: "text", text: line }] : undefined,
-    })),
-  };
-}
-
-export function editorContentToText(content: JSONContent): string {
-  if (content.type !== "doc" || !content.content?.length)
-    throw new Error("当前正文结构无法保存为原始文本。");
-  return content.content
-    .map((paragraph) => {
-      if (paragraph.type !== "paragraph" || paragraph.attrs?.geoBlockId)
-        throw new Error("当前正文结构无法无损保存为原始文本。");
-      return (paragraph.content ?? [])
-        .map((node) => {
-          if (node.type !== "text" || node.marks?.length)
-            throw new Error("当前正文含有无法无损保存的格式。");
-          return node.text ?? "";
-        })
-        .join("");
-    })
-    .join("\n");
-}
 
 interface Draft {
   baseVersionId: string;
@@ -79,88 +26,14 @@ interface Draft {
   idempotencyKey: string;
 }
 
-function RawTextEditor({
-  value,
-  onChange,
-  onUnavailable,
-  disabled,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  onUnavailable: (reason: string | null) => void;
-  disabled: boolean;
-}) {
-  const editor = useEditor({
-    immediatelyRender: false,
-    extensions,
-    content: textToEditorContent(value),
-    editable: !disabled,
-    editorProps: {
-      attributes: {
-        "aria-label": "资料正文（原始文本）",
-        role: "textbox",
-        class: "structured-content-input",
-      },
-      handlePaste: (_view, event) => {
-        const plainText = event.clipboardData?.getData("text/plain");
-        if (plainText === undefined) return false;
-        event.preventDefault();
-        if (plainText)
-          editor?.commands.insertContent({ type: "text", text: plainText });
-        return true;
-      },
-    },
-    onUpdate: ({ editor: current }) => {
-      try {
-        onUnavailable(null);
-        onChange(editorContentToText(current.getJSON()));
-      } catch (error) {
-        onUnavailable((error as Error).message);
-      }
-    },
-  });
-
-  useEffect(() => {
-    if (!editor) return;
-    try {
-      const roundTrip = editorContentToText(editor.getJSON());
-      if (roundTrip !== value) {
-        onUnavailable("此版本的空白或换行无法准确保留，暂不能编辑。");
-      }
-    } catch (error) {
-      onUnavailable((error as Error).message);
-    }
-  }, [editor, value, onUnavailable]);
-  useEffect(() => {
-    if (editor && editor.isEditable === disabled)
-      editor.setEditable(!disabled, false);
-  }, [editor, disabled]);
-
-  return (
-    <div className="structured-content-editor">
-      {!disabled && (
-        <div
-          className="structured-content-toolbar"
-          role="toolbar"
-          aria-label="资料编辑"
-        >
-          <Button
-            size="small"
-            onClick={() => editor?.chain().focus().undo().run()}
-          >
-            撤销
-          </Button>
-          <Button
-            size="small"
-            onClick={() => editor?.chain().focus().redo().run()}
-          >
-            重做
-          </Button>
-        </div>
-      )}
-      <EditorContent editor={editor} />
-    </div>
-  );
+export function preserveSourceLineEndings(
+  text: string,
+  original: string,
+): string {
+  return original.includes("\r\n") &&
+    !original.replaceAll("\r\n", "").includes("\n")
+    ? text.replaceAll("\r\n", "\n").replaceAll("\n", "\r\n")
+    : text;
 }
 
 export function SourceTextRevisionPanel({
@@ -178,6 +51,7 @@ export function SourceTextRevisionPanel({
   canEdit: boolean;
   onViewLatest: () => void;
 }) {
+  const { t } = useTranslation();
   const contentQuery = useSourceVersionContentQuery(
     tenantId,
     projectId,
@@ -186,7 +60,6 @@ export function SourceTextRevisionPanel({
   );
   const save = useSaveSourceTextMutation(tenantId, projectId);
   const [draft, setDraft] = useState<Draft | null>(null);
-  const [unavailable, setUnavailable] = useState<string | null>(null);
   const [conflicted, setConflicted] = useState(false);
   const content = contentQuery.data;
   const historical = selectedVersionId !== source.current_version_id;
@@ -217,7 +90,6 @@ export function SourceTextRevisionPanel({
         text: content.text,
         idempotencyKey: createIdempotencyKey(),
       });
-      setUnavailable(null);
       setConflicted(false);
     }
   }, [
@@ -259,15 +131,18 @@ export function SourceTextRevisionPanel({
         <>
           <p>
             {selected.representation === "authored_text"
-              ? "编辑派生版本"
-              : "原件版本"}
+              ? t("knowledgeEditor.authored")
+              : t("knowledgeEditor.original")}
             {" · "}
+            {selected.media_type === "text/markdown"
+              ? t("knowledgeEditor.markdownFormat")
+              : selected.media_type === "text/plain"
+                ? t("knowledgeEditor.plainFormat")
+                : selected.media_type}
             {selected.text_basis === "extracted"
-              ? "从证据提取的草稿"
-              : "精确保存的正文"}
-            {" · "}
-            {selected.media_type}
-            {historical ? " · 历史只读" : ""}
+              ? ` · ${t("knowledgeEditor.extracted")}`
+              : ""}
+            {historical ? ` · ${t("knowledgeEditor.historical")}` : ""}
           </p>
           {historical || !editing ? (
             <pre className="source-original-text">{selected.text}</pre>
@@ -281,26 +156,46 @@ export function SourceTextRevisionPanel({
                     </MessageBarBody>
                   </MessageBar>
                 )}
-                <p>以原始文本编辑，Markdown 标记会保留。</p>
-                {unavailable ? (
-                  <>
-                    <MessageBar intent="warning">
-                      <MessageBarBody>{unavailable}</MessageBarBody>
-                    </MessageBar>
-                    <pre className="source-original-text">{draft.text}</pre>
-                  </>
-                ) : (
-                  <RawTextEditor
+                <p>
+                  {draft.mediaType === "text/markdown"
+                    ? t("knowledgeEditor.markdownHint")
+                    : t("knowledgeEditor.plainHint")}
+                </p>
+                {draft.mediaType === "text/markdown" ? (
+                  <MarkdownSourceEditor
                     key={editorKey}
                     value={draft.text}
                     disabled={save.isPending || conflicted || mismatch}
-                    onUnavailable={setUnavailable}
                     onChange={(text) => {
                       setDraft(
                         (previous) =>
                           previous && {
                             ...previous,
-                            text,
+                            text: preserveSourceLineEndings(
+                              text,
+                              previous.originalText,
+                            ),
+                            idempotencyKey: createIdempotencyKey(),
+                          },
+                      );
+                    }}
+                  />
+                ) : (
+                  <textarea
+                    aria-label={t("knowledgeEditor.rawInput")}
+                    className="source-textarea"
+                    spellCheck={false}
+                    value={draft.text}
+                    disabled={save.isPending || conflicted || mismatch}
+                    onChange={(event) => {
+                      setDraft(
+                        (previous) =>
+                          previous && {
+                            ...previous,
+                            text: preserveSourceLineEndings(
+                              event.target.value,
+                              previous.originalText,
+                            ),
                             idempotencyKey: createIdempotencyKey(),
                           },
                       );
@@ -353,7 +248,6 @@ export function SourceTextRevisionPanel({
                   appearance="primary"
                   disabled={
                     !dirty ||
-                    !!unavailable ||
                     !!textTooLarge ||
                     save.isPending ||
                     conflicted ||

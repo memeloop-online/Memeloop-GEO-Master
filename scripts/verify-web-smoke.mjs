@@ -415,6 +415,127 @@ async function main() {
   );
   console.log("P04: actual CSV source and logical-record evidence visible");
 
+  await page.goto(`${base}/knowledge`);
+  await page.getByRole("button", { name: "导入资料", exact: true }).click();
+  const originalMarkdown =
+    "# 合成标题\n\n这是 **合成重点**，包含 [示例链接](https://example.invalid/guide)。\n\n1. 第一项\n2. 第二项\n\n| 项目 | 值 |\n| --- | --- |\n| 合成产品 | 中文 |\n";
+  await sidebar.locator('input[type="file"]').setInputFiles({
+    name: "synthetic-article.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from(originalMarkdown, "utf8"),
+  });
+  await sidebar.getByRole("button", { name: "开始导入" }).click();
+  await sidebar.getByText("已受理 1 项，失败 0 项").waitFor();
+  await sidebar.getByRole("link", { name: "查看处理详情" }).click();
+  await page.getByRole("heading", { name: "synthetic-article.md" }).waitFor();
+  const visualEditor = page.locator(
+    "[data-testid='knowledge-visual-editor'] [contenteditable='true']",
+  );
+  await visualEditor.locator("h1").filter({ hasText: "合成标题" }).waitFor();
+  assert(
+    (await visualEditor.locator("strong").textContent()) === "合成重点",
+    "Markdown emphasis was not rendered in the actual knowledge editor",
+  );
+  assert(
+    (await visualEditor.locator("table").textContent()).includes("中文"),
+    "Markdown table was not rendered in the actual knowledge editor",
+  );
+  assert(
+    await page.getByRole("button", { name: "保存为新版本" }).isDisabled(),
+    "Parsing unchanged Markdown must not create an editable revision",
+  );
+  const originalVersion = await page
+    .getByRole("combobox", { name: "查看证据版本" })
+    .inputValue();
+  const editorToolbar = page.getByRole("toolbar", { name: "资料编辑" });
+  await editorToolbar
+    .getByRole("button", { name: "标题", exact: true })
+    .focus();
+  await page.keyboard.press("ArrowRight");
+  assert(
+    await editorToolbar
+      .getByRole("button", { name: "加粗", exact: true })
+      .evaluate((element) => element === document.activeElement),
+    "Knowledge editor formatting toolbar must support arrow-key navigation",
+  );
+  await visualEditor.locator("a").click();
+  await editorToolbar.getByRole("button", { name: "添加链接" }).click();
+  const linkPopover = page.locator(".source-link-popover");
+  const linkInput = linkPopover.getByRole("textbox", { name: "链接地址" });
+  assert(
+    (await linkInput.inputValue()) === "https://example.invalid/guide",
+    "Editing an existing link must prefill its saved URL",
+  );
+  await linkInput.fill("javascript:alert(1)");
+  await linkPopover.getByRole("button", { name: "添加链接" }).click();
+  await linkPopover.getByRole("alert").waitFor();
+  assert(
+    await page.getByRole("button", { name: "保存为新版本" }).isDisabled(),
+    "Rejected link schemes must not dirty the saved document",
+  );
+  await linkInput.fill("/updated");
+  await linkPopover.getByRole("button", { name: "添加链接" }).click();
+  await page.keyboard.press("Escape");
+  assert(
+    (await visualEditor.locator("a").getAttribute("href")) === "/updated",
+    "Updating a link must update the linked text, not just future typing",
+  );
+  await visualEditor.locator("h1").click();
+  await page.keyboard.press("End");
+  await page.keyboard.insertText("（修订）");
+  const textRevisionResponse = page.waitForResponse(
+    (response) =>
+      /\/knowledge\/sources\/[^/]+\/versions$/.test(
+        new URL(response.url()).pathname,
+      ) && response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "保存为新版本" }).click();
+  const savedText = await textRevisionResponse;
+  assert(
+    savedText.status() === 201,
+    "Knowledge text revision was not persisted",
+  );
+  const textReceipt = await savedText.json();
+  assert(
+    textReceipt.source_version.source_version_id !== originalVersion,
+    "Visual edits must create a distinct immutable source version",
+  );
+  await page.reload();
+  await page
+    .locator(".source-detail-page h1")
+    .filter({ hasText: "合成标题（修订）" })
+    .waitFor();
+  assert(
+    (await visualEditor.locator("a").getAttribute("href")) === "/updated",
+    "The revised link must survive a persisted page reload",
+  );
+  await screenshot(page, runDir, "p04-markdown-editor-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "p04-markdown-editor-narrow", {
+    width: 390,
+    height: 844,
+  });
+  await page
+    .getByRole("combobox", { name: "查看证据版本" })
+    .selectOption(originalVersion);
+  await page.getByText("正在查看已保存的历史证据", { exact: false }).waitFor();
+  assert(
+    (await page
+      .locator(".source-detail-page [contenteditable='true']")
+      .count()) === 0,
+    "Historical source versions must remain read-only",
+  );
+  assert(
+    (await page.locator(".source-original-text").textContent()) ===
+      originalMarkdown,
+    "Saving a visual revision changed the immutable original Markdown",
+  );
+  console.log(
+    "P04: actual Markdown visual edit, persisted reload and immutable history verified",
+  );
+
   await page.goto(`${base}/measurement`);
   await page
     .getByRole("heading", { name: "测量与洞察", exact: true })

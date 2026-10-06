@@ -9,3 +9,12 @@ Source and license texts are available from the upstream repository at the
 version of the package used in this build. Distribution of the bundled client
 must preserve the applicable notices and offer the corresponding MPL-covered
 source.
+
+The knowledge editor uses `@tiptap/markdown` and
+`@tiptap/extension-table` version `3.31.4` from
+https://github.com/ueberdosis/tiptap, under the MIT license. Markdown parsing
+also uses `marked` version `17.0.6` from https://github.com/markedjs/marked.
+The distributed `public/EDITOR_THIRD_PARTY_NOTICES.txt` preserves the editor
+license notices, including Marked's MIT notice and its bundled Markdown
+copyright and redistribution notice. Exact package integrity values remain
+in `pnpm-lock.yaml`.

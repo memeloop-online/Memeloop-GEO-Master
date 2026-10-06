@@ -1314,6 +1314,10 @@ input {
   font-size: 12px;
   white-space: nowrap;
 }
+.knowledge-panel-heading > .fui-Badge {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 .knowledge-table-scroll {
   overflow-x: auto;
 }
@@ -1514,6 +1518,9 @@ input {
     );
   gap: 12px;
   align-items: start;
+}
+.source-detail-workbench--text-first > .source-text-panel {
+  grid-column: 1 / -1;
 }
 .source-original-panel,
 .source-extraction-panel,

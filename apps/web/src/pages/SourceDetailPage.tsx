@@ -189,6 +189,26 @@ export function SourceDetailPage() {
     canRetry &&
     latestJob &&
     (latestJob.status === "partial" || latestJob.status === "failed");
+  // This only chooses presentation priority; the content endpoint remains
+  // authoritative for the actual editable representation and permissions.
+  const textFirst =
+    source.kind === "text" ||
+    currentVersion?.representation === "authored_text" ||
+    /\.(md|markdown|txt)$/i.test(source.name);
+  const sourceTextPanel = activeVersionId && tenantId && projectId && (
+    <SourceTextRevisionPanel
+      tenantId={tenantId}
+      projectId={projectId}
+      source={source}
+      selectedVersionId={activeVersionId}
+      canEdit={Boolean(canRetry)}
+      onViewLatest={() => {
+        setSelectedVersionId(null);
+        setSelectedChunkId(null);
+        void sourceQuery.refetch();
+      }}
+    />
+  );
 
   return (
     <div className="source-detail-page">
@@ -318,7 +338,10 @@ export function SourceDetailPage() {
           </ul>
         </section>
       )}
-      <section className="source-detail-workbench">
+      <section
+        className={`source-detail-workbench${textFirst ? " source-detail-workbench--text-first" : ""}`}
+      >
+        {textFirst && sourceTextPanel}
         <Card className="source-original-panel" style={{ minWidth: 0 }}>
           <div className="knowledge-panel-heading">
             <div>
@@ -392,20 +415,7 @@ export function SourceDetailPage() {
             </ol>
           )}
         </Card>
-        {activeVersionId && tenantId && projectId && (
-          <SourceTextRevisionPanel
-            tenantId={tenantId}
-            projectId={projectId}
-            source={source}
-            selectedVersionId={activeVersionId}
-            canEdit={Boolean(canRetry)}
-            onViewLatest={() => {
-              setSelectedVersionId(null);
-              setSelectedChunkId(null);
-              void sourceQuery.refetch();
-            }}
-          />
-        )}
+        {!textFirst && sourceTextPanel}
         <Card className="source-extraction-panel" style={{ minWidth: 0 }}>
           <div className="knowledge-panel-heading">
             <div>

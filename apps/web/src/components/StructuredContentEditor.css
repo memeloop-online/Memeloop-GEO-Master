@@ -36,3 +36,68 @@
 .structured-content-input[contenteditable="false"] {
   background: #f5f5f5;
 }
+
+.structured-content-input table {
+  border-collapse: collapse;
+  width: 100%;
+  table-layout: fixed;
+}
+
+.structured-content-input th,
+.structured-content-input td {
+  border: 1px solid #8a8886;
+  padding: 0.3rem;
+  min-width: 3rem;
+  vertical-align: top;
+}
+
+.source-textarea {
+  width: 100%;
+  min-height: 12rem;
+  box-sizing: border-box;
+  padding: 0.65rem;
+  border: 1px solid #8a8886;
+  border-radius: 4px;
+  font: inherit;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
+}
+
+.source-editor-note {
+  margin: 0.5rem 0.65rem;
+}
+
+.source-text-panel .structured-content-toolbar {
+  flex-wrap: nowrap;
+  align-items: center;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.source-text-panel .structured-content-toolbar > * {
+  flex: none;
+}
+
+.source-link-popover {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  max-width: min(24rem, calc(100vw - 2rem));
+}
+
+.source-link-popover > input,
+.source-link-popover .fui-Input {
+  flex: 1 1 11rem;
+  min-width: 0;
+}
+
+.source-link-popover [role="alert"] {
+  flex-basis: 100%;
+}
+
+.source-text-panel > h2,
+.source-text-panel > p {
+  margin: 0;
+}
