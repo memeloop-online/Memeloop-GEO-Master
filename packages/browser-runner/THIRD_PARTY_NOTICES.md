@@ -21,3 +21,9 @@ The private WebSocket relay uses `ws` 8.21.3, MIT licensed, from
 <https://github.com/websockets/ws>. Its copyright and complete license remain
 in `node_modules/ws/LICENSE` in the distributed image. The runner's standalone
 npm lock and workspace pnpm lock both pin this dependency.
+
+The isolated desktop smoke loads unmodified `@novnc/novnc` 1.7.0,
+MPL-2.0 licensed, from <https://github.com/novnc/noVNC>. Its ES-module source,
+`LICENSE.txt`, and `AUTHORS` remain in `node_modules/@novnc/novnc` in the
+test image. It supplies the RFB client, keyboard, and clipboard protocol;
+the fixture does not implement a replacement remote-input stack.

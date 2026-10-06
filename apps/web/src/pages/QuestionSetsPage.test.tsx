@@ -12,6 +12,7 @@ import {
 } from "react-router-dom";
 import { AuthProvider } from "../auth/AuthProvider";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
+import i18n from "../i18n";
 import { QuestionSetsPage } from "./QuestionSetsPage";
 
 const version = {
@@ -62,12 +63,14 @@ function mockApi({
   conflict = false,
   listError = false,
   createErrorOnce = false,
+  sourceKinds,
 }: {
   existing?: boolean;
   role?: string;
   conflict?: boolean;
   listError?: boolean;
   createErrorOnce?: boolean;
+  sourceKinds?: string[];
 } = {}) {
   const calls: {
     path: string;
@@ -77,7 +80,25 @@ function mockApi({
   }[] = [];
   let exists = existing;
   let rejectCreate = createErrorOnce;
-  let current = { ...version, parent_version_id: null as string | null };
+  const initialQuestions = sourceKinds
+    ? sourceKinds.map((kind, index) => ({
+        ...version.questions[0],
+        id: `revision-${index + 1}`,
+        question_id: `question-${index + 1}`,
+        text: `来源问题 ${index + 1}`,
+        source: { kind },
+        purpose: index === 0 ? "optimization" : "frozen_evaluation",
+      }))
+    : version.questions;
+  let current = {
+    ...version,
+    questions: initialQuestions,
+    optimization_count: sourceKinds ? (sourceKinds.length ? 1 : 0) : 0,
+    evaluation_count: sourceKinds
+      ? Math.max(sourceKinds.length - 1, 0)
+      : version.evaluation_count,
+    parent_version_id: null as string | null,
+  };
   vi.stubGlobal(
     "fetch",
     vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
@@ -258,11 +279,12 @@ function renderPage(initialEntry = "/app/tenant-1/project-1/measurement") {
   );
 }
 
-afterEach(() => {
+afterEach(async () => {
   sessionStorage.clear();
   vi.unstubAllGlobals();
   setCsrfToken(undefined);
   setUnauthorizedHandler(undefined);
+  await i18n.changeLanguage("zh-CN");
 });
 
 describe("P13 versioned question sets", () => {
@@ -583,5 +605,76 @@ describe("P13 versioned question sets", () => {
     expect(screen.getByLabelText("问题集名称")).toHaveValue("");
     await user.click(screen.getByRole("button", { name: "基于当前版本修订" }));
     expect(screen.getByLabelText("问题 1")).toHaveValue("怎样选型？");
+  });
+
+  it("localizes source and purpose labels without leaking source enums", async () => {
+    mockApi({
+      existing: true,
+      sourceKinds: [
+        "user_provided",
+        "sales_consultation",
+        "product",
+        "faq",
+        "generated",
+        "future_internal",
+      ],
+    });
+    renderPage("/app/tenant-1/project-1/measurement?tab=sets&set=set-1");
+    expect(
+      await screen.findByText(/用户提供/, { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/销售咨询/, { selector: "p" })).toBeInTheDocument();
+    expect(screen.getByText(/产品资料/, { selector: "p" })).toBeInTheDocument();
+    expect(screen.getByText(/常见问题/, { selector: "p" })).toBeInTheDocument();
+    expect(screen.getByText(/系统生成/, { selector: "p" })).toBeInTheDocument();
+    expect(
+      screen.getByText(/来源未说明/, { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("优化问题")).toBeInTheDocument();
+    expect(screen.getAllByText("冻结评估 · 不进入优化")).toHaveLength(5);
+    for (const sourceKind of [
+      "user_provided",
+      "sales_consultation",
+      "product",
+      "faq",
+      "generated",
+      "future_internal",
+    ]) {
+      expect(screen.queryByText(sourceKind)).not.toBeInTheDocument();
+    }
+    expect(screen.getByText(/创建于/)).toHaveTextContent("2026");
+
+    await i18n.changeLanguage("en");
+    expect(
+      await screen.findByText(/User-provided/, { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Sales consultation/, { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Product information/, { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/FAQ/, { selector: "p" })).toBeInTheDocument();
+    expect(
+      screen.getByText(/System-generated/, { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Source not specified/, { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Optimization question")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Frozen evaluation · excluded from optimization"),
+    ).toHaveLength(5);
+    for (const sourceKind of [
+      "user_provided",
+      "sales_consultation",
+      "product",
+      "faq",
+      "generated",
+      "future_internal",
+    ]) {
+      expect(screen.queryByText(sourceKind)).not.toBeInTheDocument();
+    }
+    expect(screen.getByText(/Created/)).toHaveTextContent("2026");
   });
 });

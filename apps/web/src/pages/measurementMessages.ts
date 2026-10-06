@@ -15,6 +15,30 @@ const zh = {
   createSet: "创建并保存问题集",
   creatingSet: "正在创建…",
   moreSettings: "更多设置",
+  purposeOptimization: "优化问题",
+  purposeFrozenEvaluation: "冻结评估 · 不进入优化",
+  sourceUserProvided: "用户提供",
+  sourceSalesConsultation: "销售咨询",
+  sourceProduct: "产品资料",
+  sourceFaq: "常见问题",
+  sourceGenerated: "系统生成",
+  sourceUnknown: "来源未说明",
+  versionHistory: "版本历史",
+  selectVersion: "选择版本",
+  selectImmutableVersion: "选择不可变版本",
+  versionDetails: "问题集版本详情",
+  versionSummary:
+    "优化 {{optimization}} · 冻结评估 {{evaluation}} · 创建于 {{createdAt}}",
+  noOptimizationQuestions: "当前版本没有优化问题；冻结评估问题不进入内容优化。",
+  historicalVersion: "这是历史不可变版本；要编辑请切换到当前版本。",
+  questionIntent: "意图 {{value}}",
+  questionProductReferences: "产品引用 {{value}}",
+  noProductReferences: "无",
+  productReferenceSeparator: "、",
+  questionMarket: "市场 {{value}}",
+  questionLanguage: "语言 {{value}}",
+  questionSource: "来源 {{value}}",
+  questionWeight: "权重 {{value}}",
 } as const;
 
 const en = {
@@ -33,6 +57,32 @@ const en = {
   createSet: "Create question set",
   creatingSet: "Creating…",
   moreSettings: "More settings",
+  purposeOptimization: "Optimization question",
+  purposeFrozenEvaluation: "Frozen evaluation · excluded from optimization",
+  sourceUserProvided: "User-provided",
+  sourceSalesConsultation: "Sales consultation",
+  sourceProduct: "Product information",
+  sourceFaq: "FAQ",
+  sourceGenerated: "System-generated",
+  sourceUnknown: "Source not specified",
+  versionHistory: "Version history",
+  selectVersion: "Select a version",
+  selectImmutableVersion: "Select an immutable version",
+  versionDetails: "Question set version details",
+  versionSummary:
+    "Optimization {{optimization}} · Frozen evaluation {{evaluation}} · Created {{createdAt}}",
+  noOptimizationQuestions:
+    "This version has no optimization questions; frozen evaluation questions are excluded from content optimization.",
+  historicalVersion:
+    "This is an immutable historical version. Switch to the current version to edit it.",
+  questionIntent: "Intent {{value}}",
+  questionProductReferences: "Product references {{value}}",
+  noProductReferences: "None",
+  productReferenceSeparator: ", ",
+  questionMarket: "Market {{value}}",
+  questionLanguage: "Language {{value}}",
+  questionSource: "Source {{value}}",
+  questionWeight: "Weight {{value}}",
 } as const;
 
 i18n.addResourceBundle("zh-CN", "measurement", zh, true, true);

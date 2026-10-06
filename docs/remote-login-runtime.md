@@ -8,6 +8,10 @@
 
 开发与生产前端均需要支持 ES2022；noVNC 的能力探测使用顶层 await。Vite 的生产 target 与开发依赖预构建 target 必须同步，不能只验证生产构建。真实 Linux 显示、中文输入、剪贴板、跨 ingress WebSocket 与真实账号验收仍按下文执行。
 
+现有 Linux 合成测试通过过显示截图、Cookie 保存和连接关闭，但这些不足以证明远程输入。新增测试用第二个 Chromium 加载未修改的 noVNC，真实发送字母、退格和 `中文😀` 剪贴板到远端网页，逐字检查结果；该增量等待 Linux CI，不允许跳过 Unicode 断言来宣称通过。
+
+中文字体不提供输入法。当前镜像未装 IBus，noVNC 的 canvas 键盘通路也没有证明支持本机 IME 组合输入。下一步验证同显示器、同会话 D-Bus 下的成熟远端拼音引擎及候选选择；不自制文字注入接口。Unicode 剪贴板依赖双方协商扩展能力，旧协议会损失非 Latin-1 字符，必须实测而不能根据组件名称推断。
+
 ## 组件与运行环境
 
 拟采用 noVNC 客户端、websockify WebSocket/RFB 转发和 TigerVNC/Xvnc 虚拟显示，运行有头 Playwright Chromium。接入前固定版本、核验维护状态及许可证分发义务；不能把依赖选型写成已完成安装。noVNC 本身不是浏览器服务，不能显示现有共享 headless Chromium。

@@ -123,6 +123,9 @@ importers:
 
   packages/browser-runner:
     dependencies:
+      '@novnc/novnc':
+        specifier: 1.7.0
+        version: 1.7.0
       playwright:
         specifier: 1.63.0
         version: 1.63.0

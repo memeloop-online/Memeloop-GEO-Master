@@ -18,6 +18,7 @@ import { useTranslation } from "react-i18next";
 import { useAuth } from "../auth/AuthProvider";
 import { membershipForTenant, queryScopeFor } from "../auth/types";
 import { ApiError } from "../api/client";
+import { formatUiDate } from "../i18n";
 import {
   createIdempotencyKey,
   createQuestionSet,
@@ -35,10 +36,18 @@ import { TopicQuestionGenerator } from "./TopicQuestionGenerator";
 import "./measurementMessages";
 import "./QuestionSetsPage.css";
 
-const purposeLabel = {
-  optimization: "优化问题",
-  frozen_evaluation: "冻结评估 · 不进入优化",
+const sourceLabelKeys = {
+  user_provided: "sourceUserProvided",
+  sales_consultation: "sourceSalesConsultation",
+  product: "sourceProduct",
+  faq: "sourceFaq",
+  generated: "sourceGenerated",
 } as const;
+const sourceLabelKey = (kind: unknown) =>
+  typeof kind === "string" &&
+  Object.prototype.hasOwnProperty.call(sourceLabelKeys, kind)
+    ? sourceLabelKeys[kind as keyof typeof sourceLabelKeys]
+    : "sourceUnknown";
 
 type EditableQuestion = QuestionDraft & { localId: string };
 type RevisionDraft = {
@@ -523,16 +532,16 @@ export function QuestionSetsPage() {
               onRetry={() => void versions.refetch()}
             />
           ) : (
-            <section aria-label="版本历史">
-              <h2>版本历史</h2>
-              <Field label="选择不可变版本">
+            <section aria-label={t("versionHistory")}>
+              <h2>{t("versionHistory")}</h2>
+              <Field label={t("selectImmutableVersion")}>
                 <Select
                   value={versionId}
                   onChange={(_, data) => {
                     updateSelection({ tab: "sets", version: data.value });
                   }}
                 >
-                  <option value="">选择版本</option>
+                  <option value="">{t("selectVersion")}</option>
                   {versions.data?.items.map((item) => (
                     <option key={item.id} value={item.id}>
                       v{item.revision} · {item.name}
@@ -553,38 +562,48 @@ export function QuestionSetsPage() {
             />
           ) : (
             version.data && (
-              <section aria-label="问题集版本详情">
+              <section aria-label={t("versionDetails")}>
                 <h2>
                   {version.data.name} · v{version.data.revision}
                 </h2>
                 <p>
-                  优化 {version.data.optimization_count} · 冻结评估{" "}
-                  {version.data.evaluation_count}
-                  {" · "}创建于{" "}
-                  {new Date(version.data.created_at).toLocaleString("zh-CN")}
+                  {t("versionSummary", {
+                    optimization: version.data.optimization_count,
+                    evaluation: version.data.evaluation_count,
+                    createdAt: formatUiDate(version.data.created_at),
+                  })}
                 </p>
                 {version.data.optimization_count === 0 && (
-                  <p role="status">
-                    当前版本没有优化问题；冻结评估问题不进入内容优化。
-                  </p>
+                  <p role="status">{t("noOptimizationQuestions")}</p>
                 )}
                 {version.data.id !== selectedSet?.current_version_id && (
-                  <p role="status">
-                    这是历史不可变版本；要编辑请切换到当前版本。
-                  </p>
+                  <p role="status">{t("historicalVersion")}</p>
                 )}
                 <ul style={{ paddingLeft: 24, overflowWrap: "anywhere" }}>
                   {version.data.questions.map((item) => (
                     <li key={item.id}>
                       <strong>{item.text}</strong>{" "}
                       <Badge appearance="outline">
-                        {purposeLabel[item.purpose]}
+                        {t(
+                          item.purpose === "frozen_evaluation"
+                            ? "purposeFrozenEvaluation"
+                            : "purposeOptimization",
+                        )}
                       </Badge>
                       <p>
-                        意图 {item.intent} · 产品引用{" "}
-                        {item.product_refs.join("、") || "无"} · 市场{" "}
-                        {item.market} · 语言 {item.language} · 来源{" "}
-                        {item.source.kind} · 权重 {item.weight}
+                        {t("questionIntent", { value: item.intent })} ·{" "}
+                        {t("questionProductReferences", {
+                          value:
+                            item.product_refs.join(
+                              t("productReferenceSeparator"),
+                            ) || t("noProductReferences"),
+                        })}{" "}
+                        · {t("questionMarket", { value: item.market })} ·{" "}
+                        {t("questionLanguage", { value: item.language })} ·{" "}
+                        {t("questionSource", {
+                          value: t(sourceLabelKey(item.source.kind)),
+                        })}{" "}
+                        · {t("questionWeight", { value: item.weight })}
                       </p>
                     </li>
                   ))}
