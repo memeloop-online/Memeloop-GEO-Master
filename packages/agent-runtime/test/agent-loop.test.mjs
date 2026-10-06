@@ -476,6 +476,9 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "channel_plan",
         "channel_manifest_read",
         "channel_target_execute",
+        "question_discover",
+        "question_create",
+        "question_revise",
         "content_start",
         "content_execution_read",
         "distribution_start",
@@ -688,6 +691,9 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "channel_plan",
         "channel_manifest_read",
         "channel_target_execute",
+        "question_discover",
+        "question_create",
+        "question_revise",
         "content_start",
         "content_execution_read",
         "distribution_start",
@@ -1015,6 +1021,16 @@ test("channel tools discover references, freeze a plan, read the manifest, and p
         .additionalProperties,
       false,
     );
+    assert.equal(
+      definitions.channel_plan.parameters.properties.bound_measurements.items
+        .additionalProperties,
+      false,
+    );
+    assert.equal(
+      definitions.channel_plan.parameters.properties.bound_measurements.items
+        .properties.question.additionalProperties,
+      false,
+    );
     assert.deepEqual(definitions.channel_target_execute.parameters.required, [
       "target_id",
     ]);
@@ -1025,6 +1041,183 @@ test("channel tools discover references, freeze a plan, read the manifest, and p
     );
     assert.match(requests[4].messages.at(-1).content, /"deferred"/u);
     assert.match(requests[5].messages.at(-1).content, /"account_unavailable"/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("native question-set tools return only safe references and freeze bound targets without a purpose override", async () => {
+  const ids = {
+    set: "00000000-0000-4000-8000-000000000121",
+    version: "00000000-0000-4000-8000-000000000122",
+    question: "00000000-0000-4000-8000-000000000123",
+    revision: "00000000-0000-4000-8000-000000000124",
+    account: "00000000-0000-4000-8000-000000000125",
+    cycle: "00000000-0000-4000-8000-000000000126",
+  };
+  const heldout = "HELDOUT_CANARY_DO_NOT_EXPOSE";
+  const reference = {
+    question_set_id: ids.set,
+    question_set_version_id: ids.version,
+    question_id: ids.question,
+    question_revision_id: ids.revision,
+  };
+  const draft = {
+    text: "Which options are available?",
+    intent: "purchase",
+    product_refs: [],
+    market: "global",
+    language: "en",
+    source: { kind: "user_provided" },
+    weight: 1,
+  };
+  const commands = [
+    [
+      "question_create",
+      {
+        idempotency_key: "create-1",
+        name: "Customer questions",
+        questions: [draft],
+      },
+    ],
+    [
+      "question_revise",
+      {
+        question_set_id: ids.set,
+        command: {
+          idempotency_key: "revise-1",
+          base_version_id: ids.version,
+          name: "Customer questions",
+          questions: [draft],
+        },
+      },
+    ],
+    [
+      "question_discover",
+      { question_set_id: ids.set, question_set_version_id: ids.version },
+    ],
+    [
+      "channel_plan",
+      {
+        cycle_id: ids.cycle,
+        publications: [],
+        measurements: [],
+        bound_measurements: [
+          {
+            account_id: ids.account,
+            provider: "search-provider",
+            model: "search-model",
+            surface: "web",
+            search_mode: "official_search",
+            protocol_version: "v1",
+            question: reference,
+            scheduled_at: "2026-10-06T00:00:00Z",
+            sample_ordinal: 0,
+          },
+        ],
+      },
+    ],
+  ];
+  const seen = [];
+  const completions = [];
+  const receipt = {
+    question_set_id: ids.set,
+    question_set_version_id: ids.version,
+    revision: 1,
+    optimization_count: 0,
+    evaluation_count: 1,
+  };
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("unexpected search");
+    },
+    async questionCreate(request) {
+      seen.push(["create", request]);
+      return receipt;
+    },
+    async questionRevise(request) {
+      seen.push(["revise", request]);
+      return { ...receipt, revision: 2 };
+    },
+    async questionDiscover(request) {
+      seen.push(["discover", request]);
+      return {
+        sets: [],
+        versions: [],
+        questions: [{ reference, purpose: "frozen_evaluation" }],
+      };
+    },
+    async channelPlan(request) {
+      seen.push(["plan", request]);
+      return {
+        plan_id: ids.question,
+        cycle_id: ids.cycle,
+        revision: 1,
+        expected_count: 1,
+        dispatch_state: "pending",
+      };
+    },
+    async modelComplete(request) {
+      completions.push(request);
+      const step = commands[completions.length - 1];
+      return step
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `questions-${completions.length}`,
+                type: "function",
+                function: { name: step[0], arguments: JSON.stringify(step[1]) },
+              },
+            ],
+          }
+        : finalModelAnswer("Bound measurement queued.");
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?questions=${Date.now()}`);
+    assert.match(
+      (
+        await main({
+          conversation_id: "question-conversation",
+          prompt: "Create, revise, discover and plan",
+          run_id: "question-run",
+          turn_id: "question-turn",
+        })
+      ).answer,
+      /queued/u,
+    );
+    assert.deepEqual(
+      seen.map(([op]) => op),
+      ["create", "revise", "discover", "plan"],
+    );
+    assert.deepEqual(seen.at(-1)[1].bound_measurements[0].question, reference);
+    assert.equal(
+      JSON.stringify(completions.at(-1).messages).includes(heldout),
+      false,
+      "the host must never supply heldout text in a discovery or write receipt",
+    );
+    const schemas = Object.fromEntries(
+      completions[0].tools.map(({ function: item }) => [
+        item.name,
+        item.parameters,
+      ]),
+    );
+    assert.equal(schemas.question_discover.additionalProperties, false);
+    assert.equal(schemas.question_create.additionalProperties, false);
+    assert.equal(schemas.question_revise.additionalProperties, false);
+    assert.equal(
+      schemas.channel_plan.properties.bound_measurements.items.properties
+        .question.properties.purpose,
+      undefined,
+    );
+    assert.equal(
+      schemas.channel_plan.properties.bound_measurements.items.properties
+        .question.properties.text,
+      undefined,
+    );
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

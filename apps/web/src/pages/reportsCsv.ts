@@ -73,6 +73,13 @@ export function reportSnapshotCsv(snapshot: ReportSnapshot): string {
   }
   for (const group of snapshot.measurement_groups) {
     rows.push(
+      [
+        "measurement_group",
+        group.comparison_key,
+        "purpose",
+        group.purpose ?? "legacy_unclassified",
+        "",
+      ],
       ...coverageRows(
         "measurement_group",
         group.comparison_key,

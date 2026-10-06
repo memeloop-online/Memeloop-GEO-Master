@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelStatus, ChannelTarget,
     ChannelTargetInput, ChannelTargetView, ConnectorAvailability, ConnectorKey, ErrorCode,
-    KnowledgePurpose, ProjectId, ProjectStatus, SourceState, TenantScope, sha256_hex,
+    KnowledgePurpose, ProjectId, ProjectStatus, QuestionReference, SourceState, TenantScope,
+    sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -23,6 +24,8 @@ use crate::{ApiError, AppState, AuthContext, RequestContext, api_error, require_
 pub struct PlanRequest {
     pub publications: Vec<PublicationRequest>,
     pub measurements: Vec<MeasurementRequest>,
+    #[serde(default)]
+    pub bound_measurements: Vec<BoundMeasurementRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +51,21 @@ pub struct MeasurementRequest {
     pub market: String,
     pub language: String,
     pub scheduled_at: chrono::DateTime<Utc>,
+    pub sample_ordinal: u32,
+}
+
+/// No caller-controlled question text, market, language, purpose or split.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundMeasurementRequest {
+    pub account_id: Uuid,
+    pub provider: String,
+    pub model: String,
+    pub surface: String,
+    pub search_mode: String,
+    pub protocol_version: String,
+    pub question: QuestionReference,
+    pub scheduled_at: DateTime<Utc>,
     pub sample_ordinal: u32,
 }
 
@@ -568,6 +586,7 @@ fn measurement_observation(
         language,
         scheduled_at,
         sample_ordinal,
+        ..
     } = &target.input
     else {
         return None;
@@ -907,7 +926,49 @@ async fn measurement_input(
         language: request.language,
         scheduled_at: request.scheduled_at,
         sample_ordinal: request.sample_ordinal,
+        question_binding: None,
     })
+}
+
+async fn bound_measurement_input(
+    state: &AppState,
+    scope: &TenantScope,
+    request: BoundMeasurementRequest,
+) -> Result<ChannelTargetInput, AppError> {
+    let resolved = state
+        .question_repository()
+        .resolve_question(scope, request.question)
+        .await?;
+    let mut input = measurement_input(
+        state,
+        scope,
+        MeasurementRequest {
+            account_id: request.account_id,
+            provider: request.provider,
+            model: request.model,
+            surface: request.surface,
+            search_mode: request.search_mode,
+            protocol_version: request.protocol_version,
+            question_set_version: resolved
+                .binding
+                .reference
+                .question_set_version_id
+                .to_string(),
+            question: resolved.revision.text.clone(),
+            market: resolved.revision.market.clone(),
+            language: resolved.revision.language.clone(),
+            scheduled_at: request.scheduled_at,
+            sample_ordinal: request.sample_ordinal,
+        },
+    )
+    .await?;
+    if let ChannelTargetInput::Measure {
+        question_binding, ..
+    } = &mut input
+    {
+        *question_binding = Some(resolved.binding);
+    }
+    Ok(input)
 }
 
 pub async fn submit_plan(
@@ -948,7 +1009,9 @@ pub async fn create_channel_plan(
     {
         return Err(AppError::not_found("cycle not found"));
     }
-    if request.publications.len() + request.measurements.len() > 100 {
+    if request.publications.len() + request.measurements.len() + request.bound_measurements.len()
+        > 100
+    {
         return Err(AppError::invalid_request(
             "channel plan exceeds 100 targets",
         ));
@@ -963,6 +1026,13 @@ pub async fn create_channel_plan(
     }
     for measure in request.measurements {
         let input = measurement_input(state, scope, measure).await?;
+        targets.push(ChannelTarget {
+            target_id: target_id(cycle_id, &input)?,
+            input,
+        });
+    }
+    for measure in request.bound_measurements {
+        let input = bound_measurement_input(state, scope, measure).await?;
         targets.push(ChannelTarget {
             target_id: target_id(cycle_id, &input)?,
             input,
@@ -1568,6 +1638,37 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn legacy_target_id_golden_bytes_remain_unchanged_when_binding_is_absent() {
+        let wire = r#"{"kind":"measure","account_id":"00000000-0000-0000-0000-000000000001","provider":"kimi","model":"fixed","surface":"consumer_web","search_mode":"web_search","protocol_version":"v1","question_set_version":"free-text-version","question":"Question?","market":"CN","language":"en","scheduled_at":"2026-09-25T00:00:00Z","sample_ordinal":0}"#;
+        let input: ChannelTargetInput = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&input).unwrap(), wire);
+        assert_eq!(
+            target_id(Uuid::nil(), &input).unwrap(),
+            Uuid::parse_str("89573342-e0c3-b1e9-09df-52760630125c").unwrap()
+        );
+        let mut bound = input.clone();
+        if let ChannelTargetInput::Measure {
+            question_binding, ..
+        } = &mut bound
+        {
+            *question_binding = Some(geo_domain::FrozenQuestionBinding {
+                reference: QuestionReference {
+                    question_set_id: Uuid::new_v4(),
+                    question_set_version_id: Uuid::new_v4(),
+                    question_id: Uuid::new_v4(),
+                    question_revision_id: Uuid::new_v4(),
+                },
+                purpose: geo_domain::QuestionPurpose::Optimization,
+                split_policy_version: "project_registry_nfkc_v1".into(),
+            });
+        }
+        assert_ne!(
+            target_id(Uuid::nil(), &input).unwrap(),
+            target_id(Uuid::nil(), &bound).unwrap()
+        );
+    }
 
     #[derive(Clone)]
     struct RunnerStub {

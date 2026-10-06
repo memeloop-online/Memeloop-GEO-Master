@@ -36,7 +36,19 @@ export type ChannelTargetInput =
       language: string;
       scheduled_at: string;
       sample_ordinal: number;
+      question_binding?: {
+        reference: QuestionReference;
+        purpose: "optimization" | "frozen_evaluation";
+        split_policy_version: string;
+      };
     };
+
+export interface QuestionReference {
+  question_set_id: string;
+  question_set_version_id: string;
+  question_id: string;
+  question_revision_id: string;
+}
 
 export interface ChannelTarget {
   target_id: string;
@@ -146,9 +158,22 @@ export interface MeasurementRequest {
   sample_ordinal: number;
 }
 
+export interface BoundMeasurementRequest {
+  account_id: string;
+  provider: string;
+  model: string;
+  surface: string;
+  search_mode: string;
+  protocol_version: string;
+  question: QuestionReference;
+  scheduled_at: string;
+  sample_ordinal: number;
+}
+
 export interface ChannelPlanRequest {
   publications: PublicationRequest[];
   measurements: MeasurementRequest[];
+  bound_measurements?: BoundMeasurementRequest[];
 }
 
 const encoded = (value: string) => encodeURIComponent(value);

@@ -24,12 +24,13 @@ use serde::de::DeserializeOwned;
 use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
     ChannelTargetExecuteRequest, ContentCloseRequest, ContentExecutionReadRequest,
-    ContentItemsReadRequest, ContentStartRequest, ContentStepRequest, DistributionReadRequest,
-    DistributionResumeRequest, DistributionStartRequest, DistributionTargetsReadRequest,
-    HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
-    KnowledgeImportStatusRequest, KnowledgeSearchRequest, KnowledgeSearchResult,
-    ManifestReadRequest, MeasureRequest, ModelCompletionRequest, PublishRequest, ReportGetRequest,
-    ReportPreviewRequest, ReportReduceRequest,
+    ContentItemsReadRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
+    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
+    DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
+    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeSearchRequest,
+    KnowledgeSearchResult, ManifestReadRequest, MeasureRequest, ModelCompletionRequest,
+    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
+    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
 };
 
 #[op2]
@@ -309,6 +310,90 @@ pub async fn op_host_channel_plan_v1(
     receipt
         .validate_for(&requested)
         .map_err(|reason| js_error(HostOpError::internal(op, reason)))?;
+    Ok(encode(op, &receipt)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_question_discover_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::QuestionDiscover;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<QuestionDiscoverRequest>(op, &payload)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let requested = request.clone();
+    let page = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .question_discover(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    page.validate_for(&requested)
+        .map_err(|reason| js_error(HostOpError::internal(op, reason)))?;
+    Ok(encode(op, &page)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_question_create_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::QuestionCreate;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<CreateQuestionSet>(op, &payload)?;
+    validate_question_create(&request)
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let receipt = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .question_create(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    receipt
+        .validate()
+        .map_err(|reason| js_error(HostOpError::internal(op, reason)))?;
+    Ok(encode(op, &receipt)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_question_revise_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::QuestionRevise;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<QuestionReviseRequest>(op, &payload)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let requested_set_id = request.question_set_id;
+    let receipt = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .question_revise(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    receipt
+        .validate()
+        .map_err(|reason| js_error(HostOpError::internal(op, reason)))?;
+    if receipt.question_set_id != requested_set_id {
+        return Err(js_error(HostOpError::internal(
+            op,
+            "question revision returned another set",
+        )));
+    }
     Ok(encode(op, &receipt)?)
 }
 
@@ -717,6 +802,9 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ReportReduce.op_name(),
     HostOp::ChannelDiscover.op_name(),
     HostOp::ChannelPlan.op_name(),
+    HostOp::QuestionDiscover.op_name(),
+    HostOp::QuestionCreate.op_name(),
+    HostOp::QuestionRevise.op_name(),
     HostOp::ChannelManifestRead.op_name(),
     HostOp::ChannelTargetExecute.op_name(),
     HostOp::ContentItemsRead.op_name(),

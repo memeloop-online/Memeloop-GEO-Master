@@ -1,9 +1,10 @@
 import { readFileSync } from "node:fs";
 import fontkit from "@pdf-lib/fontkit";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, PDFPage } from "pdf-lib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReportSnapshot } from "../api/reports";
 import { buildReportPdf, downloadReportPdf, wrapPdfText } from "./reportsPdf";
+import { reportSnapshotCsv } from "./reportsCsv";
 
 const fontBytes = new Uint8Array(
   readFileSync("public/fonts/NotoSansCJKsc-Regular.otf"),
@@ -83,6 +84,37 @@ describe("report PDF", () => {
     vi.unstubAllGlobals();
   });
 
+  it("exports per-group purpose without inventing a legacy assignment or mutating the snapshot", () => {
+    const report = snapshot();
+    report.measurement_groups.push(
+      {
+        ...report.measurement_groups[0],
+        comparison_key: "optimization-key",
+        purpose: "optimization",
+      },
+      {
+        ...report.measurement_groups[0],
+        comparison_key: "evaluation-key",
+        purpose: "frozen_evaluation",
+      },
+    );
+    const before = JSON.stringify(report);
+    const csv = reportSnapshotCsv(report);
+    expect(csv).toContain(
+      '"measurement_group","opaque-key-1","purpose","legacy_unclassified",""',
+    );
+    expect(csv).toContain(
+      '"measurement_group","optimization-key","purpose","optimization",""',
+    );
+    expect(csv).toContain(
+      '"measurement_group","evaluation-key","purpose","frozen_evaluation",""',
+    );
+    expect(csv).toContain(
+      '"measurement_group","opaque-key-1","expected_count","",""',
+    );
+    expect(JSON.stringify(report)).toBe(before);
+  });
+
   it("wraps opaque identifiers and Chinese without losing code points or crossing the width", () => {
     const text = `资料${"0123456789abcdef-".repeat(18)}终`;
     const lines = wrapPdfText(text, 13, (value) => [...value].length);
@@ -111,6 +143,20 @@ describe("report PDF", () => {
   // Real 16 MiB font embedding needs a longer limit when the full suite runs in parallel.
   it("embeds a Chinese-capable font into valid multipage A4 PDF with snapshot metadata", async () => {
     const report = snapshot();
+    const drawn = vi.spyOn(PDFPage.prototype, "drawText");
+    report.measurement_groups = [
+      report.measurement_groups[0],
+      {
+        ...report.measurement_groups[0],
+        comparison_key: "optimization-key",
+        purpose: "optimization",
+      },
+      {
+        ...report.measurement_groups[0],
+        comparison_key: "evaluation-key",
+        purpose: "frozen_evaluation",
+      },
+    ];
     report.evidence = Array.from({ length: 25 }, (_, index) => ({
       ...report.evidence[0],
       evidence_id: `evidence-${index}`,
@@ -118,6 +164,10 @@ describe("report PDF", () => {
       summary: `中文资料 ${index}：${"长文本、".repeat(35)}`,
     }));
     const bytes = await buildReportPdf(report, fontBytes);
+    const text = drawn.mock.calls.map(([value]) => value).join("\n");
+    expect(text).toContain("问题用途：优化");
+    expect(text).toContain("问题用途：冻结评估（不进入优化）");
+    expect(text).toContain("问题用途：旧未分类（不进入优化）");
     expect(new TextDecoder().decode(bytes.slice(0, 8))).toMatch(/^%PDF-1\./);
     const pdf = await PDFDocument.load(bytes);
     expect(pdf.getTitle()).toContain("report-1");

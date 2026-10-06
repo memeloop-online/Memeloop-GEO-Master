@@ -8,20 +8,21 @@ use geo_domain::{
     ErrorCode, KnowledgePurpose, SourceKind, SourceState, TenantScope, sha256_hex,
 };
 use geo_worker::{
-    ChannelDiscoverRequest, ChannelDiscoveryItem, ChannelDiscoveryKind, ChannelDiscoveryPage,
-    ChannelExecutionResult, ChannelExecutionState, ChannelManifestPage, ChannelManifestReadRequest,
-    ChannelMeasurementPlanItem, ChannelPlanReceipt, ChannelPlanRequest,
-    ChannelPublicationLookupObservation, ChannelPublicationLookupSummary,
-    ChannelPublicationPlanItem, ChannelTargetExecuteRequest, ChannelTargetKind,
-    ChannelTargetSummary,
+    ChannelBoundMeasurementPlanItem, ChannelDiscoverRequest, ChannelDiscoveryItem,
+    ChannelDiscoveryKind, ChannelDiscoveryPage, ChannelExecutionResult, ChannelExecutionState,
+    ChannelManifestPage, ChannelManifestReadRequest, ChannelMeasurementPlanItem,
+    ChannelPlanReceipt, ChannelPlanRequest, ChannelPublicationLookupObservation,
+    ChannelPublicationLookupSummary, ChannelPublicationPlanItem, ChannelTargetExecuteRequest,
+    ChannelTargetKind, ChannelTargetSummary,
 };
 use uuid::Uuid;
 
 use crate::{
     AppState,
     channel_jobs::{
-        ChannelDispatchDeferred, ChannelDispatchResult, MeasurementRequest, PlanRequest,
-        PublicationRequest, create_channel_plan, execute_channel_target,
+        BoundMeasurementRequest, ChannelDispatchDeferred, ChannelDispatchResult,
+        MeasurementRequest, PlanRequest, PublicationRequest, create_channel_plan,
+        execute_channel_target,
     },
     publication_lookup::read_publication_lookup,
 };
@@ -431,6 +432,33 @@ impl ChannelToolService for AppState {
                             question,
                             market,
                             language,
+                            scheduled_at,
+                            sample_ordinal,
+                        },
+                    )
+                    .collect(),
+                bound_measurements: request
+                    .bound_measurements
+                    .into_iter()
+                    .map(
+                        |ChannelBoundMeasurementPlanItem {
+                             account_id,
+                             provider,
+                             model,
+                             surface,
+                             search_mode,
+                             protocol_version,
+                             question,
+                             scheduled_at,
+                             sample_ordinal,
+                         }| BoundMeasurementRequest {
+                            account_id,
+                            provider,
+                            model,
+                            surface,
+                            search_mode,
+                            protocol_version,
+                            question,
                             scheduled_at,
                             sample_ordinal,
                         },

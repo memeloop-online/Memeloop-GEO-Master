@@ -147,6 +147,8 @@ async function screenshot(page, runDir, name, viewport) {
       ".channel-jobs-form",
       ".reports-page",
       ".report-preview",
+      ".question-sets-page",
+      ".question-sets-edit-row",
     ].flatMap((selector) =>
       [...document.querySelectorAll(selector)].flatMap((element) => {
         const style = getComputedStyle(element);
@@ -355,6 +357,89 @@ async function main() {
     "CSV upload did not reach the actual Rust API",
   );
   console.log("P04: actual CSV source and logical-record evidence visible");
+
+  await page.goto(`${base}/measurement`);
+  await page.getByRole("heading", { name: "问题集", exact: true }).waitFor();
+  await page
+    .getByRole("textbox", { name: "问题集名称", exact: true })
+    .fill("Synthetic questions");
+  await page
+    .getByRole("textbox", { name: "每行一个问题" })
+    .fill(
+      Array.from(
+        { length: 5 },
+        (_, i) => `Synthetic product question ${i + 1}?`,
+      ).join("\n"),
+    );
+  const createdResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes("/question-sets") &&
+      response.request().method() === "POST" &&
+      response.status() < 300,
+  );
+  await page.getByRole("button", { name: "创建并封存 v1" }).click();
+  const questionVersion = await (await createdResponse).json();
+  assert(
+    questionVersion.optimization_count === 4 &&
+      questionVersion.evaluation_count === 1,
+    "Actual question repository did not preserve the project split",
+  );
+  await page
+    .getByRole("heading", { name: "Synthetic questions · v1" })
+    .waitFor();
+  await page.getByRole("button", { name: "基于当前版本修订" }).click();
+  await page
+    .getByRole("textbox", { name: "问题 1", exact: true })
+    .fill("Synthetic revised product question?");
+  await screenshot(page, runDir, "p13-edit-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "p13-edit-narrow", {
+    width: 390,
+    height: 844,
+  });
+  const revisedResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes("/versions") &&
+      response.request().method() === "POST" &&
+      response.status() < 300,
+  );
+  await page.getByRole("button", { name: "保存为新版本" }).click();
+  const revisedVersion = await (await revisedResponse).json();
+  assert(
+    revisedVersion.parent_version_id === questionVersion.id &&
+      revisedVersion.questions.every((question) =>
+        questionVersion.questions.some(
+          (original) =>
+            original.question_id === question.question_id &&
+            original.purpose === question.purpose,
+        ),
+      ),
+    "Question revision changed identity or fixed purpose",
+  );
+  await page
+    .getByRole("heading", { name: "Synthetic questions · v2" })
+    .waitFor();
+  await page.reload();
+  await page
+    .getByLabel("选择问题集", { exact: true })
+    .selectOption(questionVersion.question_set_id);
+  await page
+    .getByRole("heading", { name: "Synthetic questions · v2" })
+    .waitFor();
+  await page
+    .getByLabel("选择不可变版本", { exact: true })
+    .selectOption(questionVersion.id);
+  await page
+    .getByRole("heading", { name: "Synthetic questions · v1" })
+    .waitFor();
+  await page
+    .getByText("Synthetic product question 1?", { exact: true })
+    .waitFor();
+  console.log(
+    "P13: real API create/revise/reload/history; frozen identities preserved",
+  );
 
   await page.goto(`${base}/publications`);
   await page.getByRole("heading", { name: "发布目标与执行记录" }).waitFor();

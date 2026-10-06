@@ -141,6 +141,7 @@ async fn encrypted_binding_is_pre_send_scoped_and_database_immutable() {
                         language: "en".into(),
                         scheduled_at: now,
                         sample_ordinal: 0,
+                        question_binding: None,
                     },
                 },
             ],

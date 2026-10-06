@@ -424,6 +424,14 @@ function SnapshotDetail({
                 <div key={group.comparison_key} className="report-group">
                   <h4>{group.comparison_key}</h4>
                   <p>
+                    问题用途：
+                    {group.purpose === "optimization"
+                      ? "优化问题"
+                      : group.purpose === "frozen_evaluation"
+                        ? "冻结评估（不进入优化）"
+                        : "旧数据未分类（不进入优化）"}
+                  </p>
+                  <p>
                     {group.coverage.availability === "available"
                       ? "可用"
                       : group.coverage.reason || "不可用"}

@@ -19,6 +19,7 @@ import {
 import { WorkspacePage } from "./pages/WorkspacePage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { ChannelJobsPage } from "./pages/ChannelJobsPage";
+import { QuestionSetsPage } from "./pages/QuestionSetsPage";
 import { ContentAssetPage, ContentAssetsPage } from "./pages/ContentPages";
 
 export function AppRoutes() {
@@ -66,10 +67,7 @@ export function AppRoutes() {
               element={<ChannelAccountsPage view="connect" />}
             />
             <Route path="publications" element={<ChannelJobsPage />} />
-            <Route
-              path="measurement"
-              element={<WorkbenchPage page="measurement" />}
-            />
+            <Route path="measurement" element={<QuestionSetsPage />} />
             <Route path="reports" element={<ReportsPage />} />
             <Route path="reports/:id" element={<ReportsPage />} />
             <Route path="billing" element={<WorkbenchPage page="billing" />} />

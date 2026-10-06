@@ -10,9 +10,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    AppError, ChannelSecret, EvidenceRef, ProjectId, ReportEvidenceReference, ReportManifestKind,
-    ReportManifestRef, ReportMeasurementStatus, ReportMeasurementTarget, ReportPublicationStatus,
-    ReportPublicationTarget, TenantScope,
+    AppError, ChannelSecret, EvidenceRef, FrozenQuestionBinding, ProjectId, QuestionPurpose,
+    QuestionReference, ReportEvidenceReference, ReportManifestKind, ReportManifestRef,
+    ReportMeasurementStatus, ReportMeasurementTarget, ReportPublicationStatus,
+    ReportPublicationTarget, TenantScope, sha256_hex,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,10 @@ pub enum ChannelTargetInput {
         language: String,
         scheduled_at: DateTime<Utc>,
         sample_ordinal: u32,
+        /// Absent on all historical ad-hoc samples. Never infer classification
+        /// from the legacy free-text question-set version.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question_binding: Option<FrozenQuestionBinding>,
     },
 }
 
@@ -81,10 +86,24 @@ impl ChannelTargetInput {
                 question_set_version,
                 market,
                 language,
+                question_binding,
                 ..
-            } => Some(format!(
-                "{provider}|{model}|{surface}|{search_mode}|{protocol_version}|{question_set_version}|{market}|{language}"
-            )),
+            } => {
+                let legacy = format!(
+                    "{provider}|{model}|{surface}|{search_mode}|{protocol_version}|{question_set_version}|{market}|{language}"
+                );
+                Some(match question_binding {
+                    None => legacy,
+                    Some(binding) => format!(
+                        "{legacy}|{}|{}",
+                        match binding.purpose {
+                            QuestionPurpose::Optimization => "optimization",
+                            QuestionPurpose::FrozenEvaluation => "frozen_evaluation",
+                        },
+                        binding.split_policy_version
+                    ),
+                })
+            }
             _ => None,
         }
     }
@@ -165,6 +184,189 @@ pub struct ChannelCycleInputs {
     pub manifests: Vec<ReportManifestRef>,
     pub publications: Option<Vec<ReportPublicationTarget>>,
     pub measurements: Option<Vec<ReportMeasurementTarget>>,
+}
+
+/// Deliberately not a report, answer, evidence payload, or optimizer action.
+/// Only these identities can be passed to a future optimization consumer;
+/// that consumer must fetch any further facts through its own scoped gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptimizationEligibleProjection {
+    pub cycle_id: Uuid,
+    pub observations: Vec<OptimizationEligibleObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptimizationEligibleObservation {
+    pub target_id: Uuid,
+    pub observation_id: Uuid,
+    pub question: QuestionReference,
+    pub protocol_comparison_key: String,
+}
+
+/// Never projects held-out text, answers, citations, free-text details,
+/// report findings, or mixed-purpose counts, including nested evidence.
+/// Evidence must be a timely live official search observation whose frozen
+/// target fields match the runner's original proof.
+pub fn optimization_eligible_projection(
+    scope: &TenantScope,
+    plan: &ChannelPlan,
+    attempts: &HashMap<Uuid, Vec<ChannelAttempt>>,
+    as_of: DateTime<Utc>,
+) -> Result<OptimizationEligibleProjection, AppError> {
+    if scope.project_id != Some(plan.project_id) {
+        return Err(AppError::forbidden(
+            "optimization projection outside project scope",
+        ));
+    }
+    let mut observations = Vec::new();
+    for target in &plan.targets {
+        let ChannelTargetInput::Measure {
+            account_id,
+            provider,
+            model,
+            surface,
+            search_mode,
+            protocol_version,
+            question_set_version,
+            question,
+            market,
+            language,
+            scheduled_at,
+            sample_ordinal,
+            question_binding: Some(binding),
+        } = &target.input
+        else {
+            continue;
+        };
+        if binding.purpose != QuestionPurpose::Optimization
+            || question_set_version != &binding.reference.question_set_version_id.to_string()
+        {
+            continue;
+        }
+        let Some(attempt) = attempts
+            .get(&target.target_id)
+            .and_then(|items| items.last())
+        else {
+            continue;
+        };
+        let Some(outcome) = &attempt.outcome else {
+            continue;
+        };
+        if outcome.fixture
+            || outcome.status != ChannelOutcomeStatus::Observed
+            || outcome
+                .raw_answer
+                .as_ref()
+                .is_none_or(|answer| answer.trim().is_empty())
+            || outcome
+                .connector_version
+                .as_ref()
+                .is_none_or(|version| version.is_empty() || version.starts_with("fixture"))
+            || !attempt.received_at.is_some_and(|received| {
+                attempt.claimed_at <= outcome.occurred_at
+                    && *scheduled_at <= outcome.occurred_at
+                    && outcome.occurred_at <= received
+                    && received <= as_of
+                    && *scheduled_at <= received
+            })
+        {
+            continue;
+        }
+        let expected_question_hash = sha256_hex(question.as_bytes());
+        let valid_proofs: Vec<_> = outcome
+            .runner_evidence
+            .iter()
+            .filter(|proof| {
+                proof.get("kind").and_then(serde_json::Value::as_str)
+                    == Some("official_search_observation")
+                    && proof.get("target_id").and_then(serde_json::Value::as_str)
+                        == Some(target.target_id.to_string().as_str())
+                    && proof.get("account_id").and_then(serde_json::Value::as_str)
+                        == Some(account_id.to_string().as_str())
+                    && proof
+                        .get("question_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected_question_hash.as_str())
+                    && proof.get("provider").and_then(serde_json::Value::as_str)
+                        == Some(provider.as_str())
+                    && proof.get("model").and_then(serde_json::Value::as_str)
+                        == Some(model.as_str())
+                    && proof.get("surface").and_then(serde_json::Value::as_str)
+                        == Some(surface.as_str())
+                    && proof.get("search_mode").and_then(serde_json::Value::as_str)
+                        == Some(search_mode.as_str())
+                    && proof
+                        .get("protocol_version")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(protocol_version.as_str())
+                    && proof
+                        .get("question_set_version")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(question_set_version.as_str())
+                    && proof.get("market").and_then(serde_json::Value::as_str)
+                        == Some(market.as_str())
+                    && proof.get("language").and_then(serde_json::Value::as_str)
+                        == Some(language.as_str())
+                    && proof.get("scheduled_at").and_then(|value| {
+                        serde_json::from_value::<DateTime<Utc>>(value.clone()).ok()
+                    }) == Some(*scheduled_at)
+                    && proof
+                        .get("sample_ordinal")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(*sample_ordinal as u64)
+                    && proof.get("provenance").and_then(serde_json::Value::as_str) == Some("live")
+                    && proof.get("disposition").and_then(serde_json::Value::as_str)
+                        == Some("observed")
+                    && matches!(
+                        proof
+                            .get("schema_version")
+                            .and_then(serde_json::Value::as_str),
+                        Some("geo.measure.official_search.v1" | "geo.measure.official_search.v2")
+                    )
+                    && proof
+                        .get("search_event")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|event| {
+                            event.get("kind").and_then(serde_json::Value::as_str)
+                                == Some("official_search_event")
+                                && event.get("provenance").and_then(serde_json::Value::as_str)
+                                    == Some("live")
+                                && matches!(
+                                    event.get("source").and_then(serde_json::Value::as_str),
+                                    Some("provider_search_event" | "provider_connect_stream")
+                                )
+                                && event
+                                    .get("occurred_at")
+                                    .or_else(|| event.get("observed_at"))
+                                    .and_then(|value| {
+                                        serde_json::from_value::<DateTime<Utc>>(value.clone()).ok()
+                                    })
+                                    .is_some_and(|at| {
+                                        at >= attempt.claimed_at && at <= outcome.occurred_at
+                                    })
+                        })
+                    && proof.get("raw_answer").and_then(serde_json::Value::as_str)
+                        == outcome.raw_answer.as_deref()
+                    && proof
+                        .get("connector_version")
+                        .and_then(serde_json::Value::as_str)
+                        == outcome.connector_version.as_deref()
+            })
+            .collect();
+        if valid_proofs.len() != 1 {
+            continue;
+        }
+        observations.push(OptimizationEligibleObservation {
+            target_id: target.target_id,
+            observation_id: attempt.attempt_id,
+            question: binding.reference,
+            protocol_comparison_key: target.input.comparison_key().unwrap_or_default(),
+        });
+    }
+    Ok(OptimizationEligibleProjection {
+        cycle_id: plan.cycle_id,
+        observations,
+    })
 }
 
 #[async_trait]
@@ -366,26 +568,29 @@ pub fn frozen_cycle_inputs(
                     evidence: refs,
                 })
             }
-            ChannelTargetInput::Measure { scheduled_at, .. } => {
-                measurements.push(ReportMeasurementTarget {
-                    target_id: target.target_id,
-                    comparison_key: target.input.comparison_key().unwrap_or_default(),
-                    scheduled_at: *scheduled_at,
-                    status: match outcome.map(|value| value.status) {
-                        Some(ChannelOutcomeStatus::Observed) => ReportMeasurementStatus::Observed,
-                        Some(ChannelOutcomeStatus::Refused) => ReportMeasurementStatus::Refused,
-                        Some(
-                            ChannelOutcomeStatus::Missing
-                            | ChannelOutcomeStatus::Unsupported
-                            | ChannelOutcomeStatus::LoginRequired,
-                        ) => ReportMeasurementStatus::Missing,
-                        _ if last.is_some() => ReportMeasurementStatus::Missing,
-                        _ => ReportMeasurementStatus::Pending,
-                    },
-                    missing_reason: outcome.and_then(|o| o.detail.clone()),
-                    evidence: refs,
-                })
-            }
+            ChannelTargetInput::Measure {
+                scheduled_at,
+                question_binding,
+                ..
+            } => measurements.push(ReportMeasurementTarget {
+                target_id: target.target_id,
+                comparison_key: target.input.comparison_key().unwrap_or_default(),
+                question_binding: question_binding.clone(),
+                scheduled_at: *scheduled_at,
+                status: match outcome.map(|value| value.status) {
+                    Some(ChannelOutcomeStatus::Observed) => ReportMeasurementStatus::Observed,
+                    Some(ChannelOutcomeStatus::Refused) => ReportMeasurementStatus::Refused,
+                    Some(
+                        ChannelOutcomeStatus::Missing
+                        | ChannelOutcomeStatus::Unsupported
+                        | ChannelOutcomeStatus::LoginRequired,
+                    ) => ReportMeasurementStatus::Missing,
+                    _ if last.is_some() => ReportMeasurementStatus::Missing,
+                    _ => ReportMeasurementStatus::Pending,
+                },
+                missing_reason: outcome.and_then(|o| o.detail.clone()),
+                evidence: refs,
+            }),
         }
     }
     let pub_count = publications.len() as u64;
@@ -876,7 +1081,198 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OperatorId, TenantId};
+    use crate::{OperatorId, QuestionReference, TenantId};
+
+    #[test]
+    fn legacy_measure_serialization_is_byte_stable_and_does_not_acquire_purpose() {
+        let old = r#"{"kind":"measure","account_id":"00000000-0000-0000-0000-000000000001","provider":"kimi","model":"fixed","surface":"consumer_web","search_mode":"web_search","protocol_version":"v1","question_set_version":"free-text-version","question":"Question?","market":"CN","language":"en","scheduled_at":"2026-09-25T00:00:00Z","sample_ordinal":0}"#;
+        let input: ChannelTargetInput = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&input).unwrap(), old);
+        assert_eq!(
+            input.comparison_key().as_deref(),
+            Some("kimi|fixed|consumer_web|web_search|v1|free-text-version|CN|en")
+        );
+        let mut changed = input.clone();
+        if let ChannelTargetInput::Measure {
+            question_binding, ..
+        } = &mut changed
+        {
+            *question_binding = Some(FrozenQuestionBinding {
+                reference: QuestionReference {
+                    question_set_id: Uuid::new_v4(),
+                    question_set_version_id: Uuid::new_v4(),
+                    question_id: Uuid::new_v4(),
+                    question_revision_id: Uuid::new_v4(),
+                },
+                purpose: QuestionPurpose::Optimization,
+                split_policy_version: "project_registry_nfkc_v1".into(),
+            });
+        }
+        assert_ne!(
+            serde_json::to_vec(&input).unwrap(),
+            serde_json::to_vec(&changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn optimizer_projection_excludes_heldout_unclassified_fixture_and_nested_canary() {
+        let now = Utc::now();
+        let cycle = Uuid::new_v4();
+        let version = Uuid::new_v4();
+        let make = |purpose: Option<QuestionPurpose>, question: &str| {
+            let target_id = Uuid::new_v4();
+            let binding = purpose.map(|purpose| FrozenQuestionBinding {
+                reference: QuestionReference {
+                    question_set_id: Uuid::new_v4(),
+                    question_set_version_id: version,
+                    question_id: Uuid::new_v4(),
+                    question_revision_id: Uuid::new_v4(),
+                },
+                purpose,
+                split_policy_version: "project_registry_nfkc_v1".into(),
+            });
+            ChannelTarget {
+                target_id,
+                input: ChannelTargetInput::Measure {
+                    account_id: Uuid::new_v4(),
+                    provider: "kimi".into(),
+                    model: "fixed".into(),
+                    surface: "consumer_web".into(),
+                    search_mode: "web_search".into(),
+                    protocol_version: "v1".into(),
+                    question_set_version: if binding.is_some() {
+                        version.to_string()
+                    } else {
+                        "legacy".into()
+                    },
+                    question: question.into(),
+                    market: "global".into(),
+                    language: "en".into(),
+                    scheduled_at: now,
+                    sample_ordinal: 0,
+                    question_binding: binding,
+                },
+            }
+        };
+        let targets = vec![
+            make(Some(QuestionPurpose::Optimization), "eligible"),
+            make(
+                Some(QuestionPurpose::FrozenEvaluation),
+                "HELDOUT_QUESTION_CANARY",
+            ),
+            make(None, "UNCLASSIFIED_QUESTION_CANARY"),
+            make(
+                Some(QuestionPurpose::Optimization),
+                "FIXTURE_QUESTION_CANARY",
+            ),
+            make(
+                Some(QuestionPurpose::Optimization),
+                "INVALID_EVIDENCE_CANARY",
+            ),
+        ];
+        let plan = ChannelPlan {
+            plan_id: Uuid::new_v4(),
+            project_id: ProjectId::new(Uuid::new_v4()),
+            cycle_id: cycle,
+            input_hash: "test".into(),
+            revision: 1,
+            created_at: now,
+            targets: targets.clone(),
+        };
+        let mut attempts = HashMap::new();
+        for (index, target) in targets.iter().enumerate() {
+            let ChannelTargetInput::Measure {
+                account_id,
+                provider,
+                model,
+                surface,
+                search_mode,
+                protocol_version,
+                question_set_version,
+                question,
+                market,
+                language,
+                scheduled_at,
+                sample_ordinal,
+                ..
+            } = &target.input
+            else {
+                unreachable!()
+            };
+            let mut proof = serde_json::json!({
+                "kind":"official_search_observation",
+                "schema_version":"geo.measure.official_search.v1",
+                "target_id":target.target_id,
+                "account_id":account_id,
+                "provider":provider,
+                "model":model,
+                "surface":surface,
+                "search_mode":search_mode,
+                "protocol_version":protocol_version,
+                "question_set_version":question_set_version,
+                "question_sha256":sha256_hex(question.as_bytes()),
+                "market":market,
+                "language":language,
+                "scheduled_at":scheduled_at,
+                "sample_ordinal":sample_ordinal,
+                "connector_version":"official_search_verified.v1",
+                "provenance":"live",
+                "disposition":"observed",
+                "raw_answer": if index == 1 { "HELDOUT_ANSWER_CANARY" } else { "observed answer" },
+                "search_event":{"kind":"official_search_event","provenance":"live","source":"provider_search_event","occurred_at":now},
+                "nested_canary":"HELDOUT_NESTED_EVIDENCE_CANARY"
+            });
+            if index == 4 {
+                proof["question_sha256"] = serde_json::json!("tampered");
+            }
+            attempts.insert(
+                target.target_id,
+                vec![ChannelAttempt {
+                    attempt_id: Uuid::new_v4(),
+                    target_id: target.target_id,
+                    claimed_at: now,
+                    outcome: Some(ChannelOutcome {
+                        status: ChannelOutcomeStatus::Observed,
+                        detail: Some("HELDOUT_DETAIL_CANARY".into()),
+                        occurred_at: now,
+                        raw_answer: Some(
+                            if index == 1 {
+                                "HELDOUT_ANSWER_CANARY"
+                            } else {
+                                "observed answer"
+                            }
+                            .into(),
+                        ),
+                        citations: vec!["HELDOUT_CITATION_CANARY".into()],
+                        public_url: None,
+                        screenshot_ref: Some("HELDOUT_SCREENSHOT_CANARY".into()),
+                        connector_version: Some("official_search_verified.v1".into()),
+                        runner_evidence: vec![proof],
+                        fixture: index == 3,
+                    }),
+                    received_at: Some(now),
+                }],
+            );
+        }
+        let scope = TenantScope::new(
+            OperatorId::new(Uuid::new_v4()),
+            TenantId::new(Uuid::new_v4()),
+            Some(plan.project_id),
+        );
+        let projected = optimization_eligible_projection(&scope, &plan, &attempts, now).unwrap();
+        let foreign = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        assert!(optimization_eligible_projection(&foreign, &plan, &attempts, now).is_err());
+        assert_eq!(projected.observations.len(), 1);
+        assert_eq!(projected.observations[0].target_id, targets[0].target_id);
+        let serialized = serde_json::to_string(&projected).unwrap();
+        for canary in ["HELDOUT", "CANARY", "observed answer", "eligible"] {
+            assert!(!serialized.contains(canary));
+        }
+    }
 
     #[tokio::test]
     async fn publication_binding_is_scoped_write_once_and_survives_outcome() {
@@ -944,6 +1340,7 @@ mod tests {
                             language: "en".into(),
                             scheduled_at: now,
                             sample_ordinal: 0,
+                            question_binding: None,
                         },
                     },
                 ],
@@ -1235,6 +1632,7 @@ mod tests {
             language: "en".into(),
             scheduled_at: now,
             sample_ordinal: ordinal,
+            question_binding: None,
         };
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
@@ -1523,6 +1921,7 @@ mod tests {
                         language: "en".into(),
                         scheduled_at: Utc::now(),
                         sample_ordinal: 0,
+                        question_binding: None,
                     },
                 }],
             },

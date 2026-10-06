@@ -536,6 +536,7 @@ describe("P14 immutable reports", () => {
         measurement_groups: [
           {
             comparison_key: "protocol-one",
+            purpose: "optimization",
             coverage: {
               availability: "available",
               expected_count: null,
@@ -546,6 +547,7 @@ describe("P14 immutable reports", () => {
           },
           {
             comparison_key: "protocol-two",
+            purpose: "frozen_evaluation",
             coverage: {
               availability: "available",
               expected_count: null,
@@ -565,8 +567,43 @@ describe("P14 immutable reports", () => {
     expect(within(groups).getByText("结果未知 1")).toBeInTheDocument();
     expect(within(groups).getByText("未提及 1")).toBeInTheDocument();
     expect(within(groups).getByText("缺测 1")).toBeInTheDocument();
+    expect(within(groups).getByText("问题用途：优化问题")).toBeInTheDocument();
+    expect(
+      within(groups).getByText("问题用途：冻结评估（不进入优化）"),
+    ).toBeInTheDocument();
     expect(within(groups).getAllByText("逐口径计划分母未提供")).toHaveLength(2);
     expect(screen.queryByText(/%/)).not.toBeInTheDocument();
+  });
+
+  it("marks historical groups without a purpose as unknown rather than optimization-eligible", async () => {
+    mockApi({
+      detail: {
+        ...snapshot,
+        measurement_groups: [
+          {
+            comparison_key: "legacy-measurement",
+            coverage: {
+              availability: "available",
+              expected_count: 2,
+              observed_count: 1,
+              counts: { missing: 1, pending: 1 },
+              reason: null,
+            },
+          },
+        ],
+      },
+    });
+    renderPage("/app/tenant-1/project-1/reports/report-1");
+    expect(await screen.findByText("legacy-measurement")).toBeInTheDocument();
+    expect(
+      screen.getByText("问题用途：旧数据未分类（不进入优化）"),
+    ).toBeInTheDocument();
+    const group = screen
+      .getByText("legacy-measurement")
+      .closest(".report-group");
+    expect(
+      within(group as HTMLElement).getByText("计划 2", { exact: false }),
+    ).toBeInTheDocument();
   });
 
   it("renders independent lookup findings without relabeling unknown publication or leaking private evidence to CSV", async () => {

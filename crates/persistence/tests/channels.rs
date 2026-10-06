@@ -372,6 +372,7 @@ async fn frozen_channel_plan_claim_finish_and_report_denominator_in_postgres() {
         language: "en".into(),
         scheduled_at: now,
         sample_ordinal: ordinal,
+        question_binding: None,
     };
     let plan = ChannelPlan {
         plan_id: Uuid::new_v4(),

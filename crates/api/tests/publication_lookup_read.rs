@@ -182,6 +182,7 @@ async fn lookup_http_enforces_auth_scope_target_kind_and_empty_contract() {
                             question: "Example question".into(),
                             scheduled_at: chrono::Utc::now(),
                             sample_ordinal: 1,
+                            question_binding: None,
                         },
                     },
                 ],

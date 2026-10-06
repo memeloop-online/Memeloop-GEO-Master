@@ -48,13 +48,16 @@ use geo_worker::{
     HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOps,
     HostRuntime, ManifestCoverage, ManifestItem, ManifestKind, ManifestPage, ManifestPlanningState,
     ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest, ReportGetRequest, ReportPreviewRequest, ReportReduceRequest,
-    TURN_COMPLETION_TOPIC, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder, WorkerError,
+    PublishReceipt, PublishRequest, QuestionDiscoverRequest, QuestionDiscoveryPage,
+    QuestionReviseRequest, QuestionWriteReceipt, ReportGetRequest, ReportPreviewRequest,
+    ReportReduceRequest, TURN_COMPLETION_TOPIC, ToolCallIdentity, ToolCallOutcome,
+    ToolCallRecorder, WorkerError,
 };
 use serde_json::{Value, json};
 
 use crate::channel_tools::ChannelToolService;
 use crate::provider_bridge::SharedModelProvider;
+use crate::questions_tools::QuestionToolService;
 use crate::{AppState, preview_cycle_report, reduce_cycle_report};
 
 /// The bundle and capabilities one production runtime is assembled from.
@@ -652,6 +655,7 @@ pub struct RepositoryHostOps {
     model_provider: Option<SharedModelProvider>,
     report_service: Option<Arc<dyn ReportService>>,
     channel_service: Option<Arc<dyn ChannelToolService>>,
+    question_service: Option<Arc<dyn QuestionToolService>>,
     content_state: Option<AppState>,
 }
 
@@ -752,6 +756,7 @@ impl RepositoryHostOps {
             model_provider: None,
             report_service: None,
             channel_service: None,
+            question_service: None,
             content_state: None,
         }
     }
@@ -773,7 +778,15 @@ impl RepositoryHostOps {
     /// Attaches project-scoped channel discovery, planning, frozen reads and
     /// one-shot target execution. The absent adapter fails explicitly.
     pub fn with_channels(mut self, state: AppState) -> Self {
+        self.question_service = Some(Arc::new(state.clone()));
         self.channel_service = Some(Arc::new(state));
+        self
+    }
+
+    /// Question tools share the project-scoped HTTP question services. Use
+    /// this when channels are not attached to this host.
+    pub fn with_questions(mut self, state: AppState) -> Self {
+        self.question_service = Some(Arc::new(state));
         self
     }
 
@@ -1172,6 +1185,78 @@ impl HostOps for RepositoryHostOps {
         result
             .validate_for(&request)
             .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn question_discover(
+        &self,
+        scope: &TenantScope,
+        request: QuestionDiscoverRequest,
+    ) -> Result<QuestionDiscoveryPage, HostOpError> {
+        let op = HostOp::QuestionDiscover;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.question_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(op, "question-set service is not configured")
+        })?;
+        let result = service
+            .discover(scope, request.clone())
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        result
+            .validate_for(&request)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn question_create(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::CreateQuestionSet,
+    ) -> Result<QuestionWriteReceipt, HostOpError> {
+        let op = HostOp::QuestionCreate;
+        geo_worker::host::validate_question_create(&request)
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.question_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(op, "question-set service is not configured")
+        })?;
+        let result = service
+            .create(scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        result
+            .validate()
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn question_revise(
+        &self,
+        scope: &TenantScope,
+        request: QuestionReviseRequest,
+    ) -> Result<QuestionWriteReceipt, HostOpError> {
+        let op = HostOp::QuestionRevise;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let requested_set_id = request.question_set_id;
+        let service = self.question_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(op, "question-set service is not configured")
+        })?;
+        let result = service
+            .revise(scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        result
+            .validate()
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        if result.question_set_id != requested_set_id {
+            return Err(HostOpError::internal(
+                op,
+                "question revision returned another set",
+            ));
+        }
         Ok(result)
     }
 

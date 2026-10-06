@@ -287,6 +287,7 @@ async fn run(case: Receipt) -> geo_domain::ChannelOutcome {
                     language: "en".into(),
                     scheduled_at,
                     sample_ordinal: 3,
+                    question_binding: None,
                 },
             }],
         },

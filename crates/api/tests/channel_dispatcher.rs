@@ -293,6 +293,7 @@ async fn plan_measure(
                         language: "en".into(),
                         scheduled_at,
                         sample_ordinal: 0,
+                        question_binding: None,
                     },
                 }],
             },

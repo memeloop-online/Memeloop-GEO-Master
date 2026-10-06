@@ -24,6 +24,8 @@ pub use pdf_parse::{
 mod provider_bridge;
 mod publication_lookup;
 pub use publication_lookup::dispatch_publication_lookup;
+mod questions;
+mod questions_tools;
 mod reports;
 mod run_executor;
 pub use run_executor::dispatch_queued;
@@ -115,6 +117,7 @@ pub struct AppState {
     auth_repository: SharedAuthRepository,
     project_repository: Arc<dyn ProjectRepository>,
     knowledge_repository: Arc<dyn KnowledgeRepository>,
+    question_repository: Arc<dyn geo_domain::QuestionRepository>,
     report_repository: Arc<dyn ReportRepository>,
     connector_capability_repository: Arc<dyn ConnectorCapabilityRepository>,
     channel_service: ChannelService,
@@ -150,6 +153,7 @@ impl AppState {
             auth_repository: Arc::new(MemoryAuthRepository::development_with_password(password)),
             project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
             knowledge_repository: Arc::new(MemoryKnowledgeRepository::default()),
+            question_repository: Arc::new(geo_domain::MemoryQuestionRepository::default()),
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
             connector_capability_repository: Arc::new(
                 MemoryConnectorCapabilityRepository::default(),
@@ -247,6 +251,7 @@ impl AppState {
             auth_repository,
             project_repository,
             knowledge_repository,
+            question_repository: Arc::new(geo_domain::MemoryQuestionRepository::default()),
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
             connector_capability_repository: Arc::new(
                 MemoryConnectorCapabilityRepository::default(),
@@ -302,6 +307,9 @@ impl AppState {
             database,
         )))
         .with_report_repository(Arc::new(PgReportRepository::from_database(database)))
+        .with_question_repository(Arc::new(
+            geo_persistence::PgQuestionRepository::from_database(database),
+        ))
         .with_connector_capability_repository(Arc::new(
             geo_persistence::PgConnectorCapabilityRepository::from_database(database),
         ))
@@ -369,6 +377,18 @@ impl AppState {
 
     pub fn knowledge_repository(&self) -> Arc<dyn KnowledgeRepository> {
         Arc::clone(&self.knowledge_repository)
+    }
+
+    pub fn question_repository(&self) -> Arc<dyn geo_domain::QuestionRepository> {
+        Arc::clone(&self.question_repository)
+    }
+
+    pub fn with_question_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::QuestionRepository>,
+    ) -> Self {
+        self.question_repository = repository;
+        self
     }
 
     pub fn report_repository(&self) -> Arc<dyn ReportRepository> {
@@ -1965,6 +1985,24 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(auth_scope_from_request));
 
+    // Question versions and idempotency are committed together by the scoped
+    // repository, rather than the generic HTTP response cache.
+    let question_routes: Router<AppState> = Router::new()
+        .route(
+            "/projects/{project_id}/question-sets",
+            get(questions::list_question_sets).post(questions::create_question_set),
+        )
+        .route(
+            "/projects/{project_id}/question-sets/{set_id}/versions",
+            get(questions::list_question_set_versions).post(questions::revise_question_set),
+        )
+        .route(
+            "/projects/{project_id}/question-sets/{set_id}/versions/{version_id}",
+            get(questions::get_question_set_version),
+        )
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
     // Login actions can contain transient credentials. Never put these
     // requests through the generic idempotency cache.
     let channel_routes = channels::customer_routes()
@@ -2103,6 +2141,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(estimate_routes)
                 .merge(start_routes)
                 .merge(report_routes)
+                .merge(question_routes)
                 .merge(channel_routes)
                 .merge(content_routes)
                 .merge(operator_channel_routes)

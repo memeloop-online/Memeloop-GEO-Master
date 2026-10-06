@@ -63,6 +63,33 @@ const frozenPlan: ChannelPlan = {
   created_at: "2026-10-01T00:00:00Z",
   targets: [target],
 };
+const boundVersion = {
+  id: "set-version-1",
+  question_set_id: "set-1",
+  revision: 1,
+  parent_version_id: null,
+  name: "计划问题",
+  optimization_count: 0,
+  evaluation_count: 1,
+  split_policy_version: "project_registry_nfkc_v1",
+  content_hash: "hash",
+  created_at: "2026-10-01T00:00:00Z",
+  questions: [
+    {
+      id: "revision-1",
+      question_id: "question-1",
+      text: "如何选择？",
+      intent: "selection",
+      product_refs: [],
+      market: "CN",
+      language: "zh-CN",
+      source: { kind: "user_provided" },
+      weight: 1,
+      purpose: "frozen_evaluation",
+      split_policy_version: "project_registry_nfkc_v1",
+    },
+  ],
+};
 
 function response(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -81,6 +108,8 @@ function mockApi({
   currentCycleId = cycleId,
   measurementSupported = true,
   planConflict = false,
+  questionSets = [],
+  questionVersion = null,
 }: {
   accounts?: unknown[];
   sources?: unknown[];
@@ -91,6 +120,8 @@ function mockApi({
   currentCycleId?: string | null;
   measurementSupported?: boolean;
   planConflict?: boolean;
+  questionSets?: unknown[];
+  questionVersion?: unknown;
 } = {}) {
   let plan = initialPlan;
   let detail: ChannelTargetView = { target, attempts: [] };
@@ -133,6 +164,31 @@ function mockApi({
             csrf_token: "csrf-test",
           }),
         );
+      if (path.endsWith("/projects/project-1/question-sets"))
+        return Promise.resolve(
+          response({ items: questionSets, next_cursor: null }),
+        );
+      if (path.endsWith("/question-sets/set-1/versions"))
+        return Promise.resolve(
+          response({
+            items: questionVersion
+              ? [
+                  {
+                    id: "set-version-1",
+                    question_set_id: "set-1",
+                    revision: 1,
+                    name: "计划问题",
+                    question_count: 1,
+                    optimization_count: 0,
+                    evaluation_count: 1,
+                  },
+                ]
+              : [],
+            next_cursor: null,
+          }),
+        );
+      if (path.endsWith("/question-sets/set-1/versions/set-version-1"))
+        return Promise.resolve(response(questionVersion));
       if (path.endsWith("/projects/project-1/cycles/current"))
         return Promise.resolve(
           currentCycleId
@@ -307,6 +363,134 @@ afterEach(() => {
 });
 
 describe("P12 channel jobs", () => {
+  it("labels frozen bound samples by purpose and absent historical bindings as unclassified", async () => {
+    const input = {
+      kind: "measure" as const,
+      account_id: "measure-account-1",
+      provider: "kimi",
+      model: "visible-model",
+      surface: "consumer_web",
+      search_mode: "web_search",
+      protocol_version: "v1",
+      question_set_version: "set-version-1",
+      question: "如何选择？",
+      market: "CN",
+      language: "zh-CN",
+      scheduled_at: "2026-10-06T04:30:00Z",
+      sample_ordinal: 0,
+    };
+    const bound: ChannelPlan = {
+      ...frozenPlan,
+      targets: [
+        {
+          target_id: "target-1",
+          input: {
+            ...input,
+            question_binding: {
+              reference: {
+                question_set_id: "set-1",
+                question_set_version_id: "set-version-1",
+                question_id: "question-1",
+                question_revision_id: "revision-1",
+              },
+              purpose: "frozen_evaluation",
+              split_policy_version: "project_registry_nfkc_v1",
+            },
+          },
+        },
+      ],
+    };
+    mockApi({ plan: bound });
+    const { unmount } = renderPage();
+    expect(
+      await screen.findByText(/用途 冻结评估（不进入优化）/),
+    ).toBeInTheDocument();
+    unmount();
+    mockApi({
+      plan: {
+        ...frozenPlan,
+        targets: [{ target_id: "target-1", input }],
+      },
+    });
+    renderPage();
+    expect(
+      await screen.findByText(/用途 旧数据未分类（不进入优化）/),
+    ).toBeInTheDocument();
+  });
+
+  it("freezes a bound version member by reference only, without text or caller-controlled purpose", async () => {
+    const requests = mockApi({
+      accounts: [measurementAccount],
+      sources: [],
+      questionSets: [
+        {
+          id: "set-1",
+          name: "计划问题",
+          current_version_id: "set-version-1",
+          current_revision: 1,
+          question_count: 1,
+          optimization_count: 0,
+          evaluation_count: 1,
+        },
+      ],
+      questionVersion: boundVersion,
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await user.selectOptions(
+      await screen.findByLabelText("绑定问题集"),
+      "set-1",
+    );
+    await user.selectOptions(
+      await screen.findByLabelText("绑定不可变版本"),
+      "set-version-1",
+    );
+    await user.selectOptions(
+      await screen.findByLabelText("绑定问题"),
+      "question-1",
+    );
+    expect(screen.getByText(/已选用途：冻结评估/)).toBeInTheDocument();
+    await user.selectOptions(
+      screen.getByLabelText("项目 Kimi 测量账号"),
+      "measure-account-1",
+    );
+    await user.type(screen.getByLabelText("可见模型标识"), "visible-model");
+    await user.type(screen.getByLabelText("采样协议版本"), "web-v1");
+    await user.type(
+      screen.getByLabelText("计划采样时间（本地时间）"),
+      "2026-10-06T12:30",
+    );
+    await user.click(screen.getByRole("button", { name: "加入测量目标" }));
+    await user.click(screen.getByRole("button", { name: "封存本轮计划" }));
+    const body = requests.find(
+      (item) =>
+        item.method === "POST" &&
+        item.path.endsWith("/cycles/cycle-1/channel-plan"),
+    )?.body;
+    expect(body).toEqual({
+      publications: [],
+      measurements: [],
+      bound_measurements: [
+        {
+          account_id: "measure-account-1",
+          provider: "kimi",
+          model: "visible-model",
+          surface: "consumer_web",
+          search_mode: "web_search",
+          protocol_version: "web-v1",
+          question: {
+            question_set_id: "set-1",
+            question_set_version_id: "set-version-1",
+            question_id: "question-1",
+            question_revision_id: "revision-1",
+          },
+          scheduled_at: new Date("2026-10-06T12:30").toISOString(),
+          sample_ordinal: 0,
+        },
+      ],
+    });
+  });
+
   it("builds a cycle-scoped sealed plan from a public source version and assigned account", async () => {
     const requests = mockApi();
     const user = userEvent.setup();
@@ -340,6 +524,7 @@ describe("P12 channel jobs", () => {
         },
       ],
       measurements: [],
+      bound_measurements: [],
     });
     expect(request?.url.searchParams.get("tenant_id")).toBe("tenant-1");
     expect(request?.url.searchParams.get("project_id")).toBe("project-1");
@@ -406,15 +591,22 @@ describe("P12 channel jobs", () => {
     const user = userEvent.setup();
     renderPage();
     await user.selectOptions(
+      await screen.findByLabelText("测量问题模式"),
+      "legacy",
+    );
+    await user.selectOptions(
       await screen.findByLabelText("项目 Kimi 测量账号"),
       "measure-account-1",
     );
     await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
     await user.type(screen.getByLabelText("采样协议版本"), "protocol-v1");
-    await user.type(screen.getByLabelText("问题集版本"), "evaluation-v2");
+    await user.type(screen.getByLabelText("临时问题集标签"), "evaluation-v2");
     await user.type(screen.getByLabelText("市场"), "CN");
     await user.type(screen.getByLabelText("语言"), "zh-CN");
-    await user.type(screen.getByLabelText("冻结评估问题"), "这是什么产品？");
+    await user.type(
+      screen.getByLabelText("临时问题（未分类）"),
+      "这是什么产品？",
+    );
     await user.clear(screen.getByLabelText("样本序号（0–10000）"));
     await user.type(screen.getByLabelText("样本序号（0–10000）"), "3");
     await user.type(
@@ -449,6 +641,7 @@ describe("P12 channel jobs", () => {
           sample_ordinal: 3,
         },
       ],
+      bound_measurements: [],
     });
     expect(screen.queryByText(/已观察/)).not.toBeInTheDocument();
   });
@@ -470,7 +663,8 @@ describe("P12 channel jobs", () => {
         { name: /项目账号/ },
       ),
     ).not.toBeInTheDocument();
-    await user.type(screen.getByLabelText("冻结评估问题"), "问题");
+    await user.selectOptions(screen.getByLabelText("测量问题模式"), "legacy");
+    await user.type(screen.getByLabelText("临时问题（未分类）"), "问题");
     expect(screen.getByRole("button", { name: "加入测量目标" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "封存本轮计划" })).toBeDisabled();
     expect(requests.filter((item) => item.method === "POST")).toHaveLength(0);
@@ -481,15 +675,19 @@ describe("P12 channel jobs", () => {
     const user = userEvent.setup();
     renderPage();
     await user.selectOptions(
+      await screen.findByLabelText("测量问题模式"),
+      "legacy",
+    );
+    await user.selectOptions(
       await screen.findByLabelText("项目 Kimi 测量账号"),
       "measure-account-1",
     );
     await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
     await user.type(screen.getByLabelText("采样协议版本"), "v1");
-    await user.type(screen.getByLabelText("问题集版本"), "q1");
+    await user.type(screen.getByLabelText("临时问题集标签"), "q1");
     await user.type(screen.getByLabelText("市场"), "CN");
     await user.type(screen.getByLabelText("语言"), "zh-CN");
-    await user.type(screen.getByLabelText("冻结评估问题"), "问题");
+    await user.type(screen.getByLabelText("临时问题（未分类）"), "问题");
     await user.clear(screen.getByLabelText("样本序号（0–10000）"));
     await user.type(screen.getByLabelText("样本序号（0–10000）"), "10001");
     expect(screen.getByRole("button", { name: "加入测量目标" })).toBeDisabled();
@@ -521,15 +719,19 @@ describe("P12 channel jobs", () => {
     const user = userEvent.setup();
     renderPage();
     await user.selectOptions(
+      await screen.findByLabelText("测量问题模式"),
+      "legacy",
+    );
+    await user.selectOptions(
       await screen.findByLabelText("项目 Kimi 测量账号"),
       "measure-account-1",
     );
     await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
     await user.type(screen.getByLabelText("采样协议版本"), "v1");
-    await user.type(screen.getByLabelText("问题集版本"), "q1");
+    await user.type(screen.getByLabelText("临时问题集标签"), "q1");
     await user.type(screen.getByLabelText("市场"), "CN");
     await user.type(screen.getByLabelText("语言"), "zh-CN");
-    await user.type(screen.getByLabelText("冻结评估问题"), "问题");
+    await user.type(screen.getByLabelText("临时问题（未分类）"), "问题");
     await user.type(
       screen.getByLabelText("计划采样时间（本地时间）"),
       "2026-10-06T12:30",

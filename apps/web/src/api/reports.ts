@@ -46,6 +46,8 @@ export interface PublicationGroup {
 export interface MeasurementGroup {
   /** Opaque frozen comparison key; never combine unrelated groups. */
   comparison_key: string;
+  /** Historical snapshots omit purpose; absence must not imply optimization. */
+  purpose?: "optimization" | "frozen_evaluation" | null;
   coverage: ReportCoverage;
 }
 

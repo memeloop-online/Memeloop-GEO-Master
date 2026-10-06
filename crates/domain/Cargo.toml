@@ -19,5 +19,6 @@ sha2.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 utoipa.workspace = true
+unicode-normalization.workspace = true
 url.workspace = true
 uuid.workspace = true

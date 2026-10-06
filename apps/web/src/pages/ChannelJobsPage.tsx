@@ -26,8 +26,14 @@ import {
   type ChannelTarget,
   type ChannelTargetView,
   type MeasurementRequest,
+  type BoundMeasurementRequest,
   type PublicationRequest,
 } from "../api/channelJobs";
+import {
+  getQuestionSetVersion,
+  listAllQuestionSets,
+  listAllQuestionSetVersions,
+} from "../api/questions";
 import { useChannelData } from "../api/channels";
 import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
@@ -98,6 +104,14 @@ function TargetCard({
   executeError: unknown;
 }) {
   const input = target.input;
+  const classification =
+    input.kind === "measure"
+      ? input.question_binding?.purpose === "optimization"
+        ? "优化问题"
+        : input.question_binding?.purpose === "frozen_evaluation"
+          ? "冻结评估（不进入优化）"
+          : "旧数据未分类（不进入优化）"
+      : null;
   const status = resultStatus(view);
   const attempted = Boolean(view?.attempts.length);
   return (
@@ -129,6 +143,7 @@ function TargetCard({
           {" · "}
           {input.market} / {input.language} · 样本 {input.sample_ordinal}
           {" · "}排期 {dateTime(input.scheduled_at)}
+          {" · "}用途 {classification}
         </p>
       )}
       {loading && <Spinner label="正在读取执行记录" size="tiny" />}
@@ -368,6 +383,59 @@ export function ChannelJobsPage() {
   const [measurementDraft, setMeasurementDraft] = useState<
     MeasurementRequest[]
   >([]);
+  const [boundDraft, setBoundDraft] = useState<BoundMeasurementRequest[]>([]);
+  const [measurementMode, setMeasurementMode] = useState<"bound" | "legacy">(
+    "bound",
+  );
+  const [questionSetId, setQuestionSetId] = useState("");
+  const [boundVersionId, setBoundVersionId] = useState("");
+  const [boundQuestionId, setBoundQuestionId] = useState("");
+  const questionSets = useQuery({
+    queryKey: [
+      "question-sets",
+      scope?.userId,
+      scope?.operatorId,
+      tenantId,
+      projectId,
+    ],
+    queryFn: () => listAllQuestionSets(tenantId!, projectId!),
+    enabled: Boolean(scope && cycleId && !plan.data),
+    retry: false,
+  });
+  const questionVersions = useQuery({
+    queryKey: [
+      "question-versions",
+      scope?.userId,
+      scope?.operatorId,
+      tenantId,
+      projectId,
+      questionSetId,
+    ],
+    queryFn: () =>
+      listAllQuestionSetVersions(tenantId!, projectId!, questionSetId),
+    enabled: Boolean(scope && questionSetId && !plan.data),
+    retry: false,
+  });
+  const boundVersion = useQuery({
+    queryKey: [
+      "question-version",
+      scope?.userId,
+      scope?.operatorId,
+      tenantId,
+      projectId,
+      questionSetId,
+      boundVersionId,
+    ],
+    queryFn: () =>
+      getQuestionSetVersion(
+        tenantId!,
+        projectId!,
+        questionSetId,
+        boundVersionId,
+      ),
+    enabled: Boolean(scope && questionSetId && boundVersionId && !plan.data),
+    retry: false,
+  });
   const [measurementAccountId, setMeasurementAccountId] = useState("");
   const [model, setModel] = useState("");
   const [protocolVersion, setProtocolVersion] = useState("");
@@ -424,19 +492,24 @@ export function ChannelJobsPage() {
     Boolean(selectedMeasurementAccount) &&
     validText(model, 100) &&
     validText(protocolVersion, 100) &&
-    validText(questionSetVersion, 100) &&
-    validText(question, 4000) &&
-    validText(market, 100) &&
-    validText(language, 100) &&
+    (measurementMode === "bound" ||
+      (validText(questionSetVersion, 100) &&
+        validText(question, 4000) &&
+        validText(market, 100) &&
+        validText(language, 100))) &&
     Boolean(scheduledDate && !Number.isNaN(scheduledDate.getTime())) &&
     /^(0|[1-9]\d*)$/.test(sampleOrdinal) &&
     Number(sampleOrdinal) <= 10000;
+  const selectedBoundQuestion = boundVersion.data?.questions.find(
+    (entry) => entry.question_id === boundQuestionId,
+  );
   useEffect(() => {
     setVersionId(sourceDetail.data?.source.current_version_id ?? "");
   }, [sourceDetail.data, sourceId]);
   useEffect(() => {
     setDraft([]);
     setMeasurementDraft([]);
+    setBoundDraft([]);
     setSourceId("");
     setAccountId("");
     setMeasurementAccountId("");
@@ -446,6 +519,7 @@ export function ChannelJobsPage() {
       submitChannelPlan(tenantId!, projectId!, cycleId!, {
         publications: draft,
         measurements: measurementDraft,
+        bound_measurements: boundDraft,
       }),
     onSuccess: (saved) => client.setQueryData(planKey, saved),
     onError: () => void client.invalidateQueries({ queryKey: planKey }),
@@ -471,6 +545,32 @@ export function ChannelJobsPage() {
   const addMeasurement = () => {
     if (!validMeasurement || !selectedMeasurementAccount || !scheduledDate)
       return;
+    if (measurementMode === "bound") {
+      if (!questionSetId || !boundVersionId || !selectedBoundQuestion) return;
+      const item: BoundMeasurementRequest = {
+        account_id: selectedMeasurementAccount.account_id,
+        provider: "kimi",
+        model: model.trim(),
+        surface: "consumer_web",
+        search_mode: "web_search",
+        protocol_version: protocolVersion.trim(),
+        question: {
+          question_set_id: questionSetId,
+          question_set_version_id: boundVersionId,
+          question_id: selectedBoundQuestion.question_id,
+          question_revision_id: selectedBoundQuestion.id,
+        },
+        scheduled_at: scheduledDate.toISOString(),
+        sample_ordinal: Number(sampleOrdinal),
+      };
+      if (
+        !boundDraft.some(
+          (other) => JSON.stringify(other) === JSON.stringify(item),
+        )
+      )
+        setBoundDraft((items) => [...items, item]);
+      return;
+    }
     const item: MeasurementRequest = {
       account_id: selectedMeasurementAccount.account_id,
       provider: "kimi",
@@ -508,7 +608,15 @@ export function ChannelJobsPage() {
             都不代表已发布；只有公开读回验证才标为已验证。
           </p>
         </div>
-        <Link to={`/app/${tenantId}/${projectId}/channels`}>管理渠道账号</Link>
+        <div>
+          <Link to={`/app/${tenantId}/${projectId}/channels`}>
+            管理渠道账号
+          </Link>
+          {" · "}
+          <Link to={`/app/${tenantId}/${projectId}/measurement`}>
+            管理问题集
+          </Link>
+        </div>
       </section>
       {currentCycle.isPending ? (
         <LoadingState label="正在读取当前项目周期" />
@@ -600,6 +708,142 @@ export function ChannelJobsPage() {
                         尚无分配给项目的可用发布账号。请先接入或分配账号。
                       </p>
                     )}
+                  <Field label="测量问题模式">
+                    <Select
+                      value={measurementMode}
+                      onChange={(_, data) =>
+                        setMeasurementMode(data.value as "bound" | "legacy")
+                      }
+                    >
+                      <option value="bound">
+                        绑定已保存的问题集版本（推荐）
+                      </option>
+                      <option value="legacy">
+                        临时自由文本 · 未分类，不进入优化
+                      </option>
+                    </Select>
+                  </Field>
+                  {measurementMode === "bound" && (
+                    <>
+                      {questionSets.isPending && (
+                        <LoadingState label="正在读取问题集" compact />
+                      )}
+                      {questionSets.isError && (
+                        <ErrorState
+                          title="问题集无法读取"
+                          detail={errorText(questionSets.error)}
+                          onRetry={() => void questionSets.refetch()}
+                        />
+                      )}
+                      {!questionSets.isPending &&
+                        !questionSets.isError &&
+                        !questionSets.data?.items.length && (
+                          <p role="status">
+                            没有可绑定的问题集。请先在{" "}
+                            <Link
+                              to={`/app/${tenantId}/${projectId}/measurement`}
+                            >
+                              P13 问题集
+                            </Link>
+                            创建版本。
+                          </p>
+                        )}
+                      <div className="channel-jobs-form">
+                        <Field label="绑定问题集">
+                          <Select
+                            value={questionSetId}
+                            onChange={(_, data) => {
+                              setQuestionSetId(data.value);
+                              setBoundVersionId("");
+                              setBoundQuestionId("");
+                            }}
+                          >
+                            <option value="">选择问题集</option>
+                            {questionSets.data?.items.map((set) => (
+                              <option value={set.id} key={set.id}>
+                                {set.name} · 优化 {set.optimization_count} /
+                                冻结评估 {set.evaluation_count}
+                              </option>
+                            ))}
+                          </Select>
+                        </Field>
+                        <Field label="绑定不可变版本">
+                          <Select
+                            value={boundVersionId}
+                            disabled={
+                              !questionSetId ||
+                              questionVersions.isPending ||
+                              questionVersions.isError
+                            }
+                            onChange={(_, data) => {
+                              setBoundVersionId(data.value);
+                              setBoundQuestionId("");
+                            }}
+                          >
+                            <option value="">选择版本</option>
+                            {questionVersions.data?.items.map((item) => (
+                              <option key={item.id} value={item.id}>
+                                v{item.revision} · 优化{" "}
+                                {item.optimization_count} / 冻结评估{" "}
+                                {item.evaluation_count}
+                              </option>
+                            ))}
+                          </Select>
+                        </Field>
+                        <Field label="绑定问题">
+                          <Select
+                            value={boundQuestionId}
+                            disabled={
+                              !boundVersionId ||
+                              boundVersion.isPending ||
+                              boundVersion.isError
+                            }
+                            onChange={(_, data) =>
+                              setBoundQuestionId(data.value)
+                            }
+                          >
+                            <option value="">选择问题</option>
+                            {boundVersion.data?.questions.map((item) => (
+                              <option value={item.question_id} key={item.id}>
+                                {item.text} ·{" "}
+                                {item.purpose === "optimization"
+                                  ? "优化"
+                                  : "冻结评估"}
+                              </option>
+                            ))}
+                          </Select>
+                        </Field>
+                      </div>
+                      {questionVersions.isError && (
+                        <ErrorState
+                          title="问题版本无法读取"
+                          detail={errorText(questionVersions.error)}
+                          onRetry={() => void questionVersions.refetch()}
+                        />
+                      )}
+                      {boundVersion.isError && (
+                        <ErrorState
+                          title="绑定问题无法读取"
+                          detail={errorText(boundVersion.error)}
+                          onRetry={() => void boundVersion.refetch()}
+                        />
+                      )}
+                      {selectedBoundQuestion && (
+                        <p role="status">
+                          已选用途：
+                          {selectedBoundQuestion.purpose === "optimization"
+                            ? "优化问题"
+                            : "冻结评估，不进入优化"}
+                          。问题文本、市场及语言以服务端不可变修订为准。
+                        </p>
+                      )}
+                    </>
+                  )}
+                  {measurementMode === "legacy" && (
+                    <p role="status">
+                      临时自由文本永久未分类，不进入优化；即使填写与真实版本相同的标签也不会成为绑定问题。
+                    </p>
+                  )}
                   <div className="channel-jobs-form">
                     <Field label="公开 TXT/Markdown 来源">
                       <Select
@@ -766,29 +1010,33 @@ export function ChannelJobsPage() {
                         maxLength={100}
                       />
                     </Field>
-                    <Field label="问题集版本">
-                      <Input
-                        value={questionSetVersion}
-                        onChange={(_, data) =>
-                          setQuestionSetVersion(data.value)
-                        }
-                        maxLength={100}
-                      />
-                    </Field>
-                    <Field label="市场">
-                      <Input
-                        value={market}
-                        onChange={(_, data) => setMarket(data.value)}
-                        maxLength={100}
-                      />
-                    </Field>
-                    <Field label="语言">
-                      <Input
-                        value={language}
-                        onChange={(_, data) => setLanguage(data.value)}
-                        maxLength={100}
-                      />
-                    </Field>
+                    {measurementMode === "legacy" && (
+                      <>
+                        <Field label="临时问题集标签">
+                          <Input
+                            value={questionSetVersion}
+                            onChange={(_, data) =>
+                              setQuestionSetVersion(data.value)
+                            }
+                            maxLength={100}
+                          />
+                        </Field>
+                        <Field label="市场">
+                          <Input
+                            value={market}
+                            onChange={(_, data) => setMarket(data.value)}
+                            maxLength={100}
+                          />
+                        </Field>
+                        <Field label="语言">
+                          <Input
+                            value={language}
+                            onChange={(_, data) => setLanguage(data.value)}
+                            maxLength={100}
+                          />
+                        </Field>
+                      </>
+                    )}
                     <Field label="计划采样时间（本地时间）">
                       <Input
                         type="datetime-local"
@@ -806,18 +1054,25 @@ export function ChannelJobsPage() {
                         onChange={(_, data) => setSampleOrdinal(data.value)}
                       />
                     </Field>
-                    <Field label="冻结评估问题">
-                      <Textarea
-                        value={question}
-                        onChange={(_, data) => setQuestion(data.value)}
-                        maxLength={4000}
-                      />
-                    </Field>
+                    {measurementMode === "legacy" && (
+                      <Field label="临时问题（未分类）">
+                        <Textarea
+                          value={question}
+                          onChange={(_, data) => setQuestion(data.value)}
+                          maxLength={4000}
+                        />
+                      </Field>
+                    )}
                     <Button
                       onClick={addMeasurement}
                       disabled={
                         !validMeasurement ||
-                        draft.length + measurementDraft.length >= 100
+                        (measurementMode === "bound" &&
+                          !selectedBoundQuestion) ||
+                        draft.length +
+                          measurementDraft.length +
+                          boundDraft.length >=
+                          100
                       }
                     >
                       加入测量目标
@@ -825,17 +1080,20 @@ export function ChannelJobsPage() {
                   </div>
                   <p>
                     固定协议：Kimi · consumer_web ·
-                    web_search。问题及其答案仅用于独立评估，不进入内容优化输入。
+                    web_search。绑定问题的用途由服务端确定；
+                    冻结评估题及逐题答案不进入优化，临时未分类问题也不进入优化。
                   </p>
-                  <h3>待封存测量（{measurementDraft.length}）</h3>
-                  {measurementDraft.length ? (
+                  <h3>
+                    待封存测量（{measurementDraft.length + boundDraft.length}）
+                  </h3>
+                  {measurementDraft.length || boundDraft.length ? (
                     <ul className="channel-jobs-draft">
                       {measurementDraft.map((item, index) => (
                         <li
                           key={`${item.account_id}-${item.question_set_version}-${item.sample_ordinal}-${index}`}
                         >
                           {item.question} · {item.model} /{" "}
-                          {item.protocol_version}
+                          {item.protocol_version} · 未分类，不进入优化
                           {" · "}
                           {item.market} / {item.language}
                           {" · "}样本 {item.sample_ordinal} ·{" "}
@@ -852,6 +1110,28 @@ export function ChannelJobsPage() {
                           </Button>
                         </li>
                       ))}
+                      {boundDraft.map((item, index) => (
+                        <li
+                          key={`${item.question.question_revision_id}-${item.sample_ordinal}-${index}`}
+                        >
+                          {item.question.question_set_version_id} /{" "}
+                          {item.question.question_id}
+                          {" · "}绑定问题，服务端决定用途 · {item.model} /{" "}
+                          {item.protocol_version}
+                          {" · "}样本 {item.sample_ordinal} ·{" "}
+                          {dateTime(item.scheduled_at)}
+                          <Button
+                            appearance="subtle"
+                            onClick={() =>
+                              setBoundDraft((items) =>
+                                items.filter((_, i) => i !== index),
+                              )
+                            }
+                          >
+                            移除测量
+                          </Button>
+                        </li>
+                      ))}
                     </ul>
                   ) : (
                     <p>还没有测量目标。</p>
@@ -859,8 +1139,13 @@ export function ChannelJobsPage() {
                   <Button
                     appearance="primary"
                     disabled={
-                      (!draft.length && !measurementDraft.length) ||
-                      draft.length + measurementDraft.length > 100 ||
+                      (!draft.length &&
+                        !measurementDraft.length &&
+                        !boundDraft.length) ||
+                      draft.length +
+                        measurementDraft.length +
+                        boundDraft.length >
+                        100 ||
                       submission.isPending
                     }
                     onClick={() => submission.mutate()}

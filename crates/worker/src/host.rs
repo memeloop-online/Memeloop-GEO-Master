@@ -33,6 +33,7 @@ use geo_domain::{
     DistributionTargetStatus, ImportStatus, KnowledgePurpose, PublicationLookupFinding,
     ReportPreview, ReportPreviewKind, ReportSnapshot,
 };
+pub use geo_domain::{CreateQuestionSet, QuestionReference, ReviseQuestionSet};
 pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
 pub use geo_domain::{ToolCallIdentity, ToolCallOutcome};
 
@@ -104,6 +105,26 @@ fn validate_recorded_return(
             let requested: ChannelPlanRequest = typed(op, request)?;
             let receipt: ChannelPlanReceipt = typed(op, result)?;
             receipt.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::QuestionDiscover => {
+            let requested: QuestionDiscoverRequest = typed(op, request)?;
+            let page: QuestionDiscoveryPage = typed(op, result)?;
+            page.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::QuestionCreate => {
+            let receipt: QuestionWriteReceipt = typed(op, result)?;
+            receipt.validate().map_err(invalid)?;
+        }
+        HostOp::QuestionRevise => {
+            let requested: QuestionReviseRequest = typed(op, request)?;
+            let receipt: QuestionWriteReceipt = typed(op, result)?;
+            receipt.validate().map_err(invalid)?;
+            if receipt.question_set_id != requested.question_set_id {
+                return Err(HostOpError::internal(
+                    op,
+                    "question revision returned another set",
+                ));
+            }
         }
         HostOp::ChannelManifestRead => {
             let requested: ChannelManifestReadRequest = typed(op, request)?;
@@ -227,7 +248,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v9";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v10";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -279,6 +300,9 @@ pub enum HostOp {
     ReportReduce,
     ChannelDiscover,
     ChannelPlan,
+    QuestionDiscover,
+    QuestionCreate,
+    QuestionRevise,
     ChannelManifestRead,
     ChannelTargetExecute,
     ContentItemsRead,
@@ -297,7 +321,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 26;
+    pub const COUNT: usize = 29;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -313,6 +337,9 @@ impl HostOp {
         Self::ReportReduce,
         Self::ChannelDiscover,
         Self::ChannelPlan,
+        Self::QuestionDiscover,
+        Self::QuestionCreate,
+        Self::QuestionRevise,
         Self::ChannelManifestRead,
         Self::ChannelTargetExecute,
         Self::ContentItemsRead,
@@ -344,6 +371,9 @@ impl HostOp {
             Self::ReportReduce => "report.reduce.v1",
             Self::ChannelDiscover => "channel.discover.v1",
             Self::ChannelPlan => "channel.plan.v1",
+            Self::QuestionDiscover => "question.discover.v1",
+            Self::QuestionCreate => "question.create.v1",
+            Self::QuestionRevise => "question.revise.v1",
             Self::ChannelManifestRead => "channel.manifest.read.v1",
             Self::ChannelTargetExecute => "channel.target.execute.v1",
             Self::ContentItemsRead => "content.items.read.v1",
@@ -376,6 +406,9 @@ impl HostOp {
             Self::ReportReduce => "op_host_report_reduce_v1",
             Self::ChannelDiscover => "op_host_channel_discover_v1",
             Self::ChannelPlan => "op_host_channel_plan_v1",
+            Self::QuestionDiscover => "op_host_question_discover_v1",
+            Self::QuestionCreate => "op_host_question_create_v1",
+            Self::QuestionRevise => "op_host_question_revise_v1",
             Self::ChannelManifestRead => "op_host_channel_manifest_read_v1",
             Self::ChannelTargetExecute => "op_host_channel_target_execute_v1",
             Self::ContentItemsRead => "op_host_content_items_read_v1",
@@ -445,6 +478,9 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(120_000, 4),
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(60_000, 16),
+                HostOpLimits::new(15_000, 64), // metadata-only question discovery
+                HostOpLimits::new(60_000, 16), // scoped question-set creation
+                HostOpLimits::new(60_000, 16), // optimistic question-set revision
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 128), // paged content reads
@@ -797,6 +833,39 @@ pub trait HostOps: Send + Sync {
         Err(HostOpError::capability_missing(
             HostOp::ChannelPlan,
             "channel planning is not configured",
+        ))
+    }
+
+    async fn question_discover(
+        &self,
+        _scope: &TenantScope,
+        _request: QuestionDiscoverRequest,
+    ) -> Result<QuestionDiscoveryPage, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::QuestionDiscover,
+            "question-set discovery is not configured",
+        ))
+    }
+
+    async fn question_create(
+        &self,
+        _scope: &TenantScope,
+        _request: CreateQuestionSet,
+    ) -> Result<QuestionWriteReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::QuestionCreate,
+            "question-set creation is not configured",
+        ))
+    }
+
+    async fn question_revise(
+        &self,
+        _scope: &TenantScope,
+        _request: QuestionReviseRequest,
+    ) -> Result<QuestionWriteReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::QuestionRevise,
+            "question-set revision is not configured",
         ))
     }
 
@@ -1176,6 +1245,22 @@ pub struct ChannelMeasurementPlanItem {
     pub sample_ordinal: u32,
 }
 
+/// The reference is resolved inside Rust; this DTO cannot carry text or a
+/// caller-selected split, market or language.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelBoundMeasurementPlanItem {
+    pub account_id: Uuid,
+    pub provider: String,
+    pub model: String,
+    pub surface: String,
+    pub search_mode: String,
+    pub protocol_version: String,
+    pub question: QuestionReference,
+    pub scheduled_at: DateTime<Utc>,
+    pub sample_ordinal: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelPlanRequest {
@@ -1183,6 +1268,8 @@ pub struct ChannelPlanRequest {
     pub cycle_id: Option<Uuid>,
     pub publications: Vec<ChannelPublicationPlanItem>,
     pub measurements: Vec<ChannelMeasurementPlanItem>,
+    #[serde(default)]
+    pub bound_measurements: Vec<ChannelBoundMeasurementPlanItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1192,6 +1279,184 @@ pub struct ChannelPlanReceipt {
     pub revision: i32,
     pub expected_count: u64,
     pub dispatch_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionDiscoverRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_set_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_set_version_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionDiscoveryItem {
+    pub reference: QuestionReference,
+    pub purpose: geo_domain::QuestionPurpose,
+    /// Frozen-evaluation text is absent even when a caller explicitly names
+    /// its version. Only optimization text may be used as model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimization_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionDiscoveryPage {
+    pub sets: Vec<geo_domain::QuestionSetSummary>,
+    pub versions: Vec<geo_domain::QuestionSetVersionSummary>,
+    pub questions: Vec<QuestionDiscoveryItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionReviseRequest {
+    pub question_set_id: Uuid,
+    pub command: ReviseQuestionSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionWriteReceipt {
+    pub question_set_id: Uuid,
+    pub question_set_version_id: Uuid,
+    pub revision: u32,
+    pub optimization_count: u32,
+    pub evaluation_count: u32,
+}
+
+impl QuestionDiscoverRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.question_set_id.is_some_and(|id| id.is_nil())
+            || self.question_set_version_id.is_some_and(|id| id.is_nil())
+            || (self.question_set_version_id.is_some() && self.question_set_id.is_none())
+            || self.limit.is_some_and(|limit| !(1..=100).contains(&limit))
+            || self
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 64)
+        {
+            return Err("invalid question discovery selector or page limit".into());
+        }
+        Ok(())
+    }
+}
+
+impl QuestionDiscoveryPage {
+    pub fn validate_for(&self, request: &QuestionDiscoverRequest) -> Result<(), String> {
+        let limit = request.limit.unwrap_or(25) as usize;
+        if self.sets.len() + self.versions.len() + self.questions.len() > limit
+            || self
+                .next_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 64)
+            || self.sets.iter().any(|item| {
+                item.id.is_nil()
+                    || item.current_version_id.is_nil()
+                    || item.current_revision == 0
+                    || item.question_count != item.optimization_count + item.evaluation_count
+                    || item.question_count > 100
+            })
+            || self.versions.iter().any(|item| {
+                item.id.is_nil()
+                    || Some(item.question_set_id) != request.question_set_id
+                    || item.revision == 0
+                    || item.optimization_count + item.evaluation_count > 100
+            })
+            || (request.question_set_id.is_none()
+                && (!self.versions.is_empty() || !self.questions.is_empty()))
+            || (request.question_set_id.is_some()
+                && request.question_set_version_id.is_none()
+                && (!self.sets.is_empty() || !self.questions.is_empty()))
+            || (request.question_set_version_id.is_some()
+                && (!self.sets.is_empty() || !self.versions.is_empty()))
+            || self.questions.iter().any(|item| {
+                item.reference.question_set_id != request.question_set_id.unwrap_or_default()
+                    || item.reference.question_set_version_id
+                        != request.question_set_version_id.unwrap_or_default()
+                    || item.reference.question_id.is_nil()
+                    || item.reference.question_revision_id.is_nil()
+                    || match item.purpose {
+                        geo_domain::QuestionPurpose::FrozenEvaluation => {
+                            item.optimization_text.is_some()
+                        }
+                        geo_domain::QuestionPurpose::Optimization => {
+                            item.optimization_text.as_ref().is_none_or(|text| {
+                                text.trim().is_empty()
+                                    || text.len() > MAX_MEASUREMENT_QUESTION_BYTES
+                            })
+                        }
+                    }
+            })
+        {
+            return Err("question discovery returned invalid or unsafe fields".into());
+        }
+        Ok(())
+    }
+}
+
+impl QuestionWriteReceipt {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.question_set_id.is_nil()
+            || self.question_set_version_id.is_nil()
+            || self.revision == 0
+            || self.optimization_count + self.evaluation_count == 0
+            || self.optimization_count + self.evaluation_count > 100
+        {
+            return Err("question version receipt is invalid".into());
+        }
+        Ok(())
+    }
+}
+
+impl QuestionReviseRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.question_set_id.is_nil() || self.command.base_version_id.is_nil() {
+            return Err("question-set and base-version references must be nonzero".into());
+        }
+        validate_question_command(
+            &self.command.idempotency_key,
+            &self.command.name,
+            &self.command.questions,
+        )
+    }
+}
+
+pub fn validate_question_create(request: &CreateQuestionSet) -> Result<(), String> {
+    validate_question_command(&request.idempotency_key, &request.name, &request.questions)
+}
+
+fn validate_question_command(
+    key: &str,
+    name: &str,
+    questions: &[geo_domain::QuestionDraft],
+) -> Result<(), String> {
+    if key.trim().is_empty()
+        || key.len() > 256
+        || name.trim().is_empty()
+        || name.len() > 512
+        || questions.is_empty()
+        || questions.len() > 100
+        || questions.iter().any(|item| {
+            item.text.trim().is_empty()
+                || item.text.len() > MAX_MEASUREMENT_QUESTION_BYTES
+                || item.intent.trim().is_empty()
+                || item.market.trim().is_empty()
+                || item.language.trim().is_empty()
+                || item.product_refs.len() > 100
+                || item.product_refs.iter().any(Uuid::is_nil)
+        })
+    {
+        return Err("question-set request is invalid or exceeds limits".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1387,8 +1652,10 @@ impl ChannelDiscoveryPage {
 impl ChannelPlanRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.cycle_id.is_some_and(|id| id.is_nil())
-            || self.publications.len() + self.measurements.len() == 0
-            || self.publications.len() + self.measurements.len() > 100
+            || self.publications.len() + self.measurements.len() + self.bound_measurements.len()
+                == 0
+            || self.publications.len() + self.measurements.len() + self.bound_measurements.len()
+                > 100
             || self.publications.iter().any(|item| {
                 item.source_id.is_nil()
                     || item.source_version_id.is_nil()
@@ -1412,6 +1679,22 @@ impl ChannelPlanRequest {
                     || item.question.trim().is_empty()
                     || item.question.len() > MAX_MEASUREMENT_QUESTION_BYTES
             })
+            || self.bound_measurements.iter().any(|item| {
+                item.account_id.is_nil()
+                    || item.question.question_set_id.is_nil()
+                    || item.question.question_set_version_id.is_nil()
+                    || item.question.question_id.is_nil()
+                    || item.question.question_revision_id.is_nil()
+                    || [
+                        &item.provider,
+                        &item.model,
+                        &item.surface,
+                        &item.search_mode,
+                        &item.protocol_version,
+                    ]
+                    .iter()
+                    .any(|value| !channel_label_valid(value))
+            })
         {
             return Err("channel plan contains invalid or excess targets".into());
         }
@@ -1425,7 +1708,9 @@ impl ChannelPlanReceipt {
             || self.revision <= 0
             || request.cycle_id.is_some_and(|id| id != self.cycle_id)
             || self.expected_count
-                != (request.publications.len() + request.measurements.len()) as u64
+                != (request.publications.len()
+                    + request.measurements.len()
+                    + request.bound_measurements.len()) as u64
             || self.dispatch_state != "pending"
         {
             return Err("channel plan receipt does not match the request".into());
@@ -2578,6 +2863,98 @@ mod tests {
                 .cycle_id,
             None
         );
+    }
+
+    #[test]
+    fn bound_plan_rejects_forged_question_text_purpose_and_scope() {
+        let reference = serde_json::json!({
+            "question_set_id": Uuid::new_v4(),
+            "question_set_version_id": Uuid::new_v4(),
+            "question_id": Uuid::new_v4(),
+            "question_revision_id": Uuid::new_v4(),
+        });
+        let item = serde_json::json!({
+            "account_id": Uuid::new_v4(),
+            "provider": "kimi",
+            "model": "model",
+            "surface": "consumer_web",
+            "search_mode": "web_search",
+            "protocol_version": "v1",
+            "question": reference,
+            "scheduled_at": "2026-10-06T00:00:00Z",
+            "sample_ordinal": 0,
+        });
+        let request = serde_json::json!({
+            "publications": [], "measurements": [], "bound_measurements": [item],
+        });
+        assert!(
+            serde_json::from_value::<ChannelPlanRequest>(request.clone())
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        for key in [
+            "text",
+            "market",
+            "language",
+            "purpose",
+            "evaluation_split",
+            "project_id",
+            "tenant_id",
+        ] {
+            let mut forged = request.clone();
+            forged["bound_measurements"][0][key] = serde_json::json!("forged");
+            assert!(
+                serde_json::from_value::<ChannelPlanRequest>(forged).is_err(),
+                "{key} must be rejected"
+            );
+        }
+        let mut forged = request.clone();
+        forged["bound_measurements"][0]["question"]["purpose"] = serde_json::json!("optimization");
+        assert!(serde_json::from_value::<ChannelPlanRequest>(forged).is_err());
+        let mut forged = request;
+        forged["bound_measurements"][0]["question"]["question_id"] = serde_json::json!(Uuid::nil());
+        assert!(
+            serde_json::from_value::<ChannelPlanRequest>(forged)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn heldout_discovery_cannot_claim_optimization_text() {
+        let set = Uuid::new_v4();
+        let version = Uuid::new_v4();
+        let request = QuestionDiscoverRequest {
+            question_set_id: Some(set),
+            question_set_version_id: Some(version),
+            cursor: None,
+            limit: None,
+        };
+        let mut page = QuestionDiscoveryPage {
+            sets: vec![],
+            versions: vec![],
+            questions: vec![QuestionDiscoveryItem {
+                reference: QuestionReference {
+                    question_set_id: set,
+                    question_set_version_id: version,
+                    question_id: Uuid::new_v4(),
+                    question_revision_id: Uuid::new_v4(),
+                },
+                purpose: geo_domain::QuestionPurpose::FrozenEvaluation,
+                optimization_text: None,
+            }],
+            next_cursor: None,
+        };
+        assert!(page.validate_for(&request).is_ok());
+        assert!(
+            !serde_json::to_string(&page)
+                .unwrap()
+                .contains("optimization_text")
+        );
+        page.questions[0].optimization_text = Some("HELDOUT_CANARY".into());
+        assert!(page.validate_for(&request).is_err());
     }
 
     #[test]

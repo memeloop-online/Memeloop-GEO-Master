@@ -108,6 +108,75 @@ impl FakeHostOps {
 
 #[async_trait]
 impl HostOps for FakeHostOps {
+    async fn question_discover(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::QuestionDiscoverRequest,
+    ) -> Result<geo_worker::QuestionDiscoveryPage, HostOpError> {
+        let page = geo_worker::QuestionDiscoveryPage {
+            sets: vec![],
+            versions: vec![],
+            questions: vec![geo_worker::QuestionDiscoveryItem {
+                reference: geo_worker::QuestionReference {
+                    question_set_id: request.question_set_id.unwrap(),
+                    question_set_version_id: request.question_set_version_id.unwrap(),
+                    question_id: uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000131")
+                        .unwrap(),
+                    question_revision_id: uuid::Uuid::parse_str(
+                        "00000000-0000-4000-8000-000000000132",
+                    )
+                    .unwrap(),
+                },
+                purpose: geo_domain::QuestionPurpose::FrozenEvaluation,
+                optimization_text: None,
+            }],
+            next_cursor: None,
+        };
+        self.answer(HostOp::QuestionDiscover, scope, page).await
+    }
+
+    async fn question_create(
+        &self,
+        scope: &TenantScope,
+        _request: geo_worker::CreateQuestionSet,
+    ) -> Result<geo_worker::QuestionWriteReceipt, HostOpError> {
+        self.answer(
+            HostOp::QuestionCreate,
+            scope,
+            geo_worker::QuestionWriteReceipt {
+                question_set_id: uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000133")
+                    .unwrap(),
+                question_set_version_id: uuid::Uuid::parse_str(
+                    "00000000-0000-4000-8000-000000000134",
+                )
+                .unwrap(),
+                revision: 1,
+                optimization_count: 0,
+                evaluation_count: 1,
+            },
+        )
+        .await
+    }
+
+    async fn question_revise(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::QuestionReviseRequest,
+    ) -> Result<geo_worker::QuestionWriteReceipt, HostOpError> {
+        self.answer(
+            HostOp::QuestionRevise,
+            scope,
+            geo_worker::QuestionWriteReceipt {
+                question_set_id: request.question_set_id,
+                question_set_version_id: uuid::Uuid::new_v4(),
+                revision: 2,
+                optimization_count: 0,
+                evaluation_count: 1,
+            },
+        )
+        .await
+    }
+
     async fn report_preview(
         &self,
         scope: &TenantScope,
@@ -1336,6 +1405,84 @@ async fn out_of_range_requests_are_refused() {
         "no capability may be consulted: {:?}",
         ops.seen()
     );
+}
+
+#[tokio::test]
+async fn native_question_ops_preserve_scope_and_reject_forged_bound_purpose() {
+    let ops = Arc::new(FakeHostOps::new());
+    let run_scope = scope();
+    let expected_scope = run_scope.storage_key();
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        const draft = {
+          text: "Can this be shipped?", intent: "purchase", product_refs: [],
+          market: "global", language: "en", source: {kind:"user_provided"}, weight: 1
+        };
+        const created = await attempt("question-create", () => hostOps.questionCreate({
+          idempotency_key: "native-create", name: "Questions", questions: [draft]
+        }));
+        const revised = await attempt("question-revise", () => hostOps.questionRevise({
+          question_set_id: created.value.question_set_id,
+          command: {
+            idempotency_key: "native-revise",
+            base_version_id: created.value.question_set_version_id,
+            name: "Questions", questions: [draft]
+          }
+        }));
+        await attempt("question-discover", () => hostOps.questionDiscover({
+          question_set_id: created.value.question_set_id,
+          question_set_version_id: created.value.question_set_version_id
+        }));
+        await attempt("forged-bound-purpose", () => hostOps.channelPlan({
+          publications: [], measurements: [], bound_measurements: [{
+            account_id:"00000000-0000-4000-8000-000000000111",
+            provider:"kimi",model:"model",surface:"consumer_web",
+            search_mode:"web_search",protocol_version:"v1",
+            question: {
+              question_set_id:created.value.question_set_id,
+              question_set_version_id:revised.value.question_set_version_id,
+              question_id:"00000000-0000-4000-8000-000000000131",
+              question_revision_id:"00000000-0000-4000-8000-000000000132",
+              purpose:"optimization"
+            },
+            scheduled_at:"2026-10-06T00:00:00Z",sample_ordinal:0
+          }]
+        }));
+        "#,
+        HostBridge::new(ops.clone(), run_scope, tokio::runtime::Handle::current()),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for topic in ["question-create", "question-revise", "question-discover"] {
+        assert_eq!(outcome(&runtime.host_state(), topic)["ok"], true);
+    }
+    let discover = outcome(&runtime.host_state(), "question-discover");
+    assert_eq!(
+        discover["value"]["questions"][0]["purpose"],
+        "frozen_evaluation"
+    );
+    assert!(
+        discover["value"]["questions"][0]
+            .get("optimization_text")
+            .is_none()
+    );
+    assert!(!discover.to_string().contains("HELDOUT_CANARY"));
+    assert_eq!(
+        outcome(&runtime.host_state(), "forged-bound-purpose")["error"]["code"],
+        "invalid_request"
+    );
+    assert_eq!(
+        ops.seen(),
+        vec![
+            HostOp::QuestionCreate,
+            HostOp::QuestionRevise,
+            HostOp::QuestionDiscover
+        ]
+    );
+    assert!(ops.scopes().iter().all(|actual| *actual == expected_scope));
 }
 
 #[tokio::test]

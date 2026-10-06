@@ -1,0 +1,38 @@
+.question-sets-page {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+
+.question-sets-page > *,
+.question-sets-page .fui-Card,
+.question-sets-page .fui-Field {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.question-sets-page .fui-Input,
+.question-sets-page .fui-Textarea,
+.question-sets-page .fui-Select {
+  width: 100%;
+  min-width: 0;
+}
+
+.question-sets-edit-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 8px;
+  border-top: 1px solid var(--colorNeutralStroke2);
+  padding-block: 12px;
+}
+
+.question-sets-edit-row > .fui-Field:first-child {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 600px) {
+  .question-sets-page .page-hero {
+    flex-wrap: wrap;
+  }
+}

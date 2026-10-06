@@ -5,16 +5,18 @@ use chrono::{DateTime, Duration, Utc};
 use geo_api::{AppState, RepositoryHostOps};
 use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
-    ChannelStatus, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, ImportItem, KnowledgePurpose,
-    ProjectCreate, ProjectSettings, ProjectStartCommand, PublicationLookupCandidate,
-    PublicationLookupFinding, PublicationLookupJob, PublicationLookupObservation,
-    PublicationLookupRepository, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
+    ChannelStatus, CreateQuestionSet, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, ImportItem,
+    KnowledgePurpose, ProjectCreate, ProjectSettings, ProjectStartCommand,
+    PublicationLookupCandidate, PublicationLookupFinding, PublicationLookupJob,
+    PublicationLookupObservation, PublicationLookupRepository, QuestionDraft, QuestionSource,
+    QuestionSourceKind, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
     start_request_hash,
 };
 use geo_worker::{
-    ChannelDiscoverRequest, ChannelDiscoveryItem, ChannelDiscoveryKind, ChannelExecutionState,
-    ChannelManifestReadRequest, ChannelPlanRequest, ChannelPublicationPlanItem,
-    ChannelTargetExecuteRequest, HostOpErrorCode, HostOps,
+    ChannelBoundMeasurementPlanItem, ChannelDiscoverRequest, ChannelDiscoveryItem,
+    ChannelDiscoveryKind, ChannelExecutionState, ChannelManifestReadRequest, ChannelPlanRequest,
+    ChannelPublicationPlanItem, ChannelTargetExecuteRequest, HostOpErrorCode, HostOps,
+    QuestionDiscoverRequest, QuestionReviseRequest,
 };
 use uuid::Uuid;
 
@@ -404,7 +406,163 @@ fn plan(f: &Fixture) -> ChannelPlanRequest {
             })
             .collect(),
         measurements: vec![],
+        bound_measurements: vec![],
     }
+}
+
+#[tokio::test]
+async fn questions_are_scoped_and_heldout_discovery_is_reference_only() {
+    let f = fixture().await;
+    let ops = ops(&f);
+    let measure_account_id = Uuid::new_v4();
+    f.state
+        .channel_service()
+        .repository
+        .save_account(
+            &f.scope,
+            ChannelAccountRecord {
+                account: ChannelAccount {
+                    account_id: measure_account_id,
+                    project_id: f.scope.project_id.unwrap(),
+                    owner_kind: ChannelOwnerKind::Customer,
+                    platform: "kimi".into(),
+                    group_id: None,
+                    status: ChannelStatus::NeedsLogin,
+                    display_name: None,
+                    platform_account_id: None,
+                    avatar_url: None,
+                    enabled: true,
+                    proxy_configured: true,
+                    proxy_server: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                session: None,
+                proxy: None,
+            },
+        )
+        .await
+        .unwrap();
+    let draft = |text: &str| QuestionDraft {
+        question_id: None,
+        text: text.to_owned(),
+        intent: "purchase".to_owned(),
+        product_refs: vec![],
+        market: "global".to_owned(),
+        language: "en".to_owned(),
+        source: QuestionSource {
+            kind: QuestionSourceKind::UserProvided,
+            reference_id: None,
+        },
+        weight: 1,
+    };
+    let created = ops
+        .question_create(
+            &f.scope,
+            CreateQuestionSet {
+                idempotency_key: "question-set-create-1".into(),
+                name: "Customer questions".into(),
+                questions: vec![draft("HELDOUT_CANARY_QUESTION")],
+            },
+        )
+        .await
+        .expect("writer creates scoped question set");
+    assert_eq!(created.evaluation_count, 1);
+    let discovered = ops
+        .question_discover(
+            &f.scope,
+            QuestionDiscoverRequest {
+                question_set_id: Some(created.question_set_id),
+                question_set_version_id: Some(created.question_set_version_id),
+                cursor: None,
+                limit: None,
+            },
+        )
+        .await
+        .expect("discover version");
+    assert_eq!(discovered.questions.len(), 1);
+    for item in &discovered.questions {
+        match item.purpose {
+            geo_domain::QuestionPurpose::FrozenEvaluation => {
+                assert!(item.optimization_text.is_none())
+            }
+            geo_domain::QuestionPurpose::Optimization => assert!(item.optimization_text.is_some()),
+        }
+    }
+    assert!(
+        !serde_json::to_string(&discovered)
+            .unwrap()
+            .contains("HELDOUT_CANARY_QUESTION")
+    );
+    let heldout = discovered
+        .questions
+        .iter()
+        .find(|item| item.purpose == geo_domain::QuestionPurpose::FrozenEvaluation)
+        .unwrap();
+    let plan = ops
+        .channel_plan(
+            &f.scope,
+            ChannelPlanRequest {
+                cycle_id: Some(f.cycle_id),
+                publications: vec![],
+                measurements: vec![],
+                bound_measurements: vec![ChannelBoundMeasurementPlanItem {
+                    account_id: measure_account_id,
+                    provider: "kimi".into(),
+                    model: "model".into(),
+                    surface: "consumer_web".into(),
+                    search_mode: "web_search".into(),
+                    protocol_version: "protocol.v1".into(),
+                    question: heldout.reference,
+                    scheduled_at: Utc::now() + Duration::hours(1),
+                    sample_ordinal: 0,
+                }],
+            },
+        )
+        .await
+        .expect("heldout reference schedules without exposing its text");
+    assert_eq!(plan.expected_count, 1);
+    let forged = serde_json::json!({
+        "account_id": f.account_ids[0], "provider":"provider","model":"model",
+        "surface":"web","search_mode":"official_search","protocol_version":"protocol.v1",
+        "question": heldout.reference, "scheduled_at": Utc::now(), "sample_ordinal":0,
+        "purpose":"optimization"
+    });
+    assert!(serde_json::from_value::<ChannelBoundMeasurementPlanItem>(forged).is_err());
+    let foreign_scope = TenantScope::new(
+        f.scope.operator_id,
+        f.scope.tenant_id,
+        Some(geo_domain::ProjectId::new(Uuid::new_v4())),
+    );
+    assert!(
+        ops.question_discover(
+            &foreign_scope,
+            QuestionDiscoverRequest {
+                question_set_id: Some(created.question_set_id),
+                question_set_version_id: Some(created.question_set_version_id),
+                cursor: None,
+                limit: None,
+            }
+        )
+        .await
+        .is_err()
+    );
+    let stale = ops
+        .question_revise(
+            &f.scope,
+            QuestionReviseRequest {
+                question_set_id: created.question_set_id,
+                command: geo_domain::ReviseQuestionSet {
+                    idempotency_key: "question-set-revise-1".into(),
+                    base_version_id: Uuid::new_v4(),
+                    name: "Customer questions".into(),
+                    questions: vec![draft("HELDOUT_CANARY_QUESTION")],
+                },
+            },
+        )
+        .await
+        .expect_err("revision requires exact current base");
+    assert_eq!(stale.code, HostOpErrorCode::Failed);
 }
 
 #[tokio::test]

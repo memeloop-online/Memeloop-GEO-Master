@@ -312,6 +312,14 @@ export async function buildReportPdf(
   for (const [index, group] of snapshot.measurement_groups.entries()) {
     await yieldToBrowser(index, signal);
     layout.coverage(`比较键 ${group.comparison_key}`, group.coverage);
+    layout.text(
+      group.purpose === "optimization"
+        ? "问题用途：优化"
+        : group.purpose === "frozen_evaluation"
+          ? "问题用途：冻结评估（不进入优化）"
+          : "问题用途：旧未分类（不进入优化）",
+      { muted: true },
+    );
   }
 
   layout.heading("结论与证据引用");

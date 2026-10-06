@@ -117,6 +117,7 @@ async fn pending_scan_keyset_scope_due_and_project_state() {
                 language: "en".into(),
                 scheduled_at,
                 sample_ordinal: 0,
+                question_binding: None,
             },
         };
         repo.create_plan(

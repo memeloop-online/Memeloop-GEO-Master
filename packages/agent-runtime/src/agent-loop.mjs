@@ -13,6 +13,9 @@ const REPORT_PREVIEW = "report_preview";
 const REPORT_REDUCE = "report_reduce";
 const CHANNEL_DISCOVER = "channel_discover";
 const CHANNEL_PLAN = "channel_plan";
+const QUESTION_DISCOVER = "question_discover";
+const QUESTION_CREATE = "question_create";
+const QUESTION_REVISE = "question_revise";
 const CHANNEL_MANIFEST_READ = "channel_manifest_read";
 const CHANNEL_TARGET_EXECUTE = "channel_target_execute";
 const CONTENT_START = "content_start";
@@ -33,6 +36,9 @@ const CHANNEL_TOOLS = [
   CHANNEL_PLAN,
   CHANNEL_MANIFEST_READ,
   CHANNEL_TARGET_EXECUTE,
+  QUESTION_DISCOVER,
+  QUESTION_CREATE,
+  QUESTION_REVISE,
 ];
 const TOOL_DESCRIPTIONS = {
   [REPORT_PREVIEW]:
@@ -54,7 +60,13 @@ const TOOL_DESCRIPTIONS = {
   [CHANNEL_DISCOVER]:
     "Discover current-project public source versions or available publishing/measurement accounts. Use returned IDs as references in channel_plan.",
   [CHANNEL_PLAN]:
-    "Freeze a finite publication/measurement target plan from discovered references. The backend queues and dispatches executable targets automatically; no manual approval or per-target execution loop is needed.",
+    "Freeze a finite publication/measurement target plan from discovered references. Prefer bound_measurements with immutable question references; legacy free-text measurements are unclassified and never optimize content. The backend dispatches targets automatically.",
+  [QUESTION_DISCOVER]:
+    "Discover scoped question-set versions, counts and schedulable immutable question references. Frozen evaluation text is never returned; optimization text is safe to inspect. Provide question_set_id and question_set_version_id together to page questions.",
+  [QUESTION_CREATE]:
+    "Create a versioned question set through Rust assignment and scoped validation. Purpose is never caller-selectable. Returns metadata and counts, never frozen-evaluation question text.",
+  [QUESTION_REVISE]:
+    "Publish a new version of one question set from the current base_version_id. Provide complete desired membership; identities retain their Rust-assigned purpose. Returns metadata and counts, not evaluation text.",
   [CHANNEL_MANIFEST_READ]:
     "Read a page of the frozen channel target manifest and its actual statuses. A completed target is not necessarily a successful publication: inspect outcome_status and fixture. Deferred is a normal result.",
   [CHANNEL_TARGET_EXECUTE]:
@@ -115,11 +127,113 @@ const CHANNEL_DISCOVER_SCHEMA = {
     limit: { type: "integer", minimum: 1, maximum: 100 },
   },
 };
+const QUESTION_REFERENCE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "question_set_id",
+    "question_set_version_id",
+    "question_id",
+    "question_revision_id",
+  ],
+  properties: {
+    question_set_id: { type: "string", format: "uuid" },
+    question_set_version_id: { type: "string", format: "uuid" },
+    question_id: { type: "string", format: "uuid" },
+    question_revision_id: { type: "string", format: "uuid" },
+  },
+};
+const QUESTION_DISCOVER_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    question_set_id: { type: "string", format: "uuid" },
+    question_set_version_id: { type: "string", format: "uuid" },
+    cursor: { type: "string" },
+    limit: { type: "integer", minimum: 1, maximum: 100 },
+  },
+};
+const QUESTION_DRAFT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "text",
+    "intent",
+    "product_refs",
+    "market",
+    "language",
+    "source",
+    "weight",
+  ],
+  properties: {
+    question_id: { type: "string", format: "uuid" },
+    text: { type: "string", minLength: 1 },
+    intent: { type: "string", minLength: 1 },
+    product_refs: {
+      type: "array",
+      maxItems: 100,
+      items: { type: "string", format: "uuid" },
+    },
+    market: { type: "string", minLength: 1 },
+    language: { type: "string", minLength: 1 },
+    source: {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind"],
+      properties: {
+        kind: {
+          type: "string",
+          enum: [
+            "user_provided",
+            "sales_consultation",
+            "product",
+            "faq",
+            "generated",
+          ],
+        },
+        reference_id: { type: "string", format: "uuid" },
+      },
+    },
+    weight: { type: "integer", minimum: 0 },
+  },
+};
+const QUESTION_CREATE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["idempotency_key", "name", "questions"],
+  properties: {
+    idempotency_key: { type: "string", minLength: 1 },
+    name: { type: "string", minLength: 1 },
+    questions: {
+      type: "array",
+      minItems: 1,
+      maxItems: 100,
+      items: QUESTION_DRAFT_SCHEMA,
+    },
+  },
+};
+const QUESTION_REVISE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["question_set_id", "command"],
+  properties: {
+    question_set_id: { type: "string", format: "uuid" },
+    command: {
+      type: "object",
+      additionalProperties: false,
+      required: ["idempotency_key", "base_version_id", "name", "questions"],
+      properties: {
+        ...QUESTION_CREATE_SCHEMA.properties,
+        base_version_id: { type: "string", format: "uuid" },
+      },
+    },
+  },
+};
 const CHANNEL_PLAN_SCHEMA = {
   type: "object",
   additionalProperties: false,
   description:
-    "Provide at least one and at most 100 total publication plus measurement targets, referencing discovered IDs. Do not include text bodies, hashes, or scope selectors.",
+    "Provide at least one and at most 100 total targets. bound_measurements accepts only immutable question references; legacy measurements remain unclassified. Do not include scope selectors or override heldout text/purpose.",
   required: ["publications", "measurements"],
   properties: {
     cycle_id: { type: "string", format: "uuid" },
@@ -169,6 +283,36 @@ const CHANNEL_PLAN_SCHEMA = {
           question: { type: "string" },
           market: { type: "string" },
           language: { type: "string" },
+          scheduled_at: { type: "string", format: "date-time" },
+          sample_ordinal: { type: "integer", minimum: 0 },
+        },
+      },
+    },
+    bound_measurements: {
+      type: "array",
+      maxItems: 100,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "account_id",
+          "provider",
+          "model",
+          "surface",
+          "search_mode",
+          "protocol_version",
+          "question",
+          "scheduled_at",
+          "sample_ordinal",
+        ],
+        properties: {
+          account_id: { type: "string", format: "uuid" },
+          provider: { type: "string" },
+          model: { type: "string" },
+          surface: { type: "string" },
+          search_mode: { type: "string" },
+          protocol_version: { type: "string" },
+          question: QUESTION_REFERENCE_SCHEMA,
           scheduled_at: { type: "string", format: "date-time" },
           sample_ordinal: { type: "integer", minimum: 0 },
         },
@@ -812,6 +956,9 @@ function resolveHost(requireImport) {
     typeof denoOps.op_host_report_reduce_v1 !== "function" ||
     typeof denoOps.op_host_channel_discover_v1 !== "function" ||
     typeof denoOps.op_host_channel_plan_v1 !== "function" ||
+    typeof denoOps.op_host_question_discover_v1 !== "function" ||
+    typeof denoOps.op_host_question_create_v1 !== "function" ||
+    typeof denoOps.op_host_question_revise_v1 !== "function" ||
     typeof denoOps.op_host_channel_manifest_read_v1 !== "function" ||
     typeof denoOps.op_host_channel_target_execute_v1 !== "function" ||
     typeof denoOps.op_host_content_start_v1 !== "function" ||
@@ -880,6 +1027,21 @@ function resolveHost(requireImport) {
     async channelPlan(request) {
       return JSON.parse(
         await denoOps.op_host_channel_plan_v1(JSON.stringify(request)),
+      );
+    },
+    async questionDiscover(request) {
+      return JSON.parse(
+        await denoOps.op_host_question_discover_v1(JSON.stringify(request)),
+      );
+    },
+    async questionCreate(request) {
+      return JSON.parse(
+        await denoOps.op_host_question_create_v1(JSON.stringify(request)),
+      );
+    },
+    async questionRevise(request) {
+      return JSON.parse(
+        await denoOps.op_host_question_revise_v1(JSON.stringify(request)),
       );
     },
     async channelManifestRead(request) {
@@ -1185,6 +1347,9 @@ function createHostTools(host, failures, attachments) {
   const reportReduce = reportTool(REPORT_REDUCE, "reportReduce");
   const channelDiscover = reportTool(CHANNEL_DISCOVER, "channelDiscover");
   const channelPlan = reportTool(CHANNEL_PLAN, "channelPlan");
+  const questionDiscover = reportTool(QUESTION_DISCOVER, "questionDiscover");
+  const questionCreate = reportTool(QUESTION_CREATE, "questionCreate");
+  const questionRevise = reportTool(QUESTION_REVISE, "questionRevise");
   const channelManifestRead = reportTool(
     CHANNEL_MANIFEST_READ,
     "channelManifestRead",
@@ -1256,23 +1421,29 @@ function createHostTools(host, failures, attachments) {
                     ? channelDiscover
                     : id === CHANNEL_PLAN
                       ? channelPlan
-                      : id === CHANNEL_MANIFEST_READ
-                        ? channelManifestRead
-                        : id === CHANNEL_TARGET_EXECUTE
-                          ? channelTargetExecute
-                          : id === CONTENT_START
-                            ? contentStart
-                            : id === CONTENT_EXECUTION_READ
-                              ? contentExecutionRead
-                              : id === DISTRIBUTION_START
-                                ? distributionStart
-                                : id === DISTRIBUTION_READ
-                                  ? distributionRead
-                                  : id === DISTRIBUTION_RESUME
-                                    ? distributionResume
-                                    : id === DISTRIBUTION_TARGETS_READ
-                                      ? distributionTargetsRead
-                                      : undefined,
+                      : id === QUESTION_DISCOVER
+                        ? questionDiscover
+                        : id === QUESTION_CREATE
+                          ? questionCreate
+                          : id === QUESTION_REVISE
+                            ? questionRevise
+                            : id === CHANNEL_MANIFEST_READ
+                              ? channelManifestRead
+                              : id === CHANNEL_TARGET_EXECUTE
+                                ? channelTargetExecute
+                                : id === CONTENT_START
+                                  ? contentStart
+                                  : id === CONTENT_EXECUTION_READ
+                                    ? contentExecutionRead
+                                    : id === DISTRIBUTION_START
+                                      ? distributionStart
+                                      : id === DISTRIBUTION_READ
+                                        ? distributionRead
+                                        : id === DISTRIBUTION_RESUME
+                                          ? distributionResume
+                                          : id === DISTRIBUTION_TARGETS_READ
+                                            ? distributionTargetsRead
+                                            : undefined,
     listTools: () =>
       attachments.length > 0
         ? [
@@ -1313,23 +1484,29 @@ function createHostTools(host, failures, attachments) {
                     ? CHANNEL_DISCOVER_SCHEMA
                     : id === CHANNEL_PLAN
                       ? CHANNEL_PLAN_SCHEMA
-                      : id === CHANNEL_MANIFEST_READ
-                        ? CHANNEL_MANIFEST_READ_SCHEMA
-                        : id === CHANNEL_TARGET_EXECUTE
-                          ? CHANNEL_TARGET_EXECUTE_SCHEMA
-                          : id === CONTENT_START
-                            ? CONTENT_START_SCHEMA
-                            : id === CONTENT_EXECUTION_READ
-                              ? CONTENT_EXECUTION_READ_SCHEMA
-                              : id === DISTRIBUTION_START
-                                ? DISTRIBUTION_START_SCHEMA
-                                : id === DISTRIBUTION_READ
-                                  ? DISTRIBUTION_READ_SCHEMA
-                                  : id === DISTRIBUTION_RESUME
-                                    ? DISTRIBUTION_RESUME_SCHEMA
-                                    : id === DISTRIBUTION_TARGETS_READ
-                                      ? DISTRIBUTION_TARGETS_READ_SCHEMA
-                                      : undefined,
+                      : id === QUESTION_DISCOVER
+                        ? QUESTION_DISCOVER_SCHEMA
+                        : id === QUESTION_CREATE
+                          ? QUESTION_CREATE_SCHEMA
+                          : id === QUESTION_REVISE
+                            ? QUESTION_REVISE_SCHEMA
+                            : id === CHANNEL_MANIFEST_READ
+                              ? CHANNEL_MANIFEST_READ_SCHEMA
+                              : id === CHANNEL_TARGET_EXECUTE
+                                ? CHANNEL_TARGET_EXECUTE_SCHEMA
+                                : id === CONTENT_START
+                                  ? CONTENT_START_SCHEMA
+                                  : id === CONTENT_EXECUTION_READ
+                                    ? CONTENT_EXECUTION_READ_SCHEMA
+                                    : id === DISTRIBUTION_START
+                                      ? DISTRIBUTION_START_SCHEMA
+                                      : id === DISTRIBUTION_READ
+                                        ? DISTRIBUTION_READ_SCHEMA
+                                        : id === DISTRIBUTION_RESUME
+                                          ? DISTRIBUTION_RESUME_SCHEMA
+                                          : id === DISTRIBUTION_TARGETS_READ
+                                            ? DISTRIBUTION_TARGETS_READ_SCHEMA
+                                            : undefined,
     registerTool: () => {
       throw new Error("The embedded loop cannot register tools.");
     },

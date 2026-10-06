@@ -2,9 +2,11 @@
 
 更新时间：2026-10-06
 
-最新完整绿色基线：`ef50347` / Actions `37419192163` 全绿。已读取实际日志，确认 PDF 文字/字形/分页以及持久工作区双次软件登录、退出、配置/卷/身份与旧数据库会话保留通过；Windows 构建与测试也通过。该基线包含 TCP 就绪检查修正，但不包含正在整合的跨周期复用代码。本地 Docker 重试仍未成功，不能宣称已准备好外部账号登录。
+最新完整绿色基线：`0074397` / Actions `37428319862` 全绿。已读取实际日志，确认新增跨周期复用、分发提交来源撤销 PostgreSQL 回归实际为 `ok`，以及持久工作区双次登录、退出、配置/卷/身份和数据库会话保留通过；Windows 构建与测试也通过。本地 Docker 仍未恢复，不能宣称已准备好真实外部账号登录。
 
-本批周报 PDF 从正式不可变快照本地生成，入口、字体许可与验证边界见 [`report-pdf.md`](report-pdf.md)，准确测试结果见工作日志。跨周期正文复用已接领域/API/持久层/UI 及迁移 `0027`：保持原检查版本、独立本轮覆盖，编辑采用 copy-on-write。前端 155 项、整批 Rust 默认测试及真实后继周期 API/原生工作流回归通过；内存项目/知识 guard 与数据库事务保护公开提交，分发物化已补来源复核。本批 PostgreSQL 显式验收及完整 CI 尚待执行，可证明历史分支重建仍缺，不能沿用首段旧绿色结果。契约见 [`content-reuse.md`](content-reuse.md)。
+跨周期正文复用已接领域/API/持久层/UI 及迁移 `0027`：保持原检查版本、独立本轮覆盖，编辑采用 copy-on-write。前端 155 项、默认全量、真实后继周期 API/原生工作流与 PostgreSQL 回归已通过首段 CI。内存项目/知识 guard 与数据库事务保护公开提交，分发物化在提交内复核来源；可证明历史分支重建和真实外部发布验收仍缺。契约见 [`content-reuse.md`](content-reuse.md)。
+
+当前工作区正在整合问题集版本、项目级不可翻转的评估用途及引用式测量：契约见 [`question-sets.md`](question-sets.md)，迁移为 `0028`，页面为 P13 问题集和 P12 绑定测量，P00 宿主契约升级至 v10。前端 163 项、构建/格式、Node 编排 26 项、V8 host ops 38 项及 API 工具 5 项已通过；完整 Rust、实库和真实浏览器仍待收口，不属于首段绿色基线，也不代表 NextCycleAction 优化执行器已完成。周报 PDF 边界仍见 [`report-pdf.md`](report-pdf.md)。
 
 历史绿色基线：`44f22ff` / Actions `37405615406`，Linux/Windows、前端、显式 V8、Java 21、PostgreSQL 和真实本地浏览器冒烟全部通过，包含报告只读预览、实时导入进度及原始收据核对。已读取 Linux 日志确认 `import_progress` 两项、`actual_pdf_pages_are_imported_as_searchable_source_evidence` 与 P14 临时预览/零写入浏览器检查实际通过，不是默认忽略后的通过。截图采用合成资料，不包含外部账号或真实发布/搜索验收。
 
@@ -104,7 +106,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 
 ### W00 安全 Host Ops
 
-- 封闭且带版本的 op 面（当前批次 `geo.hostops.v9`）：保留既有 25 项，新增只读 `report.preview.v1`，共 26 项；实时导入状态为 `knowledge.import_status.v1`。部署须同步新 bundle 及摘要。附件导入只接受 Rust 已绑定到当前回合的对象；业务工具只传受限资源引用，JS 无法取得 session、代理凭据、SQL、任意网络、文件、进程或环境变量。
+- 封闭且带版本的 op 面（当前批次 `geo.hostops.v10`）：保留既有 26 项，新增 `question.discover.v1`、`question.create.v1`、`question.revise.v1`，共 29 项；问题发现不返回冻结评估正文，写入回执只返回元数据。部署须同步新 bundle 及摘要。附件导入只接受 Rust 已绑定到当前回合的对象；业务工具只传受限资源引用，JS 无法取得 session、代理凭据、SQL、任意网络、文件、进程或环境变量。
 - 边界方向为 `geo-api → geo-worker`，worker 从不反向依赖 API。请求 DTO 全部 `#[serde(deny_unknown_fields)]` 且不携带 tenant/project 选择器，作用域只能来自 Rust 侧 bridge。预算、单次调用截止与取消统一在 `HostBridge::invoke` 施加。
 - `RepositoryHostOps` 已实现知识检索/附件导入、文档清单读取、报告及渠道工具和可注入的模型调用；内容工具另由受限 Rust 服务执行。本地开发模型装配见第 5 节。清单读取保留规划状态、阻断原因及覆盖分母，不把规划项 ID 冒充正文版本；正式文档×平台展开和正文分发工具已接入，真实发布与测量验收仍缺失。
 
@@ -143,7 +145,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - `crates/api/src/reports.rs`：列表、详情、证据与周期 reduce 服务。PostgreSQL 定时扫描到期周期，并恢复首次报告已存但后继未建的周期；两条扫描均使用游标分页。新周期创建不等于完整下一轮内容与发布执行。
 - P14 已接列表、详情、证据、项目时区及 CSV；P00 注册 `report_get`/`report_reduce`，省略 ID 时在 Rust 中解析当前项目周期或最新快照。
 - 应用已接已有文档规划、周期清单和渠道执行账本中的发布/测量目标；未建立计划显示不可用，缺测与未知结果保留。真实平台账号和 AI 搜索采样尚未验收，不能把夹具当成实际效果。文档状态无截止时间证明时仍保留时间依据缺口，不回填伪时间。
-- 正式周报遵循冻结截止；本批新增独立只读临时预览的 P14/API/P00 入口，证据时间截断至冻结截止，不保存正式快照或推进周期，实施契约见 [`report-preview.md`](report-preview.md)。PDF、下一周期优化动作及真实跨平台效果报告仍未完成；本批准确测试和 CI 对应关系见 `WORKLOG.md`，不能沿用旧绿色基线。
+- 正式周报遵循冻结截止；独立只读临时预览的 P14/API/P00 入口将证据时间截断至冻结截止，不保存正式快照或推进周期，实施契约见 [`report-preview.md`](report-preview.md)。正式快照 PDF 导出已实现，本批补用途分类标签；下一周期优化动作及真实跨平台效果报告仍未完成。准确测试和 CI 对应关系见 `WORKLOG.md`，不能沿用旧绿色基线。
 
 ## 当前账号与发布纵切
 
@@ -174,7 +176,7 @@ P00 AI 工作台是默认入口。用户应能通过对话或附件调用所有�
 - **running 重启对账**：已接 `GEO_SINGLE_PROCESS_EXECUTOR=true` 启动扫描，只适用于整个数据库严格单执行进程，默认关闭。滚动部署、多副本不得启用；running 租约和优雅关闭仍未实现。此旧对账测试已由 CI 独立 schema 验收，不能替代新 queued 扫描验证。
 - **回合进行中的实时取消**：当前整合批次已接隔离体及模型等待中断，独立回合取消状态不复用；生产多副本与在途外部结果核对仍须补验，见上方当前批次说明。
 - **隔离体基础保护**：64 MiB V8 堆、near-heap 终止、独立墙钟和 Rust 输出预算均已回归通过。不设固定隔离体并发准入门槛；高吞吐调度和进程资源观测仍需真实容量验收。
-- **checkpoint 与 tool-call ledger**：executor 已写完成结果存档；既有 25 项 host op 的 Rust 调用侧 intent/attempt/outcome 已通过本地及 CI，内存与 PostgreSQL 共享生命周期，应用按实际 Run 注入仓储。本批第 26 项只读报告预览沿用账本并在保存成功前核对返回结果，独立验证状态见 `WORKLOG.md`；这不是中途恢复，跨副本 running 租约、稳定重入位置和可重放结果仍缺。边界见 [`agent-tool-ledger.md`](agent-tool-ledger.md)。
+- **checkpoint 与 tool-call ledger**：executor 已写完成结果存档；既有 26 项 host op 的 Rust 调用侧 intent/attempt/outcome 已通过本地及 CI，内存与 PostgreSQL 共享生命周期，应用按实际 Run 注入仓储。本批三项问题集工具沿用账本并在保存成功前核对返回结果，独立验证状态见 `WORKLOG.md`；这不是中途恢复，跨副本 running 租约、稳定重入位置和可重放结果仍缺。边界见 [`agent-tool-ledger.md`](agent-tool-ledger.md)。
 - Token Center HTTP 适配及持久租户/项目路由已装配，配置撤销和凭据 generation 在调用时重新校验；正式权益/费用记账、流式模型事件及真实部署验证仍未完成。本地单模型配置保持仅限内存开发模式。
 - 对话 registry 已注册渠道计划/执行、第一层内容启动/查询及第二层分发启动/读取/恢复/分页工具；后者复用 `DistributionService`，不允许模型自报正文或平台能力。周期自动贯穿两次 fan-out 的原生工作流、真实搜索测量仍待补齐，不能以工具存在代替无人值守全周期运行。
 - P00 非 TXT/Markdown 解析、媒体/表格与跨回合附件使用；当前存储为内存或 PostgreSQL blob，非正式对象存储服务。回合输入可由持久 Message 重建，但这不等于完整自动恢复执行。

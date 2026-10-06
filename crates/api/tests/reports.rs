@@ -485,6 +485,7 @@ async fn create_legacy_measurement_and_publication(
                             language: "en".into(),
                             scheduled_at: cycle.report_window_start_at + Duration::hours(1),
                             sample_ordinal: 0,
+                            question_binding: None,
                         },
                     },
                 ],

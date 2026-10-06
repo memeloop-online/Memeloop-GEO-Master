@@ -34,6 +34,8 @@ mod operation;
 mod project;
 mod publication_lookup;
 pub use publication_lookup::*;
+mod questions;
+pub use questions::*;
 mod report;
 mod tenancy;
 

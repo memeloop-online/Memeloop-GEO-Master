@@ -980,6 +980,7 @@ async fn discovery_paginates_ambiguous_sends_and_enriches_only_newly_finalized_j
             language: "en".into(),
             scheduled_at: old,
             sample_ordinal: 1,
+            question_binding: None,
         },
     };
     let targets = [

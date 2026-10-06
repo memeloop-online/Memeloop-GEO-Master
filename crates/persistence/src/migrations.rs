@@ -120,6 +120,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 27,
         description: "content reuse",
     },
+    MigrationMetadata {
+        version: 28,
+        description: "question sets",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

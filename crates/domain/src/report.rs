@@ -9,7 +9,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    AppError, DocumentManifest, DocumentManifestItemState, ErrorCode, ProjectId, TenantScope,
+    AppError, DocumentManifest, DocumentManifestItemState, ErrorCode, FrozenQuestionBinding,
+    ProjectId, QuestionPurpose, TenantScope,
 };
 
 pub const REPORT_REDUCER_VERSION: &str = "geo-report-v1";
@@ -81,6 +82,9 @@ pub struct ReportMeasurementTarget {
     pub target_id: Uuid,
     /// Exact immutable protocol/question-set/provider/model/surface/market/language key.
     pub comparison_key: String,
+    /// Server-resolved purpose; absent historical rows are unclassified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_binding: Option<FrozenQuestionBinding>,
     pub scheduled_at: DateTime<Utc>,
     pub status: ReportMeasurementStatus,
     pub missing_reason: Option<String>,
@@ -132,6 +136,8 @@ pub struct ReportPublicationGroup {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ReportMeasurementGroup {
     pub comparison_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<QuestionPurpose>,
     pub coverage: ReportCoverage,
 }
 
@@ -840,6 +846,7 @@ fn project_report(
         _ => unavailable("publication targets are not available"),
     };
     let mut measurement_groups = BTreeMap::<String, ReportCoverage>::new();
+    let mut measurement_group_purposes = BTreeMap::<String, Option<QuestionPurpose>>::new();
     let measurements = match (&canonical.measurement_targets, measure_ref) {
         (Some(targets), Some(reference)) => {
             let expected = reference.expected_count.unwrap_or(0);
@@ -853,6 +860,16 @@ fn project_report(
                     return Err(error(
                         "duplicate measurement sample or empty comparison key",
                     ));
+                }
+                let purpose = target
+                    .question_binding
+                    .as_ref()
+                    .map(|binding| binding.purpose);
+                if let Some(existing) =
+                    measurement_group_purposes.insert(target.comparison_key.clone(), purpose)
+                    && existing != purpose
+                {
+                    return Err(error("measurement purpose cannot share a comparison group"));
                 }
                 let valid = collect_evidence(
                     &target.evidence,
@@ -915,6 +932,14 @@ fn project_report(
             }
             if expected > targets.len() as u64 {
                 counts.insert("unmaterialized".to_owned(), expected - targets.len() as u64);
+            } else {
+                // Every sealed sample is materialized; each protocol/purpose
+                // group now has an exact planned denominator. If the global
+                // manifest has unseen targets, their purpose is unknowable.
+                for coverage in measurement_groups.values_mut() {
+                    coverage.expected_count = Some(coverage.observed_count);
+                    coverage.reason = None;
+                }
             }
             ReportCoverage {
                 availability: ReportAvailability::Available,
@@ -1005,6 +1030,10 @@ fn project_report(
         measurement_groups: measurement_groups
             .into_iter()
             .map(|(comparison_key, coverage)| ReportMeasurementGroup {
+                purpose: measurement_group_purposes
+                    .get(&comparison_key)
+                    .copied()
+                    .flatten(),
                 comparison_key,
                 coverage,
             })
@@ -1061,6 +1090,73 @@ mod tests {
         DocumentManifestCoverage, DocumentManifestItem, DocumentManifestState, OperatorId, TenantId,
     };
     use chrono::TimeZone;
+
+    #[test]
+    fn purpose_groups_keep_heldout_legacy_and_optimization_denominators_apart() {
+        let (scope, mut input) = setup();
+        input.input_manifest_versions.push(ReportManifestRef {
+            kind: ReportManifestKind::Measurement,
+            manifest_id: Uuid::new_v4(),
+            revision: 1,
+            sealed: true,
+            expected_count: Some(3),
+        });
+        let reference = crate::QuestionReference {
+            question_set_id: Uuid::new_v4(),
+            question_set_version_id: Uuid::new_v4(),
+            question_id: Uuid::new_v4(),
+            question_revision_id: Uuid::new_v4(),
+        };
+        let make =
+            |comparison_key: &str, purpose: Option<QuestionPurpose>| ReportMeasurementTarget {
+                target_id: Uuid::new_v4(),
+                comparison_key: comparison_key.to_owned(),
+                question_binding: purpose.map(|purpose| FrozenQuestionBinding {
+                    reference,
+                    purpose,
+                    split_policy_version: "project_registry_nfkc_v1".into(),
+                }),
+                scheduled_at: instant(25),
+                status: ReportMeasurementStatus::Missing,
+                missing_reason: Some("technical".into()),
+                evidence: vec![],
+            };
+        input.measurement_targets = Some(vec![
+            make("protocol|legacy", None),
+            make(
+                "protocol|optimization|v1",
+                Some(QuestionPurpose::Optimization),
+            ),
+            make(
+                "protocol|frozen_evaluation|v1",
+                Some(QuestionPurpose::FrozenEvaluation),
+            ),
+        ]);
+        let report = preview_report(&scope, &input, instant(29)).unwrap();
+        assert_eq!(report.measurements.expected_count, Some(3));
+        assert_eq!(report.measurements.counts["missing"], 3);
+        assert_eq!(report.measurement_groups.len(), 3);
+        assert!(report.measurement_groups.iter().all(|group| {
+            group.coverage.observed_count == 1
+                && group.coverage.expected_count == Some(1)
+                && group.coverage.counts["missing"] == 1
+        }));
+        let legacy = report
+            .measurement_groups
+            .iter()
+            .find(|group| group.comparison_key == "protocol|legacy")
+            .unwrap();
+        assert_eq!(legacy.purpose, None);
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("purpose")
+                .is_none()
+        );
+        input.measurement_targets.as_mut().unwrap()[0].comparison_key =
+            "protocol|optimization|v1".into();
+        assert!(preview_report(&scope, &input, instant(29)).is_err());
+    }
 
     fn instant(day: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, day, 12, 0, 0).unwrap()
@@ -1180,6 +1276,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: observed_id,
                 comparison_key: "api/protocol".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(25),
                 status: ReportMeasurementStatus::Observed,
                 missing_reason: None,
@@ -1188,6 +1285,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: future_id,
                 comparison_key: "api/protocol".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(27),
                 status: ReportMeasurementStatus::Pending,
                 missing_reason: None,
@@ -1254,6 +1352,7 @@ mod tests {
         input.measurement_targets = Some(vec![ReportMeasurementTarget {
             target_id: sample_id,
             comparison_key: "api/protocol".to_owned(),
+            question_binding: None,
             scheduled_at: instant(25),
             status: ReportMeasurementStatus::NotMentioned,
             missing_reason: None,
@@ -1354,6 +1453,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: observed_id,
                 comparison_key: "api/model-a".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(25),
                 status: ReportMeasurementStatus::Observed,
                 missing_reason: None,
@@ -1362,6 +1462,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: not_mentioned_id,
                 comparison_key: "api/model-a".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(25),
                 status: ReportMeasurementStatus::NotMentioned,
                 missing_reason: None,
@@ -1370,6 +1471,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: refused_id,
                 comparison_key: "web/model-b".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(25),
                 status: ReportMeasurementStatus::Refused,
                 missing_reason: None,
@@ -1378,6 +1480,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: Uuid::new_v4(),
                 comparison_key: "web/model-b".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(25),
                 status: ReportMeasurementStatus::Missing,
                 missing_reason: Some("technical".to_owned()),
@@ -1423,6 +1526,7 @@ mod tests {
         input.measurement_targets = Some(vec![ReportMeasurementTarget {
             target_id: sample_id,
             comparison_key: "api/model-a".to_owned(),
+            question_binding: None,
             scheduled_at: instant(25),
             status: ReportMeasurementStatus::Observed,
             missing_reason: None,
@@ -1601,6 +1705,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: first_id,
                 comparison_key: "api/protocol-1".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(25),
                 status: ReportMeasurementStatus::Observed,
                 missing_reason: None,
@@ -1609,6 +1714,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: second_id,
                 comparison_key: "api/protocol-1".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(25),
                 status: ReportMeasurementStatus::NotMentioned,
                 missing_reason: None,
@@ -1617,6 +1723,7 @@ mod tests {
             ReportMeasurementTarget {
                 target_id: third_id,
                 comparison_key: "web/protocol-2".to_owned(),
+                question_binding: None,
                 scheduled_at: instant(25),
                 status: ReportMeasurementStatus::Refused,
                 missing_reason: None,
@@ -1632,6 +1739,30 @@ mod tests {
         assert_eq!(report.measurements.counts["observed"], 1);
         assert_eq!(report.measurements.counts["missing"], 2);
         assert!(!report.measurements.counts.contains_key("not_mentioned"));
-        assert_eq!(report.measurement_groups[0].coverage.expected_count, None);
+        assert_eq!(
+            report.measurement_groups[0].coverage.expected_count,
+            Some(2)
+        );
+        assert_eq!(
+            report.measurement_groups[1].coverage.expected_count,
+            Some(1)
+        );
+        // An unseen target's protocol is unknown. Do not infer per-group
+        // planned counts from the subset that happened to materialize.
+        input
+            .input_manifest_versions
+            .iter_mut()
+            .find(|manifest| manifest.kind == ReportManifestKind::Measurement)
+            .unwrap()
+            .expected_count = Some(4);
+        let partial = reduce_report(&scope, &input, 1, None, instant(29)).unwrap();
+        assert_eq!(partial.measurements.expected_count, Some(4));
+        assert_eq!(partial.measurements.counts["unmaterialized"], 1);
+        assert!(
+            partial
+                .measurement_groups
+                .iter()
+                .all(|group| group.coverage.expected_count.is_none())
+        );
     }
 }
