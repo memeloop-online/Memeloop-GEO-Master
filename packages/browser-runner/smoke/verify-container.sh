@@ -16,6 +16,5 @@ docker run --rm \
   --memory 2g \
   --shm-size 1g \
   --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=268435456 \
-  --tmpfs /home/pwuser:rw,nosuid,nodev,uid=1000,gid=1000,mode=700,size=134217728 \
   geo-interactive-smoke:local \
   node smoke/interactive-linux.mjs

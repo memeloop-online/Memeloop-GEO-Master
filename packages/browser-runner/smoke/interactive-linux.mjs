@@ -1,8 +1,22 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { constants } from "node:fs";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { createRunner } from "../src/runner.mjs";
 
 if (process.platform !== "linux") throw new Error("linux_smoke_required");
+assert.notEqual(process.getuid(), 0, "desktop must not run as root");
+assert.ok(isAbsolute(process.env.HOME), "runner HOME must be absolute");
+await access(process.env.HOME, constants.W_OK | constants.X_OK);
+await access(tmpdir(), constants.W_OK | constants.X_OK);
+const writable = await mkdtemp(join(tmpdir(), "geo-desktop-preflight-"));
+try {
+  await writeFile(join(writable, "writable"), "synthetic", { mode: 0o600 });
+} finally {
+  await rm(writable, { recursive: true, force: true });
+}
 const fixture = createServer((_request, response) => {
   response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   response.end(

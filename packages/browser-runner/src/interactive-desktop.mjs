@@ -104,6 +104,9 @@ export function createLinuxDesktopRuntime({
       await chmod(directory, 0o700);
       const authority = join(directory, "authority");
       const passwordFile = join(directory, "vnc-password");
+      const home = join(directory, "home");
+      const configHome = join(home, ".config");
+      const cacheHome = join(home, ".cache");
       let display;
       let displayLock;
       let xvnc;
@@ -160,6 +163,17 @@ export function createLinuxDesktopRuntime({
       let websocketPort;
       let vncPassword;
       try {
+        // Chromium's crashpad database and Openbox config must be writable
+        // even when the container root filesystem (including /home) is RO.
+        // Never put browser profile/cache state in another session's HOME.
+        await mkdir(home, { mode: 0o700 });
+        await mkdir(configHome, { mode: 0o700 });
+        await mkdir(cacheHome, { mode: 0o700 });
+        for (const location of [home, configHome, cacheHome]) {
+          const check = join(location, ".writable");
+          await writeFile(check, "", { mode: 0o600, flag: "wx" });
+          await rm(check);
+        }
         for (let attempt = 0; attempt < 64; attempt++) {
           const candidate = randomInt(100, 4000);
           const lock = join(tmpdir(), `geo-display-${candidate}.lock`);
@@ -193,6 +207,9 @@ export function createLinuxDesktopRuntime({
         if (vncPort === websocketPort) throw new Error("desktop_port_conflict");
         const env = {
           ...process.env,
+          HOME: home,
+          XDG_CONFIG_HOME: configHome,
+          XDG_CACHE_HOME: cacheHome,
           DISPLAY: `:${display}`,
           XAUTHORITY: authority,
           XDG_RUNTIME_DIR: directory,
