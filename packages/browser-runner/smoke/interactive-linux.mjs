@@ -25,6 +25,8 @@ const fixture = createServer((_request, response) => {
   );
 });
 await new Promise((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+let identityProbeError;
+let identityProbeResult;
 const runner = createRunner({
   interactiveRuntime: "linux-vnc",
   platformAdapters: {
@@ -33,16 +35,28 @@ const runner = createRunner({
       connectorVersion: "fixture.v1",
       operations: [],
       async identify(page) {
-        const visible = await page.locator("main").textContent();
-        const cookie = await page.evaluate(() => document.cookie);
-        const image = await page.screenshot({ type: "png" });
-        assert.ok(
-          image.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")),
-        );
-        return visible === "Synthetic account" &&
-          cookie.includes("fixture=ready")
-          ? { platform_account_id: "fixture-only", display_name: "Synthetic" }
-          : null;
+        try {
+          const visible = await page.locator("main").textContent();
+          const cookie = await page.evaluate(() => document.cookie);
+          const image = await page.screenshot({ type: "png" });
+          identityProbeResult = {
+            text: visible === "Synthetic account",
+            cookie: cookie.includes("fixture=ready"),
+            screenshot: image
+              .subarray(0, 8)
+              .equals(Buffer.from("89504e470d0a1a0a", "hex")),
+          };
+          assert.ok(identityProbeResult.screenshot);
+          return identityProbeResult.text && identityProbeResult.cookie
+            ? { platform_account_id: "fixture-only", display_name: "Synthetic" }
+            : null;
+        } catch (error) {
+          // This isolated fixture never opens a real platform or account.
+          // Surface its suppressed probe failure rather than diagnosing only
+          // the resulting login_required status.
+          identityProbeError = error;
+          throw error;
+        }
       },
     },
   },
@@ -51,6 +65,12 @@ try {
   const created = await runner.create({
     session_id: "synthetic",
     platform: "fixture",
+  });
+  assert.ifError(identityProbeError);
+  assert.deepEqual(identityProbeResult, {
+    text: true,
+    cookie: true,
+    screenshot: true,
   });
   assert.equal(created.phase, "ready_to_complete");
   const endpoint = runner.desktopEndpoint("synthetic");
