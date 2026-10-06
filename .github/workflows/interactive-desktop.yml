@@ -1,0 +1,36 @@
+name: Interactive desktop runtime
+
+on:
+  push:
+    paths:
+      - "packages/browser-runner/**"
+      - ".github/workflows/interactive-desktop.yml"
+  pull_request:
+    paths:
+      - "packages/browser-runner/**"
+      - ".github/workflows/interactive-desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-desktop:
+    name: Isolated headed browser and stock VNC transport
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and exercise isolated desktop
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          bash packages/browser-runner/smoke/verify-container.sh 2>&1 | tee logs/interactive-desktop.log
+      - name: Preserve synthetic runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interactive-desktop-diagnostics
+          path: logs/interactive-desktop.log
+          if-no-files-found: warn

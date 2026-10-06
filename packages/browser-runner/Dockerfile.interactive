@@ -1,0 +1,27 @@
+FROM mcr.microsoft.com/playwright:v1.63.0-noble
+
+# Ubuntu Noble packages, fixed to the distribution build versions. The
+# runner and virtual desktop are not a tenant boundary on their own; run one
+# restricted container/pod per interactive session in production.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tigervnc-standalone-server=1.13.1+dfsg-2build2 \
+    tigervnc-tools=1.13.1+dfsg-2build2 \
+    websockify=0.10.0+dfsg1-5build2 \
+    openbox=3.6.1-12build5 \
+    xauth=1:1.1.2-1build1 \
+    fonts-noto-cjk=1:20230817+repack1-3 \
+    fonts-noto-color-emoji=2.042-1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+COPY src ./src
+COPY smoke ./smoke
+COPY THIRD_PARTY_NOTICES.md ./THIRD_PARTY_NOTICES.md
+
+USER pwuser
+ENV GEO_BROWSER_RUNNER_HOST=127.0.0.1 \
+    GEO_BROWSER_INTERACTIVE_RUNTIME=linux-vnc
+EXPOSE 38080
+CMD ["node", "src/server.mjs"]

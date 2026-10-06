@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
+import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
 
 const ID = /^[a-zA-Z0-9_-]{1,128}$/;
 const VIEWPORT = Object.freeze({ width: 1280, height: 800 });
@@ -109,6 +110,8 @@ export function createRunner(options = {}) {
   const {
     browserType = chromium,
     browserChannel = process.env.GEO_BROWSER_CHANNEL,
+    interactiveRuntime = process.env.GEO_BROWSER_INTERACTIVE_RUNTIME,
+    desktopRuntime,
     sessionIdleMs = 15 * 60_000,
     executionRetentionMs = 5 * 60_000,
     executionTimeoutMs = 120_000,
@@ -126,6 +129,12 @@ export function createRunner(options = {}) {
       ? options.platformAdapters
       : defaultAdapters;
   const selectedBrowserChannel = parseBrowserChannel(browserChannel);
+  if (interactiveRuntime !== undefined && interactiveRuntime !== "linux-vnc")
+    throw new Error("invalid_interactive_runtime");
+  const desktop =
+    interactiveRuntime === "linux-vnc"
+      ? (desktopRuntime ?? createLinuxDesktopRuntime())
+      : null;
   if (
     ![
       sessionIdleMs,
@@ -141,6 +150,10 @@ export function createRunner(options = {}) {
   const executions = new Map();
   let browserPromise;
   let reapingPromise;
+
+  function dispose(record) {
+    return record.desktop ? record.desktop.close() : record.context.close();
+  }
 
   function capabilities() {
     return {
@@ -186,9 +199,13 @@ export function createRunner(options = {}) {
   function session(id) {
     const found = sessions.get(id);
     if (!found) throw new RunnerError(404, "session_not_found");
+    if (found.desktop?.closed) {
+      sessions.delete(id);
+      throw new RunnerError(404, "session_not_found");
+    }
     if (!found.busy && clock() - found.lastTouched >= sessionIdleMs) {
       sessions.delete(id);
-      void found.context.close().catch(() => {});
+      void dispose(found).catch(() => {});
       throw new RunnerError(404, "session_not_found");
     }
     found.lastTouched = clock();
@@ -201,9 +218,12 @@ export function createRunner(options = {}) {
       const now = clock();
       const expired = [];
       for (const [id, record] of sessions) {
-        if (!record.busy && now - record.lastTouched >= sessionIdleMs) {
+        if (
+          record.desktop?.closed ||
+          (!record.busy && now - record.lastTouched >= sessionIdleMs)
+        ) {
           sessions.delete(id);
-          expired.push(record.context.close());
+          expired.push(dispose(record));
         }
       }
       for (const [id, entry] of executions) {
@@ -248,6 +268,7 @@ export function createRunner(options = {}) {
 
   async function snapshot(id) {
     const record = session(id);
+    if (record.desktop) throw new RunnerError(409, "desktop_session_required");
     const screenshot = await record.page.screenshot({
       type: "png",
       animations: "disabled",
@@ -283,15 +304,28 @@ export function createRunner(options = {}) {
     const storageState = parseState(input.storage_state);
     pendingSessions.add(input.session_id);
     let context;
+    let desktopSession;
     try {
-      context = await (
-        await browser()
-      ).newContext({
-        viewport: VIEWPORT,
-        ...(proxy ? { proxy } : {}),
-        ...(storageState ? { storageState } : {}),
-      });
-      const page = await context.newPage();
+      let page;
+      if (desktop) {
+        desktopSession = await desktop.open({
+          browserType,
+          browserChannel: selectedBrowserChannel,
+          proxy,
+          storageState,
+          viewport: VIEWPORT,
+        });
+        ({ context, page } = desktopSession);
+      } else {
+        context = await (
+          await browser()
+        ).newContext({
+          viewport: VIEWPORT,
+          ...(proxy ? { proxy } : {}),
+          ...(storageState ? { storageState } : {}),
+        });
+        page = await context.newPage();
+      }
       // The caller cannot provide navigation targets. OAuth redirects, if any,
       // are handled by the platform's own UI in this isolated context.
       await page.goto(adapter.entry, {
@@ -304,6 +338,7 @@ export function createRunner(options = {}) {
         connectorVersion: adapter.connectorVersion,
         context,
         page,
+        desktop: desktopSession,
         proxy,
         identity: null,
         completed: false,
@@ -313,7 +348,8 @@ export function createRunner(options = {}) {
       sessions.set(input.session_id, record);
       return { session_id: input.session_id, phase: await phase(record) };
     } catch (error) {
-      if (context) await context.close();
+      if (desktopSession) await desktopSession.close();
+      else if (context) await context.close();
       throw error;
     } finally {
       pendingSessions.delete(input.session_id);
@@ -322,6 +358,7 @@ export function createRunner(options = {}) {
 
   async function action(id, input) {
     const record = session(id);
+    if (record.desktop) throw new RunnerError(409, "desktop_session_required");
     if (record.completed) throw new RunnerError(409, "connection_completed");
     // Once identity is established, only typed executions may change page state.
     if ((await phase(record)) === "ready_to_complete") {
@@ -384,6 +421,44 @@ export function createRunner(options = {}) {
   async function complete(id) {
     const record = session(id);
     if (record.busy) throw new RunnerError(409, "session_busy");
+    if (record.desktop) {
+      // RFB bypasses the old per-action guard: disconnect remote input before
+      // saving state, and recheck identity AFTER input is no longer possible.
+      record.busy = true;
+      let revokingInput = false;
+      try {
+        if (isChallenge(record.page)) throw new RunnerError(409, "challenge");
+        const identity = await record.adapter.identify(record.page);
+        if (!validateIdentity(identity))
+          throw new RunnerError(409, "login_required");
+        if (
+          record.identity &&
+          record.identity.platform_account_id !== identity.platform_account_id
+        )
+          throw new RunnerError(409, "account_mismatch");
+        revokingInput = true;
+        await record.desktop.closeInput();
+        const finalIdentity = await record.adapter.identify(record.page);
+        if (
+          !validateIdentity(finalIdentity) ||
+          finalIdentity.platform_account_id !== identity.platform_account_id
+        )
+          throw new RunnerError(409, "account_mismatch");
+        const storage_state = await record.context.storageState();
+        record.identity = finalIdentity;
+        record.completed = true;
+        return { identity: finalIdentity, storage_state };
+      } catch (error) {
+        // An ordinary incomplete-login probe must not strand the user.
+        if (revokingInput || record.desktop.closed) {
+          sessions.delete(id);
+          await dispose(record).catch(() => {});
+        }
+        throw error;
+      } finally {
+        record.busy = false;
+      }
+    }
     if (isChallenge(record.page)) throw new RunnerError(409, "challenge");
     const identity = await record.adapter.identify(record.page);
     if (!validateIdentity(identity))
@@ -397,6 +472,18 @@ export function createRunner(options = {}) {
     record.identity = identity;
     record.completed = true;
     return { identity, storage_state: await record.context.storageState() };
+  }
+
+  // Trusted gateway only. Never serialize this value in runner HTTP responses.
+  function desktopEndpoint(id) {
+    const record = session(id);
+    if (!record.desktop || record.completed || record.busy)
+      throw new RunnerError(409, "desktop_unavailable");
+    try {
+      return record.desktop.endpoint();
+    } catch {
+      throw new RunnerError(409, "desktop_unavailable");
+    }
   }
 
   async function measurementOptions(id) {
@@ -486,7 +573,7 @@ export function createRunner(options = {}) {
         if (sessions.get(input.session_id) === record) {
           sessions.delete(input.session_id);
         }
-        void record.context.close().catch(() => {});
+        void dispose(record).catch(() => {});
         return {
           status: "unknown",
           reason: "execution_deadline",
@@ -563,21 +650,22 @@ export function createRunner(options = {}) {
     const record = session(id);
     if (record.busy) throw new RunnerError(409, "session_busy");
     sessions.delete(id);
-    await record.context.close();
+    await dispose(record);
   }
 
   async function shutdown() {
     clearInterval(maintenance);
-    const contexts = [...sessions.values()].map((record) => record.context);
+    const records = [...sessions.values()];
     sessions.clear();
     executions.clear();
-    await Promise.allSettled(contexts.map((context) => context.close()));
+    await Promise.allSettled(records.map((record) => dispose(record)));
     if (browserPromise) await (await browserPromise).close();
   }
 
   return {
     executionProvenance: provenance,
     create,
+    desktopEndpoint,
     snapshot,
     action,
     complete,
