@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, CycleReportView, InitialSource, PendingSuccessorCycle, Project, ProjectCreate,
-    ProjectId, ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartAcceptance,
-    ProjectStartCommand, ProjectStartView, ProjectStatus, ResourceMode, StartAcceptanceStatus,
-    TenantScope, UpdateProject, next_calendar_week_window, previous_calendar_week_window,
-    settings_hash, start_request_hash,
+    AppError, ContentProjectGuard, CycleReportView, InitialSource, PendingSuccessorCycle, Project,
+    ProjectCreate, ProjectId, ProjectPatch, ProjectRepository, ProjectSettings,
+    ProjectStartAcceptance, ProjectStartCommand, ProjectStartView, ProjectStatus, ResourceMode,
+    StartAcceptanceStatus, TenantScope, UpdateProject, next_calendar_week_window,
+    previous_calendar_week_window, settings_hash, start_request_hash,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -447,6 +447,19 @@ fn scope_predicate<'a>(builder: &mut QueryBuilder<'a, Postgres>, scope: &'a Tena
 
 #[async_trait]
 impl ProjectRepository for PgProjectRepository {
+    async fn hold_content_project<'a>(
+        &'a self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        if scope.project_id.is_some_and(|bound| bound != project_id) {
+            return Err(AppError::not_found("project not found"));
+        }
+        // The PG content repository locks the project row and rechecks active
+        // eligibility inside the content transaction; a separate read lock
+        // would be released before that transaction can commit.
+        Ok(ContentProjectGuard::transactional())
+    }
     async fn list(&self, scope: &TenantScope) -> Result<Vec<Project>, AppError> {
         let mut transaction = self.pool.begin().await.map_err(map_database_error)?;
         crate::scope::set_local_scope(&mut transaction, scope)

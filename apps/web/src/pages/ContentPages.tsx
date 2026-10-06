@@ -10,7 +10,12 @@ import {
   Select,
   Textarea,
 } from "@fluentui/react-components";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import { ApiError } from "../api/client";
 import {
   type ContentBlock,
@@ -24,6 +29,7 @@ import {
   useContentExecutionsQuery,
   useContentItemsQuery,
   useContentRevisionsQuery,
+  useForkReusedContentItemMutation,
   useStartContentExecutionMutation,
 } from "../api/content";
 import { useDocumentManifestQuery } from "../api/documentManifests";
@@ -144,8 +150,32 @@ function ItemCard({
               </dd>
             </>
           )}
+          {item?.reuse_binding && (
+            <>
+              <dt>跨周期复用</dt>
+              <dd>
+                复用已检查版本；本轮仍有独立清单项和覆盖记录，正文与检查证据来自原资产。
+                原执行 {item.reuse_binding.origin_execution_id} · 原清单项{" "}
+                {item.reuse_binding.origin_item_id} · 检查{" "}
+                {item.reuse_binding.check_id}
+              </dd>
+            </>
+          )}
         </dl>
-        {item?.asset_id ? (
+        {item?.reuse_binding ? (
+          <>
+            <Link
+              to={`${encodeURIComponent(item.asset_id ?? item.reuse_binding.asset_id)}?reuse_execution_id=${encodeURIComponent(item.execution_id)}&reuse_item_id=${encodeURIComponent(item.item_id)}`}
+            >
+              {item.asset_id && item.asset_id !== item.reuse_binding.asset_id
+                ? "查看本轮修订正文与版本"
+                : "查看复用正文与原检查证据"}
+            </Link>{" "}
+            <Link to={encodeURIComponent(item.reuse_binding.asset_id)}>
+              查看原资产（直接编辑将修改原资产）
+            </Link>
+          </>
+        ) : item?.asset_id ? (
           <Link to={encodeURIComponent(item.asset_id)}>查看正文与版本</Link>
         ) : executionState === "loading" || executionState === "unavailable" ? (
           <p>正文资产状态待读取；此项仍计入冻结清单分母。</p>
@@ -485,13 +515,16 @@ function RevisionEditor({
   projectId,
   assetId,
   readonly,
+  forkContext,
 }: {
   revision: ContentRevision;
   tenantId: string;
   projectId: string;
   assetId: string;
   readonly: boolean;
+  forkContext?: { executionId: string; itemId: string };
 }) {
+  const navigate = useNavigate();
   const [draft, setDraft] = useState<StructuredDocument>(() =>
     structuredClone(revision.document),
   );
@@ -499,11 +532,14 @@ function RevisionEditor({
   const [dirty, setDirty] = useState(false);
   const [conflicted, setConflicted] = useState(false);
   const [saved, setSaved] = useState(false);
-  const mutation = useAppendContentRevisionMutation(
+  const append = useAppendContentRevisionMutation(tenantId, projectId, assetId);
+  const fork = useForkReusedContentItemMutation(
     tenantId,
     projectId,
-    assetId,
+    forkContext?.executionId ?? "",
+    forkContext?.itemId ?? "",
   );
+  const mutation = forkContext ? fork : append;
 
   useEffect(() => {
     if (!dirty && !saved && revision.revision_id !== baseId) {
@@ -527,6 +563,11 @@ function RevisionEditor({
           setBaseId(result.revision_id);
           setDirty(false);
           setSaved(true);
+          if (forkContext) {
+            navigate(
+              `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/content/${encodeURIComponent(result.asset_id)}`,
+            );
+          }
         },
         onError: (error) => {
           if (error instanceof ApiError && error.status === 409)
@@ -550,6 +591,11 @@ function RevisionEditor({
         当前基线 v{revision.revision} · {baseId}。每次保存追加不可变版本，
         不覆盖已发布内容；编辑后需要重新检查。
       </p>
+      {forkContext && (
+        <p>
+          当前正文复用原资产。编辑会在本轮创建新资产和草稿，保留原版本及检查证据；新草稿须独立检查，不需要人工审批。
+        </p>
+      )}
       {readonly && <p>当前成员只可查看正文。</p>}
       <Field label="标题">
         <Input
@@ -653,7 +699,11 @@ function RevisionEditor({
             disabled={!dirty || mutation.isPending || conflicted}
             onClick={save}
           >
-            {mutation.isPending ? "正在保存…" : "保存新版本"}
+            {mutation.isPending
+              ? "正在保存…"
+              : forkContext
+                ? "创建本轮修订"
+                : "保存新版本"}
           </Button>
         </div>
       )}
@@ -703,6 +753,15 @@ function AssetContent({
 }) {
   const { session } = useAuth();
   const readonly = !mayEdit(membershipForTenant(session, tenantId)?.role);
+  const [searchParams] = useSearchParams();
+  const reuseExecutionId = searchParams.get("reuse_execution_id");
+  const reuseItemId = searchParams.get("reuse_item_id");
+  const hasReuseContext = Boolean(reuseExecutionId || reuseItemId);
+  const contextualItems = useContentItemsQuery(
+    tenantId,
+    projectId,
+    reuseExecutionId ?? undefined,
+  );
   const asset = useContentAssetQuery(tenantId, projectId, assetId);
   const history = useContentRevisionsQuery(tenantId, projectId, assetId);
   const [selectedId, setSelectedId] = useState<string>();
@@ -711,24 +770,73 @@ function AssetContent({
   );
   const selected =
     history.data?.find((revision) => revision.revision_id === selectedId) ??
+    (hasReuseContext
+      ? history.data?.find(
+          (revision) =>
+            revision.revision_id ===
+            contextualItems.data?.find((item) => item.item_id === reuseItemId)
+              ?.reuse_binding?.revision_id,
+        )
+      : undefined) ??
     current;
   const sorted = useMemo(
     () => [...(history.data ?? [])].sort((a, b) => b.revision - a.revision),
     [history.data],
   );
+  const contextualItem = contextualItems.data?.find(
+    (item) =>
+      item.item_id === reuseItemId && item.execution_id === reuseExecutionId,
+  );
+  const isReusedSource =
+    contextualItem?.reuse_binding?.asset_id === assetId &&
+    contextualItem.asset_id === assetId &&
+    history.data?.some(
+      (revision) =>
+        revision.revision_id === contextualItem.reuse_binding?.revision_id,
+    );
+  const isForkedCurrent =
+    contextualItem?.reuse_binding &&
+    contextualItem.asset_id === assetId &&
+    contextualItem.reuse_binding.asset_id !== assetId;
+  const validContext = isReusedSource || isForkedCurrent;
 
-  if (asset.isPending || history.isPending)
+  if (
+    asset.isPending ||
+    history.isPending ||
+    (hasReuseContext && contextualItems.isPending)
+  )
     return <LoadingState label="正在加载正文与版本历史" />;
-  if (asset.isError || history.isError) {
-    const error = asset.error ?? history.error ?? new Error("内容资产不可用");
+  if (
+    asset.isError ||
+    history.isError ||
+    (hasReuseContext && contextualItems.isError)
+  ) {
+    const error =
+      asset.error ??
+      history.error ??
+      contextualItems.error ??
+      new Error("内容资产不可用");
     return (
       <ErrorState
         title={apiTitle(error, "无法读取内容资产")}
         detail={error.message}
-        onRetry={() => void Promise.all([asset.refetch(), history.refetch()])}
+        onRetry={() =>
+          void Promise.all([
+            asset.refetch(),
+            history.refetch(),
+            ...(hasReuseContext ? [contextualItems.refetch()] : []),
+          ])
+        }
       />
     );
   }
+  if (hasReuseContext && (!reuseExecutionId || !reuseItemId || !validContext))
+    return (
+      <ErrorState
+        title="无法核对本轮复用项"
+        detail="资产与本轮清单项或原版本不匹配；不会将编辑写入原资产。请返回本轮内容清单重新打开。"
+      />
+    );
   if (!asset.data || !history.data?.length || !current)
     return (
       <EmptyState
@@ -755,6 +863,30 @@ function AssetContent({
         </Button>
       </section>
       <Link to="../content">← 返回内容资产</Link>
+      {contextualItem?.reuse_binding && (
+        <Card className="panel-card">
+          <h2>复用来源与本轮覆盖</h2>
+          <p>
+            本轮执行 {contextualItem.execution_id} · 清单项{" "}
+            {contextualItem.item_id}； 复用原执行{" "}
+            {contextualItem.reuse_binding.origin_execution_id} · 原清单项{" "}
+            {contextualItem.reuse_binding.origin_item_id} · 检查{" "}
+            {contextualItem.reuse_binding.check_id}
+            。本轮覆盖独立记录，原资产和检查证据保持不变。
+          </p>
+          <Link
+            to={`../content/${encodeURIComponent(contextualItem.reuse_binding.asset_id)}`}
+          >
+            打开原资产（直接编辑将修改原资产）
+          </Link>
+        </Card>
+      )}
+      {!hasReuseContext && current.derived_from_revision_id && (
+        <p>
+          此版本从其他资产的版本 {current.derived_from_revision_id}{" "}
+          派生；原资产与历史版本保持不变。
+        </p>
+      )}
       {selected && (
         <>
           <Card className="panel-card">
@@ -780,14 +912,26 @@ function AssetContent({
               ))}
             </ul>
           </Card>
-          {selected.revision_id === current.revision_id ? (
+          {(selected.revision_id === current.revision_id && !isReusedSource) ||
+          (isReusedSource &&
+            selected.revision_id ===
+              contextualItem?.reuse_binding?.revision_id) ? (
             <RevisionEditor
-              key={assetId}
-              revision={current}
+              key={`${assetId}/${selected.revision_id}`}
+              revision={selected}
               tenantId={tenantId}
               projectId={projectId}
               assetId={assetId}
               readonly={readonly}
+              forkContext={
+                isReusedSource &&
+                selected.revision_id ===
+                  contextualItem?.reuse_binding?.revision_id &&
+                reuseExecutionId &&
+                reuseItemId
+                  ? { executionId: reuseExecutionId, itemId: reuseItemId }
+                  : undefined
+              }
             />
           ) : (
             <Card className="panel-card">

@@ -71,6 +71,15 @@ export interface ContentItem {
   asset_id: string | null;
   current_revision_id: string | null;
   ready_revision_id: string | null;
+  reuse_binding?: {
+    origin_execution_id: string;
+    origin_item_id: string;
+    asset_id: string;
+    revision_id: string;
+    check_id: string;
+    fingerprint: string;
+    reused_at: string;
+  } | null;
   automatic_repair_count?: number;
   steps: Array<{
     step: "prepare" | "generate" | "check" | "repair";
@@ -113,6 +122,7 @@ export interface ContentRevision {
   asset_id: string;
   revision: number;
   base_revision_id: string | null;
+  derived_from_revision_id?: string | null;
   document: StructuredDocument;
   markdown: string;
   evidence: ContentEvidenceRef[];
@@ -234,6 +244,24 @@ export function appendContentRevision(
 ) {
   return apiFetch<ContentRevision>(
     `${projectPath(projectId)}/contents/${encoded(assetId)}/revisions`,
+    {
+      ...scopeOptions(tenantId, projectId),
+      method: "POST",
+      body: { base_revision_id: baseRevisionId, document },
+    },
+  );
+}
+
+export function forkReusedContentItem(
+  tenantId: string,
+  projectId: string,
+  executionId: string,
+  itemId: string,
+  baseRevisionId: string,
+  document: StructuredDocument,
+) {
+  return apiFetch<ContentRevision>(
+    `${projectPath(projectId)}/document-executions/${encoded(executionId)}/items/${encoded(itemId)}/fork`,
     {
       ...scopeOptions(tenantId, projectId),
       method: "POST",
@@ -431,6 +459,48 @@ export function useAppendContentRevisionMutation(
           queryKey: key(scope, "revisions", assetId),
         });
       }
+    },
+  });
+}
+
+export function useForkReusedContentItemMutation(
+  tenantId: string,
+  projectId: string,
+  executionId: string,
+  itemId: string,
+) {
+  const { session } = useAuth();
+  const client = useQueryClient();
+  const scope = session && queryScopeFor(session, tenantId, projectId);
+  return useMutation({
+    mutationFn: ({
+      baseRevisionId,
+      document,
+    }: {
+      baseRevisionId: string;
+      document: StructuredDocument;
+    }) =>
+      forkReusedContentItem(
+        tenantId,
+        projectId,
+        executionId,
+        itemId,
+        baseRevisionId,
+        document,
+      ),
+    onSuccess: async (result) => {
+      if (!scope) return;
+      await Promise.all([
+        client.invalidateQueries({
+          queryKey: key(scope, "items", executionId),
+        }),
+        client.invalidateQueries({
+          queryKey: key(scope, "asset", result.asset_id),
+        }),
+        client.invalidateQueries({
+          queryKey: key(scope, "revisions", result.asset_id),
+        }),
+      ]);
     },
   });
 }

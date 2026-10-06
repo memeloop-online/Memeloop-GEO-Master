@@ -2,13 +2,13 @@
 use chrono::{Duration, Utc};
 use geo_domain::{
     ChannelJobRepository, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelTargetInput,
-    ContentBlock, ContentBlockKind, ContentCoverage, ContentExecution, ContentExecutionStatus,
-    ContentHandoff, ContentHandoffItem, ContentItemStatus, ContentRevision, DistributionRepository,
-    DistributionTargetStatus, DocumentManifest, DocumentManifestItemState, ErrorCode,
-    FreezeDistribution, InitialSource, InitialSourceKind, InitialSourceVisibility,
-    PlatformPlacement, PreparedDistribution, ProjectCreate, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, StructuredDocument, TenantScope, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    ChunkLocator, ContentBlock, ContentBlockKind, ContentCheck, ContentCoverage, ContentEvidence,
+    ContentExecution, ContentExecutionStatus, ContentHandoff, ContentHandoffItem,
+    ContentItemStatus, ContentRevision, DistributionRepository, DistributionTargetStatus,
+    DocumentManifest, DocumentManifestItemState, ErrorCode, EvidenceRef, FreezeDistribution,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, PlatformPlacement,
+    PreparedDistribution, ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand,
+    StructuredDocument, TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgChannelJobRepository, PgDistributionRepository, PgProjectRepository,
@@ -101,6 +101,80 @@ async fn fixture(pool: &PgPool) -> Fixture {
          sequence,index_build_id,pipeline_versions,content_hash,coverage) \
          VALUES($1,$2,$3,$4,1,'fixture','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}')"
     ).bind(release).bind(keys.0).bind(keys.1).bind(keys.2).execute(pool).await.unwrap();
+    let source = Uuid::new_v4();
+    let source_version = Uuid::new_v4();
+    let chunk_id = Uuid::new_v4();
+    let text = "Documented public capability.";
+    let locator = ChunkLocator::Text {
+        start_line: 1,
+        end_line: 1,
+        start_char: 0,
+        end_char: text.chars().count() as u32,
+    };
+    sqlx::query(
+        "INSERT INTO knowledge_sources \
+        (source_id,operator_id,tenant_id,project_id,revision,kind,name,purpose,state,locator) \
+        VALUES($1,$2,$3,$4,1,'text','Fixture evidence','public','active','{}')",
+    )
+    .bind(source)
+    .bind(keys.0)
+    .bind(keys.1)
+    .bind(keys.2)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_source_versions \
+        (source_version_id,operator_id,tenant_id,project_id,source_id,version,content_sha256,\
+         captured_at,parser_version,extraction_version) \
+        VALUES($1,$2,$3,$4,$5,1,$6,$7,'fixture-v1','fixture-v1')",
+    )
+    .bind(source_version)
+    .bind(keys.0)
+    .bind(keys.1)
+    .bind(keys.2)
+    .bind(source)
+    .bind("a".repeat(64))
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE knowledge_sources SET current_version_id=$1 WHERE source_id=$2")
+        .bind(source_version)
+        .bind(source)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_release_source_versions \
+        (knowledge_release_id,operator_id,tenant_id,project_id,source_version_id) \
+        VALUES($1,$2,$3,$4,$5)",
+    )
+    .bind(release)
+    .bind(keys.0)
+    .bind(keys.1)
+    .bind(keys.2)
+    .bind(source_version)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_chunks \
+        (chunk_id,operator_id,tenant_id,project_id,source_version_id,ordinal,kind,text,\
+         text_hash,locator,extraction_method,confidence) \
+        VALUES($1,$2,$3,$4,$5,0,'paragraph',$6,$7,$8,'fixture-v1',1)",
+    )
+    .bind(chunk_id)
+    .bind(keys.0)
+    .bind(keys.1)
+    .bind(keys.2)
+    .bind(source_version)
+    .bind(text)
+    .bind(hex::encode(Sha256::digest(text.as_bytes())))
+    .bind(serde_json::to_value(&locator).unwrap())
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE document_manifests SET state='ready',sealed=true,expected_count=2,scope_hash='fixture', \
          input_refs=$1 WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 AND manifest_id=$5"
@@ -114,10 +188,11 @@ async fn fixture(pool: &PgPool) -> Fixture {
         sqlx::query(
             "INSERT INTO document_manifest_items \
              (document_manifest_item_id,operator_id,tenant_id,project_id,manifest_id,knowledge_release_id, \
-             document_key,content_type,market,language,state,dependency_hash) \
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,'global','en','planned',$9)"
+             document_key,content_type,market,language,state,dependency_hash,source_version_refs) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,'global','en','planned',$9,$10)"
         ).bind(id).bind(keys.0).bind(keys.1).bind(keys.2).bind(document_id).bind(release)
-            .bind(name).bind(kind).bind(format!("dependency-{name}")).execute(pool).await.unwrap();
+            .bind(name).bind(kind).bind(format!("dependency-{name}"))
+            .bind(serde_json::json!([source_version])).execute(pool).await.unwrap();
     }
     let manifest = geo_domain::KnowledgeRepository::get_document_manifest(
         &geo_persistence::PgKnowledgeRepository::new(pool.clone()),
@@ -163,8 +238,8 @@ async fn fixture(pool: &PgPool) -> Fixture {
         blocks: vec![ContentBlock {
             block_id: Uuid::new_v4(),
             kind: ContentBlockKind::Paragraph,
-            text: "Fixture source-free paragraph.".into(),
-            citation_ids: vec![],
+            text: text.into(),
+            citation_ids: vec![chunk_id],
             items: vec![],
         }],
     };
@@ -173,10 +248,22 @@ async fn fixture(pool: &PgPool) -> Fixture {
         asset_id: Uuid::new_v4(),
         revision: 1,
         base_revision_id: None,
+        derived_from_revision_id: None,
         markdown: document.markdown(),
         document,
-        evidence: vec![],
-        quotes: vec![],
+        evidence: vec![EvidenceRef {
+            source_version_id: source_version,
+            chunk_id: Some(chunk_id),
+            locator: locator.clone(),
+        }],
+        quotes: vec![ContentEvidence {
+            reference: EvidenceRef {
+                source_version_id: source_version,
+                chunk_id: Some(chunk_id),
+                locator,
+            },
+            exact_quote: text.into(),
+        }],
         findings: vec![],
         created_at: Utc::now(),
     };
@@ -224,6 +311,28 @@ async fn fixture(pool: &PgPool) -> Fixture {
     ).bind(revision.revision_id).bind(keys.0).bind(keys.1).bind(keys.2).bind(execution_id)
         .bind(revision.asset_id).bind(serde_json::to_value(&revision).unwrap())
         .bind(revision.created_at).execute(pool).await.unwrap();
+    let check = ContentCheck {
+        check_id: Uuid::new_v4(),
+        revision_id: revision.revision_id,
+        findings: vec![],
+        created_at: Utc::now(),
+    };
+    sqlx::query(
+        "INSERT INTO content_checks \
+        (check_id,operator_id,tenant_id,project_id,execution_id,revision_id,body,created_at) \
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(check.check_id)
+    .bind(keys.0)
+    .bind(keys.1)
+    .bind(keys.2)
+    .bind(execution_id)
+    .bind(revision.revision_id)
+    .bind(serde_json::to_value(&check).unwrap())
+    .bind(check.created_at)
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO content_handoffs \
          (handoff_id,operator_id,tenant_id,project_id,execution_id,revision,body,created_at) \
@@ -270,6 +379,101 @@ fn freeze(fixture: &Fixture) -> FreezeDistribution {
             .collect(),
         sealed_at: Utc::now() - Duration::days(30),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL in GEO_TEST_DATABASE_URL"]
+async fn materialization_rechecks_live_frozen_source_before_any_command() {
+    let url = std::env::var("GEO_TEST_DATABASE_URL").expect("disposable database");
+    let database = Database::connect_and_migrate(&DatabaseConfig::from_url(url).unwrap())
+        .await
+        .unwrap();
+    let fixture = fixture(database.pool()).await;
+    let repository = PgDistributionRepository::from_database(&database);
+    let manifest = repository
+        .freeze(&fixture.scope, freeze(&fixture))
+        .await
+        .unwrap();
+    let page = repository
+        .expansion_page(&fixture.scope, manifest.manifest_id, 0, 6)
+        .await
+        .unwrap();
+    repository
+        .commit_expansion_page(&fixture.scope, manifest.manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let target = repository
+        .list_targets(&fixture.scope, manifest.manifest_id, None, 1)
+        .await
+        .unwrap()
+        .rows
+        .remove(0);
+    let source_version = fixture.revision.evidence[0].source_version_id;
+    let source: Uuid = sqlx::query_scalar(
+        "SELECT source_id FROM knowledge_source_versions \
+        WHERE source_version_id=$1",
+    )
+    .bind(source_version)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE knowledge_sources SET purpose='internal' WHERE source_id=$1")
+        .bind(source)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let prepared = PreparedDistribution {
+        manifest_id: manifest.manifest_id,
+        target_id: target.target_id,
+        revision: Some(fixture.revision.clone()),
+        account_id: Some(Uuid::new_v4()),
+        defer_reason: None,
+    };
+    let revoked = repository
+        .materialize(&fixture.scope, prepared.clone())
+        .await
+        .unwrap();
+    assert_eq!(revoked.target.status, DistributionTargetStatus::Deferred);
+    assert_eq!(revoked.target.reason.as_deref(), Some("source_unavailable"));
+    assert!(revoked.publication_commands.is_empty());
+    let commands: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM distribution_publication_commands WHERE project_id=$1",
+    )
+    .bind(fixture.scope.project_id.unwrap().as_uuid())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(commands, 0);
+    sqlx::query("UPDATE knowledge_sources SET purpose='public' WHERE source_id=$1")
+        .bind(source)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let valid = repository
+        .materialize(&fixture.scope, prepared.clone())
+        .await
+        .unwrap();
+    assert_eq!(valid.publication_commands.len(), 1);
+    sqlx::query("UPDATE knowledge_sources SET purpose='internal' WHERE source_id=$1")
+        .bind(source)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .materialize(&fixture.scope, prepared)
+            .await
+            .is_err(),
+        "a revoked bound intent must remain for reconciliation, not re-send"
+    );
+    let commands: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM distribution_publication_commands WHERE project_id=$1",
+    )
+    .bind(fixture.scope.project_id.unwrap().as_uuid())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(commands, 1);
 }
 
 async fn next_cycle(pool: &PgPool, first: &Fixture) -> Fixture {
@@ -320,10 +524,11 @@ async fn next_cycle(pool: &PgPool, first: &Fixture) -> Fixture {
             "INSERT INTO document_manifest_items \
              (document_manifest_item_id,operator_id,tenant_id,project_id,manifest_id,knowledge_release_id, \
              document_key,content_type,market,language,state,dependency_hash,source_version_refs) \
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'planned',$11,'[]')"
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'planned',$11,$12)"
         ).bind(Uuid::new_v4()).bind(op).bind(tenant).bind(project).bind(document_id)
             .bind(item.knowledge_release_id).bind(&item.document_key).bind(&item.content_type)
             .bind(&item.market).bind(&item.language).bind(&item.dependency_hash)
+            .bind(serde_json::to_value(&item.source_version_refs).unwrap())
             .execute(pool).await.unwrap();
     }
     let manifest = geo_domain::KnowledgeRepository::get_document_manifest(

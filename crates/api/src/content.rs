@@ -16,10 +16,11 @@ use chrono::Utc;
 use geo_domain::{
     AppError, ContentAsset, ContentBlock, ContentBlockKind, ContentBrief, ContentEvidence,
     ContentExecution, ContentFinding, ContentHandoff, ContentItem, ContentItemStatus,
-    ContentRepository, ContentRevision, ContentStep, DocumentManifest, DocumentManifestItemState,
-    DocumentManifestPlanRequest, ErrorCode, EvidenceRef, KnowledgeEvidence, KnowledgePurpose,
-    KnowledgeRepository, ProjectId, ProjectRepository, ProjectStatus, SourceState,
-    StructuredDocument, TenantScope,
+    ContentPublicEligibility, ContentRepository, ContentReuseDecision, ContentReuseRequest,
+    ContentRevision, ContentSemanticDescriptor, ContentStep, DOCUMENT_PLANNER_VERSION,
+    DocumentManifest, DocumentManifestItemState, DocumentManifestPlanRequest, ErrorCode,
+    EvidenceRef, KnowledgeEvidence, KnowledgePurpose, KnowledgeRepository, ProjectId,
+    ProjectRepository, ProjectStatus, SourceState, StructuredDocument, TenantScope,
 };
 use geo_worker::ModelCompletionRequest;
 use serde::Deserialize;
@@ -32,8 +33,13 @@ use crate::{
 };
 
 const POLICY_VERSION: &str = "evidence-content-v1";
+const OUTPUT_SCHEMA_VERSION: &str = "structured-document-v1";
+const EVIDENCE_POLICY_VERSION: &str = "located-public-evidence-v1";
+const CHECK_POLICY_VERSION: &str = "independent-factual-check-v1";
+const REPAIR_POLICY_VERSION: &str = "source-grounded-repair-v1";
+const GENERATION_POLICY_REVISION: &str = "initial";
 const MAX_EVIDENCE: usize = 24;
-const MAX_QUOTE_CHARS: usize = 1600;
+const MAX_QUOTE_CHARS: usize = geo_domain::CONTENT_EVIDENCE_MAX_QUOTE_CHARS;
 const MAX_BLOCKS: usize = 32;
 // Provider operations may legitimately take several minutes. Keep the fence
 // alive beyond the configured per-call deadline; a stale worker still cannot
@@ -61,6 +67,53 @@ fn stable_id(key: &str) -> Uuid {
 
 fn title_check_id(revision_id: Uuid) -> Uuid {
     stable_id(&format!("content-title-check:{revision_id}"))
+}
+
+fn selected_quotes(selected: &[KnowledgeEvidence]) -> Vec<ContentEvidence> {
+    selected
+        .iter()
+        .map(|e| ContentEvidence {
+            reference: EvidenceRef {
+                source_version_id: e.source_version_id,
+                chunk_id: Some(e.chunk_id),
+                locator: e.locator.clone(),
+            },
+            exact_quote: e.quote.clone(),
+        })
+        .collect()
+}
+
+fn prompt_evidence(quotes: &[ContentEvidence]) -> Vec<serde_json::Value> {
+    quotes
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "source_version_id": e.reference.source_version_id,
+                "chunk_id": e.reference.chunk_id,
+                "locator": e.reference.locator,
+                "quote": e.exact_quote,
+            })
+        })
+        .collect()
+}
+
+fn live_quotes_match(brief: &ContentBrief, current: &[KnowledgeEvidence]) -> bool {
+    !brief.quotes.is_empty()
+        && brief.quotes == selected_quotes(current)
+        && same_evidence(&brief.evidence, current)
+}
+
+fn eligibility(
+    manifest_id: Uuid,
+    item: &ContentItem,
+    evidence: Vec<ContentEvidence>,
+) -> ContentPublicEligibility {
+    ContentPublicEligibility {
+        document_manifest_id: manifest_id,
+        document_manifest_item_id: item.item_id,
+        source_version_ids: item.source_version_refs.clone(),
+        evidence,
+    }
 }
 
 #[derive(Clone)]
@@ -140,7 +193,7 @@ impl ContentService {
             if !item
                 .brief
                 .as_ref()
-                .is_some_and(|b| same_evidence(&b.evidence, &current))
+                .is_some_and(|b| live_quotes_match(b, &current))
             {
                 self.content
                     .invalidate_ready(
@@ -152,7 +205,59 @@ impl ContentService {
                     .await?;
             }
         }
-        self.content.close(scope, execution_id).await
+        // The immutable handoff is the public release boundary. Recheck all
+        // still-ready branches while holding the project and source readers
+        // through the actual content repository seal (no model awaits here).
+        let ready = self
+            .content
+            .list_items(scope, execution_id)
+            .await?
+            .into_iter()
+            .filter(|item| item.status == ContentItemStatus::Ready)
+            .collect::<Vec<_>>();
+        let inputs: Vec<_> = ready
+            .iter()
+            .map(|item| {
+                item.brief
+                    .as_ref()
+                    .map(|brief| eligibility(execution.manifest_id, item, brief.quotes.clone()))
+                    .ok_or_else(|| AppError::conflict("ready document brief missing"))
+            })
+            .collect::<Result<_, _>>()?;
+        let project_guard = self
+            .projects
+            .hold_content_project(scope, execution.project_id)
+            .await?;
+        let knowledge_guard = self.knowledge.hold_content_evidence(scope, &inputs).await?;
+        // Another checker may have completed after the snapshot but before
+        // the guards were acquired. Never seal a ready branch absent from the
+        // verified set; retry will gather and guard the new complete set.
+        let latest = self
+            .content
+            .list_items(scope, execution_id)
+            .await?
+            .into_iter()
+            .filter(|item| item.status == ContentItemStatus::Ready)
+            .collect::<Vec<_>>();
+        let same_ready_set = ready.len() == latest.len()
+            && ready.iter().all(|item| {
+                latest.iter().any(|current| {
+                    current.item_id == item.item_id
+                        && current.ready_revision_id == item.ready_revision_id
+                        && current.source_version_refs == item.source_version_refs
+                        && current.brief == item.brief
+                })
+            });
+        let sealed = if same_ready_set {
+            self.content.close(scope, execution_id).await
+        } else {
+            Err(AppError::conflict(
+                "ready content changed during handoff validation",
+            ))
+        };
+        drop(knowledge_guard);
+        drop(project_guard);
+        sealed
     }
 
     pub async fn start(
@@ -263,47 +368,136 @@ impl ContentService {
                 )
                 .await;
         }
-        let lease = self
-            .content
-            .claim(
+        let references: Vec<_> = selected_quotes(&selected);
+        let brief_title = item.document_key.clone();
+        let brief_objective = format!(
+            "Create a {} document grounded only in the prepared evidence.",
+            item.document_key
+        );
+        let (descriptor, manifest_id) = self
+            .semantic_descriptor(
                 scope,
                 execution_id,
-                item_id,
-                ContentStep::Prepare,
-                POLICY_VERSION,
-                Utc::now(),
-                LEASE_SECONDS,
+                &item,
+                references.clone(),
+                &brief_title,
+                &brief_objective,
             )
             .await?;
+        let project_guard = self
+            .projects
+            .hold_content_project(scope, scope.project_id.expect("project scope"))
+            .await?;
+        let knowledge_guard = self
+            .knowledge
+            .hold_content_evidence(
+                scope,
+                &[eligibility(manifest_id, &item, descriptor.evidence.clone())],
+            )
+            .await?;
+        let lease = match self
+            .content
+            .prepare_or_reuse(
+                scope,
+                ContentReuseRequest {
+                    execution_id,
+                    item_id,
+                    descriptor,
+                    owner: POLICY_VERSION.into(),
+                    now: Utc::now(),
+                    ttl_seconds: LEASE_SECONDS,
+                },
+            )
+            .await?
+        {
+            ContentReuseDecision::Ready(item)
+            | ContentReuseDecision::Busy(item)
+            | ContentReuseDecision::InsufficientEvidence(item) => return Ok(item),
+            ContentReuseDecision::Reserved { lease, .. } => lease,
+        };
         let brief = ContentBrief {
             brief_id: stable_id(&format!("brief:{}:{}", item.branch_key, item.input_hash)),
-            title: item.document_key.clone(),
-            objective: format!(
-                "Create a {} document grounded only in the prepared evidence.",
-                item.document_key
-            ),
-            evidence: selected
-                .iter()
-                .map(|e| EvidenceRef {
-                    source_version_id: e.source_version_id,
-                    chunk_id: Some(e.chunk_id),
-                    locator: e.locator.clone(),
-                })
-                .collect(),
-            quotes: selected
-                .into_iter()
-                .map(|e| ContentEvidence {
-                    reference: EvidenceRef {
-                        source_version_id: e.source_version_id,
-                        chunk_id: Some(e.chunk_id),
-                        locator: e.locator,
-                    },
-                    exact_quote: e.quote,
-                })
-                .collect(),
+            title: brief_title,
+            objective: brief_objective,
+            evidence: references.iter().map(|q| q.reference.clone()).collect(),
+            quotes: references,
             created_at: Utc::now(),
         };
-        self.content.complete_prepare(scope, &lease, brief).await
+        let prepared = self.content.complete_prepare(scope, &lease, brief).await;
+        drop(knowledge_guard);
+        drop(project_guard);
+        prepared
+    }
+
+    async fn semantic_descriptor(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item: &ContentItem,
+        evidence: Vec<ContentEvidence>,
+        brief_title: &str,
+        brief_objective: &str,
+    ) -> Result<(ContentSemanticDescriptor, Uuid), AppError> {
+        let execution = self
+            .content
+            .get_execution(scope, execution_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        let manifest = self
+            .knowledge
+            .get_document_manifest(scope, execution.manifest_id)
+            .await?
+            .ok_or_else(|| AppError::conflict("frozen manifest missing"))?;
+        validate_item(&manifest, &execution, item)?;
+        let planned = manifest
+            .items
+            .iter()
+            .find(|planned| planned.document_manifest_item_id == item.item_id)
+            .ok_or_else(|| AppError::conflict("document branch absent from manifest"))?;
+        let frozen = self
+            .projects
+            .get_cycle_settings(scope, execution.project_id, execution.cycle_id)
+            .await?
+            .ok_or_else(|| AppError::conflict("frozen cycle configuration unavailable"))?;
+        let mut source_version_ids = item.source_version_refs.clone();
+        source_version_ids.sort();
+        source_version_ids.dedup();
+        let mut question_clusters: Vec<_> = frozen
+            .document_scope
+            .question_clusters
+            .iter()
+            .map(|cluster| cluster.key.clone())
+            .collect();
+        question_clusters.sort();
+        question_clusters.dedup();
+        Ok((
+            ContentSemanticDescriptor {
+                version: 1,
+                scope: scope.clone(),
+                document_key: planned.document_key.clone(),
+                content_type: planned.content_type.clone(),
+                product_id: planned.product_id,
+                market: planned.market.clone(),
+                language: planned.language.clone(),
+                planner_version: DOCUMENT_PLANNER_VERSION.into(),
+                source_version_ids,
+                evidence,
+                brand_name: frozen.brand_name,
+                product_name: frozen.product_name,
+                target_audience: frozen.target_audience,
+                objective: frozen.objective,
+                question_clusters,
+                brief_title: brief_title.into(),
+                brief_objective: brief_objective.into(),
+                generation_policy_version: POLICY_VERSION.into(),
+                evidence_policy_version: EVIDENCE_POLICY_VERSION.into(),
+                check_policy_version: CHECK_POLICY_VERSION.into(),
+                repair_policy_version: REPAIR_POLICY_VERSION.into(),
+                output_schema_version: OUTPUT_SCHEMA_VERSION.into(),
+                generation_policy_revision: GENERATION_POLICY_REVISION.into(),
+            },
+            manifest.manifest_id,
+        ))
     }
 
     pub async fn generate(
@@ -325,7 +519,7 @@ impl ContentService {
             .brief
             .as_ref()
             .ok_or_else(|| AppError::conflict("prepared brief missing"))?;
-        if !same_evidence(&brief.evidence, &evidence) {
+        if !live_quotes_match(brief, &evidence) {
             self.content
                 .classify(
                     scope,
@@ -351,8 +545,26 @@ impl ContentService {
                 LEASE_SECONDS,
             )
             .await?;
+        let descriptor = item
+            .semantic_descriptor
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("prepared semantic descriptor missing"))?;
+        if descriptor.evidence != brief.quotes {
+            self.content.release_step(scope, &lease).await?;
+            return Err(AppError::conflict("prepared semantic evidence changed"));
+        }
         let output = self.complete(scope, "You are a source-grounded content generator. Output ONLY a JSON object {\"title\":string,\"blocks\":[{\"kind\":\"heading|paragraph|list\",\"text\":string,\"citation_ids\":[UUID],\"items\":[string]}]}. Never invent evidence, attribution, prices, claims, or citations. Every block including headings must cite the supplied chunk UUIDs. The title will be independently checked. Do not supply readiness, IDs, or metadata.",
-            serde_json::json!({"brief": brief, "evidence": evidence})).await;
+            serde_json::json!({
+                "brief": {"title": descriptor.brief_title, "objective": descriptor.brief_objective},
+                "document": {
+                    "key": descriptor.document_key, "content_type": descriptor.content_type,
+                    "product_id": descriptor.product_id, "market": descriptor.market,
+                    "language": descriptor.language, "brand_name": descriptor.brand_name,
+                    "product_name": descriptor.product_name, "target_audience": descriptor.target_audience,
+                    "objective": descriptor.objective, "question_clusters": descriptor.question_clusters,
+                },
+                "evidence": prompt_evidence(&descriptor.evidence),
+            })).await;
         let document = match output {
             Ok(text) => parse_generated(&text, &brief.evidence, &item.branch_key),
             Err(error)
@@ -401,7 +613,7 @@ impl ContentService {
             .brief
             .as_ref()
             .ok_or_else(|| AppError::conflict("prepared brief missing"))?;
-        if !same_evidence(&brief.evidence, &evidence) {
+        if !live_quotes_match(brief, &evidence) {
             return self
                 .content
                 .classify(
@@ -440,7 +652,7 @@ impl ContentService {
         }
         let title_check_id = title_check_id(revision.revision_id);
         let output = self.complete(scope, "You are an independent factual checker. For the supplied title_check_id AND EVERY block_id output ONLY JSON {\"checks\":[{\"block_id\":UUID,\"verdict\":\"supported|unsupported|uncertain\",\"citation_ids\":[UUID],\"detail\":string}]}. Check title and every heading/body claim against the supplied quotes, not general knowledge. Supported requires at least one real citation for each check, including title and headings. An unsupported or uncertain check must be marked accordingly. No generic pass status or readiness decision.",
-            serde_json::json!({"title_check_id":title_check_id, "document": revision.document, "evidence": evidence})).await;
+            serde_json::json!({"title_check_id":title_check_id, "document": revision.document, "evidence": prompt_evidence(&brief.quotes)})).await;
         let findings = match output {
             Ok(text) => parse_checks(&text, &revision),
             Err(error)
@@ -465,7 +677,7 @@ impl ContentService {
                         return Err(error);
                     }
                 };
-                if !same_evidence(&brief.evidence, &latest) {
+                if !live_quotes_match(brief, &latest) {
                     return self
                         .content
                         .fail_step(
@@ -475,7 +687,45 @@ impl ContentService {
                         )
                         .await;
                 }
-                self.content.complete_check(scope, &lease, findings).await
+                let execution = self
+                    .content
+                    .get_execution(scope, execution_id)
+                    .await?
+                    .ok_or_else(|| AppError::not_found("content execution not found"))?;
+                let project_guard = match self
+                    .projects
+                    .hold_content_project(scope, execution.project_id)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        self.content.release_step(scope, &lease).await?;
+                        return Err(error);
+                    }
+                };
+                let knowledge_guard = match self
+                    .knowledge
+                    .hold_content_evidence(
+                        scope,
+                        &[eligibility(
+                            execution.manifest_id,
+                            &item,
+                            brief.quotes.clone(),
+                        )],
+                    )
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        drop(project_guard);
+                        self.content.release_step(scope, &lease).await?;
+                        return Err(error);
+                    }
+                };
+                let result = self.content.complete_check(scope, &lease, findings).await;
+                drop(knowledge_guard);
+                drop(project_guard);
+                result
             }
             Err(_) => {
                 self.content
@@ -506,7 +756,7 @@ impl ContentService {
             .brief
             .as_ref()
             .ok_or_else(|| AppError::conflict("prepared brief missing"))?;
-        if !same_evidence(&brief.evidence, &evidence) {
+        if !live_quotes_match(brief, &evidence) {
             self.content
                 .classify(
                     scope,
@@ -562,7 +812,7 @@ impl ContentService {
                 serde_json::json!({
                     "previous_document": revision.document,
                     "blocking_findings": findings,
-                    "evidence": evidence,
+                    "evidence": prompt_evidence(&brief.quotes),
                     "exact_quotes": brief.quotes,
                 }),
             )
@@ -604,7 +854,7 @@ impl ContentService {
                 return Err(error);
             }
         };
-        if !same_evidence(&brief.evidence, &latest) {
+        if !live_quotes_match(brief, &latest) {
             self.content
                 .fail_step(
                     scope,
@@ -617,6 +867,41 @@ impl ContentService {
             ));
         }
         self.content.complete_repair(scope, &lease, document).await
+    }
+
+    /// Editing a reused destination starts a new asset and revision chain;
+    /// never invoke the ordinary asset edit route on the origin by accident.
+    pub async fn fork_reused_item(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item_id: Uuid,
+        base_revision_id: Uuid,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError> {
+        self.require_active_project(scope).await?;
+        let item = self.item(scope, execution_id, item_id).await?;
+        if item
+            .reuse_binding
+            .as_ref()
+            .map(|binding| binding.revision_id)
+            != Some(base_revision_id)
+        {
+            return Err(AppError::conflict("reused base revision has changed"));
+        }
+        let current = self.evidence(scope, execution_id, &item).await?;
+        if !item
+            .brief
+            .as_ref()
+            .is_some_and(|brief| live_quotes_match(brief, &current))
+        {
+            return Err(AppError::conflict(
+                "reused evidence is no longer publicly eligible",
+            ));
+        }
+        self.content
+            .fork_reused_item(scope, execution_id, item_id, base_revision_id, document)
+            .await
     }
 
     async fn complete(
@@ -994,9 +1279,9 @@ pub(crate) async fn start(
         .map_err(|e| api_error(e, context.request_id))?;
     // The parent application wires a real dispatcher here. Never accept an
     // execution that has no native engine able to process its branches.
-    if !state.content_executor_available() || !state.content_model_available() {
+    if !state.content_executor_available() {
         return Err(api_error(
-            AppError::capability_missing("content workflow or model provider is not configured"),
+            AppError::capability_missing("content workflow executor is not configured"),
             context.request_id,
         ));
     }
@@ -1040,9 +1325,9 @@ pub(crate) async fn resume(
     let scope = scoped(&state, &auth.scope, project_id)
         .await
         .map_err(|e| api_error(e, context.request_id))?;
-    if !state.content_executor_available() || !state.content_model_available() {
+    if !state.content_executor_available() {
         return Err(api_error(
-            AppError::capability_missing("content workflow or model provider is not configured"),
+            AppError::capability_missing("content workflow executor is not configured"),
             context.request_id,
         ));
     }
@@ -1215,6 +1500,31 @@ pub(crate) async fn edit(
         .map_err(|e| api_error(e, context.request_id))
 }
 
+pub(crate) async fn fork_reused_item(
+    State(state): State<AppState>,
+    Path((project_id, execution_id, item_id)): Path<(ProjectId, Uuid, Uuid)>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Json(request): Json<EditRequest>,
+) -> Result<(StatusCode, Json<ContentRevision>), ApiError> {
+    require_project_writer(&auth).map_err(|e| api_error(e, context.request_id))?;
+    let scope = scoped(&state, &auth.scope, project_id)
+        .await
+        .map_err(|e| api_error(e, context.request_id))?;
+    state
+        .content_service()
+        .fork_reused_item(
+            &scope,
+            execution_id,
+            item_id,
+            request.base_revision_id,
+            request.document,
+        )
+        .await
+        .map(|revision| (StatusCode::CREATED, Json(revision)))
+        .map_err(|e| api_error(e, context.request_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,12 +1573,12 @@ mod tests {
     }
     use async_trait::async_trait;
     use geo_domain::{
-        ChunkLocator, CurrentKnowledgeRelease, DocumentManifestPlanRequest, DocumentScope, Fact,
-        ImportAcceptance, ImportBatchAcceptance, ImportItem, InitialSource, InitialSourceKind,
-        InitialSourceVisibility, KnowledgeAskResult, KnowledgeCapability, KnowledgeOverview,
-        KnowledgeRelease, KnowledgeRepository, KnowledgeSearchRequest, KnowledgeSearchResult,
-        MemoryContentRepository, MemoryKnowledgeRepository, MemoryProjectRepository, Product,
-        Project, ProjectCreate, ProjectPatch, ProjectRepository, ProjectSettings,
+        ChunkLocator, ContentKnowledgeGuard, ContentProjectGuard, CurrentKnowledgeRelease,
+        DocumentManifestPlanRequest, DocumentScope, Fact, ImportAcceptance, ImportBatchAcceptance,
+        ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgeAskResult,
+        KnowledgeCapability, KnowledgeOverview, KnowledgeRelease, KnowledgeSearchRequest,
+        KnowledgeSearchResult, MemoryContentRepository, MemoryKnowledgeRepository,
+        MemoryProjectRepository, Product, Project, ProjectCreate, ProjectPatch, ProjectSettings,
         ProjectStartCommand, Source, SourceDetail, SourceKind, SourceVersion, StoredObject,
         UpdateProject, UploadSession, UploadSessionCommand, hash_idempotency_key, settings_hash,
         start_request_hash,
@@ -1286,6 +1596,13 @@ mod tests {
     struct PausedProjects(Arc<MemoryProjectRepository>);
     #[async_trait]
     impl ProjectRepository for PausedProjects {
+        async fn hold_content_project<'a>(
+            &'a self,
+            _scope: &TenantScope,
+            _project_id: ProjectId,
+        ) -> Result<ContentProjectGuard<'a>, AppError> {
+            Err(AppError::conflict("project is paused"))
+        }
         async fn list(&self, scope: &TenantScope) -> Result<Vec<Project>, AppError> {
             self.0.list(scope).await
         }
@@ -1455,6 +1772,16 @@ mod tests {
 
     #[async_trait]
     impl KnowledgeRepository for RevocableKnowledge {
+        async fn hold_content_evidence<'a>(
+            &'a self,
+            scope: &TenantScope,
+            inputs: &[ContentPublicEligibility],
+        ) -> Result<ContentKnowledgeGuard<'a>, AppError> {
+            if self.revoked.load(Ordering::SeqCst) {
+                return Err(AppError::conflict("public evidence was revoked"));
+            }
+            self.inner.hold_content_evidence(scope, inputs).await
+        }
         async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError> {
             self.inner.capabilities(scope).await
         }
@@ -1633,8 +1960,14 @@ mod tests {
             .await
             .unwrap();
         let repository = Arc::new(MemoryContentRepository::default());
+        let cycle_id = projects
+            .get_current_cycle(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id;
         let execution = repository
-            .start(&scope, Uuid::new_v4(), manifest, POLICY_VERSION)
+            .start(&scope, cycle_id, manifest, POLICY_VERSION)
             .await
             .unwrap();
         let item_id = repository
@@ -2130,8 +2463,14 @@ mod tests {
             .await
             .unwrap();
         let repository = Arc::new(MemoryContentRepository::default());
+        let cycle_id = projects
+            .get_current_cycle(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id;
         let execution = repository
-            .start(&scope, Uuid::new_v4(), manifest, POLICY_VERSION)
+            .start(&scope, cycle_id, manifest, POLICY_VERSION)
             .await
             .unwrap();
         let model = Arc::new(GroundedModel {
@@ -2252,7 +2591,12 @@ mod tests {
                 .all(|i| !i.source_version_refs.contains(&internal_version))
         );
         let repository = Arc::new(MemoryContentRepository::default());
-        let cycle = Uuid::new_v4();
+        let cycle = projects
+            .get_current_cycle(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id;
         let execution = repository
             .start(&scope, cycle, manifest, POLICY_VERSION)
             .await
@@ -2357,8 +2701,14 @@ mod tests {
             .await
             .unwrap();
         let repository = Arc::new(MemoryContentRepository::default());
+        let cycle_id = projects
+            .get_current_cycle(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id;
         let execution = repository
-            .start(&scope, Uuid::new_v4(), manifest, POLICY_VERSION)
+            .start(&scope, cycle_id, manifest, POLICY_VERSION)
             .await
             .unwrap();
         let item_id = repository
@@ -2481,8 +2831,14 @@ mod tests {
             .await
             .unwrap();
         let repository = Arc::new(MemoryContentRepository::default());
+        let cycle_id = projects
+            .get_current_cycle(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id;
         let execution = repository
-            .start(&scope, Uuid::new_v4(), manifest, POLICY_VERSION)
+            .start(&scope, cycle_id, manifest, POLICY_VERSION)
             .await
             .unwrap();
         let item_id = repository
@@ -2565,8 +2921,14 @@ mod tests {
             .await
             .unwrap();
         let repository = Arc::new(MemoryContentRepository::default());
+        let cycle_id = projects
+            .get_current_cycle(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id;
         let execution = repository
-            .start(&scope, Uuid::new_v4(), manifest, POLICY_VERSION)
+            .start(&scope, cycle_id, manifest, POLICY_VERSION)
             .await
             .unwrap();
         let model = Arc::new(GroundedModel {
@@ -2684,6 +3046,7 @@ mod tests {
             asset_id: Uuid::new_v4(),
             revision: 1,
             base_revision_id: None,
+            derived_from_revision_id: None,
             markdown: document.markdown(),
             document,
             evidence: vec![evidence],

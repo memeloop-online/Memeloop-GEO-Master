@@ -1,7 +1,9 @@
 //! Durable first-stage execution. Planning manifests are immutable inputs;
 //! all mutable progress lives in this separate aggregate.
 use crate::{
-    AppError, DocumentManifest, DocumentManifestItemState, EvidenceRef, ProjectId, TenantScope,
+    AppError, ContentReuseBinding, ContentReuseCandidate, ContentReuseDecision,
+    ContentReuseRequest, ContentSemanticDescriptor, DocumentManifest, DocumentManifestItemState,
+    EvidenceRef, ProjectId, TenantScope,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -145,6 +147,8 @@ pub struct ContentRevision {
     pub asset_id: Uuid,
     pub revision: i32,
     pub base_revision_id: Option<Uuid>,
+    #[serde(default)]
+    pub derived_from_revision_id: Option<Uuid>,
     pub document: StructuredDocument,
     pub markdown: String,
     pub evidence: Vec<EvidenceRef>,
@@ -247,6 +251,16 @@ pub struct ContentItem {
     pub item_id: Uuid,
     pub execution_id: Uuid,
     pub document_key: String,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub product_id: Option<Uuid>,
+    #[serde(default)]
+    pub market: String,
+    #[serde(default)]
+    pub language: String,
+    #[serde(default)]
+    pub planner_version: String,
     pub branch_key: String,
     pub input_hash: String,
     pub planning_state: DocumentManifestItemState,
@@ -258,6 +272,17 @@ pub struct ContentItem {
     pub asset_id: Option<Uuid>,
     pub current_revision_id: Option<Uuid>,
     pub ready_revision_id: Option<Uuid>,
+    #[serde(default)]
+    pub reuse_binding: Option<ContentReuseBinding>,
+    /// Pinned bindings retained for already sealed handoffs after copy-on-write.
+    #[serde(default)]
+    pub reuse_history: Vec<ContentReuseBinding>,
+    #[serde(default)]
+    pub semantic_descriptor: Option<ContentSemanticDescriptor>,
+    #[serde(default)]
+    pub semantic_fingerprint: Option<String>,
+    #[serde(default)]
+    pub reuse_reservation_token: Option<Uuid>,
     #[serde(default)]
     pub automatic_repair_count: u8,
     pub steps: Vec<StepLease>,
@@ -356,6 +381,11 @@ pub fn start_content_state(
             item_id: planned.document_manifest_item_id,
             execution_id,
             document_key: planned.document_key.clone(),
+            content_type: planned.content_type.clone(),
+            product_id: planned.product_id,
+            market: planned.market.clone(),
+            language: planned.language.clone(),
+            planner_version: manifest.planner_version.clone(),
             branch_key,
             input_hash,
             planning_state: planned.state.clone(),
@@ -367,6 +397,11 @@ pub fn start_content_state(
             asset_id: None,
             current_revision_id: None,
             ready_revision_id: None,
+            reuse_binding: None,
+            reuse_history: Vec::new(),
+            semantic_descriptor: None,
+            semantic_fingerprint: None,
+            reuse_reservation_token: None,
             automatic_repair_count: 0,
             steps: Vec::new(),
             attempts: Vec::new(),
@@ -405,6 +440,196 @@ pub fn start_content_state(
     Ok(state)
 }
 impl ContentState {
+    /// Bind a frozen semantic input to the current fenced prepare attempt.
+    pub fn set_semantic_descriptor(
+        &mut self,
+        lease: &StepLease,
+        descriptor: ContentSemanticDescriptor,
+        fingerprint: &str,
+    ) -> Result<ContentItem, AppError> {
+        self.running()?;
+        let canonical = descriptor.canonical()?;
+        if descriptor.fingerprint()? != fingerprint
+            || lease.execution_id != self.execution.execution_id
+            || lease.step != ContentStep::Prepare
+            || lease.expires_at <= Utc::now()
+            || self.execution.project_id != descriptor.scope.project_id.unwrap()
+            || self.execution.policy_version != descriptor.generation_policy_version
+        {
+            return Err(AppError::conflict(
+                "stale or mismatched content reservation",
+            ));
+        }
+        let item = self.item_mut(lease.item_id)?;
+        let mut refs = item.source_version_refs.clone();
+        refs.sort_unstable();
+        refs.dedup();
+        if item.document_key != canonical.document_key
+            || item.content_type != canonical.content_type
+            || item.product_id != canonical.product_id
+            || item.market != canonical.market
+            || item.language != canonical.language
+            || item.planner_version != canonical.planner_version
+            || item.status != ContentItemStatus::Pending
+            || !item.steps.contains(lease)
+            || refs != canonical.source_version_ids
+            || item
+                .semantic_fingerprint
+                .as_deref()
+                .is_some_and(|old| old != fingerprint)
+            || item
+                .semantic_descriptor
+                .as_ref()
+                .is_some_and(|old| old != &canonical)
+        {
+            return Err(AppError::conflict(
+                "semantic input differs from frozen branch",
+            ));
+        }
+        item.semantic_descriptor = Some(canonical);
+        item.semantic_fingerprint = Some(fingerprint.to_owned());
+        item.reuse_reservation_token = Some(lease.token);
+        Ok(item.clone())
+    }
+
+    /// The destination keeps its own manifest and coverage but references the
+    /// original immutable asset/revision/check; no records are copied locally.
+    pub fn apply_reuse(
+        &mut self,
+        item_id: Uuid,
+        binding: ContentReuseBinding,
+        descriptor: ContentSemanticDescriptor,
+        fingerprint: &str,
+    ) -> Result<ContentItem, AppError> {
+        self.running()?;
+        let canonical = descriptor.canonical()?;
+        if canonical.fingerprint()? != fingerprint
+            || binding.fingerprint != fingerprint
+            || self.execution.project_id != canonical.scope.project_id.unwrap()
+            || self.execution.policy_version != canonical.generation_policy_version
+            || binding.origin_execution_id == self.execution.execution_id
+        {
+            return Err(AppError::conflict("invalid content reuse binding"));
+        }
+        let item = self.item_mut(item_id)?;
+        let mut refs = item.source_version_refs.clone();
+        refs.sort_unstable();
+        refs.dedup();
+        if item.document_key != canonical.document_key
+            || item.content_type != canonical.content_type
+            || item.product_id != canonical.product_id
+            || item.market != canonical.market
+            || item.language != canonical.language
+            || item.planner_version != canonical.planner_version
+            || refs != canonical.source_version_ids
+            || item.status != ContentItemStatus::Pending
+            || item.steps.iter().any(|lease| lease.expires_at > Utc::now())
+        {
+            return Err(AppError::conflict("destination is not eligible for reuse"));
+        }
+        item.steps.clear();
+        item.status = ContentItemStatus::Ready;
+        item.reason = None;
+        item.brief = Some(ContentBrief {
+            brief_id: Uuid::new_v4(),
+            title: canonical.brief_title.clone(),
+            objective: canonical.brief_objective.clone(),
+            evidence: canonical
+                .evidence
+                .iter()
+                .map(|e| e.reference.clone())
+                .collect(),
+            quotes: canonical.evidence.clone(),
+            created_at: binding.reused_at,
+        });
+        item.asset_id = Some(binding.asset_id);
+        item.current_revision_id = Some(binding.revision_id);
+        item.ready_revision_id = Some(binding.revision_id);
+        item.semantic_descriptor = Some(canonical);
+        item.semantic_fingerprint = Some(fingerprint.to_owned());
+        item.reuse_history.push(binding.clone());
+        item.reuse_binding = Some(binding);
+        item.reuse_reservation_token = None;
+        let result = item.clone();
+        self.recount();
+        Ok(result)
+    }
+
+    /// Editing a reused item forks the destination's own asset, preserving the
+    /// origin's revision chain and all previously sealed handoffs.
+    pub fn fork_reused_item(
+        &mut self,
+        item_id: Uuid,
+        base_revision_id: Uuid,
+        origin: &ContentRevision,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError> {
+        if self.execution.status == ContentExecutionStatus::Cancelled {
+            return Err(AppError::conflict("cancelled content cannot be edited"));
+        }
+        let item = self
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)
+            .ok_or_else(|| AppError::not_found("content item not found"))?;
+        let binding = item
+            .reuse_binding
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("item is not a reused revision"))?;
+        if item.status != ContentItemStatus::Ready
+            || binding.revision_id != base_revision_id
+            || origin.revision_id != binding.revision_id
+            || origin.asset_id != binding.asset_id
+        {
+            return Err(AppError::conflict("reused base revision changed"));
+        }
+        document.validate(&origin.evidence)?;
+        let now = Utc::now();
+        let asset_id = stable_id(&format!(
+            "content-asset:{}:{}",
+            self.execution.execution_id, item.branch_key
+        ));
+        if self.assets.iter().any(|asset| asset.asset_id == asset_id) {
+            return Err(AppError::conflict("destination asset already exists"));
+        }
+        let next = ContentRevision {
+            revision_id: Uuid::new_v4(),
+            asset_id,
+            revision: 1,
+            base_revision_id: None,
+            derived_from_revision_id: Some(base_revision_id),
+            markdown: document.markdown(),
+            document,
+            evidence: origin.evidence.clone(),
+            quotes: origin.quotes.clone(),
+            findings: Vec::new(),
+            created_at: now,
+        };
+        if self.execution.status == ContentExecutionStatus::Closed {
+            self.execution.status = ContentExecutionStatus::Running;
+            self.execution.handoff_id = None;
+            self.handoff = None;
+        }
+        let item = self.item_mut(item_id)?;
+        item.asset_id = Some(asset_id);
+        item.current_revision_id = Some(next.revision_id);
+        item.ready_revision_id = None;
+        item.reuse_binding = None;
+        item.reuse_reservation_token = None;
+        item.status = ContentItemStatus::Drafted;
+        item.reason = None;
+        self.assets.push(ContentAsset {
+            asset_id,
+            execution_id: self.execution.execution_id,
+            item_id,
+            current_revision_id: next.revision_id,
+            created_at: now,
+        });
+        self.revisions.push(next.clone());
+        self.recount();
+        Ok(next)
+    }
+
     pub fn recount(&mut self) {
         let mut c = ContentCoverage {
             total: self.items.len() as u64,
@@ -589,6 +814,15 @@ impl ContentState {
                 "brief evidence must be located in frozen public sources",
             ));
         }
+        if let Some(descriptor) = &item.semantic_descriptor
+            && (descriptor.brief_title != brief.title
+                || descriptor.brief_objective != brief.objective
+                || descriptor.evidence != brief.quotes)
+        {
+            return Err(AppError::conflict(
+                "prepared brief differs from frozen semantic input",
+            ));
+        }
         let item = self.consume(lease, ContentStep::Prepare)?;
         if item.status != ContentItemStatus::Pending {
             return Err(AppError::conflict("prepare already completed"));
@@ -630,6 +864,7 @@ impl ContentState {
             asset_id,
             revision: 1,
             base_revision_id: None,
+            derived_from_revision_id: None,
             markdown: document.markdown(),
             document,
             evidence,
@@ -764,6 +999,7 @@ impl ContentState {
                 .checked_add(1)
                 .ok_or_else(|| AppError::conflict("too many content revisions"))?,
             base_revision_id: Some(revision_id),
+            derived_from_revision_id: None,
             markdown: document.markdown(),
             document,
             evidence: previous.evidence.clone(),
@@ -816,6 +1052,7 @@ impl ContentState {
             asset_id,
             revision: previous.revision + 1,
             base_revision_id: Some(base_revision_id),
+            derived_from_revision_id: None,
             markdown: document.markdown(),
             document,
             evidence: previous.evidence.clone(),
@@ -843,6 +1080,7 @@ impl ContentState {
         let item = self.item_mut(asset.item_id)?;
         item.current_revision_id = Some(next.revision_id);
         item.ready_revision_id = None;
+        item.reuse_reservation_token = None;
         item.status = ContentItemStatus::Drafted;
         item.reason = None;
         for attempt in &mut item.attempts {
@@ -922,6 +1160,11 @@ impl ContentState {
         if let Some(attempt) = item.attempts.iter_mut().find(|a| a.token == lease.token) {
             attempt.outcome = ContentAttemptOutcome::Released;
         }
+        if lease.step == ContentStep::Prepare {
+            item.semantic_descriptor = None;
+            item.semantic_fingerprint = None;
+            item.reuse_reservation_token = None;
+        }
         Ok(item.clone())
     }
     pub fn invalidate_ready(
@@ -940,6 +1183,7 @@ impl ContentState {
         item.status = ContentItemStatus::Blocked;
         item.ready_revision_id = None;
         item.reason = Some(reason.to_owned());
+        item.reuse_reservation_token = None;
         let result = item.clone();
         self.recount();
         Ok(result)
@@ -1025,6 +1269,26 @@ pub trait ContentRepository: Send + Sync {
         manifest: DocumentManifest,
         policy_version: &str,
     ) -> Result<ContentExecution, AppError>;
+    async fn prepare_or_reuse(
+        &self,
+        scope: &TenantScope,
+        request: ContentReuseRequest,
+    ) -> Result<ContentReuseDecision, AppError>;
+    async fn resolve_checked_revision(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<Option<ContentRevision>, AppError>;
+    async fn fork_reused_item(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item_id: Uuid,
+        base_revision_id: Uuid,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError>;
     async fn get_execution(
         &self,
         scope: &TenantScope,
@@ -1161,6 +1425,16 @@ pub trait ContentRepository: Send + Sync {
 #[derive(Default)]
 pub struct MemoryContentRepository {
     state: RwLock<HashMap<Uuid, (TenantScope, ContentState)>>,
+    candidates: std::sync::Mutex<HashMap<(TenantScope, String), ContentReuseCandidate>>,
+    reservations: std::sync::Mutex<HashMap<(TenantScope, String), ContentProducerReservation>>,
+}
+
+#[derive(Clone)]
+struct ContentProducerReservation {
+    execution_id: Uuid,
+    item_id: Uuid,
+    token: Uuid,
+    expires_at: DateTime<Utc>,
 }
 impl MemoryContentRepository {
     pub fn new() -> Self {
@@ -1213,6 +1487,373 @@ impl ContentRepository for MemoryContentRepository {
         let result = state.execution.clone();
         guard.insert(result.execution_id, (scope.clone(), state));
         Ok(result)
+    }
+    async fn prepare_or_reuse(
+        &self,
+        scope: &TenantScope,
+        request: ContentReuseRequest,
+    ) -> Result<ContentReuseDecision, AppError> {
+        if scope != &request.descriptor.scope {
+            return Err(AppError::forbidden(
+                "semantic input is outside project scope",
+            ));
+        }
+        let descriptor = request.descriptor.canonical()?;
+        let fingerprint = descriptor.fingerprint()?;
+        let key = (scope.clone(), fingerprint.clone());
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get(&request.execution_id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if stored_scope != scope {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let dest = state
+            .items
+            .iter()
+            .find(|i| i.item_id == request.item_id)
+            .ok_or_else(|| AppError::not_found("content item not found"))?;
+        if state.execution.project_id != descriptor.scope.project_id.unwrap()
+            || state.execution.policy_version != descriptor.generation_policy_version
+            || dest.document_key != descriptor.document_key
+            || dest.content_type != descriptor.content_type
+            || dest.product_id != descriptor.product_id
+            || dest.market != descriptor.market
+            || dest.language != descriptor.language
+            || dest.planner_version != descriptor.planner_version
+            || {
+                let mut refs = dest.source_version_refs.clone();
+                refs.sort_unstable();
+                refs.dedup();
+                refs != descriptor.source_version_ids
+            }
+        {
+            return Err(AppError::conflict(
+                "semantic input differs from execution branch",
+            ));
+        }
+        if !(1..=3600).contains(&request.ttl_seconds)
+            || request.now + Duration::seconds(request.ttl_seconds) <= Utc::now()
+        {
+            return Err(AppError::invalid_request(
+                "valid current reservation lifetime required",
+            ));
+        }
+        if let Some(old) = &dest.semantic_descriptor
+            && old != &descriptor
+        {
+            return Err(AppError::conflict(
+                "semantic descriptor changed for reserved branch",
+            ));
+        }
+        if dest.status == ContentItemStatus::Ready {
+            return if dest.semantic_fingerprint.as_deref() == Some(&fingerprint) {
+                Ok(ContentReuseDecision::Ready(dest.clone()))
+            } else {
+                Err(AppError::conflict("ready content input differs"))
+            };
+        }
+        if dest.status != ContentItemStatus::Pending {
+            return Ok(ContentReuseDecision::Busy(dest.clone()));
+        }
+        if dest
+            .steps
+            .iter()
+            .any(|lease| lease.expires_at > request.now)
+        {
+            return Ok(ContentReuseDecision::Busy(dest.clone()));
+        }
+        let candidate = self
+            .candidates
+            .lock()
+            .map_err(|_| AppError::conflict("candidate registry unavailable"))?
+            .get(&key)
+            .cloned();
+        if let Some(candidate) = candidate {
+            if candidate.descriptor != descriptor {
+                return Err(AppError::conflict(
+                    "semantic digest collides with another input",
+                ));
+            }
+            let origin = states
+                .get(&candidate.origin_execution_id)
+                .filter(|(stored_scope, _)| stored_scope == scope)
+                .map(|(_, state)| state)
+                .ok_or_else(|| AppError::conflict("reuse origin is missing"))?;
+            let valid = origin.execution.status != ContentExecutionStatus::Cancelled
+                && origin.items.iter().any(|item| {
+                    item.item_id == candidate.origin_item_id
+                        && item.status == ContentItemStatus::Ready
+                        && item.ready_revision_id == Some(candidate.revision_id)
+                        && item.asset_id == Some(candidate.asset_id)
+                })
+                && origin.assets.iter().any(|asset| {
+                    asset.asset_id == candidate.asset_id
+                        && asset.item_id == candidate.origin_item_id
+                        && asset.current_revision_id == candidate.revision_id
+                })
+                && origin.revisions.iter().any(|r| {
+                    r.revision_id == candidate.revision_id && r.asset_id == candidate.asset_id
+                })
+                && origin.checks.iter().any(|c| {
+                    c.check_id == candidate.check_id
+                        && c.revision_id == candidate.revision_id
+                        && !c.findings.iter().any(|f| f.blocking)
+                });
+            if !valid {
+                return Err(AppError::conflict("reuse origin is no longer current"));
+            }
+            let binding = ContentReuseBinding {
+                origin_execution_id: candidate.origin_execution_id,
+                origin_item_id: candidate.origin_item_id,
+                asset_id: candidate.asset_id,
+                revision_id: candidate.revision_id,
+                check_id: candidate.check_id,
+                fingerprint: fingerprint.clone(),
+                reused_at: request.now,
+            };
+            let item = &mut states
+                .get_mut(&request.execution_id)
+                .expect("destination was verified")
+                .1;
+            return item
+                .apply_reuse(request.item_id, binding, descriptor, &fingerprint)
+                .map(ContentReuseDecision::Ready);
+        }
+        let mut refs = dest.source_version_refs.clone();
+        refs.sort_unstable();
+        refs.dedup();
+        if states.values().any(|(stored_scope, previous)| {
+            stored_scope == scope
+                && previous.execution.execution_id != request.execution_id
+                && previous.items.iter().any(|item| {
+                    item.document_key == descriptor.document_key
+                        && item.status == ContentItemStatus::Ready
+                        && item.semantic_descriptor.is_none()
+                        && {
+                            let mut previous_refs = item.source_version_refs.clone();
+                            previous_refs.sort_unstable();
+                            previous_refs.dedup();
+                            previous_refs == refs
+                        }
+                })
+        }) {
+            let state = &mut states
+                .get_mut(&request.execution_id)
+                .expect("destination was verified")
+                .1;
+            let blocked = state.classify(
+                request.item_id,
+                ContentItemStatus::Blocked,
+                "reuse_provenance_insufficient",
+            )?;
+            return Ok(ContentReuseDecision::InsufficientEvidence(blocked));
+        }
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| AppError::conflict("content reservation registry unavailable"))?;
+        if let Some(reservation) = reservations.get(&key).cloned() {
+            let previous_item = states
+                .get(&reservation.execution_id)
+                .filter(|(stored_scope, _)| stored_scope == scope)
+                .and_then(|(_, state)| {
+                    state
+                        .items
+                        .iter()
+                        .find(|item| item.item_id == reservation.item_id)
+                });
+            let effective_expiry = previous_item
+                .into_iter()
+                .flat_map(|item| item.steps.iter().map(|lease| lease.expires_at))
+                .fold(reservation.expires_at, DateTime::<Utc>::max);
+            if effective_expiry > request.now {
+                return Ok(ContentReuseDecision::Busy(dest.clone()));
+            }
+            if (reservation.execution_id, reservation.item_id)
+                != (request.execution_id, request.item_id)
+                && let Some((_, previous)) = states.get_mut(&reservation.execution_id)
+                && previous.execution.status == ContentExecutionStatus::Running
+                && previous.items.iter().any(|item| {
+                    item.item_id == reservation.item_id
+                        && matches!(
+                            item.status,
+                            ContentItemStatus::Pending
+                                | ContentItemStatus::Prepared
+                                | ContentItemStatus::Drafted
+                                | ContentItemStatus::NeedsRepair
+                        )
+                })
+            {
+                previous.classify(
+                    reservation.item_id,
+                    ContentItemStatus::Blocked,
+                    "reuse_reservation_superseded",
+                )?;
+            }
+            reservations.remove(&key);
+        }
+        let state = &mut states
+            .get_mut(&request.execution_id)
+            .expect("destination was verified")
+            .1;
+        let lease = state.claim(
+            request.item_id,
+            ContentStep::Prepare,
+            &request.owner,
+            request.now,
+            request.ttl_seconds,
+        )?;
+        let item = state.set_semantic_descriptor(&lease, descriptor, &fingerprint)?;
+        reservations.insert(
+            key,
+            ContentProducerReservation {
+                execution_id: request.execution_id,
+                item_id: request.item_id,
+                token: lease.token,
+                expires_at: lease.expires_at,
+            },
+        );
+        Ok(ContentReuseDecision::Reserved { item, lease })
+    }
+    async fn resolve_checked_revision(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<Option<ContentRevision>, AppError> {
+        let states = self.state.read().await;
+        let (stored_scope, state) = match states.get(&execution_id) {
+            Some(entry) if scope.contains(&entry.0) => entry,
+            _ => return Ok(None),
+        };
+        let item = match state.items.iter().find(|item| item.item_id == item_id) {
+            Some(item) => item,
+            None => return Ok(None),
+        };
+        let (origin, owner_item_id, check_id, asset_id, reused) = if let Some(binding) = item
+            .reuse_history
+            .iter()
+            .find(|binding| binding.revision_id == revision_id)
+        {
+            let origin = states
+                .get(&binding.origin_execution_id)
+                .filter(|(origin_scope, _)| origin_scope == stored_scope)
+                .map(|(_, state)| state)
+                .ok_or_else(|| AppError::conflict("reuse origin is outside project scope"))?;
+            (
+                origin,
+                binding.origin_item_id,
+                Some(binding.check_id),
+                binding.asset_id,
+                true,
+            )
+        } else {
+            let asset_id = state
+                .revisions
+                .iter()
+                .find(|revision| revision.revision_id == revision_id)
+                .map(|revision| revision.asset_id);
+            let Some(asset_id) = asset_id else {
+                return Ok(None);
+            };
+            (state, item_id, None, asset_id, false)
+        };
+        if !origin.items.iter().any(|owner| {
+            owner.item_id == owner_item_id
+                && owner.asset_id == Some(asset_id)
+                && (reused
+                    || owner.ready_revision_id == Some(revision_id)
+                    || origin.handoffs.iter().any(|handoff| {
+                        handoff.items.iter().any(|handed| {
+                            handed.item_id == owner_item_id
+                                && handed.status == ContentItemStatus::Ready
+                                && handed.revision_id == Some(revision_id)
+                        })
+                    }))
+        }) || !origin.assets.iter().any(|asset| {
+            asset.asset_id == asset_id
+                && asset.item_id == owner_item_id
+                && (reused
+                    || asset.current_revision_id == revision_id
+                    || origin.handoffs.iter().any(|handoff| {
+                        handoff.items.iter().any(|handed| {
+                            handed.item_id == owner_item_id
+                                && handed.status == ContentItemStatus::Ready
+                                && handed.revision_id == Some(revision_id)
+                        })
+                    }))
+        }) || !origin.checks.iter().any(|check| {
+            check.revision_id == revision_id
+                && check_id.is_none_or(|id| check.check_id == id)
+                && !check.findings.iter().any(|finding| finding.blocking)
+        }) {
+            return Err(AppError::conflict("origin checked revision changed"));
+        }
+        let check = origin
+            .checks
+            .iter()
+            .find(|check| {
+                check.revision_id == revision_id
+                    && check_id.is_none_or(|id| check.check_id == id)
+                    && !check.findings.iter().any(|finding| finding.blocking)
+            })
+            .ok_or_else(|| AppError::conflict("successful origin check is missing"))?;
+        let revision = origin
+            .revisions
+            .iter()
+            .find(|revision| revision.revision_id == revision_id && revision.asset_id == asset_id)
+            .ok_or_else(|| AppError::conflict("checked revision is missing"))?;
+        let mut revision = revision.clone();
+        revision.findings = check.findings.clone();
+        Ok(Some(revision))
+    }
+    async fn fork_reused_item(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item_id: Uuid,
+        base_revision_id: Uuid,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError> {
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get(&execution_id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let binding = state
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)
+            .and_then(|item| item.reuse_binding.as_ref())
+            .ok_or_else(|| AppError::conflict("checked reused revision required"))?;
+        let origin_state = states
+            .get(&binding.origin_execution_id)
+            .filter(|(origin_scope, _)| origin_scope == stored_scope)
+            .map(|(_, state)| state)
+            .ok_or_else(|| AppError::conflict("reuse origin is outside project scope"))?;
+        let origin = origin_state
+            .revisions
+            .iter()
+            .find(|revision| {
+                revision.revision_id == binding.revision_id && revision.asset_id == binding.asset_id
+            })
+            .ok_or_else(|| AppError::conflict("reused revision is missing"))?
+            .clone();
+        if !origin_state.checks.iter().any(|check| {
+            check.check_id == binding.check_id
+                && check.revision_id == origin.revision_id
+                && !check.findings.iter().any(|finding| finding.blocking)
+        }) {
+            return Err(AppError::conflict("reused check is missing"));
+        }
+        let (_, state) = states
+            .get_mut(&execution_id)
+            .expect("destination was verified");
+        state.fork_reused_item(item_id, base_revision_id, &origin, document)
     }
     async fn get_execution(
         &self,
@@ -1398,8 +2039,80 @@ impl ContentRepository for MemoryContentRepository {
         now: DateTime<Utc>,
         ttl: i64,
     ) -> Result<StepLease, AppError> {
-        self.mutate(scope, id, |s| s.claim(item, step, owner, now, ttl))
-            .await
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get_mut(&id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let reservation = state
+            .items
+            .iter()
+            .find(|current| current.item_id == item)
+            .and_then(|current| {
+                current
+                    .semantic_fingerprint
+                    .as_ref()
+                    .zip(current.reuse_reservation_token)
+            })
+            .map(|(fingerprint, token)| ((stored_scope.clone(), fingerprint.clone()), token));
+        let fresh_key = (step == ContentStep::Check)
+            .then(|| {
+                state
+                    .items
+                    .iter()
+                    .find(|current| current.item_id == item)
+                    .filter(|current| {
+                        current.semantic_descriptor.is_some()
+                            && current.reuse_reservation_token.is_none()
+                    })
+                    .and_then(|current| current.semantic_fingerprint.as_ref())
+                    .map(|fingerprint| (stored_scope.clone(), fingerprint.clone()))
+            })
+            .flatten();
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| AppError::conflict("content reservation registry unavailable"))?;
+        if let Some((key, token)) = &reservation
+            && !reservations.get(key).is_some_and(|held| {
+                held.execution_id == id && held.item_id == item && held.token == *token
+            })
+        {
+            return Err(AppError::conflict(
+                "content producer reservation was superseded",
+            ));
+        }
+        if let Some(key) = &fresh_key {
+            if reservations
+                .get(key)
+                .is_some_and(|held| held.expires_at > now)
+            {
+                return Err(AppError::conflict("content producer is already reserved"));
+            }
+            reservations.remove(key);
+        }
+        let lease = state.claim(item, step, owner, now, ttl)?;
+        if let Some((key, _)) = reservation
+            && let Some(held) = reservations.get_mut(&key)
+        {
+            held.expires_at = lease.expires_at;
+        }
+        if let Some(key) = fresh_key {
+            let token = Uuid::new_v4();
+            state.item_mut(item)?.reuse_reservation_token = Some(token);
+            reservations.insert(
+                key,
+                ContentProducerReservation {
+                    execution_id: id,
+                    item_id: item,
+                    token,
+                    expires_at: lease.expires_at,
+                },
+            );
+        }
+        Ok(lease)
     }
     async fn complete_prepare(
         &self,
@@ -1429,10 +2142,94 @@ impl ContentRepository for MemoryContentRepository {
         lease: &StepLease,
         findings: Vec<ContentFinding>,
     ) -> Result<ContentItem, AppError> {
-        self.mutate(scope, lease.execution_id, |s| {
-            s.complete_check(lease, findings)
-        })
-        .await
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get_mut(&lease.execution_id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let reserving = state
+            .items
+            .iter()
+            .find(|item| item.item_id == lease.item_id)
+            .and_then(|item| {
+                item.semantic_fingerprint
+                    .as_ref()
+                    .zip(item.reuse_reservation_token)
+            })
+            .map(|(fingerprint, token)| ((stored_scope.clone(), fingerprint.clone()), token));
+        if state.items.iter().any(|item| {
+            item.item_id == lease.item_id
+                && item.semantic_descriptor.is_some()
+                && reserving.is_none()
+        }) {
+            return Err(AppError::conflict(
+                "checked semantic input lacks producer reservation",
+            ));
+        }
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| AppError::conflict("content reservation registry unavailable"))?;
+        if let Some((key, token)) = &reserving
+            && !reservations.get(key).is_some_and(|held| {
+                held.execution_id == lease.execution_id
+                    && held.item_id == lease.item_id
+                    && held.token == *token
+            })
+        {
+            return Err(AppError::conflict(
+                "content producer reservation was superseded",
+            ));
+        }
+        let result = state.complete_check(lease, findings)?;
+        if result.status == ContentItemStatus::Ready
+            && let (Some(descriptor), Some(fingerprint), Some(asset_id), Some(revision_id)) = (
+                result.semantic_descriptor.clone(),
+                result.semantic_fingerprint.clone(),
+                result.asset_id,
+                result.ready_revision_id,
+            )
+        {
+            let check = state
+                .checks
+                .iter()
+                .find(|check| {
+                    check.revision_id == revision_id && !check.findings.iter().any(|f| f.blocking)
+                })
+                .ok_or_else(|| AppError::conflict("successful check is missing"))?;
+            let candidate = ContentReuseCandidate {
+                descriptor,
+                fingerprint: fingerprint.clone(),
+                origin_execution_id: lease.execution_id,
+                origin_item_id: lease.item_id,
+                asset_id,
+                revision_id,
+                check_id: check.check_id,
+                created_at: check.created_at,
+            };
+            let mut registry = self
+                .candidates
+                .lock()
+                .map_err(|_| AppError::conflict("candidate registry unavailable"))?;
+            let key = (stored_scope.clone(), fingerprint);
+            if registry
+                .get(&key)
+                .is_some_and(|prior| prior.descriptor != candidate.descriptor)
+            {
+                return Err(AppError::conflict("semantic digest collision"));
+            }
+            registry.insert(key, candidate);
+        }
+        if matches!(
+            result.status,
+            ContentItemStatus::Ready | ContentItemStatus::Blocked
+        ) && let Some((key, _)) = reserving
+        {
+            reservations.remove(&key);
+        }
+        Ok(result)
     }
     async fn complete_repair(
         &self,
@@ -1460,7 +2257,45 @@ impl ContentRepository for MemoryContentRepository {
             .find(|(sc, s)| scope.contains(sc) && s.assets.iter().any(|a| a.asset_id == asset))
             .map(|(_, s)| s.execution.execution_id)
             .ok_or_else(|| AppError::not_found("asset not found"))?;
-        self.mutate(scope, id, |s| s.edit(asset, base, doc)).await
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get_mut(&id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let previous_candidate = state
+            .items
+            .iter()
+            .find(|item| item.asset_id == Some(asset))
+            .and_then(|item| {
+                item.semantic_fingerprint
+                    .as_ref()
+                    .map(|fingerprint| ((stored_scope.clone(), fingerprint.clone()), item.item_id))
+            });
+        let result = state.edit(asset, base, doc)?;
+        if let Some((key, edited_item_id)) = previous_candidate {
+            let mut registry = self
+                .candidates
+                .lock()
+                .map_err(|_| AppError::conflict("candidate registry unavailable"))?;
+            if registry
+                .get(&key)
+                .is_some_and(|candidate| candidate.asset_id == asset)
+            {
+                registry.remove(&key);
+            }
+            let mut reservations = self
+                .reservations
+                .lock()
+                .map_err(|_| AppError::conflict("content reservation registry unavailable"))?;
+            if reservations.get(&key).is_some_and(|reservation| {
+                reservation.execution_id == id && reservation.item_id == edited_item_id
+            }) {
+                reservations.remove(&key);
+            }
+        }
+        Ok(result)
     }
     async fn classify(
         &self,
@@ -1470,8 +2305,32 @@ impl ContentRepository for MemoryContentRepository {
         status: ContentItemStatus,
         reason: &str,
     ) -> Result<ContentItem, AppError> {
-        self.mutate(scope, id, |s| s.classify(item, status, reason))
-            .await
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get_mut(&id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let key = state
+            .items
+            .iter()
+            .find(|current| current.item_id == item)
+            .and_then(|current| current.semantic_fingerprint.as_ref())
+            .map(|fingerprint| (stored_scope.clone(), fingerprint.clone()));
+        let result = state.classify(item, status, reason)?;
+        if let Some(key) = key {
+            let mut reservations = self
+                .reservations
+                .lock()
+                .map_err(|_| AppError::conflict("content reservation registry unavailable"))?;
+            if reservations.get(&key).is_some_and(|reservation| {
+                reservation.execution_id == id && reservation.item_id == item
+            }) {
+                reservations.remove(&key);
+            }
+        }
+        Ok(result)
     }
     async fn fail_step(
         &self,
@@ -1479,16 +2338,70 @@ impl ContentRepository for MemoryContentRepository {
         lease: &StepLease,
         reason: &str,
     ) -> Result<ContentItem, AppError> {
-        self.mutate(scope, lease.execution_id, |s| s.fail_step(lease, reason))
-            .await
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get_mut(&lease.execution_id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let key = state
+            .items
+            .iter()
+            .find(|item| item.item_id == lease.item_id)
+            .and_then(|item| item.semantic_fingerprint.as_ref())
+            .map(|fingerprint| (stored_scope.clone(), fingerprint.clone()));
+        let result = state.fail_step(lease, reason)?;
+        if let Some(key) = key {
+            let mut reservations = self
+                .reservations
+                .lock()
+                .map_err(|_| AppError::conflict("content reservation registry unavailable"))?;
+            if reservations.get(&key).is_some_and(|reservation| {
+                reservation.execution_id == lease.execution_id
+                    && reservation.item_id == lease.item_id
+            }) {
+                reservations.remove(&key);
+            }
+        }
+        Ok(result)
     }
     async fn release_step(
         &self,
         scope: &TenantScope,
         lease: &StepLease,
     ) -> Result<ContentItem, AppError> {
-        self.mutate(scope, lease.execution_id, |s| s.release_step(lease))
-            .await
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get_mut(&lease.execution_id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let key = (lease.step == ContentStep::Prepare)
+            .then(|| {
+                state
+                    .items
+                    .iter()
+                    .find(|item| item.item_id == lease.item_id)
+                    .and_then(|item| item.semantic_fingerprint.as_ref())
+                    .map(|fingerprint| (stored_scope.clone(), fingerprint.clone()))
+            })
+            .flatten();
+        let result = state.release_step(lease)?;
+        if let Some(key) = key {
+            let mut reservations = self
+                .reservations
+                .lock()
+                .map_err(|_| AppError::conflict("content reservation registry unavailable"))?;
+            if reservations.get(&key).is_some_and(|reservation| {
+                reservation.execution_id == lease.execution_id
+                    && reservation.item_id == lease.item_id
+            }) {
+                reservations.remove(&key);
+            }
+        }
+        Ok(result)
     }
     async fn invalidate_ready(
         &self,
@@ -1497,13 +2410,67 @@ impl ContentRepository for MemoryContentRepository {
         item_id: Uuid,
         reason: &str,
     ) -> Result<ContentItem, AppError> {
-        self.mutate(scope, execution_id, |s| s.invalidate_ready(item_id, reason))
-            .await
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get_mut(&execution_id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let candidate_key = state
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)
+            .and_then(|item| item.semantic_fingerprint.clone())
+            .map(|fingerprint| (stored_scope.clone(), fingerprint));
+        let result = state.invalidate_ready(item_id, reason)?;
+        if let Some(key) = candidate_key {
+            let mut registry = self
+                .candidates
+                .lock()
+                .map_err(|_| AppError::conflict("candidate registry unavailable"))?;
+            if registry.get(&key).is_some_and(|candidate| {
+                candidate.origin_execution_id == execution_id && candidate.origin_item_id == item_id
+            }) {
+                registry.remove(&key);
+            }
+        }
+        Ok(result)
     }
     async fn close(&self, scope: &TenantScope, id: Uuid) -> Result<ContentHandoff, AppError> {
         self.mutate(scope, id, ContentState::close).await
     }
     async fn cancel(&self, scope: &TenantScope, id: Uuid) -> Result<ContentExecution, AppError> {
-        self.mutate(scope, id, ContentState::cancel).await
+        let mut states = self.state.write().await;
+        let (stored_scope, state) = states
+            .get_mut(&id)
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        if !scope.contains(stored_scope) {
+            return Err(AppError::not_found("content execution not found"));
+        }
+        let keys: Vec<_> = state
+            .items
+            .iter()
+            .filter_map(|item| item.semantic_fingerprint.as_ref())
+            .map(|fingerprint| (stored_scope.clone(), fingerprint.clone()))
+            .collect();
+        let result = state.cancel()?;
+        self.candidates
+            .lock()
+            .map_err(|_| AppError::conflict("candidate registry unavailable"))?
+            .retain(|_, candidate| candidate.origin_execution_id != id);
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| AppError::conflict("content reservation registry unavailable"))?;
+        for key in keys {
+            if reservations
+                .get(&key)
+                .is_some_and(|reservation| reservation.execution_id == id)
+            {
+                reservations.remove(&key);
+            }
+        }
+        Ok(result)
     }
 }

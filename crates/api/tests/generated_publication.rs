@@ -511,6 +511,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
         asset_id: Uuid::new_v4(),
         revision: 1,
         base_revision_id: None,
+        derived_from_revision_id: None,
         markdown: document.markdown(),
         document,
         evidence: vec![evidence],

@@ -13,6 +13,8 @@ mod connector_capabilities;
 pub use connector_capabilities::*;
 mod content;
 pub use content::*;
+mod content_reuse;
+pub use content_reuse::*;
 mod distribution;
 pub use distribution::*;
 mod error;
@@ -57,8 +59,9 @@ pub use error::{AppError, ErrorCode};
 pub use event::EventEnvelope;
 pub use idempotency::{IdempotencyDecision, IdempotencyStore, IdempotencyToken, StoredResponse};
 pub use knowledge::{
-    Chunk, ChunkKind, ChunkLocator, CurrentKnowledgeRelease, DOCUMENT_PLANNER_VERSION,
-    DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
+    CONTENT_EVIDENCE_MAX_QUOTE_CHARS, Chunk, ChunkKind, ChunkLocator, ContentKnowledgeGuard,
+    ContentPublicEligibility, CurrentKnowledgeRelease, DOCUMENT_PLANNER_VERSION, DocumentManifest,
+    DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
     DocumentManifestPlanRequest, DocumentManifestState, EvidenceRef, Fact, FactStatus,
     ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, ImportStage, ImportStatus,
     KnowledgeAnswerStatus, KnowledgeAskResult, KnowledgeCapability, KnowledgeCoverage,
@@ -74,10 +77,10 @@ pub use knowledge::{
 };
 pub use operation::{Operation, OperationStatus};
 pub use project::{
-    CreateProject, CycleReportView, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_PROJECT_ID,
-    DEVELOPMENT_TENANT_ID, DistributionManifestAcceptance, DistributionScope,
-    DistributionScopeMode, DocumentManifestAcceptance, DocumentScope, InitialSource,
-    InitialSourceKind, InitialSourceVisibility, MemoryProjectRepository, Operator,
+    ContentGuardMode, ContentProjectGuard, CreateProject, CycleReportView, DEVELOPMENT_OPERATOR_ID,
+    DEVELOPMENT_PROJECT_ID, DEVELOPMENT_TENANT_ID, DistributionManifestAcceptance,
+    DistributionScope, DistributionScopeMode, DocumentManifestAcceptance, DocumentScope,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, MemoryProjectRepository, Operator,
     OverviewKnowledgeStatus, PendingSuccessorCycle, PeriodPolicy, Project, ProjectCreate,
     ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
     ProjectStartAcceptance, ProjectStartCommand, ProjectStartView, ProjectStatus,

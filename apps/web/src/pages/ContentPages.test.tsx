@@ -193,6 +193,18 @@ const revision: ContentRevision = {
   ],
   created_at: "2026-10-01T08:00:00Z",
 };
+const reusedItem: ContentItem = {
+  ...items[0],
+  reuse_binding: {
+    origin_execution_id: "execution-previous",
+    origin_item_id: "item-previous",
+    asset_id: "asset-1",
+    revision_id: "revision-1",
+    check_id: "check-previous",
+    fingerprint: "opaque-fingerprint",
+    reused_at: "2026-10-02T08:00:00Z",
+  },
+};
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -210,6 +222,8 @@ function mockApi({
   manifestStatus = 200,
   resumeStatus = 202,
   cancelStatus = 200,
+  forkStatus = 201,
+  sourceAdvanced = false,
 }: {
   executionList?: ContentExecution[];
   itemList?: ContentItem[];
@@ -219,8 +233,12 @@ function mockApi({
   manifestStatus?: number;
   resumeStatus?: number;
   cancelStatus?: number;
+  forkStatus?: number;
+  sourceAdvanced?: boolean;
 } = {}) {
   let persistedExecutions = executionList;
+  let persistedItems = itemList;
+  let forkedRevision: ContentRevision | undefined;
   const requests = vi.fn((url: RequestInfo | URL, init?: RequestInit) => {
     const path = new URL(String(url), "http://localhost").pathname;
     if (path.endsWith("/auth/session"))
@@ -298,14 +316,42 @@ function mockApi({
       );
     }
     if (path.endsWith("/document-executions/execution-1/items"))
-      return Promise.resolve(json(itemList));
+      return Promise.resolve(json(persistedItems));
+    if (path.endsWith("/document-executions/execution-1/items/item-1/fork")) {
+      if (forkStatus !== 201)
+        return Promise.resolve(
+          json({ code: "conflict", message: "基线版本已改变" }, forkStatus),
+        );
+      forkedRevision = {
+        ...revision,
+        asset_id: "asset-forked",
+        revision_id: "revision-forked",
+        base_revision_id: null,
+        derived_from_revision_id: "revision-1",
+        document: JSON.parse(String(init?.body)).document,
+        findings: [],
+      };
+      persistedItems = persistedItems.map((item) =>
+        item.item_id === "item-1"
+          ? {
+              ...item,
+              asset_id: "asset-forked",
+              current_revision_id: "revision-forked",
+              ready_revision_id: null,
+              status: "drafted",
+              reuse_binding: null,
+            }
+          : item,
+      );
+      return Promise.resolve(json(forkedRevision, 201));
+    }
     if (path.endsWith("/contents/asset-1"))
       return Promise.resolve(
         json({
           asset_id: "asset-1",
           execution_id: "execution-1",
           item_id: "item-1",
-          current_revision_id: "revision-1",
+          current_revision_id: sourceAdvanced ? "revision-2" : "revision-1",
           created_at: "2026-10-01T08:00:00Z",
         }),
       );
@@ -326,8 +372,35 @@ function mockApi({
               )
             : json({ code: "conflict", message: "基线版本已改变" }, editStatus),
         );
-      return Promise.resolve(json([revision]));
+      return Promise.resolve(
+        json(
+          sourceAdvanced
+            ? [
+                revision,
+                {
+                  ...revision,
+                  revision_id: "revision-2",
+                  revision: 2,
+                  base_revision_id: "revision-1",
+                  document: { ...revision.document, title: "原资产后续修订" },
+                },
+              ]
+            : [revision],
+        ),
+      );
     }
+    if (path.endsWith("/contents/asset-forked"))
+      return Promise.resolve(
+        json({
+          asset_id: "asset-forked",
+          execution_id: "execution-1",
+          item_id: "item-1",
+          current_revision_id: "revision-forked",
+          created_at: "2026-10-02T08:00:00Z",
+        }),
+      );
+    if (path.endsWith("/contents/asset-forked/revisions"))
+      return Promise.resolve(json(forkedRevision ? [forkedRevision] : []));
     return Promise.resolve(json({ message: "not found" }, 404));
   });
   vi.stubGlobal("fetch", requests);
@@ -362,6 +435,28 @@ afterEach(() => {
 });
 
 describe("P08 content assets", () => {
+  it("separates current-cycle coverage from a reused checked source", async () => {
+    mockApi({ itemList: [reusedItem, items[1]] });
+    renderPage("/app/tenant-1/project-1/content");
+    const list = await screen.findByRole("region", { name: "全部文档分支" });
+    expect(
+      await within(list).findByText(
+        /复用已检查版本；本轮仍有独立清单项和覆盖记录/,
+      ),
+    ).toHaveTextContent("check-previous");
+    expect(
+      within(list).getByRole("link", { name: "查看复用正文与原检查证据" }),
+    ).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    expect(
+      within(list).getByRole("link", { name: /查看原资产/ }),
+    ).toHaveAttribute("href", "/app/tenant-1/project-1/content/asset-1");
+    expect(
+      within(list).queryByText("opaque-fingerprint"),
+    ).not.toBeInTheDocument();
+  });
   it("shows automatic repair as unfinished without a manual approval action", async () => {
     mockApi({
       executionList: [
@@ -553,6 +648,127 @@ describe("P08 content assets", () => {
 });
 
 describe("P09 content revision", () => {
+  it("shows source evidence and forks a reused item with an optimistic base", async () => {
+    const requests = mockApi({ itemList: [reusedItem, items[1]] });
+    renderPage(
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    expect(await screen.findByText("证据原文片段")).toBeInTheDocument();
+    expect(screen.getByText("此处依据不足")).toBeInTheDocument();
+    expect(screen.getByText(/本轮覆盖独立记录/)).toBeInTheDocument();
+    expect(
+      requests.mock.calls.some(([url]) =>
+        String(url).endsWith(
+          "/contents/asset-1?tenant_id=tenant-1&project_id=project-1",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      requests.mock.calls.some(([url]) =>
+        String(url).endsWith(
+          "/document-executions/execution-1/items?tenant_id=tenant-1&project_id=project-1",
+        ),
+      ),
+    ).toBe(true);
+    const title = screen.getByRole("textbox", { name: "标题" });
+    await userEvent.type(title, "新");
+    await userEvent.click(screen.getByRole("button", { name: "创建本轮修订" }));
+    await waitFor(() =>
+      expect(
+        requests.mock.calls.some(
+          ([url, init]) =>
+            String(url).endsWith(
+              "/projects/project-1/document-executions/execution-1/items/item-1/fork?tenant_id=tenant-1&project_id=project-1",
+            ) &&
+            init?.method === "POST" &&
+            JSON.parse(String(init.body)).base_revision_id === "revision-1" &&
+            JSON.parse(String(init.body)).document.title === "有来源的指南新",
+        ),
+      ).toBe(true),
+    );
+    expect(
+      requests.mock.calls.some(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
+    expect(
+      await screen.findByText(/此版本从其他资产的版本 revision-1 派生/),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps editing pinned to the checked source revision if the original asset advances", async () => {
+    const requests = mockApi({
+      itemList: [reusedItem, items[1]],
+      sourceAdvanced: true,
+    });
+    renderPage(
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    expect(await screen.findByRole("textbox", { name: "标题" })).toHaveValue(
+      "有来源的指南",
+    );
+    await userEvent.type(screen.getByRole("textbox", { name: "标题" }), "本轮");
+    await userEvent.click(screen.getByRole("button", { name: "创建本轮修订" }));
+    await waitFor(() =>
+      expect(
+        requests.mock.calls.some(
+          ([url, init]) =>
+            String(url).includes("/items/item-1/fork") &&
+            JSON.parse(String(init?.body)).base_revision_id === "revision-1",
+        ),
+      ).toBe(true),
+    );
+    expect(
+      requests.mock.calls.some(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions") &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  it("retains the local draft on a reuse fork conflict", async () => {
+    mockApi({ itemList: [reusedItem, items[1]], forkStatus: 409 });
+    renderPage(
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    const title = await screen.findByRole("textbox", { name: "标题" });
+    await userEvent.type(title, "本地改动");
+    await userEvent.click(screen.getByRole("button", { name: "创建本轮修订" }));
+    expect(await screen.findByText(/本地输入仍保留/)).toBeInTheDocument();
+    expect(title).toHaveValue("有来源的指南本地改动");
+  });
+
+  it("does not permit a viewer to fork a reused asset", async () => {
+    const requests = mockApi({
+      itemList: [reusedItem, items[1]],
+      role: "viewer",
+    });
+    renderPage(
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    expect(await screen.findByText("证据原文片段")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "标题" })).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: "创建本轮修订" }),
+    ).not.toBeInTheDocument();
+    expect(
+      requests.mock.calls.some(([, init]) => init?.method === "POST"),
+    ).toBe(false);
+  });
+
+  it("refuses to edit an asset through a mismatched current-cycle context", async () => {
+    mockApi({ itemList: [items[0], items[1]] });
+    renderPage(
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    expect(await screen.findByText("无法核对本轮复用项")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: "标题" }),
+    ).not.toBeInTheDocument();
+  });
   it("renders persisted exact quotes, findings and keyboard-accessible edit", async () => {
     const requests = mockApi();
     renderPage("/app/tenant-1/project-1/content/asset-1");

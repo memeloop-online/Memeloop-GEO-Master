@@ -4,7 +4,7 @@
 
 最新完整绿色基线：`ef50347` / Actions `37419192163` 全绿。已读取实际日志，确认 PDF 文字/字形/分页以及持久工作区双次软件登录、退出、配置/卷/身份与旧数据库会话保留通过；Windows 构建与测试也通过。该基线包含 TCP 就绪检查修正，但不包含正在整合的跨周期复用代码。本地 Docker 重试仍未成功，不能宣称已准备好外部账号登录。
 
-本批周报 PDF 从正式不可变快照本地生成，入口、字体许可与验证边界见 [`report-pdf.md`](report-pdf.md)，准确测试结果见工作日志。自动新周期创建新正文 revision 绕过原分发身份去重的修复正在整合：领域、API、持久层、UI 与迁移已有工作区修改，内存跨仓储原子校验及整批实库/原生验收尚未完成。契约见 [`content-reuse.md`](content-reuse.md)，不能以手工复用同 revision 的测试证明自动零重复发布。
+本批周报 PDF 从正式不可变快照本地生成，入口、字体许可与验证边界见 [`report-pdf.md`](report-pdf.md)，准确测试结果见工作日志。跨周期正文复用已接领域/API/持久层/UI 及迁移 `0027`：保持原检查版本、独立本轮覆盖，编辑采用 copy-on-write。前端 155 项、整批 Rust 默认测试及真实后继周期 API/原生工作流回归通过；内存项目/知识 guard 与数据库事务保护公开提交，分发物化已补来源复核。本批 PostgreSQL 显式验收及完整 CI 尚待执行，可证明历史分支重建仍缺，不能沿用首段旧绿色结果。契约见 [`content-reuse.md`](content-reuse.md)。
 
 历史绿色基线：`44f22ff` / Actions `37405615406`，Linux/Windows、前端、显式 V8、Java 21、PostgreSQL 和真实本地浏览器冒烟全部通过，包含报告只读预览、实时导入进度及原始收据核对。已读取 Linux 日志确认 `import_progress` 两项、`actual_pdf_pages_are_imported_as_searchable_source_evidence` 与 P14 临时预览/零写入浏览器检查实际通过，不是默认忽略后的通过。截图采用合成资料，不包含外部账号或真实发布/搜索验收。
 

@@ -141,6 +141,7 @@ fn content_revision(id: Uuid) -> ContentRevision {
         }],
     };
     ContentRevision {
+        derived_from_revision_id: None,
         revision_id: id,
         asset_id: Uuid::new_v4(),
         revision: 1,

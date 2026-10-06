@@ -16,6 +16,7 @@ async function run({
   initial = "pending",
   count = 0,
   interruptAfter,
+  preparedStatus = "prepared",
 } = {}) {
   const item = {
     item_id: itemId,
@@ -39,7 +40,7 @@ async function run({
     }),
     async prepare() {
       calls.push("prepare");
-      item.status = "prepared";
+      item.status = preparedStatus;
       return read();
     },
     async generate() {
@@ -140,6 +141,25 @@ test("third blocking check is terminal without a third repair", async () => {
   const result = await run({ checks: [true, true, true] });
   assert.equal(result.item.status, "blocked");
   assert.equal(result.calls.filter((call) => call === "repair").length, 2);
+});
+
+test("prepare can reuse a ready revision without generation or a new check", async () => {
+  const result = await run({ checks: [], preparedStatus: "ready" });
+  assert.equal(result.item.status, "ready");
+  assert.deepEqual(result.calls.slice(0, 2), ["prepare", "close"]);
+  assert.ok(result.calls.includes("distributionTargetsRead"));
+  for (const operation of ["generate", "check", "repair"]) {
+    assert.ok(!result.calls.includes(operation));
+  }
+});
+
+test("reentry of reused ready content only closes and prepares current-cycle coverage", async () => {
+  const result = await run({ checks: [], initial: "ready" });
+  assert.equal(result.calls[0], "close");
+  assert.ok(result.calls.includes("distributionTargetsRead"));
+  for (const operation of ["prepare", "generate", "check", "repair"]) {
+    assert.ok(!result.calls.includes(operation));
+  }
 });
 
 test("reentry follows persisted draft and count after interrupted repair", async () => {

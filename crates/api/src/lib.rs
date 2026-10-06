@@ -2045,6 +2045,10 @@ pub fn router(state: AppState) -> Router {
             get(content::items),
         )
         .route(
+            "/projects/{id}/document-executions/{execution_id}/items/{item_id}/fork",
+            post(content::fork_reused_item),
+        )
+        .route(
             "/projects/{id}/document-executions/{execution_id}/resume",
             post(content::resume),
         )

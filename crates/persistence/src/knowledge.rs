@@ -6,17 +6,17 @@
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use geo_domain::{
-    AppError, Chunk, CurrentKnowledgeRelease, DocumentManifest, DocumentManifestCoverage,
-    DocumentManifestItem, DocumentManifestItemState, DocumentManifestPlanRequest,
-    DocumentManifestState, DocumentScope, Fact, ImportAcceptance, ImportBatchAcceptance,
-    ImportItem, ImportJob, ImportStage, ImportStatus, KnowledgeAnswerStatus, KnowledgeAskResult,
-    KnowledgeCapability, KnowledgeCoverage, KnowledgeEvidence, KnowledgeOverview, KnowledgePurpose,
-    KnowledgeRelease, KnowledgeRepository, KnowledgeSearchRequest, KnowledgeSearchResult,
-    MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES, Operation, OperationStatus, Product, Source,
-    SourceDetail, SourceKind, SourceState, SourceVersion, StoredObject, StoredObjectState,
-    TenantScope, UPLOAD_SESSION_TTL_SECONDS, UploadSession, UploadSessionCommand,
-    UploadSessionState, is_supported_knowledge_media_type, knowledge_parser_version,
-    parsed_knowledge_chunks, plan_document_manifest, sha256_hex,
+    AppError, Chunk, ContentKnowledgeGuard, ContentPublicEligibility, CurrentKnowledgeRelease,
+    DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
+    DocumentManifestPlanRequest, DocumentManifestState, DocumentScope, Fact, ImportAcceptance,
+    ImportBatchAcceptance, ImportItem, ImportJob, ImportStage, ImportStatus, KnowledgeAnswerStatus,
+    KnowledgeAskResult, KnowledgeCapability, KnowledgeCoverage, KnowledgeEvidence,
+    KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
+    KnowledgeSearchRequest, KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES,
+    Operation, OperationStatus, Product, Source, SourceDetail, SourceKind, SourceState,
+    SourceVersion, StoredObject, StoredObjectState, TenantScope, UPLOAD_SESSION_TTL_SECONDS,
+    UploadSession, UploadSessionCommand, UploadSessionState, is_supported_knowledge_media_type,
+    knowledge_parser_version, parsed_knowledge_chunks, plan_document_manifest, sha256_hex,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -960,6 +960,16 @@ impl PgKnowledgeRepository {
 
 #[async_trait]
 impl KnowledgeRepository for PgKnowledgeRepository {
+    async fn hold_content_evidence<'a>(
+        &'a self,
+        _scope: &TenantScope,
+        _inputs: &[ContentPublicEligibility],
+    ) -> Result<ContentKnowledgeGuard<'a>, AppError> {
+        // PgContentRepository locks source rows and verifies current/public
+        // versions, frozen release membership, and exact located quotes in
+        // the same transaction as prepare, checked registration, or sealing.
+        Ok(ContentKnowledgeGuard::transactional())
+    }
     async fn get_import_progress(
         &self,
         scope: &TenantScope,

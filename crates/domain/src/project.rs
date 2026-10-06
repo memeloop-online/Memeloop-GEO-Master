@@ -969,6 +969,18 @@ impl ProjectPatch {
 
 #[async_trait]
 pub trait ProjectRepository: Send + Sync {
+    /// Keep the project eligibility read lock across one content-repository
+    /// commit. Acquire before the knowledge guard, and never await project or
+    /// knowledge operations again while either read lock is held.
+    async fn hold_content_project<'a>(
+        &'a self,
+        _scope: &TenantScope,
+        _project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        Err(AppError::capability_missing(
+            "atomic content project eligibility guard is unavailable",
+        ))
+    }
     async fn list(&self, scope: &TenantScope) -> Result<Vec<Project>, AppError>;
     async fn list_page(
         &self,
@@ -1102,6 +1114,41 @@ pub trait ProjectRepository: Send + Sync {
     }
 }
 
+/// Transactional indicates that the content repository performs the same
+/// eligibility validation inside its own write transaction. Unconfigured
+/// repository wrappers cannot silently claim this marker: the trait default
+/// fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentGuardMode {
+    Held,
+    Transactional,
+}
+
+pub struct ContentProjectGuard<'a> {
+    mode: ContentGuardMode,
+    _hold: Option<Box<dyn Send + 'a>>,
+}
+
+impl<'a> ContentProjectGuard<'a> {
+    pub fn transactional() -> Self {
+        Self {
+            mode: ContentGuardMode::Transactional,
+            _hold: None,
+        }
+    }
+
+    fn held(guard: tokio::sync::RwLockReadGuard<'a, MemoryProjectState>) -> Self {
+        Self {
+            mode: ContentGuardMode::Held,
+            _hold: Some(Box::new(guard)),
+        }
+    }
+
+    pub fn mode(&self) -> ContentGuardMode {
+        self.mode
+    }
+}
+
 fn format_cursor(project: &Project) -> String {
     format!("{}:{}", project.created_at.timestamp_millis(), project.id)
 }
@@ -1179,6 +1226,29 @@ impl MemoryProjectRepository {
 
 #[async_trait]
 impl ProjectRepository for MemoryProjectRepository {
+    async fn hold_content_project<'a>(
+        &'a self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        if scope.project_id != Some(project_id) {
+            return Err(AppError::forbidden("project is outside content scope"));
+        }
+        let guard = self.state.read().await;
+        let project = guard
+            .projects
+            .get(&project_id)
+            .filter(|project| {
+                project.operator_id == scope.operator_id && project.tenant_id == scope.tenant_id
+            })
+            .ok_or_else(|| AppError::not_found("project not found"))?;
+        if project.status != ProjectStatus::Active {
+            return Err(AppError::conflict(
+                "project is not active for public content",
+            ));
+        }
+        Ok(ContentProjectGuard::held(guard))
+    }
     async fn list(&self, scope: &TenantScope) -> Result<Vec<Project>, AppError> {
         let mut result = self
             .state
@@ -1878,6 +1948,44 @@ mod tests {
     };
     use chrono::{DateTime, Utc};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn active_project_guard_blocks_pause_until_content_commit() {
+        use std::sync::Arc;
+        use tokio::time::{Duration, sleep, timeout};
+
+        let repository = Arc::new(MemoryProjectRepository::new());
+        let id = Uuid::new_v4().into();
+        let scope = super::TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), Some(id));
+        let mut project = super::Project::new(
+            id,
+            &scope,
+            "guard-project",
+            "Guard project",
+            ProjectSettings::default(),
+        )
+        .unwrap();
+        project.status = ProjectStatus::Active;
+        repository.insert(project).await.unwrap();
+        let held = repository.hold_content_project(&scope, id).await.unwrap();
+        assert_eq!(held.mode(), super::ContentGuardMode::Held);
+        let writer_repo = repository.clone();
+        let writer = tokio::spawn(async move {
+            let mut state = writer_repo.state.write().await;
+            state.projects.get_mut(&id).unwrap().status = ProjectStatus::Paused;
+        });
+        sleep(Duration::from_millis(30)).await;
+        assert!(
+            !writer.is_finished(),
+            "project pause must wait for content commit"
+        );
+        drop(held);
+        timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repository.hold_content_project(&scope, id).await.is_err());
+    }
 
     fn utc(value: &str) -> DateTime<Utc> {
         value.parse::<DateTime<Utc>>().expect("valid UTC fixture")

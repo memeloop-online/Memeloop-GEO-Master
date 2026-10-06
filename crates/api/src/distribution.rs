@@ -13,11 +13,11 @@ use chrono::Utc;
 use geo_domain::{
     AppError, ChannelAccount, ChannelRepository, ChannelStatus, ConnectorAvailability,
     ConnectorCapabilityRepository, ConnectorKey, ContentExecutionStatus, ContentItemStatus,
-    ContentRepository, ContentRevision, DistributionDeferralReason, DistributionManifest,
-    DistributionRepository, DistributionScopeMode, DistributionTarget, DistributionTargetPage,
-    DistributionTargetStatus, FreezeDistribution, KnowledgePurpose, KnowledgeRepository,
-    PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository, ProjectStatus,
-    SourceState, TenantScope, publication_format_for_semantic_type,
+    ContentPublicEligibility, ContentRepository, ContentRevision, DistributionDeferralReason,
+    DistributionManifest, DistributionRepository, DistributionScopeMode, DistributionTarget,
+    DistributionTargetPage, DistributionTargetStatus, FreezeDistribution, KnowledgePurpose,
+    KnowledgeRepository, PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository,
+    ProjectStatus, SourceState, TenantScope, publication_format_for_semantic_type,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -527,22 +527,40 @@ impl DistributionService {
             })
             .map(|account| account.account_id);
         let checked = self.checked_revision(scope, manifest, &row).await?;
-        let (revision, defer_reason) = match checked {
-            Ok(revision) => (account_id.map(|_| revision), None),
-            Err(reason) => (None, Some(reason)),
+        let (revision, eligibility, defer_reason) = match checked {
+            Ok((revision, eligibility)) if account_id.is_some() => {
+                (Some(revision), Some(eligibility), None)
+            }
+            Ok(_) => (None, None, None),
+            Err(reason) => (None, None, Some(reason)),
         };
-        self.distribution
-            .materialize(
-                scope,
-                PreparedDistribution {
-                    manifest_id: manifest.manifest_id,
-                    target_id: row.target_id,
-                    revision,
-                    account_id,
-                    defer_reason,
-                },
-            )
-            .await?;
+        let prepared = PreparedDistribution {
+            manifest_id: manifest.manifest_id,
+            target_id: row.target_id,
+            revision,
+            account_id,
+            defer_reason,
+        };
+        if let Some(eligibility) = eligibility {
+            // All repository reads above are preliminary. Keep the project
+            // and complete frozen source dependencies locked across the
+            // outbox commit, in that order. PostgreSQL's transactional guard
+            // delegates the same checks to materialize's own transaction.
+            let project_guard = self
+                .projects
+                .hold_content_project(scope, manifest.project_id)
+                .await?;
+            let knowledge_guard = self
+                .knowledge
+                .hold_content_evidence(scope, &[eligibility])
+                .await?;
+            let materialized = self.distribution.materialize(scope, prepared).await;
+            drop(knowledge_guard);
+            drop(project_guard);
+            materialized?;
+        } else {
+            self.distribution.materialize(scope, prepared).await?;
+        }
         Ok(())
     }
 
@@ -551,7 +569,10 @@ impl DistributionService {
         scope: &TenantScope,
         manifest: &DistributionManifest,
         row: &DistributionTarget,
-    ) -> Result<Result<ContentRevision, DistributionDeferralReason>, AppError> {
+    ) -> Result<
+        Result<(ContentRevision, ContentPublicEligibility), DistributionDeferralReason>,
+        AppError,
+    > {
         let Some(item) = self
             .content
             .get_item(scope, manifest.content_execution_id, row.document_item_id)
@@ -584,26 +605,22 @@ impl DistributionService {
         }) {
             return Ok(Err(DistributionDeferralReason::ContentUnsupported));
         }
-        let Some(asset_id) = item.asset_id else {
-            return Ok(Err(DistributionDeferralReason::ContentUnsupported));
-        };
-        let Some(asset) = self.content.get_asset(scope, asset_id).await? else {
-            return Ok(Err(DistributionDeferralReason::ContentUnsupported));
-        };
-        if asset.execution_id != item.execution_id || asset.item_id != item.item_id {
-            return Ok(Err(DistributionDeferralReason::ContentUnsupported));
-        }
+        // The repository resolves both local revisions and an explicitly
+        // bound, independently checked origin. A reused asset is never
+        // misrepresented as belonging to this destination execution.
         let Some(revision) = self
             .content
-            .list_revisions(scope, asset_id)
+            .resolve_checked_revision(
+                scope,
+                manifest.content_execution_id,
+                row.document_item_id,
+                frozen_id,
+            )
             .await?
-            .into_iter()
-            .find(|revision| revision.revision_id == frozen_id)
         else {
             return Ok(Err(DistributionDeferralReason::ContentUnsupported));
         };
-        if revision.asset_id != asset_id
-            || revision.findings.is_empty()
+        if revision.revision_id != frozen_id
             || revision.findings.iter().any(|finding| finding.blocking)
             || revision.evidence.is_empty()
             || revision.markdown != revision.document.markdown()
@@ -668,11 +685,30 @@ impl DistributionService {
                 Some(chunk.chunk_id) == reference.chunk_id
                     && chunk.source_version_id == reference.source_version_id
                     && chunk.locator == reference.locator
+                    && revision.quotes.iter().any(|quote| {
+                        quote.reference == *reference
+                            && if matches!(chunk.locator, geo_domain::ChunkLocator::Csv { .. }) {
+                                chunk.text == quote.exact_quote
+                            } else {
+                                chunk
+                                    .text
+                                    .chars()
+                                    .take(geo_domain::CONTENT_EVIDENCE_MAX_QUOTE_CHARS)
+                                    .collect::<String>()
+                                    == quote.exact_quote
+                            }
+                    })
             }) {
                 return Ok(Err(DistributionDeferralReason::SourceUnavailable));
             }
         }
-        Ok(Ok(revision))
+        let eligibility = ContentPublicEligibility {
+            document_manifest_id: manifest.document_manifest_id,
+            document_manifest_item_id: row.document_item_id,
+            source_version_ids: planned_item.source_version_refs.clone(),
+            evidence: revision.quotes.clone(),
+        };
+        Ok(Ok((revision, eligibility)))
     }
 }
 

@@ -9,11 +9,12 @@ use geo_api::{
     RepositoryHostOps, content_runtime::ContentWorkflowExecutor,
 };
 use geo_domain::{
-    ContentItemStatus, DocumentScope, ImportItem, InitialSource, InitialSourceKind,
-    InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, MemoryAuthRepository,
-    MemoryContentRepository, MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate,
-    ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartCommand, SourceKind, TenantScope,
-    hash_idempotency_key, settings_hash, start_request_hash,
+    ContentItemStatus, ContentRepository, DocumentScope, ImportItem, InitialSource,
+    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository,
+    MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
+    MemoryProjectRepository, ProjectCreate, ProjectPatch, ProjectRepository, ProjectSettings,
+    ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
+    start_request_hash,
 };
 use geo_worker::{
     ContentCloseRequest, ContentExecutionReadRequest, ContentItemsReadRequest, ContentStartRequest,
@@ -504,4 +505,232 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         Some(2),
         "successor planning uses frozen config, not the edited project draft"
     );
+    let next_items = state
+        .content_service()
+        .repository()
+        .list_items(&scope, next_ref.execution_id)
+        .await
+        .unwrap();
+    let changed = host
+        .content_prepare(
+            &scope,
+            ContentStepRequest {
+                execution_id: next_ref.execution_id,
+                item_id: next_items[0].item_id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed.status, ContentItemStatus::Prepared);
+    assert_eq!(
+        model.0.load(Ordering::SeqCst),
+        4,
+        "a changed public source dependency must prepare a fresh draft"
+    );
+}
+
+#[tokio::test]
+async fn two_automatic_content_cycles_reuse_the_same_checked_revision_without_model_calls() {
+    let tenant = TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), None);
+    let projects = Arc::new(MemoryProjectRepository::default());
+    let project = projects
+        .create(
+            &tenant,
+            ProjectCreate {
+                slug: None,
+                display_name: "Cycle reuse".into(),
+                settings: ProjectSettings {
+                    brand_name: "Example".into(),
+                    market: "US".into(),
+                    language: "en".into(),
+                    initial_sources: vec![InitialSource {
+                        kind: InitialSourceKind::Text,
+                        value: "Public description".into(),
+                        visibility: InitialSourceVisibility::Public,
+                        version_ref: None,
+                        content_hash: None,
+                    }],
+                    ..ProjectSettings::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let hash = settings_hash(&project.settings.clone().validate_start().unwrap()).unwrap();
+    let accepted = projects
+        .start(
+            &tenant,
+            project.id,
+            ProjectStartCommand {
+                expected_revision: project.revision,
+                idempotency_key_hash: hash_idempotency_key("reuse-start"),
+                request_hash: start_request_hash(project.id, project.revision, &hash),
+                settings_hash: hash,
+                operation_id: Uuid::new_v4(),
+            },
+        )
+        .await
+        .unwrap();
+    let scope = TenantScope::new(tenant.operator_id, tenant.tenant_id, Some(project.id));
+    let knowledge = Arc::new(MemoryKnowledgeRepository::default());
+    knowledge
+        .import_batch(
+            &scope,
+            vec![ImportItem {
+                client_item_id: "public".into(),
+                kind: SourceKind::Text,
+                name: "public".into(),
+                purpose: KnowledgePurpose::Public,
+                text: Some("Public description".into()),
+                url: None,
+                object_id: None,
+                knowledge_release_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let model = Arc::new(GroundedModel(AtomicUsize::new(0)));
+    let executor = Arc::new(AcceptedExecutor(AtomicUsize::new(0)));
+    let repository = Arc::new(MemoryContentRepository::default());
+    let state = AppState::with_stores_and_auth_and_projects_and_knowledge(
+        Arc::new(MemoryOperationStore::default()),
+        Arc::new(MemoryIdempotencyStore::default()),
+        Arc::new(MemoryAuthRepository::development_with_password("unused")),
+        projects.clone(),
+        knowledge.clone(),
+        EventBus::default(),
+        false,
+    )
+    .with_content_repository(repository.clone());
+    state.configure_content_model(model.clone());
+    state.configure_content_executor(executor);
+    let host = RepositoryHostOps::new(knowledge).with_content(state);
+    let first = host
+        .content_start(
+            &scope,
+            ContentStartRequest {
+                cycle_id: Some(accepted.cycle_id),
+            },
+        )
+        .await
+        .unwrap();
+    let first_item = repository
+        .list_items(&scope, first.execution_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let first_step = ContentStepRequest {
+        execution_id: first.execution_id,
+        item_id: first_item.item_id,
+    };
+    host.content_prepare(&scope, first_step.clone())
+        .await
+        .unwrap();
+    host.content_generate(&scope, first_step.clone())
+        .await
+        .unwrap();
+    host.content_check(&scope, first_step).await.unwrap();
+    let first_checked = repository
+        .get_item(&scope, first.execution_id, first_item.item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_checked.status, ContentItemStatus::Ready);
+    assert_eq!(model.0.load(Ordering::SeqCst), 2);
+    host.content_close(
+        &scope,
+        ContentCloseRequest {
+            execution_id: first.execution_id,
+        },
+    )
+    .await
+    .unwrap();
+    let first_cycle = projects
+        .get_current_cycle(&scope, project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let next = projects
+        .schedule_next_cycle(
+            &scope,
+            project.id,
+            accepted.cycle_id,
+            first_cycle.cutoff_at + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+    let second = host
+        .content_start(
+            &scope,
+            ContentStartRequest {
+                cycle_id: Some(next.cycle_id),
+            },
+        )
+        .await
+        .unwrap();
+    let second_item = repository
+        .list_items(&scope, second.execution_id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_ne!(first.execution_id, second.execution_id);
+    assert_ne!(first_item.item_id, second_item.item_id);
+    let prepared = host
+        .content_prepare(
+            &scope,
+            ContentStepRequest {
+                execution_id: second.execution_id,
+                item_id: second_item.item_id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.status, ContentItemStatus::Ready);
+    assert_eq!(model.0.load(Ordering::SeqCst), 2);
+    let reused = repository
+        .get_item(&scope, second.execution_id, second_item.item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reused.ready_revision_id, first_checked.ready_revision_id);
+    let binding = reused.reuse_binding.unwrap();
+    assert_eq!(binding.origin_execution_id, first.execution_id);
+    assert_eq!(binding.origin_item_id, first_item.item_id);
+    assert_eq!(
+        repository
+            .resolve_checked_revision(
+                &scope,
+                second.execution_id,
+                second_item.item_id,
+                first_checked.ready_revision_id.unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .revision_id,
+        first_checked.ready_revision_id.unwrap()
+    );
+    let foreign = TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id);
+    assert!(
+        repository
+            .resolve_checked_revision(
+                &foreign,
+                second.execution_id,
+                second_item.item_id,
+                first_checked.ready_revision_id.unwrap(),
+            )
+            .await
+            .unwrap_or(None)
+            .is_none(),
+        "foreign tenants cannot resolve another tenant's origin"
+    );
+    host.content_close(
+        &scope,
+        ContentCloseRequest {
+            execution_id: second.execution_id,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(model.0.load(Ordering::SeqCst), 2);
 }

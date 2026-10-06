@@ -14,9 +14,10 @@ pub fn spawn(state: AppState, repository: PgContentRepository, projects: PgProje
         loop {
             ticks.tick().await;
             let now = chrono::Utc::now();
-            // A model is needed to create documents, but NOT to recover the
-            // already closed handoff and prepare distribution coverage.
-            if state.content_model_available() {
+            // Preparation can reuse an independently checked revision without
+            // a model. Only a genuine generation/check/repair miss needs one;
+            // those operations preserve retryable capability-missing state.
+            {
                 let mut after = None;
                 loop {
                     match projects
@@ -81,9 +82,6 @@ pub fn spawn(state: AppState, repository: PgContentRepository, projects: PgProje
                 }
             }
             for stage in [false, true] {
-                if !stage && !state.content_model_available() {
-                    continue;
-                }
                 let mut after = None;
                 loop {
                     let page = if stage {

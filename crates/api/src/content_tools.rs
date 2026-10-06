@@ -57,9 +57,9 @@ pub(crate) async fn start(
     let project_id = scope
         .project_id
         .ok_or_else(|| AppError::forbidden("project scope required"))?;
-    if !state.content_executor_available() || !state.content_model_available() {
+    if !state.content_executor_available() {
         return Err(AppError::capability_missing(
-            "content workflow or model provider is not configured",
+            "content workflow executor is not configured",
         ));
     }
     let cycle_id = match request.cycle_id {

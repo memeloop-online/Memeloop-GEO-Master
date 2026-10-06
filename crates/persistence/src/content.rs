@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ContentAsset, ContentBrief, ContentCheck, ContentExecution, ContentFinding,
-    ContentHandoff, ContentItem, ContentItemStatus, ContentRepository, ContentRevision,
+    ContentHandoff, ContentItem, ContentItemStatus, ContentRepository, ContentReuseBinding,
+    ContentReuseDecision, ContentReuseRequest, ContentRevision, ContentSemanticDescriptor,
     ContentState, ContentStep, DocumentManifest, ErrorCode, StepLease, StructuredDocument,
     TenantScope, start_content_state,
 };
@@ -299,6 +300,126 @@ impl PgContentRepository {
         crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
         Ok(tx)
     }
+    // Project -> execution -> registry is the lock order for every content
+    // transition. In particular source changes in another transaction cannot
+    // race a reuse decision: source rows are locked FOR SHARE below.
+    async fn lock_project(
+        tx: &mut Transaction<'_, Postgres>,
+        scope: &TenantScope,
+    ) -> Result<(), AppError> {
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::invalid_request("project scope required"))?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM projects WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+        .fetch_optional(&mut **tx).await.map_err(db)?;
+        if status.is_none() {
+            return Err(AppError::not_found("content project not found"));
+        }
+        Ok(())
+    }
+    async fn validate_reuse_sources(
+        tx: &mut Transaction<'_, Postgres>,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        descriptor: &ContentSemanticDescriptor,
+    ) -> Result<(), AppError> {
+        Self::validate_frozen_sources(
+            tx,
+            scope,
+            execution_id,
+            &descriptor.document_key,
+            &descriptor.source_version_ids,
+            &descriptor.evidence,
+        )
+        .await
+    }
+    async fn validate_frozen_sources(
+        tx: &mut Transaction<'_, Postgres>,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        document_key: &str,
+        source_version_ids: &[Uuid],
+        evidence: &[geo_domain::ContentEvidence],
+    ) -> Result<(), AppError> {
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::invalid_request("project scope required"))?;
+        let active: bool = sqlx::query_scalar(
+            "SELECT status='active' FROM projects WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3",
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .fetch_one(&mut **tx).await.map_err(db)?;
+        if !active {
+            return Err(AppError::conflict("content requires an active project"));
+        }
+        let release: Option<Uuid> = sqlx::query_scalar(
+            "SELECT mi.knowledge_release_id FROM content_executions c \
+             JOIN document_manifest_items mi ON (mi.operator_id,mi.tenant_id,mi.project_id,mi.manifest_id)= \
+                 (c.operator_id,c.tenant_id,c.project_id,c.manifest_id) \
+             WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 \
+             AND c.execution_id=$4 AND mi.document_key=$5",
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .bind(execution_id).bind(document_key).fetch_optional(&mut **tx).await.map_err(db)?;
+        let release =
+            release.ok_or_else(|| AppError::conflict("frozen document release is missing"))?;
+        for source_version_id in source_version_ids {
+            let eligible: Option<bool> = sqlx::query_scalar(
+                "SELECT s.state='active' AND s.purpose='public' AND s.current_version_id=v.source_version_id \
+                 FROM knowledge_source_versions v JOIN knowledge_sources s \
+                   ON (s.operator_id,s.tenant_id,s.project_id,s.source_id)= \
+                      (v.operator_id,v.tenant_id,v.project_id,v.source_id) \
+                 JOIN knowledge_release_source_versions r \
+                   ON (r.operator_id,r.tenant_id,r.project_id,r.source_version_id)= \
+                      (v.operator_id,v.tenant_id,v.project_id,v.source_version_id) \
+                 WHERE v.operator_id=$1 AND v.tenant_id=$2 AND v.project_id=$3 \
+                   AND v.source_version_id=$4 AND r.knowledge_release_id=$5 FOR SHARE OF s",
+            ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+                .bind(*source_version_id).bind(release).fetch_optional(&mut **tx).await.map_err(db)?;
+            if eligible != Some(true) {
+                return Err(AppError::conflict("frozen source is not currently public"));
+            }
+        }
+        for evidence in evidence {
+            let chunk = evidence
+                .reference
+                .chunk_id
+                .ok_or_else(|| AppError::invalid_request("located evidence required"))?;
+            let row = sqlx::query(
+                "SELECT text,locator FROM knowledge_chunks WHERE operator_id=$1 AND tenant_id=$2 \
+                 AND project_id=$3 AND source_version_id=$4 AND chunk_id=$5",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project.as_uuid())
+            .bind(evidence.reference.source_version_id)
+            .bind(chunk)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db)?;
+            let Some(row) = row else {
+                return Err(AppError::conflict("frozen evidence is unavailable"));
+            };
+            let locator = serde_json::to_value(&evidence.reference.locator).map_err(encode)?;
+            let text: String = row.get("text");
+            let expected_quote: String = if matches!(
+                evidence.reference.locator,
+                geo_domain::ChunkLocator::Csv { .. }
+            ) {
+                text
+            } else {
+                text.chars().take(1600).collect()
+            };
+            if row.get::<serde_json::Value, _>("locator") != locator
+                || expected_quote != evidence.exact_quote
+                || evidence.exact_quote.chars().count() > 1600
+            {
+                return Err(AppError::conflict("frozen evidence quote changed"));
+            }
+        }
+        Ok(())
+    }
     async fn read(&self, scope: &TenantScope, id: Uuid) -> Result<Option<ContentState>, AppError> {
         let Some(project) = scope.project_id else {
             return Err(AppError::invalid_request("project scope required"));
@@ -324,6 +445,7 @@ impl PgContentRepository {
             return Err(AppError::invalid_request("project scope required"));
         };
         let mut tx = self.transaction(scope).await?;
+        Self::lock_project(&mut tx, scope).await?;
         let json: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT state FROM content_executions WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND execution_id=$4 FOR UPDATE",
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
@@ -340,7 +462,174 @@ impl PgContentRepository {
         let previous_revision_count = state.revisions.len();
         let previous_check_count = state.checks.len();
         let previous_handoff_count = state.handoffs.len();
+        let previous_reservations: Vec<_> = state
+            .items
+            .iter()
+            .filter_map(|i| {
+                Some((
+                    i.item_id,
+                    i.semantic_fingerprint.clone()?,
+                    i.reuse_reservation_token?,
+                ))
+            })
+            .collect();
         let result = change(&mut state)?;
+        for (item_id, fingerprint, token) in previous_reservations {
+            if state.items.iter().any(|i| {
+                i.item_id == item_id
+                    && (i.reuse_reservation_token != Some(token)
+                        || matches!(
+                            i.status,
+                            ContentItemStatus::Blocked | ContentItemStatus::Cancelled
+                        ))
+            }) {
+                sqlx::query("UPDATE content_reuse_registry SET reservation_execution_id=NULL, \
+                     reservation_item_id=NULL,reservation_token=NULL,reservation_expires_at=NULL,updated_at=now() \
+                     WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND fingerprint=$4 \
+                     AND reservation_execution_id=$5 AND reservation_item_id=$6 AND reservation_token=$7")
+                    .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
+                    .bind(project.as_uuid()).bind(fingerprint).bind(id).bind(item_id).bind(token)
+                    .execute(&mut *tx).await.map_err(db)?;
+            }
+        }
+        // Manual edits and copy-on-write forks preserve semantic inputs but
+        // explicitly discard the previous producer fence. A fresh independent
+        // Check claim acquires the shared fingerprint reservation. A competing
+        // producer with a live lease remains authoritative until it finishes
+        // or expires, while the edited branch stays drafted and retryable.
+        for item in state.items.iter_mut().filter(|i| {
+            i.status == ContentItemStatus::Drafted
+                && i.semantic_descriptor.is_some()
+                && i.reuse_reservation_token.is_none()
+        }) {
+            let Some(check_lease) = item
+                .steps
+                .iter()
+                .find(|step| step.step == ContentStep::Check && step.expires_at > Utc::now())
+            else {
+                continue;
+            };
+            let fingerprint = item
+                .semantic_fingerprint
+                .as_ref()
+                .ok_or_else(|| AppError::conflict("semantic fingerprint missing"))?;
+            let row = sqlx::query(
+                "SELECT descriptor,reservation_token,reservation_expires_at \
+                 FROM content_reuse_registry WHERE operator_id=$1 AND tenant_id=$2 \
+                 AND project_id=$3 AND fingerprint=$4 FOR UPDATE",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project.as_uuid())
+            .bind(fingerprint)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| AppError::conflict("semantic registry missing"))?;
+            if row.get::<serde_json::Value, _>("descriptor")
+                != serde_json::to_value(item.semantic_descriptor.as_ref().expect("filtered"))
+                    .map_err(encode)?
+            {
+                return Err(AppError::conflict(
+                    "semantic fingerprint descriptor collision",
+                ));
+            }
+            if row.get::<Option<Uuid>, _>("reservation_token").is_some()
+                && row
+                    .get::<Option<DateTime<Utc>>, _>("reservation_expires_at")
+                    .is_some_and(|expires| expires > Utc::now())
+            {
+                return Err(AppError::conflict("semantic producer is still active"));
+            }
+            sqlx::query("UPDATE content_reuse_registry SET reservation_execution_id=$1,reservation_item_id=$2, \
+                 reservation_token=$3,reservation_expires_at=$4,updated_at=now() \
+                 WHERE operator_id=$5 AND tenant_id=$6 AND project_id=$7 AND fingerprint=$8")
+                .bind(id).bind(item.item_id).bind(check_lease.token).bind(check_lease.expires_at)
+                .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+                .bind(fingerprint).execute(&mut *tx).await.map_err(db)?;
+            item.reuse_reservation_token = Some(check_lease.token);
+        }
+        for item in state.items.iter().filter(|i| {
+            i.status == ContentItemStatus::Drafted
+                && i.semantic_fingerprint.is_some()
+                && i.steps
+                    .iter()
+                    .any(|step| step.step == ContentStep::Check && step.expires_at > Utc::now())
+        }) {
+            let owned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM content_reuse_registry WHERE operator_id=$1 \
+                 AND tenant_id=$2 AND project_id=$3 AND fingerprint=$4 \
+                 AND reservation_execution_id=$5 AND reservation_item_id=$6 AND reservation_token=$7)",
+            ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
+                .bind(project.as_uuid()).bind(item.semantic_fingerprint.as_ref().expect("filtered"))
+                .bind(id).bind(item.item_id).bind(item.reuse_reservation_token)
+                .fetch_one(&mut *tx).await.map_err(db)?;
+            if !owned {
+                return Err(AppError::conflict(
+                    "semantic producer reservation was superseded",
+                ));
+            }
+        }
+        if state.handoffs.len() > previous_handoff_count {
+            for item in state
+                .items
+                .iter()
+                .filter(|i| i.status == ContentItemStatus::Ready)
+            {
+                let quotes = item
+                    .brief
+                    .as_ref()
+                    .map(|b| b.quotes.as_slice())
+                    .unwrap_or(&[]);
+                Self::validate_frozen_sources(
+                    &mut tx,
+                    scope,
+                    id,
+                    &item.document_key,
+                    &item.source_version_refs,
+                    quotes,
+                )
+                .await?;
+            }
+        }
+        // The first producer's reservation is held through the successful
+        // independent check. A late model result can never become ready after
+        // another execution has taken over the fingerprint.
+        for item in state.items.iter().filter(|item| {
+            item.status == ContentItemStatus::Ready
+                && item.semantic_descriptor.is_some()
+                && item.reuse_binding.is_none()
+                && state.checks[previous_check_count..]
+                    .iter()
+                    .any(|check| Some(check.revision_id) == item.ready_revision_id)
+        }) {
+            Self::validate_reuse_sources(
+                &mut tx,
+                scope,
+                id,
+                item.semantic_descriptor.as_ref().expect("filtered"),
+            )
+            .await?;
+            let fingerprint = item
+                .semantic_fingerprint
+                .as_ref()
+                .ok_or_else(|| AppError::conflict("semantic fingerprint missing"))?;
+            let token = item
+                .reuse_reservation_token
+                .ok_or_else(|| AppError::conflict("producer reservation missing"))?;
+            let owned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM content_reuse_registry WHERE operator_id=$1 AND tenant_id=$2 \
+                 AND project_id=$3 AND fingerprint=$4 AND reservation_execution_id=$5 \
+                 AND reservation_item_id=$6 AND reservation_token=$7 AND reservation_expires_at>now())",
+            ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+                .bind(fingerprint).bind(id).bind(item.item_id).bind(token)
+                .fetch_one(&mut *tx).await.map_err(db)?;
+            if !owned {
+                return Err(AppError::conflict(
+                    "content producer reservation was superseded",
+                ));
+            }
+        }
         for item in state
             .items
             .iter()
@@ -356,10 +645,11 @@ impl PgContentRepository {
         // the updated execution state. A stale lease or cancelled execution
         // returns above without writing anything.
         for revision in &state.revisions[previous_revision_count..] {
-            sqlx::query("INSERT INTO content_revisions (revision_id,operator_id,tenant_id,project_id,execution_id,asset_id,revision,body,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+            sqlx::query("INSERT INTO content_revisions (revision_id,operator_id,tenant_id,project_id,execution_id,asset_id,revision,body,created_at,derived_from_revision_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
                 .bind(revision.revision_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
                 .bind(id).bind(revision.asset_id).bind(revision.revision)
                 .bind(serde_json::to_value(revision).map_err(encode)?).bind(revision.created_at)
+                .bind(revision.derived_from_revision_id)
                 .execute(&mut *tx).await.map_err(db)?;
         }
         for check in &state.checks[previous_check_count..] {
@@ -368,6 +658,69 @@ impl PgContentRepository {
                 .bind(id).bind(check.revision_id).bind(serde_json::to_value(check).map_err(encode)?).bind(check.created_at)
                 .execute(&mut *tx).await.map_err(db)?;
         }
+        // Older executions can finish after the one-time migration backfill.
+        // Index those proof-incomplete ready branches in this same check
+        // transaction so a successor cannot silently generate a new identity.
+        for item in state.items.iter().filter(|item| {
+            item.status == ContentItemStatus::Ready
+                && item.semantic_descriptor.is_none()
+                && state.checks[previous_check_count..].iter().any(|check| {
+                    Some(check.revision_id) == item.ready_revision_id
+                        && !check.findings.iter().any(|finding| finding.blocking)
+                })
+        }) {
+            sqlx::query("INSERT INTO content_reuse_legacy_branches \
+                 (operator_id,tenant_id,project_id,execution_id,item_id,document_key,source_version_refs) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
+                .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
+                .bind(project.as_uuid()).bind(id).bind(item.item_id).bind(&item.document_key)
+                .bind(serde_json::to_value(&item.source_version_refs).map_err(encode)?)
+                .execute(&mut *tx).await.map_err(db)?;
+        }
+        for item in &state.items {
+            let Some(fingerprint) = &item.semantic_fingerprint else {
+                continue;
+            };
+            if let Some(token) = item.reuse_reservation_token {
+                let expires = item.steps.iter().map(|lease| lease.expires_at).max();
+                if let Some(expires) = expires {
+                    sqlx::query("UPDATE content_reuse_registry SET reservation_expires_at=GREATEST(reservation_expires_at,$1),updated_at=now() \
+                         WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 AND fingerprint=$5 \
+                         AND reservation_execution_id=$6 AND reservation_item_id=$7 AND reservation_token=$8")
+                        .bind(expires).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
+                        .bind(project.as_uuid()).bind(fingerprint).bind(id).bind(item.item_id).bind(token)
+                        .execute(&mut *tx).await.map_err(db)?;
+                }
+            }
+            if item.status == ContentItemStatus::Ready
+                && item.reuse_binding.is_none()
+                && let Some(revision_id) = item.ready_revision_id
+                && let Some(check) = state.checks[previous_check_count..].iter().find(|c| {
+                    c.revision_id == revision_id && !c.findings.iter().any(|f| f.blocking)
+                })
+            {
+                sqlx::query("UPDATE content_reuse_registry SET origin_execution_id=$1,origin_item_id=$2,asset_id=$3,revision_id=$4,check_id=$5, \
+                    reservation_execution_id=NULL,reservation_item_id=NULL,reservation_token=NULL,reservation_expires_at=NULL,updated_at=now() \
+                    WHERE operator_id=$6 AND tenant_id=$7 AND project_id=$8 AND fingerprint=$9")
+                    .bind(id).bind(item.item_id).bind(item.asset_id.ok_or_else(|| AppError::conflict("asset missing"))?)
+                    .bind(revision_id).bind(check.check_id).bind(scope.operator_id.as_uuid())
+                    .bind(scope.tenant_id.as_uuid()).bind(project.as_uuid()).bind(fingerprint)
+                    .execute(&mut *tx).await.map_err(db)?;
+            }
+        }
+        // An edit, recheck, or invalidation may supersede a candidate. Keep
+        // the immutable old check, but cease offering its outdated revision.
+        let active_candidates: Vec<Uuid> = state
+            .items
+            .iter()
+            .filter(|i| i.status == ContentItemStatus::Ready && i.reuse_binding.is_none())
+            .filter_map(|i| i.ready_revision_id)
+            .collect();
+        sqlx::query("UPDATE content_reuse_registry SET origin_execution_id=NULL,origin_item_id=NULL,asset_id=NULL,revision_id=NULL,check_id=NULL,updated_at=now() \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND origin_execution_id=$4 \
+             AND NOT (revision_id=ANY($5))")
+            .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .bind(id).bind(&active_candidates).execute(&mut *tx).await.map_err(db)?;
         for handoff in &state.handoffs[previous_handoff_count..] {
             sqlx::query("INSERT INTO content_handoffs (handoff_id,operator_id,tenant_id,project_id,execution_id,revision,supersedes_handoff_id,body,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
                     .bind(handoff.handoff_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
@@ -426,6 +779,345 @@ fn decode(json: serde_json::Value) -> Result<ContentState, AppError> {
 }
 #[async_trait]
 impl ContentRepository for PgContentRepository {
+    async fn prepare_or_reuse(
+        &self,
+        scope: &TenantScope,
+        request: ContentReuseRequest,
+    ) -> Result<ContentReuseDecision, AppError> {
+        let descriptor = request.descriptor.canonical()?;
+        if &descriptor.scope != scope {
+            return Err(AppError::conflict("semantic descriptor scope differs"));
+        }
+        let fingerprint = descriptor.fingerprint()?;
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::invalid_request("project scope required"))?;
+        let mut tx = self.transaction(scope).await?;
+        Self::lock_project(&mut tx, scope).await?;
+        let active: bool = sqlx::query_scalar(
+            "SELECT status='active' FROM projects WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3",
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .fetch_one(&mut *tx).await.map_err(db)?;
+        if !active {
+            return Err(AppError::conflict(
+                "content reuse requires an active project",
+            ));
+        }
+        let json: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT state FROM content_executions WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND execution_id=$4 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(request.execution_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let mut state =
+            decode(json.ok_or_else(|| AppError::not_found("content execution not found"))?)?;
+        if state.execution.status != geo_domain::ContentExecutionStatus::Running {
+            return Err(AppError::conflict("execution is not running"));
+        }
+        let item = state
+            .items
+            .iter()
+            .find(|i| i.item_id == request.item_id)
+            .ok_or_else(|| AppError::not_found("content item not found"))?
+            .clone();
+        if item.document_key != descriptor.document_key
+            || item
+                .source_version_refs
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                != descriptor
+                    .source_version_ids
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+        {
+            return Err(AppError::conflict(
+                "descriptor differs from frozen document inputs",
+            ));
+        }
+        Self::validate_reuse_sources(&mut tx, scope, request.execution_id, &descriptor).await?;
+        if item.status == ContentItemStatus::Ready {
+            if item.semantic_fingerprint.as_deref() != Some(&fingerprint) {
+                return Err(AppError::conflict(
+                    "ready item has different semantic input",
+                ));
+            }
+            tx.commit().await.map_err(db)?;
+            return Ok(ContentReuseDecision::Ready(item));
+        }
+        if item.status != ContentItemStatus::Pending {
+            if item.semantic_fingerprint.as_deref() != Some(&fingerprint) {
+                return Err(AppError::conflict(
+                    "item already has a different semantic input",
+                ));
+            }
+            tx.commit().await.map_err(db)?;
+            return Ok(ContentReuseDecision::Busy(item));
+        }
+        sqlx::query("INSERT INTO content_reuse_registry (operator_id,tenant_id,project_id,fingerprint,descriptor) \
+             VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
+            .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .bind(&fingerprint).bind(serde_json::to_value(&descriptor).map_err(encode)?)
+            .execute(&mut *tx).await.map_err(db)?;
+        let registry = sqlx::query(
+            "SELECT descriptor,origin_execution_id,origin_item_id,asset_id,revision_id,check_id, \
+             reservation_execution_id,reservation_item_id,reservation_token,reservation_expires_at \
+             FROM content_reuse_registry WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+             AND fingerprint=$4 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(&fingerprint)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if registry.get::<serde_json::Value, _>("descriptor")
+            != serde_json::to_value(&descriptor).map_err(encode)?
+        {
+            return Err(AppError::conflict(
+                "semantic fingerprint descriptor collision",
+            ));
+        }
+        if let (
+            Some(origin_execution_id),
+            Some(origin_item_id),
+            Some(asset_id),
+            Some(revision_id),
+            Some(check_id),
+        ) = (
+            registry.get::<Option<Uuid>, _>("origin_execution_id"),
+            registry.get::<Option<Uuid>, _>("origin_item_id"),
+            registry.get::<Option<Uuid>, _>("asset_id"),
+            registry.get::<Option<Uuid>, _>("revision_id"),
+            registry.get::<Option<Uuid>, _>("check_id"),
+        ) {
+            let origin_json: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT state FROM content_executions WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+                 AND execution_id=$4",
+            ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+                .bind(origin_execution_id).fetch_optional(&mut *tx).await.map_err(db)?;
+            let origin = decode(
+                origin_json.ok_or_else(|| AppError::conflict("reuse origin is unavailable"))?,
+            )?;
+            let origin_item = origin.items.iter().find(|i| i.item_id == origin_item_id);
+            let valid = origin_item.is_some_and(|i| {
+                i.status == ContentItemStatus::Ready
+                    && i.asset_id == Some(asset_id)
+                    && i.ready_revision_id == Some(revision_id)
+                    && i.semantic_fingerprint.as_deref() == Some(&fingerprint)
+            }) && origin.checks.iter().any(|c| {
+                c.check_id == check_id
+                    && c.revision_id == revision_id
+                    && !c.findings.iter().any(|f| f.blocking)
+            }) && origin
+                .assets
+                .iter()
+                .any(|a| a.asset_id == asset_id && a.current_revision_id == revision_id);
+            if valid {
+                let binding = ContentReuseBinding {
+                    origin_execution_id,
+                    origin_item_id,
+                    asset_id,
+                    revision_id,
+                    check_id,
+                    fingerprint: fingerprint.clone(),
+                    reused_at: request.now,
+                };
+                let ready = state.apply_reuse(
+                    request.item_id,
+                    binding.clone(),
+                    descriptor.clone(),
+                    &fingerprint,
+                )?;
+                sqlx::query("INSERT INTO content_reuse_bindings \
+                     (operator_id,tenant_id,project_id,execution_id,item_id,fingerprint,origin_execution_id,origin_item_id,asset_id,revision_id,check_id,reused_at) \
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
+                    .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+                    .bind(request.execution_id).bind(request.item_id).bind(&fingerprint)
+                    .bind(origin_execution_id).bind(origin_item_id).bind(asset_id).bind(revision_id)
+                    .bind(check_id).bind(request.now).execute(&mut *tx).await.map_err(db)?;
+                sqlx::query("UPDATE content_executions SET state=$1 WHERE execution_id=$2")
+                    .bind(serde_json::to_value(&state).map_err(encode)?)
+                    .bind(request.execution_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                tx.commit().await.map_err(db)?;
+                return Ok(ContentReuseDecision::Ready(ready));
+            }
+            sqlx::query(
+                "UPDATE content_reuse_registry SET origin_execution_id=NULL,origin_item_id=NULL,\
+                 asset_id=NULL,revision_id=NULL,check_id=NULL,updated_at=now() \
+                 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND fingerprint=$4",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project.as_uuid())
+            .bind(&fingerprint)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        let historical: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM content_reuse_legacy_branches \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+             AND document_key=$4 AND source_version_refs @> $5 AND source_version_refs <@ $5)",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(&descriptor.document_key)
+        .bind(serde_json::to_value(&descriptor.source_version_ids).map_err(encode)?)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if historical {
+            let blocked = state.classify(
+                request.item_id,
+                ContentItemStatus::Blocked,
+                "reuse_provenance_insufficient",
+            )?;
+            sqlx::query("UPDATE content_executions SET state=$1 WHERE execution_id=$2")
+                .bind(serde_json::to_value(&state).map_err(encode)?)
+                .bind(request.execution_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            tx.commit().await.map_err(db)?;
+            return Ok(ContentReuseDecision::InsufficientEvidence(blocked));
+        }
+        if registry
+            .get::<Option<DateTime<Utc>>, _>("reservation_expires_at")
+            .is_some_and(|expires| expires > request.now)
+        {
+            tx.commit().await.map_err(db)?;
+            return Ok(ContentReuseDecision::Busy(item));
+        }
+        let lease = state.claim(
+            request.item_id,
+            ContentStep::Prepare,
+            &request.owner,
+            request.now,
+            request.ttl_seconds,
+        )?;
+        state.set_semantic_descriptor(&lease, descriptor.clone(), &fingerprint)?;
+        sqlx::query(
+            "UPDATE content_reuse_registry SET reservation_execution_id=$1,reservation_item_id=$2, \
+             reservation_token=$3,reservation_expires_at=$4,updated_at=now() \
+             WHERE operator_id=$5 AND tenant_id=$6 AND project_id=$7 AND fingerprint=$8",
+        )
+        .bind(request.execution_id)
+        .bind(request.item_id)
+        .bind(lease.token)
+        .bind(lease.expires_at)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(&fingerprint)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        sqlx::query("UPDATE content_executions SET state=$1 WHERE execution_id=$2")
+            .bind(serde_json::to_value(&state).map_err(encode)?)
+            .bind(request.execution_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let item = state
+            .items
+            .iter()
+            .find(|i| i.item_id == request.item_id)
+            .expect("claimed item")
+            .clone();
+        tx.commit().await.map_err(db)?;
+        Ok(ContentReuseDecision::Reserved { item, lease })
+    }
+    async fn resolve_checked_revision(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<Option<ContentRevision>, AppError> {
+        let Some(state) = self.read(scope, execution_id).await? else {
+            return Ok(None);
+        };
+        if !state.items.iter().any(|i| i.item_id == item_id) {
+            return Ok(None);
+        }
+        let Some(project) = scope.project_id else {
+            return Err(AppError::invalid_request("project scope required"));
+        };
+        let binding: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT origin_execution_id,check_id FROM content_reuse_bindings WHERE \
+             operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND execution_id=$4 \
+             AND item_id=$5 AND revision_id=$6",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(execution_id)
+        .bind(item_id)
+        .bind(revision_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        if let Some((origin_execution_id, check_id)) = binding {
+            let row: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT r.body FROM content_revisions r JOIN content_checks c \
+                 ON c.operator_id=r.operator_id AND c.tenant_id=r.tenant_id AND c.project_id=r.project_id \
+                 AND c.revision_id=r.revision_id WHERE r.operator_id=$1 AND r.tenant_id=$2 \
+                 AND r.project_id=$3 AND r.execution_id=$4 AND r.revision_id=$5 AND c.check_id=$6 \
+                 AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(c.body->'findings') f WHERE (f->>'blocking')::boolean)",
+            ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+                .bind(origin_execution_id).bind(revision_id).bind(check_id)
+                .fetch_optional(&self.pool).await.map_err(db)?;
+            return row
+                .map(|v| {
+                    serde_json::from_value(v).map_err(|_| {
+                        AppError::new(ErrorCode::Internal, "stored origin revision invalid")
+                    })
+                })
+                .transpose();
+        }
+        if !state.assets.iter().any(|a| {
+            a.item_id == item_id
+                && state
+                    .revisions
+                    .iter()
+                    .any(|r| r.revision_id == revision_id && r.asset_id == a.asset_id)
+        }) || !state.checks.iter().any(|c| {
+            c.revision_id == revision_id && !c.findings.iter().any(|finding| finding.blocking)
+        }) {
+            return Ok(None);
+        }
+        Ok(state
+            .revisions
+            .into_iter()
+            .find(|r| r.revision_id == revision_id))
+    }
+    async fn fork_reused_item(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item_id: Uuid,
+        base_revision_id: Uuid,
+        document: StructuredDocument,
+    ) -> Result<ContentRevision, AppError> {
+        let origin = self
+            .resolve_checked_revision(scope, execution_id, item_id, base_revision_id)
+            .await?
+            .ok_or_else(|| AppError::conflict("checked origin revision missing"))?;
+        self.mutate(scope, execution_id, |s| {
+            s.fork_reused_item(item_id, base_revision_id, &origin, document)
+        })
+        .await
+    }
     async fn start(
         &self,
         scope: &TenantScope,

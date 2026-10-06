@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelVariant, ContentExecution,
-    ContentHandoff, ContentRevision, DistributionCycleInputs, DistributionExpansionPage,
-    DistributionManifest, DistributionPublicationResult, DistributionRepository,
-    DistributionSnapshot, DistributionTarget, DistributionTargetPage, DistributionTargetStatus,
-    ErrorCode, FreezeDistribution, IntentVerification, MaterializedDistribution,
-    PreparedDistribution, PublicationBundle, PublicationCommand, PublicationIntent,
-    ReportPublicationStatus, TenantScope, distribution_cell, freeze_distribution,
-    prepare_publication_intent, prepare_variant, target_publication_evidence,
+    AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelVariant, ContentCheck, ContentExecution,
+    ContentHandoff, ContentRevision, DistributionCycleInputs, DistributionDeferralReason,
+    DistributionExpansionPage, DistributionManifest, DistributionPublicationResult,
+    DistributionRepository, DistributionSnapshot, DistributionTarget, DistributionTargetPage,
+    DistributionTargetStatus, ErrorCode, FreezeDistribution, IntentVerification,
+    MaterializedDistribution, PreparedDistribution, PublicationBundle, PublicationCommand,
+    PublicationIntent, ReportPublicationStatus, TenantScope, distribution_cell,
+    freeze_distribution, prepare_publication_intent, prepare_variant, target_publication_evidence,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -99,6 +99,116 @@ async fn current_target(
     .await
     .map_err(db)?;
     decode(row.ok_or_else(|| AppError::not_found("distribution target not found"))?)
+}
+/// Check the original frozen document item's complete source dependency set
+/// and the exact checked revision quotes under source row locks. This runs
+/// after the project lock and before creating a variant, intent or command.
+async fn live_materialization_sources(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    manifest: &DistributionManifest,
+    target: &DistributionTarget,
+    revision: &ContentRevision,
+) -> Result<Option<DistributionDeferralReason>, AppError> {
+    let row = sqlx::query(
+        "SELECT mi.knowledge_release_id,mi.source_version_refs \
+         FROM document_manifest_items mi JOIN document_manifests m ON \
+           (m.operator_id,m.tenant_id,m.project_id,m.manifest_id)= \
+           (mi.operator_id,mi.tenant_id,mi.project_id,mi.manifest_id) \
+         WHERE mi.operator_id=$1 AND mi.tenant_id=$2 AND mi.project_id=$3 \
+           AND mi.manifest_id=$4 AND mi.document_manifest_item_id=$5 \
+           AND m.revision=$6 AND m.sealed=true",
+    )
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project(scope)?)
+    .bind(manifest.document_manifest_id)
+    .bind(target.document_item_id)
+    .bind(manifest.document_manifest_revision)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db)?;
+    let Some(row) = row else {
+        return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+    };
+    let release: Uuid = row.get("knowledge_release_id");
+    let source_ids: Vec<Uuid> = decode(row.get("source_version_refs"))?;
+    if source_ids.is_empty() || revision.evidence.is_empty() {
+        return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+    }
+    for source_version_id in &source_ids {
+        let row = sqlx::query(
+            "SELECT s.state,s.purpose,s.current_version_id FROM knowledge_source_versions v \
+             JOIN knowledge_sources s ON (s.operator_id,s.tenant_id,s.project_id,s.source_id)= \
+               (v.operator_id,v.tenant_id,v.project_id,v.source_id) \
+             JOIN knowledge_release_source_versions lr ON \
+               (lr.operator_id,lr.tenant_id,lr.project_id,lr.source_version_id)= \
+               (v.operator_id,v.tenant_id,v.project_id,v.source_version_id) \
+             WHERE v.operator_id=$1 AND v.tenant_id=$2 AND v.project_id=$3 \
+               AND v.source_version_id=$4 AND lr.knowledge_release_id=$5 FOR SHARE OF s",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(*source_version_id)
+        .bind(release)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?;
+        let Some(row) = row else {
+            return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+        };
+        if row.get::<Option<Uuid>, _>("current_version_id") != Some(*source_version_id) {
+            return Ok(Some(DistributionDeferralReason::SourceChanged));
+        }
+        if row.get::<String, _>("state") != "active" || row.get::<String, _>("purpose") != "public"
+        {
+            return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+        }
+    }
+    for reference in &revision.evidence {
+        if !source_ids.contains(&reference.source_version_id) {
+            return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+        }
+        let Some(quote) = revision
+            .quotes
+            .iter()
+            .find(|quote| quote.reference == *reference)
+        else {
+            return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+        };
+        let Some(chunk) = reference.chunk_id else {
+            return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+        };
+        let row = sqlx::query(
+            "SELECT text,locator FROM knowledge_chunks WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND source_version_id=$4 AND chunk_id=$5",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(reference.source_version_id)
+        .bind(chunk)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?;
+        let Some(row) = row else {
+            return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+        };
+        let text: String = row.get("text");
+        let expected = if matches!(reference.locator, geo_domain::ChunkLocator::Csv { .. }) {
+            text
+        } else {
+            text.chars().take(1600).collect()
+        };
+        if row.get::<serde_json::Value, _>("locator") != encode(&reference.locator)?
+            || expected != quote.exact_quote
+            || quote.exact_quote.chars().count() > 1600
+        {
+            return Ok(Some(DistributionDeferralReason::SourceUnavailable));
+        }
+    }
+    Ok(None)
 }
 async fn change_target(
     tx: &mut Transaction<'_, Postgres>,
@@ -681,8 +791,8 @@ impl DistributionRepository for PgDistributionRepository {
         let mut tx = self.transaction(scope).await?;
         // Project-scoped serialization is necessary because two different
         // cycle manifests can race to create the same logical publication.
-        let locked: Option<Uuid> = sqlx::query_scalar(
-            "SELECT project_id FROM projects WHERE operator_id=$1 AND tenant_id=$2 \
+        let locked: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM projects WHERE operator_id=$1 AND tenant_id=$2 \
              AND project_id=$3 FOR UPDATE",
         )
         .bind(scope.operator_id.as_uuid())
@@ -691,9 +801,9 @@ impl DistributionRepository for PgDistributionRepository {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db)?;
-        if locked.is_none() {
+        let Some(project_status) = locked else {
             return Err(AppError::not_found("project not found"));
-        }
+        };
         let manifest = locked_manifest(&mut tx, scope, prepared.manifest_id).await?;
         if !manifest.complete {
             return Err(AppError::not_ready("distribution expansion incomplete"));
@@ -811,10 +921,60 @@ impl DistributionRepository for PgDistributionRepository {
         let canonical: ContentRevision = decode(
             stored_revision.ok_or_else(|| AppError::not_found("content revision not found"))?,
         )?;
-        if canonical != *revision {
+        let mut checked_canonical = canonical;
+        checked_canonical.findings = revision.findings.clone();
+        if checked_canonical != *revision {
             return Err(AppError::conflict(
                 "content revision differs from immutable storage",
             ));
+        }
+        let stored_check: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT body FROM content_checks WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND revision_id=$4",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(revision.revision_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let check: ContentCheck = decode(
+            stored_check
+                .ok_or_else(|| AppError::conflict("independent content check is missing"))?,
+        )?;
+        if check.revision_id != revision.revision_id
+            || check.findings.iter().any(|finding| finding.blocking)
+            || revision.findings.iter().any(|finding| finding.blocking)
+        {
+            return Err(AppError::conflict(
+                "content revision has no successful independent check",
+            ));
+        }
+        let ineligible = if project_status != "active" {
+            Some(DistributionDeferralReason::SourceUnavailable)
+        } else {
+            live_materialization_sources(&mut tx, scope, &manifest, &old, revision).await?
+        };
+        if let Some(reason) = ineligible {
+            if old.publication_intent_id.is_some() {
+                // A prior unknown/sent intent remains bound to its original
+                // reconciliation path. Revoke must never create a new send.
+                return Err(AppError::conflict(
+                    "bound publication source is no longer eligible",
+                ));
+            }
+            let mut next = old.clone();
+            next.status = DistributionTargetStatus::Deferred;
+            next.reason = Some(reason.code().into());
+            let next = change_target(&mut tx, scope, &old, next).await?;
+            tx.commit().await.map_err(db)?;
+            return Ok(MaterializedDistribution {
+                target: next,
+                variant: None,
+                intent: None,
+                publication_commands: vec![],
+            });
         }
         let variant = prepare_variant(revision, placement)?;
         if let Some(stored) = sqlx::query_scalar::<_, serde_json::Value>(

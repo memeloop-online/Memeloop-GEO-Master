@@ -31,6 +31,7 @@ pub const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 /// boundary; larger material must use verified raw-byte upload.
 pub const MAX_INLINE_TEXT_BYTES: usize = 256 * 1024;
 pub const UPLOAD_SESSION_TTL_SECONDS: i64 = 60 * 60;
+pub const CONTENT_EVIDENCE_MAX_QUOTE_CHARS: usize = 1600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -932,6 +933,19 @@ pub struct KnowledgeOverview {
 
 #[async_trait]
 pub trait KnowledgeRepository: Send + Sync {
+    /// Validate the precise frozen content branches while holding the memory
+    /// source read lock until the caller's content transaction has committed.
+    /// A PostgreSQL implementation explicitly opts into the transactional
+    /// marker; third-party wrappers fail closed unless they implement this.
+    async fn hold_content_evidence<'a>(
+        &'a self,
+        _scope: &TenantScope,
+        _inputs: &[ContentPublicEligibility],
+    ) -> Result<ContentKnowledgeGuard<'a>, AppError> {
+        Err(AppError::capability_missing(
+            "atomic content evidence guard is unavailable",
+        ))
+    }
     async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError>;
     /// Read a single original job; PDF retry successors are never followed implicitly.
     async fn get_import_progress(
@@ -1112,6 +1126,39 @@ pub trait KnowledgeRepository: Send + Sync {
         request: KnowledgeSearchRequest,
     ) -> Result<KnowledgeAskResult, AppError>;
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentPublicEligibility {
+    pub document_manifest_id: Uuid,
+    pub document_manifest_item_id: Uuid,
+    pub source_version_ids: Vec<Uuid>,
+    pub evidence: Vec<crate::ContentEvidence>,
+}
+
+pub struct ContentKnowledgeGuard<'a> {
+    mode: crate::project::ContentGuardMode,
+    _hold: Option<Box<dyn Send + 'a>>,
+}
+
+impl<'a> ContentKnowledgeGuard<'a> {
+    pub fn transactional() -> Self {
+        Self {
+            mode: crate::project::ContentGuardMode::Transactional,
+            _hold: None,
+        }
+    }
+
+    fn held(guard: tokio::sync::RwLockReadGuard<'a, MemoryState>) -> Self {
+        Self {
+            mode: crate::project::ContentGuardMode::Held,
+            _hold: Some(Box::new(guard)),
+        }
+    }
+
+    pub fn mode(&self) -> crate::project::ContentGuardMode {
+        self.mode
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1771,6 +1818,127 @@ scoped_knowledge!(
 
 #[async_trait]
 impl KnowledgeRepository for MemoryKnowledgeRepository {
+    async fn hold_content_evidence<'a>(
+        &'a self,
+        scope: &TenantScope,
+        inputs: &[ContentPublicEligibility],
+    ) -> Result<ContentKnowledgeGuard<'a>, AppError> {
+        let project_id = Self::require_project(scope)?;
+        let guard = self.state.read().await;
+        for input in inputs {
+            let manifest = guard
+                .document_manifests
+                .get(&input.document_manifest_id)
+                .filter(|manifest| {
+                    manifest.operator_id == scope.operator_id
+                        && manifest.tenant_id == scope.tenant_id
+                        && manifest.project_id == project_id
+                        && manifest.sealed
+                        && manifest.expected_count == Some(manifest.items.len() as i64)
+                })
+                .ok_or_else(|| AppError::conflict("frozen public document manifest missing"))?;
+            let planned = manifest
+                .items
+                .iter()
+                .find(|item| item.document_manifest_item_id == input.document_manifest_item_id)
+                .filter(|item| {
+                    item.manifest_id == manifest.manifest_id
+                        && item.knowledge_release_id == manifest.knowledge_release_id
+                        && item.state == DocumentManifestItemState::Planned
+                })
+                .ok_or_else(|| AppError::conflict("frozen public document branch missing"))?;
+            let mut expected = planned.source_version_refs.clone();
+            let mut actual = input.source_version_ids.clone();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            if expected.is_empty() || expected != actual {
+                return Err(AppError::conflict(
+                    "public source dependencies differ from frozen branch",
+                ));
+            }
+            let release = guard
+                .releases
+                .get(&manifest.knowledge_release_id)
+                .filter(|release| {
+                    release.operator_id == scope.operator_id
+                        && release.tenant_id == scope.tenant_id
+                        && release.project_id == project_id
+                })
+                .ok_or_else(|| AppError::conflict("frozen public source release missing"))?;
+            for id in &expected {
+                if !release.source_version_refs.contains(id) {
+                    return Err(AppError::conflict(
+                        "public source is outside frozen release",
+                    ));
+                }
+                let version = guard
+                    .versions
+                    .get(id)
+                    .filter(|version| Self::in_scope(scope, *version))
+                    .ok_or_else(|| AppError::conflict("frozen public source version missing"))?;
+                let source = guard
+                    .sources
+                    .get(&version.source_id)
+                    .filter(|source| {
+                        Self::in_scope(scope, *source)
+                            && source.purpose == KnowledgePurpose::Public
+                            && source.state == SourceState::Active
+                            && source.current_version_id == Some(*id)
+                    })
+                    .ok_or_else(|| {
+                        AppError::conflict("frozen source no longer public or current")
+                    })?;
+                if source.source_id != version.source_id {
+                    return Err(AppError::conflict("source/version ownership differs"));
+                }
+            }
+            for quote in &input.evidence {
+                let reference = &quote.reference;
+                if !expected.contains(&reference.source_version_id)
+                    || quote.exact_quote.trim().is_empty()
+                {
+                    return Err(AppError::conflict(
+                        "public quote is outside frozen dependencies",
+                    ));
+                }
+                let chunk_id = reference
+                    .chunk_id
+                    .ok_or_else(|| AppError::conflict("public quote must identify a chunk"))?;
+                if !guard
+                    .chunks
+                    .get(&reference.source_version_id)
+                    .is_some_and(|chunks| {
+                        chunks.iter().any(|chunk| {
+                            Self::in_scope(scope, chunk)
+                                && chunk.chunk_id == chunk_id
+                                && chunk.source_version_id == reference.source_version_id
+                                && chunk.locator == reference.locator
+                                && match &chunk.locator {
+                                    ChunkLocator::Csv { .. } => {
+                                        chunk.text.chars().count()
+                                            <= CONTENT_EVIDENCE_MAX_QUOTE_CHARS
+                                            && chunk.text == quote.exact_quote
+                                    }
+                                    _ => {
+                                        chunk
+                                            .text
+                                            .chars()
+                                            .take(CONTENT_EVIDENCE_MAX_QUOTE_CHARS)
+                                            .collect::<String>()
+                                            == quote.exact_quote
+                                    }
+                                }
+                        })
+                    })
+                {
+                    return Err(AppError::conflict(
+                        "public evidence quote or locator changed",
+                    ));
+                }
+            }
+        }
+        Ok(ContentKnowledgeGuard::held(guard))
+    }
     async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError> {
         Self::require_project(scope)?;
         let mut capability = KnowledgeCapability::memory();
@@ -3518,6 +3686,113 @@ mod tests {
         PdfPageText, TenantScope,
     };
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn frozen_public_evidence_guard_blocks_source_writer_until_content_commit() {
+        use std::sync::Arc;
+        use tokio::time::{Duration, sleep, timeout};
+
+        let repository = Arc::new(MemoryKnowledgeRepository::default());
+        let scope = scope();
+        let imported = repository
+            .import_batch(
+                &scope,
+                vec![ImportItem {
+                    client_item_id: "public-evidence".into(),
+                    kind: SourceKind::Text,
+                    name: "Public source".into(),
+                    purpose: KnowledgePurpose::Public,
+                    text: Some("Grounded public sentence".into()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let accepted = &imported.items[0];
+        let release_id = accepted.release.as_ref().unwrap().knowledge_release_id;
+        let version_id = accepted.source_version.as_ref().unwrap().source_version_id;
+        let source_id = accepted.source.as_ref().unwrap().source_id;
+        let manifest = repository
+            .plan_document_manifest(
+                &scope,
+                DocumentManifestPlanRequest {
+                    manifest_id: Uuid::new_v4(),
+                    knowledge_release_id: release_id,
+                },
+                DocumentScope {
+                    content_types: vec!["faq".into()],
+                    markets: vec!["global".into()],
+                    languages: vec!["en".into()],
+                    ..DocumentScope::default()
+                },
+            )
+            .await
+            .unwrap();
+        let item = manifest
+            .items
+            .iter()
+            .find(|item| item.state == DocumentManifestItemState::Planned)
+            .unwrap();
+        let detail = repository
+            .get_source_detail(&scope, source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let chunk = detail
+            .chunks
+            .iter()
+            .find(|chunk| chunk.source_version_id == version_id)
+            .unwrap();
+        let input = super::ContentPublicEligibility {
+            document_manifest_id: manifest.manifest_id,
+            document_manifest_item_id: item.document_manifest_item_id,
+            source_version_ids: item.source_version_refs.clone(),
+            evidence: vec![crate::ContentEvidence {
+                reference: super::EvidenceRef {
+                    source_version_id: version_id,
+                    chunk_id: Some(chunk.chunk_id),
+                    locator: chunk.locator.clone(),
+                },
+                exact_quote: chunk.text.clone(),
+            }],
+        };
+        let held = repository
+            .hold_content_evidence(&scope, std::slice::from_ref(&input))
+            .await
+            .unwrap();
+        assert_eq!(held.mode(), crate::ContentGuardMode::Held);
+        let writer_repo = repository.clone();
+        let writer = tokio::spawn(async move {
+            let mut state = writer_repo.state.write().await;
+            state.sources.get_mut(&source_id).unwrap().purpose = KnowledgePurpose::Internal;
+        });
+        sleep(Duration::from_millis(30)).await;
+        assert!(
+            !writer.is_finished(),
+            "source writer must wait for content commit"
+        );
+        drop(held);
+        timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            repository
+                .hold_content_evidence(&scope, std::slice::from_ref(&input))
+                .await
+                .is_err()
+        );
+        let mut invalid = input;
+        invalid.source_version_ids = vec![Uuid::new_v4()];
+        assert!(
+            repository
+                .hold_content_evidence(&scope, &[invalid])
+                .await
+                .is_err()
+        );
+    }
 
     fn scope() -> TenantScope {
         TenantScope::new(

@@ -19,10 +19,11 @@ use geo_domain::{
     MemoryAuthRepository, MemoryChannelJobRepository, MemoryChannelRepository,
     MemoryConnectorCapabilityRepository, MemoryContentRepository, MemoryDistributionRepository,
     MemoryKnowledgeRepository, MemoryProjectRepository, PLAIN_TEXT_ARTICLE_FORMAT,
-    PlatformPlacement, PreparedDistribution, ProjectCreate, ProjectPatch, ProjectRepository,
-    ProjectSettings, ProjectStartCommand, PublicationLookupCandidate, PublicationLookupFinding,
-    PublicationLookupJob, PublicationLookupObservation, PublicationLookupRepository, SourceKind,
-    TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
+    PlatformPlacement, PreparedDistribution, Project, ProjectCreate, ProjectId, ProjectPatch,
+    ProjectRepository, ProjectSettings, ProjectStartCommand, PublicationLookupCandidate,
+    PublicationLookupFinding, PublicationLookupJob, PublicationLookupObservation,
+    PublicationLookupRepository, SourceKind, TenantScope, UpdateProject, hash_idempotency_key,
+    settings_hash, start_request_hash,
 };
 use geo_worker::{
     DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
@@ -290,6 +291,32 @@ struct Fixture {
     service: DistributionService,
 }
 
+struct ProjectWithoutPublicCommitGuard(Arc<MemoryProjectRepository>);
+
+#[async_trait]
+impl ProjectRepository for ProjectWithoutPublicCommitGuard {
+    async fn list(&self, scope: &TenantScope) -> Result<Vec<Project>, AppError> {
+        self.0.list(scope).await
+    }
+    async fn get(&self, scope: &TenantScope, id: ProjectId) -> Result<Option<Project>, AppError> {
+        self.0.get(scope, id).await
+    }
+    async fn create(&self, scope: &TenantScope, input: ProjectCreate) -> Result<Project, AppError> {
+        self.0.create(scope, input).await
+    }
+    async fn update(
+        &self,
+        scope: &TenantScope,
+        id: ProjectId,
+        revision: i64,
+        patch: ProjectPatch,
+    ) -> Result<UpdateProject, AppError> {
+        self.0.update(scope, id, revision, patch).await
+    }
+    // Intentionally use the fail-closed trait default for
+    // hold_content_project; a wrapper cannot silently waive the guard.
+}
+
 async fn setup(second_blocked: bool) -> Fixture {
     let tenant = TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), None);
     let projects = Arc::new(MemoryProjectRepository::default());
@@ -363,6 +390,9 @@ async fn setup(second_blocked: bool) -> Fixture {
         .as_ref()
         .unwrap()
         .knowledge_release_id;
+    let mut document_scope = project.settings.document_scope.clone();
+    document_scope.markets = project.settings.effective_markets();
+    document_scope.languages = project.settings.effective_languages();
     let planned = knowledge
         .plan_document_manifest(
             &scope,
@@ -370,7 +400,7 @@ async fn setup(second_blocked: bool) -> Fixture {
                 manifest_id: started.document_manifest.manifest_id,
                 knowledge_release_id: release_id,
             },
-            project.settings.document_scope,
+            document_scope,
         )
         .await
         .unwrap();
@@ -1281,5 +1311,200 @@ async fn frozen_scope_does_not_drift_and_delayed_account_uses_sealed_checked_rev
             .await
             .len(),
         2
+    );
+}
+
+#[tokio::test]
+async fn successor_content_reuse_keeps_original_publish_identity_without_new_commands() {
+    let fixture = setup(false).await;
+    add_account(&fixture).await;
+    let first = fixture
+        .service
+        .freeze(&fixture.scope, fixture.cycle_id)
+        .await
+        .unwrap();
+    fixture
+        .service
+        .resume(&fixture.scope, first.manifest_id, 1)
+        .await
+        .unwrap();
+    let old = fixture
+        .service
+        .targets(&fixture.scope, first.manifest_id, None, 10)
+        .await
+        .unwrap();
+    let old_commands = fixture
+        .distribution
+        .publication_commands(&fixture.scope)
+        .await
+        .len();
+    assert_eq!(old_commands, 2);
+    let project_id = fixture.scope.project_id.unwrap();
+    let first_cycle = fixture
+        .projects
+        .get_current_cycle(&fixture.scope, project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let next = fixture
+        .projects
+        .schedule_next_cycle(
+            &fixture.scope,
+            project_id,
+            fixture.cycle_id,
+            first_cycle.cutoff_at + Duration::days(1),
+        )
+        .await
+        .unwrap();
+    let content = ContentService::new(
+        fixture.content.clone(),
+        fixture.knowledge.clone(),
+        fixture.projects.clone(),
+    );
+    let execution = content.start(&fixture.scope, next.cycle_id).await.unwrap();
+    let items = fixture
+        .content
+        .list_items(&fixture.scope, execution.execution_id)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2);
+    for item in items {
+        assert_eq!(
+            content
+                .prepare(&fixture.scope, execution.execution_id, item.item_id)
+                .await
+                .unwrap()
+                .status,
+            ContentItemStatus::Ready,
+            "unchanged content can be reused even without a model provider"
+        );
+    }
+    let handoff = content
+        .close(&fixture.scope, execution.execution_id)
+        .await
+        .unwrap();
+    assert_eq!(handoff.coverage.ready, 2);
+    let successor = fixture
+        .service
+        .freeze(&fixture.scope, next.cycle_id)
+        .await
+        .unwrap();
+    let reused_item = fixture
+        .content
+        .list_items(&fixture.scope, execution.execution_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let original_revision_id = reused_item.ready_revision_id.unwrap();
+    let original = fixture
+        .content
+        .resolve_checked_revision(
+            &fixture.scope,
+            execution.execution_id,
+            reused_item.item_id,
+            original_revision_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut edited = original.document.clone();
+    edited.title = "Destination-only successor draft".into();
+    let forked = content
+        .fork_reused_item(
+            &fixture.scope,
+            execution.execution_id,
+            reused_item.item_id,
+            original_revision_id,
+            edited,
+        )
+        .await
+        .unwrap();
+    assert_ne!(forked.asset_id, original.asset_id);
+    assert_eq!(forked.derived_from_revision_id, Some(original_revision_id));
+    assert_eq!(
+        fixture
+            .content
+            .resolve_checked_revision(
+                &fixture.scope,
+                execution.execution_id,
+                reused_item.item_id,
+                original_revision_id,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .revision_id,
+        original_revision_id,
+        "the sealed successor handoff must still resolve its original checked version"
+    );
+    fixture
+        .service
+        .resume(&fixture.scope, successor.manifest_id, 1)
+        .await
+        .unwrap();
+    let fresh = fixture
+        .service
+        .targets(&fixture.scope, successor.manifest_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(fresh.rows.len(), old.rows.len());
+    assert_ne!(successor.manifest_id, first.manifest_id);
+    for original in old
+        .rows
+        .iter()
+        .filter(|row| row.status == DistributionTargetStatus::Ready)
+    {
+        let reused = fresh
+            .rows
+            .iter()
+            .find(|row| row.platform_id == original.platform_id && row.ordinal == original.ordinal)
+            .unwrap();
+        assert_ne!(reused.document_item_id, original.document_item_id);
+        assert_eq!(reused.content_revision_id, original.content_revision_id);
+        assert_eq!(reused.variant_id, original.variant_id);
+        assert_eq!(reused.publication_intent_id, original.publication_intent_id);
+    }
+    assert_eq!(
+        fixture
+            .distribution
+            .publication_commands(&fixture.scope)
+            .await
+            .len(),
+        old_commands,
+        "a successor must not enqueue another publish command"
+    );
+}
+
+#[tokio::test]
+async fn missing_live_project_guard_never_commits_a_publish_command() {
+    let fixture = setup(false).await;
+    add_account(&fixture).await;
+    let frozen = fixture
+        .service
+        .freeze(&fixture.scope, fixture.cycle_id)
+        .await
+        .unwrap();
+    let unguarded = DistributionService::new(
+        fixture.distribution.clone(),
+        fixture.content.clone(),
+        fixture.knowledge.clone(),
+        Arc::new(ProjectWithoutPublicCommitGuard(fixture.projects.clone())),
+        fixture.channels.clone(),
+    );
+    assert_eq!(
+        unguarded
+            .resume(&fixture.scope, frozen.manifest_id, 1)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::CapabilityMissing
+    );
+    assert!(
+        fixture
+            .distribution
+            .publication_commands(&fixture.scope)
+            .await
+            .is_empty(),
+        "missing cross-repository eligibility guard must fail before outbox mutation"
     );
 }

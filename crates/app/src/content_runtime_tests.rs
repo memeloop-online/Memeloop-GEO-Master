@@ -425,4 +425,64 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
             .len(),
         2
     );
+
+    // A genuinely new cycle must reuse checked content, not merely replay the
+    // old execution. No model is configured in this reassembled application.
+    let next_execution = restarted
+        .content_service()
+        .start(&scope, successor.cycle_id)
+        .await
+        .expect("prepare successor without a model");
+    assert_ne!(next_execution.execution_id, execution.execution_id);
+    tokio::time::timeout(
+        Duration::from_secs(45),
+        executor.run(scope.clone(), next_execution.execution_id),
+    )
+    .await
+    .expect("native successor bounded")
+    .expect("unchanged successor reuses checked revisions");
+    let next_items = restarted
+        .content_service()
+        .repository()
+        .list_items(&scope, next_execution.execution_id)
+        .await
+        .unwrap();
+    assert_eq!(next_items.len(), items.len());
+    for next in &next_items {
+        let original = items
+            .iter()
+            .find(|item| item.document_key == next.document_key)
+            .unwrap();
+        assert_eq!(next.status, ContentItemStatus::Ready);
+        assert_eq!(next.ready_revision_id, original.ready_revision_id);
+        assert_eq!(next.asset_id, original.asset_id);
+        assert_ne!(next.execution_id, original.execution_id);
+    }
+    assert_eq!(model.generated.load(Ordering::SeqCst), 2);
+    assert_eq!(model.checked.load(Ordering::SeqCst), 2);
+    assert!(
+        restarted
+            .content_service()
+            .repository()
+            .list_assets(&scope, next_execution.execution_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "reuse does not copy origin assets into a new owner"
+    );
+    let next_distribution = restarted
+        .distribution_service()
+        .latest_for_cycle(&scope, successor.cycle_id)
+        .await
+        .unwrap()
+        .expect("successor has independent distribution coverage");
+    assert_ne!(
+        next_distribution.manifest_id,
+        frozen_distribution.manifest_id
+    );
+    assert_eq!(
+        next_distribution.expected_count,
+        frozen_distribution.expected_count
+    );
+    assert!(next_distribution.complete);
 }
