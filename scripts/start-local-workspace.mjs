@@ -36,6 +36,27 @@ const stopSignal = new Promise((yes) => {
   resolveStopSignal = yes;
 });
 
+const startupStages = new Set([
+  "prerequisites",
+  "private configuration",
+  "local PostgreSQL",
+  "identity bootstrap",
+  "browser runner",
+  "Rust API",
+  "frontend",
+  "first-party browser login",
+  "service supervision",
+]);
+
+// The verifier accepts only these fixed labels over IPC, never child output,
+// exception text, private paths, or arbitrary diagnostic payloads.
+export function launcherFailureStage(message) {
+  return message?.type === "local-workspace-failure" &&
+    startupStages.has(message.stage)
+    ? message.stage
+    : undefined;
+}
+
 function assert(ok, message) {
   if (!ok) throw new Error(message);
 }
@@ -477,31 +498,36 @@ async function postgres(config) {
   } else if (!inspected.State.Running) {
     docker(["start", config.container]);
   }
-  await until(
-    async () => {
-      const result = spawnSync(
-        "docker",
-        [
-          "exec",
-          config.container,
-          "pg_isready",
-          "-U",
-          "geo_local",
-          "-d",
-          "geo_local",
-        ],
-        {
-          env: cleanEnv(),
-          encoding: "utf8",
-          windowsHide: true,
-          timeout: 2000,
-        },
-      );
-      return result.status === 0;
+  await until(async () => postgresTcpReady(config), 45000, "PostgreSQL");
+}
+
+export function postgresTcpReady(config, run = spawnSync) {
+  // The image's first-run initialization starts a temporary Unix-socket-only
+  // server. Its pg_isready success does not mean the application's TCP
+  // connection is usable. Wait for the final TCP listener before bootstrap.
+  const result = run(
+    "docker",
+    [
+      "exec",
+      config.container,
+      "pg_isready",
+      "-h",
+      "127.0.0.1",
+      "-p",
+      "5432",
+      "-U",
+      "geo_local",
+      "-d",
+      "geo_local",
+    ],
+    {
+      env: cleanEnv(),
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 2000,
     },
-    45000,
-    "PostgreSQL",
   );
+  return !result.error && result.status === 0;
 }
 
 async function until(check, ms, name, child) {
@@ -782,6 +808,12 @@ if (
   });
   main()
     .catch((error) => {
+      if (process.connected) {
+        process.send(
+          { type: "local-workspace-failure", stage: startupStage },
+          () => {},
+        );
+      }
       if (
         error?.message?.startsWith("Browser rejected the Secure session cookie")
       ) {

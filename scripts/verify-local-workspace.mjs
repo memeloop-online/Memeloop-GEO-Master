@@ -6,7 +6,11 @@ import { lstat, readFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadState, verifyDockerResource } from "./start-local-workspace.mjs";
+import {
+  launcherFailureStage,
+  loadState,
+  verifyDockerResource,
+} from "./start-local-workspace.mjs";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = join(repository, "scripts", "start-local-workspace.mjs");
@@ -16,6 +20,7 @@ const servicePorts = [8080, 5173, 38080];
 let activeLauncher;
 let interrupted = false;
 let stage = "prerequisites";
+let launcherStage;
 
 function assert(condition) {
   if (!condition) throw new Error("Verification failed");
@@ -152,11 +157,16 @@ async function assertFreePorts() {
 
 async function checkLauncher(environment) {
   assert(!interrupted);
+  launcherStage = undefined;
   const child = spawn(process.execPath, [launcher, "--check"], {
     cwd: repository,
     env: environment,
     windowsHide: true,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+  });
+  child.on("message", (message) => {
+    const safeStage = launcherFailureStage(message);
+    if (safeStage) launcherStage = safeStage;
   });
   activeLauncher = child;
   try {
@@ -263,6 +273,8 @@ process.on("SIGTERM", handleInterrupt);
 main().catch(() => {
   // Never print thrown errors: OS paths, Docker metadata, and private data
   // must not appear in CI logs. The launcher suppresses its own details too.
-  console.error(`FAIL local workspace restart verification: ${stage}`);
+  console.error(
+    `FAIL local workspace restart verification: ${stage}${launcherStage ? ` (${launcherStage})` : ""}`,
+  );
   process.exitCode = 1;
 });

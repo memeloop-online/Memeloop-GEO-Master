@@ -2,9 +2,9 @@
 
 更新时间：2026-10-06
 
-当前启动器增量：`0edb588` / Actions `37409480534` 的 Linux 已通过真实双次启动、安全软件登录和旧 PostgreSQL 会话保留验证；Windows 路径检查子进程超时仍在修复，整轮不是全绿。本地 Docker 重试仍未成功，不能宣称已准备好外部账号登录。
+当前启动器增量：`9b823f3` / Actions `37415984319` Windows 已通过，Linux 前端、PDF、显式 V8、PostgreSQL 及合成 UI 通过，但最终持久工作区首次启动失败。TCP 就绪检查与安全阶段诊断修正待新 CI；历史 `0edb588` 的双次启动通过不能替代本次验证。本地 Docker 重试仍未成功，不能宣称已准备好外部账号登录。
 
-本批周报 PDF 从正式不可变快照本地生成，入口、字体许可与验证边界见 [`report-pdf.md`](report-pdf.md)，准确测试结果见工作日志。另已确认自动新周期创建新正文 revision 可能绕过原分发身份去重；修复契约见 [`content-reuse.md`](content-reuse.md)，尚未实现，不能以手工复用同 revision 的测试证明自动零重复发布。
+本批周报 PDF 从正式不可变快照本地生成，入口、字体许可与验证边界见 [`report-pdf.md`](report-pdf.md)，准确测试结果见工作日志。自动新周期创建新正文 revision 绕过原分发身份去重的修复正在整合：领域、API、持久层、UI 与迁移已有工作区修改，内存跨仓储原子校验及整批实库/原生验收尚未完成。契约见 [`content-reuse.md`](content-reuse.md)，不能以手工复用同 revision 的测试证明自动零重复发布。
 
 最新完整绿色基线：`44f22ff` / Actions `37405615406`，Linux/Windows、前端、显式 V8、Java 21、PostgreSQL 和真实本地浏览器冒烟全部通过，包含报告只读预览、实时导入进度及原始收据核对。已读取 Linux 日志确认 `import_progress` 两项、`actual_pdf_pages_are_imported_as_searchable_source_evidence` 与 P14 临时预览/零写入浏览器检查实际通过，不是默认忽略后的通过。截图采用合成资料，不包含外部账号或真实发布/搜索验收。后续持久本地登录环境为独立工作，不能沿用该绿色结论。
 

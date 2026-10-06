@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   mkdtemp,
@@ -14,10 +14,102 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  launcherFailureStage,
   loadState,
+  postgresTcpReady,
   requireSecureCookie,
   verifyDockerResource,
 } from "./start-local-workspace.mjs";
+
+test("PostgreSQL readiness rejects the temporary socket-only initialization server", () => {
+  let tcpReady = false;
+  const probe = (command, args, options) => {
+    assert.equal(command, "docker");
+    assert.equal(options.timeout, 2000);
+    assert.deepEqual(args, [
+      "exec",
+      "synthetic-owned-container",
+      "pg_isready",
+      "-h",
+      "127.0.0.1",
+      "-p",
+      "5432",
+      "-U",
+      "geo_local",
+      "-d",
+      "geo_local",
+    ]);
+    return { status: args.includes("-h") && !tcpReady ? 2 : 0 };
+  };
+  const config = { container: "synthetic-owned-container" };
+  assert.equal(postgresTcpReady(config, probe), false);
+  tcpReady = true;
+  assert.equal(postgresTcpReady(config, probe), true);
+  assert.equal(
+    postgresTcpReady(config, () => ({ status: null })),
+    false,
+  );
+  assert.equal(
+    postgresTcpReady(config, () => ({
+      status: 0,
+      error: new Error("timeout"),
+    })),
+    false,
+  );
+});
+
+test("launcher diagnostics accept fixed failure stages only", () => {
+  assert.equal(
+    launcherFailureStage({
+      type: "local-workspace-failure",
+      stage: "identity bootstrap",
+      details: "synthetic-private-data",
+    }),
+    "identity bootstrap",
+  );
+  for (const message of [
+    null,
+    "synthetic-private-data",
+    { type: "other", stage: "identity bootstrap" },
+    { type: "local-workspace-failure", stage: "synthetic-private-data" },
+    { type: "local-workspace-failure", stage: "identity bootstrap\nprivate" },
+    { type: "local-workspace-failure", stage: {} },
+  ]) {
+    assert.equal(launcherFailureStage(message), undefined);
+  }
+});
+
+test("failed launcher delivers a safe stage over IPC with private output suppressed", async () => {
+  const child = spawn(
+    process.execPath,
+    [join(import.meta.dirname, "start-local-workspace.mjs"), "--check"],
+    {
+      env: {
+        ...process.env,
+        GEO_LOCAL_APP_BINARY: "deliberately-invalid-private-path",
+        DATABASE_URL: "postgres://private-password@private-host/db",
+      },
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    },
+  );
+  const messages = [];
+  child.on("message", (message) => messages.push(message));
+  const timeout = setTimeout(() => child.kill(), 5000);
+  try {
+    const code = await new Promise((done, fail) => {
+      child.once("error", fail);
+      child.once("close", done);
+    });
+    assert.equal(code, 1);
+    assert.deepEqual(messages, [
+      { type: "local-workspace-failure", stage: "prerequisites" },
+    ]);
+    assert.equal(launcherFailureStage(messages[0]), "prerequisites");
+  } finally {
+    clearTimeout(timeout);
+  }
+});
 
 test("new private state persists identity, database password and encryption key", async () => {
   const parent = await mkdtemp(join(tmpdir(), "geo-private-check-"));
