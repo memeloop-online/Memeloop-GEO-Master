@@ -8,11 +8,14 @@ import {
 import { ArrowSyncRegular } from "@fluentui/react-icons";
 import { Link, useParams } from "react-router-dom";
 import {
+  useCurrentReportCycleQuery,
   useReportEvidenceQuery,
+  useReportPreviewQuery,
   useReportQuery,
   useReportsQuery,
   type ReportCoverage,
   type ReportEvidenceReference,
+  type ReportProjection,
   type ReportSnapshot,
 } from "../api/reports";
 import { ApiError } from "../api/client";
@@ -163,6 +166,7 @@ function EvidenceItem({
 
 function SnapshotDetail({
   snapshot,
+  savedSnapshot,
   evidence,
   evidenceError,
   evidenceLoading,
@@ -170,7 +174,8 @@ function SnapshotDetail({
   onRefresh,
   refreshing,
 }: {
-  snapshot: ReportSnapshot;
+  snapshot: ReportProjection;
+  savedSnapshot?: ReportSnapshot;
   evidence: ReportEvidenceReference[];
   evidenceError: Error | null;
   evidenceLoading: boolean;
@@ -179,70 +184,134 @@ function SnapshotDetail({
   refreshing: boolean;
 }) {
   const evidenceIds = new Set(evidence.map((item) => item.evidence_id));
+  const Container = savedSnapshot ? "div" : "section";
   return (
-    <div className="workbench-page reports-page">
-      <section className="page-hero">
-        <div>
-          <p className="eyebrow">P14 · 不可变周报快照</p>
-          <h1>
-            周报 ·{" "}
-            {dateTime(
-              snapshot.report_window_start_at,
-              snapshot.report_timezone,
-            )}
-          </h1>
-          <p>
-            {dateTime(
-              snapshot.report_window_start_at,
-              snapshot.report_timezone,
-            )}{" "}
-            —{" "}
-            {dateTime(snapshot.report_window_end_at, snapshot.report_timezone)}
-            {" · "}时区 {snapshot.report_timezone}
-          </p>
-        </div>
-        <div className="report-actions">
-          <Button onClick={() => downloadReportCsv(snapshot)}>
-            下载覆盖与证据 CSV
-          </Button>
-          <Button
-            icon={<ArrowSyncRegular />}
-            disabled={refreshing}
-            onClick={onRefresh}
+    <Container
+      className={
+        savedSnapshot
+          ? "workbench-page reports-page"
+          : "reports-page report-preview"
+      }
+      aria-label={savedSnapshot ? undefined : "临时报告预览"}
+    >
+      {savedSnapshot ? (
+        <>
+          <section className="page-hero">
+            <div>
+              <p className="eyebrow">P14 · 不可变周报快照</p>
+              <h1>
+                周报 ·{" "}
+                {dateTime(
+                  snapshot.report_window_start_at,
+                  snapshot.report_timezone,
+                )}
+              </h1>
+              <p>
+                {dateTime(
+                  snapshot.report_window_start_at,
+                  snapshot.report_timezone,
+                )}{" "}
+                —{" "}
+                {dateTime(
+                  snapshot.report_window_end_at,
+                  snapshot.report_timezone,
+                )}
+                {" · "}时区 {snapshot.report_timezone}
+              </p>
+            </div>
+            <div className="report-actions">
+              <Button onClick={() => downloadReportCsv(savedSnapshot)}>
+                下载覆盖与证据 CSV
+              </Button>
+              <Button
+                icon={<ArrowSyncRegular />}
+                disabled={refreshing}
+                onClick={onRefresh}
+              >
+                刷新快照
+              </Button>
+            </div>
+          </section>
+          <Link to="../reports">← 返回报告列表</Link>
+          <MessageBar
+            intent={snapshot.status === "partial" ? "warning" : "info"}
           >
-            刷新快照
-          </Button>
-        </div>
-      </section>
-      <Link to="../reports">← 返回报告列表</Link>
-      <MessageBar intent={snapshot.status === "partial" ? "warning" : "info"}>
-        <MessageBarBody>
-          {snapshot.status === "partial" ? "部分覆盖" : "完整覆盖"}
-          ：这是截止 {dateTime(
-            snapshot.cutoff_at,
-            snapshot.report_timezone,
-          )}{" "}
-          的固定快照，后续证据不会静默改写本版本。生成于{" "}
-          {dateTime(snapshot.generated_at, snapshot.report_timezone)}。
-        </MessageBarBody>
-      </MessageBar>
+            <MessageBarBody>
+              {snapshot.status === "partial" ? "部分覆盖" : "完整覆盖"}
+              ：这是截止{" "}
+              {dateTime(snapshot.cutoff_at, snapshot.report_timezone)}{" "}
+              的固定快照，后续证据不会静默改写本版本。生成于{" "}
+              {dateTime(snapshot.generated_at, snapshot.report_timezone)}。
+            </MessageBarBody>
+          </MessageBar>
+        </>
+      ) : (
+        <>
+          <div className="report-list-heading">
+            <h2>当前周期报告预览</h2>
+            <Button
+              icon={<ArrowSyncRegular />}
+              disabled={refreshing}
+              onClick={onRefresh}
+            >
+              刷新预览
+            </Button>
+          </div>
+          <MessageBar intent="warning">
+            <MessageBarBody>
+              临时预览 · 未保存为正式周报（
+              {snapshot.status === "partial" ? "部分覆盖" : "完整覆盖"}
+              ）。完整计划分母仍按冻结清单展示；仅纳入当前证据水位之前的证据，刷新可能变化。
+            </MessageBarBody>
+          </MessageBar>
+          <dl className="report-metadata">
+            <dt>生成时间</dt>
+            <dd>{dateTime(snapshot.generated_at, snapshot.report_timezone)}</dd>
+            <dt>证据水位</dt>
+            <dd>
+              {dateTime(snapshot.evidence_as_of, snapshot.report_timezone)}
+            </dd>
+            <dt>冻结截止</dt>
+            <dd>{dateTime(snapshot.cutoff_at, snapshot.report_timezone)}</dd>
+          </dl>
+        </>
+      )}
       <Card className="report-panel">
-        <h2>快照范围与版本</h2>
+        <h2>{savedSnapshot ? "快照范围与版本" : "预览范围与输入版本"}</h2>
+        <p>
+          {dateTime(snapshot.report_window_start_at, snapshot.report_timezone)}{" "}
+          — {dateTime(snapshot.report_window_end_at, snapshot.report_timezone)}
+          {" · "}时区 {snapshot.report_timezone}
+        </p>
         <dl className="report-metadata">
-          <dt>报告 ID</dt>
-          <dd>{snapshot.report_id}</dd>
+          {savedSnapshot && (
+            <>
+              <dt>报告 ID</dt>
+              <dd>{savedSnapshot.report_id}</dd>
+            </>
+          )}
           <dt>周期 ID</dt>
           <dd>{snapshot.cycle_id}</dd>
-          <dt>修订</dt>
-          <dd>{snapshot.revision}</dd>
-          <dt>更正前版本</dt>
-          <dd>{snapshot.correction_of ?? "无"}</dd>
+          {savedSnapshot && (
+            <>
+              <dt>修订</dt>
+              <dd>{savedSnapshot.revision}</dd>
+              <dt>更正前版本</dt>
+              <dd>{savedSnapshot.correction_of ?? "无"}</dd>
+            </>
+          )}
           <dt>Reduce 版本</dt>
           <dd>{snapshot.reducer_version}</dd>
           <dt>输入摘要</dt>
           <dd>{snapshot.input_hash}</dd>
-          <dt>证据水位</dt>
-          <dd>{dateTime(snapshot.evidence_as_of, snapshot.report_timezone)}</dd>
+          {savedSnapshot && (
+            <>
+              <dt>证据水位</dt>
+              <dd>
+                {dateTime(snapshot.evidence_as_of, snapshot.report_timezone)}
+              </dd>
+            </>
+          )}
         </dl>
         <h3>输入清单版本</h3>
         {snapshot.input_manifest_versions.length ? (
@@ -357,7 +426,8 @@ function SnapshotDetail({
                         <li key={id}>
                           {evidenceIds.has(id) ? (
                             <a href={`#evidence-${encodeURIComponent(id)}`}>
-                              查看快照证据 {id}
+                              {savedSnapshot ? "查看快照证据" : "查看预览证据"}{" "}
+                              {id}
                             </a>
                           ) : evidenceLoading || evidenceError ? (
                             <>证据 {id} 的明细暂不可用；请重试证据读取</>
@@ -375,7 +445,10 @@ function SnapshotDetail({
             ))}
           </ul>
         ) : (
-          <p>本快照没有可追溯的结论；不推断效果变化。</p>
+          <p>
+            本{savedSnapshot ? "快照" : "预览"}
+            没有可追溯的结论；不推断效果变化。
+          </p>
         )}
       </section>
       <section className="report-section" aria-label="证据明细">
@@ -399,17 +472,20 @@ function SnapshotDetail({
             ))}
           </ul>
         ) : !evidenceLoading && !evidenceError ? (
-          <p>当前快照未包含证据引用。</p>
+          <p>当前{savedSnapshot ? "快照" : "预览"}未包含证据引用。</p>
         ) : null}
       </section>
-      <MessageBar intent="info">
-        <MessageBarBody>
-          此 CSV
-          仅导出快照已有的覆盖、结论与证据。独立查回只陈述资产存在，不证明原发送成功。资产明细、费用、下一轮动作及
-          PDF 尚未由此接口提供；页面不会生成替代数据或将本快照称作完整商业报告。
-        </MessageBarBody>
-      </MessageBar>
-    </div>
+      {savedSnapshot && (
+        <MessageBar intent="info">
+          <MessageBarBody>
+            此 CSV
+            仅导出快照已有的覆盖、结论与证据。独立查回只陈述资产存在，不证明原发送成功。资产明细、费用、下一轮动作及
+            PDF
+            尚未由此接口提供；页面不会生成替代数据或将本快照称作完整商业报告。
+          </MessageBarBody>
+        </MessageBar>
+      )}
+    </Container>
   );
 }
 
@@ -421,20 +497,12 @@ function ReportListPage({
   projectId: string;
 }) {
   const query = useReportsQuery(tenantId, projectId);
-  if (query.isPending) return <LoadingState label="正在读取周报快照" />;
-  if (query.isError) {
-    return (
-      <ErrorState
-        title={
-          query.error instanceof ApiError && query.error.status === 403
-            ? "权限不足"
-            : "无法加载报告"
-        }
-        detail={query.error.message}
-        onRetry={() => void query.refetch()}
-      />
-    );
-  }
+  const cycle = useCurrentReportCycleQuery(tenantId, projectId);
+  const preview = useReportPreviewQuery(
+    tenantId,
+    projectId,
+    cycle.data?.cycle_id,
+  );
   return (
     <div className="workbench-page reports-page">
       <section className="page-hero">
@@ -451,51 +519,124 @@ function ReportListPage({
           刷新列表
         </Button>
       </section>
-      {query.data.items.length === 0 ? (
+      {cycle.isPending ? (
+        <LoadingState label="正在读取当前周期" compact />
+      ) : cycle.isError ? (
+        <ErrorState
+          title={
+            cycle.error instanceof ApiError && cycle.error.status === 403
+              ? "权限不足"
+              : "无法读取当前周期"
+          }
+          detail={cycle.error.message}
+          onRetry={() => void cycle.refetch()}
+        />
+      ) : !cycle.data ? (
         <EmptyState
-          title="尚无周报快照"
-          detail="截至目前没有已生成的报告。周期截止或输入到齐后，系统才会保存固定快照；这里不会用演示数据填充。"
+          title="暂无活动周期"
+          detail="项目尚无可供预览的当前周期；正式周报快照仍可在下方查看。"
+          action={
+            <Button
+              icon={<ArrowSyncRegular />}
+              onClick={() => void cycle.refetch()}
+            >
+              检查当前周期
+            </Button>
+          }
+        />
+      ) : preview.isPending ? (
+        <LoadingState label="正在生成临时报告预览" compact />
+      ) : preview.isError ? (
+        <ErrorState
+          title={
+            preview.error instanceof ApiError && preview.error.status === 403
+              ? "权限不足"
+              : "无法加载临时预览"
+          }
+          detail={preview.error.message}
+          onRetry={() => void preview.refetch()}
+        />
+      ) : preview.data.project_id !== projectId ||
+        preview.data.cycle_id !== cycle.data.cycle_id ||
+        preview.data.kind !== "preview" ? (
+        <ErrorState
+          title="预览不属于当前周期"
+          detail="请刷新当前周期后重试。"
+          onRetry={() => void cycle.refetch()}
         />
       ) : (
-        <ul className="report-list">
-          {query.data.items.map((snapshot) => (
-            <li key={snapshot.report_id}>
-              <Card className="report-panel">
-                <div className="report-list-heading">
-                  <h2>
-                    <Link to={encodeURIComponent(snapshot.report_id)}>
-                      {dateTime(
-                        snapshot.report_window_start_at,
-                        snapshot.report_timezone,
-                      )}{" "}
-                      —{" "}
-                      {dateTime(
-                        snapshot.report_window_end_at,
-                        snapshot.report_timezone,
-                      )}
-                    </Link>
-                  </h2>
-                  <Badge
-                    appearance="tint"
-                    color={
-                      snapshot.status === "partial" ? "warning" : "success"
-                    }
-                  >
-                    {snapshot.status === "partial" ? "部分覆盖" : "完整覆盖"}
-                  </Badge>
-                </div>
-                <p>
-                  周期 {snapshot.cycle_id} · 修订 {snapshot.revision} · 截止{" "}
-                  {dateTime(snapshot.cutoff_at, snapshot.report_timezone)}
-                </p>
-                {snapshot.correction_of && (
-                  <p>显式更正版本，原报告 {snapshot.correction_of} 仍保留。</p>
-                )}
-              </Card>
-            </li>
-          ))}
-        </ul>
+        <SnapshotDetail
+          snapshot={preview.data}
+          evidence={preview.data.evidence}
+          evidenceError={null}
+          evidenceLoading={false}
+          onEvidenceRetry={() => {}}
+          refreshing={preview.isFetching}
+          onRefresh={() => void preview.refetch()}
+        />
       )}
+      <section aria-label="已保存的正式周报">
+        <h2>已保存的正式周报</h2>
+        {query.isPending ? (
+          <LoadingState label="正在读取周报快照" compact />
+        ) : query.isError ? (
+          <ErrorState
+            title={
+              query.error instanceof ApiError && query.error.status === 403
+                ? "权限不足"
+                : "无法加载报告"
+            }
+            detail={query.error.message}
+            onRetry={() => void query.refetch()}
+          />
+        ) : query.data.items.length === 0 ? (
+          <EmptyState
+            title="尚无周报快照"
+            detail="截至目前没有已生成的报告。周期截止或输入到齐后，系统才会保存固定快照；这里不会用演示数据填充。"
+          />
+        ) : (
+          <ul className="report-list">
+            {query.data.items.map((snapshot) => (
+              <li key={snapshot.report_id}>
+                <Card className="report-panel">
+                  <div className="report-list-heading">
+                    <h2>
+                      <Link to={encodeURIComponent(snapshot.report_id)}>
+                        {dateTime(
+                          snapshot.report_window_start_at,
+                          snapshot.report_timezone,
+                        )}{" "}
+                        —{" "}
+                        {dateTime(
+                          snapshot.report_window_end_at,
+                          snapshot.report_timezone,
+                        )}
+                      </Link>
+                    </h2>
+                    <Badge
+                      appearance="tint"
+                      color={
+                        snapshot.status === "partial" ? "warning" : "success"
+                      }
+                    >
+                      {snapshot.status === "partial" ? "部分覆盖" : "完整覆盖"}
+                    </Badge>
+                  </div>
+                  <p>
+                    周期 {snapshot.cycle_id} · 修订 {snapshot.revision} · 截止{" "}
+                    {dateTime(snapshot.cutoff_at, snapshot.report_timezone)}
+                  </p>
+                  {snapshot.correction_of && (
+                    <p>
+                      显式更正版本，原报告 {snapshot.correction_of} 仍保留。
+                    </p>
+                  )}
+                </Card>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
     </div>
   );
 }
@@ -538,6 +679,7 @@ function ReportDetailPage({
   return (
     <SnapshotDetail
       snapshot={query.data}
+      savedSnapshot={query.data}
       evidence={evidence.data?.items ?? []}
       evidenceError={evidence.isError ? evidence.error : null}
       evidenceLoading={evidence.isPending}

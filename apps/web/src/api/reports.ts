@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor, type QueryScope } from "../auth/types";
+import { getCurrentCycle } from "./channelJobs";
 import { apiFetch } from "./client";
 
 export interface ReportCoverage {
@@ -73,9 +74,37 @@ export interface ReportSnapshot {
   evidence: ReportEvidenceReference[];
 }
 
+export type ReportProjection = Omit<
+  ReportSnapshot,
+  "report_id" | "revision" | "correction_of"
+>;
+
+export type ReportPreview = ReportProjection & { kind: "preview" };
+
 export interface ReportList {
   items: ReportSnapshot[];
 }
+
+export const currentReportCycleQueryKey = (scope: QueryScope) =>
+  [
+    "reports",
+    "current-cycle",
+    scope.userId,
+    scope.operatorId,
+    scope.tenantId,
+    scope.projectId ?? "",
+  ] as const;
+
+export const reportPreviewQueryKey = (scope: QueryScope, cycleId: string) =>
+  [
+    "reports",
+    "preview",
+    scope.userId,
+    scope.operatorId,
+    scope.tenantId,
+    scope.projectId ?? "",
+    cycleId,
+  ] as const;
 
 export const reportsQueryKey = (scope: QueryScope) =>
   [
@@ -125,6 +154,54 @@ export function getReportEvidence(
     `/reports/${encodeURIComponent(reportId)}/evidence`,
     { tenantId, projectId },
   );
+}
+
+export function getReportPreview(
+  tenantId: string,
+  projectId: string,
+  cycleId: string,
+) {
+  return apiFetch<ReportPreview>(
+    `/cycles/${encodeURIComponent(cycleId)}/report-preview`,
+    { tenantId, projectId },
+  );
+}
+
+export function useCurrentReportCycleQuery(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+) {
+  const { session } = useAuth();
+  const scope =
+    session && tenantId && projectId
+      ? queryScopeFor(session, tenantId, projectId)
+      : undefined;
+  return useQuery({
+    queryKey: scope
+      ? currentReportCycleQueryKey(scope)
+      : ["reports", "current-cycle", "anonymous", tenantId, projectId],
+    queryFn: () => getCurrentCycle(tenantId!, projectId!),
+    enabled: Boolean(scope),
+  });
+}
+
+export function useReportPreviewQuery(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+  cycleId: string | undefined,
+) {
+  const { session } = useAuth();
+  const scope =
+    session && tenantId && projectId
+      ? queryScopeFor(session, tenantId, projectId)
+      : undefined;
+  return useQuery({
+    queryKey: scope
+      ? reportPreviewQueryKey(scope, cycleId ?? "")
+      : ["reports", "preview", "anonymous", tenantId, projectId, cycleId],
+    queryFn: () => getReportPreview(tenantId!, projectId!, cycleId!),
+    enabled: Boolean(scope && cycleId),
+  });
 }
 
 export function useReportsQuery(

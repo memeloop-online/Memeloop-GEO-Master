@@ -29,7 +29,7 @@ use crate::host::{
     HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
     KnowledgeImportStatusRequest, KnowledgeSearchRequest, KnowledgeSearchResult,
     ManifestReadRequest, MeasureRequest, ModelCompletionRequest, PublishRequest, ReportGetRequest,
-    ReportReduceRequest,
+    ReportPreviewRequest, ReportReduceRequest,
 };
 
 #[op2]
@@ -645,6 +645,33 @@ pub async fn op_host_report_get_v1(
     Ok(encode(op, &report)?)
 }
 
+/// Returns an ephemeral scoped preview, without saving an official report.
+#[op2]
+#[string]
+pub async fn op_host_report_preview_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] request: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ReportPreview;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ReportPreviewRequest>(op, &request)?;
+    if request.cycle_id.is_some_and(|id| id.is_nil()) {
+        return Err(js_error(HostOpError::invalid_request(
+            op,
+            "cycle ID must be non-zero",
+        )));
+    }
+    let preview = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .report_preview(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &preview)?)
+}
+
 /// Builds a report from server-owned evidence after the frozen cutoff.
 #[op2]
 #[string]
@@ -686,6 +713,7 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::Publish.op_name(),
     HostOp::Measure.op_name(),
     HostOp::ReportGet.op_name(),
+    HostOp::ReportPreview.op_name(),
     HostOp::ReportReduce.op_name(),
     HostOp::ChannelDiscover.op_name(),
     HostOp::ChannelPlan.op_name(),

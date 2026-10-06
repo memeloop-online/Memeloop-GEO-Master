@@ -9,6 +9,7 @@ const KNOWLEDGE_SEARCH = "knowledge_search";
 const KNOWLEDGE_IMPORT_ATTACHMENTS = "knowledge_import_attachments";
 const KNOWLEDGE_IMPORT_STATUS = "knowledge_import_status";
 const REPORT_GET = "report_get";
+const REPORT_PREVIEW = "report_preview";
 const REPORT_REDUCE = "report_reduce";
 const CHANNEL_DISCOVER = "channel_discover";
 const CHANNEL_PLAN = "channel_plan";
@@ -34,6 +35,8 @@ const CHANNEL_TOOLS = [
   CHANNEL_TARGET_EXECUTE,
 ];
 const TOOL_DESCRIPTIONS = {
+  [REPORT_PREVIEW]:
+    "Read a temporary, unsaved report preview for the current project cycle (or scoped cycle_id). This is not an official report: it has no report_id, revision or correction reference. It does not reduce, schedule or save anything.",
   [KNOWLEDGE_IMPORT_STATUS]:
     "Read actual progress for one import_job_id returned by knowledge_import_attachments. Queued/running means source evidence is NOT usable; do not busy-poll indefinitely. Succeeded/partial returns an exact knowledge_release_id for knowledge_search (partial has coverage gaps). Failed/cancelled must not be cited or presented as evidence. This read does not automatically continue a turn.",
   [CONTENT_START]:
@@ -200,6 +203,17 @@ const REPORT_GET_SCHEMA = {
     },
   },
 };
+const REPORT_PREVIEW_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    cycle_id: {
+      type: "string",
+      format: "uuid",
+      description: "Omit to preview the current project cycle.",
+    },
+  },
+};
 const REPORT_REDUCE_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -275,6 +289,7 @@ export async function main(input) {
           KNOWLEDGE_IMPORT_STATUS,
           KNOWLEDGE_SEARCH,
           REPORT_GET,
+          REPORT_PREVIEW,
           REPORT_REDUCE,
           ...CHANNEL_TOOLS,
           ...CONTENT_TOOLS,
@@ -284,6 +299,7 @@ export async function main(input) {
           KNOWLEDGE_SEARCH,
           KNOWLEDGE_IMPORT_STATUS,
           REPORT_GET,
+          REPORT_PREVIEW,
           REPORT_REDUCE,
           ...CHANNEL_TOOLS,
           ...CONTENT_TOOLS,
@@ -537,6 +553,7 @@ function createContext({ session, definition, modelId, provider, tools }) {
           { pattern: KNOWLEDGE_IMPORT_ATTACHMENTS, action: "allow" },
           { pattern: KNOWLEDGE_IMPORT_STATUS, action: "allow" },
           { pattern: REPORT_GET, action: "allow" },
+          { pattern: REPORT_PREVIEW, action: "allow" },
           { pattern: REPORT_REDUCE, action: "allow" },
           ...CHANNEL_TOOLS.map((pattern) => ({ pattern, action: "allow" })),
           ...CONTENT_TOOLS.map((pattern) => ({ pattern, action: "allow" })),
@@ -791,6 +808,7 @@ function resolveHost(requireImport) {
     typeof denoOps.op_host_knowledge_search_v1 !== "function" ||
     typeof denoOps.op_host_knowledge_import_status_v1 !== "function" ||
     typeof denoOps.op_host_report_get_v1 !== "function" ||
+    typeof denoOps.op_host_report_preview_v1 !== "function" ||
     typeof denoOps.op_host_report_reduce_v1 !== "function" ||
     typeof denoOps.op_host_channel_discover_v1 !== "function" ||
     typeof denoOps.op_host_channel_plan_v1 !== "function" ||
@@ -842,6 +860,11 @@ function resolveHost(requireImport) {
     async reportGet(request) {
       return JSON.parse(
         await denoOps.op_host_report_get_v1(JSON.stringify(request)),
+      );
+    },
+    async reportPreview(request) {
+      return JSON.parse(
+        await denoOps.op_host_report_preview_v1(JSON.stringify(request)),
       );
     },
     async reportReduce(request) {
@@ -1158,6 +1181,7 @@ function createHostTools(host, failures, attachments) {
     }
   };
   const reportGet = reportTool(REPORT_GET, "reportGet");
+  const reportPreview = reportTool(REPORT_PREVIEW, "reportPreview");
   const reportReduce = reportTool(REPORT_REDUCE, "reportReduce");
   const channelDiscover = reportTool(CHANNEL_DISCOVER, "channelDiscover");
   const channelPlan = reportTool(CHANNEL_PLAN, "channelPlan");
@@ -1224,29 +1248,31 @@ function createHostTools(host, failures, attachments) {
             ? importAttachments
             : id === REPORT_GET
               ? reportGet
-              : id === REPORT_REDUCE
-                ? reportReduce
-                : id === CHANNEL_DISCOVER
-                  ? channelDiscover
-                  : id === CHANNEL_PLAN
-                    ? channelPlan
-                    : id === CHANNEL_MANIFEST_READ
-                      ? channelManifestRead
-                      : id === CHANNEL_TARGET_EXECUTE
-                        ? channelTargetExecute
-                        : id === CONTENT_START
-                          ? contentStart
-                          : id === CONTENT_EXECUTION_READ
-                            ? contentExecutionRead
-                            : id === DISTRIBUTION_START
-                              ? distributionStart
-                              : id === DISTRIBUTION_READ
-                                ? distributionRead
-                                : id === DISTRIBUTION_RESUME
-                                  ? distributionResume
-                                  : id === DISTRIBUTION_TARGETS_READ
-                                    ? distributionTargetsRead
-                                    : undefined,
+              : id === REPORT_PREVIEW
+                ? reportPreview
+                : id === REPORT_REDUCE
+                  ? reportReduce
+                  : id === CHANNEL_DISCOVER
+                    ? channelDiscover
+                    : id === CHANNEL_PLAN
+                      ? channelPlan
+                      : id === CHANNEL_MANIFEST_READ
+                        ? channelManifestRead
+                        : id === CHANNEL_TARGET_EXECUTE
+                          ? channelTargetExecute
+                          : id === CONTENT_START
+                            ? contentStart
+                            : id === CONTENT_EXECUTION_READ
+                              ? contentExecutionRead
+                              : id === DISTRIBUTION_START
+                                ? distributionStart
+                                : id === DISTRIBUTION_READ
+                                  ? distributionRead
+                                  : id === DISTRIBUTION_RESUME
+                                    ? distributionResume
+                                    : id === DISTRIBUTION_TARGETS_READ
+                                      ? distributionTargetsRead
+                                      : undefined,
     listTools: () =>
       attachments.length > 0
         ? [
@@ -1254,6 +1280,7 @@ function createHostTools(host, failures, attachments) {
             KNOWLEDGE_IMPORT_STATUS,
             KNOWLEDGE_SEARCH,
             REPORT_GET,
+            REPORT_PREVIEW,
             REPORT_REDUCE,
             ...CHANNEL_TOOLS,
             ...CONTENT_TOOLS,
@@ -1263,6 +1290,7 @@ function createHostTools(host, failures, attachments) {
             KNOWLEDGE_SEARCH,
             KNOWLEDGE_IMPORT_STATUS,
             REPORT_GET,
+            REPORT_PREVIEW,
             REPORT_REDUCE,
             ...CHANNEL_TOOLS,
             ...CONTENT_TOOLS,
@@ -1277,29 +1305,31 @@ function createHostTools(host, failures, attachments) {
             ? importSchema
             : id === REPORT_GET
               ? REPORT_GET_SCHEMA
-              : id === REPORT_REDUCE
-                ? REPORT_REDUCE_SCHEMA
-                : id === CHANNEL_DISCOVER
-                  ? CHANNEL_DISCOVER_SCHEMA
-                  : id === CHANNEL_PLAN
-                    ? CHANNEL_PLAN_SCHEMA
-                    : id === CHANNEL_MANIFEST_READ
-                      ? CHANNEL_MANIFEST_READ_SCHEMA
-                      : id === CHANNEL_TARGET_EXECUTE
-                        ? CHANNEL_TARGET_EXECUTE_SCHEMA
-                        : id === CONTENT_START
-                          ? CONTENT_START_SCHEMA
-                          : id === CONTENT_EXECUTION_READ
-                            ? CONTENT_EXECUTION_READ_SCHEMA
-                            : id === DISTRIBUTION_START
-                              ? DISTRIBUTION_START_SCHEMA
-                              : id === DISTRIBUTION_READ
-                                ? DISTRIBUTION_READ_SCHEMA
-                                : id === DISTRIBUTION_RESUME
-                                  ? DISTRIBUTION_RESUME_SCHEMA
-                                  : id === DISTRIBUTION_TARGETS_READ
-                                    ? DISTRIBUTION_TARGETS_READ_SCHEMA
-                                    : undefined,
+              : id === REPORT_PREVIEW
+                ? REPORT_PREVIEW_SCHEMA
+                : id === REPORT_REDUCE
+                  ? REPORT_REDUCE_SCHEMA
+                  : id === CHANNEL_DISCOVER
+                    ? CHANNEL_DISCOVER_SCHEMA
+                    : id === CHANNEL_PLAN
+                      ? CHANNEL_PLAN_SCHEMA
+                      : id === CHANNEL_MANIFEST_READ
+                        ? CHANNEL_MANIFEST_READ_SCHEMA
+                        : id === CHANNEL_TARGET_EXECUTE
+                          ? CHANNEL_TARGET_EXECUTE_SCHEMA
+                          : id === CONTENT_START
+                            ? CONTENT_START_SCHEMA
+                            : id === CONTENT_EXECUTION_READ
+                              ? CONTENT_EXECUTION_READ_SCHEMA
+                              : id === DISTRIBUTION_START
+                                ? DISTRIBUTION_START_SCHEMA
+                                : id === DISTRIBUTION_READ
+                                  ? DISTRIBUTION_READ_SCHEMA
+                                  : id === DISTRIBUTION_RESUME
+                                    ? DISTRIBUTION_RESUME_SCHEMA
+                                    : id === DISTRIBUTION_TARGETS_READ
+                                      ? DISTRIBUTION_TARGETS_READ_SCHEMA
+                                      : undefined,
     registerTool: () => {
       throw new Error("The embedded loop cannot register tools.");
     },

@@ -10,7 +10,9 @@ import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
 import {
   getReport,
   getReportEvidence,
+  getReportPreview,
   listReports,
+  type ReportPreview,
   type ReportSnapshot,
 } from "../api/reports";
 import { reportSnapshotCsv } from "./reportsCsv";
@@ -95,6 +97,19 @@ const snapshot: ReportSnapshot = {
   ],
 };
 
+const {
+  report_id: _reportId,
+  revision: _revision,
+  correction_of: _correctionOf,
+  ...projection
+} = snapshot;
+const reportPreview: ReportPreview = {
+  ...projection,
+  kind: "preview",
+  generated_at: "2026-09-27T12:01:00Z",
+  evidence_as_of: "2026-09-27T12:00:00Z",
+};
+
 function response(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -108,12 +123,20 @@ function mockApi({
   listStatus = 200,
   detailStatus = 200,
   evidenceStatus = 200,
+  cycleStatus = 200,
+  previewStatus = 200,
+  preview = reportPreview,
+  previewWait,
 }: {
   reports?: ReportSnapshot[];
   detail?: ReportSnapshot;
   listStatus?: number;
   detailStatus?: number;
   evidenceStatus?: number;
+  cycleStatus?: number;
+  previewStatus?: number;
+  preview?: ReportPreview;
+  previewWait?: Promise<void>;
 } = {}) {
   const fetchMock = vi.fn((request: RequestInfo | URL) => {
     const url = new URL(String(request), "http://localhost");
@@ -121,6 +144,29 @@ function mockApi({
       return Promise.resolve(response(session));
     if (url.pathname.endsWith("/projects"))
       return Promise.resolve(response({ items: [], next_cursor: null }));
+    if (url.pathname.endsWith("/projects/project-1/cycles/current"))
+      return Promise.resolve(
+        response(
+          cycleStatus === 200
+            ? {
+                project_id: "project-1",
+                cycle_id: "cycle-1",
+                report_timezone: "Asia/Shanghai",
+                report_window_start_at: snapshot.report_window_start_at,
+                report_window_end_at: snapshot.report_window_end_at,
+                cutoff_at: snapshot.cutoff_at,
+              }
+            : { message: "当前没有周期" },
+          cycleStatus,
+        ),
+      );
+    if (url.pathname.endsWith("/cycles/cycle-1/report-preview"))
+      return (previewWait ?? Promise.resolve()).then(() =>
+        response(
+          previewStatus === 200 ? preview : { message: "预览暂不可用" },
+          previewStatus,
+        ),
+      );
     if (url.pathname.endsWith("/projects/project-1/reports"))
       return Promise.resolve(
         response(
@@ -179,6 +225,135 @@ afterEach(() => {
 });
 
 describe("P14 immutable reports", () => {
+  it("renders a read-only preview alongside an empty saved list with distinct times, full denominator and inline evidence", async () => {
+    const fetchMock = mockApi({
+      reports: [],
+      preview: {
+        ...reportPreview,
+        measurements: {
+          availability: "available",
+          expected_count: 4,
+          observed_count: 2,
+          counts: { missing: 1, not_mentioned: 1, pending: 2 },
+          reason: null,
+        },
+        measurement_groups: [
+          {
+            comparison_key: "frozen-protocol",
+            coverage: {
+              availability: "available",
+              expected_count: 4,
+              observed_count: 2,
+              counts: { missing: 1, not_mentioned: 1, pending: 2 },
+              reason: null,
+            },
+          },
+        ],
+      },
+    });
+    const user = userEvent.setup();
+    renderPage();
+    const previewSection = await screen.findByRole("region", {
+      name: "临时报告预览",
+    });
+    expect(
+      within(previewSection).getByText(/临时预览 · 未保存为正式周报/),
+    ).toBeInTheDocument();
+    expect(
+      within(previewSection).getByText("资料不足的文档分支"),
+    ).toBeInTheDocument();
+    expect(within(previewSection).getByText("生成时间")).toBeInTheDocument();
+    expect(within(previewSection).getByText("证据水位")).toBeInTheDocument();
+    expect(within(previewSection).getByText("冻结截止")).toBeInTheDocument();
+    expect(
+      within(previewSection).getByText("2026/09/27 20:01"),
+    ).toBeInTheDocument();
+    expect(
+      within(previewSection).getByText("2026/09/27 20:00"),
+    ).toBeInTheDocument();
+    expect(
+      within(previewSection).getByText("2026/09/28 20:00"),
+    ).toBeInTheDocument();
+    const measurement = within(previewSection)
+      .getByRole("heading", { name: "AI 渠道测量覆盖" })
+      .closest(".report-panel")!;
+    expect(
+      within(measurement as HTMLElement).getByText(/计划分母 4/),
+    ).toBeInTheDocument();
+    expect(
+      within(measurement as HTMLElement).getByText("缺测"),
+    ).toBeInTheDocument();
+    expect(
+      within(measurement as HTMLElement).getByText("未提及"),
+    ).toBeInTheDocument();
+    expect(
+      within(previewSection).getByRole("link", { name: /查看预览证据/ }),
+    ).toHaveAttribute("href", "#evidence-evidence-1");
+    expect(
+      within(previewSection).queryByText("报告 ID"),
+    ).not.toBeInTheDocument();
+    expect(within(previewSection).queryByText("修订")).not.toBeInTheDocument();
+    expect(
+      within(previewSection).queryByRole("button", { name: /CSV/ }),
+    ).not.toBeInTheDocument();
+    expect(await screen.findByText("尚无周报快照")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([request]) =>
+        String(request).includes("/cycles/cycle-1/report-preview"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.some(([request]) =>
+        String(request).includes("/reports/report-1/evidence"),
+      ),
+    ).toBe(false);
+    await user.click(
+      within(previewSection).getByRole("button", { name: "刷新预览" }),
+    );
+    expect(
+      fetchMock.mock.calls.filter(([request]) =>
+        String(request).includes("/cycles/cycle-1/report-preview"),
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("reports preview loading/errors/no active cycle without hiding saved snapshots", async () => {
+    let finishPreview!: () => void;
+    mockApi({
+      previewWait: new Promise<void>((resolve) => {
+        finishPreview = resolve;
+      }),
+    });
+    const loadingPage = renderPage();
+    expect(
+      await screen.findByLabelText("正在生成临时报告预览"),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByRole("link", { name: /2026.*2026/ }),
+    ).toBeInTheDocument();
+    finishPreview();
+    loadingPage.unmount();
+    vi.unstubAllGlobals();
+    mockApi({ cycleStatus: 404 });
+    const page = renderPage();
+    expect(await screen.findByText("暂无活动周期")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: "临时报告预览" }),
+    ).not.toBeInTheDocument();
+    expect(
+      await screen.findByRole("link", { name: /2026.*2026/ }),
+    ).toBeInTheDocument();
+    page.unmount();
+    vi.unstubAllGlobals();
+    mockApi({ previewStatus: 503 });
+    renderPage();
+    expect(await screen.findByText("无法加载临时预览")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("link", { name: /2026.*2026/ }),
+    ).toBeInTheDocument();
+  });
+
   it("lists saved snapshots, follows detail, and preserves correction lineage", async () => {
     const fetchMock = mockApi();
     const user = userEvent.setup();
@@ -425,6 +600,7 @@ describe("P14 immutable reports", () => {
     await listReports("tenant-other", "project-other");
     await getReport("tenant-other", "project-other", "report/other");
     await getReportEvidence("tenant-other", "project-other", "report/other");
+    await getReportPreview("tenant-other", "project-other", "cycle/other");
     expect(String(fetchMock.mock.calls[0][0])).toContain(
       "/projects/project-other/reports?tenant_id=tenant-other&project_id=project-other",
     );
@@ -433,6 +609,9 @@ describe("P14 immutable reports", () => {
     );
     expect(String(fetchMock.mock.calls[2][0])).toContain(
       "/reports/report%2Fother/evidence?tenant_id=tenant-other&project_id=project-other",
+    );
+    expect(String(fetchMock.mock.calls[3][0])).toContain(
+      "/cycles/cycle%2Fother/report-preview?tenant_id=tenant-other&project_id=project-other",
     );
   });
 });

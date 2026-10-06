@@ -470,6 +470,7 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "knowledge_search",
         "knowledge_import_status",
         "report_get",
+        "report_preview",
         "report_reduce",
         "channel_discover",
         "channel_plan",
@@ -485,6 +486,81 @@ test("report reduction and immutable read are exposed as separate scoped host to
     );
     assert.match(requests[1].messages.at(-1).content, /"status":"partial"/u);
     assert.match(requests[2].messages.at(-1).content, /"evidence_id"/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("report preview is independent of official read and reduce", async () => {
+  const cycleId = "00000000-0000-4000-8000-000000000031";
+  const calls = [];
+  const requests = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async reportGet() {
+      throw new Error("Preview must not read an official report");
+    },
+    async reportReduce() {
+      throw new Error("Preview must not create an official report");
+    },
+    async reportPreview(request) {
+      calls.push(request);
+      return { kind: "preview", cycle_id: cycleId, status: "partial" };
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      return requests.length <= 2
+        ? {
+            text: "",
+            tool_calls: [
+              {
+                id: `preview-${requests.length}`,
+                type: "function",
+                function: {
+                  name: "report_preview",
+                  arguments:
+                    requests.length === 1
+                      ? "{}"
+                      : JSON.stringify({ cycle_id: cycleId }),
+                },
+              },
+            ],
+            model: "stub-model",
+            prompt_tokens: 3,
+            completion_tokens: 3,
+            finish_reason: "tool_calls",
+          }
+        : {
+            text: "This is a temporary preview.",
+            model: "stub-model",
+            prompt_tokens: 3,
+            completion_tokens: 3,
+            finish_reason: "stop",
+          };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?preview=${Date.now()}`);
+    const result = await main({
+      conversation_id: "conversation-preview",
+      prompt: "Preview current coverage",
+      run_id: "run-preview",
+      turn_id: "turn-preview",
+    });
+    assert.equal(result.answer, "This is a temporary preview.");
+    assert.deepEqual(calls, [{}, { cycle_id: cycleId }]);
+    const previewTool = requests[0].tools.find(
+      (tool) => tool.function.name === "report_preview",
+    );
+    assert.deepEqual(Object.keys(previewTool.function.parameters.properties), [
+      "cycle_id",
+    ]);
+    assert.equal(previewTool.function.parameters.additionalProperties, false);
+    assert.match(previewTool.function.description, /temporary|unsaved/u);
+    assert.match(requests[1].messages.at(-1).content, /"kind":"preview"/u);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
@@ -606,6 +682,7 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "knowledge_import_status",
         "knowledge_search",
         "report_get",
+        "report_preview",
         "report_reduce",
         "channel_discover",
         "channel_plan",

@@ -10,6 +10,26 @@
   padding: 18px;
 }
 
+.reports-page .report-preview {
+  padding: 18px;
+  border: 2px solid #b8cee7;
+  border-radius: 10px;
+  background: #f4f8fd;
+}
+
+.reports-page .report-preview > .report-metadata {
+  margin: 12px 0 0;
+}
+
+.reports-page .report-preview .report-list-heading h2 {
+  margin: 0;
+}
+
+.reports-page > section[aria-label="已保存的正式周报"] {
+  display: grid;
+  gap: 12px;
+}
+
 .reports-page h2,
 .reports-page h3,
 .reports-page h4 {

@@ -31,7 +31,7 @@ use uuid::Uuid;
 use geo_domain::{
     AppError, AttachmentReference, ContentCoverage, ContentExecutionStatus, ContentItemStatus,
     DistributionTargetStatus, ImportStatus, KnowledgePurpose, PublicationLookupFinding,
-    ReportSnapshot,
+    ReportPreview, ReportPreviewKind, ReportSnapshot,
 };
 pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
 pub use geo_domain::{ToolCallIdentity, ToolCallOutcome};
@@ -55,6 +55,7 @@ pub trait ToolCallRecorder: Send + Sync {
 // ledger; failed conversion also has a static, non-sensitive error.
 fn validate_recorded_return(
     op: HostOp,
+    scope: &TenantScope,
     request: &serde_json::Value,
     result: &serde_json::Value,
 ) -> Result<bool, HostOpError> {
@@ -135,6 +136,26 @@ fn validate_recorded_return(
                 .validate_for(&requested)
                 .map_err(|_| HostOpError::unknown_result(op, "measurement sample is invalid"))?;
         }
+        HostOp::ReportPreview => {
+            let requested: ReportPreviewRequest = typed(op, request)?;
+            let response: ReportPreview = typed(op, result)?;
+            if result.as_object().is_none_or(|fields| {
+                ["report_id", "revision", "correction_of"]
+                    .iter()
+                    .any(|field| fields.contains_key(*field))
+            }) || response.kind != ReportPreviewKind::Preview
+                || scope.project_id != Some(response.project_id)
+                || requested.cycle_id.is_some_and(|id| id != response.cycle_id)
+                || response.cycle_id.is_nil()
+                || response.evidence_as_of > response.cutoff_at
+                || response.evidence_as_of > response.generated_at
+            {
+                return Err(HostOpError::internal(
+                    op,
+                    "preview returned invalid scope or evidence",
+                ));
+            }
+        }
         HostOp::ContentPrepare
         | HostOp::ContentGenerate
         | HostOp::ContentCheck
@@ -206,7 +227,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v8";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v9";
 
 /// The JavaScript error class every host-op failure carries.
 ///
@@ -252,6 +273,8 @@ pub enum HostOp {
     Measure,
     /// Read an immutable scoped report snapshot.
     ReportGet,
+    /// Inspect a temporary current-cycle report without saving a snapshot.
+    ReportPreview,
     /// Reduce a due cycle from server-owned evidence.
     ReportReduce,
     ChannelDiscover,
@@ -274,7 +297,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 25;
+    pub const COUNT: usize = 26;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -286,6 +309,7 @@ impl HostOp {
         Self::Publish,
         Self::Measure,
         Self::ReportGet,
+        Self::ReportPreview,
         Self::ReportReduce,
         Self::ChannelDiscover,
         Self::ChannelPlan,
@@ -316,6 +340,7 @@ impl HostOp {
             Self::Publish => "publish.submit.v2",
             Self::Measure => "measure.sample.v2",
             Self::ReportGet => "report.get.v1",
+            Self::ReportPreview => "report.preview.v1",
             Self::ReportReduce => "report.reduce.v1",
             Self::ChannelDiscover => "channel.discover.v1",
             Self::ChannelPlan => "channel.plan.v1",
@@ -347,6 +372,7 @@ impl HostOp {
             Self::Publish => "op_host_publish_submit_v2",
             Self::Measure => "op_host_measure_sample_v2",
             Self::ReportGet => "op_host_report_get_v1",
+            Self::ReportPreview => "op_host_report_preview_v1",
             Self::ReportReduce => "op_host_report_reduce_v1",
             Self::ChannelDiscover => "op_host_channel_discover_v1",
             Self::ChannelPlan => "op_host_channel_plan_v1",
@@ -415,6 +441,7 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(60_000, 16),
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 32),
+                HostOpLimits::new(15_000, 32), // temporary report preview
                 HostOpLimits::new(120_000, 4),
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(60_000, 16),
@@ -726,6 +753,17 @@ pub trait HostOps: Send + Sync {
         Err(HostOpError::capability_missing(
             HostOp::ReportGet,
             "report reads are not configured",
+        ))
+    }
+
+    async fn report_preview(
+        &self,
+        _scope: &TenantScope,
+        _request: ReportPreviewRequest,
+    ) -> Result<ReportPreview, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ReportPreview,
+            "report preview is not configured",
         ))
     }
 
@@ -1493,6 +1531,14 @@ pub struct ReportGetRequest {
     pub report_id: Option<Uuid>,
 }
 
+/// A read-only projection for the current project cycle by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportPreviewRequest {
+    #[serde(default)]
+    pub cycle_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportReduceRequest {
@@ -2244,11 +2290,12 @@ impl HostBridge {
         let Some((run_id, recorder)) = self.recorder.as_ref() else {
             return self
                 .invoke(op, move |bridge| async move {
+                    let scope = bridge.scope().clone();
                     let value = work(bridge).await?;
                     let actual = serde_json::to_value(&value).map_err(|_| {
                         HostOpError::internal(op, "capability response cannot be encoded")
                     })?;
-                    validate_recorded_return(op, &request_value, &actual)?;
+                    validate_recorded_return(op, &scope, &request_value, &actual)?;
                     Ok(value)
                 })
                 .await;
@@ -2269,6 +2316,7 @@ impl HostBridge {
         };
         let recorder = Arc::clone(recorder);
         let bridge = self.clone();
+        let scope = self.scope.clone();
         let cancellation = Arc::clone(&self.cancellation);
         self.executor
             .spawn(async move {
@@ -2347,7 +2395,7 @@ impl HostBridge {
                             HostOpError::internal(op, "capability response cannot be encoded")
                         }
                     })?;
-                    let unknown = validate_recorded_return(op, &request_value, &actual)?;
+                    let unknown = validate_recorded_return(op, &scope, &request_value, &actual)?;
                     Ok((value, unknown))
                 });
                 let outcome = match &validated {

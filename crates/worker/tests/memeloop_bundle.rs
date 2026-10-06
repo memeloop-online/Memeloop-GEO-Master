@@ -19,7 +19,7 @@ use geo_worker::{
     HostBridge, HostOp, HostOpError, HostOps, HostRuntime, KnowledgeImportAttachmentResultItem,
     KnowledgeImportAttachmentsRequest, KnowledgeImportAttachmentsResult, ManifestPage,
     ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest, ReportGetRequest, ReportReduceRequest,
+    PublishReceipt, PublishRequest, ReportGetRequest, ReportPreviewRequest, ReportReduceRequest,
 };
 
 const BUNDLE_SPECIFIER: &str = "memeloop://bundle/memeloop-agent-loop.bundle.mjs";
@@ -34,6 +34,7 @@ struct RecordingHostOps {
     tool_turn: bool,
     import_turn: bool,
     report_turn: bool,
+    preview_turn: bool,
 }
 
 impl RecordingHostOps {
@@ -71,6 +72,21 @@ impl HostOps for RecordingHostOps {
             .lock()
             .expect("model call recorder must not be poisoned");
         calls.push((scope.storage_key(), request));
+        if self.preview_turn && calls.len() == 1 {
+            return Ok(serde_json::from_value(serde_json::json!({
+                "text": "",
+                "tool_calls": [{
+                    "id": "report-preview-1",
+                    "type": "function",
+                    "function": { "name": "report_preview", "arguments": "{}" }
+                }],
+                "model": "probe-model",
+                "prompt_tokens": 7,
+                "completion_tokens": 4,
+                "finish_reason": "tool_calls"
+            }))
+            .expect("preview completion fixture must match the host DTO"));
+        }
         if self.report_turn && calls.len() <= 2 {
             let first = calls.len() == 1;
             return Ok(serde_json::from_value(serde_json::json!({
@@ -141,7 +157,9 @@ impl HostOps for RecordingHostOps {
             .expect("tool completion fixture must match the host DTO"));
         }
         Ok(ModelCompletion {
-            text: if self.report_turn {
+            text: if self.preview_turn {
+                "Temporary preview with a coverage gap.".to_owned()
+            } else if self.report_turn {
                 "Report available with a coverage gap.".to_owned()
             } else if self.tool_turn || self.import_turn {
                 "The warranty lasts two years (Manual).".to_owned()
@@ -271,6 +289,33 @@ impl HostOps for RecordingHostOps {
             .unwrap()
             .push((scope.storage_key(), format!("get:{:?}", request.report_id)));
         Ok(report_fixture())
+    }
+
+    async fn report_preview(
+        &self,
+        scope: &TenantScope,
+        request: ReportPreviewRequest,
+    ) -> Result<geo_domain::ReportPreview, HostOpError> {
+        self.report_calls.lock().unwrap().push((
+            scope.storage_key(),
+            format!("preview:{:?}", request.cycle_id),
+        ));
+        let mut value = serde_json::to_value(report_fixture()).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("report_id");
+        fields.remove("revision");
+        fields.remove("correction_of");
+        fields.insert("kind".to_owned(), serde_json::json!("preview"));
+        fields.insert(
+            "project_id".to_owned(),
+            serde_json::to_value(scope.project_id.expect("project scope")).unwrap(),
+        );
+        serde_json::from_value(value).map_err(|_| {
+            HostOpError::internal(
+                HostOp::ReportPreview,
+                "fixture preview could not be created",
+            )
+        })
     }
 }
 
@@ -449,6 +494,63 @@ async fn generated_memeloop_bundle_reduces_and_reads_a_report_through_rust() {
             .payload
             .contains("Report available with a coverage gap")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires `pnpm agent:bundle`; run with `cargo test -p geo-worker --test memeloop_bundle -- --ignored`"]
+async fn generated_memeloop_bundle_previews_without_formal_report_ops() {
+    let source = generated_bundle();
+    let provider = Arc::new(RecordingHostOps {
+        preview_turn: true,
+        ..Default::default()
+    });
+    let scoped = test_scope();
+    let expected_scope = scoped.storage_key();
+    let bridge = HostBridge::new(
+        Arc::clone(&provider) as Arc<dyn HostOps>,
+        scoped,
+        tokio::runtime::Handle::current(),
+    );
+    let mut runtime = HostRuntime::new(
+        &[(BUNDLE_SPECIFIER, source.as_str())],
+        bridge,
+        Some(64 * 1024 * 1024),
+    )
+    .unwrap();
+    runtime.install_heap_limit_guard(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    runtime
+        .call_main(
+            BUNDLE_SPECIFIER,
+            &serde_json::json!({
+                "conversation_id": "conversation-preview-probe",
+                "prompt": "Preview this cycle",
+                "run_id": "run-preview-probe",
+                "turn_id": "turn-preview-probe"
+            })
+            .to_string(),
+            TURN_DEADLINE,
+        )
+        .await
+        .expect("native MemeLoop must call the scoped preview op");
+    assert_eq!(runtime.op_calls(HostOp::ReportPreview), 1);
+    assert_eq!(runtime.op_calls(HostOp::ReportReduce), 0);
+    assert_eq!(runtime.op_calls(HostOp::ReportGet), 0);
+    assert_eq!(
+        provider.report_calls.lock().unwrap().as_slice(),
+        &[(expected_scope, "preview:None".to_owned())],
+    );
+    let models = provider.model_calls();
+    let preview = models[1]
+        .1
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .as_deref()
+        .unwrap();
+    assert!(preview.contains("\"kind\":\"preview\""));
+    assert!(!preview.contains("\"report_id\""));
+    assert!(!preview.contains("\"revision\""));
 }
 
 #[tokio::test(flavor = "current_thread")]

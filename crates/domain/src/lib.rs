@@ -88,9 +88,9 @@ pub use project::{
 pub use report::{
     MemoryReportRepository, REPORT_REDUCER_VERSION, ReportAvailability, ReportCoverage,
     ReportEvidenceReference, ReportFinding, ReportManifestKind, ReportManifestRef,
-    ReportMeasurementGroup, ReportMeasurementStatus, ReportMeasurementTarget,
-    ReportPublicationGroup, ReportPublicationStatus, ReportPublicationTarget, ReportReduceInput,
-    ReportRepository, ReportSnapshot, ReportStatus, publication_lookup_asset_evidence,
-    reduce_report, validate_correction,
+    ReportMeasurementGroup, ReportMeasurementStatus, ReportMeasurementTarget, ReportPreview,
+    ReportPreviewKind, ReportPublicationGroup, ReportPublicationStatus, ReportPublicationTarget,
+    ReportReduceInput, ReportRepository, ReportSnapshot, ReportStatus, preview_report,
+    publication_lookup_asset_evidence, reduce_report, validate_correction,
 };
 pub use tenancy::{OperatorId, ProjectId, TenantId, TenantScope, TenantScopeId};

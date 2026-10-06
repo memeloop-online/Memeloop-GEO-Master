@@ -4,13 +4,14 @@
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
+    http::{HeaderMap, HeaderValue, header::CACHE_CONTROL},
 };
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, DistributionPublicationResult, DistributionTarget, DistributionTargetStatus,
-    ErrorCode, ProjectId, ReportManifestKind, ReportManifestRef, ReportPublicationStatus,
-    ReportPublicationTarget, ReportReduceInput, ReportSnapshot, TenantScope,
-    publication_lookup_asset_evidence, reduce_report,
+    AppError, CycleReportView, DistributionPublicationResult, DistributionTarget,
+    DistributionTargetStatus, ErrorCode, ProjectId, ReportManifestKind, ReportManifestRef,
+    ReportPreview, ReportPublicationStatus, ReportPublicationTarget, ReportReduceInput,
+    ReportSnapshot, TenantScope, preview_report, publication_lookup_asset_evidence, reduce_report,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -165,6 +166,63 @@ pub async fn reduce_cycle_report(
             "report cutoff has not arrived",
         ));
     }
+    let parent = correction_of.map(|parent_id| {
+        *revisions
+            .iter()
+            .find(|report| report.report_id == parent_id)
+            .expect("correction parent checked above")
+    });
+    let input = assemble_report_input(
+        state,
+        scope,
+        &cycle,
+        parent,
+        if correction_of.is_some() {
+            now
+        } else {
+            cycle.cutoff_at
+        },
+    )
+    .await?;
+    let snapshot = reduce_report(scope, &input, revision, correction_of, now)?;
+    let snapshot = state.report_repository().create(scope, snapshot).await?;
+    schedule_successor_after_report(state, scope, &snapshot, now).await;
+    Ok(snapshot)
+}
+
+/// Evaluate the frozen cycle as it is currently observable without creating
+/// an official snapshot, scheduling a successor, or reading report history.
+pub async fn preview_cycle_report(
+    state: &AppState,
+    scope: &TenantScope,
+    cycle_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<ReportPreview, AppError> {
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::forbidden("project scope required"))?;
+    let cycle = state
+        .project_repository()
+        .get_report_cycle(scope, project_id, cycle_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("cycle not found"))?;
+    let evidence_at = now.min(cycle.cutoff_at);
+    let input = assemble_report_input(state, scope, &cycle, None, evidence_at).await?;
+    preview_report(scope, &input, now)
+}
+
+/// Only authoritative scoped repository reads belong here. For a correction
+/// the parent's frozen formal manifest is retained; for first reports and
+/// previews the original cutoff fixes the eligible frozen denominator.
+async fn assemble_report_input(
+    state: &AppState,
+    scope: &TenantScope,
+    cycle: &CycleReportView,
+    correction_parent: Option<&ReportSnapshot>,
+    evidence_at: DateTime<Utc>,
+) -> Result<ReportReduceInput, AppError> {
+    let project_id = cycle.project_id;
+    let cycle_id = cycle.cycle_id;
     let document_manifest = if let Some(reference) = &cycle.document_manifest {
         state
             .knowledge_repository()
@@ -187,11 +245,7 @@ pub async fn reduce_cycle_report(
     // can see later versions of those targets, not manifests frozen later or
     // a newer manifest revision that would rewrite the original denominator.
     let distribution_repository = state.distribution_repository();
-    let formal = if let Some(parent_id) = correction_of {
-        let parent = revisions
-            .iter()
-            .find(|report| report.report_id == parent_id)
-            .expect("correction parent checked above");
+    let formal = if let Some(parent) = correction_parent {
         let reference = parent.input_manifest_versions.iter().find(|reference| {
             reference.kind == ReportManifestKind::Distribution && reference.sealed
         });
@@ -205,7 +259,7 @@ pub async fn reduce_cycle_report(
                         && manifest.sealed_at <= cycle.cutoff_at =>
                 {
                     let snapshot = distribution_repository
-                        .as_of(scope, manifest.manifest_id, now)
+                        .as_of(scope, manifest.manifest_id, evidence_at)
                         .await?;
                     Some((manifest, snapshot.targets))
                 }
@@ -218,7 +272,7 @@ pub async fn reduce_cycle_report(
         }
     } else {
         let formal_at_cutoff = distribution_repository
-            .cycle_inputs(scope, cycle_id, cycle.cutoff_at)
+            .cycle_inputs(scope, cycle_id, evidence_at)
             .await?;
         formal_at_cutoff
             .manifest
@@ -246,15 +300,7 @@ pub async fn reduce_cycle_report(
     // manifest existed at cutoff. Independent measurement inputs remain.
     let channel_inputs = state
         .channel_job_repository()
-        .cycle_inputs(
-            scope,
-            cycle_id,
-            if correction_of.is_some() {
-                now
-            } else {
-                cycle.cutoff_at
-            },
-        )
+        .cycle_inputs(scope, cycle_id, evidence_at)
         .await?;
     let has_distribution = formal.is_some()
         || channel_inputs
@@ -268,11 +314,6 @@ pub async fn reduce_cycle_report(
         sealed: true,
         expected_count: Some(manifest.expected_count),
     });
-    let evidence_at = if correction_of.is_some() {
-        now
-    } else {
-        cycle.cutoff_at
-    };
     // A formal frozen coverage cell can reuse a send from an earlier cycle.
     // Resolve its original intent binding, never equate its coverage-cell ID
     // with the original channel send target. Legacy target IDs already are
@@ -381,12 +422,12 @@ pub async fn reduce_cycle_report(
     } else {
         None
     };
-    let input = ReportReduceInput {
+    Ok(ReportReduceInput {
         project_id,
         cycle_id,
         report_window_start_at: cycle.report_window_start_at,
         report_window_end_at: cycle.report_window_end_at,
-        report_timezone: cycle.report_timezone,
+        report_timezone: cycle.report_timezone.clone(),
         cutoff_at: cycle.cutoff_at,
         input_temporal_provenance_verified: false,
         input_manifest_versions: cycle
@@ -433,11 +474,7 @@ pub async fn reduce_cycle_report(
             })
         }),
         measurement_targets: channel_inputs.measurements,
-    };
-    let snapshot = reduce_report(scope, &input, revision, correction_of, now)?;
-    let snapshot = state.report_repository().create(scope, snapshot).await?;
-    schedule_successor_after_report(state, scope, &snapshot, now).await;
-    Ok(snapshot)
+    })
 }
 
 async fn schedule_successor_after_report(
@@ -459,6 +496,34 @@ async fn schedule_successor_after_report(
     {
         tracing::warn!(code = ?error.code, "report successor not scheduled");
     }
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/cycles/{id}/report-preview",
+    security(("sessionCookie" = [])),
+    params(("id" = Uuid, Path), ("project_id" = ProjectId, Query)),
+    responses(
+        (status = 200, body = ReportPreview, description = "Ephemeral, uncached projection; never an official report"),
+        (status = 404, body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_report_preview(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ReportProjectQuery>,
+    Extension(tenant_scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<(HeaderMap, Json<ReportPreview>), ApiError> {
+    let now = Utc::now();
+    let scope = project_scope(&state, &tenant_scope, query.project_id)
+        .await
+        .map_err(|e| api_error(e, context.request_id))?;
+    let preview = preview_cycle_report(&state, &scope, id, now)
+        .await
+        .map_err(|e| api_error(e, context.request_id))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((headers, Json(preview)))
 }
 
 #[utoipa::path(

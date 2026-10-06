@@ -7,7 +7,7 @@ use axum::{
 use chrono::{Duration, Utc};
 use geo_api::{
     AppState, CSRF_HEADER, EventBus, MemoryIdempotencyStore, MemoryOperationStore,
-    RepositoryHostOps, reduce_cycle_report, router,
+    RepositoryHostOps, preview_cycle_report, reduce_cycle_report, router,
 };
 use geo_domain::{
     AppError, ChannelPlan, ChannelTarget, ChannelTargetInput, ContentBlock, ContentBlockKind,
@@ -1196,6 +1196,249 @@ async fn due_report_replays_immutable_snapshot_and_keeps_absent_sources_unavaila
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn preview_preserves_frozen_window_and_never_persists_or_advances_cycle() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let cycle = state
+        .project_repository()
+        .get_report_cycle(&scope, project_id, cycle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (distribution, manifest_id) = freeze_formal_coverage(&state, &scope, cycle_id).await;
+    let page = distribution
+        .expansion_page(&scope, manifest_id, 0, 4)
+        .await
+        .unwrap();
+    distribution
+        .commit_expansion_page(&scope, manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let before = state
+        .project_repository()
+        .get_current_cycle(&scope, project_id)
+        .await
+        .unwrap();
+    let early = cutoff - Duration::seconds(1);
+    for _ in 0..2 {
+        let preview = preview_cycle_report(&state, &scope, cycle_id, early)
+            .await
+            .unwrap();
+        let serialized = serde_json::to_value(preview).unwrap();
+        assert_eq!(serialized["kind"], "preview");
+        assert_eq!(serialized["generated_at"], json!(early));
+        assert_eq!(serialized["evidence_as_of"], json!(early));
+        assert_eq!(
+            serialized["report_window_start_at"],
+            json!(cycle.report_window_start_at)
+        );
+        assert_eq!(
+            serialized["report_window_end_at"],
+            json!(cycle.report_window_end_at)
+        );
+        assert_eq!(serialized["cutoff_at"], json!(cutoff));
+        assert_eq!(serialized["publications"]["expected_count"], 6);
+        assert_eq!(serialized["publications"]["observed_count"], 4);
+        assert!(serialized.get("report_id").is_none());
+        assert!(serialized.get("revision").is_none());
+        assert!(serialized.get("correction_of").is_none());
+    }
+    assert!(
+        state
+            .report_repository()
+            .list(&scope, project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        state
+            .project_repository()
+            .get_current_cycle(&scope, project_id)
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        reduce_cycle_report(&state, &scope, cycle_id, None, early)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotReady
+    );
+}
+
+#[tokio::test]
+async fn preview_at_or_after_cutoff_excludes_late_asset_observations() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    create_legacy_measurement_and_publication(&state, &scope, cycle_id).await;
+    let plan = state
+        .channel_job_repository()
+        .get_plan(&scope, cycle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let target = &plan.targets[0];
+    let row = report_lookup_row(
+        target.target_id,
+        target.input.account_id(),
+        cutoff + Duration::seconds(1),
+    );
+    let state = state.with_publication_lookup_repository(Arc::new(ReportLookup {
+        scope: scope.clone(),
+        row,
+        invalid_newer: false,
+    }));
+    let preview = preview_cycle_report(&state, &scope, cycle_id, cutoff + Duration::days(1))
+        .await
+        .unwrap();
+    assert_eq!(preview.evidence_as_of, cutoff);
+    assert_eq!(preview.generated_at, cutoff + Duration::days(1));
+    assert_eq!(preview.publications.expected_count, Some(1));
+    assert_eq!(preview.measurements.expected_count, Some(1));
+    assert!(
+        !preview
+            .findings
+            .iter()
+            .any(|f| f.kind == "publication_asset_observed")
+    );
+    assert!(
+        preview
+            .evidence
+            .iter()
+            .all(|e| e.kind != "publication_lookup_asset_observed")
+    );
+    assert!(
+        state
+            .report_repository()
+            .list(&scope, project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn viewer_can_preview_before_cutoff_without_creating_report_or_successor() {
+    let (state, auth, project_id, cycle_id, cutoff) = fixture().await;
+    assert!(Utc::now() < cutoff, "fixture must have a future cutoff");
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let viewer = User::new(
+        Uuid::new_v4().into(),
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        "preview-viewer@localhost",
+        "Viewer",
+        "viewer-password",
+    )
+    .unwrap();
+    auth.insert_user(viewer.clone()).await.unwrap();
+    auth.insert_membership(Membership::new(
+        viewer.id,
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Role::CustomerReadOnly,
+    ))
+    .await
+    .unwrap();
+    let app = router(state.clone());
+    let (cookie, csrf) = login(&app, "preview-viewer@localhost", "viewer-password").await;
+    let uri = format!(
+        "/api/v1/cycles/{cycle_id}/report-preview?tenant_id={DEVELOPMENT_TENANT_ID}&project_id={project_id}"
+    );
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(request("GET", &uri, &cookie, None, ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 128 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["kind"], "preview");
+        assert_eq!(body["cycle_id"], cycle_id.to_string());
+        assert!(body.get("report_id").is_none());
+        assert!(body.get("revision").is_none());
+        assert!(body.get("correction_of").is_none());
+    }
+    assert!(
+        state
+            .report_repository()
+            .list(&scope, project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        state
+            .project_repository()
+            .get_current_cycle(&scope, project_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cycle_id,
+        cycle_id
+    );
+    let forbidden = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!(
+                "/api/v1/cycles/{cycle_id}/reductions?tenant_id={DEVELOPMENT_TENANT_ID}&project_id={project_id}"
+            ),
+            &cookie,
+            Some(&csrf),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    let cross_project = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!(
+                "/api/v1/cycles/{cycle_id}/report-preview?tenant_id={DEVELOPMENT_TENANT_ID}&project_id={}",
+                Uuid::new_v4()
+            ),
+            &cookie,
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_project.status(), StatusCode::NOT_FOUND);
+    let cross_cycle = app
+        .oneshot(request(
+            "GET",
+            &format!(
+                "/api/v1/cycles/{}/report-preview?tenant_id={DEVELOPMENT_TENANT_ID}&project_id={project_id}",
+                Uuid::new_v4()
+            ),
+            &cookie,
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_cycle.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

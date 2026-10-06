@@ -177,6 +177,62 @@ pub struct ReportSnapshot {
     pub evidence: Vec<ReportEvidenceReference>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportPreviewKind {
+    Preview,
+}
+
+/// An ephemeral read-only projection. It cannot be stored as an official
+/// snapshot or referenced as a correction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReportPreview {
+    pub kind: ReportPreviewKind,
+    pub project_id: ProjectId,
+    pub cycle_id: Uuid,
+    pub report_window_start_at: DateTime<Utc>,
+    pub report_window_end_at: DateTime<Utc>,
+    pub report_timezone: String,
+    pub cutoff_at: DateTime<Utc>,
+    pub evidence_as_of: DateTime<Utc>,
+    pub generated_at: DateTime<Utc>,
+    pub reducer_version: String,
+    pub input_hash: String,
+    pub status: ReportStatus,
+    pub input_manifest_versions: Vec<ReportManifestRef>,
+    pub documents: ReportCoverage,
+    pub publications: ReportCoverage,
+    pub measurements: ReportCoverage,
+    pub publication_groups: Vec<ReportPublicationGroup>,
+    pub measurement_groups: Vec<ReportMeasurementGroup>,
+    pub findings: Vec<ReportFinding>,
+    pub evidence: Vec<ReportEvidenceReference>,
+}
+
+struct ReportProjection {
+    finding_namespace: Uuid,
+    evidence_as_of: DateTime<Utc>,
+    input_hash: String,
+    status: ReportStatus,
+    input_manifest_versions: Vec<ReportManifestRef>,
+    documents: ReportCoverage,
+    publications: ReportCoverage,
+    measurements: ReportCoverage,
+    publication_groups: Vec<ReportPublicationGroup>,
+    measurement_groups: Vec<ReportMeasurementGroup>,
+    findings: Vec<ReportFinding>,
+    evidence: Vec<ReportEvidenceReference>,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionMode {
+    Official {
+        revision: u32,
+        correction_of: Option<Uuid>,
+    },
+    Preview,
+}
+
 #[async_trait]
 pub trait ReportRepository: Send + Sync {
     async fn create(
@@ -383,6 +439,79 @@ pub fn reduce_report(
     correction_of: Option<Uuid>,
     now: DateTime<Utc>,
 ) -> Result<ReportSnapshot, AppError> {
+    let projection = project_report(
+        scope,
+        input,
+        now,
+        ProjectionMode::Official {
+            revision,
+            correction_of,
+        },
+    )?;
+    Ok(ReportSnapshot {
+        report_id: projection.finding_namespace,
+        project_id: input.project_id,
+        cycle_id: input.cycle_id,
+        revision,
+        correction_of,
+        report_window_start_at: input.report_window_start_at,
+        report_window_end_at: input.report_window_end_at,
+        report_timezone: input.report_timezone.clone(),
+        cutoff_at: input.cutoff_at,
+        evidence_as_of: projection.evidence_as_of,
+        generated_at: now,
+        reducer_version: REPORT_REDUCER_VERSION.to_owned(),
+        input_hash: projection.input_hash,
+        status: projection.status,
+        input_manifest_versions: projection.input_manifest_versions,
+        documents: projection.documents,
+        publications: projection.publications,
+        measurements: projection.measurements,
+        publication_groups: projection.publication_groups,
+        measurement_groups: projection.measurement_groups,
+        findings: projection.findings,
+        evidence: projection.evidence,
+    })
+}
+
+/// Project the frozen full-window denominators against evidence known by now.
+/// No report identity or revision is allocated, and this is never persisted.
+pub fn preview_report(
+    scope: &TenantScope,
+    input: &ReportReduceInput,
+    now: DateTime<Utc>,
+) -> Result<ReportPreview, AppError> {
+    let projection = project_report(scope, input, now, ProjectionMode::Preview)?;
+    Ok(ReportPreview {
+        kind: ReportPreviewKind::Preview,
+        project_id: input.project_id,
+        cycle_id: input.cycle_id,
+        report_window_start_at: input.report_window_start_at,
+        report_window_end_at: input.report_window_end_at,
+        report_timezone: input.report_timezone.clone(),
+        cutoff_at: input.cutoff_at,
+        evidence_as_of: projection.evidence_as_of,
+        generated_at: now,
+        reducer_version: REPORT_REDUCER_VERSION.to_owned(),
+        input_hash: projection.input_hash,
+        status: projection.status,
+        input_manifest_versions: projection.input_manifest_versions,
+        documents: projection.documents,
+        publications: projection.publications,
+        measurements: projection.measurements,
+        publication_groups: projection.publication_groups,
+        measurement_groups: projection.measurement_groups,
+        findings: projection.findings,
+        evidence: projection.evidence,
+    })
+}
+
+fn project_report(
+    scope: &TenantScope,
+    input: &ReportReduceInput,
+    now: DateTime<Utc>,
+    mode: ProjectionMode,
+) -> Result<ReportProjection, AppError> {
     if scope.project_id != Some(input.project_id) {
         return Err(AppError::forbidden(
             "report project is outside tenant scope",
@@ -390,8 +519,14 @@ pub fn reduce_report(
     }
     if input.report_window_start_at >= input.report_window_end_at
         || input.cutoff_at < input.report_window_end_at
-        || revision == 0
-        || (revision == 1) != correction_of.is_none()
+        || matches!(mode, ProjectionMode::Official { revision: 0, .. })
+        || matches!(
+            mode,
+            ProjectionMode::Official {
+                revision,
+                correction_of
+            } if (revision == 1) != correction_of.is_none()
+        )
         || input.report_timezone.trim().is_empty()
     {
         return Err(error("invalid report window, timezone or revision"));
@@ -470,24 +605,31 @@ pub fn reduce_report(
     let input_bytes = serde_json::to_vec(&canonical)
         .map_err(|_| AppError::new(ErrorCode::Internal, "report input cannot be serialized"))?;
     let input_hash = hex::encode(Sha256::digest(input_bytes));
-    let key = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        scope.operator_id,
-        scope.tenant_id,
-        input.project_id,
-        input.cycle_id,
-        input.report_window_start_at,
-        input.report_window_end_at,
-        input.cutoff_at,
-        serde_json::to_string(&canonical.input_manifest_versions).unwrap_or_default(),
-        REPORT_REDUCER_VERSION,
-        revision,
-    );
-    let report_id = stable_uuid(&key);
-    let evidence_as_of = if correction_of.is_some() {
-        now
-    } else {
-        std::cmp::min(now, input.cutoff_at)
+    let evidence_as_of = match mode {
+        ProjectionMode::Official {
+            correction_of: Some(_),
+            ..
+        } => now,
+        _ => std::cmp::min(now, input.cutoff_at),
+    };
+    let finding_namespace = match mode {
+        ProjectionMode::Official { revision, .. } => stable_uuid(&format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            scope.operator_id,
+            scope.tenant_id,
+            input.project_id,
+            input.cycle_id,
+            input.report_window_start_at,
+            input.report_window_end_at,
+            input.cutoff_at,
+            serde_json::to_string(&canonical.input_manifest_versions).unwrap_or_default(),
+            REPORT_REDUCER_VERSION,
+            revision,
+        )),
+        ProjectionMode::Preview => stable_uuid(&format!(
+            "report-preview-v1:{}:{}:{}:{}:{}",
+            scope.operator_id, scope.tenant_id, input.project_id, input.cycle_id, evidence_as_of,
+        )),
     };
     let mut findings = Vec::new();
     let mut evidence_map = BTreeMap::<Uuid, ReportEvidenceReference>::new();
@@ -538,7 +680,7 @@ pub fn reduce_report(
                 if status != "not_applicable" {
                     findings.push(ReportFinding {
                         finding_id: stable_uuid(&format!(
-                            "{report_id}:document:{}",
+                            "{finding_namespace}:document:{}",
                             item.document_manifest_item_id
                         )),
                         kind: format!("document_{status}"),
@@ -630,7 +772,7 @@ pub fn reduce_report(
                 if !lookup_evidence.is_empty() {
                     findings.push(ReportFinding {
                         finding_id: stable_uuid(&format!(
-                            "{report_id}:publication:asset_observed:{}",
+                            "{finding_namespace}:publication:asset_observed:{}",
                             target.target_id
                         )),
                         kind: "publication_asset_observed".to_owned(),
@@ -658,7 +800,7 @@ pub fn reduce_report(
                     "unknown" | "failed" | "blocked" | "deferred" | "cancelled" | "pending"
                 ) {
                     findings.push(ReportFinding {
-                        finding_id: stable_uuid(&format!("{report_id}:publication:{}", target.target_id)),
+                        finding_id: stable_uuid(&format!("{finding_namespace}:publication:{}", target.target_id)),
                         kind: format!("publication_{status}"),
                         summary: format!("Publication target remains {status}; no public verification is inferred."),
                         evidence_ids: std::iter::once(target.target_id)
@@ -746,7 +888,7 @@ pub fn reduce_report(
                 )?;
                 if matches!(status, "missing" | "pending" | "refused") {
                     findings.push(ReportFinding {
-                        finding_id: stable_uuid(&format!("{report_id}:measurement:{}", target.target_id)),
+                        finding_id: stable_uuid(&format!("{finding_namespace}:measurement:{}", target.target_id)),
                         kind: format!("measurement_{status}"),
                         summary: format!("Independent measurement sample is {status}; missing is not counted as not-mentioned."),
                         evidence_ids: std::iter::once(target.target_id)
@@ -787,9 +929,12 @@ pub fn reduce_report(
     };
     if canonical.document_manifest.is_some() && !input.input_temporal_provenance_verified {
         findings.push(ReportFinding {
-            finding_id: stable_uuid(&format!("{report_id}:temporal_provenance")),
+            finding_id: stable_uuid(&format!("{finding_namespace}:temporal_provenance")),
             kind: "temporal_provenance_unavailable".to_owned(),
-            summary: "Current document manifest state is visible, but its state at the report cutoff cannot be verified.".to_owned(),
+            summary: match mode {
+                ProjectionMode::Preview => "Current document manifest state is visible, but its state at the preview evidence time cannot be verified.".to_owned(),
+                ProjectionMode::Official { .. } => "Current document manifest state is visible, but its state at the report cutoff cannot be verified.".to_owned(),
+            },
             evidence_ids: canonical.document_manifest.as_ref().map(|docs| docs.items.iter().map(|item| item.document_manifest_item_id).collect()).unwrap_or_default(),
             insufficient_reason: Some("The source has no recorded seal or item transition timestamps.".to_owned()),
         });
@@ -810,7 +955,7 @@ pub fn reduce_report(
         && !measurements.counts.contains_key("missing")
         && !measurements.counts.contains_key("pending")
         && !measurements.counts.contains_key("refused");
-    if now < input.cutoff_at && !complete {
+    if matches!(mode, ProjectionMode::Official { .. }) && now < input.cutoff_at && !complete {
         return Err(AppError::new(
             ErrorCode::NotReady,
             "report inputs remain incomplete before cutoff",
@@ -818,10 +963,18 @@ pub fn reduce_report(
     }
     if !complete {
         findings.push(ReportFinding {
-            finding_id: stable_uuid(&format!("{report_id}:coverage_gap")),
+            finding_id: stable_uuid(&format!("{finding_namespace}:coverage_gap")),
             kind: "coverage_gap".to_owned(),
-            summary: "Planned inputs are incomplete or unavailable at the reporting cutoff."
-                .to_owned(),
+            summary: match mode {
+                ProjectionMode::Preview => {
+                    "Planned inputs are incomplete or unavailable at the preview evidence time."
+                        .to_owned()
+                }
+                ProjectionMode::Official { .. } => {
+                    "Planned inputs are incomplete or unavailable at the reporting cutoff."
+                        .to_owned()
+                }
+            },
             evidence_ids: Vec::new(),
             insufficient_reason: Some(
                 "No unsupported effectiveness or trend inference is made from incomplete inputs."
@@ -829,19 +982,9 @@ pub fn reduce_report(
             ),
         });
     }
-    Ok(ReportSnapshot {
-        report_id,
-        project_id: input.project_id,
-        cycle_id: input.cycle_id,
-        revision,
-        correction_of,
-        report_window_start_at: input.report_window_start_at,
-        report_window_end_at: input.report_window_end_at,
-        report_timezone: input.report_timezone.clone(),
-        cutoff_at: input.cutoff_at,
+    Ok(ReportProjection {
+        finding_namespace,
         evidence_as_of,
-        generated_at: now,
-        reducer_version: REPORT_REDUCER_VERSION.to_owned(),
         input_hash,
         status: if complete {
             ReportStatus::Complete
@@ -1019,6 +1162,119 @@ mod tests {
             received_at: Some(instant(26)),
             summary: "Recorded external observation".to_owned(),
         }
+    }
+
+    #[test]
+    fn preview_before_cutoff_keeps_full_window_and_does_not_create_snapshot_identity() {
+        let (scope, mut input) = setup();
+        input.input_manifest_versions.push(ReportManifestRef {
+            kind: ReportManifestKind::Measurement,
+            manifest_id: Uuid::new_v4(),
+            revision: 1,
+            sealed: true,
+            expected_count: Some(3),
+        });
+        let observed_id = Uuid::new_v4();
+        let future_id = Uuid::new_v4();
+        input.measurement_targets = Some(vec![
+            ReportMeasurementTarget {
+                target_id: observed_id,
+                comparison_key: "api/protocol".to_owned(),
+                scheduled_at: instant(25),
+                status: ReportMeasurementStatus::Observed,
+                missing_reason: None,
+                evidence: vec![evidence("observation", observed_id)],
+            },
+            ReportMeasurementTarget {
+                target_id: future_id,
+                comparison_key: "api/protocol".to_owned(),
+                scheduled_at: instant(27),
+                status: ReportMeasurementStatus::Pending,
+                missing_reason: None,
+                evidence: vec![],
+            },
+        ]);
+        let preview = preview_report(&scope, &input, instant(26)).unwrap();
+        assert_eq!(preview.kind, ReportPreviewKind::Preview);
+        assert_eq!(preview.generated_at, instant(26));
+        assert_eq!(preview.evidence_as_of, instant(26));
+        assert_eq!(preview.report_window_end_at, instant(27));
+        assert_eq!(preview.measurements.expected_count, Some(3));
+        assert_eq!(preview.measurements.observed_count, 2);
+        assert_eq!(preview.measurements.counts["observed"], 1);
+        assert_eq!(preview.measurements.counts["pending"], 1);
+        assert_eq!(preview.measurements.counts["unmaterialized"], 1);
+        assert_eq!(preview.status, ReportStatus::Partial);
+        let json = serde_json::to_value(&preview).unwrap();
+        assert_eq!(json["kind"], "preview");
+        for identity in ["report_id", "revision", "correction_of"] {
+            assert!(json.get(identity).is_none(), "unexpected {identity}");
+        }
+        assert!(preview.findings.iter().any(|finding| {
+            finding.kind == "coverage_gap" && finding.summary.contains("preview evidence time")
+        }));
+        assert!(preview.findings.iter().any(|finding| {
+            finding.kind == "temporal_provenance_unavailable"
+                && finding.summary.contains("preview evidence time")
+        }));
+        let official = reduce_report(&scope, &input, 1, None, instant(26)).unwrap_err();
+        assert_eq!(official.code, ErrorCode::NotReady);
+        let replay = preview_report(&scope, &input, instant(26)).unwrap();
+        assert_eq!(preview, replay);
+    }
+
+    #[test]
+    fn preview_clamps_evidence_after_cutoff_without_treating_missing_as_not_mentioned() {
+        let (scope, mut input) = setup();
+        let distribution = input
+            .input_manifest_versions
+            .iter_mut()
+            .find(|reference| reference.kind == ReportManifestKind::Distribution)
+            .unwrap();
+        distribution.sealed = true;
+        distribution.expected_count = Some(1);
+        input.input_manifest_versions.push(ReportManifestRef {
+            kind: ReportManifestKind::Measurement,
+            manifest_id: Uuid::new_v4(),
+            revision: 1,
+            sealed: true,
+            expected_count: Some(1),
+        });
+        let publication_id = Uuid::new_v4();
+        input.publication_targets = Some(vec![ReportPublicationTarget {
+            target_id: publication_id,
+            platform_id: "platform".to_owned(),
+            status: ReportPublicationStatus::Unknown,
+            reason: None,
+            evidence: vec![],
+        }]);
+        let sample_id = Uuid::new_v4();
+        let mut late = evidence("observation", sample_id);
+        late.received_at = Some(instant(29));
+        input.measurement_targets = Some(vec![ReportMeasurementTarget {
+            target_id: sample_id,
+            comparison_key: "api/protocol".to_owned(),
+            scheduled_at: instant(25),
+            status: ReportMeasurementStatus::NotMentioned,
+            missing_reason: None,
+            evidence: vec![late.clone()],
+        }]);
+        let preview = preview_report(&scope, &input, instant(30)).unwrap();
+        assert_eq!(preview.generated_at, instant(30));
+        assert_eq!(preview.evidence_as_of, input.cutoff_at);
+        assert_eq!(preview.publications.counts["unknown"], 1);
+        assert_eq!(preview.measurements.counts["missing"], 1);
+        assert!(!preview.measurements.counts.contains_key("not_mentioned"));
+        assert!(!preview.evidence.contains(&late));
+        let official = reduce_report(&scope, &input, 1, None, instant(30)).unwrap();
+        assert_eq!(official.measurements, preview.measurements);
+        assert_ne!(
+            official.findings[0].finding_id,
+            preview.findings[0].finding_id
+        );
+        let corrected =
+            reduce_report(&scope, &input, 2, Some(official.report_id), instant(30)).unwrap();
+        assert_eq!(corrected.measurements.counts["not_mentioned"], 1);
     }
 
     #[test]

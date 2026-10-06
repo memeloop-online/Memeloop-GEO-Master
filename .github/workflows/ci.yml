@@ -159,6 +159,17 @@ jobs:
           test "$ready" -eq 1
           cargo test -p geo-api --test pdf_parse -- --ignored 2>&1 | tee logs/cargo-pdf-parser-live.log
 
+      - name: Test real local UI with synthetic knowledge and report preview
+        env:
+          GEO_SMOKE_APP_BINARY: ${{ github.workspace }}/target/debug/geo-app
+          GEO_SMOKE_OUTPUT_DIR: ${{ runner.temp }}/geo-web-smoke
+          GEO_SMOKE_TMP_DIR: ${{ runner.temp }}/geo-web-smoke-tmp
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p geo-app 2>&1 | tee logs/cargo-web-smoke-build.log
+          node scripts/verify-web-smoke.mjs 2>&1 | tee logs/web-smoke.log
+
       - name: Write 5-minute milestone summary
         if: always()
         shell: bash
@@ -197,6 +208,14 @@ jobs:
           name: document-parser-java21-${{ github.sha }}
           if-no-files-found: error
           path: services/document-parser/target/document-parser-1.0.0.jar
+
+      - name: Upload synthetic UI acceptance screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-smoke-synthetic-${{ github.sha }}
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/geo-web-smoke/
 
   windows-msvc:
     name: Windows MSVC Rust/V8 (5-minute milestone)

@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use geo_domain::{
     AttachmentId, AttachmentReference, ChunkLocator, ImportStatus, KnowledgeEvidence,
-    KnowledgeImportProgress, KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope,
+    KnowledgeImportProgress, KnowledgeSearchRequest, KnowledgeSearchResult, ReportPreview,
+    TenantScope,
 };
 use geo_worker::{
     HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
@@ -22,8 +23,8 @@ use geo_worker::{
     KnowledgeImportAttachmentResultItem, KnowledgeImportAttachmentsRequest,
     KnowledgeImportAttachmentsResult, KnowledgeImportStatusRequest, ManifestItem, ManifestPage,
     ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest, PublishState, ToolCallIdentity, ToolCallOutcome,
-    ToolCallRecorder,
+    PublishReceipt, PublishRequest, PublishState, ReportPreviewRequest, ToolCallIdentity,
+    ToolCallOutcome, ToolCallRecorder,
 };
 use serde_json::Value;
 
@@ -48,6 +49,7 @@ struct Behaviour {
     /// isolate boundary redacts what a bridge hands it.
     failure_message: Option<String>,
     import_status: Option<KnowledgeImportProgress>,
+    preview_response: Option<ReportPreview>,
 }
 
 /// Records what the bridge was asked for and answers from `behaviour`.
@@ -106,6 +108,19 @@ impl FakeHostOps {
 
 #[async_trait]
 impl HostOps for FakeHostOps {
+    async fn report_preview(
+        &self,
+        scope: &TenantScope,
+        _request: ReportPreviewRequest,
+    ) -> Result<ReportPreview, HostOpError> {
+        match self.behaviour.preview_response.clone() {
+            Some(value) => self.answer(HostOp::ReportPreview, scope, value).await,
+            None => Err(HostOpError::capability_missing(
+                HostOp::ReportPreview,
+                "preview unavailable",
+            )),
+        }
+    }
     async fn knowledge_import_status(
         &self,
         scope: &TenantScope,
@@ -1127,6 +1142,13 @@ async fn report_ops_without_an_adapter_fail_closed_after_scope_validation() {
         await attempt("read", () => hostOps.reportGet({
           report_id: "00000000-0000-4000-8000-000000000001",
         }));
+        await attempt("preview", () => hostOps.reportPreview({}));
+        await attempt("preview-invalid", () => hostOps.reportPreview({
+          cycle_id: "00000000-0000-0000-0000-000000000000",
+        }));
+        await attempt("preview-foreign", () => hostOps.reportPreview({
+          project_id: "00000000-0000-4000-8000-000000000002",
+        }));
         await attempt("reduce", () => hostOps.reportReduce({
           cycle_id: "00000000-0000-4000-8000-000000000002",
         }));
@@ -1146,6 +1168,21 @@ async fn report_ops_without_an_adapter_fail_closed_after_scope_validation() {
         "report_get",
     );
     assert_typed_error(
+        &outcome(&runtime.host_state(), "preview"),
+        "capability_missing",
+        "report_preview",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "preview-invalid"),
+        "invalid_request",
+        "report_preview",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "preview-foreign"),
+        "invalid_request",
+        "report_preview",
+    );
+    assert_typed_error(
         &outcome(&runtime.host_state(), "reduce"),
         "capability_missing",
         "report_reduce",
@@ -1156,6 +1193,115 @@ async fn report_ops_without_an_adapter_fail_closed_after_scope_validation() {
         "report_reduce",
     );
     assert!(ops.seen().is_empty());
+}
+
+fn preview_fixture(project_id: geo_domain::ProjectId, cycle_id: uuid::Uuid) -> ReportPreview {
+    let unavailable = serde_json::json!({
+        "availability": "unavailable", "expected_count": null,
+        "observed_count": 0, "counts": {}, "reason": "no frozen source"
+    });
+    serde_json::from_value(serde_json::json!({
+        "kind": "preview",
+        "project_id": project_id,
+        "cycle_id": cycle_id,
+        "report_window_start_at": "2026-09-01T00:00:00Z",
+        "report_window_end_at": "2026-09-08T00:00:00Z",
+        "report_timezone": "UTC",
+        "cutoff_at": "2026-09-08T00:00:00Z",
+        "evidence_as_of": "2026-09-07T00:00:00Z",
+        "generated_at": "2026-09-07T00:00:00Z",
+        "reducer_version": "test",
+        "input_hash": "test-hash",
+        "status": "partial",
+        "input_manifest_versions": [],
+        "documents": unavailable,
+        "publications": unavailable,
+        "measurements": unavailable,
+        "publication_groups": [],
+        "measurement_groups": [],
+        "findings": [],
+        "evidence": []
+    }))
+    .expect("preview fixture must match domain DTO")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preview_rejects_foreign_project_and_cycle_before_recording_success() {
+    struct Outcomes(Arc<Mutex<Vec<ToolCallOutcome>>>);
+    #[async_trait]
+    impl ToolCallRecorder for Outcomes {
+        async fn begin(&self, _: &ToolCallIdentity) -> Result<bool, HostOpError> {
+            Ok(true)
+        }
+        async fn attempt(&self, _: &ToolCallIdentity) -> Result<bool, HostOpError> {
+            Ok(true)
+        }
+        async fn finish(
+            &self,
+            _: &ToolCallIdentity,
+            outcome: ToolCallOutcome,
+        ) -> Result<(), HostOpError> {
+            self.0.lock().unwrap().push(outcome);
+            Ok(())
+        }
+    }
+    let scoped = scope();
+    let other_cycle = uuid::Uuid::new_v4();
+    let foreign_project = uuid::Uuid::new_v4().into();
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let script = r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("preview", () => hostOps.reportPreview({
+          cycle_id: "00000000-0000-4000-8000-000000000031",
+        }));
+    "#;
+    // Use the same explicit request on each run, so mismatched project and
+    // cycle responses are independently rejected by the recorded-return path.
+    let requested_cycle = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000031").unwrap();
+    for (project, response_cycle) in [
+        (foreign_project, requested_cycle),
+        (scoped.project_id.unwrap(), other_cycle),
+        (scoped.project_id.unwrap(), requested_cycle),
+    ] {
+        let ops = Arc::new(FakeHostOps::with(Behaviour {
+            preview_response: Some(preview_fixture(project, response_cycle)),
+            ..Behaviour::default()
+        }));
+        let bridge = HostBridge::new(ops, scoped.clone(), tokio::runtime::Handle::current())
+            .with_recorder(
+                geo_domain::RunId::from(uuid::Uuid::new_v4()),
+                Arc::new(Outcomes(Arc::clone(&results))),
+            );
+        let mut runtime = HostRuntime::new(
+            &[
+                ("memeloop://bundle/host-ops.js", geo_worker::HOST_OPS_JS),
+                (SCENARIO_MODULE, script),
+            ],
+            bridge,
+            None,
+        )
+        .unwrap();
+        runtime
+            .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+            .await
+            .unwrap();
+        let event = outcome(&runtime.host_state(), "preview");
+        if project != scoped.project_id.unwrap() || response_cycle != requested_cycle {
+            assert_typed_error(&event, "internal", "report_preview");
+        } else {
+            let preview = assert_success(&event);
+            assert_eq!(preview["kind"], "preview");
+            assert!(preview.get("report_id").is_none());
+        }
+    }
+    assert_eq!(
+        *results.lock().unwrap(),
+        vec![
+            ToolCallOutcome::Failed,
+            ToolCallOutcome::Failed,
+            ToolCallOutcome::Succeeded
+        ],
+    );
 }
 
 /// A request that is well-shaped but out of the declared range is refused the

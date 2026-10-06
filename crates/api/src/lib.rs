@@ -103,7 +103,7 @@ pub use provider_bridge::{
     ModelProviderBridge, ProviderClientBridge, ProviderRoute, ProviderRouteResolver,
     RoutedProviderClientBridge, SharedModelProvider,
 };
-pub use reports::reduce_cycle_report;
+pub use reports::{preview_cycle_report, reduce_cycle_report};
 pub use storage::{EventBus, MemoryOperationStore, OperationStore, PgOperationStore};
 
 #[derive(Clone)]
@@ -1713,6 +1713,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         reports::list_reports,
         reports::get_report,
         reports::get_report_evidence,
+        reports::get_report_preview,
         reports::create_reduction,
         knowledge::capabilities,
         knowledge::create_upload_session,
@@ -1775,6 +1776,8 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         reports::ReportList,
         reports::ReportEvidenceList,
         geo_domain::ReportSnapshot,
+        geo_domain::ReportPreview,
+        geo_domain::ReportPreviewKind,
         geo_domain::ReportStatus,
         geo_domain::ReportAvailability,
         geo_domain::ReportCoverage,
@@ -1954,6 +1957,10 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}/reports", get(reports::list_reports))
         .route("/reports/{id}", get(reports::get_report))
         .route("/reports/{id}/evidence", get(reports::get_report_evidence))
+        .route(
+            "/cycles/{id}/report-preview",
+            get(reports::get_report_preview),
+        )
         .route("/cycles/{id}/reductions", post(reports::create_reduction))
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(auth_scope_from_request));

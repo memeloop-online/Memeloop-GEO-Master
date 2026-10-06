@@ -48,14 +48,14 @@ use geo_worker::{
     HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOps,
     HostRuntime, ManifestCoverage, ManifestItem, ManifestKind, ManifestPage, ManifestPlanningState,
     ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest, ReportGetRequest, ReportReduceRequest, TURN_COMPLETION_TOPIC,
-    ToolCallIdentity, ToolCallOutcome, ToolCallRecorder, WorkerError,
+    PublishReceipt, PublishRequest, ReportGetRequest, ReportPreviewRequest, ReportReduceRequest,
+    TURN_COMPLETION_TOPIC, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder, WorkerError,
 };
 use serde_json::{Value, json};
 
 use crate::channel_tools::ChannelToolService;
 use crate::provider_bridge::SharedModelProvider;
-use crate::{AppState, reduce_cycle_report};
+use crate::{AppState, preview_cycle_report, reduce_cycle_report};
 
 /// The bundle and capabilities one production runtime is assembled from.
 ///
@@ -662,6 +662,12 @@ trait ReportService: Send + Sync {
         scope: &TenantScope,
         request: ReportGetRequest,
     ) -> Result<ReportSnapshot, AppError>;
+    async fn preview(
+        &self,
+        scope: &TenantScope,
+        request: ReportPreviewRequest,
+        now: DateTime<Utc>,
+    ) -> Result<geo_domain::ReportPreview, AppError>;
     async fn reduce(
         &self,
         scope: &TenantScope,
@@ -690,6 +696,28 @@ impl ReportService for AppState {
                 .next()
                 .ok_or_else(|| AppError::not_found("no report exists for this project"))
         }
+    }
+
+    async fn preview(
+        &self,
+        scope: &TenantScope,
+        request: ReportPreviewRequest,
+        now: DateTime<Utc>,
+    ) -> Result<geo_domain::ReportPreview, AppError> {
+        let cycle_id = if let Some(id) = request.cycle_id {
+            id
+        } else {
+            let project_id = scope
+                .project_id
+                .ok_or_else(|| AppError::forbidden("project scope required"))?;
+            self.project_repository()
+                .get(scope, project_id)
+                .await?
+                .ok_or_else(|| AppError::not_found("project not found"))?
+                .current_cycle_id
+                .ok_or_else(|| AppError::not_found("current cycle not found"))?
+        };
+        preview_cycle_report(self, scope, cycle_id, now).await
     }
 
     async fn reduce(
@@ -1203,6 +1231,23 @@ impl HostOps for RepositoryHostOps {
             .get(scope, request)
             .await
             .map_err(|error| worker_error(HostOp::ReportGet, error))
+    }
+
+    async fn report_preview(
+        &self,
+        scope: &TenantScope,
+        request: ReportPreviewRequest,
+    ) -> Result<geo_domain::ReportPreview, HostOpError> {
+        let service = self.report_service.as_ref().ok_or_else(|| {
+            HostOpError::capability_missing(
+                HostOp::ReportPreview,
+                "report service is not configured",
+            )
+        })?;
+        service
+            .preview(scope, request, Utc::now())
+            .await
+            .map_err(|error| worker_error(HostOp::ReportPreview, error))
     }
 
     async fn report_reduce(

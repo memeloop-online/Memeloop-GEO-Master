@@ -1306,6 +1306,8 @@ input {
 .knowledge-table td b,
 .knowledge-table td small {
   display: block;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .knowledge-table td small {
   margin-top: 3px;
@@ -1351,6 +1353,18 @@ input {
   background: #fff;
   box-shadow: -8px 0 24px rgba(0, 0, 0, 0.14);
 }
+.knowledge-import-sidebar,
+.knowledge-import-sidebar .fui-MessageBar,
+.knowledge-import-sidebar .fui-Field {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.knowledge-import-sidebar .fui-Input,
+.knowledge-import-sidebar .fui-Select,
+.knowledge-import-sidebar .fui-Textarea {
+  min-width: 0;
+  max-width: 100%;
+}
 .knowledge-sidebar-heading {
   padding-bottom: 16px;
   border-bottom: 1px solid #e1e4e8;
@@ -1361,17 +1375,20 @@ input {
 }
 .knowledge-import-form {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   padding: 18px 0;
 }
 .knowledge-import-section {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
 .knowledge-inline-heading {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 12px;
   border: 1px dashed #9ba8b5;
@@ -1380,7 +1397,14 @@ input {
 }
 .knowledge-inline-heading div {
   display: grid;
+  min-width: 0;
   gap: 3px;
+}
+.knowledge-import-queue li span,
+.knowledge-import-results li span,
+.knowledge-import-results li small {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .knowledge-inline-heading small {
   color: #616161;
@@ -1747,6 +1771,9 @@ input {
   .source-detail-workbench,
   .knowledge-ask-layout {
     grid-template-columns: 1fr;
+  }
+  .knowledge-table {
+    min-width: 640px;
   }
   .knowledge-context,
   .source-impact-panel {

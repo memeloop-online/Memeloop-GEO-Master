@@ -1,0 +1,497 @@
+// Real local-memory API + real Vite + installed Chromium. No route interception,
+// external provider requests, account connections, or reusable credentials.
+// Set GEO_SMOKE_APP_BINARY and GEO_SMOKE_OUTPUT_DIR (outside the repository).
+// Optional: PLAYWRIGHT_BROWSERS_PATH, GEO_SMOKE_TMP_DIR; then run with Node.
+import { randomBytes, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { createServer } from "node:net";
+import { mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const webRoot = join(repository, "apps", "web");
+const apiUrl = "http://127.0.0.1:8080";
+const webUrl = "http://127.0.0.1:5173";
+const browserCache = process.env.PLAYWRIGHT_BROWSERS_PATH;
+const scratch = resolve(process.env.GEO_SMOKE_TMP_DIR ?? tmpdir());
+const binary = process.env.GEO_SMOKE_APP_BINARY;
+const outputRoot = process.env.GEO_SMOKE_OUTPUT_DIR;
+const requireBrowser = createRequire(
+  join(repository, "packages", "browser-runner", "package.json"),
+);
+const requireWeb = createRequire(join(webRoot, "package.json"));
+const processes = [];
+const visualIssues = [];
+let browser;
+let browserServer;
+let deadline;
+let screenshotsDirectory;
+let ephemeralPassword;
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function safeEnvironment(extra = {}) {
+  // An explicit allow-list prevents accidental passage of DB, model, proxy,
+  // channel, token-center, and other workstation credentials to either child.
+  const allowed = [
+    "PATH",
+    "Path",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+  ];
+  const result = Object.fromEntries(
+    allowed
+      .filter((key) => process.env[key] !== undefined)
+      .map((key) => [key, process.env[key]]),
+  );
+  return {
+    ...result,
+    TMP: scratch,
+    TEMP: scratch,
+    ...(browserCache ? { PLAYWRIGHT_BROWSERS_PATH: browserCache } : {}),
+    NO_PROXY: "127.0.0.1,localhost",
+    no_proxy: "127.0.0.1,localhost",
+    ...extra,
+  };
+}
+
+async function portIsFree(port) {
+  const server = createServer();
+  try {
+    await new Promise((accept, reject) => {
+      server.once("error", reject);
+      server.listen({ host: "127.0.0.1", port, exclusive: true }, accept);
+    });
+    return true;
+  } catch (error) {
+    if (error.code === "EADDRINUSE" || error.code === "EACCES") return false;
+    throw error;
+  } finally {
+    if (server.listening) {
+      await new Promise((accept) => server.close(accept));
+    }
+  }
+}
+
+function ownedChild(command, args, cwd, env) {
+  const child = spawn(command, args, {
+    cwd,
+    env,
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  child.once("error", (error) => {
+    child.launchError = error;
+  });
+  processes.push(child);
+  return child;
+}
+
+async function untilReady(url, child, label) {
+  const end = Date.now() + 25_000;
+  while (Date.now() < end) {
+    if (child.launchError) throw new Error(`${label} could not start`);
+    assert(child.exitCode === null && !child.killed, `${label} exited early`);
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(1500) });
+      if (response.ok) return;
+    } catch {
+      // Expected before the service starts listening.
+    }
+    await new Promise((accept) => setTimeout(accept, 350));
+  }
+  throw new Error(`${label} failed its local readiness check within 25s`);
+}
+
+async function stopOwnedChildren() {
+  for (const child of processes.reverse()) {
+    if (child.exitCode !== null || child.signalCode !== null) continue;
+    // Both commands are direct child processes, not shell trees. Never kill
+    // by executable name or by port: those may belong to another workspace.
+    child.kill("SIGTERM");
+    await Promise.race([
+      new Promise((accept) => child.once("exit", accept)),
+      new Promise((accept) => setTimeout(accept, 2500)),
+    ]);
+    if (child.exitCode === null && child.signalCode === null)
+      child.kill("SIGKILL");
+  }
+}
+
+async function screenshot(page, runDir, name, viewport) {
+  await page.setViewportSize(viewport);
+  await page.waitForTimeout(350); // allow responsive layout to settle
+  const overflow = await page.evaluate(() => ({
+    viewport: innerWidth,
+    document: document.documentElement.scrollWidth,
+    body: document.body.scrollWidth,
+    clippedRegions: [
+      ".page-content",
+      ".knowledge-import-sidebar",
+      ".knowledge-import-form",
+      ".knowledge-workbench",
+      ".source-detail-page",
+      ".channel-jobs-page",
+      ".channel-jobs-form",
+      ".reports-page",
+      ".report-preview",
+    ].flatMap((selector) =>
+      [...document.querySelectorAll(selector)].flatMap((element) => {
+        const style = getComputedStyle(element);
+        const bounds = element.getBoundingClientRect();
+        const clippedByWidth =
+          element.scrollWidth > element.clientWidth + 2 &&
+          !["auto", "scroll"].includes(style.overflowX);
+        const outsideViewport =
+          bounds.left < -2 || bounds.right > innerWidth + 2;
+        return clippedByWidth || outsideViewport
+          ? [
+              {
+                selector,
+                client: element.clientWidth,
+                content: element.scrollWidth,
+                left: Math.round(bounds.left),
+                right: Math.round(bounds.right),
+              },
+            ]
+          : [];
+      }),
+    ),
+  }));
+  const path = join(runDir, `${name}.png`);
+  await page.screenshot({ path, fullPage: true, animations: "disabled" });
+  assert(
+    overflow.document <= overflow.viewport + 1 &&
+      overflow.body <= overflow.viewport + 1,
+    `${name} has horizontal viewport overflow: ${JSON.stringify(overflow)}`,
+  );
+  if (overflow.clippedRegions.length) {
+    visualIssues.push(`${name}: ${JSON.stringify(overflow.clippedRegions)}`);
+    console.log(`${name}: screenshot captured; clipped UI regions detected`);
+  } else {
+    console.log(
+      `${name}: screenshot captured; no viewport overflow or clipped UI region`,
+    );
+  }
+}
+
+async function main() {
+  assert(
+    binary && outputRoot,
+    "Set GEO_SMOKE_APP_BINARY and GEO_SMOKE_OUTPUT_DIR",
+  );
+  assert(
+    await portIsFree(8080),
+    "Port 8080 is occupied; refusing to touch another service",
+  );
+  assert(
+    await portIsFree(5173),
+    "Port 5173 is occupied; refusing to touch another service",
+  );
+  const runDir = join(resolve(outputRoot), `run-${randomUUID()}`);
+  screenshotsDirectory = runDir;
+  await mkdir(scratch, { recursive: true });
+  await mkdir(runDir, { recursive: true });
+  const password = randomBytes(36).toString("base64url");
+  ephemeralPassword = password;
+  const api = ownedChild(
+    binary,
+    [],
+    repository,
+    safeEnvironment({
+      GEO_DEV_PASSWORD: password,
+      GEO_BIND_ADDR: "127.0.0.1:8080",
+    }),
+  );
+  await untilReady(`${apiUrl}/health/ready`, api, "Rust API");
+  const viteCli = join(
+    dirname(requireWeb.resolve("vite/package.json")),
+    "bin",
+    "vite.js",
+  );
+  const vite = ownedChild(
+    process.execPath,
+    [viteCli, "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
+    webRoot,
+    safeEnvironment(),
+  );
+  await untilReady(`${webUrl}/`, vite, "Vite");
+
+  if (browserCache) process.env.PLAYWRIGHT_BROWSERS_PATH = browserCache;
+  const { chromium } = requireBrowser("playwright");
+  browserServer = await chromium.launchServer({
+    headless: true,
+    timeout: 15_000,
+    env: safeEnvironment(),
+  });
+  browser = await chromium.connect(browserServer.wsEndpoint(), {
+    timeout: 15_000,
+  });
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    serviceWorkers: "block",
+  });
+  const page = await context.newPage();
+  page.setDefaultTimeout(14_000);
+  page.setDefaultNavigationTimeout(18_000);
+  const apiResponses = [];
+  const writes = [];
+  page.on("response", (response) => {
+    if (response.url().startsWith(`${webUrl}/api/v1/`)) {
+      apiResponses.push({
+        path: new URL(response.url()).pathname,
+        status: response.status(),
+      });
+    }
+  });
+  page.on("request", (request) => {
+    const { pathname } = new URL(request.url());
+    if (
+      request.url().startsWith(`${webUrl}/api/v1/`) &&
+      pathname.includes("/reports") &&
+      !["GET", "HEAD"].includes(request.method())
+    ) {
+      writes.push(request.method());
+    }
+  });
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto(`${webUrl}/login`);
+  await page.getByRole("textbox", { name: "用户名" }).fill("demo@localhost");
+  await page.getByRole("textbox", { name: "密码" }).fill(password);
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await page.getByRole("heading", { name: "选择客户工作区" }).waitFor();
+  assert(
+    apiResponses.some(
+      (response) =>
+        response.path.endsWith("/auth/login") && response.status === 200,
+    ),
+    "First-party browser login did not complete against Rust API",
+  );
+  console.log("First-party login: real local API accepted");
+
+  // A fresh in-memory service starts empty, so create and start via the UI.
+  await page.getByRole("button", { name: "创建项目" }).first().click();
+  await page.getByRole("textbox", { name: "品牌名称" }).fill("Synthetic Acme");
+  await page
+    .getByRole("textbox", { name: "初始资料（可选）" })
+    .fill("Synthetic Acme makes a fictional sample product for local testing.");
+  await page.getByRole("button", { name: "下一步" }).click();
+  await page.getByRole("heading", { name: "目标与市场" }).waitFor();
+  await page.getByRole("button", { name: "下一步" }).click();
+  await page.getByRole("heading", { name: "发布资源与预算" }).waitFor();
+  await page.getByRole("button", { name: "启动项目" }).click();
+  await page.waitForURL(/\/app\/[^/]+\/[^/]+\/chat$/);
+  const match = /^\/app\/([^/]+)\/([^/]+)\/chat$/.exec(
+    new URL(page.url()).pathname,
+  );
+  assert(match, "Project start did not reach its project route");
+  const [, tenantId, projectId] = match;
+  const base = `${webUrl}/app/${tenantId}/${projectId}`;
+  console.log("Synthetic project: created and started through browser UI");
+
+  await page.goto(`${base}/knowledge`);
+  await page
+    .getByRole("heading", { name: "企业知识库", exact: true })
+    .waitFor();
+  await screenshot(page, runDir, "p03-desktop-before-import", {
+    width: 1440,
+    height: 900,
+  });
+  await page.getByRole("button", { name: "导入资料", exact: true }).click();
+  const sidebar = page.getByRole("complementary", { name: "导入资料" });
+  await sidebar.locator('input[type="file"]').setInputFiles({
+    name: "synthetic-evidence.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from(
+      'product,price,note\r\nsample-A,0012,"plain sample"\r\nsample-B,"USD 20","quoted, cell"\r\n',
+      "utf8",
+    ),
+  });
+  await sidebar.getByRole("button", { name: "开始导入" }).click();
+  await sidebar.getByText("已受理 1 项，失败 0 项").waitFor();
+  const detailLink = sidebar.getByRole("link", { name: "查看处理详情" });
+  await detailLink.waitFor();
+  await screenshot(page, runDir, "p03-desktop-import", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "p03-narrow-import", {
+    width: 390,
+    height: 844,
+  });
+  await detailLink.click();
+  await page.getByRole("heading", { name: "synthetic-evidence.csv" }).waitFor();
+  await page
+    .getByText(/第 2–2 条逻辑记录/)
+    .first()
+    .waitFor();
+  await page.getByText("sample-A").first().waitFor();
+  await screenshot(page, runDir, "p04-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "p04-narrow", {
+    width: 390,
+    height: 844,
+  });
+  assert(
+    apiResponses.some(
+      (response) =>
+        response.path.includes("upload-sessions") && response.status < 300,
+    ),
+    "CSV upload did not reach the actual Rust API",
+  );
+  console.log("P04: actual CSV source and logical-record evidence visible");
+
+  await page.goto(`${base}/publications`);
+  await page.getByRole("heading", { name: "发布目标与执行记录" }).waitFor();
+  await page.getByText("网页账号登录只表示可尝试采样").waitFor();
+  await page.getByText("官方联网搜索适配器尚未实测验证").waitFor();
+  await page.getByText("还没有测量目标。").waitFor();
+  assert(
+    apiResponses.some(
+      (response) =>
+        response.path.endsWith("/cycles/current") && response.status === 200,
+    ),
+    "P12 did not read the active cycle from the actual Rust API",
+  );
+  await screenshot(page, runDir, "p12-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "p12-narrow", {
+    width: 390,
+    height: 844,
+  });
+
+  const previewResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes("/report-preview") && response.status() === 200,
+  );
+  await page.goto(`${base}/reports`);
+  const preview = await (await previewResponse).json();
+  assert(
+    preview.kind === "preview" &&
+      preview.project_id === projectId &&
+      !Object.hasOwn(preview, "report_id") &&
+      !Object.hasOwn(preview, "revision") &&
+      !Object.hasOwn(preview, "correction_of"),
+    "P14 response is not a distinct non-persisted preview projection",
+  );
+  const previewArea = page.getByRole("region", { name: "临时报告预览" });
+  await previewArea
+    .getByText("临时预览 · 未保存为正式周报", { exact: false })
+    .waitFor();
+  await page.getByRole("heading", { name: "尚无周报快照" }).waitFor();
+  assert(
+    (await previewArea.getByText("报告 ID", { exact: true }).count()) === 0 &&
+      (await previewArea
+        .getByRole("button", { name: "下载覆盖与证据 CSV" })
+        .count()) === 0,
+    "Temporary preview is being presented as an official saved report",
+  );
+  await screenshot(page, runDir, "p14-preview-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "p14-preview-narrow", {
+    width: 390,
+    height: 844,
+  });
+  const refreshedPreview = page.waitForResponse(
+    (response) =>
+      response.url().includes("/report-preview") && response.status() === 200,
+  );
+  await previewArea.getByRole("button", { name: "刷新预览" }).click();
+  const refreshed = await (await refreshedPreview).json();
+  assert(
+    refreshed.kind === "preview" && !Object.hasOwn(refreshed, "report_id"),
+    "Refreshed preview acquired a saved report identity",
+  );
+  await page.reload();
+  await page.getByRole("heading", { name: "尚无周报快照" }).waitFor();
+  assert(
+    writes.length === 0,
+    `Preview caused unexpected report API write: ${writes.join(", ")}`,
+  );
+  console.log(
+    "P14: distinct temporary preview; no saved report or report write",
+  );
+
+  assert(
+    errors.length === 0,
+    `Browser JavaScript errors: ${errors.join(" | ")}`,
+  );
+  if (visualIssues.length) {
+    for (const issue of visualIssues) console.error(`VISUAL ISSUE: ${issue}`);
+    throw new Error(
+      `${visualIssues.length} screenshot states contain clipped UI regions`,
+    );
+  }
+  console.log(
+    `PASS: synthetic in-memory browser smoke; screenshots: ${runDir}`,
+  );
+  console.log(
+    "Scope: local Rust API and UI only; no external publishing, AI, or account acceptance.",
+  );
+}
+
+try {
+  deadline = setTimeout(() => {
+    console.error("Smoke test exceeded its 180s deadline");
+    process.exitCode = 1;
+    for (const child of processes) {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+  }, 180_000);
+  await main();
+} catch (error) {
+  // Do not include child output, request bodies, tokens, or raw environment.
+  const message = error instanceof Error ? error.message : "unknown error";
+  console.error(
+    `FAIL: ${ephemeralPassword ? message.replaceAll(ephemeralPassword, "[redacted]") : message}`,
+  );
+  if (screenshotsDirectory)
+    console.error(`Screenshots: ${screenshotsDirectory}`);
+  process.exitCode = 1;
+} finally {
+  clearTimeout(deadline);
+  try {
+    if (browser) {
+      await Promise.race([
+        browser.close().catch(() => undefined),
+        new Promise((accept) => setTimeout(accept, 5_000)),
+      ]);
+    }
+    if (browserServer) {
+      await Promise.race([
+        browserServer.close().catch(() => undefined),
+        new Promise((accept) => setTimeout(accept, 5_000)),
+      ]);
+    }
+  } finally {
+    // BrowserServer.process() is the Playwright-owned Chromium process. Never
+    // terminate other browser instances discovered through a port/name.
+    const ownedBrowserProcess = browserServer?.process();
+    if (
+      ownedBrowserProcess?.exitCode === null &&
+      ownedBrowserProcess.signalCode === null
+    ) {
+      ownedBrowserProcess.kill("SIGTERM");
+    }
+    await stopOwnedChildren();
+  }
+}
