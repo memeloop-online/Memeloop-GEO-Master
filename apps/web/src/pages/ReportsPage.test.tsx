@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
-import { MemoryRouter } from "react-router-dom";
+import { Link, MemoryRouter } from "react-router-dom";
 import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
@@ -16,6 +16,9 @@ import {
   type ReportSnapshot,
 } from "../api/reports";
 import { reportSnapshotCsv } from "./reportsCsv";
+import { downloadReportPdf } from "./reportsPdf";
+
+vi.mock("./reportsPdf", () => ({ downloadReportPdf: vi.fn() }));
 
 const session = {
   user: { id: "user-1", login_name: "user@example.test", display_name: "User" },
@@ -190,13 +193,18 @@ function mockApi({
           detailStatus,
         ),
       );
+    if (url.pathname.endsWith("/reports/report-2"))
+      return Promise.resolve(response({ ...detail, report_id: "report-2" }));
     return Promise.resolve(response({ message: "not found" }, 404));
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
 
-function renderPage(path = "/app/tenant-1/project-1/reports") {
+function renderPage(
+  path = "/app/tenant-1/project-1/reports",
+  alternatePath?: string,
+) {
   return render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider
@@ -208,6 +216,7 @@ function renderPage(path = "/app/tenant-1/project-1/reports") {
       >
         <AuthProvider>
           <MemoryRouter initialEntries={[path]}>
+            {alternatePath && <Link to={alternatePath}>切换报告范围</Link>}
             <AppRoutes />
           </MemoryRouter>
         </AuthProvider>
@@ -217,6 +226,7 @@ function renderPage(path = "/app/tenant-1/project-1/reports") {
 }
 
 afterEach(() => {
+  vi.mocked(downloadReportPdf).mockReset();
   setCsrfToken(undefined);
   setUnauthorizedHandler(undefined);
   vi.unstubAllGlobals();
@@ -295,6 +305,12 @@ describe("P14 immutable reports", () => {
     expect(within(previewSection).queryByText("修订")).not.toBeInTheDocument();
     expect(
       within(previewSection).queryByRole("button", { name: /CSV/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(previewSection).queryByRole("button", { name: /PDF/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /PDF/ }),
     ).not.toBeInTheDocument();
     expect(await screen.findByText("尚无周报快照")).toBeInTheDocument();
     expect(
@@ -411,6 +427,95 @@ describe("P14 immutable reports", () => {
     expect(screen.getByText("文档覆盖与资料缺口")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
   });
+
+  it("downloads a saved snapshot using embedded evidence even when its separate evidence read fails", async () => {
+    mockApi({ evidenceStatus: 503 });
+    const user = userEvent.setup();
+    renderPage("/app/tenant-1/project-1/reports/report-1");
+    expect(await screen.findByText("无法读取证据明细")).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "下载覆盖与证据 PDF" }),
+    );
+    await waitFor(() =>
+      expect(downloadReportPdf).toHaveBeenCalledWith(
+        snapshot,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
+    );
+  });
+
+  it("disables duplicate PDF generation until completion and allows retry after a failure", async () => {
+    let finish!: () => void;
+    vi.mocked(downloadReportPdf).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    mockApi();
+    const user = userEvent.setup();
+    renderPage("/app/tenant-1/project-1/reports/report-1");
+    const button = await screen.findByRole("button", {
+      name: "下载覆盖与证据 PDF",
+    });
+    await user.click(button);
+    expect(
+      await screen.findByRole("button", { name: "正在生成 PDF…" }),
+    ).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "正在生成 PDF…" }));
+    expect(downloadReportPdf).toHaveBeenCalledTimes(1);
+    finish();
+    await waitFor(() => expect(button).toBeEnabled());
+
+    vi.mocked(downloadReportPdf).mockRejectedValueOnce(
+      new Error("private implementation detail"),
+    );
+    await user.click(button);
+    expect(
+      await screen.findByText(/PDF 生成失败，未下载文件/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/private implementation detail/),
+    ).not.toBeInTheDocument();
+    expect(button).toBeEnabled();
+    await user.click(button);
+    await waitFor(() => expect(downloadReportPdf).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(screen.queryByText(/PDF 生成失败/)).not.toBeInTheDocument(),
+    );
+  });
+
+  it.each([
+    ["/app/tenant-1/project-1/reports/report-2", "report-2"],
+    ["/app/tenant-1/project-2/reports/report-2", "报告不属于当前项目"],
+  ])(
+    "aborts a PDF in progress when switching to %s before it can download",
+    async (alternatePath, expectedDestination) => {
+      let finish!: () => void;
+      let downloads = 0;
+      vi.mocked(downloadReportPdf).mockImplementation((_report, options) =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }).then(() => {
+          if (!options?.signal?.aborted) downloads++;
+        }),
+      );
+      mockApi();
+      const user = userEvent.setup();
+      renderPage("/app/tenant-1/project-1/reports/report-1", alternatePath);
+      await user.click(
+        await screen.findByRole("button", { name: "下载覆盖与证据 PDF" }),
+      );
+      const signal = vi.mocked(downloadReportPdf).mock.calls[0][1]?.signal;
+      expect(signal?.aborted).toBe(false);
+      await user.click(screen.getByRole("link", { name: "切换报告范围" }));
+      expect(await screen.findByText(expectedDestination)).toBeInTheDocument();
+      expect(signal?.aborted).toBe(true);
+      finish();
+      await Promise.resolve();
+      expect(downloads).toBe(0);
+    },
+  );
 
   it("keeps platform and AI comparison groups separate, including unknown and missing states", async () => {
     mockApi({

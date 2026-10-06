@@ -42,6 +42,12 @@ test("refuses checkout and foreign/preexisting state without rewriting it", asyn
     const repo = join(parent, "repository");
     await mkdir(repo);
     await assert.rejects(loadState(join(repo, "secrets"), repo), /outside/);
+    if (process.platform === "win32") {
+      await assert.rejects(
+        loadState(join(`\\\\?\\${repo}`, "secrets"), repo),
+        /outside/,
+      );
+    }
     const foreign = join(parent, "foreign");
     await mkdir(foreign);
     await writeFile(join(foreign, "other-data"), "untouched");
@@ -79,22 +85,24 @@ test(
   { skip: process.platform !== "win32" },
   async (t) => {
     const parent = await mkdtemp(join(tmpdir(), "geo-private-check-"));
-    const powershell = (path, command) =>
-      spawnSync(
-        "powershell.exe",
-        ["-NoProfile", "-NonInteractive", "-Command", command],
-        {
-          env: { ...process.env, GEO_PRIVATE_PATH: path },
-          encoding: "utf8",
-          windowsHide: true,
-          timeout: 15000,
-          maxBuffer: 8192,
-        },
-      );
+    const powershell = (path, command) => {
+      const args = ["-NoProfile", "-NonInteractive", "-Command", command];
+      const options = {
+        env: { ...process.env, GEO_PRIVATE_PATH: path },
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 15000,
+        maxBuffer: 8192,
+      };
+      const result = spawnSync("pwsh.exe", args, options);
+      return result.error?.code === "ENOENT"
+        ? spawnSync("powershell.exe", args, options)
+        : result;
+    };
     const ownership = (path) =>
       powershell(
         path,
-        '$path=$env:GEO_PRIVATE_PATH; $item=if ([System.IO.Directory]::Exists($path)) { [System.IO.DirectoryInfo]::new($path) } else { [System.IO.FileInfo]::new($path) }; $owner=$item.GetAccessControl().GetOwner([System.Security.Principal.SecurityIdentifier]); $me=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; if ($owner.Value -eq $me.Value) { "owned" } else { "foreign" }',
+        '$path=$env:GEO_PRIVATE_PATH; $item=if ([System.IO.Directory]::Exists($path)) { [System.IO.DirectoryInfo]::new($path) } else { [System.IO.FileInfo]::new($path) }; $acl=if ($PSVersionTable.PSEdition -eq "Core") { [System.IO.FileSystemAclExtensions]::GetAccessControl($item) } else { $item.GetAccessControl() }; $owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]); $me=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; if ($owner.Value -eq $me.Value) { "owned" } else { "foreign" }',
       ).stdout.trim();
     try {
       const state = join(parent, "owned");
@@ -109,7 +117,7 @@ test(
       const marker = join(state, ".geo-local-owned");
       const changed = powershell(
         marker,
-        "$item=[System.IO.FileInfo]::new($env:GEO_PRIVATE_PATH); $acl=$item.GetAccessControl(); $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')); try { $item.SetAccessControl($acl); exit 0 } catch { exit 8 }",
+        "$item=[System.IO.FileInfo]::new($env:GEO_PRIVATE_PATH); $acl=if ($PSVersionTable.PSEdition -eq 'Core') { [System.IO.FileSystemAclExtensions]::GetAccessControl($item) } else { $item.GetAccessControl() }; $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')); try { if ($PSVersionTable.PSEdition -eq 'Core') { [System.IO.FileSystemAclExtensions]::SetAccessControl($item, $acl) } else { $item.SetAccessControl($acl) }; exit 0 } catch { exit 8 }",
       );
       if (changed.status !== 0) {
         t.skip("Changing a synthetic fixture owner requires elevated Windows");

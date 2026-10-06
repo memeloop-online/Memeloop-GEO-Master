@@ -109,6 +109,15 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee logs/cargo-clippy.log
           cargo test --workspace --all-targets 2>&1 | tee logs/cargo-test.log
 
+      - name: Verify report PDF text, glyphs, and pagination
+        env:
+          GEO_REPORT_PDF_OUTPUT_DIR: ${{ runner.temp }}/geo-report-pdf-smoke
+          GEO_REPORT_PDF_PARSER_JAR: ${{ github.workspace }}/services/document-parser/target/document-parser-1.0.0.jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-report-pdf.mjs 2>&1 | tee logs/report-pdf-smoke.log
+
       - name: Run generated bundle Rust/V8 compatibility test
         shell: bash
         run: |
@@ -228,6 +237,14 @@ jobs:
           name: web-smoke-synthetic-${{ github.sha }}
           if-no-files-found: warn
           path: ${{ runner.temp }}/geo-web-smoke/
+
+      - name: Upload synthetic report PDF acceptance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-pdf-synthetic-${{ github.sha }}
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/geo-report-pdf-smoke/
 
   windows-msvc:
     name: Windows MSVC Rust/V8 (5-minute milestone)

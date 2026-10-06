@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef, useState } from "react";
 import {
   Badge,
   Button,
@@ -185,6 +186,37 @@ function SnapshotDetail({
 }) {
   const evidenceIds = new Set(evidence.map((item) => item.evidence_id));
   const Container = savedSnapshot ? "div" : "section";
+  const [pdfExporting, setPdfExporting] = useState(false);
+  const [pdfError, setPdfError] = useState(false);
+  const pdfController = useRef<AbortController | null>(null);
+
+  useLayoutEffect(() => {
+    return () => {
+      pdfController.current?.abort();
+      pdfController.current = null;
+    };
+  }, [savedSnapshot?.report_id, savedSnapshot?.input_hash]);
+
+  async function exportPdf() {
+    if (!savedSnapshot || pdfController.current) return;
+    const controller = new AbortController();
+    pdfController.current = controller;
+    setPdfError(false);
+    setPdfExporting(true);
+    try {
+      const { downloadReportPdf } = await import("./reportsPdf");
+      if (controller.signal.aborted) return;
+      await downloadReportPdf(savedSnapshot, { signal: controller.signal });
+    } catch {
+      if (!controller.signal.aborted) setPdfError(true);
+    } finally {
+      if (pdfController.current === controller) {
+        pdfController.current = null;
+        if (!controller.signal.aborted) setPdfExporting(false);
+      }
+    }
+  }
+
   return (
     <Container
       className={
@@ -223,6 +255,9 @@ function SnapshotDetail({
               <Button onClick={() => downloadReportCsv(savedSnapshot)}>
                 下载覆盖与证据 CSV
               </Button>
+              <Button disabled={pdfExporting} onClick={() => void exportPdf()}>
+                {pdfExporting ? "正在生成 PDF…" : "下载覆盖与证据 PDF"}
+              </Button>
               <Button
                 icon={<ArrowSyncRegular />}
                 disabled={refreshing}
@@ -232,6 +267,13 @@ function SnapshotDetail({
               </Button>
             </div>
           </section>
+          {pdfError && (
+            <MessageBar intent="error">
+              <MessageBarBody>
+                PDF 生成失败，未下载文件。可重试下载。
+              </MessageBarBody>
+            </MessageBar>
+          )}
           <Link to="../reports">← 返回报告列表</Link>
           <MessageBar
             intent={snapshot.status === "partial" ? "warning" : "info"}
@@ -478,10 +520,8 @@ function SnapshotDetail({
       {savedSnapshot && (
         <MessageBar intent="info">
           <MessageBarBody>
-            此 CSV
-            仅导出快照已有的覆盖、结论与证据。独立查回只陈述资产存在，不证明原发送成功。资产明细、费用、下一轮动作及
-            PDF
-            尚未由此接口提供；页面不会生成替代数据或将本快照称作完整商业报告。
+            CSV 和 PDF
+            仅导出快照已有的覆盖、结论与证据。独立查回只陈述资产存在，不证明原发送成功。资产明细、费用及下一轮动作尚未由此接口提供；页面不会生成替代数据或将本快照称作完整商业报告。
           </MessageBarBody>
         </MessageBar>
       )}

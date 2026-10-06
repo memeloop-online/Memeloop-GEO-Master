@@ -4,7 +4,15 @@ import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { lstat, mkdir, open, readFile, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,15 +41,60 @@ function assert(ok, message) {
 }
 
 function inside(root, candidate) {
-  const path = relative(root, candidate);
+  const comparable = (value) => {
+    let path = resolve(value);
+    if (process.platform === "win32") {
+      if (path.startsWith("\\\\?\\UNC\\")) path = `\\\\${path.slice(8)}`;
+      else if (path.startsWith("\\\\?\\")) path = path.slice(4);
+      path = path.toLowerCase();
+    }
+    return path;
+  };
+  const path = relative(comparable(root), comparable(candidate));
   return (
     !path ||
     (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path))
   );
 }
 
+async function canonicalCandidate(path) {
+  let cursor = resolve(path);
+  const missing = [];
+  for (;;) {
+    try {
+      return resolve(await realpath(cursor), ...missing.reverse());
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const parent = dirname(cursor);
+      assert(parent !== cursor, "State path cannot be resolved");
+      missing.push(basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+function windowsPowerShell(script, extra = {}) {
+  const args = ["-NoProfile", "-NonInteractive", "-Command", script];
+  const options = {
+    env: cleanEnv(extra),
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15000,
+    maxBuffer: 8192,
+  };
+  // Windows PowerShell 5 startup can stall on hosted runners. PowerShell 7
+  // requires no profile and is already installed there; retain the built-in
+  // Windows PowerShell fallback for local machines without pwsh.
+  const result = spawnSync("pwsh.exe", args, options);
+  if (result.error?.code === "ENOENT") {
+    return spawnSync("powershell.exe", args, options);
+  }
+  return result;
+}
+
 async function checkComponents(path) {
   let cursor = resolve(path);
+  const existing = [];
   for (;;) {
     try {
       const stat = await lstat(cursor);
@@ -49,34 +102,31 @@ async function checkComponents(path) {
         !stat.isSymbolicLink(),
         "State path contains a link or reparse point",
       );
-      if (process.platform === "win32") {
-        const result = spawnSync(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-Item -LiteralPath $env:GEO_PRIVATE_PATH -Force).Attributes.ToString()",
-          ],
-          {
-            env: cleanEnv({ GEO_PRIVATE_PATH: cursor }),
-            encoding: "utf8",
-            windowsHide: true,
-            timeout: 15000,
-            maxBuffer: 8192,
-          },
-        );
-        assert(
-          result.status === 0 && !result.stdout.includes("ReparsePoint"),
-          "State path contains a link or reparse point",
-        );
-      }
+      if (process.platform === "win32") existing.push(cursor);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
     const parent = dirname(cursor);
-    if (parent === cursor) return;
+    if (parent === cursor) break;
     cursor = parent;
+  }
+  if (process.platform === "win32") {
+    // Windows path components cannot contain newlines. Probe every existing
+    // component in one process with .NET attributes, avoiding slow per-path
+    // PowerShell provider resolution while still rejecting all reparse tags.
+    const result = windowsPowerShell(
+      `try {
+  foreach ($candidate in $env:GEO_PRIVATE_COMPONENTS -split [char]10) {
+    if (([System.IO.File]::GetAttributes($candidate) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { exit 2 }
+  }
+} catch { exit 3 }`,
+      { GEO_PRIVATE_COMPONENTS: existing.join("\n") },
+    );
+    assert(
+      result.error?.code !== "ETIMEDOUT",
+      "Windows path attribute probe timed out",
+    );
+    assert(result.status === 0, "State path contains a link or reparse point");
   }
 }
 
@@ -85,10 +135,18 @@ async function checkComponents(path) {
 const aclScript = `
 $ErrorActionPreference = 'Stop'
 try {
+function GetPrivateAcl($item) {
+  if ($PSVersionTable.PSEdition -eq 'Core') { return [System.IO.FileSystemAclExtensions]::GetAccessControl($item) }
+  return $item.GetAccessControl()
+}
+function SetPrivateAcl($item, $acl) {
+  if ($PSVersionTable.PSEdition -eq 'Core') { [System.IO.FileSystemAclExtensions]::SetAccessControl($item, $acl) }
+  else { $item.SetAccessControl($acl) }
+}
 $path = $env:GEO_PRIVATE_PATH
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $item = if ([System.IO.Directory]::Exists($path)) { [System.IO.DirectoryInfo]::new($path) } else { [System.IO.FileInfo]::new($path) }
-$acl = $item.GetAccessControl()
+$acl = GetPrivateAcl $item
 $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
 if ($env:GEO_PRIVATE_ACTION -eq 'create') {
   # Elevated Windows processes may give their own freshly created items the
@@ -97,47 +155,40 @@ if ($env:GEO_PRIVATE_ACTION -eq 'create') {
   if ($owner.Value -ne $identity.User.Value -and $owner.Value -ne $administrators.Value) { exit 5 }
   if ($owner.Value -eq $administrators.Value) { $acl.SetOwner($identity.User) }
   $acl.SetAccessRuleProtection($true, $false)
-  foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
+  foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) { [void]$acl.RemoveAccessRuleSpecific($rule) }
   $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-  $inherit = if ($item.PSIsContainer) { [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit } else { [System.Security.AccessControl.InheritanceFlags]::None }
+  $inherit = if ($item -is [System.IO.DirectoryInfo]) { [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit } else { [System.Security.AccessControl.InheritanceFlags]::None }
   $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity.User, $rights, $inherit, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
   [void]$acl.SetAccessRule($rule)
-  $item.SetAccessControl($acl)
-  $acl = $item.GetAccessControl()
+  SetPrivateAcl $item $acl
+  $acl = GetPrivateAcl $item
 } elseif ($owner.Value -ne $identity.User.Value) {
   exit 5
 }
 if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) { exit 5 }
 if (-not $acl.AreAccessRulesProtected) { exit 2 }
-foreach ($rule in $acl.Access) {
+$rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+foreach ($rule in $rules) {
   if ($rule.IsInherited -or $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) { exit 3 }
 }
-if ($acl.Access.Count -eq 0) { exit 4 }
+if ($rules.Count -eq 0) { exit 4 }
 } catch {
-  [Console]::Error.WriteLine("$($_.Exception.GetType().Name):$($_.InvocationInfo.ScriptLineNumber):$($_.InvocationInfo.MyCommand.Name)")
+  [Console]::Error.WriteLine("$($_.Exception.GetType().Name):$($_.InvocationInfo.ScriptLineNumber)")
   exit 8
 }
 `;
 
 async function privatePermissions(path, set = false) {
   if (process.platform === "win32") {
-    const result = spawnSync(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-Command", aclScript],
-      {
-        env: cleanEnv({
-          GEO_PRIVATE_PATH: path,
-          GEO_PRIVATE_ACTION: set ? "create" : "check",
-        }),
-        encoding: "utf8",
-        windowsHide: true,
-        timeout: 15000,
-        maxBuffer: 8192,
-      },
-    );
+    const result = windowsPowerShell(aclScript, {
+      GEO_PRIVATE_PATH: path,
+      GEO_PRIVATE_ACTION: set ? "create" : "check",
+    });
     assert(
       result.status === 0,
-      `Private state ACL could not be verified (${result.status}; ${result.stderr.trim().slice(0, 80)})`,
+      result.error?.code === "ETIMEDOUT"
+        ? "Windows private state ACL probe timed out"
+        : `Private state ACL could not be verified (${result.status}; ${result.stderr.trim().slice(0, 80)})`,
     );
     return;
   }
@@ -215,9 +266,15 @@ export async function loadState(dir, repo = repository) {
     "GEO_LOCAL_STATE_DIR must be absolute",
   );
   const state = resolve(dir);
-  const project = await realpath(repo);
+  const requestedProject = resolve(repo);
   assert(
-    !inside(project, state) && !inside(state, project),
+    !inside(requestedProject, state) && !inside(state, requestedProject),
+    "State directory must be outside the repository",
+  );
+  const project = await realpath(requestedProject);
+  const actualState = await canonicalCandidate(state);
+  assert(
+    !inside(project, actualState) && !inside(actualState, project),
     "State directory must be outside the repository",
   );
   await checkComponents(state);
