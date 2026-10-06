@@ -12,7 +12,11 @@ import java.util.Set;
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.contentstream.PDContentStream;
+import org.apache.pdfbox.contentstream.operator.Operator;
+import org.apache.pdfbox.contentstream.operator.OperatorName;
 import org.apache.pdfbox.multipdf.PDFCloneUtility;
+import org.apache.pdfbox.pdfparser.PDFStreamParser;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDResources;
@@ -97,7 +101,9 @@ public final class PdfDocumentParser {
                 String text = content.toString().trim();
                 if (text.getBytes(StandardCharsets.UTF_8).length > MAX_TEXT_BYTES)
                     throw new ParseFailure("output_too_large");
-                String reason = text.isEmpty() ? (hasImages ? "ocr_required" : "empty_text") : null;
+                String reason = text.isEmpty()
+                        ? (hasImages || hasInlineImages(original) ? "ocr_required" : "empty_text")
+                        : null;
                 return new PageText(sha256(bytes), page, text, reason);
             }
         } catch (LimitExceeded ex) {
@@ -142,6 +148,34 @@ public final class PdfDocumentParser {
             if (object instanceof PDImageXObject) return true;
             if (object instanceof PDFormXObject form
                     && hasRasterImages(form.getResources(), seen, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    // Inline BI/ID/EI images are in page content, not /Resources /XObject.
+    // Scan operators only when no text or XObject was found; never decode OCR pixels.
+    private static boolean hasInlineImages(PDPage page) throws IOException {
+        if (!page.hasContents()) return false;
+        return hasInlineImages(page, Collections.newSetFromMap(new IdentityHashMap<>()), 0);
+    }
+
+    private static boolean hasInlineImages(PDContentStream content,
+            Set<COSDictionary> seenForms, int depth) throws IOException {
+        if (depth > 8) return false;
+        PDFStreamParser parser = new PDFStreamParser(content);
+        Object token;
+        while ((token = parser.parseNextToken()) != null) {
+            if (token instanceof Operator operator
+                    && OperatorName.BEGIN_INLINE_IMAGE.equals(operator.getName())) return true;
+        }
+        PDResources resources = content.getResources();
+        if (resources != null) {
+            for (var name : resources.getXObjectNames()) {
+                PDXObject object = resources.getXObject(name);
+                if (object instanceof PDFormXObject form
+                        && seenForms.add(form.getCOSObject())
+                        && hasInlineImages(form, seenForms, depth + 1)) return true;
+            }
         }
         return false;
     }

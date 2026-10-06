@@ -888,4 +888,57 @@ mod tests {
         );
         gate.add_permits(3);
     }
+
+    #[tokio::test]
+    async fn already_lost_lease_never_polls_parser_request() {
+        let (lost_tx, mut lost_rx) = watch::channel(false);
+        lost_tx.send(true).unwrap();
+        let request = std::future::poll_fn(|_| -> std::task::Poll<Result<(), ParserFailure>> {
+            panic!("a request must not be polled after its lease was lost");
+        });
+        assert!(matches!(
+            request_or_lease_loss(&mut lost_rx, request).await,
+            Err(ParserFailure::Transient)
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_flight_lease_loss_drops_pending_parser_request() {
+        let (lost_tx, mut lost_rx) = watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (mut pending_tx, pending_rx) = tokio::sync::oneshot::channel::<()>();
+        let request = async move {
+            started_tx.send(()).unwrap();
+            pending_rx.await.map_err(|_| ParserFailure::Transient)
+        };
+        let worker =
+            tokio::spawn(async move { request_or_lease_loss(&mut lost_rx, request).await });
+        started_rx.await.expect("request was polled and is pending");
+        lost_tx.send(true).unwrap();
+        assert!(matches!(
+            worker.await.unwrap(),
+            Err(ParserFailure::Transient)
+        ));
+        pending_tx.closed().await;
+    }
+
+    #[tokio::test]
+    async fn disconnected_lease_watch_drops_pending_parser_request() {
+        let (lost_tx, mut lost_rx) = watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (mut pending_tx, pending_rx) = tokio::sync::oneshot::channel::<()>();
+        let request = async move {
+            started_tx.send(()).unwrap();
+            pending_rx.await.map_err(|_| ParserFailure::Transient)
+        };
+        let worker =
+            tokio::spawn(async move { request_or_lease_loss(&mut lost_rx, request).await });
+        started_rx.await.expect("request was polled and is pending");
+        drop(lost_tx);
+        assert!(matches!(
+            worker.await.unwrap(),
+            Err(ParserFailure::Transient)
+        ));
+        pending_tx.closed().await;
+    }
 }

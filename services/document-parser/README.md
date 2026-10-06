@@ -47,6 +47,8 @@ evidence limitations, not successful OCR. Each response must be bound by its
 SHA-256, parser profile and original one-based page number. Invalid PDF,
 encrypted input, out-of-range pages and limits return only static error codes
 in `{"error":{"code":"...","retryable":false}}`.
+Raster detection includes inline `BI` images in page content and nested Form
+XObjects; it does not turn those pixels into extracted text.
 The local concurrency-limit response is HTTP 503
 `{"error":{"code":"parser_busy","retryable":true}}`.
 

@@ -10,6 +10,19 @@
 
 扫描图片页显示需要 OCR，空白页显示无可提取文字。当前不会生成图像描述、推测页码、伪造文字或把所有页面都算作成功。PDF 表格结构、版式还原、原件高亮预览和扫描件识别尚未完成；当前提取的是文字层。
 
+### P00 自动接续：下一实施切片，尚未完成
+
+当前 `agent_runtime.rs` 的附件导入投影没有返回解析 job ID，worker 结果 DTO 也尚无该引用。后台解析完成不能据此自动恢复正在等待的 MemeLoop 阶段；直接 runner 没有 phase-resume 入口。
+
+不依赖上游修改的下一最小切片是明确标识的“资料完成后自动后续回答”，不是原 Run 中途恢复：
+
+- 在显式导入边界保存原 message/turn/run、工具调用、job 集合及回答目标；与入队原子保存，或先保存可对账意图，避免任务先完成而关联丢失。
+- 复用解析完成事务中的 ready/partial/failed outbox，并增加分页补偿扫描。按稳定依赖身份去重，只创建一次后续 queued run。
+- 后续 turn 具有明确系统 origin/causation，UI 显示“解析完成，自动接续”；不得伪造一条用户消息。仅允许读取已绑定 release/version 并检索回答，不重新取得附件导入或原任务全部写操作权限。
+- 创建 continuation、run 和会话事件同事务；沿用会话串行。原请求取消抑制关联接续，部分成功/全失败按实际结果回答，不伪造引用。
+
+实施接缝为 `crates/api/src/agent_runtime.rs`、`crates/worker/src/host.rs`、Agent 仓储/dispatcher、PDF 完成 outbox 及 P00 事件呈现。验收须覆盖页面关闭、完成早于关联、乱序重复事件、多副本、事务边界重启、取消竞争和跨租户隔离。该方案解决后续任务入队恢复，不解决新 Run 的 running 阶段崩溃；完整同 Run 恢复仍按 `agent-tool-ledger.md` 的依赖推进。
+
 ## 存储与调度
 
 1. 上传按原有流程核验大小、SHA-256 和作用域，保存原始对象。PDF 入队事务同时保存 Source、ImportJob、Operation、解析输入绑定和受理回执；不在 SQL 事务中调用解析服务。
@@ -54,6 +67,12 @@ $env:GEO_PDF_PARSER_URL = "http://127.0.0.1:18081"
 随后按 `HANDOFF.md` 启动 Rust 应用。Compose 中解析服务使用独立无外部出口网络、非 root 用户、只读文件系统及临时目录；不公开到所有宿主接口。不配置该变量时，现有文字/Markdown/CSV 路径不受影响，PDF 仍明确显示缺少解析能力。
 
 CI 构建 Java 21 服务，执行真实合成 PDF 测试，上传可供开发复用的 JAR；另启动该 JAR，显式执行 Rust 上传到知识版本的真实 HTTP 集成测试。PostgreSQL 的 `pdf_parse` 套件使用可丢弃数据库验证持久进度、作用域、租约及部分重试。模拟解析结果的仓储测试不能代替真实服务集成测试。
+
+### 复用 CI 产物
+
+成功的 CI run 提供 `document-parser-java21-<完整提交 SHA>` artifact，包含 `document-parser-1.0.0.jar`。使用 `gh run download <run-id> --name <artifact-name> --dir <本地缓存目录>` 下载，记录来源 run 与提交；无需本地 Maven 编译。Java 21 或以上可执行 `java -jar <JAR 路径>`，默认仅绑定 `127.0.0.1:8080`；开发时设置 `GEO_PDF_PORT=18081` 避免与应用端口冲突，再配置 Rust 的解析器地址。
+
+独立 JAR 只是本地开发方式，不带 Compose 的容器文件系统与网络隔离。生产须使用隔离部署；客户端文件不能改变 Java 命令、classpath 或解析服务目的地址。
 
 每个解析请求在独立子 JVM 中执行，环境清空，仅保留必要系统变量；原件由 stdin 传入，stdout 有界，异常详情不外泄。监督进程在 20 秒截止后强制结束并回收子进程，再释放解析槽；Rust 请求截止为 25 秒。1 GiB 开发容器配置一个解析槽，增加槽数须同时增加 JVM 与容器内存，不影响 Agent 运行并发。
 

@@ -11,6 +11,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.security.MessageDigest;
+import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.pdfbox.Loader;
@@ -18,11 +19,14 @@ import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.common.PDStream;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+import org.apache.pdfbox.pdmodel.graphics.form.PDFormXObject;
 import org.apache.pdfbox.pdmodel.encryption.AccessPermission;
 import org.apache.pdfbox.pdmodel.encryption.StandardProtectionPolicy;
 import org.junit.jupiter.api.Test;
@@ -114,6 +118,63 @@ class PdfParserTest {
             var second = PdfDocumentParser.parsePage(pdf, 2);
             assertEquals("", second.text());
             assertEquals("empty_text", second.reason());
+        }
+    }
+
+    @Test
+    void inlineImageWithoutXObjectStillRequiresOcr() throws Exception {
+        try (PDDocument document = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            document.addPage(page);
+            PDStream contents = new PDStream(document);
+            try (var stream = contents.createOutputStream()) {
+                stream.write("q\n1 0 0 1 10 10 cm\nBI\n/W 1\n/H 1\n/BPC 8\n/CS /RGB\nID\n"
+                        .getBytes(StandardCharsets.US_ASCII));
+                stream.write(new byte[] {0, 0, 0}); // one black pixel, no binary fixture file
+                stream.write("\nEI\nQ\n".getBytes(StandardCharsets.US_ASCII));
+            }
+            page.setContents(contents);
+            assertTrue(page.getResources() == null || !page.getResources().getXObjectNames()
+                    .iterator().hasNext(), "inline image must not be an XObject resource");
+            var result = PdfDocumentParser.parsePage(save(document), 1);
+            assertEquals("", result.text());
+            assertEquals("ocr_required", result.reason());
+        }
+    }
+
+    @Test
+    void inlineImageInsideNestedFormsStillRequiresOcr() throws Exception {
+        try (PDDocument document = new PDDocument()) {
+            PDFormXObject inner = new PDFormXObject(document);
+            inner.setBBox(new PDRectangle(100, 100));
+            inner.setResources(new PDResources());
+            try (var image = inner.getCOSObject().createOutputStream()) {
+                image.write("BI\n/W 1\n/H 1\n/BPC 8\n/CS /RGB\nID\n"
+                        .getBytes(StandardCharsets.US_ASCII));
+                image.write(new byte[] {0, 0, 0});
+                image.write("\nEI\n".getBytes(StandardCharsets.US_ASCII));
+            }
+            PDFormXObject outer = new PDFormXObject(document);
+            outer.setBBox(new PDRectangle(100, 100));
+            PDResources outerResources = new PDResources();
+            outerResources.put(COSName.getPDFName("Inner"), inner);
+            outer.setResources(outerResources);
+            try (var invoke = outer.getCOSObject().createOutputStream()) {
+                invoke.write("/Inner Do\n".getBytes(StandardCharsets.US_ASCII));
+            }
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            PDResources pageResources = new PDResources();
+            pageResources.put(COSName.getPDFName("Outer"), outer);
+            page.setResources(pageResources);
+            document.addPage(page);
+            PDStream contents = new PDStream(document);
+            try (var invoke = contents.createOutputStream()) {
+                invoke.write("/Outer Do\n".getBytes(StandardCharsets.US_ASCII));
+            }
+            page.setContents(contents);
+            var parsed = PdfDocumentParser.parsePage(save(document), 1);
+            assertEquals("", parsed.text());
+            assertEquals("ocr_required", parsed.reason());
         }
     }
 

@@ -2,7 +2,7 @@
 
 更新时间：2026-10-06
 
-最新完整绿色基线：`1e2ea25` / Actions `37394756908`，Linux/Windows、前端、显式 V8 与 PostgreSQL 全部通过。已读取 Linux 日志确认工具账本旧拒绝/未知状态回归、checkpoint 和空引用兼容回归实际执行通过；PostgreSQL Agent 套件 25 项通过，不是默认忽略后的通过。PDF 导入为后续增量，验证状态见 `WORKLOG.md`。
+最新完整绿色基线：`718fdea` / Actions `37396649272`，Linux/Windows、前端、显式 V8、Java 21 与 PostgreSQL 全部通过。已读取 Linux 日志确认 PDF 实库三项以及 `actual_pdf_pages_are_imported_as_searchable_source_evidence` 实际为 `ok`，验证了 Rust 上传 → 真实解析服务 → 可检索原页码证据，不是默认忽略后的通过。后续内联图片分类、打包许可证和失租补测仍须独立 CI；当前验证状态见 `WORKLOG.md`。
 
 该绿色基线包含：P00 正文分发工具读取跨周期原发送目标及查回摘要；网页搜索修正乱序聊天关联、无效引用回退，支持同回答多次搜索及原始字节初始化超时。CSV v2 对超长记录保存独立生成证据及精确单元格范围，完整原记录不变、普通知识检索不重复返回分片；新增 PostgreSQL 持久分片/检索回归已通过。真实登录、发布/搜索、P04/P12 实机视觉、旧 CSV 版本补建与完整项目验收仍缺。
 

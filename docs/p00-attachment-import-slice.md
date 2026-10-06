@@ -15,7 +15,7 @@
 形成 SourceVersion/KnowledgeRelease → 模型调用知识检索 → 引用证据回答。
 
 不增加人工确认步骤，不另写 Agent 循环，不把原始文件塞进 prompt。
-仅支持已有确定性 TXT/Markdown 解析器；其余格式逐项返回能力缺失。
+首个切片使用确定性 TXT/Markdown 解析器；后续 CSV 契约见 `csv-import.md`。可配置的 PDF 文字解析现已复用同一显式附件导入入口，返回后台排队收据，不立即声称已有知识版本；逐页状态、失败页重试及验证边界见 `pdf-import.md` 和工作日志。其余未接入格式逐项返回能力缺失。
 
 ### 1. 持久回合输入
 

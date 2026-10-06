@@ -37,6 +37,10 @@ JetStream on `localhost:4222` (monitoring on `8222`), Redis on `localhost:6379`,
 and MinIO on `localhost:9000` (console on `9001`). The matching application
 variables are documented in [`.env.example`](.env.example).
 
+PDF text imports use an optional isolated parser; see
+[`docs/pdf-import.md`](docs/pdf-import.md) for the Compose profile, reusable
+Java 21 CI artifact, page-level evidence and current limitations.
+
 Once the frontend and Rust workspaces are present, use the root commands:
 
 ```powershell
