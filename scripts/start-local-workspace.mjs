@@ -57,6 +57,39 @@ export function launcherFailureStage(message) {
     : undefined;
 }
 
+export function selectBrowserRunner(config, env = process.env) {
+  const externalUrl = env.GEO_BROWSER_RUNNER_URL;
+  const externalToken = env.GEO_BROWSER_RUNNER_TOKEN;
+  if (externalUrl === undefined && externalToken === undefined) {
+    return { external: false, url: runnerUrl, token: config.runnerToken };
+  }
+  assert(
+    typeof externalUrl === "string" &&
+      externalUrl.length > 0 &&
+      typeof externalToken === "string" &&
+      externalToken.length > 0,
+    "External browser runner URL and token must be configured together",
+  );
+  let parsed;
+  try {
+    parsed = new URL(externalUrl);
+  } catch {
+    throw new Error("External browser runner URL is invalid");
+  }
+  assert(
+    ["http:", "https:"].includes(parsed.protocol) &&
+      parsed.hostname &&
+      !parsed.username &&
+      !parsed.password &&
+      parsed.pathname === "/" &&
+      !externalUrl.includes("?") &&
+      !externalUrl.includes("#") &&
+      !/\s/.test(externalUrl),
+    "External browser runner URL must be a credential-free http(s) origin",
+  );
+  return { external: true, url: parsed.origin, token: externalToken };
+}
+
 function assert(ok, message) {
   if (!ok) throw new Error(message);
 }
@@ -579,6 +612,64 @@ async function ready(url, child, name, headers = {}) {
   );
 }
 
+export async function probeBrowserRunner(url, token, request = fetch) {
+  try {
+    const response = await request(`${url}/v1/capabilities`, {
+      headers: { Authorization: `Bearer ${token}` },
+      redirect: "manual",
+      signal: AbortSignal.timeout(1200),
+    });
+    if (response.status !== 200) return false;
+    const capabilities = await response.json();
+    return (
+      capabilities !== null &&
+      typeof capabilities === "object" &&
+      Array.isArray(capabilities.connectors)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function startBrowserRunner(
+  selection,
+  { launch = owned, probe = probeBrowserRunner } = {},
+) {
+  if (selection.external) {
+    assert(
+      await probe(selection.url, selection.token),
+      "External browser runner capabilities unavailable",
+    );
+    return;
+  }
+  const runner = launch(
+    process.execPath,
+    [join(packageRoot, "src", "server.mjs")],
+    repository,
+    {
+      GEO_BROWSER_RUNNER_HOST: "127.0.0.1",
+      GEO_BROWSER_RUNNER_PORT: "38080",
+      GEO_BROWSER_RUNNER_TOKEN: selection.token,
+      ...(process.env.PLAYWRIGHT_BROWSERS_PATH
+        ? { PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH }
+        : {}),
+      ...(process.env.GEO_LOCAL_TMP_DIR
+        ? {
+            TMP: process.env.GEO_LOCAL_TMP_DIR,
+            TEMP: process.env.GEO_LOCAL_TMP_DIR,
+          }
+        : {}),
+    },
+  );
+  await until(
+    () => probe(selection.url, selection.token),
+    35000,
+    "Browser runner",
+    runner,
+  );
+  return runner;
+}
+
 async function stopChildren() {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -685,6 +776,7 @@ async function main() {
   );
   startupStage = "private configuration";
   const config = await loadState(process.env.GEO_LOCAL_STATE_DIR);
+  const runnerSelection = selectBrowserRunner(config);
   const scratch = process.env.GEO_LOCAL_TMP_DIR;
   if (scratch) {
     assert(
@@ -693,7 +785,11 @@ async function main() {
     );
     await checkComponents(scratch);
   }
-  for (const port of [8080, 5173, 38080]) {
+  for (const port of [
+    8080,
+    5173,
+    ...(runnerSelection.external ? [] : [38080]),
+  ]) {
     assert(await portFree(port), `Local port ${port} must be free`);
   }
   assert(!shutdownRequested, "Startup interrupted");
@@ -711,8 +807,8 @@ async function main() {
     ...environment,
     GEO_BIND_ADDR: "127.0.0.1:8080",
     GEO_ALLOWED_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173",
-    GEO_BROWSER_RUNNER_URL: runnerUrl,
-    GEO_BROWSER_RUNNER_TOKEN: config.runnerToken,
+    GEO_BROWSER_RUNNER_URL: runnerSelection.url,
+    GEO_BROWSER_RUNNER_TOKEN: runnerSelection.token,
     GEO_CHANNEL_SECRET_KEY: config.cipherKey,
   };
   const bootstrapEnvironment = {
@@ -741,23 +837,7 @@ async function main() {
   });
   assert(bootstrap.status === 0, "Local identity bootstrap failed");
   startupStage = "browser runner";
-  const runner = owned(
-    process.execPath,
-    [join(packageRoot, "src", "server.mjs")],
-    repository,
-    {
-      GEO_BROWSER_RUNNER_HOST: "127.0.0.1",
-      GEO_BROWSER_RUNNER_PORT: "38080",
-      GEO_BROWSER_RUNNER_TOKEN: config.runnerToken,
-      ...(process.env.PLAYWRIGHT_BROWSERS_PATH
-        ? { PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH }
-        : {}),
-      ...(scratch ? { TMP: scratch, TEMP: scratch } : {}),
-    },
-  );
-  await ready(`${runnerUrl}/v1/capabilities`, runner, "Browser runner", {
-    Authorization: `Bearer ${config.runnerToken}`,
-  });
+  await startBrowserRunner(runnerSelection);
   startupStage = "Rust API";
   const api = owned(binary, [], repository, apiEnvironment);
   await ready(`${apiUrl}/health/ready`, api, "Rust API");

@@ -17,9 +17,158 @@ import {
   launcherFailureStage,
   loadState,
   postgresTcpReady,
+  probeBrowserRunner,
   requireSecureCookie,
+  selectBrowserRunner,
+  startBrowserRunner,
   verifyDockerResource,
 } from "./start-local-workspace.mjs";
+
+test("runner selection requires a paired credential-free backend-compatible origin", () => {
+  const config = { runnerToken: "synthetic-persistent-local-token" };
+  assert.deepEqual(selectBrowserRunner(config, {}), {
+    external: false,
+    url: "http://127.0.0.1:38080",
+    token: config.runnerToken,
+  });
+  assert.deepEqual(
+    selectBrowserRunner(config, {
+      GEO_BROWSER_RUNNER_URL: "https://runner.example.invalid:8443/",
+      GEO_BROWSER_RUNNER_TOKEN: "synthetic-external-token",
+    }),
+    {
+      external: true,
+      url: "https://runner.example.invalid:8443",
+      token: "synthetic-external-token",
+    },
+  );
+  for (const overrides of [
+    { GEO_BROWSER_RUNNER_URL: "https://runner.example.invalid" },
+    { GEO_BROWSER_RUNNER_TOKEN: "synthetic-external-token" },
+    {
+      GEO_BROWSER_RUNNER_URL: "https://runner.example.invalid",
+      GEO_BROWSER_RUNNER_TOKEN: "",
+    },
+    {
+      GEO_BROWSER_RUNNER_URL: "",
+      GEO_BROWSER_RUNNER_TOKEN: "synthetic-external-token",
+    },
+    ...[
+      "ftp://runner.example.invalid",
+      "https://user:private-password@runner.example.invalid",
+      "https://runner.example.invalid/v1",
+      "https://runner.example.invalid?private-query",
+      "https://runner.example.invalid#private-fragment",
+      "https://runner.example.invalid/ path",
+      "not-an-origin",
+    ].map((url) => ({
+      GEO_BROWSER_RUNNER_URL: url,
+      GEO_BROWSER_RUNNER_TOKEN: "synthetic-external-token",
+    })),
+  ]) {
+    assert.throws(
+      () => selectBrowserRunner(config, overrides),
+      (error) =>
+        !/private-password|private-query|private-fragment|synthetic-external-token/.test(
+          error.message,
+        ),
+    );
+  }
+});
+
+test("runner probe authenticates capabilities and never follows redirects", async () => {
+  const requests = [];
+  const request = async (url, options) => {
+    requests.push({ url, options });
+    return { status: 200, json: async () => ({ connectors: [] }) };
+  };
+  assert.equal(
+    await probeBrowserRunner(
+      "https://runner.example.invalid",
+      "synthetic-external-token",
+      request,
+    ),
+    true,
+  );
+  assert.equal(
+    requests[0].url,
+    "https://runner.example.invalid/v1/capabilities",
+  );
+  assert.equal(requests[0].options.redirect, "manual");
+  assert.equal(
+    requests[0].options.headers.Authorization,
+    "Bearer synthetic-external-token",
+  );
+  for (const response of [
+    { status: 401 },
+    { status: 302 },
+    { status: 200, json: async () => ({}) },
+    { status: 200, json: async () => "unrelated page" },
+  ]) {
+    assert.equal(
+      await probeBrowserRunner(
+        "https://runner.example.invalid",
+        "token",
+        async () => response,
+      ),
+      false,
+    );
+  }
+  assert.equal(
+    await probeBrowserRunner(
+      "https://runner.example.invalid",
+      "token",
+      async () => {
+        throw new Error("synthetic network outage");
+      },
+    ),
+    false,
+  );
+});
+
+test("external runner remains unowned; local runner is launched and checked", async () => {
+  const launched = [];
+  const checked = [];
+  const ownedChild = { exitCode: null, signalCode: null };
+  const launch = (...args) => {
+    launched.push(args);
+    return ownedChild;
+  };
+  const probe = async (url, token) => {
+    checked.push([url, token]);
+    return true;
+  };
+  const external = selectBrowserRunner(
+    { runnerToken: "persistent-local-token" },
+    {
+      GEO_BROWSER_RUNNER_URL: "http://runner.example.invalid:38080",
+      GEO_BROWSER_RUNNER_TOKEN: "external-token",
+    },
+  );
+  assert.equal(
+    await startBrowserRunner(external, { launch, probe }),
+    undefined,
+  );
+  assert.equal(launched.length, 0);
+  assert.deepEqual(checked, [[external.url, external.token]]);
+  await assert.rejects(
+    startBrowserRunner(external, {
+      launch,
+      probe: async () => false,
+    }),
+    /capabilities unavailable/,
+  );
+  assert.equal(launched.length, 0);
+  const local = selectBrowserRunner(
+    { runnerToken: "persistent-local-token" },
+    {},
+  );
+  const child = await startBrowserRunner(local, { launch, probe });
+  assert.equal(child, ownedChild);
+  assert.equal(launched.length, 1);
+  assert.equal(launched[0][3].GEO_BROWSER_RUNNER_TOKEN, local.token);
+  assert.deepEqual(checked.at(-1), [local.url, local.token]);
+});
 
 test("PostgreSQL readiness rejects the temporary socket-only initialization server", () => {
   let tcpReady = false;
@@ -322,6 +471,35 @@ test("startup error output never includes a supplied secret or machine path", as
     result.stderr,
     /private-password|private-host|deliberately-invalid-private-path/,
   );
+});
+
+test("invalid external runner configuration never logs its URL or bearer token", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "geo-private-check-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [join(import.meta.dirname, "start-local-workspace.mjs"), "--check"],
+      {
+        encoding: "utf8",
+        timeout: 20000,
+        env: {
+          ...process.env,
+          GEO_LOCAL_APP_BINARY: process.execPath,
+          GEO_LOCAL_STATE_DIR: join(parent, "state"),
+          GEO_BROWSER_RUNNER_URL:
+            "https://private-user:private-password@runner.example.invalid",
+          GEO_BROWSER_RUNNER_TOKEN: "synthetic-private-bearer",
+        },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.doesNotMatch(
+      `${result.stdout}${result.stderr}`,
+      /private-user|private-password|runner\.example\.invalid|synthetic-private-bearer/,
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 test("browser authentication requires the persistent Secure HttpOnly session cookie", () => {
