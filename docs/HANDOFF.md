@@ -6,7 +6,7 @@
 
 跨周期正文复用已接领域/API/持久层/UI 及迁移 `0027`：保持原检查版本、独立本轮覆盖，编辑采用 copy-on-write。前端 155 项、默认全量、真实后继周期 API/原生工作流与 PostgreSQL 回归已通过首段 CI。内存项目/知识 guard 与数据库事务保护公开提交，分发物化在提交内复核来源；可证明历史分支重建和真实外部发布验收仍缺。契约见 [`content-reuse.md`](content-reuse.md)。
 
-当前工作区正在整合问题集版本、项目级不可翻转的评估用途及引用式测量：契约见 [`question-sets.md`](question-sets.md)，迁移为 `0028`，页面为 P13 问题集和 P12 绑定测量，P00 宿主契约升级至 v10。前端 163 项、构建/格式、Node 编排 26 项、V8 host ops 38 项及 API 工具 5 项已通过；完整 Rust、实库和真实浏览器仍待收口，不属于首段绿色基线，也不代表 NextCycleAction 优化执行器已完成。周报 PDF 边界仍见 [`report-pdf.md`](report-pdf.md)。
+问题集批次已推送为 `091f754`：契约见 [`question-sets.md`](question-sets.md)，迁移 `0028`，P13 问题集、P12 引用式测量和 P00 v10 工具已接线。前端 163 项、构建/格式、Node 编排 26 项、连接器夹具 72 项、Rust 默认全量与严格 Clippy 均通过；显式原生 bundle 6 项/渠道运行时 1 项及真实本地 P13 创建→修订→刷新→旧版本路径通过。Actions `37435387407` Linux 在已有 V8 probe 引擎内部断言崩溃，后续实库未执行，当前不能称为全绿；故障排查进行中。冻结评估身份不翻转，报告及 PDF/CSV 分开用途，但不代表 NextCycleAction 优化器或真实外部采样已完成。
 
 历史绿色基线：`44f22ff` / Actions `37405615406`，Linux/Windows、前端、显式 V8、Java 21、PostgreSQL 和真实本地浏览器冒烟全部通过，包含报告只读预览、实时导入进度及原始收据核对。已读取 Linux 日志确认 `import_progress` 两项、`actual_pdf_pages_are_imported_as_searchable_source_evidence` 与 P14 临时预览/零写入浏览器检查实际通过，不是默认忽略后的通过。截图采用合成资料，不包含外部账号或真实发布/搜索验收。
 

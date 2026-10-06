@@ -130,6 +130,9 @@ jobs:
           cargo test -p geo-app content_runtime_tests -- --ignored 2>&1 | tee logs/cargo-content-app-runtime.log
 
       - name: Test repositories against disposable PostgreSQL
+        # Preserve independent migration evidence if a V8 probe aborts earlier.
+        # Earlier failures still fail the job; this is not continue-on-error.
+        if: ${{ !cancelled() }}
         env:
           GEO_TEST_DATABASE_URL: postgres://geo_ci:disposable-ci-only@127.0.0.1:5432/geo_test
         shell: bash
@@ -141,6 +144,27 @@ jobs:
               failed=1
             fi
           done
+          exit "$failed"
+
+      - name: Diagnose V8 heap pressure with isolated and concurrent probes
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          failed=0
+          for round in $(seq 1 5); do
+            if ! cargo test -p geo-worker --test probe enforces_heap_limit -- --exact --nocapture 2>&1 | tee "logs/v8-heap-alone-${round}.log"; then
+              failed=1
+            fi
+            if ! cargo test -p geo-worker --test probe -- --test-threads=1 --nocapture 2>&1 | tee "logs/v8-probe-serial-${round}.log"; then
+              failed=1
+            fi
+            if ! cargo test -p geo-worker --test probe -- --nocapture 2>&1 | tee "logs/v8-probe-parallel-${round}.log"; then
+              failed=1
+            fi
+          done
+          # Every invocation counts. Later success cannot erase an earlier crash.
           exit "$failed"
 
       - name: Test Rust import pipeline against real PDF parser
