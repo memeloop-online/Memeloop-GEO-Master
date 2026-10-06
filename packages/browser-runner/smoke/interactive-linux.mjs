@@ -31,7 +31,10 @@ const fixture = createServer(async (request, response) => {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(
       "<!doctype html><title>Isolated login fixture</title>" +
+        "<style>#render-marker{position:fixed;left:80px;top:180px;" +
+        "width:260px;height:120px;background:#27b5e9}</style>" +
         "<main>Synthetic account</main><input id='synthetic-input' autofocus>" +
+        "<div id='render-marker' aria-hidden='true'></div>" +
         "<script>document.cookie='fixture=ready; SameSite=Lax'</script>",
     );
     return;
@@ -97,6 +100,63 @@ async function expectSyntheticInput(expected, stage) {
     );
   }
 }
+async function waitForSyntheticMarker(client) {
+  try {
+    const handle = await client.waitForFunction(
+      () => {
+        const canvas = document.querySelector("#screen canvas");
+        if (
+          !window.syntheticDesktop?.connected ||
+          !canvas?.width ||
+          !canvas?.height
+        )
+          return false;
+        const { data } = canvas
+          .getContext("2d")
+          .getImageData(0, 0, canvas.width, canvas.height);
+        let count = 0;
+        let minX = canvas.width;
+        let minY = canvas.height;
+        let maxX = 0;
+        let maxY = 0;
+        for (let y = 0; y < canvas.height; y += 4) {
+          for (let x = 0; x < canvas.width; x += 4) {
+            const index = (y * canvas.width + x) * 4;
+            if (
+              data[index] === 39 &&
+              data[index + 1] === 181 &&
+              data[index + 2] === 233
+            ) {
+              count++;
+              minX = Math.min(minX, x);
+              minY = Math.min(minY, y);
+              maxX = Math.max(maxX, x);
+              maxY = Math.max(maxY, y);
+            }
+          }
+        }
+        // The remote fixture's solid #27b5e9 block has thousands of sampled
+        // pixels. A connected RFB socket or an otherwise valid PNG is not
+        // enough to show that the remote browser is visible on this canvas.
+        return count >= 1_000
+          ? {
+              minX,
+              minY,
+              maxX,
+              maxY,
+              width: canvas.width,
+              height: canvas.height,
+            }
+          : false;
+      },
+      undefined,
+      { timeout: 10_000 },
+    );
+    return await handle.jsonValue();
+  } catch {
+    throw new Error("synthetic_novnc_framebuffer_marker_missing");
+  }
+}
 const runner = createRunner({
   interactiveRuntime: "linux-vnc",
   platformAdapters: {
@@ -109,15 +169,10 @@ const runner = createRunner({
           remotePage = page;
           const visible = await page.locator("main").textContent();
           const cookie = await page.evaluate(() => document.cookie);
-          const image = await page.screenshot({ type: "png" });
           identityProbeResult = {
             text: visible === "Synthetic account",
             cookie: cookie.includes("fixture=ready"),
-            screenshot: image
-              .subarray(0, 8)
-              .equals(Buffer.from("89504e470d0a1a0a", "hex")),
           };
-          assert.ok(identityProbeResult.screenshot);
           return identityProbeResult.text && identityProbeResult.cookie
             ? { platform_account_id: "fixture-only", display_name: "Synthetic" }
             : null;
@@ -141,7 +196,6 @@ try {
   assert.deepEqual(identityProbeResult, {
     text: true,
     cookie: true,
-    screenshot: true,
   });
   assert.equal(created.phase, "ready_to_complete");
   const endpoint = runner.desktopEndpoint("synthetic");
@@ -167,10 +221,47 @@ try {
     [],
     "upstream noVNC module must load without errors",
   );
-  await remotePage.waitForFunction(
-    () => document.activeElement?.id === "synthetic-input",
+  await remotePage.bringToFront();
+  const marker = await waitForSyntheticMarker(client);
+  const inputBox = await remotePage.locator("#synthetic-input").boundingBox();
+  assert.ok(inputBox, "synthetic_input_not_visible");
+  const canvasBox = await client.locator("#screen canvas").boundingBox();
+  assert.ok(canvasBox, "synthetic_novnc_canvas_not_visible");
+  // Locate the synthetic input from the marker's known fixture coordinates.
+  // This read-only geometry check does not use Playwright to focus/type in
+  // the remote browser: the click below travels through stock noVNC pointer.
+  const markerScaleX = (marker.maxX - marker.minX + 4) / 260;
+  const markerScaleY = (marker.maxY - marker.minY + 4) / 120;
+  const remoteX =
+    marker.minX + (inputBox.x + inputBox.width / 2 - 80) * markerScaleX;
+  const remoteY =
+    marker.minY + (inputBox.y + inputBox.height / 2 - 180) * markerScaleY;
+  const clickX = canvasBox.x + (remoteX / marker.width) * canvasBox.width;
+  const clickY = canvasBox.y + (remoteY / marker.height) * canvasBox.height;
+  assert.ok(
+    clickX >= canvasBox.x &&
+      clickX < canvasBox.x + canvasBox.width &&
+      clickY >= canvasBox.y &&
+      clickY < canvasBox.y + canvasBox.height,
+    "synthetic_input_outside_remote_framebuffer",
   );
-  await client.evaluate(() => document.querySelector("#screen canvas").focus());
+  await client.mouse.click(clickX, clickY);
+  try {
+    await remotePage.waitForFunction(
+      () =>
+        document.hasFocus() && document.activeElement?.id === "synthetic-input",
+      undefined,
+      { timeout: 10_000 },
+    );
+  } catch {
+    const focus = await remotePage.evaluate(() => ({
+      document: document.hasFocus(),
+      active: document.activeElement?.id ?? null,
+    }));
+    throw new Error(
+      `synthetic_remote_pointer_focus_failed: ${JSON.stringify(focus)}`,
+    );
+  }
   await client.keyboard.type("AbC123", { delay: 40 });
   await expectSyntheticInput("AbC123", "ascii");
   await client.keyboard.press("Backspace");
@@ -178,10 +269,30 @@ try {
   // The clipboard is transmitted through stock RFB; this exact assertion
   // fails if the legacy Latin-1 clipboard path substitutes '?' for Unicode.
   await client.evaluate(() => window.syntheticDesktop.paste("中文😀"));
-  await client.waitForTimeout(300);
   await client.keyboard.press("Control+V");
   await expectSyntheticInput("AbC12中文😀", "unicode_clipboard");
+  // The identity probe only establishes the fixture's DOM and cookie.
+  // Separately prove the actual noVNC-rendered desktop is screenshotable;
+  // the headed remote Chromium's CDP capture is not part of identity.
+  await client.bringToFront();
+  await waitForSyntheticMarker(client);
+  let desktopImage;
+  try {
+    desktopImage = await client.locator("#screen canvas").screenshot({
+      type: "png",
+      timeout: 10_000,
+    });
+  } catch (error) {
+    throw new Error("synthetic_novnc_render_screenshot_failed", {
+      cause: error,
+    });
+  }
+  assert.ok(
+    desktopImage.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")),
+    "synthetic_novnc_render_invalid_png",
+  );
   const receipt = await runner.complete("synthetic");
+  assert.ifError(identityProbeError);
   await client.waitForFunction(
     () => window.syntheticDesktop.disconnected,
     undefined,
