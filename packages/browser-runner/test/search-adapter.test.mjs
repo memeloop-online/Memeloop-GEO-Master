@@ -198,22 +198,6 @@ test("candidate extractor rejects malformed provenance and unsafe citation URLs"
 });
 
 test("Kimi web measurement cannot report fixture data or plain chat as a verified search", async () => {
-  assert.equal(
-    adapters.kimi.allowLoginControl(new URL("https://www.kimi.com/")),
-    true,
-    "the Kimi homepage hosts the login modal",
-  );
-  assert.equal(
-    adapters.kimi.allowLoginControl(
-      new URL("https://www.kimi.com/other/account"),
-    ),
-    false,
-    "pixel login controls must stop outside the login surface",
-  );
-  assert.equal(
-    adapters.kimi.allowLoginControl(new URL("https://www.kimi.com.evil.test/")),
-    false,
-  );
   assert.deepEqual(await adapters.kimi.execute(null, "measure", {}), {
     status: "unsupported",
     reason: "invalid_measurement_payload",

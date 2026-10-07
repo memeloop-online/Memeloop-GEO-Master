@@ -186,43 +186,6 @@ impl BrowserBridge {
         started
     }
 
-    pub async fn snapshot(&self, id: Uuid) -> Result<BrowserSnapshot, AppError> {
-        let response = self
-            .client
-            .get(self.endpoint(id, "/snapshot"))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|_| {
-                AppError::new(
-                    ErrorCode::DependencyUnavailable,
-                    "browser runner unavailable",
-                )
-            })?;
-        Self::response(response).await
-    }
-
-    pub async fn action(
-        &self,
-        id: Uuid,
-        action: &BrowserAction,
-    ) -> Result<BrowserSnapshot, AppError> {
-        let response = self
-            .client
-            .post(self.endpoint(id, "/actions"))
-            .bearer_auth(&self.token)
-            .json(action)
-            .send()
-            .await
-            .map_err(|_| {
-                AppError::new(
-                    ErrorCode::DependencyUnavailable,
-                    "browser runner unavailable",
-                )
-            })?;
-        Self::response(response).await
-    }
-
     pub async fn complete(&self, id: Uuid) -> Result<VerifiedBrowserSession, AppError> {
         let response = self
             .client
@@ -440,61 +403,11 @@ pub struct BrowserIdentity {
     pub avatar_url: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, utoipa::ToSchema)]
-pub struct BrowserSnapshot {
-    pub phase: String,
-    pub url: String,
-    pub width: u32,
-    pub height: u32,
-    pub screenshot_base64: String,
-    #[serde(default)]
-    pub identity: Option<BrowserIdentity>,
-}
-
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct BrowserDesktopStatus {
     pub phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<BrowserIdentity>,
-}
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum BrowserAction {
-    Click { x: f64, y: f64 },
-    Type { text: String },
-    Key { key: String },
-    Scroll { delta_y: f64 },
-}
-
-impl Serialize for BrowserAction {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(None)?;
-        match self {
-            Self::Click { x, y } => {
-                map.serialize_entry("kind", "click")?;
-                map.serialize_entry("x", x)?;
-                map.serialize_entry("y", y)?;
-            }
-            Self::Type { text } => {
-                map.serialize_entry("kind", "type")?;
-                map.serialize_entry("text", text)?;
-            }
-            Self::Key { key } => {
-                map.serialize_entry("kind", "key")?;
-                map.serialize_entry("key", key)?;
-            }
-            Self::Scroll { delta_y } => {
-                map.serialize_entry("kind", "scroll")?;
-                map.serialize_entry("delta_y", delta_y)?;
-            }
-        }
-        map.end()
-    }
 }
 
 /// This type is never Serialize/Debug: raw storageState is server-only.

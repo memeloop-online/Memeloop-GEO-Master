@@ -1047,9 +1047,6 @@ export const adapters = Object.freeze({
     origin: "https://www.zhihu.com",
     entry: "https://www.zhihu.com/creator",
     operations: Object.freeze(["publish", "lookup"]),
-    allowLoginControl(url) {
-      return url.hostname === "www.zhihu.com" && url.pathname === "/signin";
-    },
     identify(page) {
       return probeOwnAccount(page, ZHIHU_SELF, zhihuIdentity);
     },
@@ -1076,12 +1073,6 @@ export const adapters = Object.freeze({
     origin: "https://baijiahao.baidu.com",
     entry: "https://baijiahao.baidu.com/builder/theme/bjh/login",
     operations: Object.freeze(["publish", "lookup"]),
-    allowLoginControl(url) {
-      return (
-        url.hostname === "baijiahao.baidu.com" &&
-        url.pathname.startsWith("/builder/theme/bjh/login")
-      );
-    },
     identify(page) {
       return probeOwnAccount(page, BAIDU_SELF, baiduIdentity);
     },
@@ -1095,11 +1086,6 @@ export const adapters = Object.freeze({
     origin: "https://creator.xiaohongshu.com",
     entry: "https://creator.xiaohongshu.com/login",
     operations: Object.freeze(["publish", "lookup"]),
-    allowLoginControl(url) {
-      return (
-        url.hostname === "creator.xiaohongshu.com" && url.pathname === "/login"
-      );
-    },
     identify(page) {
       return xiaohongshuIdentity(page);
     },
@@ -1113,9 +1099,6 @@ export const adapters = Object.freeze({
     origin: "https://www.kimi.com",
     entry: "https://www.kimi.com/",
     operations: Object.freeze(["measure"]),
-    allowLoginControl(url) {
-      return url.hostname === "www.kimi.com" && url.pathname === "/";
-    },
     identify(page) {
       return probeKimiAccount(page);
     },

@@ -82,7 +82,7 @@ export interface ProxyInput {
   password?: string;
 }
 
-export interface LoginSnapshot {
+export interface LoginStatus {
   phase: string;
   identity?: { display_name?: string; platform_account_id?: string } | null;
 }
@@ -242,21 +242,12 @@ export const startChannelLogin = (
       body: { project_id: projectId, account_id: accountId },
     },
   );
-export const getChannelLoginSnapshot = (
-  tenantId: string,
-  projectId: string,
-  sessionId: string,
-) =>
-  apiFetch<LoginSnapshot>(
-    `/channel-login-sessions/${encoded(sessionId)}/snapshot`,
-    scope(tenantId, projectId),
-  );
 export const getChannelLoginStatus = (
   tenantId: string,
   projectId: string,
   sessionId: string,
 ) =>
-  apiFetch<LoginSnapshot>(
+  apiFetch<LoginStatus>(
     `/channel-login-sessions/${encoded(sessionId)}/status`,
     scope(tenantId, projectId),
   );
@@ -355,12 +346,8 @@ export const startPoolLogin = (accountId: string) =>
     "/operator/channel-login-sessions",
     { method: "POST", body: { account_id: accountId } },
   );
-export const getPoolLoginSnapshot = (sessionId: string) =>
-  apiFetch<LoginSnapshot>(
-    `/operator/channel-login-sessions/${encoded(sessionId)}/snapshot`,
-  );
 export const getPoolLoginStatus = (sessionId: string) =>
-  apiFetch<LoginSnapshot>(
+  apiFetch<LoginStatus>(
     `/operator/channel-login-sessions/${encoded(sessionId)}/status`,
   );
 export const authorizePoolDesktop = (sessionId: string) =>

@@ -77,26 +77,6 @@ export function createRunnerServer({
         parts.length === 4 &&
         parts[0] === "v1" &&
         parts[1] === "sessions" &&
-        parts[3] === "snapshot" &&
-        request.method === "GET"
-      ) {
-        send(response, 200, await runner.snapshot(parts[2]));
-      } else if (
-        parts.length === 4 &&
-        parts[0] === "v1" &&
-        parts[1] === "sessions" &&
-        parts[3] === "actions" &&
-        request.method === "POST"
-      ) {
-        send(
-          response,
-          200,
-          await runner.action(parts[2], await readJson(request)),
-        );
-      } else if (
-        parts.length === 4 &&
-        parts[0] === "v1" &&
-        parts[1] === "sessions" &&
         parts[3] === "complete" &&
         request.method === "POST"
       ) {

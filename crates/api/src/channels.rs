@@ -24,9 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, AuthContext, RequestContext, api_error,
-    browser_bridge::{
-        BrowserAction, BrowserBridge, BrowserDesktopStatus, BrowserProxy, BrowserSnapshot,
-    },
+    browser_bridge::{BrowserBridge, BrowserDesktopStatus, BrowserProxy},
     require_project_writer,
 };
 
@@ -1223,29 +1221,6 @@ async fn valid_login(
     Ok(session)
 }
 
-pub async fn snapshot(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Query(query): Query<ChannelQuery>,
-    Extension(tenant): Extension<TenantScope>,
-    Extension(context): Extension<RequestContext>,
-) -> Result<Json<BrowserSnapshot>, ApiError> {
-    let scope = scope(&state, &tenant, query.project_id)
-        .await
-        .map_err(|e| err(e, context))?;
-    valid_login(&state, &scope, id)
-        .await
-        .map_err(|e| err(e, context))?;
-    let image = state
-        .channel_service()
-        .browser()
-        .map_err(|e| err(e, context))?
-        .snapshot(id)
-        .await
-        .map_err(|e| err(e, context))?;
-    Ok(Json(image))
-}
-
 #[derive(Serialize)]
 pub struct DesktopAuthorization {
     pub websocket_path: String,
@@ -1370,32 +1345,6 @@ pub async fn desktop_status(
             .await
             .map_err(|e| err(e, context))?,
     ))
-}
-
-pub async fn action(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Query(query): Query<ChannelQuery>,
-    Extension(tenant): Extension<TenantScope>,
-    Extension(auth): Extension<AuthContext>,
-    Extension(context): Extension<RequestContext>,
-    Json(input): Json<BrowserAction>,
-) -> Result<Json<BrowserSnapshot>, ApiError> {
-    writer(&auth, context)?;
-    let scope = scope(&state, &tenant, query.project_id)
-        .await
-        .map_err(|e| err(e, context))?;
-    valid_login(&state, &scope, id)
-        .await
-        .map_err(|e| err(e, context))?;
-    let snapshot = state
-        .channel_service()
-        .browser()
-        .map_err(|e| err(e, context))?
-        .action(id, &input)
-        .await
-        .map_err(|e| err(e, context))?;
-    Ok(Json(snapshot))
 }
 
 pub async fn complete_login(
@@ -1936,26 +1885,6 @@ async fn valid_pool_login(
     Ok(session)
 }
 
-pub async fn pool_snapshot(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Extension(auth): Extension<AuthContext>,
-    Extension(context): Extension<RequestContext>,
-) -> Result<Json<BrowserSnapshot>, ApiError> {
-    valid_pool_login(&state, &auth, id)
-        .await
-        .map_err(|e| err(e, context))?;
-    Ok(Json(
-        state
-            .channel_service()
-            .browser()
-            .map_err(|e| err(e, context))?
-            .snapshot(id)
-            .await
-            .map_err(|e| err(e, context))?,
-    ))
-}
-
 pub async fn pool_desktop_authorization(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -2053,27 +1982,6 @@ pub async fn pool_desktop_status(
             .browser()
             .map_err(|e| err(e, context))?
             .desktop_status(id)
-            .await
-            .map_err(|e| err(e, context))?,
-    ))
-}
-
-pub async fn pool_action(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Extension(auth): Extension<AuthContext>,
-    Extension(context): Extension<RequestContext>,
-    Json(input): Json<BrowserAction>,
-) -> Result<Json<BrowserSnapshot>, ApiError> {
-    valid_pool_login(&state, &auth, id)
-        .await
-        .map_err(|e| err(e, context))?;
-    Ok(Json(
-        state
-            .channel_service()
-            .browser()
-            .map_err(|e| err(e, context))?
-            .action(id, &input)
             .await
             .map_err(|e| err(e, context))?,
     ))
@@ -2212,17 +2120,12 @@ pub fn customer_routes() -> Router<AppState> {
             axum::routing::patch(patch_account).delete(delete_account),
         )
         .route("/channel-login-sessions", axum::routing::post(start_login))
-        .route("/channel-login-sessions/{id}/snapshot", get(snapshot))
         .route("/channel-login-sessions/{id}/status", get(desktop_status))
         .route(
             "/channel-login-sessions/{id}/desktop-authorization",
             axum::routing::post(desktop_authorization),
         )
         .route("/channel-login-sessions/{id}/desktop", get(desktop_socket))
-        .route(
-            "/channel-login-sessions/{id}/actions",
-            axum::routing::post(action),
-        )
         .route(
             "/channel-login-sessions/{id}/complete",
             axum::routing::post(complete_login),
@@ -2263,10 +2166,6 @@ pub fn operator_routes() -> Router<AppState> {
             axum::routing::post(start_pool_login),
         )
         .route(
-            "/operator/channel-login-sessions/{id}/snapshot",
-            get(pool_snapshot),
-        )
-        .route(
             "/operator/channel-login-sessions/{id}/status",
             get(pool_desktop_status),
         )
@@ -2277,10 +2176,6 @@ pub fn operator_routes() -> Router<AppState> {
         .route(
             "/operator/channel-login-sessions/{id}/desktop",
             get(pool_desktop_socket),
-        )
-        .route(
-            "/operator/channel-login-sessions/{id}/actions",
-            axum::routing::post(pool_action),
         )
         .route(
             "/operator/channel-login-sessions/{id}/complete",

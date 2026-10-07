@@ -22,6 +22,10 @@ before(async () => {
       <button id="connect" onclick="document.body.dataset.connected =
         document.querySelector('#account').value">Connect</button>
       <div id="identity"></div>
+      <script>
+        const stored = localStorage.getItem("account");
+        if (stored) document.body.dataset.connected = stored;
+      </script>
     </body></html>`);
   });
   await new Promise((resolve) => fixture.listen(0, "127.0.0.1", resolve));
@@ -30,7 +34,6 @@ before(async () => {
     connectorVersion: "fixture.v1",
     entry: url,
     operations: ["publish", "measure", "lookup"],
-    allowLoginControl: (current) => current.origin === new URL(url).origin,
     async inspectMeasurementOptions() {
       return {
         models: [{ id: "fixture-model", label: "Fixture model" }],
@@ -158,7 +161,7 @@ test("authenticated capabilities describe the running adapters without verificat
   );
 });
 
-test("auth, fixed platform list, and no arbitrary navigation/action", async () => {
+test("auth, fixed platform list, and retired control routes", async () => {
   assert.equal(
     (await request("/v1/sessions", "POST", {}, "wrong")).status,
     401,
@@ -182,9 +185,17 @@ test("auth, fixed platform list, and no arbitrary navigation/action", async () =
     ).body,
     { error: "unsupported_platform" },
   );
+  assert.deepEqual(
+    await request("/v1/sessions", "POST", {
+      session_id: "headless-login",
+      platform: "fixture",
+    }),
+    { status: 503, body: { error: "capability_missing" } },
+  );
   await request("/v1/sessions", "POST", {
     session_id: "control",
     platform: "fixture",
+    storage_state: { cookies: [], origins: [] },
   });
   assert.deepEqual(
     (
@@ -193,7 +204,7 @@ test("auth, fixed platform list, and no arbitrary navigation/action", async () =
         url,
       })
     ).body,
-    { error: "invalid_action" },
+    { error: "not_found" },
   );
   assert.deepEqual(
     (
@@ -202,8 +213,11 @@ test("auth, fixed platform list, and no arbitrary navigation/action", async () =
         key: "ControlOrMeta+L",
       })
     ).body,
-    { error: "invalid_action" },
+    { error: "not_found" },
   );
+  assert.deepEqual((await request("/v1/sessions/control/snapshot")).body, {
+    error: "not_found",
+  });
   assert.deepEqual(
     (await request("/v1/sessions/control/complete", "POST")).body,
     {
@@ -212,50 +226,23 @@ test("auth, fixed platform list, and no arbitrary navigation/action", async () =
   );
 });
 
-test("pixel-controlled login, verified identity, server-only state, and execution ledger", async () => {
+test("headless sessions require storage state and preserve the execution ledger", async () => {
   const created = await request("/v1/sessions", "POST", {
     session_id: "connected",
     platform: "fixture",
+    storage_state: {
+      cookies: [],
+      origins: [
+        {
+          origin: new URL(url).origin,
+          localStorage: [{ name: "account", value: "Fixture user" }],
+        },
+      ],
+    },
   });
   assert.deepEqual(created, {
     status: 201,
-    body: { session_id: "connected", phase: "login_required" },
-  });
-  const initial = await request("/v1/sessions/connected/snapshot");
-  assert.equal(initial.body.width, 1280);
-  assert.equal(initial.body.height, 800);
-  assert.ok(
-    Buffer.from(initial.body.screenshot_base64, "base64")
-      .subarray(0, 8)
-      .equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])),
-  );
-  // Playwright itself finds coordinates for this local fixture; the runner
-  // receives only pixels and keyboard input, never CSS selectors.
-  const coordinates = await (async () => {
-    const browser = await chromium.launch(testBrowserOptions);
-    try {
-      const page = await browser.newPage();
-      await page.goto(url);
-      const input = await page.locator("#account").boundingBox();
-      const button = await page.locator("#connect").boundingBox();
-      return { input, button };
-    } finally {
-      await browser.close();
-    }
-  })();
-  await request("/v1/sessions/connected/actions", "POST", {
-    kind: "click",
-    x: Math.round(coordinates.input.x + 10),
-    y: Math.round(coordinates.input.y + 10),
-  });
-  await request("/v1/sessions/connected/actions", "POST", {
-    kind: "type",
-    text: "Fixture user",
-  });
-  await request("/v1/sessions/connected/actions", "POST", {
-    kind: "click",
-    x: Math.round(coordinates.button.x + 10),
-    y: Math.round(coordinates.button.y + 10),
+    body: { session_id: "connected", phase: "ready_to_complete" },
   });
   const completed = await request("/v1/sessions/connected/complete", "POST");
   assert.equal(completed.status, 200);
@@ -280,15 +267,6 @@ test("pixel-controlled login, verified identity, server-only state, and executio
       )
     ).status,
     401,
-  );
-  assert.equal(
-    (
-      await request("/v1/sessions/connected/actions", "POST", {
-        kind: "key",
-        key: "Enter",
-      })
-    ).body.error,
-    "connection_completed",
   );
   const execution = {
     execution_id: "lookup-1",
@@ -356,7 +334,7 @@ test("pixel-controlled login, verified identity, server-only state, and executio
   assert.deepEqual((await request("/v1/sessions/connected", "DELETE")).body, {
     closed: true,
   });
-  assert.deepEqual((await request("/v1/sessions/connected/snapshot")).body, {
+  assert.deepEqual((await request("/v1/sessions/connected/status")).body, {
     error: "session_not_found",
   });
 });
@@ -393,7 +371,12 @@ test("proxy is passed to isolated browser context without direct retry", async (
     platformAdapters: { fixture: { entry: url } },
   });
   await assert.rejects(
-    isolated.create({ session_id: "proxied", platform: "fixture", proxy }),
+    isolated.create({
+      session_id: "proxied",
+      platform: "fixture",
+      proxy,
+      storage_state: { cookies: [], origins: [] },
+    }),
     /proxy_unavailable/,
   );
   assert.equal(contexts.length, 1);
@@ -444,7 +427,11 @@ test("the host stamps every execution outcome and ignores adapter metadata", asy
     platformAdapters: { fixture: adapter },
   });
   try {
-    await isolated.create({ session_id: "receipt", platform: "fixture" });
+    await isolated.create({
+      session_id: "receipt",
+      platform: "fixture",
+      storage_state: { cookies: [], origins: [] },
+    });
     await isolated.complete("receipt");
     adapter.connectorVersion = "fixture.changed.v2";
     const run = (execution_id, operation) =>
@@ -545,7 +532,11 @@ test("idle contexts and settled cache expire, but active execution is never reap
     maintenanceIntervalMs: 10_000,
   });
   try {
-    await expiring.create({ session_id: "ttl", platform: "fixture" });
+    await expiring.create({
+      session_id: "ttl",
+      platform: "fixture",
+      storage_state: { cookies: [], origins: [] },
+    });
     await expiring.complete("ttl");
     const input = {
       execution_id: "ttl-execution",
@@ -585,7 +576,7 @@ test("idle contexts and settled cache expire, but active execution is never reap
     await expiring.reap();
     assert.equal(closed, 1);
     await assert.rejects(
-      expiring.snapshot("ttl"),
+      expiring.status("ttl"),
       (error) => error.code === "session_not_found",
     );
   } finally {
@@ -635,7 +626,11 @@ test("a stalled execution expires as unknown and closes its context", async () =
     executionTimeoutMs: 20,
   });
   try {
-    await stalled.create({ session_id: "stalled", platform: "fixture" });
+    await stalled.create({
+      session_id: "stalled",
+      platform: "fixture",
+      storage_state: { cookies: [], origins: [] },
+    });
     await stalled.complete("stalled");
     const result = await stalled.execute({
       execution_id: "stalled-attempt",
@@ -653,7 +648,7 @@ test("a stalled execution expires as unknown and closes its context", async () =
     });
     assert.equal(closed, 1);
     await assert.rejects(
-      stalled.snapshot("stalled"),
+      stalled.status("stalled"),
       (error) => error.code === "session_not_found",
     );
   } finally {

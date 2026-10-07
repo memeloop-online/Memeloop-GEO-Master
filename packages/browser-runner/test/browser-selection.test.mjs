@@ -63,6 +63,7 @@ test("bundled chromium remains the default when no channel is configured", async
     await runner.create({
       session_id: "default",
       platform: "fixture",
+      storage_state: { cookies: [], origins: [] },
     });
     assert.deepEqual(capture.launches, [{ headless: true }]);
   } finally {
@@ -82,6 +83,7 @@ test("configured browsers use only their allowlisted Playwright channels", async
       await runner.create({
         session_id: browserChannel,
         platform: "fixture",
+        storage_state: { cookies: [], origins: [] },
         proxy: {
           server: "http://127.0.0.1:9999",
           username: "fixture-user",

@@ -128,14 +128,8 @@ test("interactive login pending retains input, then revokes input before final i
       () => runner.desktopEndpoint("desktop"),
       (e) => e.code === "desktop_unavailable",
     );
-    await assert.rejects(
-      runner.snapshot("desktop"),
-      (e) => e.code === "desktop_session_required",
-    );
-    await assert.rejects(
-      runner.action("desktop", { kind: "click", x: 1, y: 1 }),
-      (e) => e.code === "desktop_session_required",
-    );
+    assert.equal(runner.snapshot, undefined);
+    assert.equal(runner.action, undefined);
   } finally {
     await runner.shutdown();
   }

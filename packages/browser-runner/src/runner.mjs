@@ -5,20 +5,6 @@ import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
 
 const ID = /^[a-zA-Z0-9_-]{1,128}$/;
 const VIEWPORT = Object.freeze({ width: 1280, height: 800 });
-const KEYS = new Set([
-  "Enter",
-  "Tab",
-  "Escape",
-  "Backspace",
-  "Delete",
-  "ArrowUp",
-  "ArrowDown",
-  "ArrowLeft",
-  "ArrowRight",
-  "Home",
-  "End",
-  "ControlOrMeta+A",
-]);
 const OPERATIONS = new Set(["publish", "measure", "lookup"]);
 const BROWSER_CHANNELS = new Set(["chromium", "chrome", "msedge"]);
 const STATUSES = new Set([
@@ -268,24 +254,6 @@ export function createRunner(options = {}) {
       : "login_required";
   }
 
-  async function snapshot(id) {
-    const record = session(id);
-    if (record.desktop) throw new RunnerError(409, "desktop_session_required");
-    const screenshot = await record.page.screenshot({
-      type: "png",
-      animations: "disabled",
-    });
-    const size = record.page.viewportSize() ?? VIEWPORT;
-    return {
-      phase: await phase(record),
-      url: record.page.url(),
-      width: size.width,
-      height: size.height,
-      screenshot_base64: screenshot.toString("base64"),
-      ...(record.identity ? { identity: record.identity } : {}),
-    };
-  }
-
   async function create(input) {
     if (
       !fields(input, ["session_id", "platform", "storage_state", "proxy"]) ||
@@ -304,6 +272,9 @@ export function createRunner(options = {}) {
     }
     const proxy = parseProxy(input.proxy);
     const storageState = parseState(input.storage_state);
+    if (!desktop && !storageState) {
+      throw new RunnerError(503, "capability_missing");
+    }
     pendingSessions.add(input.session_id);
     let context;
     let desktopSession;
@@ -357,68 +328,6 @@ export function createRunner(options = {}) {
     } finally {
       pendingSessions.delete(input.session_id);
     }
-  }
-
-  async function action(id, input) {
-    const record = session(id);
-    if (record.desktop) throw new RunnerError(409, "desktop_session_required");
-    if (record.completed) throw new RunnerError(409, "connection_completed");
-    // Once identity is established, only typed executions may change page state.
-    if ((await phase(record)) === "ready_to_complete") {
-      throw new RunnerError(409, "connection_ready");
-    }
-    if (!record.adapter.allowLoginControl(new URL(record.page.url()))) {
-      throw new RunnerError(409, "connection_unverified");
-    }
-    if (!object(input) || typeof input.kind !== "string") {
-      throw new RunnerError(400, "invalid_action");
-    }
-    const page = record.page;
-    switch (input.kind) {
-      case "click":
-        if (
-          !fields(input, ["kind", "x", "y"]) ||
-          !Number.isInteger(input.x) ||
-          !Number.isInteger(input.y) ||
-          input.x < 0 ||
-          input.y < 0 ||
-          input.x >= VIEWPORT.width ||
-          input.y >= VIEWPORT.height
-        ) {
-          throw new RunnerError(400, "invalid_action");
-        }
-        await page.mouse.click(input.x, input.y);
-        break;
-      case "type":
-        if (
-          !fields(input, ["kind", "text"]) ||
-          typeof input.text !== "string" ||
-          input.text.length > 4096
-        ) {
-          throw new RunnerError(400, "invalid_action");
-        }
-        await page.keyboard.insertText(input.text);
-        break;
-      case "key":
-        if (!fields(input, ["kind", "key"]) || !KEYS.has(input.key)) {
-          throw new RunnerError(400, "invalid_action");
-        }
-        await page.keyboard.press(input.key);
-        break;
-      case "scroll":
-        if (
-          !fields(input, ["kind", "delta_y"]) ||
-          !Number.isFinite(input.delta_y) ||
-          Math.abs(input.delta_y) > 2000
-        ) {
-          throw new RunnerError(400, "invalid_action");
-        }
-        await page.mouse.wheel(0, input.delta_y);
-        break;
-      default:
-        throw new RunnerError(400, "invalid_action");
-    }
-    return snapshot(id);
   }
 
   async function complete(id) {
@@ -695,8 +604,6 @@ export function createRunner(options = {}) {
     desktopEndpoint,
     attachDesktopClient,
     status,
-    snapshot,
-    action,
     complete,
     measurementOptions,
     execute,

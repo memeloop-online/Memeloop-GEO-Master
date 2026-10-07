@@ -340,7 +340,11 @@ test("runner preserves the unknown candidate observation time without upgrading 
     },
   });
   try {
-    await runner.create({ session_id: "candidate", platform: "fixture" });
+    await runner.create({
+      session_id: "candidate",
+      platform: "fixture",
+      storage_state: { cookies: [], origins: [] },
+    });
     await runner.complete("candidate");
     const result = await runner.execute({
       execution_id: "candidate-execution",
