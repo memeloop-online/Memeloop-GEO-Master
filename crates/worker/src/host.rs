@@ -3998,8 +3998,10 @@ mod tests {
                     .unwrap()
                     .keys()
                     .map(String::as_str)
-                    .collect::<Vec<_>>(),
+                    .collect::<std::collections::BTreeSet<_>>(),
                 ["attempts", "next_retry_at", "reason"]
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
             );
             assert!(!visible.to_string().contains("sql"));
             assert!(!visible.to_string().contains("credential"));

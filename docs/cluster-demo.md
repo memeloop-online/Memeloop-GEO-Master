@@ -99,6 +99,11 @@ GEO_PRODUCTION_AGENT_BUNDLE_SHA256=<matching line from /opt/geo/bundles/SHA256SU
 数据库中的租户模型路由仍必须由部署者显式配置；普通推理能力不等于官方
 搜索、引用或真实渠道测量验收。生产镜像绝不包含模型密钥。
 
+隔离测试部署可选用 [`scoped-test-ai.md`](scoped-test-ai.md) 的显式项目级推理配置；
+它与上述生产配置互斥，不代替正式租户权益和 Token Center 验收。必须使用同版
+镜像内的 bundle 摘要，通过秘密引用注入已批准的测试凭据，并分别验证实际回合、
+持久历史和跨项目拒绝。不要直接复用解析服务配置来推断工作台已启用。
+
 原生内容 fan-out bundle 额外使用以下两项，必须一起设置或一起缺省：
 
 ```text
@@ -107,7 +112,7 @@ GEO_CONTENT_BUNDLE_SHA256=<matching line from /opt/geo/bundles/SHA256SUMS>
 ```
 
 无模型时，经过摘要校验的内容 bundle 仍可用于已经封存内容的分发准备；
-新的正文生成仍需要生产模型配置。缺少或错误摘要会使 API 拒绝启动相关配置。
+新的正文生成仍需要适用作用域内的模型配置。缺少或错误摘要会使 API 拒绝启动相关配置。
 
 ### 浏览器交互执行器部署
 
