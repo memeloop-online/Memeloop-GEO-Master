@@ -8,6 +8,52 @@ const privateField =
   /^(?:authorization|cookies?|password|access_?token|refresh_?token|session_?(?:token|key)|api_?key|email|phone|user_?id|account_?id)$/iu;
 const reasoningField = /^(?:think|thinking|reasoning|reasoning_content)$/iu;
 
+const diagnosticStages = new Set([
+  "input_validation",
+  "navigation",
+  "configuration",
+  "composer",
+  "capture",
+  "rendered_answer",
+  "extraction_prompt",
+  "extraction",
+  "interpretation",
+]);
+const diagnosticCodes = new Set([
+  "unverified",
+  "capture_unverified",
+  "returned_none",
+  "grounding_rejected",
+  "grounded",
+  "cancelled",
+  "budget_exhausted",
+  "unexpected_exception",
+]);
+const diagnosticRoutes = new Set(["signed_in_browser", "configured_model_api"]);
+
+/** Only fixed vocabulary crosses this diagnostic boundary, never source data. */
+export function reportObservationDiagnostic(onDiagnostic, stage, code, route) {
+  if (!diagnosticStages.has(stage) || !diagnosticCodes.has(code)) return;
+  const diagnostic = {
+    kind: "observation_diagnostic",
+    schema_version: "geo.observation.diagnostic.v1",
+    stage,
+    code,
+    ...(diagnosticRoutes.has(route) ? { route } : {}),
+  };
+  try {
+    onDiagnostic?.(diagnostic);
+  } catch {
+    // Diagnostics must not alter execution or trigger another submission.
+  }
+}
+
+export function observationAbortCode(signal) {
+  return signal?.reason?.name === "TimeoutError"
+    ? "budget_exhausted"
+    : "cancelled";
+}
+
 /** Transport data only. Credentials and private model reasoning are not inputs. */
 export function observationDocument(exchange, renderedText) {
   const clean = (value) => {
@@ -47,7 +93,7 @@ Return exactly ONE JSON object, without Markdown, following this schema:
 {"decision":"searched_answer","chat_id":{"path":"/messages/0/..."},"message_id":{"path":"/messages/1/..."},"answer_owner":{"path":"/messages/2/..."},"search_owner":{"path":"/messages/3/..."},"search_block_id":{"path":"/messages/3/..."},"completion":{"path":"/messages/4/..."},"search_activity":{"path":"/messages/3/..."},"answer_segments":[{"path":"/messages/5/..."}],"citations":[{"url":{"path":"/messages/6/..."},"usage":{"path":"/messages/7/..."}}]}
 All paths are RFC6901 JSON Pointers into the document represented by the numbered records. Never invent field names. IDs must come from the source. answer_owner and search_owner must point to the actual owning assistant message IDs, equal to message_id. completion must identify source evidence of FINAL successful assistant completion, not an intermediate state. search_activity must identify a completed web-search tool result/activity owned by that assistant. search_block_id is that tool/search block's ID.
 answer_segments select the final assistant answer only, excluding thinking, UI labels, question echoes and tool contents. Select full source strings where possible. If streaming deltas are the only source, list exact string paths in order. Do not duplicate repeated full snapshots. To select a substring, use {"path":"...","quote":"exact unique verbatim source substring"}; do not count character offsets. /rendered_text is available for exact final displayed answer substrings.
-Each citation URL must be a literal URL in the source; usage must point to evidence that this specific URL was used/referenced by the final answer (e.g. an answer citation marker mapped to that source or the assistant's own reference collection). Search results alone are NOT answer citations. Unused hits must be omitted. Preserve actual URLs, never infer or repair URLs. Up to 50 citations.
+Each citation URL must be a literal URL in the source. The url.path must resolve to JUST the URL string, NOT an entire sentence or Markdown answer. Prefer a dedicated source URL field. If the URL exists only inside text, use url:{"path":"...","quote":"https://exact-url-from-source"} to select its exact unique substring. usage must point to evidence that this specific URL was used/referenced by the final answer (e.g. an answer citation marker mapped to that source or the assistant's own reference collection). Search results alone are NOT answer citations. Unused hits must be omitted. Preserve actual URLs, never infer or repair URLs. Up to 50 citations.
 If completion, actual search, ownership, answer, or citation association cannot be established, return {"decision":"unverified"}. A truly completed searched answer with no citations may have [].
 SOURCE RECORDS:
 ${records.join("\n")}`;
@@ -160,13 +206,28 @@ export async function interpretObservation(
     browserExtract,
     apiExtract = invokeExtractionApi,
     signal,
+    onDiagnostic,
   } = {},
 ) {
-  const document = observationDocument(exchange, renderedText);
+  if (signal?.aborted) {
+    reportObservationDiagnostic(
+      onDiagnostic,
+      "extraction_prompt",
+      observationAbortCode(signal),
+    );
+    return null;
+  }
+  let document;
   let prompt;
   try {
+    document = observationDocument(exchange, renderedText);
     prompt = extractionPrompt(document);
   } catch {
+    reportObservationDiagnostic(
+      onDiagnostic,
+      "extraction_prompt",
+      "unexpected_exception",
+    );
     return null;
   }
   const attempts = [];
@@ -179,12 +240,43 @@ export async function interpretObservation(
     try {
       result = await invoke(prompt, { signal });
     } catch {
+      reportObservationDiagnostic(
+        onDiagnostic,
+        "extraction",
+        "unexpected_exception",
+        route,
+      );
       result = null;
     }
-    if (signal?.aborted) return null;
-    const grounded = result
-      ? validateAiObservation(document, result.extracted)
-      : null;
+    if (signal?.aborted) {
+      reportObservationDiagnostic(
+        onDiagnostic,
+        "extraction",
+        observationAbortCode(signal),
+        route,
+      );
+      return null;
+    }
+    let grounded;
+    try {
+      grounded = result
+        ? validateAiObservation(document, result.extracted)
+        : null;
+    } catch {
+      reportObservationDiagnostic(
+        onDiagnostic,
+        "extraction",
+        "unexpected_exception",
+        route,
+      );
+      grounded = null;
+    }
+    reportObservationDiagnostic(
+      onDiagnostic,
+      "extraction",
+      grounded ? "grounded" : result ? "grounding_rejected" : "returned_none",
+      route,
+    );
     attempts.push({ route, status: grounded ? "grounded" : "unverified" });
     if (!grounded) continue;
     return {
@@ -197,6 +289,7 @@ export async function interpretObservation(
         model: result.model,
         surface: result.surface,
         attempts,
+        source_json: JSON.stringify(document),
         source_sha256: createHash("sha256")
           .update(JSON.stringify(document))
           .digest("hex"),

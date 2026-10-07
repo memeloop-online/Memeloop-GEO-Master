@@ -43,7 +43,8 @@ SEO / GEO 是同组内不同证据视图，不新建相互独立的项目、内�
 | `seo.site.change.prepare.v1` | 页面快照、内容版本、目标适配器 | 不可变 change set、检查结果 |
 | `seo.site.change.apply.v1` | change set ID、幂等键 | 写入意图、执行状态、证据引用 |
 | `seo.site.change.rollback.v1` | 原变更 ID、幂等键 | 条件回滚意图与结果 |
-| `seo.index.observe.v1` | 公开资产、已授权连接 | 独立索引观察任务 |
+| `seo.index.observe.v1` | 公开资产、观察类型、适用连接引用 | 独立观察任务或该类型 unsupported |
+| `content.distribute.request.v1` | 固定正文版本、渠道/账号引用、幂等键 | 单篇分发请求与既有意图引用 |
 
 现有知识、内容、媒体、分发、独立测量、渠道建议和报告工具复用，不为 SEO 复制工具链。
 所有写工具采用严格 DTO；tenant/project/member 由 Rust bridge 注入，模型不得指定。
@@ -65,8 +66,13 @@ SEO / GEO 是同组内不同证据视图，不新建相互独立的项目、内�
 默认遵守 robots；抓取失败、禁止或不可判定分别记录，不静默绕过。
 robots 允许抓取不等于获得修改或账号权限；站点范围授权与写权限分别校验。
 取消停止新出站及新页领取，正在保存的证据可完成；重启按已冻结队列恢复而非重抓全部页面。
-rendered 模式同样约束脚本、iframe、XHR、图片和下载请求，不能只验证顶层导航。
+页面导航与链接发现严格遵守冻结范围；rendered 模式同样约束脚本、iframe、XHR、图片和下载请求。
+渲染所需公网 CDN/脚本/XHR 等子资源使用独立请求数、字节和时间预算，逐次校验实际请求与重定向的 SSRF 边界。
+子资源加载不将其 URL 加入页面发现队列，不赋予跨域页面抓取权限；iframe 文档导航仍受页面范围限制。
+依赖被阻断或超预算时记录 `rendered_partial` 及依赖缺口，只降级受影响的渲染结论。
+已取得的 HTTP 正文、状态和 robots 等证据仍有效，不因单个渲染依赖失败将整份报告改为 unknown。
 默认拒绝登录态页面，不附加发布账号 Cookie；抓取连接与渠道登录上下文隔离。
+公开页面的只读诊断输入网址即可开始，不要求额外 DNS 所有权验证或人工审批；站长私有数据和官网写入才需要相应连接权限。
 
 ### 3.2 网络安全
 
@@ -74,7 +80,7 @@ URL 仅接受 HTTP(S)，拒绝用户信息、非许可端口、混淆主机、�
 DNS 每次连接和每跳重定向重新校验；阻断 loopback、私网、链路本地、保留地址和云元数据。
 同时覆盖 IPv4、IPv6、映射地址、DNS 重绑定及代理解析差异；连接实际目的地址必须符合校验结果。
 链接、canonical、sitemap 和 hreflang 的外域值可以记录为证据，但不能自动扩张允许抓取范围。
-重定向跳出授权同域/路径范围时记录边界并停止跟随；新增范围必须走独立授权修订。
+页面重定向跳出授权同域/路径范围时记录边界并停止跟随；新增范围必须走独立授权修订。
 站点抓取策略只限制 SEO 出站执行器，不改变应用自身内网演示访问、数据库或合法内部服务调用。
 证据正文与 URL 查询参数按敏感信息策略处理；凭据、私人入口和真实运行上下文不进入公开仓库。
 
@@ -97,6 +103,10 @@ structured data 先校验语法和适用 schema，再指出内容不一致；通
 外部关键词估算必须标 `estimated`、方法与日期；AI 预测的问题必须标 `model_predicted`。
 `observed`、`estimated`、`model_predicted` 不混合求和，也不以空值替代零。
 查询按意图/主题聚类，再关联已存在页面、知识来源和内容机会；聚类模型及输入版本可回溯。
+模型预测、公开页面观测和授权站长实际查询分别保存来源记录与用途，不能只用同一自由文本字段区分。
+机会采用后持久关联内容 revision、渠道变体、问题集版本及适用 cycle，记录采用理由与原证据引用。
+服务端按租户、项目、用途和授权筛出 eligible evidence refs；聚类、生成及每次后续读取均重新校验。
+冻结评估题、逐题答案以及可还原其内容的摘要/派生字段不得进入优化工具，不能依赖模型自行遵守。
 首次实现确定性标准化、精确关联及有界模型聚类，不因尚无搜索量供应商而编造指标。
 无授权数据时允许使用页面诊断和模型建议，但卡片明确未连接实际搜索表现。
 
@@ -113,10 +123,12 @@ structured data 先校验语法和适用 schema，再指出内容不一致；通
 | `PageSnapshot` | crawl/page key、URL、安全规范化 URL、fetch/render 时间、状态、内容摘要、证据对象 |
 | `SeoFinding` | snapshot、rule_version、证据位置、类别、severity、修复范围 |
 | `SearchDataset` | connection、日期/维度、页游标、完整性、来源/观察类别、不可变数据版本 |
-| `OpportunityCluster` | dataset/问题集引用、聚类版本、页面/知识绑定、建议依据 |
+| `OpportunityCluster` | 合格来源引用、聚类版本、页面/知识绑定、用途；预测/公开观测/实际查询独立来源 |
+| `OpportunityAdoption` | cluster、eligible evidence refs、content_revision、variant、question_set_revision、适用 cycle、采用理由 |
+| `ContentDistributionRequest` | 冻结 revision、渠道/账号、请求摘要、稳定幂等键、既有 intent 引用；不自建发布状态机 |
 | `SiteChangeSet` | 原快照/远端版本、内容 revision、适配器版本、diff 摘要、校验结果、回滚引用 |
 | `SiteChangeAttempt` | change_set、稳定发送键、租约、远端版本/事件关联、未知状态 |
-| `IndexObservation` | asset、provider/surface、观察/接收时间、状态、证据引用 |
+| `IndexObservation` | asset、观察类型、provider/surface、适用查询/时地、观察/接收时间、状态、证据引用 |
 
 HTTP 均位于现有 `/api/v1/projects/{project_id}` 下，使用会话权限及现有 CSRF/Origin 防护：
 
@@ -131,6 +143,9 @@ GET  /seo/crawls/{id}/findings
 POST /search-connections/{id}/sync
 GET  /seo/search-datasets/{id}
 GET  /seo/opportunities
+POST /seo/opportunities/{id}/adoptions
+POST /content-distribution-requests
+GET  /content-distribution-requests/{id}
 POST /site-changes
 POST /site-changes/{id}/apply
 POST /site-changes/{id}/rollback
@@ -186,9 +201,26 @@ change set 保存 base ETag/commit/revision 和目标 diff；执行前复核，�
 Git/CMS 的既有保护规则仍生效；没有直接写权限时只生成可导出成果，不要求用户为产品新建审批流程。
 变更成功后重新抓取公开页面；索引与 AI 观测仍通过独立任务获取，不能承诺自动收录或引用。
 
+### 5.4 本篇立即分发与后续默认范围
+
+“把本篇发到指定渠道”与“以后默认包含该渠道”是独立意图；前者不得顺带修改项目默认范围。
+意图明确时直接执行已授权动作，无需确认；正文版本、目标或意图真正歧义时只问一次必要问题。
+当前单篇即时分发尚无完备正式命令；新增薄 `ContentDistributionRequest`，受理时固定当前 content revision、渠道及账号。
+复用现有变体、PublicationIntent、outbox、发送前检查和只读查回，不建立第二套发送账本或发布状态机。
+请求重试复用稳定键；发送前按固定版本、目标、账号及格式检查已有有效回执或在途/未知意图并关联。
+已有效发布则复用；在途等待，unknown 只查回；超时、对话重试和重复事件不能触发第二次发送。
+更改后续默认范围沿用既有项目修订 API 和 `distribution_scope`；不追改当前或已冻结周期。
+单篇动作在报告单列；仅按执行前已明确的冻结覆盖匹配规则关联原覆盖项，不改变分母或事后补算。
+请求、采用关系与报告投影均复核同作用域资源；跨项目 revision、账号或原意图引用必须拒绝。
+
 ## 6. 周报与效果口径
 
 SEO 记录页面技术状态、实际站长表现和独立索引证据；GEO 记录固定协议下回答、提及及引用样本。
+外部渠道公开文章同样进入 SEO 只读观测和共同 ReportSnapshot，不以官网写权限或 CMS 接入为前置条件。
+匿名可读、允许索引信号、某查询/时间/地区的 SERP 命中、官方索引状态和 AI 引用分别保存，不互相替代。
+允许索引信号仅说明已观察到的 robots/noindex 等条件，SERP 未命中也不能直接判定未收录。
+站长连接仅能查询其实际授权 property；第三方文章无官方索引权限时该类型为 unsupported，不借本站连接查询外域。
+公开读取与合法 SERP 观测可独立进行；某类型 unsupported 不抹去其他已取得的证据。
 AI mentions 只能称为“本次样本中的提及次数/比例”，必须显示样本分母、缺测、模型、时间和观测面。
 不能把采样 mentions、引用频次或模型预测转成真实用户曝光、访问量、平台权重或因果增量。
 报告冻结覆盖清单与截止；发布未知、公开资产存在、收录未知、引用缺测各自保留。
@@ -201,10 +233,12 @@ AI mentions 只能称为“本次样本中的提及次数/比例”，必须显�
 ### I1：已有发布路径真实闭环
 
 复用持久账号、能力 bootstrap、正式分发及查回账本，补齐真实知乎发送和匿名完整读回证据。
+同时交付薄单篇分发请求、公开资产基础 SEO 观测与共同周报投影，不等待官网写入迭代。
 验收从实际 P00/详情页面开始：用户完成必要登录后自动发送，离开/返回页面显示同一任务。
 验证账号归属、内容全文、匿名可见、发送仅一次；实测未知结果没有“重发”恢复路径。
 故障注入覆盖发送前崩溃、发送后丢回执、重复事件、重启及多副本领取。
 单元、夹具、CI 和真实外部验收分别记录；不得用绿色 CI 替代本门槛。
+最小 E2E：聊天指定当前 revision 分发且默认范围不变 → 超时重试仅发送一次并查回 → 公开 SEO 观测 → 共同周报且冻结分母不变 → 优化工具拒绝 heldout 证据读取。
 
 ### I2：富文本与图片正式分发
 
@@ -216,15 +250,18 @@ AI mentions 只能称为“本次样本中的提及次数/比例”，必须显�
 ### I3：SEO 只读诊断与站长数据
 
 交付范围配置、raw/rendered 抓取、取消/恢复、规则诊断、站长连接及查询/页面聚类。
+完善外部公开资产的分类型 SEO 观察、共同周报，以及机会到内容/变体/问题集/周期的持久采用关系。
 用受控公开页面验证重定向、robots/noindex、canonical、sitemap/hreflang、重复与结构化数据。
 安全测试覆盖内网/IPv6/重绑定/跨域跳转/浏览器子请求；不破坏内部演示登录访问。
+验证公网 CDN 正常加载但不扩页队列、阻断依赖仅造成 rendered_partial、有效 HTTP/robots 结论仍保留。
+跨租户/用途读取、heldout 派生摘要及撤权证据必须被拒绝；无外域站长权限显示 unsupported。
 实际浏览器验证 SEO/GEO 标签、空数据/部分抓取/分页、AI 发起与详情读回、授权失效和重启恢复。
 
 ### I4：官网写入及独立效果观察
 
 至少接一种已授权 CMS/Git/patch 适配器，验证有写权限自动修改、公开复查和条件回滚。
 无写权限仅诊断/导出；并发页面修改、重复命令及未知写入不得覆盖或盲目重试。
-交付独立索引观察、不可变周报和下一轮增量；真实缺测必须在卡片、报告和导出一致出现。
+官网变更接入 I1/I3 已建立的独立观察和共同周报，补下一轮增量；真实缺测在卡片、报告和导出一致出现。
 验证截止前后、旧周期复用、来源撤销、权限撤销和跨租户读取；任一 HTTP 成功不得自动标记收录/AI 引用。
 
 ### I5：独立渠道扩展

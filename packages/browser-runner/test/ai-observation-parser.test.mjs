@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
+import { validateAiObservation } from "../src/ai-observation-grounding.mjs";
 import {
   configuredExtractionModel,
   extractionPrompt,
@@ -8,6 +9,7 @@ import {
   invokeExtractionApi,
   observationDocument,
   parseExtractionJson,
+  reportObservationDiagnostic,
 } from "../src/ai-observation-parser.mjs";
 
 // Synthetic transport and extraction results only; no external requests.
@@ -67,6 +69,88 @@ const api = (fetchImpl, options = {}) =>
     fetchImpl,
     ...options,
   });
+
+test("failed extraction emits only allowlisted route diagnostics and preserves null", async () => {
+  const diagnostics = [];
+  const result = await interpretObservation(exchange, {
+    browserExtract: async () => null,
+    apiExtract: async () =>
+      extraction({ extracted: { decision: "unverified" } }),
+    onDiagnostic: (entry) => diagnostics.push(entry),
+  });
+  assert.equal(result, null);
+  assert.deepEqual(diagnostics, [
+    {
+      kind: "observation_diagnostic",
+      schema_version: "geo.observation.diagnostic.v1",
+      stage: "extraction",
+      code: "returned_none",
+      route: "signed_in_browser",
+    },
+    {
+      kind: "observation_diagnostic",
+      schema_version: "geo.observation.diagnostic.v1",
+      stage: "extraction",
+      code: "grounding_rejected",
+      route: "configured_model_api",
+    },
+  ]);
+});
+
+test("exceptions and cancellation diagnostics never retain arbitrary details", async () => {
+  for (const reason of [
+    new Error("synthetic-private-error"),
+    new DOMException("synthetic-private-error", "TimeoutError"),
+  ]) {
+    const controller = new AbortController();
+    const diagnostics = [];
+    let apiCalls = 0;
+    assert.equal(
+      await interpretObservation(exchange, {
+        signal: controller.signal,
+        browserExtract: async () => {
+          controller.abort(reason);
+          throw new Error("synthetic-private-error");
+        },
+        apiExtract: async () => {
+          apiCalls += 1;
+        },
+        onDiagnostic: (entry) => diagnostics.push(entry),
+      }),
+      null,
+    );
+    assert.equal(apiCalls, 0);
+    assert.equal(
+      diagnostics.at(-1).code,
+      reason.name === "TimeoutError" ? "budget_exhausted" : "cancelled",
+    );
+    assert.doesNotMatch(
+      JSON.stringify(diagnostics),
+      /synthetic-private|example\.org|chat-synthetic|source-backed/u,
+    );
+  }
+  const diagnostics = [];
+  const collect = (entry) => diagnostics.push(entry);
+  reportObservationDiagnostic(collect, "synthetic-private", "returned_none");
+  reportObservationDiagnostic(collect, "extraction", "synthetic-private");
+  reportObservationDiagnostic(
+    collect,
+    "extraction",
+    "returned_none",
+    "synthetic-private",
+  );
+  assert.equal(diagnostics.length, 1);
+  assert.equal(Object.hasOwn(diagnostics[0], "route"), false);
+  assert.doesNotThrow(() =>
+    reportObservationDiagnostic(
+      () => {
+        throw new Error("synthetic-private");
+      },
+      "extraction",
+      "returned_none",
+    ),
+  );
+});
 
 test("document removes nested private fields and reasoning without mutating source or indexes", () => {
   const source = structuredClone(exchange);
@@ -564,4 +648,35 @@ test("grounded searched answers can preserve an empty citation list without fabr
       status: "grounded",
     },
   ]);
+});
+
+test("audit preserves replayable sanitized source JSON bound to the exact digest", async () => {
+  const source = structuredClone(exchange);
+  source.messages[0].authorization = "synthetic-private-credential";
+  source.messages[1].reasoning = "synthetic-private-reasoning";
+  source.messages[2].metadata = { account_id: "synthetic-private-account" };
+  const renderedText = "The source-backed answer.";
+  const result = await interpretObservation(source, {
+    renderedText,
+    browserExtract: async () => extraction(),
+    apiExtract: async () => {
+      throw new Error("API fallback must not run");
+    },
+  });
+  const expectedDocument = observationDocument(source, renderedText);
+  assert.equal(result.audit.source_json, JSON.stringify(expectedDocument));
+  assert.doesNotMatch(result.audit.source_json, /synthetic-private/u);
+  assert.equal(
+    result.audit.source_sha256,
+    createHash("sha256").update(result.audit.source_json, "utf8").digest("hex"),
+  );
+  const replayed = validateAiObservation(
+    JSON.parse(result.audit.source_json),
+    extracted,
+  );
+  assert.equal(replayed.raw_answer, result.raw_answer);
+  assert.deepEqual(replayed.citations, result.citations);
+  assert.equal(replayed.chat_id, result.chat_id);
+  assert.equal(replayed.message_id, result.message_id);
+  assert.deepEqual(replayed.audit.refs, result.audit.refs);
 });

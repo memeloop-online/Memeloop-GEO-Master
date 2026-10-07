@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 const ID = /^[A-Za-z0-9_-]{1,128}$/u;
 const MAX_ANSWER_BYTES = 100_000;
 const MAX_AUDIT_BYTES = 512;
-const MAX_SEGMENTS = 64;
+const MAX_SEGMENTS = 32_768;
 const MAX_CITATIONS = 50;
 
 const object = (value) =>
@@ -126,14 +126,35 @@ export function validateAiObservation(document, extracted) {
     return null;
 
   const refs = [];
-  const resolve = (candidate, role, valid = nonempty) => {
+  const resolve = (candidate, role, valid = nonempty, allowQuote = false) => {
     if (!object(candidate) || typeof candidate.path !== "string") return null;
     const found = pointer(document, candidate.path);
-    if (!found || !valid(found.value)) return null;
-    const value = auditValue(found.value);
+    if (!found) return null;
+    let selected = found.value;
+    if (allowQuote && Object.hasOwn(candidate, "quote")) {
+      if (
+        typeof selected !== "string" ||
+        typeof candidate.quote !== "string" ||
+        !candidate.quote ||
+        !selected.includes(candidate.quote) ||
+        selected.indexOf(candidate.quote) !==
+          selected.lastIndexOf(candidate.quote)
+      )
+        return null;
+      selected = candidate.quote;
+    }
+    if (!valid(selected)) return null;
+    const value = auditValue(selected);
     if (!value) return null;
-    refs.push({ role, path: found.path, ...value });
-    return found.value;
+    refs.push({
+      role,
+      path: found.path,
+      ...(allowQuote && candidate.quote !== undefined
+        ? { quote: candidate.quote }
+        : {}),
+      ...value,
+    });
+    return selected;
   };
   const validId = (value) => typeof value === "string" && ID.test(value);
   const chatId = resolve(extracted.chat_id, "chat_id", validId);
@@ -197,7 +218,7 @@ export function validateAiObservation(document, extracted) {
     }
     const exact = source.slice(start, end);
     if (
-      !exact.trim() ||
+      !exact.length ||
       /[\uD800-\uDBFF]$/u.test(source.slice(0, start)) ||
       /^[\uDC00-\uDFFF]/u.test(source.slice(start)) ||
       /[\uD800-\uDBFF]$/u.test(exact)
@@ -222,7 +243,7 @@ export function validateAiObservation(document, extracted) {
   const citations = [];
   for (const citation of extracted.citations) {
     if (!object(citation)) return null;
-    const url = resolve(citation.url, "citation_url", publicUrl);
+    const url = resolve(citation.url, "citation_url", publicUrl, true);
     const usage = resolve(citation.usage, "citation_usage");
     if (!url || usage === null) return null;
     if (!citations.includes(url)) citations.push(url);

@@ -697,6 +697,17 @@ pub(crate) fn measurement_observation(
             .iter()
             .filter(|value| value["kind"] == "observation_extraction");
         let audit = audits.next()?;
+        // Sanitized runner input is retained only in tenant-scoped evidence,
+        // allowing replay without promoting model interpretation to raw facts.
+        let source_json = audit["source_json"].as_str()?;
+        if source_json.len() > 750_000 || sha256_hex(source_json.as_bytes()) != event.source_sha256
+        {
+            return None;
+        }
+        let source: serde_json::Value = serde_json::from_str(source_json).ok()?;
+        if !source.is_object() || !source["messages"].is_array() {
+            return None;
+        }
         if audits.next().is_some()
             || audit["method"] != "llm_grounded"
             || audit["model"].as_str() != Some(event.extraction_model.as_str())

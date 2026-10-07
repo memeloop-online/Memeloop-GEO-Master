@@ -25,7 +25,7 @@
 
 新增 AI 提取路径：浏览器保留请求/流完整性关联，模型解释响应结构，通用 JSON Pointer 校验器仅核对来源存在、消息归属值及原文片段，不声称确定性证明模型的语义判断。优先使用同一登录上下文中的独立解析会话，失败时使用部署配置的低成本模型；两种解析方式均不是新的测量样本，测量平台/观测面不改变。旧字段归并器只保留历史合成回归，不作为生产回退。
 
-AI 路径使用 `geo.measure.official_search.v3`，事件来源为 `provider_connect_stream_ai`，保存实际聊天/消息/块标识、原测量请求摘要与时间，并绑定解析模型、提示版本及脱敏源摘要。不虚构供应商 event offset。另存唯一 `observation_extraction` 审计，`method=llm_grounded`，记录原文定位及有界证据；服务端同时校验冻结测量字段、真实 runner 来源和审计绑定。
+AI 路径使用 `geo.measure.official_search.v3`，事件来源为 `provider_connect_stream_ai`，保存实际聊天/消息/块标识、原测量请求摘要与时间，并绑定解析模型、提示版本及脱敏源摘要。不虚构供应商 event offset。另存唯一 `observation_extraction` 审计，`method=llm_grounded`，记录原文定位、有界证据及可重放的脱敏 `source_json`；服务端同时校验冻结测量字段、真实 runner 来源、源 JSON 结构和摘要绑定。源 JSON 仅保存在租户作用域内的证据记录，不进入公开仓库或日志。
 
 解析模型配置仅从服务端 `GEO_OBSERVATION_AI_BASE_URL`、`GEO_OBSERVATION_AI_API_KEY`、`GEO_OBSERVATION_AI_MODEL` 读取。没有可用解析结果时仍为未验证，不转为“未提及”。解析输入不包含凭据、账号身份字段或私有推理内容；模型输出不能引入源中不存在的回答和 URL。合成测试不能替代实际账号及模型验收。
 

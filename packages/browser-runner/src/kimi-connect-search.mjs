@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { captureConnectExchange } from "./connect-browser-capture.mjs";
-import { interpretObservation } from "./ai-observation-parser.mjs";
+import {
+  interpretObservation,
+  observationAbortCode,
+  reportObservationDiagnostic,
+} from "./ai-observation-parser.mjs";
 import { extractWithSignedInBrowser } from "./browser-ai-extraction.mjs";
 
 const ORIGIN = "https://www.kimi.com";
@@ -376,15 +380,30 @@ export async function observeKimiConnectSearch(
     deadlineAt,
     signal,
     interpret = interpretObservation,
+    onDiagnostic,
   } = {},
 ) {
+  let stage = "input_validation";
+  const unverified = (code = "unverified") => {
+    reportObservationDiagnostic(
+      onDiagnostic,
+      stage,
+      signal?.aborted
+        ? observationAbortCode(signal)
+        : deadlineAt !== undefined && performance.now() >= deadlineAt
+          ? "budget_exhausted"
+          : code,
+    );
+    return null;
+  };
   if (
     !page ||
     !payload ||
     typeof payload.model !== "string" ||
     !/^[\w.-]{1,128}$/u.test(payload.model)
   )
-    return null;
+    return unverified();
+  if (signal?.aborted) return unverified();
   let request = null;
   try {
     const origin = new URL(trustedOrigin);
@@ -396,31 +415,36 @@ export async function observeKimiConnectSearch(
           ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname)
         ))
     )
-      return null;
+      return unverified();
+    stage = "navigation";
     await page.goto(`${trustedOrigin}/`, {
       waitUntil: "domcontentloaded",
       timeout: 12_000,
     });
-    if (new URL(page.url()).origin !== trustedOrigin) return null;
+    if (new URL(page.url()).origin !== trustedOrigin) return unverified();
+    stage = "configuration";
     const configured = await configureKimiSearch(page, payload.model);
     if (configured !== true)
       return configured === "requested_model_unavailable"
         ? { reason: configured }
-        : null;
+        : unverified();
+    stage = "composer";
     const composer = page.locator(
       '[role="textbox"][contenteditable="true"].chat-input-editor',
     );
-    if (!(await composer.isVisible())) return null;
-    if (signal?.aborted) return null;
+    if (!(await composer.isVisible())) return unverified();
+    if (signal?.aborted) return unverified();
     await composer.fill(payload.question);
     // The runner's monotonic deadline includes its identity and UI setup.
     // Standalone fixture calls retain their explicit/default capture timeout.
     if (deadlineAt !== undefined) {
       const remaining = deadlineAt - performance.now();
-      if (!Number.isFinite(remaining) || remaining <= 0) return null;
+      if (!Number.isFinite(remaining) || remaining <= 0)
+        return unverified("budget_exhausted");
       timeoutMs = Math.min(120_000, Math.max(1, Math.floor(remaining)));
     }
-    if (signal?.aborted) return null;
+    if (signal?.aborted) return unverified();
+    stage = "capture";
     const captured = await captureConnectExchange(page, {
       endpoint: `${trustedOrigin}${CHAT_PATH}`,
       timeoutMs,
@@ -441,7 +465,9 @@ export async function observeKimiConnectSearch(
         await send.click({ timeout: 5_000 });
       },
     });
-    if (!captured || !request || signal?.aborted) return null;
+    if (!captured || !request || signal?.aborted)
+      return unverified("capture_unverified");
+    stage = "rendered_answer";
     const renderedAnswer = page.locator(
       ".chat-content-item-assistant .markdown-container:not(.toolcall-content-text) > .markdown",
     );
@@ -449,9 +475,11 @@ export async function observeKimiConnectSearch(
       (await renderedAnswer.count()) > 0
         ? await renderedAnswer.last().innerText()
         : undefined;
+    stage = "interpretation";
     const observation = await interpret(captured, {
       renderedText,
       signal,
+      onDiagnostic,
       // Test fixtures may inject an interpreter; live execution always uses
       // grounded AI extraction, never the historical schema-specific reducer.
       question: payload.question,
@@ -478,7 +506,7 @@ export async function observeKimiConnectSearch(
             configureKimiSearch(parserPage, model, false),
         }),
     });
-    if (!observation || signal?.aborted) return null;
+    if (!observation || signal?.aborted) return unverified();
     return {
       raw_answer: observation.raw_answer,
       citations: observation.citations,
@@ -501,6 +529,6 @@ export async function observeKimiConnectSearch(
       },
     };
   } catch {
-    return null;
+    return unverified("unexpected_exception");
   }
 }

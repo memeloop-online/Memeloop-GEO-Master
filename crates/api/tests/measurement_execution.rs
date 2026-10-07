@@ -51,6 +51,9 @@ enum Receipt {
     AiEventMismatch(&'static str),
     AiEventValue(&'static str, &'static str),
     AiAuditMismatch(&'static str),
+    AiMissingSource,
+    AiSource(&'static str),
+    AiOversizedSource,
     AiMissingAudit,
     AiDuplicateAudit,
     AiEmptyRefs,
@@ -68,6 +71,9 @@ impl Receipt {
                 | Self::AiEventMismatch(_)
                 | Self::AiEventValue(_, _)
                 | Self::AiAuditMismatch(_)
+                | Self::AiMissingSource
+                | Self::AiSource(_)
+                | Self::AiOversizedSource
                 | Self::AiMissingAudit
                 | Self::AiDuplicateAudit
                 | Self::AiEmptyRefs
@@ -189,7 +195,7 @@ async fn runner(
                     "request_question_sha256":proof["question_sha256"],
                     "extraction_model":"synthetic-extractor",
                     "extraction_prompt_version":"observation.v1",
-                    "source_sha256":sha256_hex(b"synthetic raw source")
+                    "source_sha256":sha256_hex(br#"{"messages":[]}"#)
                 });
                 if let Receipt::AiEventMismatch(field) = case {
                     proof["search_event"][field] = json!("invalid value");
@@ -224,12 +230,30 @@ async fn runner(
                     "method":"llm_grounded",
                     "model":"synthetic-extractor",
                     "prompt_version":"observation.v1",
-                    "source_sha256":sha256_hex(b"synthetic raw source"),
+                    "source_sha256":sha256_hex(br#"{"messages":[]}"#),
+                    "source_json":r#"{"messages":[]}"#,
                     "surface":"signed_in_browser",
                     "refs":[{"pointer":"/synthetic", "quote":"synthetic raw source"}]
                 });
                 if let Receipt::AiAuditMismatch(field) = case {
                     audit[field] = json!("invalid value");
+                }
+                if matches!(case, Receipt::AiMissingSource) {
+                    audit.as_object_mut().unwrap().remove("source_json");
+                }
+                let replacement_source = match case {
+                    Receipt::AiSource(value) => Some(value.to_owned()),
+                    Receipt::AiOversizedSource => Some(format!(
+                        "{{\"messages\":[],\"padding\":\"{}\"}}",
+                        "x".repeat(750_000)
+                    )),
+                    _ => None,
+                };
+                if let Some(source) = replacement_source {
+                    let digest = sha256_hex(source.as_bytes());
+                    evidence[0]["search_event"]["source_sha256"] = json!(digest);
+                    audit["source_sha256"] = json!(digest);
+                    audit["source_json"] = json!(source);
                 }
                 if matches!(case, Receipt::AiEmptyRefs) {
                     audit["refs"] = json!([]);
@@ -561,6 +585,7 @@ async fn ai_extracted_search_requires_bound_audit_and_live_runner() {
         "model",
         "prompt_version",
         "source_sha256",
+        "source_json",
         "surface",
         "refs",
     ] {
@@ -577,9 +602,19 @@ async fn ai_extracted_search_requires_bound_audit_and_live_runner() {
         Receipt::AiWrongSchema,
         Receipt::AiFuture,
         Receipt::AiFixture,
+        Receipt::AiMissingSource,
+        Receipt::AiSource("invalid JSON"),
+        Receipt::AiSource("[]"),
+        Receipt::AiSource("{}"),
+        Receipt::AiSource(r#"{"messages":null}"#),
+        Receipt::AiOversizedSource,
         Receipt::AiEventValue("extraction_model", " "),
         Receipt::AiEventValue("extraction_prompt_version", ""),
         Receipt::AiEventValue("source_sha256", "not-a-digest"),
+        Receipt::AiEventValue(
+            "source_sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ),
         Receipt::AiEventValue(
             "request_question_sha256",
             "0000000000000000000000000000000000000000000000000000000000000000",

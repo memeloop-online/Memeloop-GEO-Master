@@ -107,7 +107,8 @@ export function TargetCard({
   executeError: unknown;
   automatic?: boolean;
 }) {
-  const { t } = useTranslation("measurement");
+  const { t, i18n } = useTranslation("measurement");
+  const [showTechnicalDetails, setShowTechnicalDetails] = useState(false);
   const input = target.input;
   const classification =
     input.kind === "measure"
@@ -128,6 +129,136 @@ export function TargetCard({
         : status === "in_flight"
           ? t("automaticInFlight")
           : t(`automaticOutcome.${status}`, { defaultValue: status });
+  if (automatic && input.kind === "measure") {
+    const measurementDate = (value?: string | null) =>
+      value
+        ? new Date(value).toLocaleString(i18n.resolvedLanguage)
+        : t("resultNotRecorded");
+    return (
+      <Card className="channel-job-target">
+        <div className="channel-job-target-heading">
+          <div>
+            <h3>{input.question}</h3>
+            <p>
+              {input.provider} ·{" "}
+              {t("resultAccount", { value: input.account_id })}
+            </p>
+          </div>
+          <Badge appearance="outline">
+            {view?.attempts.at(-1)?.outcome?.fixture && status === "observed"
+              ? t("resultFixture")
+              : automaticLabel}
+          </Badge>
+        </div>
+        <p>
+          {t("resultScheduled", { value: measurementDate(input.scheduled_at) })}
+        </p>
+        {loading && <Spinner label={t("automaticLoading")} size="tiny" />}
+        {loadError && (
+          <ErrorState
+            title={t("automaticReadError")}
+            detail={errorText(loadError)}
+            onRetry={onRefresh}
+          />
+        )}
+        {!loading && !loadError && !attempted && (
+          <p role="status">{t("automaticQueuedDetail")}</p>
+        )}
+        {view?.attempts.map((attempt) => {
+          const outcome = attempt.outcome;
+          const observed = outcome?.status === "observed" && !outcome.fixture;
+          const citations = [
+            ...new Set(
+              (outcome?.citations ?? [])
+                .map(safeOriginalPublicUrl)
+                .filter((url): url is string => url !== null),
+            ),
+          ];
+          return (
+            <div className="channel-job-attempt" key={attempt.attempt_id}>
+              <p>
+                {outcome ? (
+                  outcome.fixture && outcome.status === "observed" ? (
+                    t("resultFixture")
+                  ) : (
+                    t(`automaticOutcome.${outcome.status}`, {
+                      defaultValue: outcome.status,
+                    })
+                  )
+                ) : (
+                  <span>{t("automaticInFlightDetail")}</span>
+                )}
+                {" · "}
+                {t("resultTime", {
+                  value: measurementDate(
+                    outcome?.occurred_at ?? attempt.claimed_at,
+                  ),
+                })}
+              </p>
+              {observed && (
+                <>
+                  <h4>{t("resultAnswer")}</h4>
+                  <div
+                    style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                  >
+                    {outcome.raw_answer?.trim()
+                      ? outcome.raw_answer
+                      : t("resultAnswerMissing")}
+                  </div>
+                  <h4>{t("resultCitations")}</h4>
+                  {citations.length ? (
+                    <ul>
+                      {citations.map((url) => (
+                        <li key={url} style={{ overflowWrap: "anywhere" }}>
+                          <a
+                            href={url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            {url}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>
+                      {t(
+                        outcome.citations.length
+                          ? "resultNoSafeCitations"
+                          : "resultNoCitations",
+                      )}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          );
+        })}
+        {attempted && status === "unknown" && (
+          <p role="status">{t("automaticUnknownDetail")}</p>
+        )}
+        <details
+          onToggle={(event) =>
+            setShowTechnicalDetails(event.currentTarget.open)
+          }
+        >
+          <summary>{t("resultTechnicalDetails")}</summary>
+          {showTechnicalDetails && (
+            <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+              {JSON.stringify(
+                { target, attempts: view?.attempts ?? [] },
+                null,
+                2,
+              )}
+            </pre>
+          )}
+        </details>
+        <Button appearance="subtle" onClick={onRefresh}>
+          {t("resultRefresh")}
+        </Button>
+      </Card>
+    );
+  }
   return (
     <Card className="channel-job-target">
       <div className="channel-job-target-heading">

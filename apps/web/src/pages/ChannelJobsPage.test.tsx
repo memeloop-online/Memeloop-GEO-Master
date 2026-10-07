@@ -1,13 +1,169 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "../auth/AuthProvider";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
-import type { ChannelPlan, ChannelTargetView } from "../api/channelJobs";
-import { ChannelJobsPage } from "./ChannelJobsPage";
+import type {
+  ChannelOutcome,
+  ChannelPlan,
+  ChannelTarget,
+  ChannelTargetView,
+} from "../api/channelJobs";
+import { ChannelJobsPage, TargetCard } from "./ChannelJobsPage";
+import i18n from "../i18n";
+
+const automaticTarget: ChannelTarget = {
+  target_id: "measurement-target",
+  input: {
+    kind: "measure",
+    question: "如何选择办公工具？",
+    provider: "example",
+    account_id: "measurement-account",
+    model: "example-model",
+    surface: "consumer_web",
+    search_mode: "web_search",
+    protocol_version: "v1",
+    question_set_version: "v1",
+    market: "CN",
+    language: "zh-CN",
+    scheduled_at: "2026-10-01T00:00:00Z",
+    sample_ordinal: 0,
+  },
+};
+
+function renderAutomaticResult(overrides: Partial<ChannelOutcome> = {}) {
+  return render(
+    <FluentProvider theme={webLightTheme}>
+      <TargetCard
+        target={automaticTarget}
+        tenantId="tenant-1"
+        projectId="project-1"
+        automatic
+        canWrite
+        loading={false}
+        loadError={null}
+        executing={false}
+        executeError={null}
+        onExecute={vi.fn()}
+        onRefresh={vi.fn()}
+        view={{
+          target: automaticTarget,
+          attempts: [
+            {
+              attempt_id: "private-attempt-id",
+              target_id: automaticTarget.target_id,
+              claimed_at: "2026-10-01T00:00:00Z",
+              received_at: "2026-10-01T00:01:00Z",
+              outcome: {
+                status: "observed",
+                detail: "internal_reason_code",
+                occurred_at: "2026-10-01T00:01:00Z",
+                raw_answer: "第一行\n第二行 <script>alert(1)</script>",
+                citations: ["https://example.com/source"],
+                public_url: null,
+                screenshot_ref: null,
+                connector_version: "internal-connector-v3",
+                runner_evidence: [{ source_json: "large-audit-payload" }],
+                fixture: false,
+                ...overrides,
+              },
+            },
+          ],
+        }}
+      />
+    </FluentProvider>,
+  );
+}
+
+describe("automatic measurement results", () => {
+  it("shows the answer as plain text and citations, with evidence only on demand", async () => {
+    const { container } = renderAutomaticResult();
+    expect(screen.getByRole("heading", { name: "回答" })).toBeVisible();
+    const answer = screen.getByText(/第一行/);
+    expect(answer.textContent).toBe("第一行\n第二行 <script>alert(1)</script>");
+    expect(answer).toHaveStyle({ whiteSpace: "pre-wrap" });
+    expect(container.querySelector("script")).toBeNull();
+    expect(
+      screen.getByRole("link", { name: "https://example.com/source" }),
+    ).toHaveAttribute("rel", "noopener noreferrer");
+    expect(screen.queryByText(/large-audit-payload/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/private-attempt-id/)).not.toBeInTheDocument();
+    const details = container.querySelector("details")!;
+    expect(details.open).toBe(false);
+    await userEvent.click(screen.getByText("技术详情 / 原始证据"));
+    await waitFor(() =>
+      expect(screen.getByText(/large-audit-payload/)).toBeVisible(),
+    );
+  });
+
+  it("only links safe http and https citations", () => {
+    renderAutomaticResult({
+      citations: [
+        "https://example.com/source",
+        "http://example.com/other",
+        "javascript:alert(1)",
+        "data:text/html,test",
+        "/relative",
+        "https://user:password@example.com/private",
+        "https://example.com/source",
+      ],
+    });
+    expect(screen.getAllByRole("link")).toHaveLength(2);
+    expect(
+      screen.getByRole("link", { name: "http://example.com/other" }),
+    ).toHaveAttribute("href", "http://example.com/other");
+  });
+
+  it("does not infer a search failure from an answer without citations", () => {
+    renderAutomaticResult({ citations: [] });
+    expect(screen.getByText("本次回答未提供引用链接。")).toBeVisible();
+    expect(screen.queryByText(/未联网/)).not.toBeInTheDocument();
+  });
+
+  it.each(["unknown", "missing"] as const)(
+    "does not present an unconfirmed %s answer as a result",
+    (status) => {
+      renderAutomaticResult({ status });
+      expect(
+        screen.queryByRole("heading", { name: "回答" }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/第一行/)).not.toBeInTheDocument();
+      expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    },
+  );
+
+  it("labels fixtures and does not present them as real answers", () => {
+    renderAutomaticResult({ fixture: true });
+    expect(screen.getAllByText("测试数据，非真实测量").length).toBeGreaterThan(
+      0,
+    );
+    expect(screen.queryByText("已取得测量结果")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "回答" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("localizes the result in English", async () => {
+    await i18n.changeLanguage("en");
+    try {
+      renderAutomaticResult({ citations: [] });
+      expect(screen.getByRole("heading", { name: "Answer" })).toBeVisible();
+      expect(
+        screen.getByText("This answer did not provide citation links."),
+      ).toBeVisible();
+      expect(
+        screen.getByText("Technical details / original evidence"),
+      ).toBeVisible();
+    } finally {
+      await act(async () => {
+        await i18n.changeLanguage("zh-CN");
+      });
+    }
+  });
+});
 
 const cycleId = "cycle-1";
 const source = {

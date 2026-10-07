@@ -35,6 +35,39 @@ const frozen = {
   scheduled_at: "2026-01-01T00:00:00Z",
   sample_ordinal: 0,
 };
+
+test("unknown adapter evidence keeps safe stage diagnostics without successful observation", async () => {
+  let navigations = 0;
+  const outcome = await measureKimi(
+    {
+      goto: async () => {
+        navigations += 1;
+        throw new Error(
+          "synthetic-private-credential https://example.org/private",
+        );
+      },
+    },
+    frozen,
+    { expectedAccountId: "synthetic-private-account" },
+  );
+  assert.equal(navigations, 1);
+  assert.equal(outcome.status, "unknown");
+  assert.equal(outcome.reason, "official_search_observation_unverified");
+  assert.equal(Object.hasOwn(outcome, "raw_answer"), false);
+  assert.deepEqual(outcome.evidence, [
+    {
+      kind: "observation_diagnostic",
+      schema_version: "geo.observation.diagnostic.v1",
+      stage: "navigation",
+      code: "unexpected_exception",
+    },
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(outcome),
+    /synthetic-private|example\.org/u,
+  );
+});
+
 const request = {
   tools: [{ type: "SEARCH", search: {} }],
   message: { role: "user", blocks: [{ text: { content: QUESTION } }] },
@@ -475,13 +508,21 @@ test("browser UI submits exactly once and its captured framed request creates v2
     assert.equal(sends, 3, "an aborted runner cannot submit");
     responseDelayMs = 0;
     omitEnd = true;
+    const captureDiagnostics = [];
     assert.equal(
       await observeKimiConnectSearch(page, frozen, {
         trustedOrigin: origin,
         deadlineAt: performance.now() + 1_000,
+        onDiagnostic: (entry) => captureDiagnostics.push(entry),
       }),
       null,
       "a streamed answer without the Connect end frame is not evidence",
+    );
+    assert.equal(captureDiagnostics.at(-1).stage, "capture");
+    assert.ok(
+      ["capture_unverified", "budget_exhausted"].includes(
+        captureDiagnostics.at(-1).code,
+      ),
     );
     assert.equal(sends, 4);
     omitEnd = false;

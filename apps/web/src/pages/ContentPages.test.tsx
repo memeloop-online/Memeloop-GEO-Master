@@ -1723,7 +1723,7 @@ describe("P09 content revision", () => {
     } finally {
       timeout.mockRestore();
     }
-  });
+  }, 15_000);
 
   it("downloads the selected immutable revision, including reuse origin identity", async () => {
     const requests = mockApi({

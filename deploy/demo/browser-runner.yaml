@@ -38,6 +38,12 @@ spec:
             - name: http
               containerPort: 38080
               protocol: TCP
+          envFrom:
+            # Optional low-cost extraction fallback. This does not configure
+            # or replace the measured consumer-web account.
+            - secretRef:
+                name: geo-observation-parser
+                optional: true
           env:
             - name: GEO_BROWSER_RUNNER_HOST
               value: 0.0.0.0

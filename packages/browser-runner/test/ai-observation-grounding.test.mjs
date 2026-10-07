@@ -66,6 +66,102 @@ const modernExtracted = {
 const validate = (overrides = {}, document = modern) =>
   validateAiObservation(document, { ...modernExtracted, ...overrides });
 
+test("preserves all 65 streamed answer deltas while enforcing the total answer byte limit", () => {
+  const document = structuredClone(modern);
+  const deltas = Array.from({ length: 65 }, (_, index) => `段${index}。`);
+  document.messages[3].block.text.deltas = deltas;
+  const answer_segments = deltas.map((_, index) => ({
+    path: `/messages/3/block/text/deltas/${index}`,
+  }));
+  const result = validate({ answer_segments }, document);
+  assert.equal(result.raw_answer, deltas.join(""));
+  assert.equal(
+    result.audit.refs.filter((ref) => ref.role === "answer_segment").length,
+    65,
+  );
+  assert.deepEqual(result.citations, ["https://example.org/source"]);
+  document.messages[3].block.text.deltas = deltas.map(() => "界".repeat(513));
+  assert.equal(validate({ answer_segments }, document), null);
+});
+
+test("grounds a citation URL in a unique exact source quote and rejects fabricated or ambiguous quotes", () => {
+  const document = structuredClone(modern);
+  const url = "https://example.org/source";
+  document.messages[3].block.text.content = `A supported answer cites [the public source](${url}).`;
+  const citation = {
+    url: { path: "/messages/3/block/text/content", quote: url },
+    usage: modernExtracted.citations[0].usage,
+  };
+  const result = validate({ citations: [citation] }, document);
+  assert.deepEqual(result.citations, [url]);
+  assert.equal(result.raw_answer, document.messages[3].block.text.content);
+  assert.equal(
+    validate(
+      {
+        citations: [
+          {
+            ...citation,
+            url: { ...citation.url, quote: "https://example.org/fabricated" },
+          },
+        ],
+      },
+      document,
+    ),
+    null,
+  );
+  assert.equal(
+    validate(
+      {
+        citations: [
+          {
+            ...citation,
+            url: { ...citation.url, quote: ` ${url}` },
+          },
+        ],
+      },
+      document,
+    ),
+    null,
+  );
+  document.messages[3].block.text.content += ` Again: ${url}`;
+  assert.equal(validate({ citations: [citation] }, document), null);
+});
+
+test("preserves whitespace-only streaming deltas but rejects a whitespace-only final answer", () => {
+  const document = structuredClone(modern);
+  document.messages[3].block.text.deltas = [
+    "A",
+    " ",
+    "source-backed",
+    "\n",
+    "answer.",
+    "\t",
+  ];
+  const answer_segments = document.messages[3].block.text.deltas.map(
+    (_, index) => ({
+      path: `/messages/3/block/text/deltas/${index}`,
+    }),
+  );
+  const result = validate({ answer_segments }, document);
+  assert.equal(result.raw_answer, "A source-backed\nanswer.\t");
+  assert.deepEqual(result.citations, ["https://example.org/source"]);
+  assert.equal(
+    validate(
+      {
+        answer_segments: [
+          answer_segments[1],
+          answer_segments[3],
+          answer_segments[5],
+        ],
+      },
+      document,
+    ),
+    null,
+  );
+  document.messages[3].block.text.deltas[1] = "";
+  assert.equal(validate({ answer_segments }, document), null);
+});
+
 test("grounds a complete observation in exact source values and records bounded audit refs", () => {
   const result = validate();
   assert.equal(result.raw_answer, "Answer from the source.");

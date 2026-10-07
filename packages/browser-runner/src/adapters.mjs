@@ -5,6 +5,7 @@ import {
   observeKimiConnectSearch,
   inspectKimiMeasurementOptions,
 } from "./kimi-connect-search.mjs";
+import { reportObservationDiagnostic } from "./ai-observation-parser.mjs";
 
 export const CONNECTOR_VERSION = "live_unverified.source_derived.v1";
 
@@ -424,14 +425,28 @@ export async function measureKimi(
     return unknown("official_search_provenance_unverified", "measure");
   }
   if (!page) return unsupported("official_web_search_unverified");
+  const diagnostics = [];
   const observation = await observeKimiConnectSearch(page, payload, {
     deadlineAt,
     signal,
+    onDiagnostic: (entry) => {
+      if (diagnostics.length >= 12) return;
+      reportObservationDiagnostic(
+        (safe) => diagnostics.push(safe),
+        entry.stage,
+        entry.code,
+        entry.route,
+      );
+    },
   });
   if (observation?.reason === "requested_model_unavailable")
     return unsupported("requested_model_unavailable");
   if (!observation)
-    return unknown("official_search_observation_unverified", "measure");
+    return unknown(
+      "official_search_observation_unverified",
+      "measure",
+      diagnostics,
+    );
   const observedAt = new Date().toISOString();
   const rawAnswer = observation.raw_answer;
   return {

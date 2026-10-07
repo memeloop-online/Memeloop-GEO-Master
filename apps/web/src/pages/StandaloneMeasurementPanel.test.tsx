@@ -215,7 +215,9 @@ describe("standalone arbitrary-topic measurement", () => {
     expect(screen.getByText("正在等待测量结果。")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "刷新记录" }));
     expect(await screen.findByText("已取得测量结果")).toBeInTheDocument();
-    expect(screen.getByText(/已收到搜索答案/)).toBeInTheDocument();
+    expect(screen.getByText("可在晴朗夜晚观测")).toBeVisible();
+    expect(screen.getByText("本次回答未提供引用链接。")).toBeVisible();
+    expect(screen.queryByText(/已收到搜索答案/)).not.toBeInTheDocument();
     expect(createMeasurementPlan).toHaveBeenCalledOnce();
     expect(executeChannelTarget).not.toHaveBeenCalled();
   });
@@ -279,10 +281,10 @@ describe("standalone arbitrary-topic measurement", () => {
     );
     expect(await screen.findByText("测量结果未知")).toBeInTheDocument();
     expect(screen.getByText("未能确认本次测量结果。")).toBeInTheDocument();
-    expect(screen.getByText(/响应采集超时/)).toBeInTheDocument();
-    expect(screen.getByText(/结果尚未验证/)).toBeInTheDocument();
+    expect(screen.queryByText(/响应采集超时/)).not.toBeInTheDocument();
+    expect(screen.queryByText("测试数据，非真实测量")).not.toBeInTheDocument();
     expect(
-      screen.queryByText(/测试数据|非真实外部结果/),
+      screen.queryByRole("heading", { name: "回答" }),
     ).not.toBeInTheDocument();
     expect(screen.queryByText(/已取得测量结果/)).not.toBeInTheDocument();
     expect(screen.queryByText(/等待对账/)).not.toBeInTheDocument();
@@ -290,6 +292,8 @@ describe("standalone arbitrary-topic measurement", () => {
       screen.queryByRole("button", { name: "执行此目标" }),
     ).not.toBeInTheDocument();
     expect(executeChannelTarget).not.toHaveBeenCalled();
+    await user.click(screen.getByText("技术详情 / 原始证据"));
+    expect(await screen.findByText(/响应采集超时/)).toBeVisible();
   });
 
   it("keeps model discovery errors visible and does not submit a plan", async () => {
