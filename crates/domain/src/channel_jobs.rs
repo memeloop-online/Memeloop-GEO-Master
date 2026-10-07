@@ -430,15 +430,16 @@ pub trait ChannelJobRepository: Send + Sync {
         scope: &TenantScope,
         plan_id: Uuid,
     ) -> Result<Option<StandaloneMeasurementPlan>, AppError>;
-    /// Ascending UUID keyset page, with an exclusive cursor.
+    /// Newest-first keyset page by (created_at DESC, plan_id DESC).
+    /// The exclusive UUID cursor must identify a plan in the same project.
     async fn list_measurement_plans(
         &self,
         scope: &TenantScope,
         after_plan_id: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<StandaloneMeasurementPlan>, AppError>;
-    /// Ascending keyset page of plans containing an immutable target bound to
-    /// optimization. Excluded-only plan IDs must never become AI cursors.
+    /// Newest-first keyset page of plans containing an immutable target bound
+    /// to optimization. Excluded-only plan IDs must never become AI cursors.
     async fn list_optimization_measurement_plans(
         &self,
         scope: &TenantScope,
@@ -841,14 +842,22 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         }
         let key = scope_key(scope)?;
         let all = self.0.lock().await;
+        let cursor = after_plan_id
+            .map(|id| {
+                all.get(&(key.0, key.1, key.2, ChannelOwner::Measurement(id)))
+                    .and_then(|entry| entry.measurement.as_ref())
+                    .map(|plan| (plan.created_at, plan.plan_id))
+                    .ok_or_else(|| AppError::invalid_request("invalid measurement cursor"))
+            })
+            .transpose()?;
         let mut plans: Vec<_> = all
             .iter()
             .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
             .filter_map(|(_, entry)| entry.measurement.as_ref())
-            .filter(|plan| after_plan_id.is_none_or(|after| plan.plan_id > after))
+            .filter(|plan| cursor.is_none_or(|after| (plan.created_at, plan.plan_id) < after))
             .cloned()
             .collect();
-        plans.sort_unstable_by_key(|plan| plan.plan_id);
+        plans.sort_unstable_by_key(|plan| std::cmp::Reverse((plan.created_at, plan.plan_id)));
         plans.truncate(limit);
         Ok(plans)
     }
@@ -863,28 +872,38 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         }
         let key = scope_key(scope)?;
         let all = self.0.lock().await;
+        let eligible = |plan: &StandaloneMeasurementPlan| {
+            plan.targets.iter().any(|target| {
+                matches!(
+                    &target.input,
+                    ChannelTargetInput::Measure {
+                        question_binding: Some(FrozenQuestionBinding {
+                            purpose: QuestionPurpose::Optimization,
+                            ..
+                        }),
+                        ..
+                    }
+                )
+            })
+        };
+        let cursor = after_plan_id
+            .map(|id| {
+                all.get(&(key.0, key.1, key.2, ChannelOwner::Measurement(id)))
+                    .and_then(|entry| entry.measurement.as_ref())
+                    .filter(|plan| eligible(plan))
+                    .map(|plan| (plan.created_at, plan.plan_id))
+                    .ok_or_else(|| AppError::invalid_request("invalid measurement cursor"))
+            })
+            .transpose()?;
         let mut plans: Vec<_> = all
             .iter()
             .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
             .filter_map(|(_, entry)| entry.measurement.as_ref())
-            .filter(|plan| after_plan_id.is_none_or(|after| plan.plan_id > after))
-            .filter(|plan| {
-                plan.targets.iter().any(|target| {
-                    matches!(
-                        &target.input,
-                        ChannelTargetInput::Measure {
-                            question_binding: Some(FrozenQuestionBinding {
-                                purpose: QuestionPurpose::Optimization,
-                                ..
-                            }),
-                            ..
-                        }
-                    )
-                })
-            })
+            .filter(|plan| eligible(plan))
+            .filter(|plan| cursor.is_none_or(|after| (plan.created_at, plan.plan_id) < after))
             .cloned()
             .collect();
-        plans.sort_unstable_by_key(|plan| plan.plan_id);
+        plans.sort_unstable_by_key(|plan| std::cmp::Reverse((plan.created_at, plan.plan_id)));
         plans.truncate(limit);
         Ok(plans)
     }
@@ -1317,6 +1336,135 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
 mod tests {
     use super::*;
     use crate::{OperatorId, QuestionReference, TenantId};
+
+    #[tokio::test]
+    async fn measurement_pages_sort_by_time_then_uuid_and_validate_scoped_eligible_cursors() {
+        let repo = MemoryChannelJobRepository::default();
+        let scope = TenantScope::new(
+            OperatorId::new(Uuid::new_v4()),
+            TenantId::new(Uuid::new_v4()),
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let other = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let now = Utc::now();
+        let base = Uuid::new_v4().as_u128() & !0xff;
+        let version = Uuid::new_v4();
+        let mut ids = Vec::new();
+        // Creation times deliberately contradict UUID order; the two newest
+        // plans share a timestamp, testing the stable tie-break across pages.
+        for (offset, seconds_ago, purpose) in [
+            (9, 60, Some(QuestionPurpose::Optimization)),
+            (2, 0, Some(QuestionPurpose::Optimization)),
+            (1, 0, Some(QuestionPurpose::Optimization)),
+            (8, 30, Some(QuestionPurpose::FrozenEvaluation)),
+            (7, 40, None),
+            (3, 50, Some(QuestionPurpose::Optimization)),
+        ] {
+            let plan_id = Uuid::from_u128(base + offset);
+            ids.push(plan_id);
+            let plan = StandaloneMeasurementPlan {
+                plan_id,
+                project_id: scope.project_id.unwrap(),
+                title: "Topic".into(),
+                input_hash: plan_id.to_string(),
+                revision: 1,
+                created_at: now - chrono::Duration::seconds(seconds_ago),
+                targets: vec![ChannelTarget {
+                    target_id: Uuid::new_v4(),
+                    input: ChannelTargetInput::Measure {
+                        account_id: Uuid::new_v4(),
+                        provider: "fixture".into(),
+                        model: "fixed".into(),
+                        surface: "consumer_web".into(),
+                        search_mode: "web_search".into(),
+                        protocol_version: "v1".into(),
+                        question_set_version: "ad-hoc".into(),
+                        question: "Topic question".into(),
+                        market: "global".into(),
+                        language: "en".into(),
+                        scheduled_at: now,
+                        sample_ordinal: 0,
+                        question_binding: purpose.map(|purpose| FrozenQuestionBinding {
+                            reference: QuestionReference {
+                                question_set_id: Uuid::new_v4(),
+                                question_set_version_id: version,
+                                question_id: Uuid::new_v4(),
+                                question_revision_id: Uuid::new_v4(),
+                            },
+                            purpose,
+                            split_policy_version: "synthetic_v1".into(),
+                        }),
+                    },
+                }],
+            };
+            repo.create_measurement_plan(&scope, &plan_id.to_string(), "request", plan)
+                .await
+                .unwrap();
+        }
+        let expected_all = [ids[1], ids[2], ids[3], ids[4], ids[5], ids[0]];
+        let expected_optimization = [ids[1], ids[2], ids[5], ids[0]];
+        for (optimization, expected) in [
+            (false, expected_all.as_slice()),
+            (true, expected_optimization.as_slice()),
+        ] {
+            let mut cursor = None;
+            let mut observed = Vec::new();
+            loop {
+                let page = if optimization {
+                    repo.list_optimization_measurement_plans(&scope, cursor, 1)
+                        .await
+                        .unwrap()
+                } else {
+                    repo.list_measurement_plans(&scope, cursor, 1)
+                        .await
+                        .unwrap()
+                };
+                if page.is_empty() {
+                    break;
+                }
+                cursor = Some(page[0].plan_id);
+                observed.push(page[0].plan_id);
+            }
+            assert_eq!(observed, expected);
+            assert_eq!(
+                (if optimization {
+                    repo.list_optimization_measurement_plans(&scope, Some(Uuid::new_v4()), 1)
+                        .await
+                } else {
+                    repo.list_measurement_plans(&scope, Some(Uuid::new_v4()), 1)
+                        .await
+                })
+                .unwrap_err()
+                .code,
+                crate::ErrorCode::InvalidRequest
+            );
+        }
+        assert_eq!(
+            repo.list_measurement_plans(&other, Some(ids[1]), 1)
+                .await
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            repo.list_optimization_measurement_plans(&scope, Some(ids[3]), 1)
+                .await
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            repo.list_optimization_measurement_plans(&scope, Some(ids[4]), 1)
+                .await
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::InvalidRequest
+        );
+    }
 
     #[tokio::test]
     async fn standalone_measurements_replay_scope_dispatch_and_never_enter_cycle_reports() {

@@ -156,6 +156,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 36,
         description: "content distribution requests",
     },
+    MigrationMetadata {
+        version: 37,
+        description: "measurement recency",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

@@ -384,8 +384,8 @@ async fn optimization_cursor_skips_excluded_only_pages_without_exposing_evaluati
         )
         .await
         .unwrap();
-    assert_eq!(page.plan_ids, vec![first]);
-    assert_eq!(page.next_after, Some(first));
+    assert_eq!(page.plan_ids, vec![second]);
+    assert_eq!(page.next_after, Some(second));
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].citing_answers, 1);
     let serialized = serde_json::to_string(&page).unwrap();
@@ -425,7 +425,7 @@ async fn optimization_cursor_skips_excluded_only_pages_without_exposing_evaluati
         )
         .await
         .unwrap();
-    assert_eq!(page.plan_ids, vec![second]);
+    assert_eq!(page.plan_ids, vec![first]);
     assert_eq!(page.next_after, None);
     assert_eq!(page.items[0].citing_answers, 1);
     let serialized = serde_json::to_string(&page).unwrap();

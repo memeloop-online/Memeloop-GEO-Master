@@ -288,10 +288,30 @@ impl ChannelJobRepository for PgChannelJobRepository {
         if limit == 0 || limit > 1000 {
             return Err(AppError::invalid_request("invalid measurement page size"));
         }
+        let cursor_at: Option<DateTime<Utc>> = if let Some(cursor) = after_plan_id {
+            Some(
+                sqlx::query_scalar(
+                    "SELECT created_at FROM measurement_execution_plans \
+                 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND plan_id=$4",
+                )
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(project(scope)?)
+                .bind(cursor)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?
+                .ok_or_else(|| AppError::invalid_request("invalid measurement cursor"))?,
+            )
+        } else {
+            None
+        };
         let rows: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND ($4::uuid IS NULL OR plan_id>$4) ORDER BY plan_id LIMIT $5"
+            "SELECT plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+             AND ($4::timestamptz IS NULL OR (created_at, plan_id) < ($4, $5::uuid)) \
+             ORDER BY created_at DESC, plan_id DESC LIMIT $6"
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
-            .bind(after_plan_id).bind(limit as i64).fetch_all(&self.pool).await.map_err(db)?;
+            .bind(cursor_at).bind(after_plan_id).bind(limit as i64).fetch_all(&self.pool).await.map_err(db)?;
         rows.into_iter().map(decode).collect()
     }
 
@@ -304,15 +324,35 @@ impl ChannelJobRepository for PgChannelJobRepository {
         if limit == 0 || limit > 1000 {
             return Err(AppError::invalid_request("invalid measurement page size"));
         }
-        // The keyset predicate and LIMIT apply to eligible plans, not to a
-        // raw page which could consist entirely of frozen/unknown purposes.
+        // An excluded-only plan cannot become an AI cursor or reveal its position.
+        let cursor_at: Option<DateTime<Utc>> = if let Some(cursor) = after_plan_id {
+            Some(sqlx::query_scalar(
+                "SELECT created_at FROM measurement_execution_plans \
+                 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND plan_id=$4 \
+                 AND EXISTS (SELECT 1 FROM jsonb_array_elements(plan->'targets') AS target \
+                   WHERE target->'input'->>'kind'='measure' AND target->'input'->'question_binding'->>'purpose'='optimization')",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project(scope)?)
+            .bind(cursor)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| AppError::invalid_request("invalid measurement cursor"))?)
+        } else {
+            None
+        };
+        // Filter eligibility in SQL before LIMIT, even when many newer plans
+        // contain only frozen/unknown questions.
         let rows: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND ($4::uuid IS NULL OR plan_id>$4) \
+            "SELECT plan FROM measurement_execution_plans WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+             AND ($4::timestamptz IS NULL OR (created_at, plan_id) < ($4, $5::uuid)) \
              AND EXISTS (SELECT 1 FROM jsonb_array_elements(plan->'targets') AS target \
                WHERE target->'input'->>'kind'='measure' AND target->'input'->'question_binding'->>'purpose'='optimization') \
-             ORDER BY plan_id LIMIT $5"
+             ORDER BY created_at DESC, plan_id DESC LIMIT $6"
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
-            .bind(after_plan_id).bind(limit as i64).fetch_all(&self.pool).await.map_err(db)?;
+            .bind(cursor_at).bind(after_plan_id).bind(limit as i64).fetch_all(&self.pool).await.map_err(db)?;
         rows.into_iter().map(decode).collect()
     }
 

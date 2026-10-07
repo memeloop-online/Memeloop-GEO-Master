@@ -1,5 +1,5 @@
 //! Requires a disposable database; no external account or measurement is used.
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use geo_domain::{
     ChannelJobRepository, ChannelTarget, ChannelTargetInput, FrozenQuestionBinding,
     QuestionPurpose, QuestionReference, StandaloneMeasurementPlan, TenantScope,
@@ -154,7 +154,17 @@ async fn standalone_measurement_draft_concurrency_restart_and_owner_constraints(
     }
     assert_eq!(
         restarted
-            .list_optimization_measurement_plans(&scope, Some(Uuid::from_u128(base)), 1)
+            .list_optimization_measurement_plans(&scope, None, 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|plan| plan.plan_id)
+            .collect::<Vec<_>>(),
+        eligible_ids[1..]
+    );
+    assert_eq!(
+        restarted
+            .list_optimization_measurement_plans(&scope, Some(eligible_ids[1]), 1)
             .await
             .unwrap()
             .into_iter()
@@ -162,15 +172,86 @@ async fn standalone_measurement_draft_concurrency_restart_and_owner_constraints(
             .collect::<Vec<_>>(),
         eligible_ids[..1]
     );
+    for invalid in [Uuid::from_u128(base), saved.plan_id] {
+        assert_eq!(
+            restarted
+                .list_optimization_measurement_plans(&scope, Some(invalid), 1)
+                .await
+                .unwrap_err()
+                .code,
+            geo_domain::ErrorCode::InvalidRequest
+        );
+    }
+    let mut eligible = restarted
+        .get_measurement_plan(&scope, eligible_ids[0])
+        .await
+        .unwrap()
+        .unwrap();
+    let newest_id = Uuid::from_u128(base);
+    eligible.plan_id = newest_id;
+    eligible.created_at = now + Duration::seconds(10);
+    eligible.targets[0].target_id = Uuid::new_v4();
+    restarted
+        .create_measurement_plan(&scope, "newest", "newest", eligible.clone())
+        .await
+        .unwrap();
+    let oldest_id = Uuid::from_u128(base + 254);
+    eligible.plan_id = oldest_id;
+    eligible.created_at = now - Duration::seconds(10);
+    eligible.targets[0].target_id = Uuid::new_v4();
+    restarted
+        .create_measurement_plan(&scope, "oldest", "oldest", eligible)
+        .await
+        .unwrap();
+    // Timestamp is authoritative even when UUIDs point in the opposite direction.
+    let mut at_same_time = (1..=6)
+        .map(|offset| Uuid::from_u128(base + offset))
+        .chain(std::iter::once(saved.plan_id))
+        .collect::<Vec<_>>();
+    at_same_time.sort_unstable_by(|left, right| right.cmp(left));
+    let expected_all = [vec![newest_id], at_same_time, vec![oldest_id]].concat();
+    let expected_optimization = vec![newest_id, eligible_ids[1], eligible_ids[0], oldest_id];
+    for (optimization, expected) in [
+        (false, expected_all.as_slice()),
+        (true, expected_optimization.as_slice()),
+    ] {
+        let mut cursor = None;
+        let mut observed = Vec::new();
+        loop {
+            let page = if optimization {
+                restarted
+                    .list_optimization_measurement_plans(&scope, cursor, 2)
+                    .await
+                    .unwrap()
+            } else {
+                restarted
+                    .list_measurement_plans(&scope, cursor, 2)
+                    .await
+                    .unwrap()
+            };
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|plan| plan.plan_id);
+            observed.extend(page.into_iter().map(|plan| plan.plan_id));
+        }
+        assert_eq!(observed, expected);
+    }
     assert_eq!(
         restarted
-            .list_optimization_measurement_plans(&scope, Some(eligible_ids[0]), 1)
+            .list_measurement_plans(&scope, Some(Uuid::new_v4()), 1)
             .await
-            .unwrap()
-            .into_iter()
-            .map(|plan| plan.plan_id)
-            .collect::<Vec<_>>(),
-        eligible_ids[1..]
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        restarted
+            .list_optimization_measurement_plans(&scope, Some(Uuid::from_u128(base + 4)), 1)
+            .await
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::InvalidRequest
     );
     let other = TenantScope::new(
         scope.operator_id,
@@ -191,6 +272,21 @@ async fn standalone_measurement_draft_concurrency_restart_and_owner_constraints(
             .unwrap()
             .is_empty()
     );
+    for optimization in [false, true] {
+        let result = if optimization {
+            restarted
+                .list_optimization_measurement_plans(&other, Some(newest_id), 1)
+                .await
+        } else {
+            restarted
+                .list_measurement_plans(&other, Some(newest_id), 1)
+                .await
+        };
+        assert_eq!(
+            result.unwrap_err().code,
+            geo_domain::ErrorCode::InvalidRequest
+        );
+    }
     assert!(
         restarted
             .cycle_inputs(&scope, saved.plan_id, now)

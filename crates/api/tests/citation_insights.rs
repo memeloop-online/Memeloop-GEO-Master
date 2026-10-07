@@ -234,11 +234,12 @@ async fn paged_denominator_and_cross_project_isolation_are_explicit() {
     ];
     for (index, plan_id) in plan_ids.into_iter().enumerate() {
         let target = add_plan(&state, &scope, plan_id).await;
-        if index == 0 {
+        if index == 2 {
             complete_live_search(&state, &scope, &target).await;
         }
     }
-    add_plan(&state, &other_scope, Uuid::new_v4()).await;
+    let other_plan_id = Uuid::new_v4();
+    add_plan(&state, &other_scope, other_plan_id).await;
     let app = router(state);
     let cookie = login(&app).await;
     let base = format!(
@@ -264,7 +265,7 @@ async fn paged_denominator_and_cross_project_isolation_are_explicit() {
         "https://example.org/article"
     );
     assert_eq!(first["observed_sources"][0]["citing_answers"], 1);
-    assert_eq!(first["plan_ids"], json!(&plan_ids[..2]));
+    assert_eq!(first["plan_ids"], json!([plan_ids[2], plan_ids[1]]));
     assert_eq!(first["next_after"], json!(plan_ids[1]));
     let recommendations_path = format!(
         "/api/v1/projects/{}/source-channel-recommendations?limit=2",
@@ -303,7 +304,18 @@ async fn paged_denominator_and_cross_project_isolation_are_explicit() {
     assert_eq!(second["coverage"]["observed_live"], 0);
     assert_eq!(second["observed_sources"], json!([]));
     assert_eq!(second["next_after"], Value::Null);
-    assert_eq!(second["plan_ids"], json!([plan_ids[2]]));
+    assert_eq!(second["plan_ids"], json!([plan_ids[0]]));
+    for cursor in [other_plan_id, Uuid::new_v4()] {
+        let invalid_cursor = app
+            .clone()
+            .oneshot(request(
+                &format!("{base}?limit=2&after={cursor}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_cursor.status(), StatusCode::BAD_REQUEST);
+    }
     let invalid_limit = app
         .clone()
         .oneshot(request(&format!("{base}?limit=11"), Some(&cookie)))
