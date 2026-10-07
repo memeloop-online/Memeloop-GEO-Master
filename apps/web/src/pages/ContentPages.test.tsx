@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -1256,19 +1256,44 @@ describe("P09 content revision", () => {
     ).toBe(false);
   });
 
-  it("saves a bold edit as a rich node with the original block and citation", async () => {
+  it("autosaves a bold edit as a rich node with the original block and citation", async () => {
     const requests = mockApi();
     renderPage("/app/tenant-1/project-1/content/asset-1");
     const body = await screen.findByRole("textbox", { name: "结构化正文" });
     const paragraph = within(body).getByText("原始正文");
-    await userEvent.click(paragraph);
-    putCaretAtEnd(paragraph);
-    await userEvent.click(screen.getByRole("button", { name: "加粗" }));
-    await userEvent.keyboard("新");
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "保存新版本" })).toBeEnabled(),
-    );
-    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    let autosave: (() => void) | undefined;
+    const timeout = vi
+      .spyOn(window as Window, "setTimeout")
+      .mockImplementation((handler, delay, ...args) => {
+        if (delay === 1000 && typeof handler === "function") {
+          autosave = () => handler();
+          return nativeSetTimeout(() => {}, 0);
+        }
+        return nativeSetTimeout(handler, delay, ...args);
+      });
+    try {
+      await userEvent.click(paragraph);
+      putCaretAtEnd(paragraph);
+      await userEvent.click(screen.getByRole("button", { name: "加粗" }));
+      await waitFor(() => expect(body).toHaveFocus(), { timeout: 850 });
+      await userEvent.keyboard("新");
+      expect(body).toHaveTextContent("原始正文新");
+      expect(screen.getByRole("button", { name: "保存新版本" })).toBeEnabled();
+      expect(autosave).toBeDefined();
+      expect(
+        requests.mock.calls.filter(
+          ([url, init]) =>
+            String(url).includes("/contents/asset-1/revisions?") &&
+            init?.method === "POST",
+        ),
+      ).toHaveLength(0);
+      await act(async () => {
+        autosave?.();
+      });
+    } finally {
+      timeout.mockRestore();
+    }
     await waitFor(() => {
       const write = requests.mock.calls.find(
         ([url, init]) =>
@@ -1291,6 +1316,9 @@ describe("P09 content revision", () => {
         marks: [{ type: "bold" }],
       });
     });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "保存新版本" })).toBeDisabled(),
+    );
   });
 
   it("saves and reloads a styled rich block without changing its nested node tree", async () => {

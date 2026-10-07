@@ -6,19 +6,19 @@
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use geo_domain::{
-    AppError, Chunk, ContentKnowledgeGuard, ContentPublicEligibility, CurrentKnowledgeRelease,
-    DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
-    DocumentManifestPlanRequest, DocumentManifestState, DocumentScope, Fact, ImportAcceptance,
-    ImportBatchAcceptance, ImportItem, ImportJob, ImportStage, ImportStatus, KnowledgeAnswerStatus,
-    KnowledgeAskResult, KnowledgeCapability, KnowledgeCoverage, KnowledgeEvidence,
-    KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
-    KnowledgeSearchRequest, KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES,
-    Operation, OperationStatus, Product, ReviseSourceTextCommand, Source, SourceDetail, SourceKind,
-    SourceState, SourceTextRevisionReceipt, SourceVersion, SourceVersionContent,
-    SourceVersionRepresentation, StoredObject, StoredObjectState, TenantScope,
-    UPLOAD_SESSION_TTL_SECONDS, UploadSession, UploadSessionCommand, UploadSessionState,
-    is_supported_knowledge_media_type, knowledge_parser_version, parsed_knowledge_chunks,
-    plan_document_manifest, sha256_hex,
+    AppError, AttachmentObjectBytes, Chunk, ContentKnowledgeGuard, ContentPublicEligibility,
+    CurrentKnowledgeRelease, DocumentManifest, DocumentManifestCoverage, DocumentManifestItem,
+    DocumentManifestItemState, DocumentManifestPlanRequest, DocumentManifestState, DocumentScope,
+    Fact, ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, ImportStage,
+    ImportStatus, KnowledgeAnswerStatus, KnowledgeAskResult, KnowledgeCapability,
+    KnowledgeCoverage, KnowledgeEvidence, KnowledgeOverview, KnowledgePurpose, KnowledgeRelease,
+    KnowledgeRepository, KnowledgeSearchRequest, KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES,
+    MAX_UPLOAD_BYTES, Operation, OperationStatus, Product, ReviseSourceTextCommand, Source,
+    SourceDetail, SourceKind, SourceState, SourceTextRevisionReceipt, SourceVersion,
+    SourceVersionContent, SourceVersionRepresentation, StoredObject, StoredObjectState,
+    TenantScope, UPLOAD_SESSION_TTL_SECONDS, UploadSession, UploadSessionCommand,
+    UploadSessionState, is_supported_knowledge_media_type, knowledge_parser_version,
+    parsed_knowledge_chunks, plan_document_manifest, sha256_hex,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -1804,6 +1804,78 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                 filename,
             )
         }))
+    }
+
+    async fn get_attachment_object_bytes(
+        &self,
+        scope: &TenantScope,
+        object_id: Uuid,
+        object_version: i64,
+        sha256: &str,
+    ) -> Result<Option<AttachmentObjectBytes>, AppError> {
+        let project_id = Self::project_id(scope)?;
+        let mut transaction = self.transaction(scope).await?;
+        let row = sqlx::query(
+            "SELECT object.backend,object.opaque_key,object.actual_size,
+                    object.detected_media_type,object.created_at,
+                    blob.actual_size AS blob_size,blob.sha256 AS blob_hash,
+                    CASE WHEN octet_length(blob.content) <= $7 THEN blob.content
+                         ELSE NULL END AS content
+             FROM knowledge_stored_objects object
+             JOIN knowledge_upload_sessions session
+               ON session.committed_object_id=object.object_id
+              AND session.operator_id=object.operator_id AND session.tenant_id=object.tenant_id
+              AND session.project_id=object.project_id
+             LEFT JOIN knowledge_upload_blobs blob
+               ON blob.upload_session_id=session.upload_session_id
+             WHERE object.object_id=$1 AND object.operator_id=$2 AND object.tenant_id=$3
+               AND object.project_id=$4 AND object.object_version=$5 AND object.sha256=$6
+               AND object.state='committed' AND session.state='committed'
+               AND session.staging_object_ref='agent-attachment'",
+        )
+        .bind(object_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(object_version)
+        .bind(sha256)
+        .bind(MAX_UPLOAD_BYTES as i64)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let object = StoredObject {
+            object_id,
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id,
+            object_version,
+            backend: row.get("backend"),
+            opaque_key: row.get("opaque_key"),
+            actual_size: row.get::<i64, _>("actual_size") as u64,
+            detected_media_type: row.get("detected_media_type"),
+            sha256: sha256.to_owned(),
+            state: StoredObjectState::Committed,
+            created_at: row.get("created_at"),
+        };
+        let bytes: Option<Vec<u8>> = row.get("content");
+        if row.get::<Option<i64>, _>("blob_size") != Some(object.actual_size as i64)
+            || row.get::<Option<String>, _>("blob_hash").as_deref() != Some(sha256)
+        {
+            return Err(AppError::conflict(
+                "committed attachment bytes do not match object metadata",
+            ));
+        }
+        AttachmentObjectBytes::verified(
+            object,
+            bytes.ok_or_else(|| {
+                AppError::conflict("committed attachment bytes do not match object metadata")
+            })?,
+        )
+        .map(Some)
     }
 
     async fn import_batch(

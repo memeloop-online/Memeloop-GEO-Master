@@ -511,6 +511,31 @@ pub struct StoredObject {
     pub created_at: DateTime<Utc>,
 }
 
+/// An internal snapshot of one committed agent attachment's original bytes.
+/// `detected_media_type` in the object is currently uploader-declared; callers
+/// must inspect and decode the bytes before treating them as media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentObjectBytes {
+    pub object: StoredObject,
+    pub bytes: Vec<u8>,
+}
+
+impl AttachmentObjectBytes {
+    pub fn verified(object: StoredObject, bytes: Vec<u8>) -> Result<Self, AppError> {
+        if object.state != StoredObjectState::Committed
+            || object.actual_size == 0
+            || object.actual_size > MAX_UPLOAD_BYTES
+            || bytes.len() as u64 != object.actual_size
+            || sha256_hex(&bytes) != object.sha256
+        {
+            return Err(AppError::conflict(
+                "committed attachment bytes do not match object metadata",
+            ));
+        }
+        Ok(Self { object, bytes })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Source {
     pub source_id: Uuid,
@@ -1458,6 +1483,20 @@ pub trait KnowledgeRepository: Send + Sync {
         scope: &TenantScope,
         id: Uuid,
     ) -> Result<Option<(StoredObject, String)>, AppError>;
+    /// Read only an agent-attachment upload committed in this project, matching
+    /// its immutable object identity, version, and digest. This is not a public
+    /// media authorization or MIME validation boundary.
+    async fn get_attachment_object_bytes(
+        &self,
+        _scope: &TenantScope,
+        _object_id: Uuid,
+        _object_version: i64,
+        _sha256: &str,
+    ) -> Result<Option<AttachmentObjectBytes>, AppError> {
+        Err(AppError::capability_missing(
+            "committed attachment byte reading is unavailable",
+        ))
+    }
     async fn import_batch(
         &self,
         scope: &TenantScope,
@@ -4329,6 +4368,39 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             return Ok(None);
         };
         Ok(Some((object, session.filename.clone())))
+    }
+
+    async fn get_attachment_object_bytes(
+        &self,
+        scope: &TenantScope,
+        object_id: Uuid,
+        object_version: i64,
+        sha256: &str,
+    ) -> Result<Option<AttachmentObjectBytes>, AppError> {
+        Self::require_project(scope)?;
+        let state = self.state.read().await;
+        let Some(object) = state.stored_objects.get(&object_id).filter(|object| {
+            Self::in_scope(scope, *object)
+                && object.state == StoredObjectState::Committed
+                && object.object_version == object_version
+                && object.sha256 == sha256
+        }) else {
+            return Ok(None);
+        };
+        if !state.upload_sessions.values().any(|session| {
+            session.committed_object_id == Some(object_id)
+                && session.state == UploadSessionState::Committed
+                && state
+                    .attachment_completions
+                    .contains_key(&session.upload_session_id)
+                && Self::in_scope(scope, session)
+        }) {
+            return Ok(None);
+        }
+        let bytes = state.object_bytes.get(&object_id).cloned().ok_or_else(|| {
+            AppError::conflict("committed attachment bytes do not match object metadata")
+        })?;
+        AttachmentObjectBytes::verified(object.clone(), bytes).map(Some)
     }
 
     async fn import_batch(
