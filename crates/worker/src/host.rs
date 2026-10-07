@@ -272,6 +272,32 @@ fn validate_recorded_return(
                 return Err(HostOpError::internal(op, "step returned an unrelated item"));
             }
         }
+        HostOp::ContentMediaList => {
+            let requested: ContentMediaListRequest = typed(op, request)?;
+            let response: ContentMediaPage = typed(op, result)?;
+            response.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::ContentMediaBind => {
+            let requested: ContentMediaBindRequest = typed(op, request)?;
+            let response: ContentMediaRef = typed(op, result)?;
+            response.validate().map_err(invalid)?;
+            if response.key.object_id != requested.attachment_id {
+                return Err(HostOpError::internal(
+                    op,
+                    "media binding returned another attachment object",
+                ));
+            }
+        }
+        HostOp::ContentDocumentRead => {
+            let requested: ContentDocumentReadRequest = typed(op, request)?;
+            let response: ContentDocumentSnapshot = typed(op, result)?;
+            response.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::ContentMediaInsert => {
+            let requested: ContentMediaInsertRequest = typed(op, request)?;
+            let response: ContentMediaInsertReceipt = typed(op, result)?;
+            response.validate_for(&requested).map_err(invalid)?;
+        }
         _ => {}
     }
     Ok(false)
@@ -333,7 +359,246 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v14";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v15";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMediaListRequest {
+    pub after: Option<Uuid>,
+    pub limit: Option<usize>,
+}
+
+impl ContentMediaListRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.after.is_some_and(|id| id.is_nil())
+            || self.limit.is_some_and(|limit| !(1..=25).contains(&limit))
+        {
+            return Err("invalid media cursor or page size".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMediaRef {
+    pub binding_id: Uuid,
+    pub key: geo_domain::MediaObjectKey,
+    pub media_type: String,
+    pub byte_len: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ContentMediaRef {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.binding_id.is_nil() {
+            return Err("media binding identity is missing".into());
+        }
+        geo_domain::VerifiedImage {
+            key: self.key.clone(),
+            media_type: self.media_type.clone(),
+            byte_len: self.byte_len,
+            width: self.width,
+            height: self.height,
+        }
+        .validate()
+        .map_err(|_| "media image metadata is invalid".into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMediaPage {
+    pub items: Vec<ContentMediaRef>,
+    pub next_cursor: Option<Uuid>,
+}
+
+impl ContentMediaPage {
+    pub fn validate_for(&self, request: &ContentMediaListRequest) -> Result<(), String> {
+        let limit = request.limit.unwrap_or(10);
+        if self.items.len() > limit || self.next_cursor.is_some_and(|id| id.is_nil()) {
+            return Err("media page exceeds requested bounds".into());
+        }
+        let mut seen = HashSet::new();
+        for item in &self.items {
+            item.validate()?;
+            if !seen.insert(item.binding_id) || request.after == Some(item.binding_id) {
+                return Err("media page contains duplicate or cursor item".into());
+            }
+        }
+        if self.next_cursor.is_some()
+            && (self.items.is_empty()
+                || self.next_cursor != self.items.last().map(|item| item.binding_id))
+        {
+            return Err("media page cursor does not match last item".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMediaBindRequest {
+    pub attachment_id: Uuid,
+}
+
+impl ContentMediaBindRequest {
+    pub fn validate(&self, attachments: &[AttachmentReference]) -> Result<(), HostOpError> {
+        if self.attachment_id.is_nil() {
+            return Err(HostOpError::invalid_request(
+                HostOp::ContentMediaBind,
+                "attachment reference must be non-zero",
+            ));
+        }
+        if !attachments
+            .iter()
+            .any(|item| item.attachment_id.as_uuid() == self.attachment_id)
+        {
+            return Err(HostOpError::denied(
+                HostOp::ContentMediaBind,
+                "attachment is not bound to this run",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentDocumentReadRequest {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub revision_id: Option<Uuid>,
+}
+
+impl ContentDocumentReadRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.execution_id.is_nil()
+            || self.item_id.is_nil()
+            || self.revision_id.is_some_and(|id| id.is_nil())
+        {
+            return Err("invalid content document references".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentDocumentSnapshot {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub asset_id: Uuid,
+    pub revision_id: Uuid,
+    pub current_revision_id: Uuid,
+    pub revision: i32,
+    pub is_reused: bool,
+    pub document: geo_domain::StructuredDocument,
+}
+
+impl ContentDocumentSnapshot {
+    pub fn validate_for(&self, request: &ContentDocumentReadRequest) -> Result<(), String> {
+        if self.execution_id != request.execution_id
+            || self.item_id != request.item_id
+            || self.asset_id.is_nil()
+            || self.revision_id.is_nil()
+            || self.current_revision_id.is_nil()
+            || self.revision < 1
+            || request.revision_id.is_some_and(|id| id != self.revision_id)
+            || self.document.title.trim().is_empty()
+            || self.document.blocks.is_empty()
+            || !matches!(self.document.schema_version, None | Some(2))
+            || self
+                .document
+                .blocks
+                .iter()
+                .any(|block| block.block_id.is_nil())
+        {
+            return Err("content document identity or revision is invalid".into());
+        }
+        let mut seen = HashSet::new();
+        for block in &self.document.blocks {
+            if !seen.insert(block.block_id)
+                || block
+                    .rich
+                    .as_ref()
+                    .is_some_and(|rich| rich.validate().is_err())
+            {
+                return Err("content document contains an invalid block".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMediaInsertRequest {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub base_revision_id: Uuid,
+    pub binding_id: Uuid,
+    pub after_block_id: Option<Uuid>,
+    pub alt: String,
+    pub caption: String,
+}
+
+impl ContentMediaInsertRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.execution_id.is_nil()
+            || self.item_id.is_nil()
+            || self.base_revision_id.is_nil()
+            || self.binding_id.is_nil()
+            || self.after_block_id.is_some_and(|id| id.is_nil())
+        {
+            return Err("invalid content or media reference".into());
+        }
+        geo_domain::RichContent {
+            version: 1,
+            node: geo_domain::RichNode::Media {
+                attrs: geo_domain::MediaReference {
+                    object_id: Uuid::from_u128(1),
+                    object_version: 1,
+                    sha256: "0".repeat(64),
+                    alt: self.alt.clone(),
+                    caption: self.caption.clone(),
+                },
+            },
+        }
+        .validate()
+        .map_err(|_| "invalid media alternative text or caption".into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMediaInsertReceipt {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub asset_id: Uuid,
+    pub revision_id: Uuid,
+    pub base_revision_id: Uuid,
+    pub block_id: Uuid,
+    pub revision: i32,
+}
+
+impl ContentMediaInsertReceipt {
+    pub fn validate_for(&self, request: &ContentMediaInsertRequest) -> Result<(), String> {
+        if self.execution_id != request.execution_id
+            || self.item_id != request.item_id
+            || self.base_revision_id != request.base_revision_id
+            || self.asset_id.is_nil()
+            || self.revision_id.is_nil()
+            || self.revision_id == self.base_revision_id
+            || self.block_id.is_nil()
+            || self.revision < 1
+        {
+            return Err("insert receipt is missing exact persisted revision references".into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -539,6 +804,10 @@ pub enum HostOp {
     ContentClose,
     ContentStart,
     ContentExecutionRead,
+    ContentMediaList,
+    ContentMediaBind,
+    ContentDocumentRead,
+    ContentMediaInsert,
     DistributionStart,
     DistributionRead,
     DistributionResume,
@@ -552,7 +821,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 39;
+    pub const COUNT: usize = 43;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -586,6 +855,10 @@ impl HostOp {
         Self::ContentClose,
         Self::ContentStart,
         Self::ContentExecutionRead,
+        Self::ContentMediaList,
+        Self::ContentMediaBind,
+        Self::ContentDocumentRead,
+        Self::ContentMediaInsert,
         Self::DistributionStart,
         Self::DistributionRead,
         Self::DistributionResume,
@@ -630,6 +903,10 @@ impl HostOp {
             Self::ContentClose => "content.close.v1",
             Self::ContentStart => "content.start.v1",
             Self::ContentExecutionRead => "content.execution.read.v1",
+            Self::ContentMediaList => "content.media.list.v1",
+            Self::ContentMediaBind => "content.media.bind.v1",
+            Self::ContentDocumentRead => "content.document.read.v1",
+            Self::ContentMediaInsert => "content.media.insert.v1",
             Self::DistributionStart => "distribution.start.v1",
             Self::DistributionRead => "distribution.read.v1",
             Self::DistributionResume => "distribution.resume.v1",
@@ -675,6 +952,10 @@ impl HostOp {
             Self::ContentClose => "op_host_content_close_v1",
             Self::ContentStart => "op_host_content_start_v1",
             Self::ContentExecutionRead => "op_host_content_execution_read_v1",
+            Self::ContentMediaList => "op_host_content_media_list_v1",
+            Self::ContentMediaBind => "op_host_content_media_bind_v1",
+            Self::ContentDocumentRead => "op_host_content_document_read_v1",
+            Self::ContentMediaInsert => "op_host_content_media_insert_v1",
             Self::DistributionStart => "op_host_distribution_start_v1",
             Self::DistributionRead => "op_host_distribution_read_v1",
             Self::DistributionResume => "op_host_distribution_resume_v1",
@@ -780,6 +1061,10 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(30_000, 4),   // close
                 HostOpLimits::new(30_000, 4),   // start
                 HostOpLimits::new(15_000, 32),  // execution read
+                HostOpLimits::new(15_000, 64),  // bounded media list
+                HostOpLimits::new(60_000, 32),  // bound attachment verification
+                HostOpLimits::new(15_000, 32),  // exact full document read
+                HostOpLimits::new(60_000, 32),  // durable optimistic insertion
                 HostOpLimits::new(120_000, 4),  // freeze and advance one page
                 HostOpLimits::new(15_000, 64),  // manifest state
                 HostOpLimits::new(120_000, 32), // bounded expansion/revisit
@@ -1386,6 +1671,51 @@ pub trait HostOps: Send + Sync {
         Err(HostOpError::capability_missing(
             HostOp::ContentExecutionRead,
             "content execution is not configured",
+        ))
+    }
+
+    async fn content_media_list(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentMediaListRequest,
+    ) -> Result<ContentMediaPage, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentMediaList,
+            "content media listing is not configured",
+        ))
+    }
+
+    async fn content_media_bind(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentMediaBindRequest,
+        _attachments: &[AttachmentReference],
+    ) -> Result<ContentMediaRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentMediaBind,
+            "content media binding is not configured",
+        ))
+    }
+
+    async fn content_document_read(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentDocumentReadRequest,
+    ) -> Result<ContentDocumentSnapshot, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentDocumentRead,
+            "content document reading is not configured",
+        ))
+    }
+
+    async fn content_media_insert(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentMediaInsertRequest,
+    ) -> Result<ContentMediaInsertReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentMediaInsert,
+            "content media insertion is not configured",
         ))
     }
 

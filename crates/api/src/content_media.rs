@@ -203,37 +203,69 @@ pub(crate) async fn create_binding(
     require_project_writer(&auth).map_err(|e| api_error(e, context.request_id))?;
     key.validate()
         .map_err(|e| api_error(e, context.request_id))?;
-    let scope = crate::content::scoped(&state, &auth.scope, project_id)
+    let scope = TenantScope::new(
+        auth.scope.operator_id,
+        auth.scope.tenant_id,
+        Some(project_id),
+    );
+    let binding = bind_image(&state, &scope, key)
         .await
         .map_err(|e| api_error(e, context.request_id))?;
+    Ok((StatusCode::CREATED, Json(binding)))
+}
+
+/// Bind committed attachment bytes for a project. Callers must separately
+/// authorize the current operation (HTTP writer role or AI turn attachment).
+pub(crate) async fn bind_image(
+    state: &AppState,
+    scope: &TenantScope,
+    key: MediaObjectKey,
+) -> Result<ContentMediaBinding, AppError> {
+    key.validate()?;
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::forbidden("project scope required"))?;
+    let scope = crate::content::scoped(state, scope, project_id).await?;
     let snapshot = state
         .knowledge_repository()
         .get_attachment_object_bytes(&scope, key.object_id, key.object_version, &key.sha256)
-        .await
-        .map_err(|e| api_error(e, context.request_id))?
-        .ok_or_else(|| {
-            api_error(
-                AppError::not_found("attachment not found"),
-                context.request_id,
-            )
-        })?;
+        .await?
+        .ok_or_else(|| AppError::not_found("attachment not found"))?;
     // The storage seam verifies committed status, hash, version and byte
     // length. MIME in object metadata is uploader-declared and never trusted.
     let verified = tokio::task::spawn_blocking(move || verify_image_bytes(key, snapshot.bytes))
         .await
         .map_err(|_| {
-            api_error(
-                AppError::new(geo_domain::ErrorCode::Internal, "image decoder task failed"),
-                context.request_id,
-            )
-        })?
-        .map_err(|e| api_error(e, context.request_id))?;
-    let binding = state
+            AppError::new(geo_domain::ErrorCode::Internal, "image decoder task failed")
+        })??;
+    state
         .content_media_repository()
         .create_binding(&scope, verified)
         .await
-        .map_err(|e| api_error(e, context.request_id))?;
-    Ok((StatusCode::CREATED, Json(binding)))
+}
+
+/// List current-project bindings using the same cursor and page limits as HTTP.
+pub(crate) async fn binding_page(
+    state: &AppState,
+    scope: &TenantScope,
+    after: Option<Uuid>,
+    limit: Option<usize>,
+) -> Result<BindingPage, AppError> {
+    let limit = limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+        return Err(AppError::invalid_request("limit must be between 1 and 100"));
+    }
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::forbidden("project scope required"))?;
+    let scope = crate::content::scoped(state, scope, project_id).await?;
+    let mut items = state
+        .content_media_repository()
+        .list_bindings(&scope, after, limit + 1)
+        .await?;
+    let next_cursor = (items.len() > limit).then(|| items[limit - 1].binding_id);
+    items.truncate(limit);
+    Ok(BindingPage { items, next_cursor })
 }
 
 pub(crate) async fn list_bindings(
@@ -244,24 +276,11 @@ pub(crate) async fn list_bindings(
     Extension(context): Extension<RequestContext>,
 ) -> Result<Json<BindingPage>, ApiError> {
     let _ = (query.tenant_id, query.project_id);
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
-    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-        return Err(api_error(
-            AppError::invalid_request("limit must be between 1 and 100"),
-            context.request_id,
-        ));
-    }
-    let scope = crate::content::scoped(&state, &scope, project_id)
+    let scope = TenantScope::new(scope.operator_id, scope.tenant_id, Some(project_id));
+    binding_page(&state, &scope, query.after, query.limit)
         .await
-        .map_err(|e| api_error(e, context.request_id))?;
-    let mut items = state
-        .content_media_repository()
-        .list_bindings(&scope, query.after, limit + 1)
-        .await
-        .map_err(|e| api_error(e, context.request_id))?;
-    let next_cursor = (items.len() > limit).then(|| items[limit - 1].binding_id);
-    items.truncate(limit);
-    Ok(Json(BindingPage { items, next_cursor }))
+        .map(Json)
+        .map_err(|e| api_error(e, context.request_id))
 }
 
 pub(crate) async fn get_binding_bytes(
@@ -358,6 +377,7 @@ pub(crate) async fn withdraw_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geo_domain::{DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, ErrorCode};
 
     #[test]
     fn rejects_markup_and_missing_image_data() {
@@ -368,5 +388,36 @@ mod tests {
         };
         assert!(verify_image_bytes(key.clone(), b"<svg/>".to_vec()).is_err());
         assert!(verify_image_bytes(key, b"\x89PNG\r\n\x1a\n".to_vec()).is_err());
+    }
+
+    #[tokio::test]
+    async fn shared_services_require_project_scope_and_bounded_pages() {
+        let state = AppState::development();
+        let tenant = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
+        let key = MediaObjectKey {
+            object_id: Uuid::new_v4(),
+            object_version: 1,
+            sha256: "a".repeat(64),
+        };
+        assert_eq!(
+            bind_image(&state, &tenant, key).await.unwrap_err().code,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            binding_page(&state, &tenant, None, None)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Forbidden
+        );
+        for limit in [Some(0), Some(101)] {
+            assert_eq!(
+                binding_page(&state, &tenant, None, limit)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidRequest
+            );
+        }
     }
 }

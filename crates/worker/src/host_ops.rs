@@ -23,17 +23,18 @@ use serde::de::DeserializeOwned;
 
 use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
-    ChannelTargetExecuteRequest, ContentCloseRequest, ContentExecutionReadRequest,
-    ContentItemsReadRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
-    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
-    DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
-    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeSearchRequest,
-    KnowledgeSearchResult, KnowledgeTextReadRequest, KnowledgeTextReviseRequest,
-    ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest, MeasurementPlanCreateRequest,
-    MeasurementPlanReadRequest, ModelCompletionRequest, ProjectCurrentRequest,
-    ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest, PublishRequest,
-    QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest, ReportPreviewRequest,
-    ReportReduceRequest, validate_question_create,
+    ChannelTargetExecuteRequest, ContentCloseRequest, ContentDocumentReadRequest,
+    ContentExecutionReadRequest, ContentItemsReadRequest, ContentMediaBindRequest,
+    ContentMediaInsertRequest, ContentMediaListRequest, ContentStartRequest, ContentStepRequest,
+    CreateQuestionSet, DistributionReadRequest, DistributionResumeRequest,
+    DistributionStartRequest, DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge,
+    HostOp, HostOpError, KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest,
+    KnowledgeSearchRequest, KnowledgeSearchResult, KnowledgeTextReadRequest,
+    KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
+    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
+    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
+    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
+    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -241,6 +242,96 @@ pub async fn op_host_content_execution_read_v1(
             bridge
                 .capabilities()
                 .content_execution_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_content_media_list_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentMediaList;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentMediaListRequest>(op, &payload)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .content_media_list(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_content_media_bind_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentMediaBind;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentMediaBindRequest>(op, &payload)?;
+    request.validate(bridge.attachments())?;
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .content_media_bind(bridge.scope(), request, bridge.attachments())
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_content_document_read_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentDocumentRead;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentDocumentReadRequest>(op, &payload)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .content_document_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_content_media_insert_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentMediaInsert;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentMediaInsertRequest>(op, &payload)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .content_media_insert(bridge.scope(), request)
                 .await
         })
         .await?;
@@ -1011,6 +1102,10 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ContentClose.op_name(),
     HostOp::ContentStart.op_name(),
     HostOp::ContentExecutionRead.op_name(),
+    HostOp::ContentMediaList.op_name(),
+    HostOp::ContentMediaBind.op_name(),
+    HostOp::ContentDocumentRead.op_name(),
+    HostOp::ContentMediaInsert.op_name(),
     HostOp::DistributionStart.op_name(),
     HostOp::DistributionRead.op_name(),
     HostOp::DistributionResume.op_name(),

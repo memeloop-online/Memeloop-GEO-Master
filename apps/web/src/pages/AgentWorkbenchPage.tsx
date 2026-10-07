@@ -26,6 +26,7 @@ import type { WebMemeLoopChatAdapter } from "@memeloop/react-ui/chat";
 import { createTheme, ThemeProvider } from "@mui/material/styles";
 import type { ConversationMessageListProjection } from "memeloop";
 import { useNavigate, useParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import {
   agentEventStreamUrl,
   cancelAgentTurn,
@@ -45,12 +46,13 @@ import {
 import { createIdempotencyKey } from "../api/client";
 import { ErrorState, LoadingState } from "../components/AsyncState";
 import { useAppearance } from "../appearance/AppearanceProvider";
+import { formatUiDate } from "../i18n";
 
 // A composer projection only, never saved or presented as a server conversation.
 const emptyConversation: AgentConversationDetail = {
   conversation: {
     id: "local-unsent-composer",
-    title: "开始对话",
+    title: "",
     status: "active",
     revision: 0,
     created_at: "",
@@ -89,11 +91,14 @@ function projectMessage(
 
 function conversationName(
   conversation: Pick<AgentConversationSummary, "title" | "created_at">,
+  unnamed: string,
+  newConversation: string,
 ) {
   if (conversation.title?.trim()) return conversation.title;
+  if (!conversation.created_at) return newConversation;
   const date = new Date(conversation.created_at);
-  if (Number.isNaN(date.getTime())) return "未命名对话";
-  return `新对话 · ${date.toLocaleDateString("zh-CN")}`;
+  if (Number.isNaN(date.getTime())) return unnamed;
+  return `${newConversation} · ${formatUiDate(date)}`;
 }
 
 function orderedRuns(runs: readonly AgentRun[]) {
@@ -102,16 +107,18 @@ function orderedRuns(runs: readonly AgentRun[]) {
   );
 }
 
-function unavailableRuntimeNotice(runs: readonly AgentRun[]) {
+function unavailableRuntimeNotice(
+  runs: readonly AgentRun[],
+  missing: string,
+  unavailable: string,
+) {
   const failedRun = orderedRuns(runs).find(
     (run) =>
       run.status === "failed" &&
       ["missing", "unavailable"].includes(run.capability.status),
   );
   if (!failedRun) return undefined;
-  return failedRun.capability.status === "missing"
-    ? "AI 服务未启用，请联系管理员完成配置。"
-    : "AI 服务暂时不可用，请稍后重试。";
+  return failedRun.capability.status === "missing" ? missing : unavailable;
 }
 
 interface PendingAttachment {
@@ -124,15 +131,6 @@ interface PendingAttachment {
   contentUploaded?: boolean;
   reference?: AgentAttachmentReference;
 }
-
-const uploadLabels: Record<PendingAttachment["status"], string> = {
-  waiting: "等待上传",
-  creating_session: "创建上传会话",
-  uploading: "上传字节中",
-  completing: "核验中",
-  uploaded: "对象已核验；等待对话中的导入操作",
-  failed: "上传失败",
-};
 
 function ConversationList({
   activeConversationId,
@@ -153,12 +151,15 @@ function ConversationList({
   onSelect: (conversationId: string) => void;
   onRetry: () => void;
 }) {
+  const { t } = useTranslation();
   return (
-    <aside className="agent-conversation-list" aria-label="AI 对话列表">
+    <aside
+      className="agent-conversation-list"
+      aria-label={t("chatWorkbench.conversationList")}
+    >
       <div className="agent-conversation-list-heading">
         <div>
-          <p className="eyebrow">AI 工作台</p>
-          <h2>AI 工作台</h2>
+          <h2>{t("chatWorkbench.title")}</h2>
         </div>
         {(activeConversationId || items.length > 0) && (
           <Button
@@ -168,26 +169,28 @@ function ConversationList({
             disabled={creating}
             onClick={onCreate}
           >
-            {creating ? "正在创建…" : "新建"}
+            {creating ? t("chatWorkbench.creating") : t("chatWorkbench.create")}
           </Button>
         )}
       </div>
       <p className="agent-conversation-list-description">
-        对话和运行记录按当前项目隔离。
+        {t("chatWorkbench.description")}
       </p>
       <div className="agent-conversation-items">
-        {pending && <LoadingState compact label="正在加载对话" />}
+        {pending && <LoadingState compact label={t("chatWorkbench.loading")} />}
         {error && (
           <Button
             appearance="subtle"
             icon={<ArrowSyncRegular />}
             onClick={onRetry}
           >
-            重新加载对话
+            {t("chatWorkbench.reload")}
           </Button>
         )}
         {!pending && !error && items.length === 0 && (
-          <p className="agent-conversation-list-empty">还没有对话。</p>
+          <p className="agent-conversation-list-empty">
+            {t("chatWorkbench.noConversations")}
+          </p>
         )}
         {items.map((conversation) => (
           <Button
@@ -198,7 +201,11 @@ function ConversationList({
             className="agent-conversation-item"
             onClick={() => onSelect(conversation.id)}
           >
-            {conversationName(conversation)}
+            {conversationName(
+              conversation,
+              t("chatWorkbench.unnamedConversation"),
+              t("chatWorkbench.newConversation"),
+            )}
           </Button>
         ))}
       </div>
@@ -219,6 +226,7 @@ function AgentChat({
   onRefresh: () => Promise<void>;
   onFirstMessage?: (conversationId: string) => void;
 }) {
+  const { t } = useTranslation();
   const { appearance } = useAppearance();
   const agentTheme = useMemo(
     () =>
@@ -251,8 +259,13 @@ function AgentChat({
     ["queued", "running"].includes(run.status),
   );
   const activeTurnId = activeRun?.turn_id ?? localTurnId;
-  const capabilityNotice = unavailableRuntimeNotice(conversation.runs);
-  const displayedRuntimeNotice = capabilityNotice ?? runtimeNotice;
+  const capabilityNotice = unavailableRuntimeNotice(
+    conversation.runs,
+    t("chatWorkbench.runtimeMissing"),
+    t("chatWorkbench.runtimeUnavailable"),
+  );
+  const displayedRuntimeNotice =
+    capabilityNotice ?? (runtimeNotice ? t(runtimeNotice) : undefined);
   const latestAnswer = [...conversation.messages]
     .filter((message) => message.role === "assistant")
     .sort((a, b) => b.sequence - a.sequence)[0];
@@ -269,13 +282,13 @@ function AgentChat({
       const available = Math.max(0, 100 - current.length);
       const accepted = files.slice(0, available).filter((file) => {
         if (file.size > 100 * 1024 * 1024) {
-          setAttachmentNotice("每个附件最大为 100 MB。");
+          setAttachmentNotice("chatWorkbench.fileTooLarge");
           return false;
         }
         return true;
       });
       if (files.length > available) {
-        setAttachmentNotice("每批最多选择 100 个附件。");
+        setAttachmentNotice("chatWorkbench.tooManyFiles");
       }
       return [
         ...current,
@@ -376,9 +389,7 @@ function AgentChat({
           setAttachmentNotice(undefined);
           const results = await Promise.allSettled(batch.map(upload));
           if (results.some((result) => result.status === "rejected")) {
-            setAttachmentNotice(
-              "部分附件上传失败。已核验的附件会保留；请重试失败项后再次发送。",
-            );
+            setAttachmentNotice("chatWorkbench.partialUploadFailed");
             throw new Error("agent-attachment-upload-incomplete");
           }
           const references = results.map(
@@ -426,12 +437,10 @@ function AgentChat({
               : undefined,
           );
           if (references.length) {
-            setRuntimeNotice(
-              "附件已上传。告诉 AI 你想了解什么，或将资料加入企业知识。",
-            );
+            setRuntimeNotice("chatWorkbench.uploadedHint");
           }
           if (acceptance.error?.code === "capability_missing") {
-            setRuntimeNotice("AI 服务未启用，请联系管理员完成配置。");
+            setRuntimeNotice("chatWorkbench.runtimeMissing");
           }
           if (!onFirstMessage) await onRefresh();
           pendingSubmission.current = undefined;
@@ -457,9 +466,7 @@ function AgentChat({
       },
       onError: () => {
         if (attachmentNotice) return;
-        setRuntimeNotice(
-          "操作未完成。请确认 Agent 运行时已配置且当前项目有权限后重试。",
-        );
+        setRuntimeNotice("chatWorkbench.operationFailed");
       },
     }),
     [
@@ -478,16 +485,16 @@ function AgentChat({
   const empty: ReactNode = (
     <div className="agent-chat-empty">
       <FolderOpenRegular fontSize={28} aria-hidden="true" />
-      <h2>从你的资料或想法开始</h2>
-      <p>拖入文件、粘贴资料，或告诉 AI 你想完成的事。</p>
-      <p>无需先填表；可以在对话中逐步补充必要信息。</p>
+      <h2>{t("chatWorkbench.emptyTitle")}</h2>
+      <p>{t("chatWorkbench.emptyHint")}</p>
+      <p>{t("chatWorkbench.emptyDetail")}</p>
     </div>
   );
 
   return (
     <section
       className="agent-chat-column"
-      aria-label="AI 对话"
+      aria-label={t("chatWorkbench.conversation")}
       onDragOverCapture={(event) => {
         if (event.dataTransfer.types.includes("Files")) event.preventDefault();
       }}
@@ -496,57 +503,67 @@ function AgentChat({
     >
       <div className="agent-chat-titlebar">
         <div>
-          <p className="eyebrow">AI 工作台</p>
-          <h1>{conversationName(conversation.conversation)}</h1>
+          <p className="eyebrow">{t("chatWorkbench.title")}</p>
+          <h1>
+            {conversationName(
+              conversation.conversation,
+              t("chatWorkbench.unnamedConversation"),
+              t("chatWorkbench.newConversation"),
+            )}
+          </h1>
         </div>
         {activeTurnId && (
           <span className="agent-run-state" aria-live="polite">
-            正在运行
+            {t("chatWorkbench.running")}
           </span>
         )}
       </div>
       {attachmentNotice && (
         <MessageBar intent="warning" className="agent-file-reference-notice">
-          <MessageBarBody>{attachmentNotice}</MessageBarBody>
+          <MessageBarBody>{t(attachmentNotice)}</MessageBarBody>
         </MessageBar>
       )}
       {typeof omittedHistory === "number" &&
         Number.isSafeInteger(omittedHistory) &&
         omittedHistory > 0 && (
-          <MessageBar intent="info" aria-label="历史上下文范围">
+          <MessageBar
+            intent="info"
+            aria-label={t("chatWorkbench.historyScope")}
+          >
             <MessageBarBody>
-              最近一次回复未包含较早的 {omittedHistory}{" "}
-              轮已完成对话。历史消息仍保留在会话中；如需引用较早细节，请在新消息中补充。
+              {t("chatWorkbench.historyOmitted", { count: omittedHistory })}
             </MessageBarBody>
           </MessageBar>
         )}
       {attachments.length > 0 && (
-        <div className="agent-file-reference-notice" aria-label="待发送附件">
-          <p>
-            上传不直接加入知识库。可在对话中要求 AI 导入 TXT / Markdown / UTF-8
-            CSV 并引用原文回答。CSV 使用逗号分隔，首条记录作为表头。
-          </p>
+        <div
+          className="agent-file-reference-notice"
+          aria-label={t("chatWorkbench.pendingAttachments")}
+        >
+          <p>{t("chatWorkbench.attachmentHint")}</p>
           {attachments.map((item) => (
             <div key={item.id}>
               <span>
-                {item.file.name} · {uploadLabels[item.status]}
+                {item.file.name} · {t(`chatWorkbench.upload.${item.status}`)}
               </span>
               {item.status === "failed" && (
                 <Button
                   appearance="subtle"
                   onClick={() =>
                     void upload(item).catch(() =>
-                      setAttachmentNotice("附件重试失败，请稍后再试。"),
+                      setAttachmentNotice("chatWorkbench.retryUploadFailed"),
                     )
                   }
                 >
-                  重试 {item.file.name}
+                  {t("chatWorkbench.retryFile", { name: item.file.name })}
                 </Button>
               )}
               <Button
                 appearance="subtle"
                 icon={<DismissRegular />}
-                aria-label={`移除文件 ${item.file.name}`}
+                aria-label={t("chatWorkbench.removeFile", {
+                  name: item.file.name,
+                })}
                 onClick={() =>
                   setAttachments((current) =>
                     current.filter((candidate) => candidate.id !== item.id),
@@ -563,14 +580,12 @@ function AgentChat({
                 .sendMessage({ text: "", file: selectedFile })
                 .catch(() =>
                   setAttachmentNotice(
-                    (previous) =>
-                      previous ??
-                      "附件上传或消息提交未完成，已核验的引用已保留，请重试。",
+                    (previous) => previous ?? "chatWorkbench.submissionFailed",
                   ),
                 )
             }
           >
-            仅发送附件
+            {t("chatWorkbench.sendAttachments")}
           </Button>
         </div>
       )}
@@ -594,7 +609,7 @@ function AgentChat({
                   ref={picker}
                   type="file"
                   multiple
-                  aria-label="选择多个附件"
+                  aria-label={t("chatWorkbench.selectFiles")}
                   data-testid="agent-multi-file-input"
                   style={{ display: "none" }}
                   disabled={disabled}
@@ -606,22 +621,23 @@ function AgentChat({
                   disabled={disabled}
                   onClick={() => picker.current?.click()}
                 >
-                  添加文件
+                  {t("chatWorkbench.addFile")}
                 </Button>
               </>
             )}
-            placeholder="介绍你的品牌、粘贴资料，或添加文件开始"
+            placeholder={t("chatWorkbench.placeholder")}
             composerLabels={{
-              input: "输入任务",
-              send: "发送",
-              cancel: "取消运行",
-              addFile: "添加文件",
-              removeFile: (filename) => `移除文件 ${filename}`,
+              input: t("chatWorkbench.input"),
+              send: t("chatWorkbench.send"),
+              cancel: t("chatWorkbench.cancel"),
+              addFile: t("chatWorkbench.addFile"),
+              removeFile: (filename) =>
+                t("chatWorkbench.removeFile", { name: filename }),
             }}
-            emptyMessage="此对话还没有消息"
-            loadingMessage="正在读取对话…"
-            genericErrorMessage="Agent 运行时暂不可用，暂时无法读取消息。"
-            operationErrorMessage="操作未完成；未生成任何模拟回复。"
+            emptyMessage={t("chatWorkbench.noMessages")}
+            loadingMessage={t("chatWorkbench.reading")}
+            genericErrorMessage={t("chatWorkbench.readFailed")}
+            operationErrorMessage={t("chatWorkbench.noReply")}
             showTurnActions={false}
             showTimeline={false}
           />
@@ -632,6 +648,7 @@ function AgentChat({
 }
 
 export function AgentWorkbenchPage() {
+  const { t } = useTranslation();
   const { tenantId, projectId, conversationId } = useParams();
   const navigate = useNavigate();
   const conversations = useAgentConversationsQuery(tenantId, projectId);
@@ -695,13 +712,13 @@ export function AgentWorkbenchPage() {
         <div className="agent-workbench-content">
           {conversationId && conversation.isPending && (
             <div className="agent-workbench-loading">
-              <Spinner label="正在加载对话" />
+              <Spinner label={t("chatWorkbench.loading")} />
             </div>
           )}
           {conversationId && conversation.isError && (
             <ErrorState
-              title="AI 运行时暂不可用"
-              detail="无法读取当前对话。请检查服务连接或稍后重试。"
+              title={t("chatWorkbench.conversationUnavailable")}
+              detail={t("chatWorkbench.conversationUnavailableDetail")}
               onRetry={() => void conversation.refetch()}
             />
           )}

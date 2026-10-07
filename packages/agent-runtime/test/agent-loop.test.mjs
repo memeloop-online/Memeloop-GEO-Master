@@ -772,6 +772,9 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "measurement_plan_read",
         "content_start",
         "content_execution_read",
+        "content_media_list",
+        "content_document_read",
+        "content_media_insert",
         "distribution_start",
         "distribution_read",
         "distribution_resume",
@@ -997,6 +1000,10 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "measurement_plan_read",
         "content_start",
         "content_execution_read",
+        "content_media_list",
+        "content_document_read",
+        "content_media_insert",
+        "content_media_bind",
         "distribution_start",
         "distribution_read",
         "distribution_resume",
@@ -1897,6 +1904,279 @@ test("content start accepts a reference-only current cycle and reads durable cov
       ["start", {}],
       ["read", { execution_id: executionId }],
     ]);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("media tools bind only current-turn attachments and return exact host document and draft receipt", async () => {
+  const ids = {
+    attachment: "00000000-0000-4000-8000-000000000701",
+    previousAttachment: "00000000-0000-4000-8000-000000000702",
+    binding: "00000000-0000-4000-8000-000000000703",
+    execution: "00000000-0000-4000-8000-000000000704",
+    item: "00000000-0000-4000-8000-000000000705",
+    base: "00000000-0000-4000-8000-000000000706",
+    revision: "00000000-0000-4000-8000-000000000707",
+    block: "00000000-0000-4000-8000-000000000708",
+  };
+  const insert = {
+    execution_id: ids.execution,
+    item_id: ids.item,
+    base_revision_id: ids.base,
+    binding_id: ids.binding,
+    after_block_id: ids.block,
+    alt: "An annotated diagram",
+    caption: "",
+  };
+  const receipt = {
+    execution_id: ids.execution,
+    item_id: ids.item,
+    asset_id: "00000000-0000-4000-8000-000000000709",
+    base_revision_id: ids.base,
+    revision_id: ids.revision,
+    block_id: "00000000-0000-4000-8000-000000000710",
+    status: "draft",
+  };
+  const document = {
+    execution_id: ids.execution,
+    item_id: ids.item,
+    revision_id: ids.base,
+    current_revision_id: ids.base,
+    reused: true,
+    document: { version: 2, blocks: [{ id: ids.block, text: "Original" }] },
+  };
+  const calls = [];
+  const requests = [];
+  let verifySchema = true;
+  const steps = [
+    ["content_media_list", { limit: 2 }],
+    ["content_media_bind", { attachment_id: ids.attachment }],
+    ["content_execution_read", { execution_id: ids.execution }],
+    [
+      "content_document_read",
+      { execution_id: ids.execution, item_id: ids.item },
+    ],
+    ["content_media_insert", insert],
+  ];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected knowledge search");
+    },
+    async knowledgeImportAttachments() {
+      throw new Error("Unexpected knowledge import");
+    },
+    async contentMediaList(request) {
+      calls.push(["list", request]);
+      return { items: [{ binding_id: ids.binding }], next_cursor: null };
+    },
+    async contentMediaBind(request) {
+      calls.push(["bind", request]);
+      return { binding_id: ids.binding, media_type: "image/png" };
+    },
+    async contentExecutionRead(request) {
+      calls.push(["execution", request]);
+      return { execution_id: ids.execution, items: [{ item_id: ids.item }] };
+    },
+    async contentDocumentRead(request) {
+      calls.push(["document", request]);
+      return document;
+    },
+    async contentMediaInsert(request) {
+      calls.push(["insert", request]);
+      return receipt;
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      if (verifySchema) {
+        verifySchema = false;
+        const schemas = Object.fromEntries(
+          request.tools.map((tool) => [
+            tool.function.name,
+            tool.function.parameters,
+          ]),
+        );
+        for (const name of [
+          "content_media_list",
+          "content_media_bind",
+          "content_document_read",
+          "content_media_insert",
+        ]) {
+          assert.equal(schemas[name].additionalProperties, false);
+          assert.equal(schemas[name].properties.project_id, undefined);
+          assert.equal(schemas[name].properties.object_key, undefined);
+        }
+        assert.deepEqual(schemas.content_media_bind.required, [
+          "attachment_id",
+        ]);
+        assert.deepEqual(
+          schemas.content_media_bind.properties.attachment_id.enum,
+          [ids.attachment],
+        );
+        assert.equal(schemas.content_media_list.properties.limit.maximum, 25);
+        assert.deepEqual(schemas.content_document_read.required, [
+          "execution_id",
+          "item_id",
+        ]);
+        assert.deepEqual(
+          schemas.content_media_insert.required,
+          Object.keys(insert).filter((key) => key !== "after_block_id"),
+        );
+        assert.match(request.system, /current turn/u);
+        assert.match(request.system, /not checked, ready, published/u);
+        assert.ok(
+          !JSON.stringify(request.tools).includes(ids.previousAttachment),
+        );
+      }
+      const next = steps[requests.length - 1];
+      return next
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `media-${requests.length}`,
+                type: "function",
+                function: {
+                  name: next[0],
+                  arguments: JSON.stringify(next[1]),
+                },
+              },
+            ],
+          }
+        : finalModelAnswer("The draft revision is saved, pending checks.");
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?mediaTools=${Date.now()}`
+    );
+    const result = await main({
+      ...historyTurn,
+      prompt: "Insert this attached image in the existing document",
+      attachments: [
+        {
+          attachment_id: ids.attachment,
+          object_id: "internal-object-not-model-visible",
+          object_version: "internal-version-not-model-visible",
+          filename: "diagram.png",
+          media_type: "image/png",
+          size_bytes: 16,
+          sha256: "c".repeat(64),
+        },
+      ],
+    });
+    assert.match(result.answer, /pending checks/u);
+    assert.deepEqual(calls, [
+      ["list", { limit: 2 }],
+      ["bind", { attachment_id: ids.attachment }],
+      ["execution", { execution_id: ids.execution }],
+      ["document", { execution_id: ids.execution, item_id: ids.item }],
+      ["insert", insert],
+    ]);
+    assert.match(requests[4].messages.at(-1).content, /"reused":true/u);
+    assert.deepEqual(JSON.parse(requests[5].messages.at(-1).content), receipt);
+    assert.ok(
+      !JSON.stringify(requests).includes("internal-object-not-model-visible"),
+    );
+    assert.ok(
+      !JSON.stringify(requests).includes("internal-version-not-model-visible"),
+    );
+    requests.length = 0;
+    steps.length = 0;
+    await main({
+      ...historyTurn,
+      message_id: "next-message",
+      turn_id: "next-turn",
+      run_id: "next-run",
+      attachments: [],
+    });
+    assert.ok(
+      requests[0].tools.some(
+        ({ function: tool }) => tool.name === "content_media_list",
+      ),
+    );
+    assert.ok(
+      !requests[0].tools.some(
+        ({ function: tool }) => tool.name === "content_media_bind",
+      ),
+    );
+    requests.length = 0;
+    await main({
+      ...historyTurn,
+      message_id: "another-message",
+      turn_id: "another-turn",
+      run_id: "another-run",
+      attachments: [
+        {
+          attachment_id: ids.previousAttachment,
+          filename: "different-image.png",
+          media_type: "image/png",
+        },
+      ],
+    });
+    const bindSchema = requests[0].tools.find(
+      ({ function: tool }) => tool.name === "content_media_bind",
+    ).function.parameters;
+    assert.deepEqual(bindSchema.properties.attachment_id.enum, [
+      ids.previousAttachment,
+    ]);
+    assert.ok(!JSON.stringify(bindSchema).includes(ids.attachment));
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("media insertion conflict fails without choosing a new base or completing the turn", async () => {
+  const calls = [];
+  const events = [];
+  let completions = 0;
+  const command = {
+    execution_id: "00000000-0000-4000-8000-000000000711",
+    item_id: "00000000-0000-4000-8000-000000000712",
+    base_revision_id: "00000000-0000-4000-8000-000000000713",
+    binding_id: "00000000-0000-4000-8000-000000000714",
+    alt: "Diagram",
+    caption: "",
+  };
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(...event) {
+      events.push(event);
+    },
+    async knowledgeSearch() {
+      throw new Error("Unexpected knowledge search");
+    },
+    async contentMediaInsert(request) {
+      calls.push(request);
+      throw new Error("revision_conflict: read current document");
+    },
+    async modelComplete() {
+      completions++;
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          {
+            id: "media-conflict",
+            type: "function",
+            function: {
+              name: "content_media_insert",
+              arguments: JSON.stringify(command),
+            },
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?mediaConflict=${Date.now()}`
+    );
+    await assert.rejects(main(historyTurn), /revision_conflict/u);
+    assert.deepEqual(calls, [command]);
+    assert.equal(completions, 1);
+    assert.deepEqual(events, []);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

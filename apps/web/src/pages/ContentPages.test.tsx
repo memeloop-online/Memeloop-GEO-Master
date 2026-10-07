@@ -376,7 +376,7 @@ function mockApi({
       const status = bundleStatuses.shift() ?? 200;
       return (bundleDeferred ?? Promise.resolve()).then(() =>
         status === 200
-          ? new Response(new Blob(["ZIP contents"]), {
+          ? new Response(new TextEncoder().encode("ZIP contents"), {
               headers: { "Content-Type": bundleMime },
             })
           : json(
@@ -1909,10 +1909,22 @@ describe("P09 content revision", () => {
       credentials: "same-origin",
       headers: { Accept: "application/zip" },
     });
-    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
-    expect((createObjectURL.mock.calls[0][0] as Blob).type).toBe(
-      "application/zip",
-    );
+    // Response.blob() can use Node's Blob realm rather than jsdom's Blob.
+    // Verify the actual MIME and bytes, not cross-realm instanceof identity.
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    const payload = createObjectURL.mock.calls[0][0];
+    expect(payload.type).toBe("application/zip");
+    expect(payload.size).toBe(new TextEncoder().encode("ZIP contents").length);
+    const readBlobText = (blob: Blob): Promise<string> => {
+      if (typeof blob.text === "function") return blob.text();
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(blob);
+      });
+    };
+    expect(await readBlobText(payload)).toBe("ZIP contents");
     await waitFor(() =>
       expect(revokeObjectURL).toHaveBeenCalledWith("blob:media-zip"),
     );
@@ -1934,6 +1946,10 @@ describe("P09 content revision", () => {
         ),
       ),
     ).toBe(true);
+    expect(createObjectURL).toHaveBeenCalledTimes(2);
+    expect(await readBlobText(createObjectURL.mock.calls[1][0])).toBe(
+      "ZIP contents",
+    );
   });
 
   it("keeps an in-flight export pinned, blocks duplicate requests and supports error retry", async () => {

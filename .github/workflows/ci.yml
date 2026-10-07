@@ -126,6 +126,7 @@ jobs:
           cargo test -p geo-app generated_bundle_runs_one_turn_through_assembled_provider -- --ignored 2>&1 | tee logs/cargo-app-bundle.log
           cargo test -p geo-api --test attachment_import_runtime -- --ignored 2>&1 | tee logs/cargo-attachment-import-runtime.log
           cargo test -p geo-api --test channel_tools_runtime -- --ignored 2>&1 | tee logs/cargo-channel-tools-runtime.log
+          cargo test -p geo-worker --test content_media_runtime -- --ignored 2>&1 | tee logs/cargo-content-media-runtime.log
           cargo test -p geo-worker --test content_workflow -- --ignored 2>&1 | tee logs/cargo-content-workflow.log
           cargo test -p geo-app content_runtime_tests -- --ignored 2>&1 | tee logs/cargo-content-app-runtime.log
 
@@ -145,6 +146,9 @@ jobs:
             fi
           done
           if ! cargo test -p geo-persistence --lib content_validation_holds_object_and_binding_until_caller_commits -- --ignored 2>&1 | tee "logs/cargo-media-lock-postgres.log"; then
+            failed=1
+          fi
+          if ! cargo test -p geo-api --test content_media_tools -- --ignored 2>&1 | tee "logs/cargo-media-tools-postgres.log"; then
             failed=1
           fi
           exit "$failed"
@@ -209,6 +213,7 @@ jobs:
           set -euo pipefail
           cargo build -p geo-app 2>&1 | tee logs/cargo-web-smoke-build.log
           node scripts/verify-web-smoke.mjs 2>&1 | tee logs/web-smoke.log
+          node scripts/verify-chat-copy-smoke.mjs 2>&1 | tee logs/chat-copy-smoke.log
 
       - name: Verify persistent local login across service restart
         env:

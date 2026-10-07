@@ -1205,6 +1205,81 @@ impl HostOps for RepositoryHostOps {
             .map_err(|error| worker_error(op, error))
     }
 
+    async fn content_media_list(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentMediaListRequest,
+    ) -> Result<geo_worker::ContentMediaPage, HostOpError> {
+        let op = HostOp::ContentMediaList;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let result =
+            crate::content_media_tools::list(self.content_state(op)?, scope, request.clone())
+                .await
+                .map_err(|error| worker_error(op, error))?;
+        result
+            .validate_for(&request)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn content_media_bind(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentMediaBindRequest,
+        attachments: &[AttachmentReference],
+    ) -> Result<geo_worker::ContentMediaRef, HostOpError> {
+        let op = HostOp::ContentMediaBind;
+        request.validate(attachments)?;
+        let result =
+            crate::content_media_tools::bind(self.content_state(op)?, scope, request, attachments)
+                .await
+                .map_err(|error| worker_error(op, error))?;
+        result
+            .validate()
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn content_document_read(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentDocumentReadRequest,
+    ) -> Result<geo_worker::ContentDocumentSnapshot, HostOpError> {
+        let op = HostOp::ContentDocumentRead;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let result =
+            crate::content_media_tools::read(self.content_state(op)?, scope, request.clone())
+                .await
+                .map_err(|error| worker_error(op, error))?;
+        result
+            .validate_for(&request)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
+    async fn content_media_insert(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentMediaInsertRequest,
+    ) -> Result<geo_worker::ContentMediaInsertReceipt, HostOpError> {
+        let op = HostOp::ContentMediaInsert;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let result =
+            crate::content_media_tools::insert(self.content_state(op)?, scope, request.clone())
+                .await
+                .map_err(|error| worker_error(op, error))?;
+        result
+            .validate_for(&request)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
     async fn content_close(
         &self,
         scope: &TenantScope,

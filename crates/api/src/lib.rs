@@ -12,6 +12,7 @@ mod connector_capabilities;
 mod content;
 mod content_export;
 mod content_media;
+mod content_media_tools;
 pub mod content_runtime;
 mod content_tools;
 mod desktop_gateway;

@@ -7,7 +7,14 @@ import {
   it,
   vi,
 } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -15,6 +22,7 @@ import { MemoryRouter } from "react-router-dom";
 import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import type { AuthSession } from "../auth/types";
+import i18n from "../i18n";
 
 const originalScrollTo = Object.getOwnPropertyDescriptor(
   HTMLElement.prototype,
@@ -81,9 +89,11 @@ function renderApp(path: string) {
   );
 }
 
-afterEach(() => {
+afterEach(async () => {
+  cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  await i18n.changeLanguage("zh-CN");
 });
 
 describe("P00 AI workbench routing", () => {
@@ -185,13 +195,19 @@ describe("P00 AI workbench routing", () => {
     expect(
       screen.getByRole("heading", { name: "从你的资料或想法开始" }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("输入任务")).toBeInTheDocument();
+    expect(screen.getByLabelText("输入任务")).toHaveAttribute(
+      "placeholder",
+      "提出问题、描述任务，或添加文件",
+    );
     expect(
       screen.queryByRole("button", { name: "新建对话" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /^新建$/ }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("告诉 AI 你想完成的工作，也可以添加资料。"),
+    ).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.filter(
         ([, options]) =>
@@ -286,7 +302,22 @@ describe("P00 AI workbench routing", () => {
     ).toBeInTheDocument();
     expect(screen.getByLabelText("输入任务")).toBeInTheDocument();
     expect(
-      screen.getByText("无需先填表；可以在对话中逐步补充必要信息。"),
+      screen.getByText("可以在对话中逐步补充必要信息。"),
+    ).toBeInTheDocument();
+    await act(async () => {
+      await i18n.changeLanguage("en");
+    });
+    expect(
+      screen.getByText("Tell AI what you want to do, or add files."),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Enter a task")).toHaveAttribute(
+      "placeholder",
+      "Ask a question, describe a task, or add a file",
+    );
+    expect(
+      screen.getByText(
+        "AI service is not enabled. Contact your administrator to set it up.",
+      ),
     ).toBeInTheDocument();
   });
 
@@ -357,7 +388,7 @@ describe("P00 AI workbench routing", () => {
       const send = screen.getByRole("button", { name: "发送" });
       fireEvent.click(send);
       fireEvent.click(send);
-      await screen.findByText(/操作未完成。请确认/);
+      await screen.findByText(/操作未完成。请稍后重试/);
       expect(screen.getByLabelText("输入任务")).toHaveValue(
         "先整理我的产品资料",
       );
@@ -388,6 +419,17 @@ describe("P00 AI workbench routing", () => {
       expect(JSON.parse(String(messages.at(-1)?.init?.body)).content).toBe(
         "先整理我的产品资料",
       );
+      expect(
+        await screen.findByRole("heading", { name: /新对话 · 2026年9月19日/ }),
+      ).toBeInTheDocument();
+      await act(async () => {
+        await i18n.changeLanguage("en");
+      });
+      expect(
+        screen.getByRole("heading", {
+          name: /New conversation · Sep 19, 2026/,
+        }),
+      ).toBeInTheDocument();
     },
   );
 
@@ -515,10 +557,17 @@ describe("P00 AI workbench routing", () => {
       });
     }
     fireEvent.change(fileInput, { target: { files: [first, second] } });
+    expect(
+      screen.getByText(
+        "上传的文件可在对话中使用。需要加入企业知识时，请告诉 AI。",
+      ),
+    ).toBeInTheDocument();
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "仅发送附件" }));
     expect(await screen.findByText(/部分附件上传失败/)).toBeInTheDocument();
-    expect(screen.getByText(/first.txt · 对象已核验/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/first.txt · 已上传，可在对话中使用/),
+    ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "重试 second.txt" }),
     ).toBeInTheDocument();
@@ -527,14 +576,34 @@ describe("P00 AI workbench routing", () => {
     ).toHaveLength(0);
 
     await user.click(screen.getByRole("button", { name: "重试 second.txt" }));
-    await screen.findByText(/second.txt · 对象已核验/);
+    await screen.findByText(/second.txt · 已上传，可在对话中使用/);
+    await act(async () => {
+      await i18n.changeLanguage("en");
+    });
+    expect(
+      screen.getByText(/first.txt · Uploaded · ready to use in chat/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/second.txt · Uploaded · ready to use in chat/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Some attachments failed to upload/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Uploaded files can be used in chat. Ask AI to add them to company knowledge when needed.",
+      ),
+    ).toBeInTheDocument();
+    await act(async () => {
+      await i18n.changeLanguage("zh-CN");
+    });
     await user.click(screen.getByRole("button", { name: "仅发送附件" }));
     await waitFor(() =>
       expect(
         requests.filter(({ url }) => url.includes("/messages?")),
       ).toHaveLength(1),
     );
-    expect(await screen.findByText(/消息提交未完成/)).toBeInTheDocument();
+    expect(await screen.findByText(/消息发送未完成/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "仅发送附件" }));
     await waitFor(() =>
       expect(
