@@ -10,6 +10,7 @@ import {
   Select,
 } from "@fluentui/react-components";
 import { Link, useSearchParams } from "react-router-dom";
+import { safeOriginalPublicUrl } from "../pages/PublicationLookupPanel";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor } from "../auth/types";
 import { createIdempotencyKey } from "../api/client";
@@ -340,6 +341,11 @@ export function ContentDistributionPanel({
         return "unrecognized";
     }
   })();
+  const publicUrl =
+    publication.data?.request_id === receipt.data?.request_id &&
+    !publication.data?.fixture
+      ? safeOriginalPublicUrl(publication.data?.public_url ?? null)
+      : null;
 
   return (
     <Card className="panel-card">
@@ -415,6 +421,11 @@ export function ContentDistributionPanel({
                   <p role="status">
                     {t(`contentDistribution.${publicationKey}`)}
                   </p>
+                )}
+                {publicUrl && (
+                  <a href={publicUrl} target="_blank" rel="noopener noreferrer">
+                    {t("contentDistribution.openPublicPage")}
+                  </a>
                 )}
                 <Button onClick={() => void publication.refetch()}>
                   {t("contentDistribution.refreshPublication")}

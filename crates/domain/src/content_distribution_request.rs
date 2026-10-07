@@ -241,12 +241,14 @@ struct MemoryRequestState {
     revisions: HashMap<(TenantScope, Uuid), ContentRevision>,
 }
 
+#[derive(Clone)]
 pub struct MemoryContentDistributionRequestRepository {
-    state: RwLock<MemoryRequestState>,
+    state: Arc<RwLock<MemoryRequestState>>,
     distribution: Arc<dyn ContentDistributionIntentLookup>,
     authorities: Option<MemoryRequestAuthorities>,
 }
 
+#[derive(Clone)]
 struct MemoryRequestAuthorities {
     content: Arc<dyn ContentRepository>,
     knowledge: Arc<dyn KnowledgeRepository>,
@@ -258,10 +260,21 @@ struct MemoryRequestAuthorities {
 impl MemoryContentDistributionRequestRepository {
     pub fn new(distribution: Arc<dyn ContentDistributionIntentLookup>) -> Self {
         Self {
-            state: RwLock::new(MemoryRequestState::default()),
+            state: Arc::new(RwLock::new(MemoryRequestState::default())),
             distribution,
             authorities: None,
         }
+    }
+
+    /// Rebind a forked AppState without losing accepted request/intent links.
+    /// The original wrapper retains its own lookup and cannot inherit a
+    /// builder override made to another AppState clone.
+    pub fn with_distribution_lookup(
+        mut self,
+        distribution: Arc<dyn ContentDistributionIntentLookup>,
+    ) -> Self {
+        self.distribution = distribution;
+        self
     }
 
     pub fn with_authorities(
@@ -524,19 +537,34 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
         scope: &TenantScope,
         request_id: Uuid,
     ) -> Result<ContentDistributionRequest, AppError> {
-        // All in-memory writers acquire request then distribution. A failure
-        // before returning leaves neither repository with a partial link.
-        let mut state = self.state.write().await;
-        let request = state_get(&state, scope, request_id)?;
-        if request.publication_intent_id.is_some() {
-            return Ok(request);
-        }
-        let revision = state
-            .revisions
-            .get(&(scope.clone(), request_id))
-            .ok_or_else(|| AppError::not_found("accepted revision not found"))?
-            .clone();
+        // Validate against live authorities without holding the request write
+        // lock through independent repository I/O. The accepted revision is
+        // immutable; the second read below serializes only linking and the
+        // shared distribution write (request → distribution lock order).
+        let (request, revision) = {
+            let state = self.state.read().await;
+            let request = state_get(&state, scope, request_id)?;
+            if request.publication_intent_id.is_some() {
+                return Ok(request);
+            }
+            let revision = state
+                .revisions
+                .get(&(scope.clone(), request_id))
+                .ok_or_else(|| AppError::not_found("accepted revision not found"))?
+                .clone();
+            (request, revision)
+        };
         let revision = self.check_live(&request, &revision).await?;
+        let mut state = self.state.write().await;
+        let latest = state_get(&state, scope, request_id)?;
+        if latest.publication_intent_id.is_some() {
+            return Ok(latest);
+        }
+        if latest != request {
+            return Err(AppError::conflict(
+                "accepted request changed during validation",
+            ));
+        }
         let intent = self
             .distribution
             .materialize_accepted_request(scope, &request, &revision)

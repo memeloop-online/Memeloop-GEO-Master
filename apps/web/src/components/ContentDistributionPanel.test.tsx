@@ -443,7 +443,56 @@ describe("ContentDistributionPanel", () => {
       "request-1",
     );
     expect(await screen.findByText("等待发布")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "打开公开页面" })).toBeNull();
     expect(submitContentDistributionRequest).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "https://publisher.example.test/post/12",
+    "http://publisher.example.test/post/12",
+  ])(
+    "links to the ledger's safe public page %s without implying verification",
+    async (publicUrl) => {
+      vi.mocked(getContentDistributionPublication).mockResolvedValue({
+        request_id: "request-1",
+        publication_intent_id: "intent-1",
+        channel_target_id: "target-1",
+        attempt_id: "attempt-1",
+        outcome: "published",
+        fixture: false,
+        public_url: publicUrl,
+      });
+      mount({ path: "/?distribution_request_id=request-1" });
+      const link = await screen.findByRole("link", { name: "打开公开页面" });
+      expect(link).toHaveAttribute("href", publicUrl);
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noopener noreferrer");
+      expect(screen.getByText("平台已接收；公开验证尚未确认。")).toBeTruthy();
+      expect(screen.queryByText("已完成公开验证。")).toBeNull();
+    },
+  );
+
+  it.each([
+    "javascript:alert(1)",
+    "data:text/html,hello",
+    "https://name:secret@publisher.example.test/post/12",
+    "http://name@publisher.example.test/post/12",
+    "//publisher.example.test/post/12",
+  ])("does not link unsafe ledger URL %s", async (publicUrl) => {
+    vi.mocked(getContentDistributionPublication).mockResolvedValue({
+      request_id: "request-1",
+      publication_intent_id: "intent-1",
+      channel_target_id: "target-1",
+      attempt_id: "attempt-1",
+      outcome: "published",
+      fixture: false,
+      public_url: publicUrl,
+    });
+    mount({ path: "/?distribution_request_id=request-1" });
+    expect(
+      await screen.findByText("平台已接收；公开验证尚未确认。"),
+    ).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "打开公开页面" })).toBeNull();
   });
 
   it("clears a recovered pending key after loading the matching persisted receipt", async () => {
@@ -579,11 +628,12 @@ describe("ContentDistributionPanel", () => {
       attempt_id: "attempt-1",
       outcome: "verified",
       fixture: true,
-      public_url: null,
+      public_url: "https://publisher.example.test/post/12",
     });
     mount({ path: "/?distribution_request_id=request-1" });
     expect(await screen.findByText("测试结果")).toBeTruthy();
     expect(screen.queryByText("已完成公开验证。")).toBeNull();
+    expect(screen.queryByRole("link", { name: "打开公开页面" })).toBeNull();
   });
 
   it("shows an unknown outcome without claiming reconciliation has started", async () => {

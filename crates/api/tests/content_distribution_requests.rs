@@ -11,13 +11,15 @@ use geo_api::{
     MemoryOperationStore, ModelProviderBridge, router,
 };
 use geo_domain::{
-    ChannelAccount, ChannelAccountRecord, ChannelOwnerKind, ChannelRepository, ChannelStatus,
-    ContentRepository, DocumentManifestPlanRequest, DocumentScope, ImportItem, InitialSource,
-    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, Membership,
-    MemoryAuthRepository, MemoryChannelRepository, MemoryContentRepository,
-    MemoryProjectRepository, ProjectCreate, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, Role, SourceKind, TenantScope, User, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
+    ChannelRepository, ChannelStatus, ConnectorKey, ConnectorVerification, ContentRepository,
+    ContentStep, DistributionRepository, DocumentManifestPlanRequest, DocumentScope, ImportItem,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
+    KnowledgeRepository, Membership, MemoryAuthRepository, MemoryChannelRepository,
+    MemoryConnectorCapabilityRepository, MemoryContentRepository, MemoryDistributionRepository,
+    MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate, ProjectRepository,
+    ProjectSettings, ProjectStartCommand, ReviseSourceTextCommand, Role, SourceKind, TenantScope,
+    User, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_worker::{HostOpError, ModelCompletion, ModelCompletionRequest};
 use serde_json::{Value, json};
@@ -51,6 +53,9 @@ impl ModelProviderBridge for FixtureModel {
 
 struct Fixture {
     app: axum::Router,
+    state: AppState,
+    distribution: Arc<MemoryDistributionRepository>,
+    knowledge: Arc<MemoryKnowledgeRepository>,
     channels: Arc<MemoryChannelRepository>,
     scope: TenantScope,
     project: String,
@@ -60,6 +65,8 @@ struct Fixture {
     content_asset_id: Uuid,
     content_revision_id: Uuid,
     account_id: Uuid,
+    source_id: Uuid,
+    source_version_id: Uuid,
 }
 
 fn req(
@@ -192,7 +199,7 @@ async fn fixture() -> Fixture {
         .await
         .unwrap();
     let scope = TenantScope::new(tenant.operator_id, tenant.tenant_id, Some(project.id));
-    let knowledge = Arc::new(geo_domain::MemoryKnowledgeRepository::default());
+    let knowledge = Arc::new(MemoryKnowledgeRepository::default());
     let imported = knowledge
         .import_batch(
             &scope,
@@ -244,6 +251,22 @@ async fn fixture() -> Fixture {
         .generate(&scope, execution.execution_id, item.item_id)
         .await
         .unwrap();
+    let lease = content
+        .claim(
+            &scope,
+            execution.execution_id,
+            item.item_id,
+            ContentStep::Check,
+            "request-fixture",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    content
+        .complete_check(&scope, &lease, vec![])
+        .await
+        .unwrap();
     let channels = Arc::new(MemoryChannelRepository::default());
     let now = Utc::now();
     let account_id = Uuid::new_v4();
@@ -273,21 +296,26 @@ async fn fixture() -> Fixture {
         )
         .await
         .unwrap();
+    let distribution = Arc::new(MemoryDistributionRepository::default());
     let state = AppState::with_stores_and_auth_and_projects_and_knowledge(
         Arc::new(MemoryOperationStore::default()),
         Arc::new(MemoryIdempotencyStore::default()),
         auth,
         projects,
-        knowledge,
+        knowledge.clone(),
         EventBus::default(),
         false,
     )
     .with_content_repository(content)
-    .with_channel_service(ChannelService::unconfigured(channels.clone()));
-    let app = router(state);
+    .with_channel_service(ChannelService::unconfigured(channels.clone()))
+    .with_distribution_repository(distribution.clone());
+    let app = router(state.clone());
     let (cookie, csrf) = login(&app, "demo@localhost", "fixture-pass").await;
     Fixture {
         app,
+        state,
+        distribution,
+        knowledge,
         channels,
         scope,
         project: project.id.to_string(),
@@ -297,10 +325,76 @@ async fn fixture() -> Fixture {
         content_asset_id: revision.asset_id,
         content_revision_id: revision.revision_id,
         account_id,
+        source_id: imported.items[0].source.as_ref().unwrap().source_id,
+        source_version_id: imported.items[0]
+            .source_version
+            .as_ref()
+            .unwrap()
+            .source_version_id,
     }
 }
 
 impl Fixture {
+    async fn prove_text_connector(&self) {
+        let registry = self.state.connector_capability_repository();
+        let key = ConnectorKey {
+            platform_id: "generic".into(),
+            placement_slot: "primary".into(),
+        };
+        let at = Utc::now();
+        let url = "https://example.org/articles/100".to_owned();
+        let receipt = ChannelOutcome {
+            status: ChannelOutcomeStatus::Published,
+            detail: None,
+            occurred_at: at,
+            raw_answer: None,
+            citations: vec![],
+            public_url: Some(url.clone()),
+            screenshot_ref: None,
+            connector_version: Some("live.v1".into()),
+            runner_evidence: vec![],
+            fixture: false,
+        };
+        let readback = ChannelOutcome {
+            status: ChannelOutcomeStatus::Verified,
+            runner_evidence: vec![json!({
+                "kind":"public_readback",
+                "url":url,
+                "content_matched":true,
+                "owned_by_account":true,
+                "expected_sha256":"a".repeat(64),
+                "readback_sha256":"a".repeat(64),
+            })],
+            ..receipt.clone()
+        };
+        registry
+            .insert_verification(
+                self.scope.operator_id,
+                ConnectorVerification {
+                    verification_id: Uuid::new_v4(),
+                    key: key.clone(),
+                    connector_version: "live.v1".into(),
+                    content_type: "faq".into(),
+                    publication_receipt: receipt,
+                    public_readback: readback,
+                    verified_at: at,
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .configure(
+                self.scope.operator_id,
+                key,
+                0,
+                true,
+                vec!["faq".into()],
+                "live.v1",
+            )
+            .await
+            .unwrap();
+    }
+
     fn path(&self) -> String {
         format!(
             "/api/v1/projects/{}/content-distribution-requests?tenant_id={}",
@@ -438,6 +532,219 @@ async fn accepted_key_replays_after_account_revocation_and_conflicts_before_auth
     );
     let (status, _) = f.post(Some("fresh-key"), f.body()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn checked_single_article_materializes_one_origin_outbox_without_a_cycle() {
+    let f = fixture().await;
+    f.prove_text_connector().await;
+    let (status, first) = f.post(Some("publish-checked"), f.body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let request_id = Uuid::parse_str(first["request_id"].as_str().unwrap()).unwrap();
+    let intent_id = Uuid::parse_str(first["publication_intent_id"].as_str().unwrap()).unwrap();
+    let commands = f.distribution.publication_commands(&f.scope).await;
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].target_id.is_nil());
+    assert_eq!(commands[0].intent_id, intent_id);
+    let bundle = f
+        .distribution
+        .get_publication_bundle(&f.scope, intent_id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(bundle.origin, geo_domain::PublicationOrigin::ContentRequest { request }
+        if request.request_id == request_id)
+    );
+    assert_eq!(bundle.command.command_id, commands[0].command_id);
+    assert_eq!(f.post(Some("publish-checked"), f.body()).await.1, first);
+    let (status, distinct) = f.post(Some("another-accepted-request"), f.body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{distinct}");
+    assert_ne!(distinct["request_id"], first["request_id"]);
+    assert_eq!(
+        distinct["publication_intent_id"],
+        first["publication_intent_id"]
+    );
+    assert_eq!(f.distribution.publication_commands(&f.scope).await.len(), 1);
+    assert!(matches!(
+        f.distribution
+            .get_publication_bundle(&f.scope, intent_id)
+            .await
+            .unwrap()
+            .origin,
+        geo_domain::PublicationOrigin::ContentRequest { request }
+            if request.request_id == request_id
+    ));
+    let other = TenantScope::new(
+        f.scope.operator_id,
+        f.scope.tenant_id,
+        Some(Uuid::new_v4().into()),
+    );
+    assert_eq!(
+        f.state
+            .content_distribution_request_repository()
+            .get(&other, request_id)
+            .await
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::NotFound
+    );
+}
+
+#[tokio::test]
+async fn builder_authority_overrides_are_fresh_without_mutating_sibling_state() {
+    let f = fixture().await;
+    let (status, accepted) = f.post(Some("pending-builder"), f.body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let id = Uuid::parse_str(accepted["request_id"].as_str().unwrap()).unwrap();
+    f.prove_text_connector().await;
+    // Each fork retains accepted rows, but validates against its own latest
+    // channel/content/capability snapshot. The original still publishes.
+    let empty_channels = Arc::new(MemoryChannelRepository::default());
+    let no_account = f
+        .state
+        .clone()
+        .with_channel_service(ChannelService::unconfigured(empty_channels));
+    assert_eq!(
+        no_account
+            .content_distribution_request_repository()
+            .materialize(&f.scope, id)
+            .await
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::Conflict
+    );
+    let no_content = f
+        .state
+        .clone()
+        .with_content_repository(Arc::new(MemoryContentRepository::default()));
+    assert_eq!(
+        no_content
+            .content_distribution_request_repository()
+            .materialize(&f.scope, id)
+            .await
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::Conflict
+    );
+    let no_proof = f
+        .state
+        .clone()
+        .with_connector_capability_repository(Arc::new(
+            MemoryConnectorCapabilityRepository::default(),
+        ));
+    assert_eq!(
+        no_proof
+            .content_distribution_request_repository()
+            .materialize(&f.scope, id)
+            .await
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::Conflict
+    );
+    let original_distribution = f.state.distribution_repository();
+    let fork_distribution = Arc::new(MemoryDistributionRepository::default());
+    let fork = f
+        .state
+        .clone()
+        .with_distribution_repository(fork_distribution.clone());
+    assert!(Arc::ptr_eq(
+        &original_distribution,
+        &f.state.distribution_repository()
+    ));
+    assert!(!Arc::ptr_eq(
+        &original_distribution,
+        &fork.distribution_repository()
+    ));
+    let linked = f
+        .state
+        .content_distribution_request_repository()
+        .materialize(&f.scope, id)
+        .await
+        .unwrap();
+    let intent_id = linked.publication_intent_id.unwrap();
+    assert_eq!(f.distribution.publication_commands(&f.scope).await.len(), 1);
+    assert!(
+        fork_distribution
+            .publication_commands(&f.scope)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        fork.distribution_repository()
+            .get_publication_bundle(&f.scope, intent_id)
+            .await
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::NotFound
+    );
+}
+
+#[tokio::test]
+async fn revoked_source_or_account_keeps_accepted_memory_request_unlinked() {
+    let f = fixture().await;
+    let (status, accepted) = f.post(Some("pending-source"), f.body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let id = Uuid::parse_str(accepted["request_id"].as_str().unwrap()).unwrap();
+    f.prove_text_connector().await;
+    let source = f
+        .knowledge
+        .get_source(&f.scope, f.source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    f.knowledge
+        .revise_source_text(
+            &f.scope,
+            f.source_id,
+            source.revision,
+            "new-source-version",
+            ReviseSourceTextCommand {
+                base_version_id: f.source_version_id,
+                media_type: "text/plain".into(),
+                text: "Updated public source".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.state
+            .content_distribution_request_repository()
+            .materialize(&f.scope, id)
+            .await
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::Conflict
+    );
+    assert!(
+        f.distribution
+            .publication_commands(&f.scope)
+            .await
+            .is_empty()
+    );
+
+    let f = fixture().await;
+    let (_, accepted) = f.post(Some("pending-account"), f.body()).await;
+    let id = Uuid::parse_str(accepted["request_id"].as_str().unwrap()).unwrap();
+    f.prove_text_connector().await;
+    f.channels
+        .delete_account(&f.scope, f.account_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.state
+            .content_distribution_request_repository()
+            .materialize(&f.scope, id)
+            .await
+            .unwrap_err()
+            .code,
+        geo_domain::ErrorCode::Conflict
+    );
+    assert!(
+        f.distribution
+            .publication_commands(&f.scope)
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]

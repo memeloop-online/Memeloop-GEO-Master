@@ -150,6 +150,7 @@ pub struct AppState {
     distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
     content_distribution_request_repository:
         Arc<dyn geo_domain::ContentDistributionRequestRepository>,
+    memory_request_repository: Option<geo_domain::MemoryContentDistributionRequestRepository>,
     distribution_intent_lookup: Arc<DistributionIntentLookupAdapter>,
     content_dispatch_repository: Option<geo_persistence::PgContentRepository>,
     content_model: Arc<std::sync::RwLock<Option<SharedModelProvider>>>,
@@ -214,12 +215,15 @@ impl AppState {
         let distribution_intent_lookup = Arc::new(DistributionIntentLookupAdapter(
             std::sync::RwLock::new(distribution_repository.clone()),
         ));
+        let memory_request_repository = geo_domain::MemoryContentDistributionRequestRepository::new(
+            distribution_intent_lookup.clone(),
+        );
         let content_media_repository = Arc::new(
             geo_domain::MemoryContentMediaRepository::with_knowledge_repository(
                 knowledge_repository.clone(),
             ),
         );
-        Self {
+        let mut state = Self {
             operation_store: Arc::new(MemoryOperationStore::default()),
             idempotency_store: Arc::new(MemoryIdempotencyStore::default()),
             agent_repository: Arc::new(MemoryAgentRepository::default()),
@@ -243,11 +247,8 @@ impl AppState {
             ),
             content_media_repository,
             distribution_repository,
-            content_distribution_request_repository: Arc::new(
-                geo_domain::MemoryContentDistributionRequestRepository::new(
-                    distribution_intent_lookup.clone(),
-                ),
-            ),
+            content_distribution_request_repository: Arc::new(memory_request_repository.clone()),
+            memory_request_repository: Some(memory_request_repository),
             distribution_intent_lookup,
             content_dispatch_repository: None,
             content_model: Arc::new(std::sync::RwLock::new(None)),
@@ -257,7 +258,9 @@ impl AppState {
             durable_storage: false,
             origin_scheme: Arc::from("http"),
             origin_config: OriginConfig::local_http(),
-        }
+        };
+        state.refresh_memory_request_authorities();
+        state
     }
 
     /// Replace the identity store during explicit local application assembly.
@@ -356,12 +359,15 @@ impl AppState {
         let distribution_intent_lookup = Arc::new(DistributionIntentLookupAdapter(
             std::sync::RwLock::new(distribution_repository.clone()),
         ));
+        let memory_request_repository = geo_domain::MemoryContentDistributionRequestRepository::new(
+            distribution_intent_lookup.clone(),
+        );
         let content_media_repository = Arc::new(
             geo_domain::MemoryContentMediaRepository::with_knowledge_repository(
                 knowledge_repository.clone(),
             ),
         );
-        Self {
+        let mut state = Self {
             operation_store,
             idempotency_store,
             agent_repository: Arc::new(MemoryAgentRepository::default()),
@@ -385,11 +391,8 @@ impl AppState {
             ),
             content_media_repository,
             distribution_repository,
-            content_distribution_request_repository: Arc::new(
-                geo_domain::MemoryContentDistributionRequestRepository::new(
-                    distribution_intent_lookup.clone(),
-                ),
-            ),
+            content_distribution_request_repository: Arc::new(memory_request_repository.clone()),
+            memory_request_repository: Some(memory_request_repository),
             distribution_intent_lookup,
             content_dispatch_repository: None,
             content_model: Arc::new(std::sync::RwLock::new(None)),
@@ -399,7 +402,9 @@ impl AppState {
             durable_storage,
             origin_scheme: Arc::from("http"),
             origin_config: OriginConfig::local_http(),
-        }
+        };
+        state.refresh_memory_request_authorities();
+        state
     }
 
     pub fn with_origin_scheme(mut self, scheme: impl Into<Arc<str>>) -> Self {
@@ -569,6 +574,7 @@ impl AppState {
         repository: Arc<dyn ConnectorCapabilityRepository>,
     ) -> Self {
         self.connector_capability_repository = repository;
+        self.refresh_memory_request_authorities();
         self
     }
 
@@ -617,7 +623,25 @@ impl AppState {
         repository: Arc<dyn geo_domain::ContentDistributionRequestRepository>,
     ) -> Self {
         self.content_distribution_request_repository = repository;
+        self.memory_request_repository = None;
         self
+    }
+
+    /// Each builder publishes a new immutable validation snapshot while
+    /// sharing only accepted request rows. A cloned AppState cannot silently
+    /// replace another clone's content/account/source/capability authority.
+    fn refresh_memory_request_authorities(&mut self) {
+        if let Some(repository) = self.memory_request_repository.clone() {
+            let repository = repository.with_authorities(
+                Arc::clone(&self.content_repository),
+                Arc::clone(&self.knowledge_repository),
+                Arc::clone(&self.project_repository),
+                Arc::clone(&self.channel_service.repository),
+                Arc::clone(&self.connector_capability_repository),
+            );
+            self.content_distribution_request_repository = Arc::new(repository.clone());
+            self.memory_request_repository = Some(repository);
+        }
     }
 
     pub fn distribution_service(&self) -> distribution::DistributionService {
@@ -638,12 +662,17 @@ impl AppState {
         mut self,
         repository: Arc<dyn geo_domain::DistributionRepository>,
     ) -> Self {
-        *self
-            .distribution_intent_lookup
-            .0
-            .write()
-            .expect("distribution lookup lock") = repository.clone();
+        // Fork the adapter too. In-place mutation of an Arc shared by a
+        // previously cloned AppState would silently change its origin ledger.
+        self.distribution_intent_lookup = Arc::new(DistributionIntentLookupAdapter(
+            std::sync::RwLock::new(repository.clone()),
+        ));
         self.distribution_repository = repository;
+        if let Some(memory) = self.memory_request_repository.take() {
+            self.memory_request_repository =
+                Some(memory.with_distribution_lookup(self.distribution_intent_lookup.clone()));
+        }
+        self.refresh_memory_request_authorities();
         self
     }
 
@@ -652,6 +681,7 @@ impl AppState {
         repository: Arc<dyn geo_domain::ContentRepository>,
     ) -> Self {
         self.content_repository = repository;
+        self.refresh_memory_request_authorities();
         self
     }
 
@@ -789,6 +819,7 @@ impl AppState {
 
     pub fn with_channel_service(mut self, service: ChannelService) -> Self {
         self.channel_service = service;
+        self.refresh_memory_request_authorities();
         self
     }
 

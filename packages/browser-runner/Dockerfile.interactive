@@ -3,7 +3,15 @@ FROM mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b7
 # Ubuntu Noble packages, fixed to the distribution build versions. The
 # runner and virtual desktop are not a tenant boundary on their own; run one
 # restricted container/pod per interactive session in production.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Keep signed, pinned packages while avoiding the HTTP mirror that can stall
+# hosted builds. Both legacy and deb822 APT source layouts are supported.
+RUN for task_source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt; do \
+      if [ -f "$task_source" ]; then \
+        sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$task_source"; \
+      fi; \
+    done \
+    && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 install -y --no-install-recommends \
     tigervnc-standalone-server=1.13.1+dfsg-2build2 \
     tigervnc-tools=1.13.1+dfsg-2build2 \
     websockify=0.10.0+dfsg1-5build2 \
