@@ -138,51 +138,44 @@ export async function probeKimiAccount(
   page,
   { trustedOrigin = KIMI_ORIGIN } = {},
 ) {
-  const probe = await page.context().newPage();
   try {
-    const response = await probe.goto(`${trustedOrigin}/`, {
-      waitUntil: "domcontentloaded",
-      timeout: 12_000,
-    });
-    if (
-      response?.status() !== 200 ||
-      new URL(probe.url()).origin !== trustedOrigin
-    ) {
-      return null;
-    }
-    // Fixed, same-origin Connect request. Token never leaves the browser page
-    // and is never returned to Node, logs, the HTTP caller or another origin.
-    // This mirrors the public client's getToken()/getCurrentUser() path.
-    const data = await probe.evaluate(async (selfPath) => {
-      const accessToken = localStorage.getItem("access_token");
-      const refreshToken = localStorage.getItem("refresh_token");
-      if (!accessToken || !refreshToken) return null;
-      const response = await fetch(selfPath, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          "Connect-Protocol-Version": "1",
-          "x-msh-platform": "web",
-        },
-        body: "{}",
-        redirect: "error",
-      });
-      if (
-        !response.ok ||
-        !/application\/json/i.test(response.headers.get("content-type") ?? "")
-      ) {
-        return null;
-      }
-      const text = await response.text();
-      return text.length <= 128_000 ? JSON.parse(text) : null;
-    }, KIMI_SELF);
+    // The interactive page must keep its URL, focus, and in-progress input.
+    // Check origin in the page before touching its storage or making a request:
+    // even a navigation between calls cannot send a token from another site.
+    const data = await page.evaluate(
+      async ({ origin, selfPath }) => {
+        if (location.origin !== origin) return null;
+        const accessToken = localStorage.getItem("access_token");
+        const refreshToken = localStorage.getItem("refresh_token");
+        if (!accessToken || !refreshToken) return null;
+        // Fixed, same-origin Connect request. Tokens remain page-side.
+        const response = await fetch(selfPath, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            "x-msh-platform": "web",
+          },
+          body: "{}",
+          redirect: "error",
+        });
+        if (
+          !response.ok ||
+          response.url !== `${origin}${selfPath}` ||
+          !/application\/json/i.test(response.headers.get("content-type") ?? "")
+        ) {
+          return null;
+        }
+        const text = await response.text();
+        return text.length <= 128_000 ? JSON.parse(text) : null;
+      },
+      { origin: trustedOrigin, selfPath: KIMI_SELF },
+    );
     return kimiIdentity(data);
   } catch {
     return null;
-  } finally {
-    await probe.close();
   }
 }
 

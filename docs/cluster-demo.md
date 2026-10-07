@@ -109,6 +109,44 @@ GEO_CONTENT_BUNDLE_SHA256=<matching line from /opt/geo/bundles/SHA256SUMS>
 无模型时，经过摘要校验的内容 bundle 仍可用于已经封存内容的分发准备；
 新的正文生成仍需要生产模型配置。缺少或错误摘要会使 API 拒绝启动相关配置。
 
+### 浏览器交互执行器部署
+
+[`deploy/demo/browser-runner.yaml`](../deploy/demo/browser-runner.yaml) 提供一个不含
+命名空间的可复用演示 `Deployment` 和内部 `ClusterIP Service`。它只消费 CI 已经
+构建并验证过的 `packages/browser-runner/Dockerfile.interactive` 镜像：镜像内已经
+包含 Playwright/Chromium、TigerVNC、websockify 和 Node 依赖；noVNC 客户端由前端提供。Pod 启动时
+不会运行 `apt`、`npm` 或源码安装步骤。清单中的 GHCR 镜像是故意使用的通用
+占位引用；部署者必须从成功的 interactive-desktop CI 运行中取得对应提交的
+不可变 digest，替换 `image` 后再应用，不能把 `latest` 或未经验证的标签当作
+部署凭据。
+
+旧的 runtime-install / app-volume 方案不得用于这个执行器。把依赖安装或源码
+目录放进启动时的 `emptyDir` 会把大文件写入临时存储，在配额紧张时可能驱逐
+Pod，也会绕过 CI 已验证的镜像内容；此清单只为 `/tmp` 提供 1 GiB 磁盘
+`emptyDir`，为 `/dev/shm` 提供 1 GiB 内存 `emptyDir`，不挂载 `/app` 或源码。
+
+在目标隔离命名空间中，由秘密管理器创建名为 `geo-browser-runner` 的 Secret，
+并提供 `GEO_BROWSER_RUNNER_TOKEN` 键。该值同时配置给 API 的
+`GEO_BROWSER_RUNNER_TOKEN`；API 在集群内使用
+`http://browser-runner:38080` 访问 Service。不要把令牌写入清单、镜像、前端
+变量或命令日志。应用清单和 Secret 由部署环境选择命名空间，例如：
+
+```text
+kubectl --namespace <demo-namespace> apply -f deploy/demo/browser-runner.yaml
+kubectl --namespace <demo-namespace> rollout status deployment/browser-runner
+```
+
+容器以 UID/GID 1000 的非 root 用户运行，关闭 service-account token 自动挂载、
+提权和额外 capabilities，并保留 `RuntimeDefault` seccomp；就绪检查只验证
+容器的 TCP 38080 端口。资源请求/上限是 headed Chromium/VNC 的保守基线，用于
+集群容量调度，不是业务并发或租户配额承诺，应按实际节点和 CI/运行时观测调整。
+
+这是隔离测试集群中的单副本演示包装，不是生产级每会话隔离，也不代替
+NetworkPolicy、TLS/Ingress、出口控制或 Secret 生命周期管理。当前 runner
+进程和浏览器运行时本身不能作为租户边界；生产部署需要由平台为交互会话安排
+受限的容器/Pod，并在集群侧补齐网络策略和入口认证。清单中的 ClusterIP 不应
+直接暴露到公网。
+
 ### 其他服务端能力
 
 只有已经部署对应服务时才注入下列受支持配置；它们不是前端变量：

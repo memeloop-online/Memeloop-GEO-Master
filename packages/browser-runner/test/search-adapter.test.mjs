@@ -86,20 +86,24 @@ test("candidate collector bounds stalled work and aborts flow without verificati
 });
 
 test("source-derived Kimi self probe requires authenticated browser storage and own user JSON", async () => {
+  let selfRequests = 0;
+  let selfBody = { user: { id: "own-123", nickname: "Fixture owner" } };
+  let selfContentType = "application/json";
   const server = createServer((request, response) => {
     if (request.url === "/") {
       response.writeHead(200, { "content-type": "text/html" });
-      response.end("<!doctype html><html><body>Fixture</body></html>");
+      response.end(
+        '<!doctype html><html><body><input id="draft" value=""></body></html>',
+      );
     } else if (
       request.url ===
         "/apiv2/kimi.gateway.account.v1.UserService/GetCurrentUser" &&
       request.method === "POST" &&
       request.headers.authorization === "Bearer fixture-access"
     ) {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({ user: { id: "own-123", nickname: "Fixture owner" } }),
-      );
+      selfRequests++;
+      response.writeHead(200, { "content-type": selfContentType });
+      response.end(JSON.stringify(selfBody));
     } else {
       response.writeHead(401, { "content-type": "application/json" });
       response.end("{}");
@@ -116,6 +120,7 @@ test("source-derived Kimi self probe requires authenticated browser storage and 
     });
     const anonymous = await browser.newContext();
     const anonymousPage = await anonymous.newPage();
+    await anonymousPage.goto(`${origin}/`);
     assert.equal(
       await probeKimiAccount(anonymousPage, { trustedOrigin: origin }),
       null,
@@ -127,9 +132,52 @@ test("source-derived Kimi self probe requires authenticated browser storage and 
       localStorage.setItem("refresh_token", "fixture-refresh");
     });
     const authenticatedPage = await authenticated.newPage();
-    assert.deepEqual(
+    await authenticatedPage.goto(`${origin}/`);
+    await authenticatedPage.locator("#draft").fill("unfinished login input");
+    const initialUrl = authenticatedPage.url();
+    authenticated.newPage = () => {
+      throw new Error("identity polling must not open another browser tab");
+    };
+    for (let check = 0; check < 3; check++) {
+      assert.deepEqual(
+        await probeKimiAccount(authenticatedPage, { trustedOrigin: origin }),
+        { platform_account_id: "own-123", display_name: "Fixture owner" },
+      );
+      assert.equal(authenticatedPage.url(), initialUrl);
+      assert.equal(
+        await authenticatedPage.locator("#draft").inputValue(),
+        "unfinished login input",
+      );
+      assert.equal(authenticated.pages().length, 1);
+    }
+    assert.equal(selfRequests, 3);
+    selfBody = { user: { id: "own-123", nickname: "" } };
+    assert.equal(
       await probeKimiAccount(authenticatedPage, { trustedOrigin: origin }),
-      { platform_account_id: "own-123", display_name: "Fixture owner" },
+      null,
+      "incomplete own identity cannot connect an account",
+    );
+    selfContentType = "text/html";
+    assert.equal(
+      await probeKimiAccount(authenticatedPage, { trustedOrigin: origin }),
+      null,
+      "the self endpoint must return JSON",
+    );
+    selfContentType = "application/json";
+    selfBody = { user: { id: "own-123", nickname: "Fixture owner" } };
+    const previousRequests = selfRequests;
+    assert.equal(
+      await probeKimiAccount(authenticatedPage, {
+        trustedOrigin: "https://www.kimi.com",
+      }),
+      null,
+      "a page on a different origin cannot supply its stored token",
+    );
+    assert.equal(selfRequests, previousRequests);
+    assert.equal(authenticatedPage.url(), initialUrl);
+    assert.equal(
+      await authenticatedPage.locator("#draft").inputValue(),
+      "unfinished login input",
     );
     await authenticated.close();
     assert.equal(
