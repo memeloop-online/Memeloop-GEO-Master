@@ -285,7 +285,7 @@ export function createRunner(options = {}) {
     let desktopSession;
     try {
       let page;
-      if (desktop) {
+      if (desktop && !storageState) {
         desktopSession = await desktop.open({
           browserType,
           browserChannel: selectedBrowserChannel,
@@ -393,7 +393,7 @@ export function createRunner(options = {}) {
         record.busy = false;
       }
     }
-    // A restored desktop session uses the same bounded readiness path above.
+    // A restored headless session uses the same bounded readiness path above.
     if (record.restoredKimi) record.busy = true;
     try {
       const identity = await identityForCompletion(record);
@@ -513,10 +513,17 @@ export function createRunner(options = {}) {
       const controller = new AbortController();
       let timer;
       const timeout = new Promise((resolve) => {
-        timer = setTimeout(() => {
+        const expire = () => {
+          const remaining = deadlineAt - performance.now();
+          if (remaining > 0) {
+            // Node timers may fire just before a fractional monotonic deadline.
+            timer = setTimeout(expire, Math.ceil(remaining));
+            return;
+          }
           controller.abort();
           resolve(deadline);
-        }, executionTimeoutMs);
+        };
+        timer = setTimeout(expire, executionTimeoutMs);
       });
       function timedOut() {
         // The external side effect may have happened. Closing this browser

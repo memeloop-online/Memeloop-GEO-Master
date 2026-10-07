@@ -56,8 +56,22 @@ function harness({
     interactiveRuntime: "linux-vnc",
     desktopRuntime,
     browserType: {
-      async launch() {
-        throw new Error("shared browser forbidden");
+      async launch(options) {
+        events.push(["launch", options]);
+        return {
+          async newContext(contextOptions) {
+            events.push(["newContext", contextOptions]);
+            return {
+              ...context,
+              async newPage() {
+                return page;
+              },
+            };
+          },
+          async close() {
+            events.push("browserClose");
+          },
+        };
       },
     },
     platformAdapters: {
@@ -90,7 +104,52 @@ function harness({
   };
 }
 
-test("restored Kimi desktop waits for hydration before revoking input and keeps its page", async () => {
+test("saved state on an interactive runner uses a headless context with its proxy", async () => {
+  const { runner, events, state, login } = harness();
+  const proxy = { server: "http://127.0.0.1:9876" };
+  login();
+  try {
+    assert.deepEqual(
+      await runner.create({
+        session_id: "restored",
+        platform: "fixture",
+        proxy,
+        storage_state: state,
+      }),
+      { session_id: "restored", phase: "ready_to_complete" },
+    );
+    assert.deepEqual(await runner.complete("restored"), {
+      identity: {
+        platform_account_id: "synthetic",
+        display_name: "Synthetic",
+      },
+      storage_state: state,
+    });
+    assert.equal(
+      events.filter((event) => Array.isArray(event) && event[0] === "open")
+        .length,
+      0,
+    );
+    assert.deepEqual(
+      events.find((event) => Array.isArray(event) && event[0] === "launch")[1],
+      { headless: true },
+    );
+    assert.deepEqual(
+      events.find(
+        (event) => Array.isArray(event) && event[0] === "newContext",
+      )[1],
+      { viewport: { width: 1280, height: 800 }, proxy, storageState: state },
+    );
+    assert.throws(
+      () => runner.desktopEndpoint("restored"),
+      (error) => error.code === "desktop_unavailable",
+    );
+  } finally {
+    await runner.shutdown();
+  }
+});
+
+test("restored Kimi uses headless context and waits for hydration on its page", async () => {
   let ready = false;
   const { runner, events, state } = harness({
     platform: "kimi",
@@ -112,22 +171,33 @@ test("restored Kimi desktop waits for hydration before revoking input and keeps 
     assert.equal(completed.identity.platform_account_id, "own");
     assert.equal(completed.storage_state, state);
     assert.equal(events.filter((event) => event === "goto").length, 1);
+    assert.ok(events.filter((event) => event === "identify").length >= 2);
+    assert.equal(events.filter((event) => event === "closeInput").length, 0);
     assert.equal(
-      events.filter((event) => event === "identify").length >= 4,
-      true,
-      "a final identity check still occurs after input is revoked",
+      events.filter((event) => Array.isArray(event) && event[0] === "open")
+        .length,
+      0,
     );
-    assert.equal(events.filter((event) => event === "closeInput").length, 1);
     assert.deepEqual(
-      events.filter((event) => typeof event === "string").slice(-3),
-      ["closeInput", "identify", "storageState"],
+      events.find((event) => Array.isArray(event) && event[0] === "launch")[1],
+      { headless: true },
+    );
+    assert.deepEqual(
+      events.find(
+        (event) => Array.isArray(event) && event[0] === "newContext",
+      )[1].storageState,
+      state,
+    );
+    assert.deepEqual(
+      events.filter((event) => typeof event === "string").slice(-2),
+      ["identify", "storageState"],
     );
   } finally {
     await runner.shutdown();
   }
 });
 
-test("restored Kimi desktop never revokes input for missing or changed identity", async () => {
+test("restored Kimi headless session rejects missing or changed identity", async () => {
   let identity = null;
   const { runner, events, state } = harness({
     platform: "kimi",
@@ -167,6 +237,11 @@ test("restored Kimi desktop never revokes input for missing or changed identity"
     );
     assert.equal(events.includes("closeInput"), false);
     assert.equal(events.filter((event) => event === "goto").length, 2);
+    assert.equal(
+      events.filter((event) => Array.isArray(event) && event[0] === "open")
+        .length,
+      0,
+    );
   } finally {
     await runner.shutdown();
   }
@@ -179,7 +254,6 @@ test("interactive login pending retains input, then revokes input before final i
       session_id: "desktop",
       platform: "fixture",
       proxy: { server: "http://127.0.0.1:9876" },
-      storage_state: { cookies: [], origins: [] },
     });
     assert.equal(created.phase, "login_required");
     assert.deepEqual(runner.desktopEndpoint("desktop"), {
@@ -211,6 +285,11 @@ test("interactive login pending retains input, then revokes input before final i
     assert.deepEqual(events.find((e) => Array.isArray(e))[1].proxy, {
       server: "http://127.0.0.1:9876",
     });
+    assert.equal(
+      events.filter((event) => Array.isArray(event) && event[0] === "launch")
+        .length,
+      0,
+    );
     assert.throws(
       () => runner.desktopEndpoint("desktop"),
       (e) => e.code === "desktop_unavailable",

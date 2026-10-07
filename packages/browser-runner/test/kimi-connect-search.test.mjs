@@ -515,6 +515,64 @@ const pageHtml = `<!doctype html><html><body>
   };
 </script></body></html>`;
 
+test("search configuration selects exact bilingual title prefixes with descriptions, never other tools", async () => {
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
+  });
+  try {
+    const page = await browser.newPage();
+    for (const labels of [
+      ["联网搜索", "自动搜索", "关闭搜索"],
+      ["联网搜索\n搜索实时信息", "自动搜索\n按需联网", "关闭搜索\n不联网"],
+      [
+        "Web Search\nFind live news and info",
+        "Auto search\nBrowses the web when needed",
+        "Turn off search\nNo web access",
+      ],
+    ]) {
+      await page.setContent(`<!doctype html><html><body>
+        <button data-testid="model-select-trigger">Model</button>
+        <button data-testid="model-option" data-moon-key="example-model">Example</button>
+        <button data-testid="toolkit-trigger-btn">Tools</button>
+        <button role="menuitem" data-wrong>Search</button>
+        <button role="menuitem" data-wrong>Swarm Search</button>
+        <button role="menuitem" data-wrong>Web Searchlight</button>
+        <button role="menuitem" id="search">${labels[0]}</button>
+        <button role="menuitemradio" data-wrong aria-checked="false">Auto searchlight</button>
+        <button role="menuitemradio" data-wrong aria-checked="false">Turn off searchable tools</button>
+        <button role="menuitemradio" id="auto" aria-checked="false">${labels[1]}</button>
+        <button role="menuitemradio" id="off" aria-checked="true">${labels[2]}</button>
+        <script>
+          window.actions = [];
+          document.querySelectorAll("[data-wrong]").forEach(button => {
+            button.onclick = () => window.actions.push("wrong");
+          });
+          document.querySelector("#search").onclick = () => window.actions.push("search");
+          for (const id of ["auto", "off"]) {
+            document.getElementById(id).onclick = () => {
+              window.actions.push(id);
+              for (const other of ["auto", "off"])
+                document.getElementById(other).setAttribute("aria-checked", String(other === id));
+            };
+          }
+        </script></body></html>`);
+      assert.equal(await configureKimiSearch(page, MODEL, true), true);
+      assert.equal(await configureKimiSearch(page, MODEL, false), true);
+      assert.deepEqual(await page.evaluate(() => window.actions), [
+        "search",
+        "auto",
+        "search",
+        "search",
+        "off",
+        "search",
+      ]);
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
 test("browser UI submits exactly once and its captured framed request creates v2 receipt", async () => {
   let sends = 0;
   let cookieSeen = false;

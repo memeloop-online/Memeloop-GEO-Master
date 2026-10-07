@@ -11,6 +11,8 @@ const ORIGIN = "https://www.kimi.com";
 const CHAT_PATH = "/apiv2/kimi.gateway.chat.v1.ChatService/Chat";
 const ID = /^[\w-]{1,128}$/u;
 const MAX_ANSWER = 100_000;
+// Accessible names include the menu description after the observed title.
+const SEARCH_MENU_NAME = /^(?:联网搜索|Web Search)(?:\s|$)/u;
 
 const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
@@ -367,12 +369,14 @@ export async function configureKimiSearch(
     const toolkit = page.getByTestId("toolkit-trigger-btn");
     await toolkit.click({ timeout: 5_000 });
     stage = "config_search_menu";
-    await page.getByRole("menuitem", { name: "联网搜索" }).click({
+    await page.getByRole("menuitem", { name: SEARCH_MENU_NAME }).click({
       timeout: 5_000,
     });
     stage = "config_search_setting";
     const auto = page.getByRole("menuitemradio", {
-      name: searchEnabled ? "自动搜索" : "关闭搜索",
+      name: searchEnabled
+        ? /^(?:自动搜索|Auto search)(?:\s|$)/u
+        : /^(?:关闭搜索|Turn off search)(?:\s|$)/u,
     });
     if ((await auto.getAttribute("aria-checked")) !== "true") {
       await auto.click({ timeout: 5_000 });
@@ -380,7 +384,7 @@ export async function configureKimiSearch(
       stage = "config_toolkit";
       await toolkit.click({ timeout: 5_000 });
       stage = "config_search_menu";
-      await page.getByRole("menuitem", { name: "联网搜索" }).click({
+      await page.getByRole("menuitem", { name: SEARCH_MENU_NAME }).click({
         timeout: 5_000,
       });
     }

@@ -339,6 +339,34 @@ test("headless sessions require storage state and preserve the execution ledger"
   });
 });
 
+test("without desktop runtime or saved state, login fails before launching a browser", async () => {
+  let launches = 0;
+  const headless = createRunner({
+    browserType: {
+      async launch() {
+        launches++;
+        throw new Error("must_not_launch");
+      },
+    },
+    platformAdapters: {
+      fixture: {
+        entry: "http://127.0.0.1/",
+        connectorVersion: "fixture.v1",
+        operations: ["measure"],
+      },
+    },
+  });
+  try {
+    await assert.rejects(
+      headless.create({ session_id: "missing-state", platform: "fixture" }),
+      (error) => error.code === "capability_missing",
+    );
+    assert.equal(launches, 0);
+  } finally {
+    await headless.shutdown();
+  }
+});
+
 test("restored Kimi identity waits on the same page for website hydration", async () => {
   let ready = false;
   let newPages = 0;
@@ -746,7 +774,7 @@ test("idle contexts and settled cache expire, but active execution is never reap
   }
 });
 
-test("a stalled execution expires as unknown and closes its context", async () => {
+test("a stalled execution expires as unknown and closes its context", async (t) => {
   let closed = 0;
   let executionSignal;
   let executionDeadlineAt;
@@ -798,12 +826,32 @@ test("a stalled execution expires as unknown and closes its context", async () =
       storage_state: { cookies: [], origins: [] },
     });
     await stalled.complete("stalled");
-    const result = await stalled.execute({
-      execution_id: "stalled-attempt",
-      session_id: "stalled",
-      operation: "publish",
-      payload: { title: "T", body: "B" },
-    });
+    const nativeSetTimeout = globalThis.setTimeout;
+    let forcedEarly = false;
+    const mockedSetTimeout = t.mock.method(
+      globalThis,
+      "setTimeout",
+      (callback, duration, ...args) => {
+        if (duration === 20 && !forcedEarly) {
+          forcedEarly = true;
+          queueMicrotask(() => callback(...args));
+          return nativeSetTimeout(() => {}, 0);
+        }
+        return nativeSetTimeout(callback, duration, ...args);
+      },
+    );
+    let result;
+    try {
+      result = await stalled.execute({
+        execution_id: "stalled-attempt",
+        session_id: "stalled",
+        operation: "publish",
+        payload: { title: "T", body: "B" },
+      });
+    } finally {
+      mockedSetTimeout.mock.restore();
+    }
+    assert.equal(forcedEarly, true);
     assert.deepEqual(result, {
       execution_id: "stalled-attempt",
       connector_version: "fixture.timeout.v1",
