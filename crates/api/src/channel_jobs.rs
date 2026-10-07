@@ -477,11 +477,39 @@ struct ConnectSearchEvent {
     request_question_sha256: String,
 }
 
+/// Semantic extraction from the authenticated runner, not a deterministic
+/// decoding of provider fields. Raw-source grounding remains runner-owned.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiConnectSearchEvent {
+    kind: String,
+    source: String,
+    provenance: String,
+    chat_id: String,
+    message_id: String,
+    block_id: String,
+    observed_at: DateTime<Utc>,
+    request_model: String,
+    request_question_sha256: String,
+    extraction_model: String,
+    extraction_prompt_version: String,
+    source_sha256: String,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum SearchEvent {
     Provider(OfficialSearchEvent),
     Connect(ConnectSearchEvent),
+    AiConnect(AiConnectSearchEvent),
+}
+
+fn extraction_label(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 200 && !value.chars().any(char::is_control)
+}
+
+fn extraction_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn search_identifier(value: &str) -> bool {
@@ -525,6 +553,24 @@ impl SearchEvent {
                         .is_ok_and(|offset| offset.to_string() == event.event_offset)
                     && event.request_model == model
                     && event.request_question_sha256 == question_sha256 =>
+            {
+                Some(event.observed_at)
+            }
+            Self::AiConnect(event)
+                if schema == "geo.measure.official_search.v3"
+                    && event.kind == "official_search_event"
+                    && event.source == "provider_connect_stream_ai"
+                    && event.provenance == "live"
+                    && search_identifier(&event.chat_id)
+                    && search_identifier(&event.message_id)
+                    && search_identifier(&event.block_id)
+                    && event.request_model == model
+                    && extraction_label(&event.request_model)
+                    && event.request_question_sha256 == question_sha256
+                    && extraction_sha256(&event.request_question_sha256)
+                    && extraction_label(&event.extraction_model)
+                    && extraction_label(&event.extraction_prompt_version)
+                    && extraction_sha256(&event.source_sha256) =>
             {
                 Some(event.observed_at)
             }
@@ -638,10 +684,34 @@ pub(crate) fn measurement_observation(
         proof
             .search_event
             .observed_at(&proof.schema_version, model, &proof.question_sha256)?;
-    if proof.schema_version == "geo.measure.official_search.v2"
-        && (surface != "consumer_web" || search_mode != "web_search")
+    if matches!(
+        proof.schema_version.as_str(),
+        "geo.measure.official_search.v2" | "geo.measure.official_search.v3"
+    ) && (surface != "consumer_web" || search_mode != "web_search")
     {
         return None;
+    }
+    if let SearchEvent::AiConnect(event) = &proof.search_event {
+        let mut audits = result
+            .evidence
+            .iter()
+            .filter(|value| value["kind"] == "observation_extraction");
+        let audit = audits.next()?;
+        if audits.next().is_some()
+            || audit["method"] != "llm_grounded"
+            || audit["model"].as_str() != Some(event.extraction_model.as_str())
+            || audit["prompt_version"].as_str() != Some(event.extraction_prompt_version.as_str())
+            || audit["source_sha256"].as_str() != Some(event.source_sha256.as_str())
+            // This is the extractor's surface. API-based interpretation of
+            // captured browser bytes does not change the measured surface.
+            || !matches!(
+                audit["surface"].as_str(),
+                Some("signed_in_browser" | "model_api")
+            )
+            || !audit["refs"].as_array().is_some_and(|refs| !refs.is_empty())
+        {
+            return None;
+        }
     }
     if claimed_at > observed_at
         || observed_at > completed_at

@@ -5,9 +5,18 @@ import { chromium } from "playwright";
 import { measureKimi } from "../src/adapters.mjs";
 import {
   matchesKimiChatRequest,
-  observeKimiConnectSearch,
+  observeKimiConnectSearch as observeCapturedSearch,
   reduceKimiConnectExchange,
 } from "../src/kimi-connect-search.mjs";
+
+// This suite exercises transport/UI ownership with a deterministic fixture
+// interpreter. Live response interpretation is tested in the AI suites.
+const observeKimiConnectSearch = (page, payload, options) =>
+  observeCapturedSearch(page, payload, {
+    ...options,
+    interpret: async (exchange, context) =>
+      reduceKimiConnectExchange(exchange, context),
+  });
 
 const QUESTION = "What does this example mean?";
 const MODEL = "example-model";
@@ -492,6 +501,35 @@ test("browser UI submits exactly once and its captured framed request creates v2
     assert.equal(sends, 5);
     assert.equal(page.listenerCount("response"), responseListeners);
     abortOnRequest = undefined;
+    responseDelayMs = 0;
+    const aiObserved = await observeCapturedSearch(page, frozen, {
+      trustedOrigin: origin,
+      timeoutMs: 5_000,
+      interpret: async (captured, context) => {
+        const found = reduceKimiConnectExchange(captured, context);
+        return {
+          raw_answer: found.raw_answer,
+          citations: found.citations,
+          chat_id: found.search_event.chat_id,
+          message_id: found.search_event.message_id,
+          block_id: found.search_event.block_id,
+          audit: {
+            kind: "observation_extraction",
+            method: "llm_grounded",
+            model: "extraction-model",
+            prompt_version: "extract.v1",
+            source_sha256: "b".repeat(64),
+          },
+        };
+      },
+    });
+    assert.equal(aiObserved.raw_answer, "An answer.");
+    assert.equal(aiObserved.search_event.source, "provider_connect_stream_ai");
+    assert.equal(aiObserved.search_event.request_model, MODEL);
+    assert.equal(aiObserved.search_event.extraction_model, "extraction-model");
+    assert.equal(aiObserved.search_event.source_sha256, "b".repeat(64));
+    assert.equal("event_offset" in aiObserved.search_event, false);
+    assert.equal(sends, 6);
     // Runner stays fixture-stamped; a synthetic trace cannot verify a real account.
     assert.equal(
       (await measureKimi(null, frozen, { expectedAccountId: "fixture" }))

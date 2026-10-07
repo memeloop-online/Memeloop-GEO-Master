@@ -442,7 +442,9 @@ export async function measureKimi(
     evidence: [
       {
         kind: "official_search_observation",
-        schema_version: "geo.measure.official_search.v2",
+        schema_version: observation.extraction_audit
+          ? "geo.measure.official_search.v3"
+          : "geo.measure.official_search.v2",
         target_id: payload.target_id,
         account_id: payload.account_id,
         provider: payload.provider,
@@ -465,6 +467,7 @@ export async function measureKimi(
         citations: observation.citations,
         search_event: observation.search_event,
       },
+      ...(observation.extraction_audit ? [observation.extraction_audit] : []),
     ],
     connector_version: CONNECTOR_VERSION,
   };

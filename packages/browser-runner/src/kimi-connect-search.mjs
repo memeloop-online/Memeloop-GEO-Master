@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { captureConnectExchange } from "./connect-browser-capture.mjs";
+import { interpretObservation } from "./ai-observation-parser.mjs";
+import { extractWithSignedInBrowser } from "./browser-ai-extraction.mjs";
 
 const ORIGIN = "https://www.kimi.com";
 const CHAT_PATH = "/apiv2/kimi.gateway.chat.v1.ChatService/Chat";
@@ -328,7 +330,7 @@ export async function inspectKimiMeasurementOptions(page) {
   }
 }
 
-async function configureKimiSearch(page, model) {
+export async function configureKimiSearch(page, model, searchEnabled = true) {
   const selector = page.getByTestId("model-select-trigger");
   await selector.click({ timeout: 5_000 });
   await page.getByTestId("model-option").first().waitFor({
@@ -348,7 +350,9 @@ async function configureKimiSearch(page, model) {
   await page.getByRole("menuitem", { name: "联网搜索" }).click({
     timeout: 5_000,
   });
-  const auto = page.getByRole("menuitemradio", { name: "自动搜索" });
+  const auto = page.getByRole("menuitemradio", {
+    name: searchEnabled ? "自动搜索" : "关闭搜索",
+  });
   if ((await auto.getAttribute("aria-checked")) !== "true") {
     await auto.click({ timeout: 5_000 });
     await page.keyboard.press("Escape");
@@ -366,7 +370,13 @@ async function configureKimiSearch(page, model) {
 export async function observeKimiConnectSearch(
   page,
   payload,
-  { trustedOrigin = ORIGIN, timeoutMs = 30_000, deadlineAt, signal } = {},
+  {
+    trustedOrigin = ORIGIN,
+    timeoutMs = 30_000,
+    deadlineAt,
+    signal,
+    interpret = interpretObservation,
+  } = {},
 ) {
   if (
     !page ||
@@ -431,13 +441,65 @@ export async function observeKimiConnectSearch(
         await send.click({ timeout: 5_000 });
       },
     });
-    return captured && request
-      ? reduceKimiConnectExchange(captured, {
-          question: payload.question,
+    if (!captured || !request || signal?.aborted) return null;
+    const renderedAnswer = page.locator(
+      ".chat-content-item-assistant .markdown-container:not(.toolcall-content-text) > .markdown",
+    );
+    const renderedText =
+      (await renderedAnswer.count()) > 0
+        ? await renderedAnswer.last().innerText()
+        : undefined;
+    const observation = await interpret(captured, {
+      renderedText,
+      signal,
+      // Test fixtures may inject an interpreter; live execution always uses
+      // grounded AI extraction, never the historical schema-specific reducer.
+      question: payload.question,
+      model: payload.model,
+      request,
+      browserExtract: (prompt) =>
+        extractWithSignedInBrowser(page, prompt, {
           model: payload.model,
-          request,
-        })
-      : null;
+          trustedOrigin,
+          // Leave part of the overall execution window for the configured
+          // model fallback if the signed-in parsing conversation is slow.
+          deadlineAt: Math.min(
+            deadlineAt ?? performance.now() + 60_000,
+            performance.now() +
+              Math.max(
+                1,
+                ((deadlineAt ?? performance.now() + 90_000) -
+                  performance.now()) *
+                  0.65,
+              ),
+          ),
+          signal,
+          configureModel: (parserPage, model) =>
+            configureKimiSearch(parserPage, model, false),
+        }),
+    });
+    if (!observation || signal?.aborted) return null;
+    return {
+      raw_answer: observation.raw_answer,
+      citations: observation.citations,
+      extraction_audit: observation.audit,
+      search_event: observation.search_event ?? {
+        kind: "official_search_event",
+        source: "provider_connect_stream_ai",
+        provenance: "live",
+        chat_id: observation.chat_id,
+        message_id: observation.message_id,
+        block_id: observation.block_id,
+        extraction_model: observation.audit.model,
+        extraction_prompt_version: observation.audit.prompt_version,
+        source_sha256: observation.audit.source_sha256,
+        observed_at: captured.received_at,
+        request_model: payload.model,
+        request_question_sha256: createHash("sha256")
+          .update(payload.question, "utf8")
+          .digest("hex"),
+      },
+    };
   } catch {
     return null;
   }
