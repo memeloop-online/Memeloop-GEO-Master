@@ -23,6 +23,7 @@ import {
   type RichNode,
   type StructuredDocument,
   exportContentRevision,
+  exportContentRevisionBundle,
   useAppendContentRevisionMutation,
   useContentAssetQuery,
   useContentCycleQuery,
@@ -761,6 +762,7 @@ function AssetContent({
 }) {
   const { t } = useTranslation();
   const [exporting, setExporting] = useState<"markdown" | "html" | null>(null);
+  const exportPending = useRef(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const { session } = useAuth();
   const readonly = !mayEdit(membershipForTenant(session, tenantId)?.role);
@@ -820,37 +822,57 @@ function AssetContent({
       (block) => block.rich && containsMedia(block.rich.node),
     ) ?? false;
   const download = async (format: "markdown" | "html") => {
-    if (!selected || exporting || selectedHasMedia) return;
+    if (!selected || exportPending.current) return;
+    exportPending.current = true;
     setExportError(null);
     setExporting(format);
+    const revisionId = selected.revision_id;
+    const selectedAssetId = selected.asset_id;
+    const withMedia = selectedHasMedia;
     try {
       // The asset and revision IDs come from the selected persisted history,
       // including the original immutable revision in a reuse context.
-      const result = await exportContentRevision(
-        tenantId,
-        projectId,
-        selected.asset_id,
-        selected.revision_id,
-        format,
-      );
-      if (
-        result.revision_id !== selected.revision_id ||
-        result.format !== format
-      )
-        throw new Error(t("generatedEditor.exportError"));
-      const objectUrl = URL.createObjectURL(
-        new Blob([result.content], { type: result.media_type }),
-      );
+      let payload: Blob;
+      let filename: string;
+      if (withMedia) {
+        payload = await exportContentRevisionBundle(
+          tenantId,
+          projectId,
+          selectedAssetId,
+          revisionId,
+          format,
+        );
+        if (payload.type !== "application/zip")
+          throw new Error(t("generatedEditor.exportError"));
+        filename = `${revisionId}-${format}.zip`;
+      } else {
+        const result = await exportContentRevision(
+          tenantId,
+          projectId,
+          selectedAssetId,
+          revisionId,
+          format,
+        );
+        if (result.revision_id !== revisionId || result.format !== format)
+          throw new Error(t("generatedEditor.exportError"));
+        payload = new Blob([result.content], { type: result.media_type });
+        filename = result.filename;
+      }
+      const objectUrl = URL.createObjectURL(payload);
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
-      anchor.download = result.filename;
+      anchor.download = filename;
       document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+      try {
+        anchor.click();
+      } finally {
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+      }
     } catch {
       setExportError(t("generatedEditor.exportError"));
     } finally {
+      exportPending.current = false;
       setExporting(null);
     }
   };
@@ -1022,24 +1044,28 @@ function AssetContent({
                 ))}
               </ul>
               <div className="content-export-actions">
-                {selectedHasMedia ? (
-                  <p>{t("generatedEditor.mediaExportUnavailable")}</p>
-                ) : (
-                  <>
-                    <Button
-                      disabled={!!exporting}
-                      onClick={() => void download("markdown")}
-                    >
-                      {t("generatedEditor.exportMarkdown")}
-                    </Button>
-                    <Button
-                      disabled={!!exporting}
-                      onClick={() => void download("html")}
-                    >
-                      {t("generatedEditor.exportHtml")}
-                    </Button>
-                  </>
-                )}
+                <>
+                  <Button
+                    disabled={!!exporting}
+                    onClick={() => void download("markdown")}
+                  >
+                    {t(
+                      selectedHasMedia
+                        ? "generatedEditor.exportMarkdownWithImages"
+                        : "generatedEditor.exportMarkdown",
+                    )}
+                  </Button>
+                  <Button
+                    disabled={!!exporting}
+                    onClick={() => void download("html")}
+                  >
+                    {t(
+                      selectedHasMedia
+                        ? "generatedEditor.exportHtmlWithImages"
+                        : "generatedEditor.exportHtml",
+                    )}
+                  </Button>
+                </>
               </div>
               {exportError && (
                 <MessageBar intent="error">

@@ -201,13 +201,16 @@ export async function apiFetchBlob(
     tenantId,
     projectId,
     signal,
-  }: Pick<ApiRequestOptions, "tenantId" | "projectId" | "signal"> = {},
+    accept = "image/png, image/jpeg, image/webp",
+  }: Pick<ApiRequestOptions, "tenantId" | "projectId" | "signal"> & {
+    accept?: string;
+  } = {},
 ): Promise<Blob> {
   let response: Response;
   try {
     response = await fetch(apiRequestUrl(path, { tenantId, projectId }), {
       method: "GET",
-      headers: { Accept: "image/png, image/jpeg, image/webp" },
+      headers: { Accept: accept },
       credentials: "same-origin",
       signal,
     });

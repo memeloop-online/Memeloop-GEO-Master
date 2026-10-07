@@ -139,9 +139,10 @@ export const resources = {
         mediaListError: "无法读取项目图片，请重试。",
         mediaBindError: "无法核验图片；附件已保留，正文未插入图片。",
         mediaAltRequired: "请填写图片说明。",
-        mediaExportUnavailable: "含图片的版本暂不能下载完整文件。",
         exportMarkdown: "下载 Markdown",
         exportHtml: "下载 HTML",
+        exportMarkdownWithImages: "下载 Markdown 与图片（ZIP）",
+        exportHtmlWithImages: "下载 HTML 与图片（ZIP）",
         exportError: "无法导出所选版本，请重试。",
       },
       remoteDesktop: {
@@ -355,10 +356,10 @@ export const resources = {
         mediaBindError:
           "Could not verify the image. The attachment is kept and nothing was inserted.",
         mediaAltRequired: "Enter an image description.",
-        mediaExportUnavailable:
-          "Full downloads of versions with images are not available yet.",
         exportMarkdown: "Download Markdown",
         exportHtml: "Download HTML",
+        exportMarkdownWithImages: "Download Markdown with images (ZIP)",
+        exportHtmlWithImages: "Download HTML with images (ZIP)",
         exportError: "Cannot export the selected version. Try again.",
       },
       remoteDesktop: {

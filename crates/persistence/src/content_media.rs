@@ -3,8 +3,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ContentMediaBinding, ContentMediaBindingState, ContentMediaRepository,
-    MAX_UPLOAD_BYTES, MediaObjectKey, TenantScope, VerifiedImage, sha256_hex,
+    AppError, AuthorizedMediaSnapshot, ContentMediaBinding, ContentMediaBindingState,
+    ContentMediaRepository, MAX_UPLOAD_BYTES, MediaObjectKey, TenantScope, VerifiedImage,
+    add_media_snapshot_bytes, ordered_media_snapshot_keys, sha256_hex,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
@@ -108,23 +109,30 @@ pub(crate) async fn validate_content_media_in_transaction(
     scope: &TenantScope,
     keys: &[MediaObjectKey],
 ) -> Result<Vec<ContentMediaBinding>, AppError> {
+    let bindings = lock_content_media_bindings(tx, scope, keys).await?;
+    for binding in &bindings {
+        validate_bytes(tx, scope, &binding.image).await?;
+    }
+    Ok(bindings)
+}
+
+async fn lock_content_media_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    keys: &[MediaObjectKey],
+) -> Result<Vec<ContentMediaBinding>, AppError> {
     let project_id = project(scope)?;
+    // Content checks can contain more references than an export; keep their
+    // established limit independent of the snapshot-only export limit.
     let mut ordered = keys.to_vec();
-    ordered.sort_by(|a, b| {
-        (&a.object_id, a.object_version, &a.sha256).cmp(&(
-            &b.object_id,
-            b.object_version,
-            &b.sha256,
-        ))
-    });
-    ordered.dedup_by(|a, b| {
-        a.object_id == b.object_id && a.object_version == b.object_version && a.sha256 == b.sha256
-    });
+    ordered.sort();
+    ordered.dedup();
     // Every object lock precedes every grant lock. In particular a later key
     // cannot invert the lock order against a concurrent multi-image writer.
+    let mut sizes = Vec::with_capacity(ordered.len());
     for key in &ordered {
-        let found: Option<Uuid> = sqlx::query_scalar(
-            "SELECT object_id FROM knowledge_stored_objects
+        let size: Option<i64> = sqlx::query_scalar(
+            "SELECT actual_size FROM knowledge_stored_objects
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND object_id=$4
                AND object_version=$5 AND sha256=$6 AND state='committed'
              FOR UPDATE",
@@ -138,12 +146,10 @@ pub(crate) async fn validate_content_media_in_transaction(
         .fetch_optional(&mut **tx)
         .await
         .map_err(db)?;
-        if found.is_none() {
-            return Err(AppError::conflict("media object is unavailable"));
-        }
+        sizes.push(size.ok_or_else(|| AppError::conflict("media object is unavailable"))?);
     }
     let mut bindings = Vec::with_capacity(ordered.len());
-    for key in &ordered {
+    for (key, size) in ordered.iter().zip(sizes) {
         let row = sqlx::query(&format!(
             "SELECT {BINDING_COLUMNS} FROM content_media_bindings
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3
@@ -163,10 +169,10 @@ pub(crate) async fn validate_content_media_in_transaction(
         if binding.state != ContentMediaBindingState::Active {
             return Err(AppError::conflict("media binding has been withdrawn"));
         }
+        if i64::try_from(binding.image.byte_len).ok() != Some(size) {
+            return Err(AppError::conflict("media object byte length changed"));
+        }
         bindings.push(binding);
-    }
-    for binding in &bindings {
-        validate_bytes(tx, scope, &binding.image).await?;
     }
     Ok(bindings)
 }
@@ -178,7 +184,7 @@ async fn validate_bytes(
     tx: &mut Transaction<'_, Postgres>,
     scope: &TenantScope,
     image: &VerifiedImage,
-) -> Result<(), AppError> {
+) -> Result<Vec<u8>, AppError> {
     let id = project(scope)?;
     let row = sqlx::query(
         "SELECT object.backend,object.opaque_key,object.actual_size,
@@ -228,12 +234,39 @@ async fn validate_bytes(
         ));
     }
     // The blob row was locked before its bytes were read and remains locked
-    // through the caller's commit.
-    Ok(())
+    // through the caller's commit. The export path keeps this exact Vec.
+    bytes.ok_or_else(|| AppError::conflict("committed media attachment bytes changed"))
 }
 
 #[async_trait]
 impl ContentMediaRepository for PgContentMediaRepository {
+    async fn snapshot_authorized_images(
+        &self,
+        scope: &TenantScope,
+        keys: &[MediaObjectKey],
+    ) -> Result<Vec<AuthorizedMediaSnapshot>, AppError> {
+        let ordered = ordered_media_snapshot_keys(keys)?;
+        let mut tx = self.transaction(scope).await?;
+        lock_project(&mut tx, scope).await?;
+        let bindings = lock_content_media_bindings(&mut tx, scope, &ordered).await?;
+        // Binding lengths have just been compared against locked object
+        // metadata, so reject an oversized aggregate before selecting blobs.
+        let mut total = 0;
+        for binding in &bindings {
+            total = add_media_snapshot_bytes(total, binding.image.byte_len)?;
+        }
+        let mut snapshots = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let bytes = validate_bytes(&mut tx, scope, &binding.image).await?;
+            snapshots.push(AuthorizedMediaSnapshot {
+                image: binding.image,
+                bytes,
+            });
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(snapshots)
+    }
+
     async fn create_binding(
         &self,
         scope: &TenantScope,

@@ -210,6 +210,37 @@ const reusedItem: ContentItem = {
     reused_at: "2026-10-02T08:00:00Z",
   },
 };
+const mediaDocument: StructuredDocument = {
+  title: "Illustrated guide",
+  schema_version: 2,
+  blocks: [
+    {
+      block_id: "block-1",
+      kind: "rich",
+      text: "",
+      items: [],
+      citation_ids: ["chunk-1"],
+      rich: {
+        version: 1,
+        node: {
+          type: "paragraph",
+          content: [
+            {
+              type: "media",
+              attrs: {
+                object_id: "1e47ee2e-534a-4695-a998-46a32639d0b2",
+                object_version: 2,
+                sha256: "a".repeat(64),
+                alt: "Diagram",
+                caption: "",
+              },
+            },
+          ],
+        },
+      },
+    },
+  ],
+};
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -231,6 +262,9 @@ function mockApi({
   sourceAdvanced = false,
   documentOverride,
   exportStatus = 200,
+  bundleStatuses = [200],
+  bundleMime = "application/zip",
+  bundleDeferred,
   persistWrites = false,
   editDeferred,
 }: {
@@ -246,6 +280,9 @@ function mockApi({
   sourceAdvanced?: boolean;
   documentOverride?: StructuredDocument;
   exportStatus?: number;
+  bundleStatuses?: number[];
+  bundleMime?: string;
+  bundleDeferred?: Promise<void>;
   persistWrites?: boolean;
   editDeferred?: Promise<void>;
 } = {}) {
@@ -335,6 +372,19 @@ function mockApi({
     }
     if (path.endsWith("/document-executions/execution-1/items"))
       return Promise.resolve(json(persistedItems));
+    if (/\/contents\/[^/]+\/revisions\/[^/]+\/export-bundle$/.test(path)) {
+      const status = bundleStatuses.shift() ?? 200;
+      return (bundleDeferred ?? Promise.resolve()).then(() =>
+        status === 200
+          ? new Response(new Blob(["ZIP contents"]), {
+              headers: { "Content-Type": bundleMime },
+            })
+          : json(
+              { code: "export_unavailable", message: "无法导出此版本" },
+              status,
+            ),
+      );
+    }
     if (/\/contents\/[^/]+\/revisions\/[^/]+\/export$/.test(path)) {
       if (exportStatus !== 200)
         return Promise.resolve(
@@ -435,7 +485,10 @@ function mockApi({
                     revision_id: "revision-2",
                     revision: 2,
                     base_revision_id: "revision-1",
-                    document: { ...revision.document, title: "原资产后续修订" },
+                    document: {
+                      ...(documentOverride ?? revision.document),
+                      title: "原资产后续修订",
+                    },
                   },
                 ]
               : [editingRevision],
@@ -1584,6 +1637,17 @@ describe("P09 content revision", () => {
     await waitFor(() =>
       expect(screen.getByText("当前版本 v2")).toBeInTheDocument(),
     );
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    let autosave: (() => void) | undefined;
+    const timeout = vi
+      .spyOn(window as Window, "setTimeout")
+      .mockImplementation((handler, delay, ...args) => {
+        if (delay === 1000 && typeof handler === "function") {
+          autosave = () => handler();
+          return nativeSetTimeout(() => {}, 0);
+        }
+        return nativeSetTimeout(handler, delay, ...args);
+      });
     await userEvent.click(screen.getByText("版本历史"));
     await userEvent.click(screen.getByRole("button", { name: /^v1 ·/ }));
     expect(
@@ -1610,6 +1674,21 @@ describe("P09 content revision", () => {
     await userEvent.click(nextParagraph);
     putCaretAtEnd(nextParagraph);
     await userEvent.keyboard("后");
+    expect(autosave).toBeDefined();
+    expect(
+      requests.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions?") &&
+          init?.method === "POST",
+      ),
+    ).toHaveLength(2);
+    try {
+      await act(async () => {
+        autosave?.();
+      });
+    } finally {
+      timeout.mockRestore();
+    }
     await waitFor(
       () =>
         expect(
@@ -1640,15 +1719,18 @@ describe("P09 content revision", () => {
       itemList: [reusedItem, items[1]],
       sourceAdvanced: true,
     });
-    const createObjectURL = vi.fn(() => "blob:local-export");
+    const createObjectURL = vi.fn((_payload: Blob) => "blob:local-export");
     const revokeObjectURL = vi.fn();
     vi.stubGlobal(
       "URL",
       Object.assign(URL, { createObjectURL, revokeObjectURL }),
     );
+    let downloadedName: string | undefined;
     const click = vi
       .spyOn(HTMLAnchorElement.prototype, "click")
-      .mockImplementation(() => {});
+      .mockImplementation(function (this: HTMLAnchorElement) {
+        downloadedName = this.download;
+      });
     renderPage(
       "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
     );
@@ -1666,6 +1748,10 @@ describe("P09 content revision", () => {
       ),
     ).toBe(true);
     expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+    expect((createObjectURL.mock.calls[0][0] as Blob).type).toBe(
+      "text/markdown",
+    );
+    expect(downloadedName).toBe("content.md");
   });
 
   it("shows export failures without downloading an unrelated version", async () => {
@@ -1684,7 +1770,7 @@ describe("P09 content revision", () => {
     expect(click).not.toHaveBeenCalled();
   });
 
-  it("leaves unsupported media-bearing revisions read-only without emitting writes", async () => {
+  it("offers a complete ZIP for read-only media revisions without emitting writes", async () => {
     const requests = mockApi({
       documentOverride: {
         title: "Media document",
@@ -1711,7 +1797,10 @@ describe("P09 content revision", () => {
     expect(screen.getByRole("textbox", { name: "标题" })).toBeDisabled();
     await userEvent.click(screen.getByText("版本历史"));
     expect(
-      screen.getByText("含图片的版本暂不能下载完整文件。"),
+      screen.getByRole("button", { name: "下载 Markdown 与图片（ZIP）" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "下载 HTML 与图片（ZIP）" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "下载 Markdown" }),
@@ -1721,7 +1810,7 @@ describe("P09 content revision", () => {
     ).toBe(false);
   });
 
-  it("hides plain downloads for a nested media reference even when the structure cannot be edited", async () => {
+  it("offers ZIP downloads for nested media references without plain downloads", async () => {
     mockApi({
       documentOverride: {
         title: "Nested media",
@@ -1774,10 +1863,146 @@ describe("P09 content revision", () => {
     renderPage("/app/tenant-1/project-1/content/asset-1");
     await userEvent.click(await screen.findByText("版本历史"));
     expect(
-      screen.getByText("含图片的版本暂不能下载完整文件。"),
+      screen.getByRole("button", { name: "下载 Markdown 与图片（ZIP）" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "下载 Markdown" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("downloads ZIP bytes with the selected historical and reused revision IDs", async () => {
+    const requests = mockApi({
+      documentOverride: mediaDocument,
+      sourceAdvanced: true,
+      itemList: [reusedItem, items[1]],
+    });
+    const createObjectURL = vi.fn((_payload: Blob) => "blob:media-zip");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, { createObjectURL, revokeObjectURL }),
+    );
+    const downloads: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloads.push(this.download);
+    });
+    renderPage(
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    await userEvent.click(await screen.findByText("版本历史"));
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: "下载 Markdown 与图片（ZIP）",
+      }),
+    );
+    await waitFor(() => expect(downloads).toEqual(["revision-1-markdown.zip"]));
+    const request = requests.mock.calls.find(([url]) =>
+      String(url).includes("/revisions/revision-1/export-bundle?"),
+    );
+    expect(String(request?.[0])).toContain(
+      "/contents/asset-1/revisions/revision-1/export-bundle?format=markdown&tenant_id=tenant-1&project_id=project-1",
+    );
+    expect(request?.[1]).toMatchObject({
+      method: "GET",
+      credentials: "same-origin",
+      headers: { Accept: "application/zip" },
+    });
+    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+    expect((createObjectURL.mock.calls[0][0] as Blob).type).toBe(
+      "application/zip",
+    );
+    await waitFor(() =>
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:media-zip"),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /v2/ }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "下载 HTML 与图片（ZIP）" }),
+    );
+    await waitFor(() =>
+      expect(downloads).toEqual([
+        "revision-1-markdown.zip",
+        "revision-2-html.zip",
+      ]),
+    );
+    expect(
+      requests.mock.calls.some(([url]) =>
+        String(url).includes(
+          "/contents/asset-1/revisions/revision-2/export-bundle?format=html",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps an in-flight export pinned, blocks duplicate requests and supports error retry", async () => {
+    let finishRequest!: () => void;
+    const deferred = new Promise<void>((resolve) => {
+      finishRequest = resolve;
+    });
+    const requests = mockApi({
+      documentOverride: mediaDocument,
+      sourceAdvanced: true,
+      bundleStatuses: [422, 200],
+      bundleDeferred: deferred,
+    });
+    const createObjectURL = vi.fn(() => "blob:retry");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, { createObjectURL, revokeObjectURL }),
+    );
+    const downloads: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloads.push(this.download);
+    });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    await userEvent.click(await screen.findByText("版本历史"));
+    const markdown = screen.getByRole("button", {
+      name: "下载 Markdown 与图片（ZIP）",
+    });
+    await userEvent.click(markdown);
+    expect(markdown).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "下载 HTML 与图片（ZIP）" }),
+    ).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: /v1/ }));
+    expect(
+      requests.mock.calls.filter(([url]) =>
+        String(url).includes("/export-bundle?"),
+      ),
+    ).toHaveLength(1);
+    await act(async () => finishRequest());
+    expect(
+      await screen.findByText("无法导出所选版本，请重试。"),
+    ).toBeInTheDocument();
+    expect(downloads).toEqual([]);
+    await userEvent.click(
+      screen.getByRole("button", { name: "下载 HTML 与图片（ZIP）" }),
+    );
+    await waitFor(() => expect(downloads).toEqual(["revision-1-html.zip"]));
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an unexpected MIME type without creating a download link", async () => {
+    mockApi({ documentOverride: mediaDocument, bundleMime: "text/html" });
+    const createObjectURL = vi.fn();
+    vi.stubGlobal("URL", Object.assign(URL, { createObjectURL }));
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    await userEvent.click(await screen.findByText("版本历史"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "下载 Markdown 与图片（ZIP）" }),
+    );
+    expect(
+      await screen.findByText("无法导出所选版本，请重试。"),
+    ).toBeInTheDocument();
+    expect(createObjectURL).not.toHaveBeenCalled();
+    expect(click).not.toHaveBeenCalled();
   });
 });

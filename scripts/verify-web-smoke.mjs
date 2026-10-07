@@ -3,10 +3,11 @@
 // Set GEO_SMOKE_APP_BINARY and GEO_SMOKE_OUTPUT_DIR (outside the repository).
 // Optional: PLAYWRIGHT_BROWSERS_PATH, GEO_SMOKE_TMP_DIR,
 // GEO_SMOKE_API_PORT, GEO_SMOKE_WEB_PORT. GEO_SMOKE_CONTENT=1 additionally
-// requires approved local bundles and an unused GEO_SMOKE_PROVIDER_PORT.
+// requires approved local bundles, an unused GEO_SMOKE_PROVIDER_PORT, and
+// Python 3 (override its executable with GEO_SMOKE_PYTHON) for ZIP inspection.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { deflateSync } from "node:zlib";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
@@ -14,6 +15,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const webRoot = join(repository, "apps", "web");
@@ -53,6 +55,7 @@ const requireBrowser = createRequire(
   join(repository, "packages", "browser-runner", "package.json"),
 );
 const requireWeb = createRequire(join(webRoot, "package.json"));
+const runZipReader = promisify(execFile);
 const processes = [];
 const visualIssues = [];
 let browser;
@@ -100,6 +103,31 @@ function syntheticPng() {
     chunk("IDAT", deflateSync(pixels)),
     chunk("IEND", Buffer.alloc(0)),
   ]);
+}
+
+async function readZipEntries(path) {
+  // Python's maintained standard-library ZIP reader validates the directory
+  // and CRCs. Inspect the browser download in place without extracting paths.
+  const code = [
+    "import base64,json,sys,zipfile",
+    "with zipfile.ZipFile(sys.argv[1]) as archive:",
+    " names=archive.namelist()",
+    " if len(names)!=2 or any(archive.getinfo(name).file_size>1000000 for name in names): raise ValueError('unexpected archive entries')",
+    " print(json.dumps({name:base64.b64encode(archive.read(name)).decode('ascii') for name in names}))",
+  ].join("\n");
+  const python =
+    process.env.GEO_SMOKE_PYTHON ??
+    (process.platform === "win32" ? "python" : "python3");
+  const { stdout } = await runZipReader(python, ["-c", code, path], {
+    env: safeEnvironment(),
+    maxBuffer: 3_000_000,
+  });
+  return Object.fromEntries(
+    Object.entries(JSON.parse(stdout)).map(([name, value]) => [
+      name,
+      Buffer.from(value, "base64"),
+    ]),
+  );
 }
 
 async function approvedBundle(name) {
@@ -935,14 +963,93 @@ async function verifyGeneratedRichContent(
       (await page.locator(".panel-card [contenteditable='true']").count()) ===
         0 &&
       (await page.getByRole("button", { name: "保存新版本" }).count()) === 0 &&
-      (await history.getByRole("button", { name: "下载 Markdown" }).count()) ===
-        0 &&
-      (await history.getByRole("button", { name: "下载 HTML" }).count()) ===
-        0 &&
-      (await history.getByText("含图片的版本暂不能下载完整文件。").count()) ===
-        1,
-    "Historical media revision was editable, lost preview, or offered incomplete exports",
+      (await history
+        .getByRole("button", { name: "下载 Markdown", exact: true })
+        .count()) === 0 &&
+      (await history
+        .getByRole("button", { name: "下载 HTML", exact: true })
+        .count()) === 0,
+    "Historical media revision was editable, lost preview, or offered incomplete plain exports",
   );
+  const verifyMediaBundle = async (format) => {
+    const button = history.getByRole("button", {
+      name:
+        format === "html"
+          ? "下载 HTML 与图片（ZIP）"
+          : "下载 Markdown 与图片（ZIP）",
+    });
+    assert(await button.isVisible(), "Media version lacks a ZIP export action");
+    const bundlePath = `/revisions/${mediaRevision.revision_id}/export-bundle`;
+    const responsePromise = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname.endsWith(bundlePath) &&
+        new URL(response.url()).searchParams.get("format") === format,
+    );
+    const downloadPromise = page
+      .waitForEvent("download")
+      .catch((error) => error);
+    await button.click();
+    const response = await responsePromise;
+    if (response.status() !== 200) {
+      const failure = await response.json();
+      throw new Error(
+        `Media bundle API returned ${response.status()} / ${failure.error?.code ?? "unknown"}: ${failure.error?.message ?? "no reason"}`,
+      );
+    }
+    assert(
+      response.headers()["content-type"] === "application/zip",
+      "Media bundle API did not return a ZIP content type",
+    );
+    const download = await downloadPromise;
+    assert(
+      !(download instanceof Error) &&
+        download.suggestedFilename() ===
+          `${mediaRevision.revision_id}-${format}.zip`,
+      "Browser did not download the selected immutable media ZIP",
+    );
+    // Chromium is connected through a BrowserServer, so its remote download
+    // path cannot be read directly by this Node process.
+    const archivePath = join(
+      runDir,
+      `content-media-${mediaRevision.revision_id}-${format}.zip`,
+    );
+    await download.saveAs(archivePath);
+    const entries = await readZipEntries(archivePath);
+    const documentName = `${mediaRevision.revision_id}.${format === "html" ? "html" : "md"}`;
+    const imageName = `media/${key.object_id}-${key.object_version}.png`;
+    assert(
+      Object.keys(entries).sort().join("|") ===
+        [documentName, imageName].sort().join("|") &&
+        entries[imageName]?.equals(png),
+      "Media ZIP omitted or changed the exact bound PNG bytes",
+    );
+    const document = entries[documentName].toString("utf8");
+    const readableDocument =
+      format === "markdown"
+        ? document.replace(/\\([\\`*_{}\[\]()#+\-.!|>])/g, "$1")
+        : document;
+    assert(
+      readableDocument.includes(evidenceTitle) &&
+        !readableDocument.includes(`${evidenceTitle} (with image)`) &&
+        readableDocument.includes(evidenceSentence) &&
+        readableDocument.includes(imageName) &&
+        readableDocument.includes(alt) &&
+        readableDocument.includes(caption),
+      "Media ZIP document differs from the selected historical content or image reference",
+    );
+    if (format === "html")
+      assert(
+        /<img\b/.test(document) && /<figcaption\b/.test(document),
+        "HTML ZIP did not render the image and caption",
+      );
+    else
+      assert(
+        readableDocument.includes(`![${alt}](${imageName})`),
+        "Markdown ZIP did not link its bundled image",
+      );
+  };
+  await verifyMediaBundle("markdown");
+  await verifyMediaBundle("html");
   await screenshot(page, runDir, "content-media-history-desktop", {
     width: 1440,
     height: 900,
@@ -957,7 +1064,7 @@ async function verifyGeneratedRichContent(
   await verifyDownload(saved, "markdown");
   await verifyDownload(saved, "html");
   console.log(
-    "Content: source-backed rich text, authenticated media insertion/reload/history, and immutable text exports verified",
+    "Content: source-backed rich text, authenticated media insertion/reload/history, exact media ZIPs and immutable text exports verified",
   );
 }
 

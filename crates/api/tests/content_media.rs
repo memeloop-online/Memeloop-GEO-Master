@@ -226,6 +226,46 @@ async fn attachment(
 }
 
 #[tokio::test]
+async fn parser_profile_development_shares_attachment_bytes_with_media_snapshots() {
+    for (pdf, office) in [
+        (None, None),
+        (Some("synthetic-pdf".to_owned()), None),
+        (None, Some("synthetic-office".to_owned())),
+    ] {
+        let state = AppState::development_with_parser_profiles("test-password", pdf, office);
+        let project_id = project(&state).await;
+        let bytes = png();
+        let key = attachment(&state, project_id, bytes.clone(), "image/png", true).await;
+        let app = router(state.clone());
+        let (cookie, csrf) = login(&app, "demo@localhost", "test-password").await;
+        let (status, _, result) = call(
+            &app,
+            "POST",
+            &base(project_id),
+            Some(&cookie),
+            Some(&csrf),
+            key.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{}", body(&result));
+        let scope = TenantScope::new(
+            DEVELOPMENT_OPERATOR_ID,
+            DEVELOPMENT_TENANT_ID,
+            Some(project_id),
+        );
+        let key: geo_domain::MediaObjectKey = serde_json::from_value(key).unwrap();
+        let snapshots = state
+            .content_media_repository()
+            .snapshot_authorized_images(&scope, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].image.key, key);
+        assert_eq!(snapshots[0].bytes, bytes);
+    }
+}
+
+#[tokio::test]
 async fn image_bindings_validate_bytes_and_are_revocable() {
     let state = AppState::development_with_password("test-password");
     let project_id = project(&state).await;

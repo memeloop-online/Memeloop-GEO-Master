@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor, type QueryScope } from "../auth/types";
-import { apiFetch } from "./client";
+import { apiFetch, apiFetchBlob } from "./client";
 import { getCurrentCycle } from "./channelJobs";
 
 export interface ContentCoverage {
@@ -263,6 +263,19 @@ export function exportContentRevision(
   return apiFetch<ContentRevisionExport>(
     `${projectPath(projectId)}/contents/${encoded(assetId)}/revisions/${encoded(revisionId)}/export?format=${format}`,
     scopeOptions(tenantId, projectId),
+  );
+}
+
+export function exportContentRevisionBundle(
+  tenantId: string,
+  projectId: string,
+  assetId: string,
+  revisionId: string,
+  format: "markdown" | "html",
+): Promise<Blob> {
+  return apiFetchBlob(
+    `${projectPath(projectId)}/contents/${encoded(assetId)}/revisions/${encoded(revisionId)}/export-bundle?format=${format}`,
+    { ...scopeOptions(tenantId, projectId), accept: "application/zip" },
   );
 }
 

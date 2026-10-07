@@ -220,19 +220,26 @@ impl StructuredDocument {
         result.trim_end().to_owned()
     }
     fn rich_markdown(&self) -> String {
+        self.render_rich_markdown(None)
+            .expect("legacy rich rendering does not resolve media paths")
+    }
+    fn render_rich_markdown(
+        &self,
+        paths: Option<&HashMap<MediaObjectKey, String>>,
+    ) -> Result<String, AppError> {
         let mut result = format!(
             "# {}\n\n",
             crate::rich_content::escape_markdown(&self.title)
         );
         for block in &self.blocks {
             match block.kind {
-                ContentBlockKind::Rich => result.push_str(
-                    &block
-                        .rich
-                        .as_ref()
-                        .expect("validated rich block")
-                        .markdown(),
-                ),
+                ContentBlockKind::Rich => {
+                    let rich = block.rich.as_ref().expect("validated rich block");
+                    result.push_str(&match paths {
+                        Some(paths) => rich.markdown_with_media_paths(paths)?,
+                        None => rich.markdown(),
+                    });
+                }
                 ContentBlockKind::Heading => result.push_str(&format!(
                     "## {}\n\n",
                     crate::rich_content::escape_markdown(&block.text)
@@ -258,22 +265,73 @@ impl StructuredDocument {
                 }
             }
         }
-        result.trim_end().to_owned()
+        Ok(result.trim_end().to_owned())
     }
     /// Rendering requires valid structure. Authorization of media references remains a service responsibility.
     pub fn checked_markdown(&self, evidence: &[EvidenceRef]) -> Result<String, AppError> {
         self.validate(evidence)?;
         Ok(self.markdown())
     }
+    /// Resolve image paths from an authorized, immutable media snapshot. The
+    /// mapping is applied only to typed media nodes, never to document text.
+    pub fn markdown_with_media_paths(
+        &self,
+        evidence: &[EvidenceRef],
+        paths: &HashMap<MediaObjectKey, String>,
+    ) -> Result<String, AppError> {
+        self.validate(evidence)?;
+        self.validate_export_media_identities()?;
+        if self.schema_version == Some(2) {
+            self.render_rich_markdown(Some(paths))
+        } else {
+            Ok(self.markdown())
+        }
+    }
     /// HTML contains relative media paths only. A caller must authorize and package all media before export.
     pub fn html(&self, evidence: &[EvidenceRef]) -> Result<String, AppError> {
         self.validate(evidence)?;
+        self.render_html(None)
+    }
+    /// Render typed media references against the authorized bundle paths.
+    pub fn html_with_media_paths(
+        &self,
+        evidence: &[EvidenceRef],
+        paths: &HashMap<MediaObjectKey, String>,
+    ) -> Result<String, AppError> {
+        self.validate(evidence)?;
+        self.validate_export_media_identities()?;
+        self.render_html(Some(paths))
+    }
+    fn validate_export_media_identities(&self) -> Result<(), AppError> {
+        let mut seen = HashMap::new();
+        for reference in self.media_references() {
+            let identity = (reference.object_id, reference.object_version);
+            if seen
+                .insert(identity, reference.sha256.as_str())
+                .is_some_and(|digest| digest != reference.sha256.as_str())
+            {
+                return Err(AppError::invalid_request(
+                    "media object has conflicting digests",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn render_html(
+        &self,
+        paths: Option<&HashMap<MediaObjectKey, String>>,
+    ) -> Result<String, AppError> {
         let mut output = format!("<h1>{}</h1>", crate::rich_content::escape_html(&self.title));
         for block in &self.blocks {
             match block.kind {
-                ContentBlockKind::Rich => {
-                    output.push_str(&block.rich.as_ref().expect("validated rich block").html())
-                }
+                ContentBlockKind::Rich => output.push_str(&match paths {
+                    Some(paths) => block
+                        .rich
+                        .as_ref()
+                        .expect("validated rich block")
+                        .html_with_media_paths(paths)?,
+                    None => block.rich.as_ref().expect("validated rich block").html(),
+                }),
                 ContentBlockKind::Heading => output.push_str(&format!(
                     "<h2>{}</h2>",
                     crate::rich_content::escape_html(&block.text)

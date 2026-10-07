@@ -10,6 +10,7 @@ mod channels;
 mod citation_insights;
 mod connector_capabilities;
 mod content;
+mod content_export;
 mod content_media;
 pub mod content_runtime;
 mod content_tools;
@@ -160,8 +161,21 @@ impl AppState {
     }
 
     pub fn development_with_password(password: &str) -> Self {
-        let content_media_repository =
-            Arc::new(geo_domain::MemoryContentMediaRepository::default());
+        Self::development_with_knowledge_repository(
+            password,
+            Arc::new(MemoryKnowledgeRepository::default()),
+        )
+    }
+
+    fn development_with_knowledge_repository(
+        password: &str,
+        knowledge_repository: Arc<dyn KnowledgeRepository>,
+    ) -> Self {
+        let content_media_repository = Arc::new(
+            geo_domain::MemoryContentMediaRepository::with_knowledge_repository(
+                knowledge_repository.clone(),
+            ),
+        );
         Self {
             operation_store: Arc::new(MemoryOperationStore::default()),
             idempotency_store: Arc::new(MemoryIdempotencyStore::default()),
@@ -169,7 +183,7 @@ impl AppState {
             agent_runtime: Arc::new(MissingAgentRuntime),
             auth_repository: Arc::new(MemoryAuthRepository::development_with_password(password)),
             project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
-            knowledge_repository: Arc::new(MemoryKnowledgeRepository::default()),
+            knowledge_repository,
             question_repository: Arc::new(geo_domain::MemoryQuestionRepository::default()),
             report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
             connector_capability_repository: Arc::new(
@@ -216,13 +230,14 @@ impl AppState {
         pdf_profile: Option<String>,
         office_profile: Option<String>,
     ) -> Self {
-        let mut state = Self::development_with_password(password);
-        state.knowledge_repository = Arc::new(MemoryKnowledgeRepository::with_parser_profiles(
-            pdf_profile,
-            office_profile.clone(),
-            office_profile,
-        ));
-        state
+        Self::development_with_knowledge_repository(
+            password,
+            Arc::new(MemoryKnowledgeRepository::with_parser_profiles(
+                pdf_profile,
+                office_profile.clone(),
+                office_profile,
+            )),
+        )
     }
 
     pub fn with_stores(
@@ -287,8 +302,11 @@ impl AppState {
         events: EventBus,
         durable_storage: bool,
     ) -> Self {
-        let content_media_repository =
-            Arc::new(geo_domain::MemoryContentMediaRepository::default());
+        let content_media_repository = Arc::new(
+            geo_domain::MemoryContentMediaRepository::with_knowledge_repository(
+                knowledge_repository.clone(),
+            ),
+        );
         Self {
             operation_store,
             idempotency_store,
@@ -2180,6 +2198,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/projects/{id}/contents/{asset_id}/revisions/{revision_id}/export",
             get(content::export),
+        )
+        .route(
+            "/projects/{id}/contents/{asset_id}/revisions/{revision_id}/export-bundle",
+            get(content_export::export_bundle),
         )
         .layer(middleware::from_fn(no_store_middleware))
         .layer(middleware::from_fn(csrf_origin_from_request))

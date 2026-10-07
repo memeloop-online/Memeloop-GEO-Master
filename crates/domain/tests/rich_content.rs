@@ -1,10 +1,11 @@
 use chrono::Utc;
 use geo_domain::{
     CHANNEL_VARIANT_POLICY, ContentBlock, ContentBlockKind, ContentRevision, ErrorCode,
-    PlatformPlacement, RICH_CHANNEL_VARIANT_POLICY, RICH_MARKDOWN_FORMAT, StructuredDocument,
-    prepare_rich_variant, prepare_variant,
+    MediaObjectKey, PlatformPlacement, RICH_CHANNEL_VARIANT_POLICY, RICH_MARKDOWN_FORMAT,
+    StructuredDocument, prepare_rich_variant, prepare_variant,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 fn rich(node: Value) -> StructuredDocument {
@@ -336,6 +337,161 @@ fn media_references_are_structurally_valid_but_require_a_media_publication_adapt
             .unwrap_err()
             .code,
         ErrorCode::InvalidRequest
+    );
+}
+#[test]
+fn bundle_rendering_resolves_only_typed_media_and_preserves_legacy_output() {
+    let object_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let sha256 = "0123456789abcdef".repeat(4);
+    let media = json!({"type":"media","attrs":{
+        "object_id":object_id,"object_version":3,
+        "sha256":sha256,"alt":"An <image> & [label]","caption":"Caption & <detail>"
+    }});
+    let mut document = valid(media.clone());
+    document.title = "A <bundle> & title".into();
+    let literal = format!("literal media/{object_id}-3 and ![x](media/{object_id}-3)");
+    document.blocks.push(ContentBlock {
+        block_id: Uuid::new_v4(),
+        kind: ContentBlockKind::Rich,
+        text: String::new(),
+        items: vec![],
+        citation_ids: vec![],
+        rich: Some(geo_domain::RichContent {
+            version: 1,
+            node: serde_json::from_value(paragraph(&literal)).unwrap(),
+        }),
+    });
+    document.blocks.push(ContentBlock {
+        block_id: Uuid::new_v4(),
+        kind: ContentBlockKind::Rich,
+        text: String::new(),
+        items: vec![],
+        citation_ids: vec![],
+        rich: Some(geo_domain::RichContent {
+            version: 1,
+            node: serde_json::from_value(
+                json!({"type":"codeBlock","content":[text(&format!("media/{object_id}-3"))]}),
+            )
+            .unwrap(),
+        }),
+    });
+    document.blocks.push(ContentBlock {
+        block_id: Uuid::new_v4(),
+        kind: ContentBlockKind::Rich,
+        text: String::new(),
+        items: vec![],
+        citation_ids: vec![],
+        rich: Some(geo_domain::RichContent {
+            version: 1,
+            node: serde_json::from_value(media).unwrap(),
+        }),
+    });
+    document.validate(&[]).unwrap();
+    let key = MediaObjectKey {
+        object_id,
+        object_version: 3,
+        sha256,
+    };
+    let paths = HashMap::from([(key.clone(), format!("media/{object_id}-3.webp"))]);
+    let original_markdown = document.markdown();
+    let original_html = document.html(&[]).unwrap();
+    let markdown = document.markdown_with_media_paths(&[], &paths).unwrap();
+    let html = document.html_with_media_paths(&[], &paths).unwrap();
+    assert_eq!(
+        markdown
+            .matches(&format!("](media/{object_id}-3.webp)"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        html.matches(&format!("src=\"media/{object_id}-3.webp\""))
+            .count(),
+        2
+    );
+    assert!(markdown.contains("An &lt;image\\> &amp; \\[label\\]"));
+    assert!(markdown.contains("Caption &amp; &lt;detail\\>"));
+    assert!(html.contains("alt=\"An &lt;image&gt; &amp; [label]\""));
+    assert!(html.contains("<figcaption>Caption &amp; &lt;detail&gt;</figcaption>"));
+    assert!(markdown.contains(&format!(
+        "literal media/{}\\-3 and",
+        object_id.to_string().replace('-', "\\-")
+    )));
+    assert!(markdown.contains(&format!("media/{object_id}-3\n```")));
+    assert!(html.contains(&format!("literal media/{object_id}-3 and")));
+    assert_eq!(document.markdown(), original_markdown);
+    assert_eq!(document.html(&[]).unwrap(), original_html);
+    assert!(!original_html.contains(".webp"));
+    for missing in [
+        HashMap::new(),
+        HashMap::from([(
+            MediaObjectKey {
+                sha256: "f".repeat(64),
+                ..key.clone()
+            },
+            format!("media/{object_id}-3.webp"),
+        )]),
+    ] {
+        assert_eq!(
+            document
+                .markdown_with_media_paths(&[], &missing)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            document
+                .html_with_media_paths(&[], &missing)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+    let unsafe_paths = HashMap::from([(key, "../outside.png".into())]);
+    assert_eq!(
+        document
+            .html_with_media_paths(&[], &unsafe_paths)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    let mut conflicting = document.clone();
+    if let geo_domain::RichNode::Media { attrs } = &mut conflicting
+        .blocks
+        .last_mut()
+        .unwrap()
+        .rich
+        .as_mut()
+        .unwrap()
+        .node
+    {
+        attrs.sha256 = "f".repeat(64);
+    }
+    assert_eq!(
+        conflicting
+            .markdown_with_media_paths(&[], &paths)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        conflicting
+            .html_with_media_paths(&[], &paths)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    let nonmedia = valid(paragraph("Literal <text> & media/stays.png"));
+    assert_eq!(
+        nonmedia
+            .markdown_with_media_paths(&[], &HashMap::new())
+            .unwrap(),
+        nonmedia.markdown()
+    );
+    assert_eq!(
+        nonmedia
+            .html_with_media_paths(&[], &HashMap::new())
+            .unwrap(),
+        nonmedia.html(&[]).unwrap()
     );
 }
 #[test]

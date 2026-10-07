@@ -1,7 +1,8 @@
 //! A bounded, strictly typed subset of the ProseMirror/Tiptap document shape.
 //! These types are storage/export adapters, not an editor or an authorization grant.
-use crate::AppError;
+use crate::{AppError, MediaObjectKey};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub(crate) const MAX_NODES: usize = 10_000;
@@ -125,6 +126,27 @@ pub struct MediaReference {
 impl MediaReference {
     fn relative_path(&self) -> String {
         format!("media/{}-{}", self.object_id, self.object_version)
+    }
+    fn resolved_path<'a>(
+        &self,
+        paths: &'a HashMap<MediaObjectKey, String>,
+    ) -> Result<&'a str, AppError> {
+        let key = MediaObjectKey {
+            object_id: self.object_id,
+            object_version: self.object_version,
+            sha256: self.sha256.clone(),
+        };
+        let path = paths
+            .get(&key)
+            .ok_or_else(|| invalid("media export path is missing"))?;
+        let prefix = format!("{}.", self.relative_path());
+        if !["png", "jpg", "webp"]
+            .iter()
+            .any(|extension| path == &format!("{prefix}{extension}"))
+        {
+            return Err(invalid("invalid media export path"));
+        }
+        Ok(path)
     }
 }
 
@@ -285,6 +307,21 @@ impl RichContent {
     }
     pub fn html(&self) -> String {
         self.node.html()
+    }
+    pub(crate) fn markdown_with_media_paths(
+        &self,
+        paths: &HashMap<MediaObjectKey, String>,
+    ) -> Result<String, AppError> {
+        Ok(format!(
+            "{}\n\n",
+            self.node.markdown_with_media_paths(paths)?
+        ))
+    }
+    pub(crate) fn html_with_media_paths(
+        &self,
+        paths: &HashMap<MediaObjectKey, String>,
+    ) -> Result<String, AppError> {
+        self.node.html_with_media_paths(paths)
     }
 }
 impl RichNode {
@@ -586,13 +623,20 @@ impl RichNode {
         }
     }
     fn html(&self) -> String {
+        self.render_html(None)
+            .expect("legacy rich rendering does not resolve media paths")
+    }
+    fn render_html(
+        &self,
+        paths: Option<&HashMap<MediaObjectKey, String>>,
+    ) -> Result<String, AppError> {
         let inline = || {
             self.children()
                 .iter()
-                .map(RichNode::html)
-                .collect::<String>()
+                .map(|child| child.render_html(paths))
+                .collect::<Result<String, _>>()
         };
-        match self {
+        Ok(match self {
             Self::Text { text, marks } => {
                 let mut value = escape_html(text);
                 for mark in marks {
@@ -615,13 +659,13 @@ impl RichNode {
                 value
             }
             Self::HardBreak {} => "<br>".into(),
-            Self::Paragraph { .. } => format!("<p>{}</p>", inline()),
-            Self::Heading { attrs, .. } => format!("<h{0}>{1}</h{0}>", attrs.level, inline()),
-            Self::BulletList { .. } => format!("<ul>{}</ul>", inline()),
+            Self::Paragraph { .. } => format!("<p>{}</p>", inline()?),
+            Self::Heading { attrs, .. } => format!("<h{0}>{1}</h{0}>", attrs.level, inline()?),
+            Self::BulletList { .. } => format!("<ul>{}</ul>", inline()?),
             Self::OrderedList { attrs, .. } => {
-                format!("<ol start=\"{}\">{}</ol>", attrs.start, inline())
+                format!("<ol start=\"{}\">{}</ol>", attrs.start, inline()?)
             }
-            Self::ListItem { .. } => format!("<li>{}</li>", inline()),
+            Self::ListItem { .. } => format!("<li>{}</li>", inline()?),
             Self::CodeBlock { attrs, content } => {
                 let code = content
                     .iter()
@@ -642,8 +686,8 @@ impl RichNode {
                     escape_html(language)
                 )
             }
-            Self::Table { .. } => format!("<table><tbody>{}</tbody></table>", inline()),
-            Self::TableRow { .. } => format!("<tr>{}</tr>", inline()),
+            Self::Table { .. } => format!("<table><tbody>{}</tbody></table>", inline()?),
+            Self::TableRow { .. } => format!("<tr>{}</tr>", inline()?),
             Self::TableHeader { attrs, .. } | Self::TableCell { attrs, .. } => {
                 let tag = if matches!(self, Self::TableHeader { .. }) {
                     "th"
@@ -679,15 +723,73 @@ impl RichNode {
                         ));
                     }
                 }
-                format!("<{tag}{properties}>{}</{tag}>", inline())
+                format!("<{tag}{properties}>{}</{tag}>", inline()?)
             }
             Self::Media { attrs } => format!(
                 "<figure><img src=\"{}\" alt=\"{}\"><figcaption>{}</figcaption></figure>",
-                attrs.relative_path(),
+                match paths {
+                    Some(paths) => escape_html(attrs.resolved_path(paths)?),
+                    None => attrs.relative_path(),
+                },
                 escape_html(&attrs.alt),
                 escape_html(&attrs.caption)
             ),
+        })
+    }
+    fn markdown_with_media_paths(
+        &self,
+        paths: &HashMap<MediaObjectKey, String>,
+    ) -> Result<String, AppError> {
+        match self {
+            Self::Media { attrs } => Ok(format!(
+                "![{}]({})\n\n{}",
+                escape_markdown(&attrs.alt),
+                attrs.resolved_path(paths)?,
+                escape_markdown(&attrs.caption)
+            )),
+            Self::Paragraph { .. } => inline_markdown_with_media_paths(self.children(), paths),
+            Self::Heading { attrs, .. } => Ok(format!(
+                "{} {}",
+                "#".repeat(attrs.level as usize),
+                inline_markdown_with_media_paths(self.children(), paths)?
+            )),
+            Self::BulletList { content } => list_markdown_with_media_paths(content, None, paths),
+            Self::OrderedList { attrs, content }
+                if u64::from(attrs.start) + content.len() as u64 > 1_000_000_000 =>
+            {
+                self.html_with_media_paths(paths)
+            }
+            Self::OrderedList { attrs, content } => {
+                list_markdown_with_media_paths(content, Some(attrs.start), paths)
+            }
+            Self::ListItem { content } => {
+                let mut output = String::new();
+                for (index, child) in content.iter().enumerate() {
+                    if index != 0 {
+                        output.push_str(if matches!(child, Self::Paragraph { .. }) {
+                            "\n\n"
+                        } else {
+                            "\n"
+                        });
+                    }
+                    output.push_str(&child.markdown_with_media_paths(paths)?);
+                }
+                Ok(output)
+            }
+            // Tables need HTML for spans, alignment and widths, including any
+            // nested media nodes in a future compatible schema.
+            Self::Table { .. }
+            | Self::TableRow { .. }
+            | Self::TableHeader { .. }
+            | Self::TableCell { .. } => self.html_with_media_paths(paths),
+            _ => Ok(self.markdown()),
         }
+    }
+    fn html_with_media_paths(
+        &self,
+        paths: &HashMap<MediaObjectKey, String>,
+    ) -> Result<String, AppError> {
+        self.render_html(Some(paths))
     }
 }
 fn validate_table(rows: &[RichNode]) -> Result<(), AppError> {
@@ -753,6 +855,27 @@ fn inline_markdown(children: &[RichNode]) -> String {
         })
         .collect()
 }
+fn inline_markdown_with_media_paths(
+    children: &[RichNode],
+    paths: &HashMap<MediaObjectKey, String>,
+) -> Result<String, AppError> {
+    children
+        .iter()
+        .enumerate()
+        .map(|(index, child)| {
+            let marked =
+                |node: &RichNode| matches!(node, RichNode::Text { marks, .. } if !marks.is_empty());
+            if marked(child)
+                && (index > 0 && marked(&children[index - 1])
+                    || children.get(index + 1).is_some_and(marked))
+            {
+                child.html_with_media_paths(paths)
+            } else {
+                child.markdown_with_media_paths(paths)
+            }
+        })
+        .collect()
+}
 fn list_markdown(items: &[RichNode], start: Option<u32>) -> String {
     items
         .iter()
@@ -770,6 +893,28 @@ fn list_markdown(items: &[RichNode], start: Option<u32>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+fn list_markdown_with_media_paths(
+    items: &[RichNode],
+    start: Option<u32>,
+    paths: &HashMap<MediaObjectKey, String>,
+) -> Result<String, AppError> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let prefix = match start {
+                Some(start) => format!("{}. ", u64::from(start) + index as u64),
+                None => "- ".into(),
+            };
+            let continuation = format!("\n{}", " ".repeat(prefix.len()));
+            let body = item
+                .markdown_with_media_paths(paths)?
+                .replace('\n', &continuation);
+            Ok(format!("{prefix}{body}"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join("\n"))
 }
 pub fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -816,4 +961,74 @@ pub fn escape_markdown(text: &str) -> String {
         output.push(ch);
     }
     output
+}
+
+#[cfg(test)]
+mod media_rendering_tests {
+    use super::{MediaReference, RichContent, RichNode};
+    use crate::{ErrorCode, MediaObjectKey};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[test]
+    fn table_html_fallback_recurses_without_changing_valid_table_schema() {
+        let object_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let sha256 = "a".repeat(64);
+        let media = RichNode::Media {
+            attrs: MediaReference {
+                object_id,
+                object_version: 2,
+                sha256: sha256.clone(),
+                alt: "A & B".into(),
+                caption: "<caption>".into(),
+            },
+        };
+        // Current table cells cannot contain media. Render recursion is
+        // intentionally complete without accepting this shape for storage.
+        let document = RichContent {
+            version: 1,
+            node: RichNode::Table {
+                content: vec![RichNode::TableRow {
+                    content: vec![RichNode::TableCell {
+                        attrs: None,
+                        content: vec![RichNode::Paragraph {
+                            content: vec![media],
+                        }],
+                    }],
+                }],
+            },
+        };
+        assert_eq!(
+            document.validate().unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let paths = HashMap::from([(
+            MediaObjectKey {
+                object_id,
+                object_version: 2,
+                sha256,
+            },
+            format!("media/{object_id}-2.png"),
+        )]);
+        let expected = format!("src=\"media/{object_id}-2.png\"");
+        assert!(
+            document
+                .markdown_with_media_paths(&paths)
+                .unwrap()
+                .contains(&expected)
+        );
+        assert!(
+            document
+                .html_with_media_paths(&paths)
+                .unwrap()
+                .contains(&expected)
+        );
+        assert_eq!(
+            document
+                .markdown_with_media_paths(&HashMap::new())
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
 }
