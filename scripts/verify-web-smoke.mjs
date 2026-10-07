@@ -1377,7 +1377,9 @@ async function main() {
     (await loginResponse).status() === 200,
     "Synthetic first-party login was rejected",
   );
-  await page.getByRole("heading", { name: "选择工作区", exact: true }).waitFor();
+  await page
+    .getByRole("heading", { name: "选择工作区", exact: true })
+    .waitFor();
   assert(
     apiResponses.some(
       (response) =>
