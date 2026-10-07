@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, useLocation, useSearchParams } from "react-router-dom";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
 import {
   createMeasurementPlan,
+  executeChannelTarget,
+  getChannelTarget,
   getMeasurementPlan,
   getMeasurementOptions,
   listMeasurementPlans,
@@ -39,6 +41,8 @@ vi.mock("../api/channels", () => ({
 }));
 vi.mock("../api/channelJobs", () => ({
   createMeasurementPlan: vi.fn(),
+  executeChannelTarget: vi.fn(),
+  getChannelTarget: vi.fn(),
   getMeasurementPlan: vi.fn(),
   getMeasurementOptions: vi.fn(),
   listMeasurementPlans: vi.fn(),
@@ -48,11 +52,24 @@ vi.mock("../api/questions", () => ({
   listAllQuestionSetVersions: vi.fn(),
   getQuestionSetVersion: vi.fn(),
 }));
-vi.mock("./ChannelJobsPage", () => ({
-  PlannedTarget: ({ target }: { target: { target_id: string } }) => (
-    <div>执行证据 {target.target_id}</div>
-  ),
-}));
+const target = {
+  target_id: "target-1",
+  input: {
+    kind: "measure" as const,
+    account_id: "account-1",
+    provider: "kimi",
+    model: "visible-model",
+    surface: "consumer_web",
+    search_mode: "web_search",
+    protocol_version: "v1",
+    question_set_version: "ad_hoc.v1",
+    question: "如何观察流星雨？",
+    market: "CN",
+    language: "zh-CN",
+    scheduled_at: "2026-10-01T00:00:00Z",
+    sample_ordinal: 0,
+  },
+};
 const plan = {
   plan_id: "measurement-1",
   project_id: "project-1",
@@ -64,7 +81,26 @@ function UrlState() {
   const location = useLocation();
   return <output data-testid="measurement-url">{location.search}</output>;
 }
-function renderPanel(canWrite = true, recordsOnly = false) {
+function Panel({
+  canWrite,
+  recordsOnly,
+  followTabs,
+}: {
+  canWrite: boolean;
+  recordsOnly: boolean;
+  followTabs: boolean;
+}) {
+  const [params] = useSearchParams();
+  return (
+    <StandaloneMeasurementPanel
+      tenantId="tenant-1"
+      projectId="project-1"
+      canWrite={canWrite}
+      recordsOnly={followTabs ? params.get("tab") === "records" : recordsOnly}
+    />
+  );
+}
+function renderPanel(canWrite = true, recordsOnly = false, followTabs = false) {
   return render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider
@@ -78,11 +114,10 @@ function renderPanel(canWrite = true, recordsOnly = false) {
         }
       >
         <MemoryRouter>
-          <StandaloneMeasurementPanel
-            tenantId="tenant-1"
-            projectId="project-1"
+          <Panel
             canWrite={canWrite}
             recordsOnly={recordsOnly}
+            followTabs={followTabs}
           />
           <UrlState />
         </MemoryRouter>
@@ -106,6 +141,7 @@ beforeEach(() => {
     next_after: null,
   });
   vi.mocked(getMeasurementPlan).mockResolvedValue(plan);
+  vi.mocked(getChannelTarget).mockResolvedValue({ target, attempts: [] });
   vi.mocked(createMeasurementPlan).mockResolvedValue(plan);
   vi.mocked(getMeasurementOptions).mockResolvedValue({
     models: [{ id: "visible-model", label: "网页当前模型" }],
@@ -122,6 +158,151 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it("creates one plan and displays queued, in-progress and final results without a second execute request", async () => {
+    const savedPlan = { ...plan, targets: [target] };
+    vi.mocked(createMeasurementPlan).mockResolvedValue(savedPlan);
+    vi.mocked(getMeasurementPlan).mockResolvedValue(savedPlan);
+    vi.mocked(listMeasurementPlans).mockResolvedValue({
+      items: [savedPlan],
+      next_after: null,
+    });
+    const attempt = {
+      attempt_id: "attempt-1",
+      target_id: target.target_id,
+      claimed_at: "2026-10-01T00:00:01Z",
+      received_at: null,
+      outcome: null,
+    };
+    vi.mocked(getChannelTarget)
+      .mockResolvedValueOnce({ target, attempts: [] })
+      .mockResolvedValueOnce({ target, attempts: [attempt] })
+      .mockResolvedValueOnce({
+        target,
+        attempts: [
+          {
+            ...attempt,
+            received_at: "2026-10-01T00:00:04Z",
+            outcome: {
+              status: "observed",
+              detail: "已收到搜索答案",
+              occurred_at: "2026-10-01T00:00:04Z",
+              raw_answer: "可在晴朗夜晚观测",
+              citations: [],
+              public_url: null,
+              screenshot_ref: null,
+              connector_version: "v1",
+              runner_evidence: [],
+              fixture: false,
+            },
+          },
+        ],
+      });
+    const user = userEvent.setup();
+    renderPanel(true, false, true);
+    await user.type(
+      screen.getByLabelText("要测量的问题"),
+      target.input.question,
+    );
+    await screen.findByText("模型：网页当前模型");
+    await user.click(screen.getByRole("button", { name: "开始测量" }));
+    expect(await screen.findByText("等待自动测量")).toBeInTheDocument();
+    expect(screen.getByText("测量已排期。")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "执行此目标" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "刷新记录" }));
+    expect(await screen.findByText("执行中或等待结果")).toBeInTheDocument();
+    expect(screen.getByText("正在等待测量结果。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "刷新记录" }));
+    expect(await screen.findByText("已取得测量结果")).toBeInTheDocument();
+    expect(screen.getByText(/已收到搜索答案/)).toBeInTheDocument();
+    expect(createMeasurementPlan).toHaveBeenCalledOnce();
+    expect(executeChannelTarget).not.toHaveBeenCalled();
+  });
+
+  it("shows a real record fetch failure without offering a manual execution action", async () => {
+    const savedPlan = { ...plan, targets: [target] };
+    vi.mocked(listMeasurementPlans).mockResolvedValue({
+      items: [savedPlan],
+      next_after: null,
+    });
+    vi.mocked(getMeasurementPlan).mockResolvedValue(savedPlan);
+    vi.mocked(getChannelTarget).mockRejectedValue(new Error("状态读取失败"));
+    const user = userEvent.setup();
+    renderPanel(true, true);
+    await user.click(
+      await screen.findByRole("button", { name: /自定义问题测量/ }),
+    );
+    expect(await screen.findByText("状态读取失败")).toBeInTheDocument();
+    expect(screen.getByText("测量状态暂不可用")).toBeInTheDocument();
+    expect(screen.queryByText("等待自动测量")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "执行此目标" }),
+    ).not.toBeInTheDocument();
+    expect(executeChannelTarget).not.toHaveBeenCalled();
+  });
+
+  it("describes an unknown measurement without promising reconciliation", async () => {
+    const savedPlan = { ...plan, targets: [target] };
+    vi.mocked(listMeasurementPlans).mockResolvedValue({
+      items: [savedPlan],
+      next_after: null,
+    });
+    vi.mocked(getMeasurementPlan).mockResolvedValue(savedPlan);
+    vi.mocked(getChannelTarget).mockResolvedValue({
+      target,
+      attempts: [
+        {
+          attempt_id: "attempt-unknown",
+          target_id: target.target_id,
+          claimed_at: "2026-10-01T00:00:01Z",
+          received_at: "2026-10-01T00:00:04Z",
+          outcome: {
+            status: "unknown",
+            detail: "响应采集超时",
+            occurred_at: "2026-10-01T00:00:04Z",
+            raw_answer: null,
+            citations: [],
+            public_url: null,
+            screenshot_ref: null,
+            connector_version: "v1",
+            runner_evidence: [],
+            fixture: true,
+          },
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    renderPanel(true, true);
+    await user.click(
+      await screen.findByRole("button", { name: /自定义问题测量/ }),
+    );
+    expect(await screen.findByText("测量结果未知")).toBeInTheDocument();
+    expect(screen.getByText("未能确认本次测量结果。")).toBeInTheDocument();
+    expect(screen.getByText(/响应采集超时/)).toBeInTheDocument();
+    expect(screen.getByText(/结果尚未验证/)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/测试数据|非真实外部结果/),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/已取得测量结果/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/等待对账/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "执行此目标" }),
+    ).not.toBeInTheDocument();
+    expect(executeChannelTarget).not.toHaveBeenCalled();
+  });
+
+  it("keeps model discovery errors visible and does not submit a plan", async () => {
+    vi.mocked(getMeasurementOptions).mockRejectedValue(
+      new Error("模型发现失败"),
+    );
+    renderPanel();
+    expect(await screen.findByText("模型发现失败")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
+    expect(createMeasurementPlan).not.toHaveBeenCalled();
+    expect(executeChannelTarget).not.toHaveBeenCalled();
+  });
+
   it("submits an immediate arbitrary question without knowledge, cycle or question-set input", async () => {
     const user = userEvent.setup();
     renderPanel();

@@ -39,6 +39,26 @@ const zh = {
   questionLanguage: "语言 {{value}}",
   questionSource: "来源 {{value}}",
   questionWeight: "权重 {{value}}",
+  automaticLoading: "正在读取测量状态",
+  automaticUnavailable: "测量状态暂不可用",
+  automaticQueued: "等待自动测量",
+  automaticQueuedDetail: "测量已排期。",
+  automaticInFlight: "执行中或等待结果",
+  automaticInFlightDetail: "正在等待测量结果。",
+  automaticUnknownDetail: "未能确认本次测量结果。",
+  automaticUnverifiedResult: "结果尚未验证",
+  automaticReadError: "测量记录无法读取",
+  automaticOutcome: {
+    observed: "已取得测量结果",
+    refused: "测量时被拒答",
+    missing: "测量缺测",
+    unknown: "测量结果未知",
+    failed: "测量失败",
+    login_required: "需要重新登录",
+    unsupported: "当前不支持测量",
+    published: "已发布",
+    verified: "已验证",
+  },
 } as const;
 
 const en = {
@@ -83,6 +103,26 @@ const en = {
   questionLanguage: "Language {{value}}",
   questionSource: "Source {{value}}",
   questionWeight: "Weight {{value}}",
+  automaticLoading: "Loading measurement status",
+  automaticUnavailable: "Measurement status unavailable",
+  automaticQueued: "Waiting for automatic measurement",
+  automaticQueuedDetail: "Measurement scheduled.",
+  automaticInFlight: "Running or awaiting a result",
+  automaticInFlightDetail: "Waiting for a measurement result.",
+  automaticUnknownDetail: "This measurement result could not be confirmed.",
+  automaticUnverifiedResult: "Result not verified",
+  automaticReadError: "Unable to load measurement record",
+  automaticOutcome: {
+    observed: "Measurement result received",
+    refused: "The question was refused",
+    missing: "Measurement unavailable",
+    unknown: "Measurement result unknown",
+    failed: "Measurement failed",
+    login_required: "Sign in again",
+    unsupported: "Measurement not supported",
+    published: "Published",
+    verified: "Verified",
+  },
 } as const;
 
 i18n.addResourceBundle("zh-CN", "measurement", zh, true, true);

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Badge,
   Button,
@@ -38,6 +39,7 @@ import { useChannelData } from "../api/channels";
 import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { DistributionPanel } from "./DistributionPanel";
+import "./measurementMessages";
 import {
   PublicationLookupPanel,
   safeOriginalPublicUrl,
@@ -90,6 +92,7 @@ export function TargetCard({
   onExecute,
   executing,
   executeError,
+  automatic = false,
 }: {
   target: ChannelTarget;
   tenantId: string;
@@ -102,7 +105,9 @@ export function TargetCard({
   onExecute: () => void;
   executing: boolean;
   executeError: unknown;
+  automatic?: boolean;
 }) {
+  const { t } = useTranslation("measurement");
   const input = target.input;
   const classification =
     input.kind === "measure"
@@ -114,6 +119,15 @@ export function TargetCard({
       : null;
   const status = resultStatus(view);
   const attempted = Boolean(view?.attempts.length);
+  const automaticLabel = loading
+    ? t("automaticLoading")
+    : loadError
+      ? t("automaticUnavailable")
+      : !attempted
+        ? t("automaticQueued")
+        : status === "in_flight"
+          ? t("automaticInFlight")
+          : t(`automaticOutcome.${status}`, { defaultValue: status });
   return (
     <Card className="channel-job-target">
       <div className="channel-job-target-heading">
@@ -124,7 +138,9 @@ export function TargetCard({
             {" · "}账号 {input.account_id}
           </p>
         </div>
-        <Badge appearance="outline">{statusLabels[status] ?? status}</Badge>
+        <Badge appearance="outline">
+          {automatic ? automaticLabel : (statusLabels[status] ?? status)}
+        </Badge>
       </div>
       <p className="channel-job-ids">
         目标 {target.target_id}
@@ -149,10 +165,13 @@ export function TargetCard({
       {loading && <Spinner label="正在读取执行记录" size="tiny" />}
       {loadError && (
         <ErrorState
-          title="执行记录无法读取"
+          title={automatic ? t("automaticReadError") : "执行记录无法读取"}
           detail={errorText(loadError)}
           onRetry={onRefresh}
         />
+      )}
+      {automatic && !loading && !loadError && !attempted && (
+        <p role="status">{t("automaticQueuedDetail")}</p>
       )}
       {view?.attempts.map((attempt) => (
         <div className="channel-job-attempt" key={attempt.attempt_id}>
@@ -164,14 +183,22 @@ export function TargetCard({
             <>
               <p>
                 结果：
-                {statusLabels[attempt.outcome.status] ?? attempt.outcome.status}
+                {automatic
+                  ? t(`automaticOutcome.${attempt.outcome.status}`, {
+                      defaultValue: attempt.outcome.status,
+                    })
+                  : (statusLabels[attempt.outcome.status] ??
+                    attempt.outcome.status)}
                 {" · "}
                 {attempt.outcome.detail ?? "无详细说明"}
               </p>
               <p>
                 结果时间 {dateTime(attempt.outcome.occurred_at)}
                 {" · "}连接器 {attempt.outcome.connector_version ?? "未记录"}
-                {attempt.outcome.fixture && " · 测试数据，非真实外部结果"}
+                {attempt.outcome.fixture &&
+                  (automatic
+                    ? ` · ${t("automaticUnverifiedResult")}`
+                    : " · 测试数据，非真实外部结果")}
               </p>
               {safeOriginalPublicUrl(attempt.outcome.public_url) && (
                 <p>
@@ -205,17 +232,30 @@ export function TargetCard({
               )}
             </>
           ) : (
-            <p>尝试已领取但尚未收到结果；需要查回，不能重发。</p>
+            <p>
+              {automatic
+                ? t("automaticInFlightDetail")
+                : "尝试已领取但尚未收到结果；需要查回，不能重发。"}
+            </p>
           )}
         </div>
       ))}
-      {!attempted && !loadError && !executeError && !loading && canWrite && (
-        <Button disabled={executing} onClick={onExecute}>
-          {executing ? "正在执行…" : "执行此目标"}
-        </Button>
-      )}
+      {!automatic &&
+        !attempted &&
+        !loadError &&
+        !executeError &&
+        !loading &&
+        canWrite && (
+          <Button disabled={executing} onClick={onExecute}>
+            {executing ? "正在执行…" : "执行此目标"}
+          </Button>
+        )}
       {attempted && status === "unknown" && (
-        <p role="status">结果未知；当前没有安全的手动重发操作，请等待对账。</p>
+        <p role="status">
+          {automatic
+            ? t("automaticUnknownDetail")
+            : "结果未知；当前没有安全的手动重发操作，请等待对账。"}
+        </p>
       )}
       {input.kind === "publish" &&
         view?.attempts.some(
@@ -251,11 +291,13 @@ export function PlannedTarget({
   tenantId,
   projectId,
   canWrite,
+  automatic = false,
 }: {
   target: ChannelTarget;
   tenantId: string;
   projectId: string;
   canWrite: boolean;
+  automatic?: boolean;
 }) {
   const { session } = useAuth();
   const client = useQueryClient();
@@ -295,6 +337,7 @@ export function PlannedTarget({
       onExecute={() => execution.mutate()}
       executing={execution.isPending}
       executeError={execution.error}
+      automatic={automatic}
     />
   );
 }

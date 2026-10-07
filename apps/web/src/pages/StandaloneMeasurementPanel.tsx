@@ -590,6 +590,7 @@ export function StandaloneMeasurementPanel({
                   tenantId={tenantId}
                   projectId={projectId}
                   canWrite={canWrite}
+                  automatic
                 />
               ))}
             </div>
