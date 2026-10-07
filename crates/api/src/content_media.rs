@@ -33,6 +33,45 @@ const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 100;
+const THUMBNAIL_EDGE: u32 = 320;
+
+/// Derivatives never replace committed attachments or version-export bytes.
+/// Called on a blocking worker, after the original object's identity is checked.
+fn thumbnail_png(bytes: Vec<u8>) -> Result<Vec<u8>, AppError> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| decode_error())?;
+    if !matches!(
+        reader.format(),
+        Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP)
+    ) {
+        return Err(decode_error());
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(|_| decode_error())?;
+    let (width, height) = decoder.dimensions();
+    check_dimensions(width, height)?;
+    if decoder.total_bytes() > MAX_DECODED_BYTES {
+        return Err(decode_error());
+    }
+    let orientation = decoder.orientation().map_err(|_| decode_error())?;
+    let mut image = image::DynamicImage::from_decoder(decoder).map_err(|_| decode_error())?;
+    image.apply_orientation(orientation);
+    let image = if image.width() > THUMBNAIL_EDGE || image.height() > THUMBNAIL_EDGE {
+        image.thumbnail(THUMBNAIL_EDGE, THUMBNAIL_EDGE)
+    } else {
+        image
+    };
+    let mut output = Cursor::new(Vec::new());
+    image
+        .write_to(&mut output, ImageFormat::Png)
+        .map_err(|_| AppError::new(geo_domain::ErrorCode::Internal, "thumbnail encoding failed"))?;
+    Ok(output.into_inner())
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -289,6 +328,26 @@ pub(crate) async fn get_binding_bytes(
     Extension(scope): Extension<TenantScope>,
     Extension(context): Extension<RequestContext>,
 ) -> Result<Response, ApiError> {
+    binding_response(state, project_id, binding_id, scope, context, false).await
+}
+
+pub(crate) async fn get_binding_thumbnail(
+    State(state): State<AppState>,
+    Path((project_id, binding_id)): Path<(ProjectId, Uuid)>,
+    Extension(scope): Extension<TenantScope>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Response, ApiError> {
+    binding_response(state, project_id, binding_id, scope, context, true).await
+}
+
+async fn binding_response(
+    state: AppState,
+    project_id: ProjectId,
+    binding_id: Uuid,
+    scope: TenantScope,
+    context: RequestContext,
+    thumbnail: bool,
+) -> Result<Response, ApiError> {
     let scope = crate::content::scoped(&state, &scope, project_id)
         .await
         .map_err(|e| api_error(e, context.request_id))?;
@@ -322,8 +381,21 @@ pub(crate) async fn get_binding_bytes(
             context.request_id,
         ));
     }
-    // Read the final active binding *after* fetching bytes; a withdrawal that
-    // completed during storage I/O must not return an authorized preview.
+    let bytes = if thumbnail {
+        tokio::task::spawn_blocking(move || thumbnail_png(snapshot.bytes))
+            .await
+            .map_err(|_| {
+                api_error(
+                    AppError::new(geo_domain::ErrorCode::Internal, "thumbnail task failed"),
+                    context.request_id,
+                )
+            })?
+            .map_err(|e| api_error(e, context.request_id))?
+    } else {
+        snapshot.bytes
+    };
+    // Revalidate after storage I/O AND derivative work. Revocation before this
+    // final authorization prevents either original or derived preview delivery.
     let current = media
         .get_binding(&scope, binding_id)
         .await
@@ -337,10 +409,15 @@ pub(crate) async fn get_binding_bytes(
                 context.request_id,
             )
         })?;
-    let mut response = Response::new(Body::from(snapshot.bytes));
+    let media_type = if thumbnail {
+        "image/png"
+    } else {
+        &current.image.media_type
+    };
+    let mut response = Response::new(Body::from(bytes));
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(&current.image.media_type).map_err(|_| {
+        HeaderValue::from_str(media_type).map_err(|_| {
             api_error(
                 AppError::conflict("invalid bound image type"),
                 context.request_id,
@@ -378,6 +455,30 @@ pub(crate) async fn withdraw_binding(
 mod tests {
     use super::*;
     use geo_domain::{DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, ErrorCode};
+
+    #[test]
+    fn thumbnails_fit_without_upscaling_and_preserve_transparency() {
+        for (width, height, expected) in [
+            (800, 400, (320, 160)),
+            (400, 800, (160, 320)),
+            (12, 7, (12, 7)),
+        ] {
+            let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                width,
+                height,
+                image::Rgba([80, 120, 200, 96]),
+            ));
+            let mut source = Cursor::new(Vec::new());
+            image.write_to(&mut source, ImageFormat::Png).unwrap();
+            let result = thumbnail_png(source.into_inner()).unwrap();
+            assert_eq!(image::guess_format(&result).unwrap(), ImageFormat::Png);
+            let decoded = image::load_from_memory(&result).unwrap().into_rgba8();
+            assert_eq!(decoded.dimensions(), expected);
+            assert_eq!(decoded.get_pixel(0, 0).0[3], 96);
+        }
+        assert!(thumbnail_png(b"<svg/>".to_vec()).is_err());
+        assert!(thumbnail_png(b"\x89PNG\r\n\x1a\n".to_vec()).is_err());
+    }
 
     #[test]
     fn rejects_markup_and_missing_image_data() {

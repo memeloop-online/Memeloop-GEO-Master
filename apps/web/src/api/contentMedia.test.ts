@@ -4,6 +4,7 @@ import {
   listContentMedia,
   mediaKeyFromAttachment,
   readContentMediaBytes,
+  readContentMediaThumbnail,
 } from "./contentMedia";
 import { setCsrfToken } from "./client";
 
@@ -53,6 +54,30 @@ describe("project media transport", () => {
     expect(String(fetchMock.mock.calls[0][0])).toContain(
       "/content-media/bindings/binding-a/bytes?",
     );
+  });
+
+  it("reads the scoped PNG thumbnail derivative with an abort signal", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Uint8Array([137, 80, 78, 71]), {
+        headers: { "Content-Type": "image/png" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const blob = await readContentMediaThumbnail(
+      "tenant-a",
+      "project-a",
+      "binding-a",
+      controller.signal,
+    );
+    expect(blob.type).toBe("image/png");
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      "/projects/project-a/content-media/bindings/binding-a/thumbnail?tenant_id=tenant-a&project_id=project-a",
+    );
+    expect(new Headers(fetchMock.mock.calls[0][1].headers).get("Accept")).toBe(
+      "image/png",
+    );
+    expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
   });
 
   it("rejects attachments lacking a verified numeric object version", () => {

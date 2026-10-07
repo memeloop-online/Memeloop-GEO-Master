@@ -2191,6 +2191,10 @@ pub fn router(state: AppState) -> Router {
             "/projects/{id}/content-media/bindings/{binding_id}/bytes",
             get(content_media::get_binding_bytes),
         )
+        .route(
+            "/projects/{id}/content-media/bindings/{binding_id}/thumbnail",
+            get(content_media::get_binding_thumbnail),
+        )
         .route("/projects/{id}/contents/{asset_id}", get(content::asset))
         .route(
             "/projects/{id}/contents/{asset_id}/revisions",

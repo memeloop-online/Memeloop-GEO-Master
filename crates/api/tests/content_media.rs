@@ -129,6 +129,12 @@ fn detail(project_id: ProjectId, binding_id: &str, bytes: bool) -> String {
     )
 }
 
+fn thumbnail(project_id: ProjectId, binding_id: &str) -> String {
+    format!(
+        "/api/v1/projects/{project_id}/content-media/bindings/{binding_id}/thumbnail{TENANT}{DEVELOPMENT_TENANT_ID}"
+    )
+}
+
 fn pixels() -> [u8; 12] {
     [251, 55, 21, 21, 251, 68, 46, 33, 250, 19, 66, 255]
 }
@@ -137,6 +143,18 @@ fn png() -> Vec<u8> {
     let mut result = Vec::new();
     PngEncoder::new(&mut result)
         .write_image(&pixels(), 2, 2, ExtendedColorType::Rgb8)
+        .unwrap();
+    result
+}
+
+fn alpha_wide_png() -> Vec<u8> {
+    let mut pixels = vec![0_u8; 640 * 320 * 4];
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[251, 55, 21, 96]);
+    }
+    let mut result = Vec::new();
+    PngEncoder::new(&mut result)
+        .write_image(&pixels, 640, 320, ExtendedColorType::Rgba8)
         .unwrap();
     result
 }
@@ -413,6 +431,130 @@ async fn image_bindings_validate_bytes_and_are_revocable() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body(&bytes)["items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn thumbnail_reads_are_scoped_and_preserve_original_media_bytes() {
+    let state = AppState::development_with_password("test-password");
+    let project_id = project(&state).await;
+    let other_project = project(&state).await;
+    let app = router(state.clone());
+    let (cookie, csrf) = login(&app, "demo@localhost", "test-password").await;
+    let cases = [
+        (alpha_wide_png(), "image/png", (320, 160)),
+        (jpeg(), "image/jpeg", (2, 2)),
+        (webp(), "image/webp", (2, 2)),
+    ];
+    let mut first_binding_id = None;
+
+    for (source, media_type, dimensions) in cases {
+        let key = attachment(&state, project_id, source.clone(), "text/plain", true).await;
+        let (status, _, bytes) = call(
+            &app,
+            "POST",
+            &base(project_id),
+            Some(&cookie),
+            Some(&csrf),
+            key,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{}", body(&bytes));
+        let binding_id = body(&bytes)["binding_id"].as_str().unwrap().to_owned();
+        first_binding_id.get_or_insert_with(|| binding_id.clone());
+
+        let (status, headers, preview) = call(
+            &app,
+            "GET",
+            &thumbnail(project_id, &binding_id),
+            Some(&cookie),
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "image/png");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            image::guess_format(&preview).unwrap(),
+            image::ImageFormat::Png
+        );
+        let preview = image::load_from_memory(&preview).unwrap().into_rgba8();
+        assert_eq!(preview.dimensions(), dimensions);
+        if media_type == "image/png" {
+            assert_eq!(preview.get_pixel(0, 0).0[3], 96);
+        }
+
+        let (status, headers, original) = call(
+            &app,
+            "GET",
+            &detail(project_id, &binding_id, true),
+            Some(&cookie),
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], media_type);
+        assert_eq!(original, source);
+    }
+
+    let binding_id = first_binding_id.unwrap();
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        &thumbnail(project_id, &binding_id),
+        None,
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        &thumbnail(other_project, &binding_id),
+        Some(&cookie),
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let foreign_tenant = Uuid::new_v4();
+    let foreign_tenant_uri = format!(
+        "/api/v1/projects/{project_id}/content-media/bindings/{binding_id}/thumbnail?tenant_id={foreign_tenant}"
+    );
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        &foreign_tenant_uri,
+        Some(&cookie),
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _, bytes) = call(
+        &app,
+        "DELETE",
+        &detail(project_id, &binding_id, false),
+        Some(&cookie),
+        Some(&csrf),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        &thumbnail(project_id, &binding_id),
+        Some(&cookie),
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{}", body(&bytes));
 }
 
 #[tokio::test]

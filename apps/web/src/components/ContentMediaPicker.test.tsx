@@ -22,7 +22,7 @@ vi.mock("../api/contentMedia", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api/contentMedia")>()),
   bindContentMedia: bind,
   listContentMedia: list,
-  readContentMediaBytes: read,
+  readContentMediaThumbnail: read,
 }));
 
 const key = {
@@ -61,8 +61,12 @@ describe("content media picker", () => {
         revokeObjectURL: revoke,
       }),
     );
-    const second = { ...binding, binding_id: "binding-2" };
-    list.mockResolvedValue({ items: [binding, second], next_cursor: null });
+    const jpegBinding = {
+      ...binding,
+      image: { ...binding.image, media_type: "image/jpeg" },
+    };
+    const second = { ...jpegBinding, binding_id: "binding-2" };
+    list.mockResolvedValue({ items: [jpegBinding, second], next_cursor: null });
     read.mockImplementation(
       async () => new Blob(["image"], { type: "image/png" }),
     );
@@ -105,6 +109,11 @@ describe("content media picker", () => {
     view.unmount();
     expect(revoke).toHaveBeenCalledWith("blob:first-image");
     expect(revoke).toHaveBeenCalledWith("blob:second-image");
+    expect(
+      read.mock.calls.every(
+        ([, , , signal]) => (signal as AbortSignal).aborted,
+      ),
+    ).toBe(true);
   });
 
   it("locks file, metadata and existing selection until the uploaded object is bound", async () => {

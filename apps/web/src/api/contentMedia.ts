@@ -122,6 +122,20 @@ export function readContentMediaBytes(
   });
 }
 
+/** Read the bounded PNG derivative used by authenticated media-list previews. */
+export function readContentMediaThumbnail(
+  tenantId: string,
+  projectId: string,
+  bindingId: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  return apiFetchBlob(`${bindingPath(projectId, bindingId)}/thumbnail`, {
+    ...scope(tenantId, projectId),
+    signal,
+    accept: "image/png",
+  });
+}
+
 export function withdrawContentMedia(
   tenantId: string,
   projectId: string,

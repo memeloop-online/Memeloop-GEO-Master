@@ -890,6 +890,12 @@ async function verifyGeneratedRichContent(
       (await input.locator("figcaption").textContent()) === caption,
     "Editor image did not render the authenticated two-by-two PNG",
   );
+  const thumbnailResponse = page.waitForResponse(
+    (response) =>
+      /\/content-media\/bindings\/[^/]+\/thumbnail$/.test(
+        new URL(response.url()).pathname,
+      ) && response.request().method() === "GET",
+  );
   await page.getByRole("button", { name: "插入图片" }).click();
   const existingImage = picker.getByRole("button", {
     name: /image\/png.*2.*2/,
@@ -898,6 +904,21 @@ async function verifyGeneratedRichContent(
   await picker
     .locator(".content-media-thumbnail img")
     .evaluate((image) => image.decode());
+  const thumbnail = await thumbnailResponse;
+  assert(
+    thumbnail.ok() &&
+      thumbnail.headers()["content-type"] === "image/png" &&
+      thumbnail.headers()["cache-control"] === "no-store",
+    "Media picker did not use the authenticated PNG thumbnail endpoint",
+  );
+  assert(
+    (
+      await picker
+        .locator(".content-media-thumbnail img")
+        .evaluate((image) => [image.naturalWidth, image.naturalHeight])
+    ).join("x") === "2x2",
+    "Media thumbnail unexpectedly upscaled the source image",
+  );
   await screenshot(page, runDir, "content-media-picker-desktop", {
     width: 1440,
     height: 900,

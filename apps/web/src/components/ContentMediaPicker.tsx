@@ -9,7 +9,7 @@ import {
   bindContentMedia,
   listContentMedia,
   mediaKeyFromAttachment,
-  readContentMediaBytes,
+  readContentMediaThumbnail,
   type ContentMediaBinding,
   type MediaReference,
 } from "../api/contentMedia";
@@ -65,18 +65,13 @@ function MediaThumbnail({
     let objectUrl: string | null = null;
     void (async () => {
       try {
-        const blob = await readContentMediaBytes(
+        const blob = await readContentMediaThumbnail(
           tenantId,
           projectId,
           binding.binding_id,
           controller.signal,
         );
-        if (
-          !["image/png", "image/jpeg", "image/webp"].includes(blob.type) ||
-          blob.type !== binding.image.media_type ||
-          controller.signal.aborted
-        )
-          return;
+        if (blob.type !== "image/png" || controller.signal.aborted) return;
         objectUrl = URL.createObjectURL(blob);
         setUrl(objectUrl);
       } catch {
@@ -87,13 +82,7 @@ function MediaThumbnail({
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [
-    binding.binding_id,
-    binding.image.media_type,
-    projectId,
-    tenantId,
-    visible,
-  ]);
+  }, [binding.binding_id, projectId, tenantId, visible]);
   return (
     <span
       ref={setElement}
