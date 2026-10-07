@@ -81,7 +81,15 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install pinned browser for isolated connector tests
-        run: pnpm --filter @memeloop-geo/browser-runner exec playwright install --with-deps chromium
+        timeout-minutes: 8
+        run: |
+          # The hosted runner's preferred Azure HTTP mirror can stall APT even
+          # after the official HTTPS archive has answered successfully.
+          # Keep signed Ubuntu packages; change only that mirror preference.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          pnpm --filter @memeloop-geo/browser-runner exec playwright install --with-deps chromium
 
       - name: Build generated MemeLoop bundle
         shell: bash
