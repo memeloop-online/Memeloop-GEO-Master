@@ -12,6 +12,8 @@ import {
   UnauthorizedState,
 } from "../components/AsyncState";
 import { WorkspacePage } from "./WorkspacePage";
+import { useTranslation } from "react-i18next";
+import "../i18n";
 
 export function SetupEntry() {
   const { session } = useAuth();
@@ -46,6 +48,7 @@ interface PendingEntry {
 }
 
 function ChatFirstProjectEntry({ tenantId }: { tenantId: string }) {
+  const { t } = useTranslation();
   const { session } = useAuth();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -129,12 +132,12 @@ function ChatFirstProjectEntry({ tenantId }: { tenantId: string }) {
     <main className="workspace-page">
       {failed ? (
         <ErrorState
-          title="暂时无法打开项目对话"
-          detail="重试会继续打开同一个项目，不会重新创建项目或启动付费任务。"
+          title={t("entryState.conversationUnavailable")}
+          detail={t("entryState.retryHint")}
           onRetry={() => void enter()}
         />
       ) : (
-        <LoadingState label="正在准备项目对话，无需填写表单…" />
+        <LoadingState label={t("entryState.openingConversation")} />
       )}
     </main>
   );

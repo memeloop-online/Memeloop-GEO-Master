@@ -733,7 +733,7 @@ async function firstPartyLogin(config, interactive) {
   await page.getByRole("textbox", { name: "密码" }).fill(config.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await page
-    .getByRole("heading", { name: "选择客户工作区" })
+    .getByRole("heading", { name: "选择工作区", exact: true })
     .waitFor({ timeout: 20000 });
   const cookies = await context.cookies(webUrl);
   requireSecureCookie(cookies);

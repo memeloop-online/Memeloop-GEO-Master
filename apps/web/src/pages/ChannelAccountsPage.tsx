@@ -14,7 +14,8 @@ import {
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import "../i18n";
+import "../i18n/accounts";
+import i18n from "../i18n";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor } from "../auth/types";
 import { ApiError } from "../api/client";
@@ -61,14 +62,11 @@ import "./ChannelAccountsPage.css";
 
 type View = "channels" | "connect" | "settings";
 const terminalPhases = new Set(["connected", "cancelled", "expired", "failed"]);
-const accountState: Record<ChannelAccount["status"], string> = {
-  needs_login: "需要登录",
-  unverified: "等待身份验证",
-  ready: "已连接",
-  disabled: "已停用",
-  expired: "登录已失效",
-};
-const connectorState: Record<ConnectorAvailability, string> = {
+const accountState = (status: ChannelAccount["status"]) =>
+  i18n.t(`account.state.${status}`);
+const connectorState = (availability: ConnectorAvailability) =>
+  i18n.t(`account.connector.${availability}`);
+const operatorConnectorState: Record<ConnectorAvailability, string> = {
   unavailable: "未实测可用",
   disabled: "运营方已停用",
   version_mismatch: "连接器版本未验证",
@@ -78,7 +76,7 @@ const connectorState: Record<ConnectorAvailability, string> = {
 
 function publicationFormatLabel(format: string) {
   return format === "plain_text_article.v1"
-    ? "纯文本文章（标题与正文）"
+    ? i18n.t("account.connector.article")
     : format;
 }
 
@@ -165,7 +163,7 @@ function ConnectorCapabilityRow({
         <Badge
           color={item.availability === "available" ? "success" : "warning"}
         >
-          {connectorState[item.availability]}
+          {operatorConnectorState[item.availability]}
         </Badge>
       </div>
       <p>
@@ -219,7 +217,9 @@ function ConnectorCapabilityRow({
 }
 
 function errorText(error: unknown) {
-  return error instanceof Error ? error.message : "操作失败，请重试。";
+  return error instanceof Error
+    ? error.message
+    : i18n.t("account.operationFailed");
 }
 
 function RemoteLogin({
@@ -332,15 +332,17 @@ function RemoteLogin({
 
   const ended = screen && terminalPhases.has(screen.phase);
   return (
-    <Card className="channel-login" aria-label="远程登录">
+    <Card className="channel-login" aria-label={t("account.remote.title")}>
       <div className="channel-row">
-        <h2>远程登录</h2>
+        <h2>{t("account.remote.title")}</h2>
         <Button onClick={() => void cancel()} disabled={busy}>
-          取消并关闭
+          {t("account.remote.cancel")}
         </Button>
       </div>
-      <p>在下方远程页面完成平台登录。识别到账号身份后会自动保存连接。</p>
-      {snapshot.isPending && <LoadingState label="正在启动远程浏览器" />}
+      <p>{t("account.remote.help")}</p>
+      {snapshot.isPending && (
+        <LoadingState label={t("account.remote.launching")} />
+      )}
       {snapshot.isError && (
         <ErrorState
           detail={errorText(snapshot.error)}
@@ -356,37 +358,54 @@ function RemoteLogin({
               })}
             </Badge>
             {snapshot.isFetching && (
-              <Spinner size="tiny" label="正在确认登录状态" />
+              <Spinner size="tiny" label={t("account.remote.checking")} />
             )}
           </div>
           <RemoteDesktop authorize={authorize} active={!ended && !busy} />
           {screen.identity && (
             <p>
-              检测到账号：
-              {screen.identity.display_name ??
-                screen.identity.platform_account_id ??
-                "待核验"}
+              {t("account.remote.identity", {
+                name:
+                  screen.identity.display_name ??
+                  screen.identity.platform_account_id ??
+                  t("account.remote.pendingIdentity"),
+              })}
             </p>
           )}
           <div className="channel-row">
             {screen.identity && !ended && (
-              <span>{busy ? "正在验证并保存连接…" : "身份已识别。"}</span>
+              <span>
+                {t(
+                  busy ? "account.remote.saving" : "account.remote.identified",
+                )}
+              </span>
             )}
             {screen.identity && error && !ended && (
               <Button disabled={busy} onClick={() => void finish()}>
-                重试保存连接
+                {t("account.remote.retrySave")}
               </Button>
             )}
-            {ended && <span>登录会话已结束。请关闭后重新连接。</span>}
+            {ended && (
+              <span>
+                {t(
+                  screen.phase === "connected"
+                    ? "account.remote.connected"
+                    : "account.remote.ended",
+                )}
+              </span>
+            )}
           </div>
         </>
       )}
-      {error && <ErrorState title="远程登录操作未完成" detail={error} />}
+      {error && (
+        <ErrorState title={t("account.remote.failed")} detail={error} />
+      )}
     </Card>
   );
 }
 
 export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
+  const { t } = useTranslation();
   const { tenantId, projectId } = useParams();
   const navigate = useNavigate();
   const { session } = useAuth();
@@ -514,7 +533,8 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
   const platformName = (id: ChannelPlatformId) =>
     platforms.data?.items.find((item) => item.id === id)?.label ?? id;
   const groupNameFor = (id: string | null) =>
-    groups.data?.items.find((item) => item.group_id === id)?.name ?? "未分组";
+    groups.data?.items.find((item) => item.group_id === id)?.name ??
+    t("account.channels.ungrouped");
   function closeLogin() {
     const completedSession = activeSession;
     setActiveSession(null);
@@ -531,31 +551,41 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
       <section className="page-hero">
         <div>
           <p className="eyebrow">
-            {view === "settings" ? "P16 · 项目设置" : "P10—P11 · 账号与资源"}
+            {t(
+              view === "settings"
+                ? "account.channels.settingsEyebrow"
+                : "account.channels.eyebrow",
+            )}
           </p>
-          <h1>{view === "settings" ? "项目设置与渠道账号" : "渠道账号"}</h1>
-          <p>
-            连接自有发布账号与网页测量账号，设置分组及可选网络出口。连接状态来自服务端验证。
-          </p>
+          <h1>
+            {t(
+              view === "settings"
+                ? "account.channels.settingsTitle"
+                : "account.channels.title",
+            )}
+          </h1>
+          <p>{t("account.channels.description")}</p>
         </div>
         {view !== "connect" && (
           <Button
             onClick={() => navigate("../channels/connect")}
             appearance="primary"
           >
-            接入账号
+            {t("account.channels.connect")}
           </Button>
         )}
       </section>
       {view === "settings" && (
         <MessageBar intent="info">
           <MessageBarBody>
-            此处管理项目渠道连接；其他项目基本配置仍在项目启动向导中。{" "}
-            <Link to="../setup">查看项目配置</Link>
+            {t("account.channels.settingsNote")}{" "}
+            <Link to="../setup">{t("account.channels.viewSetup")}</Link>
           </MessageBarBody>
         </MessageBar>
       )}
-      {error && <ErrorState title="操作未完成" detail={error} />}
+      {error && (
+        <ErrorState title={t("account.channels.failed")} detail={error} />
+      )}
       {notice && (
         <MessageBar intent="success">
           <MessageBarBody>{notice}</MessageBarBody>
@@ -570,19 +600,23 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
           onClose={closeLogin}
           onDone={() => {
             closeLogin();
-            setNotice("已验证账号身份并保存连接。");
+            setNotice(t("account.channels.connected"));
           }}
         />
       )}
       <div className="channel-layout">
-        <section className="channel-stack" aria-label="账号连接">
+        <section
+          className="channel-stack"
+          aria-label={t("account.channels.connectionSection")}
+        >
           <Card className="channel-card">
-            <h2>接入账号</h2>
-            <p>
-              选择平台后启动远程登录。会话凭据保存在服务端，不会写入浏览器存储。
-            </p>
+            <h2>{t("account.channels.connect")}</h2>
+            <p>{t("account.channels.connectionHelp")}</p>
             {platforms.isPending ? (
-              <LoadingState label="正在加载支持的平台" compact />
+              <LoadingState
+                label={t("account.channels.loadingPlatforms")}
+                compact
+              />
             ) : platforms.isError ? (
               <ErrorState
                 detail={errorText(platforms.error)}
@@ -590,7 +624,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
               />
             ) : (
               <div className="channel-form">
-                <Field label="平台">
+                <Field label={t("account.channels.platform")}>
                   <Select
                     value={platform}
                     onChange={(event) =>
@@ -604,19 +638,21 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                         disabled={!item.login_supported}
                       >
                         {item.label} ·{" "}
-                        {item.purpose === "measurement"
-                          ? "网页测量"
-                          : "自有账号发布"}
+                        {t(
+                          item.purpose === "measurement"
+                            ? "account.channels.measurement"
+                            : "account.channels.publishing",
+                        )}
                       </option>
                     ))}
                   </Select>
                 </Field>
-                <Field label="资源组">
+                <Field label={t("account.channels.group")}>
                   <Select
                     value={selectedGroup}
                     onChange={(event) => setSelectedGroup(event.target.value)}
                   >
-                    <option value="">未分组</option>
+                    <option value="">{t("account.channels.ungrouped")}</option>
                     {groups.data?.items.map((group) => (
                       <option key={group.group_id} value={group.group_id}>
                         {group.name}
@@ -625,23 +661,23 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                   </Select>
                 </Field>
                 <details className="channel-proxy">
-                  <summary>可选：指定网络代理</summary>
-                  <p>指定代理不可用时不会静默直连。凭据不会回显。</p>
-                  <Field label="代理地址（HTTP CONNECT / SOCKS5）">
+                  <summary>{t("account.channels.proxyOptional")}</summary>
+                  <p>{t("account.channels.proxyHelp")}</p>
+                  <Field label={t("account.channels.proxyAddressType")}>
                     <Input
                       value={proxyServer}
                       onChange={(_, data) => setProxyServer(data.value)}
                       placeholder="socks5://host:port"
                     />
                   </Field>
-                  <Field label="用户名（可选）">
+                  <Field label={t("account.channels.usernameOptional")}>
                     <Input
                       value={proxyUsername}
                       onChange={(_, data) => setProxyUsername(data.value)}
                       autoComplete="off"
                     />
                   </Field>
-                  <Field label="密码（可选）">
+                  <Field label={t("account.channels.passwordOptional")}>
                     <Input
                       type="password"
                       value={proxyPassword}
@@ -660,16 +696,16 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                   }
                   onClick={() => void connect()}
                 >
-                  启动远程登录
+                  {t("account.channels.startLogin")}
                 </Button>
               </div>
             )}
           </Card>
           <Card className="channel-card">
-            <h2>资源组</h2>
-            <p>将多个账号归在同一组；分组不会改变登录流程或自动重复发布。</p>
+            <h2>{t("account.channels.group")}</h2>
+            <p>{t("account.channels.groupsHelp")}</p>
             <div className="channel-row">
-              <Field label="新建资源组">
+              <Field label={t("account.channels.newGroup")}>
                 <Input
                   value={groupName}
                   maxLength={80}
@@ -683,17 +719,20 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                   void run(
                     () =>
                       createChannelGroup(tenantId, projectId, groupName.trim()),
-                    "资源组已创建。",
+                    t("account.channels.groupCreated"),
                   ).then((saved) => {
                     if (saved) setGroupName("");
                   });
                 }}
               >
-                创建
+                {t("account.channels.create")}
               </Button>
             </div>
             {groups.isPending && (
-              <LoadingState label="正在加载资源组" compact />
+              <LoadingState
+                label={t("account.channels.groupsLoading")}
+                compact
+              />
             )}
             {groups.isError && (
               <ErrorState
@@ -702,7 +741,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
               />
             )}
             {groups.data?.items.length === 0 && (
-              <p>尚无资源组，账号可先保持未分组。</p>
+              <p>{t("account.channels.groupsEmpty")}</p>
             )}
             <ul className="channel-groups">
               {groups.data?.items.map((group) => (
@@ -710,7 +749,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                   {editingGroup === group.group_id ? (
                     <>
                       <Input
-                        aria-label="资源组名称"
+                        aria-label={t("account.channels.groupName")}
                         value={editingName}
                         maxLength={80}
                         onChange={(_, data) => setEditingName(data.value)}
@@ -727,16 +766,16 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                                 group.group_id,
                                 editingName.trim(),
                               ),
-                            "资源组已更新。",
+                            t("account.channels.groupUpdated"),
                           ).then((saved) => {
                             if (saved) setEditingGroup(null);
                           });
                         }}
                       >
-                        保存
+                        {t("account.channels.save")}
                       </Button>
                       <Button onClick={() => setEditingGroup(null)}>
-                        取消
+                        {t("account.channels.cancel")}
                       </Button>
                     </>
                   ) : (
@@ -749,11 +788,11 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                           setEditingName(group.name);
                         }}
                       >
-                        重命名
+                        {t("account.channels.rename")}
                       </Button>
                       {deletingGroup === group.group_id ? (
                         <>
-                          <span>确定删除此组？组内账号需先移出。</span>
+                          <span>{t("account.channels.deleteConfirm")}</span>
                           <Button
                             size="small"
                             disabled={busy}
@@ -766,7 +805,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                                     projectId,
                                     group.group_id,
                                   ),
-                                "资源组已删除。",
+                                t("account.channels.groupDeleted"),
                               ).then((saved) => {
                                 if (saved) {
                                   if (selectedGroup === group.group_id)
@@ -776,13 +815,13 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                               });
                             }}
                           >
-                            确认删除
+                            {t("account.channels.confirmDelete")}
                           </Button>
                           <Button
                             size="small"
                             onClick={() => setDeletingGroup(null)}
                           >
-                            取消
+                            {t("account.channels.cancel")}
                           </Button>
                         </>
                       ) : (
@@ -790,7 +829,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                           size="small"
                           onClick={() => setDeletingGroup(group.group_id)}
                         >
-                          删除组
+                          {t("account.channels.deleteGroup")}
                         </Button>
                       )}
                     </>
@@ -800,18 +839,23 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
             </ul>
           </Card>
         </section>
-        <section className="channel-stack" aria-label="已接入账号">
+        <section
+          className="channel-stack"
+          aria-label={t("account.channels.accountsSection")}
+        >
           <Card className="channel-card">
             <div className="channel-row">
-              <h2>项目账号</h2>
+              <h2>{t("account.channels.projectAccounts")}</h2>
               <Button
                 disabled={accounts.isFetching}
                 onClick={() => void accounts.refetch()}
               >
-                刷新状态
+                {t("account.channels.refresh")}
               </Button>
             </div>
-            {accounts.isPending && <LoadingState label="正在加载账号" />}
+            {accounts.isPending && (
+              <LoadingState label={t("account.channels.accountsLoading")} />
+            )}
             {accounts.isError && (
               <ErrorState
                 detail={errorText(accounts.error)}
@@ -820,8 +864,8 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
             )}
             {accounts.data?.items.length === 0 && (
               <EmptyState
-                title="尚未连接账号"
-                detail="选择平台并完成远程登录后，经过身份验证的账号会出现在这里。"
+                title={t("account.channels.accountsEmpty")}
+                detail={t("account.channels.accountsEmptyDetail")}
               />
             )}
             <ul className="channel-accounts">
@@ -829,36 +873,39 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                 <li key={account.account_id}>
                   <div className="channel-row">
                     <div>
-                      <h3>{account.display_name ?? "未识别账号"}</h3>
+                      <h3>
+                        {account.display_name ??
+                          t("account.channels.unidentified")}
+                      </h3>
                       <p>
                         {platformName(account.platform)} ·{" "}
                         {account.owner_kind === "operator_pool"
-                          ? "总部资源池"
+                          ? t("account.channels.operatorGroup")
                           : groupNameFor(account.group_id)}
                       </p>
                     </div>
                     <Badge appearance="tint">
                       {account.owner_kind === "operator_pool"
-                        ? "总部共享"
-                        : "自有账号"}
+                        ? t("account.channels.operatorShared")
+                        : t("account.channels.ownAccount")}
                     </Badge>
                     <Badge
                       color={account.status === "ready" ? "success" : "warning"}
                     >
-                      {accountState[account.status]}
+                      {accountState(account.status)}
                     </Badge>
                   </div>
                   {account.owner_kind === "operator_pool" ? (
-                    <p>
-                      由总部管理登录和网络出口；本项目只使用已分配的共享资源。
-                    </p>
+                    <p>{t("account.channels.sharedHelp")}</p>
                   ) : (
                     <>
                       <p>
-                        网络：
-                        {account.proxy_configured
-                          ? (account.proxy_server ?? "已配置专用代理")
-                          : "默认出口"}
+                        {t("account.channels.network", {
+                          name: account.proxy_configured
+                            ? (account.proxy_server ??
+                              t("account.channels.dedicatedProxy"))
+                            : t("account.channels.defaultNetwork"),
+                        })}
                       </p>
                       <div className="channel-row">
                         <Button
@@ -866,8 +913,8 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                           onClick={() => void connect(account.account_id)}
                         >
                           {account.status === "ready"
-                            ? "重新连接"
-                            : "登录并验证"}
+                            ? t("account.channels.reconnect")
+                            : t("account.channels.loginVerify")}
                         </Button>
                         <Button
                           disabled={busy}
@@ -879,7 +926,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                             )
                           }
                         >
-                          配置
+                          {t("account.channels.configure")}
                         </Button>
                       </div>
                     </>
@@ -887,7 +934,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                   {account.owner_kind !== "operator_pool" &&
                     activeAccount?.account_id === account.account_id && (
                       <div className="channel-account-editor">
-                        <Field label="资源组">
+                        <Field label={t("account.channels.group")}>
                           <Select
                             value={account.group_id ?? ""}
                             onChange={(event) => {
@@ -900,11 +947,13 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                                     account.account_id,
                                     { group_id: event.target.value || null },
                                   ),
-                                "账号分组已更新。",
+                                t("account.channels.accountGroupUpdated"),
                               );
                             }}
                           >
-                            <option value="">未分组</option>
+                            <option value="">
+                              {t("account.channels.ungrouped")}
+                            </option>
                             {groups.data?.items.map((group) => (
                               <option
                                 key={group.group_id}
@@ -916,7 +965,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                           </Select>
                         </Field>
                         <Checkbox
-                          label="允许项目使用"
+                          label={t("account.channels.allowProject")}
                           checked={account.enabled}
                           disabled={busy}
                           onChange={(_, data) => {
@@ -929,20 +978,20 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                                   account.account_id,
                                   { enabled: Boolean(data.checked) },
                                 ),
-                              "账号使用状态已更新。",
+                              t("account.channels.usageUpdated"),
                             );
                           }}
                         />
                         <details className="channel-proxy">
-                          <summary>更改此账号代理</summary>
-                          <p>提交新代理会替换原配置。密码不会回显。</p>
-                          <Field label="代理地址">
+                          <summary>{t("account.channels.changeProxy")}</summary>
+                          <p>{t("account.channels.changeProxyHelp")}</p>
+                          <Field label={t("account.channels.proxyAddress")}>
                             <Input
                               value={proxyServer}
                               onChange={(_, data) => setProxyServer(data.value)}
                             />
                           </Field>
-                          <Field label="用户名">
+                          <Field label={t("account.channels.username")}>
                             <Input
                               value={proxyUsername}
                               onChange={(_, data) =>
@@ -951,7 +1000,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                               autoComplete="off"
                             />
                           </Field>
-                          <Field label="密码">
+                          <Field label={t("account.channels.password")}>
                             <Input
                               type="password"
                               value={proxyPassword}
@@ -973,7 +1022,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                                     account.account_id,
                                     { proxy: proxyInput() },
                                   ),
-                                "网络代理已更新。",
+                                t("account.channels.proxyUpdated"),
                               ).finally(() => {
                                 setProxyPassword("");
                                 setProxyUsername("");
@@ -981,7 +1030,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                               });
                             }}
                           >
-                            保存代理
+                            {t("account.channels.saveProxy")}
                           </Button>
                           {account.proxy_configured && (
                             <Button
@@ -996,11 +1045,11 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                                       account.account_id,
                                       { proxy: null },
                                     ),
-                                  "已恢复默认网络出口。",
+                                  t("account.channels.defaultRestored"),
                                 );
                               }}
                             >
-                              移除账号代理
+                              {t("account.channels.removeProxy")}
                             </Button>
                           )}
                         </details>
@@ -1013,21 +1062,19 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
         </section>
       </div>
       {view === "channels" && (
-        <section aria-label="项目发布连接器能力">
+        <section aria-label={t("account.connector.section")}>
           <Card className="channel-card">
-            <h2>项目发布连接器能力</h2>
-            <p>
-              账号已连接只代表登录身份有效；发布能力需独立完成真实发布与公开读回验证，并由运营方启用。
-            </p>
+            <h2>{t("account.connector.section")}</h2>
+            <p>{t("account.connector.description")}</p>
             {capabilities.isPending && (
-              <LoadingState label="正在加载连接器能力" />
+              <LoadingState label={t("account.connector.loading")} />
             )}
             {capabilities.isError &&
               (capabilities.error instanceof ApiError &&
               capabilities.error.status === 403 ? (
                 <ErrorState
-                  title="权限不足"
-                  detail="无权查看此项目的连接器能力。"
+                  title={t("account.channels.permissionDenied")}
+                  detail={t("account.connector.forbidden")}
                 />
               ) : (
                 <ErrorState
@@ -1037,8 +1084,8 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
               ))}
             {capabilities.data?.items.length === 0 && (
               <EmptyState
-                title="尚无连接器能力"
-                detail="尚未发现可核验的平台连接器；账号登录不会自动开放发布。"
+                title={t("account.connector.empty")}
+                detail={t("account.connector.emptyDetail")}
               />
             )}
             <ul className="channel-accounts">
@@ -1055,16 +1102,19 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                           : "warning"
                       }
                     >
-                      {connectorState[item.availability]}
+                      {connectorState(item.availability)}
                     </Badge>
                   </div>
                   <p>
                     {item.availability === "available"
-                      ? `当前可用发布格式：${item.content_types.map(publicationFormatLabel).join("、") || "无"}。`
-                      : "当前没有可确认的发布内容类型；已有账号或旧配置不构成验证。"}
-                  </p>
-                  <p>
-                    此处只读；项目账号或共享账号的连接状态不代表该平台已可发布。
+                      ? t("account.connector.formats", {
+                          formats:
+                            item.content_types
+                              .map(publicationFormatLabel)
+                              .join(t("account.connector.separator")) ||
+                            t("account.connector.none"),
+                        })
+                      : t("account.connector.unavailableDetail")}
                   </p>
                 </li>
               ))}
@@ -1073,10 +1123,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
         </section>
       )}
       <MessageBar intent="info">
-        <MessageBarBody>
-          Kimi 网页登录用于独立搜索测量；Kimi Code 的编码 OAuth
-          属于不同能力，当前不在此处连接。
-        </MessageBarBody>
+        <MessageBarBody>{t("account.channels.webLoginNote")}</MessageBarBody>
       </MessageBar>
     </div>
   );
@@ -1453,7 +1500,7 @@ export function OperatorAccountsPage() {
                     <Badge
                       color={account.status === "ready" ? "success" : "warning"}
                     >
-                      {accountState[account.status]}
+                      {accountState(account.status)}
                     </Badge>
                   </div>
                   <div className="channel-row">

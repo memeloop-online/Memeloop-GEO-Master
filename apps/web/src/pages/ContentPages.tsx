@@ -258,8 +258,15 @@ function AssetsContent({
   if (!cycle.data)
     return (
       <EmptyState
-        title="尚无当前周期"
-        detail="项目启动后才会形成文档清单；内容资产不会由演示数据代替。"
+        title={t("entryState.emptyContent")}
+        detail={t("entryState.emptyContentHint")}
+        action={
+          <Link
+            to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat`}
+          >
+            {t("entryState.openWorkbench")}
+          </Link>
+        }
       />
     );
   if (requestedCycleId && requestedCycleId !== cycle.data.cycle_id)

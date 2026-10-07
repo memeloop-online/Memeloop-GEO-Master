@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "../auth/AuthProvider";
+import i18n from "../i18n";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
 import {
   assignPoolAccount,
@@ -304,6 +305,7 @@ function renderOperator() {
 }
 
 afterEach(() => {
+  void i18n.changeLanguage("zh-CN");
   desktopConnections.length = 0;
   vi.unstubAllGlobals();
   setCsrfToken(undefined);
@@ -416,11 +418,10 @@ describe("account page", () => {
     const { requests } = mockApi([account]);
     renderPage();
     expect(await screen.findByText("已识别账号")).toBeTruthy();
-    const section = await screen.findByLabelText("项目发布连接器能力");
-    expect(within(section).getByText("未实测可用")).toBeTruthy();
-    expect(
-      within(section).getByText(/账号已连接只代表登录身份有效/),
-    ).toBeTruthy();
+    const section = await screen.findByLabelText("发布可用性");
+    expect(within(section).getByText("暂不可用")).toBeTruthy();
+    expect(within(section).getByText("暂不支持发布。")).toBeTruthy();
+    expect(within(section).getByText(/账号已连接不代表可以发布/)).toBeTruthy();
     expect(within(section).queryByRole("checkbox")).toBeNull();
     expect(
       requests.some((entry) =>
@@ -440,9 +441,24 @@ describe("account page", () => {
         : original(request, init),
     );
     renderPage();
-    const section = await screen.findByLabelText("项目发布连接器能力");
+    const section = await screen.findByLabelText("发布可用性");
     expect(await within(section).findByText("权限不足")).toBeTruthy();
-    expect(within(section).queryByText("已验证可用")).toBeNull();
+    expect(within(section).queryByText("可用")).toBeNull();
+  });
+
+  it("shows a supported format only when publishing is available", async () => {
+    mockApi([account], false, {
+      ...verifiedCapability,
+      availability: "available",
+      content_types: ["plain_text_article.v1"],
+    });
+    renderPage();
+    const section = await screen.findByLabelText("发布可用性");
+    expect(await within(section).findByText("可用")).toBeInTheDocument();
+    expect(
+      within(section).getByText("支持格式：纯文本文章（标题与正文）。"),
+    ).toBeInTheDocument();
+    expect(within(section).queryByText("暂不支持发布。")).toBeNull();
   });
 
   it("shows real loaded accounts and reconnects without changing identity locally", async () => {
@@ -582,7 +598,9 @@ describe("account page", () => {
         ),
       ).toBe(true),
     );
-    expect(await screen.findByText("已验证账号身份并保存连接。")).toBeTruthy();
+    expect(
+      await screen.findByText("账号身份已验证，连接已保存。"),
+    ).toBeTruthy();
     expect(desktopConnections.at(-1)?.disconnect).toHaveBeenCalled();
   });
 
@@ -631,6 +649,83 @@ describe("account page", () => {
       ).toBeUndefined(),
     );
     expect(screen.getByRole("button", { name: "启动远程登录" })).toBeEnabled();
+  });
+
+  it("keeps the Chinese customer settings copy free of work-package labels", async () => {
+    mockApi([account]);
+    renderPage("settings");
+    expect(
+      await screen.findByRole("heading", { name: "项目设置与渠道账号" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("项目设置")).toBeInTheDocument();
+    expect(screen.queryByText(/P10|P11|P16/)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "接入账号" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("已接入账号")).toBeInTheDocument();
+  });
+
+  it("localizes customer connection, account status, publishing limits and shared remote sign-in", async () => {
+    await i18n.changeLanguage("en");
+    mockApi([{ ...account, status: "expired" }]);
+    renderPage();
+    expect(
+      await screen.findByRole("heading", { name: "Channel accounts" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Accounts & resources")).toBeInTheDocument();
+    expect(await screen.findByText("Sign-in expired")).toBeInTheDocument();
+    const publication = await screen.findByLabelText("Publishing availability");
+    expect(
+      within(publication).getByText("Currently unavailable"),
+    ).toBeInTheDocument();
+    expect(
+      within(publication).getByText(
+        /A connected account does not guarantee publishing/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(publication).getByText("Publishing is not currently available."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/P10|P11|P16/)).toBeNull();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Sign in and verify" }),
+    );
+    const remote = await screen.findByLabelText("Remote sign-in");
+    expect(
+      within(remote).getByRole("button", { name: "Cancel and close" }),
+    ).toBeInTheDocument();
+    expect(
+      within(remote).getByText(/Sign in on the remote page below/),
+    ).toBeInTheDocument();
+    expect(
+      await within(remote).findByRole("group", { name: "Remote browser" }),
+    ).toBeInTheDocument();
+  });
+
+  it("localizes English group creation and the settings page without changing API inputs", async () => {
+    await i18n.changeLanguage("en");
+    const { requests } = mockApi();
+    renderPage("settings");
+    expect(
+      await screen.findByRole("heading", {
+        name: "Project settings and channel accounts",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Project settings")).toBeInTheDocument();
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "New resource group" }),
+      "Content team",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+    expect(
+      await screen.findByText("Resource group created."),
+    ).toBeInTheDocument();
+    expect(
+      requests.find(
+        (entry) =>
+          entry.path.endsWith("/channel-groups") && entry.method === "POST",
+      )?.body,
+    ).toMatchObject({ name: "Content team" });
   });
 });
 

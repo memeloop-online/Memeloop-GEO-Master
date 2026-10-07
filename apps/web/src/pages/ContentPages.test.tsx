@@ -250,6 +250,7 @@ function json(body: unknown, status = 200) {
 }
 
 function mockApi({
+  noCycle = false,
   executionList = [execution],
   itemList = items,
   editStatus = 201,
@@ -268,6 +269,7 @@ function mockApi({
   persistWrites = false,
   editDeferred,
 }: {
+  noCycle?: boolean;
   executionList?: ContentExecution[];
   itemList?: ContentItem[];
   editStatus?: number;
@@ -305,6 +307,8 @@ function mockApi({
       );
     if (path.endsWith("/projects"))
       return Promise.resolve(json({ items: [], next_cursor: null }));
+    if (noCycle && path.endsWith("/projects/project-1/cycles/current"))
+      return Promise.resolve(json({ error: "not_found" }, 404));
     if (path.endsWith("/projects/project-1/cycles/current"))
       return Promise.resolve(
         json({
@@ -567,6 +571,15 @@ afterEach(() => {
 });
 
 describe("P08 content assets", () => {
+  it("offers the project AI workspace when no content cycle exists", async () => {
+    mockApi({ noCycle: true });
+    renderPage("/app/tenant-1/project-1/content");
+    expect(await screen.findByText("还没有内容资产")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "前往 AI 工作台" }),
+    ).toHaveAttribute("href", "/app/tenant-1/project-1/chat");
+    expect(screen.queryByText(/演示数据|尚无当前周期/)).not.toBeInTheDocument();
+  });
   it("separates current-cycle coverage from a reused checked source", async () => {
     mockApi({ itemList: [reusedItem, items[1]] });
     renderPage("/app/tenant-1/project-1/content");

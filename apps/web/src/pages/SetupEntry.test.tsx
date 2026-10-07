@@ -7,6 +7,7 @@ import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { SetupEntry } from "./SetupEntry";
 import { createProject } from "../api/projects";
 import { createAgentConversation } from "../api/agent";
+import i18n from "../i18n";
 
 const session = {
   user: { id: "entry-user" },
@@ -44,7 +45,8 @@ function renderEntry(tenant = "entry-tenant") {
     </StrictMode>,
   );
 }
-beforeEach(() => {
+beforeEach(async () => {
+  await i18n.changeLanguage("zh-CN");
   sessionStorage.clear();
   vi.mocked(createProject).mockResolvedValue({ id: "draft-project" } as Awaited<
     ReturnType<typeof createProject>
@@ -56,6 +58,18 @@ beforeEach(() => {
 afterEach(() => vi.resetAllMocks());
 
 describe("chat-first project entry", () => {
+  it("offers a concise localized retry message without implementation details", async () => {
+    await i18n.changeLanguage("en");
+    vi.mocked(createProject).mockRejectedValueOnce(
+      new Error("connection lost"),
+    );
+    renderEntry();
+    expect(
+      await screen.findByText("Unable to open the conversation"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByText("Please try again.")).toBeInTheDocument();
+  });
   it("creates only an empty draft without forms, conversations or a turn", async () => {
     renderEntry();
     expect(
@@ -76,7 +90,7 @@ describe("chat-first project entry", () => {
       new Error("connection lost"),
     );
     const first = renderEntry();
-    await screen.findByText("暂时无法打开项目对话");
+    await screen.findByText("暂时无法打开对话");
     const key = vi.mocked(createProject).mock.calls[0][2];
     first.unmount();
     renderEntry();
@@ -94,7 +108,10 @@ describe("chat-first project entry", () => {
       new Error("connection lost"),
     );
     renderEntry();
-    await screen.findByText("暂时无法打开项目对话");
+    await screen.findByText("暂时无法打开对话");
+    expect(
+      screen.queryByText(/启动付费任务|重新创建项目/),
+    ).not.toBeInTheDocument();
     const key = vi.mocked(createProject).mock.calls[0][2];
     const retry = screen.getByRole("button", { name: "重试" });
     fireEvent.click(retry);

@@ -5,6 +5,14 @@ import type { UiLocale } from "../api/appearance";
 export const resources = {
   "zh-CN": {
     translation: {
+      entryState: {
+        conversationUnavailable: "暂时无法打开对话",
+        retryHint: "请重试。",
+        openingConversation: "正在打开对话…",
+        emptyContent: "还没有内容资产",
+        emptyContentHint: "前往 AI 工作台，描述你想创建的内容。",
+        openWorkbench: "前往 AI 工作台",
+      },
       workspace: {
         emptyTitle: "还没有可用工作区",
         emptyDetail: "请联系工作区管理员获取访问权限。",
@@ -301,6 +309,15 @@ export const resources = {
   },
   en: {
     translation: {
+      entryState: {
+        conversationUnavailable: "Unable to open the conversation",
+        retryHint: "Please try again.",
+        openingConversation: "Opening conversation…",
+        emptyContent: "No content yet",
+        emptyContentHint:
+          "Open the AI workspace and describe what you want to create.",
+        openWorkbench: "Open AI workspace",
+      },
       workspace: {
         emptyTitle: "No workspaces available",
         emptyDetail: "Contact a workspace administrator for access.",

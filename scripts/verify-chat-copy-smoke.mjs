@@ -187,7 +187,9 @@ async function main() {
   await page.getByRole("textbox", { name: "用户名" }).fill("demo@localhost");
   await page.getByRole("textbox", { name: "密码" }).fill(password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
-  await page.getByRole("heading", { name: "选择客户工作区" }).waitFor();
+  await page
+    .getByRole("heading", { name: "选择工作区", exact: true })
+    .waitFor();
   await page.getByRole("button", { name: "创建项目" }).first().click();
   await page.waitForURL(/\/app\/[^/]+\/[^/]+\/chat$/);
   await page.getByTestId("agent-workbench-page").waitFor();
