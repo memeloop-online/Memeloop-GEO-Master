@@ -12,6 +12,11 @@ const diagnosticStages = new Set([
   "input_validation",
   "navigation",
   "configuration",
+  "config_model_menu",
+  "config_model_selection",
+  "config_toolkit",
+  "config_search_menu",
+  "config_search_setting",
   "composer",
   "capture",
   "rendered_answer",
@@ -28,6 +33,7 @@ const diagnosticCodes = new Set([
   "cancelled",
   "budget_exhausted",
   "unexpected_exception",
+  "timeout",
 ]);
 const diagnosticRoutes = new Set(["signed_in_browser", "configured_model_api"]);
 

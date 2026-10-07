@@ -334,40 +334,67 @@ export async function inspectKimiMeasurementOptions(page) {
   }
 }
 
-export async function configureKimiSearch(page, model, searchEnabled = true) {
-  const selector = page.getByTestId("model-select-trigger");
-  await selector.click({ timeout: 5_000 });
-  await page.getByTestId("model-option").first().waitFor({
-    state: "visible",
-    timeout: 5_000,
-  });
-  let chosen = null;
-  for (const option of await page.getByTestId("model-option").all()) {
-    if ((await option.getAttribute("data-moon-key")) !== model) continue;
-    if (chosen) return false;
-    chosen = option;
-  }
-  if (!chosen) return "requested_model_unavailable";
-  await chosen.click({ timeout: 5_000 });
-  const toolkit = page.getByTestId("toolkit-trigger-btn");
-  await toolkit.click({ timeout: 5_000 });
-  await page.getByRole("menuitem", { name: "联网搜索" }).click({
-    timeout: 5_000,
-  });
-  const auto = page.getByRole("menuitemradio", {
-    name: searchEnabled ? "自动搜索" : "关闭搜索",
-  });
-  if ((await auto.getAttribute("aria-checked")) !== "true") {
-    await auto.click({ timeout: 5_000 });
-    await page.keyboard.press("Escape");
+export async function configureKimiSearch(
+  page,
+  model,
+  searchEnabled = true,
+  onDiagnostic,
+) {
+  let stage = "config_model_menu";
+  const reportError = (error) =>
+    reportObservationDiagnostic(
+      onDiagnostic,
+      stage,
+      error?.name === "TimeoutError" ? "timeout" : "unexpected_exception",
+    );
+  try {
+    const selector = page.getByTestId("model-select-trigger");
+    await selector.click({ timeout: 5_000 });
+    await page.getByTestId("model-option").first().waitFor({
+      state: "visible",
+      timeout: 5_000,
+    });
+    stage = "config_model_selection";
+    let chosen = null;
+    for (const option of await page.getByTestId("model-option").all()) {
+      if ((await option.getAttribute("data-moon-key")) !== model) continue;
+      if (chosen) return false;
+      chosen = option;
+    }
+    if (!chosen) return "requested_model_unavailable";
+    await chosen.click({ timeout: 5_000 });
+    stage = "config_toolkit";
+    const toolkit = page.getByTestId("toolkit-trigger-btn");
     await toolkit.click({ timeout: 5_000 });
+    stage = "config_search_menu";
     await page.getByRole("menuitem", { name: "联网搜索" }).click({
       timeout: 5_000,
     });
+    stage = "config_search_setting";
+    const auto = page.getByRole("menuitemradio", {
+      name: searchEnabled ? "自动搜索" : "关闭搜索",
+    });
+    if ((await auto.getAttribute("aria-checked")) !== "true") {
+      await auto.click({ timeout: 5_000 });
+      await page.keyboard.press("Escape");
+      stage = "config_toolkit";
+      await toolkit.click({ timeout: 5_000 });
+      stage = "config_search_menu";
+      await page.getByRole("menuitem", { name: "联网搜索" }).click({
+        timeout: 5_000,
+      });
+    }
+    stage = "config_search_setting";
+    const searchOn = await auto.getAttribute("aria-checked").catch((error) => {
+      reportError(error);
+      return null;
+    });
+    await page.keyboard.press("Escape");
+    return searchOn === "true";
+  } catch (error) {
+    reportError(error);
+    throw error;
   }
-  const searchOn = await auto.getAttribute("aria-checked").catch(() => null);
-  await page.keyboard.press("Escape");
-  return searchOn === "true";
 }
 
 /** Browser UI owns the request and cookies; the observer only checks it. */
@@ -423,7 +450,12 @@ export async function observeKimiConnectSearch(
     });
     if (new URL(page.url()).origin !== trustedOrigin) return unverified();
     stage = "configuration";
-    const configured = await configureKimiSearch(page, payload.model);
+    const configured = await configureKimiSearch(
+      page,
+      payload.model,
+      true,
+      onDiagnostic,
+    );
     if (configured !== true)
       return configured === "requested_model_unavailable"
         ? { reason: configured }
@@ -503,7 +535,14 @@ export async function observeKimiConnectSearch(
           ),
           signal,
           configureModel: (parserPage, model) =>
-            configureKimiSearch(parserPage, model, false),
+            configureKimiSearch(parserPage, model, false, (entry) =>
+              reportObservationDiagnostic(
+                onDiagnostic,
+                entry.stage,
+                entry.code,
+                "signed_in_browser",
+              ),
+            ),
         }),
     });
     if (!observation || signal?.aborted) return unverified();

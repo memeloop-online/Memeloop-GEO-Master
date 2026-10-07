@@ -5,6 +5,7 @@ import { chromium } from "playwright";
 import { measureKimi } from "../src/adapters.mjs";
 import {
   matchesKimiChatRequest,
+  configureKimiSearch,
   observeKimiConnectSearch as observeCapturedSearch,
   reduceKimiConnectExchange,
 } from "../src/kimi-connect-search.mjs";
@@ -35,6 +36,122 @@ const frozen = {
   scheduled_at: "2026-01-01T00:00:00Z",
   sample_ordinal: 0,
 };
+
+function configurationPage(failedStage, error, { failReadback = false } = {}) {
+  let reads = 0;
+  const click = (stage) => async (options) => {
+    assert.equal(options.timeout, 5_000);
+    if (failedStage === stage) throw error;
+  };
+  return {
+    goto: async () => {},
+    url: () => "https://www.kimi.com/",
+    keyboard: { press: async () => {} },
+    getByTestId(name) {
+      if (name === "model-select-trigger")
+        return { click: click("config_model_menu") };
+      if (name === "toolkit-trigger-btn")
+        return { click: click("config_toolkit") };
+      assert.equal(name, "model-option");
+      return {
+        first: () => ({
+          waitFor: async (options) => {
+            assert.equal(options.timeout, 5_000);
+          },
+        }),
+        all: async () => [
+          {
+            getAttribute: async () => MODEL,
+            click: click("config_model_selection"),
+          },
+        ],
+      };
+    },
+    getByRole(role) {
+      if (role === "menuitem") return { click: click("config_search_menu") };
+      assert.equal(role, "menuitemradio");
+      return {
+        getAttribute: async () => {
+          reads += 1;
+          if (
+            failedStage === "config_search_setting" &&
+            (!failReadback || reads === 2)
+          )
+            throw error;
+          return "true";
+        },
+      };
+    },
+  };
+}
+
+test("configuration errors retain only fixed menu stage and error class", async () => {
+  for (const stage of [
+    "config_model_menu",
+    "config_model_selection",
+    "config_toolkit",
+    "config_search_menu",
+    "config_search_setting",
+  ]) {
+    for (const name of ["Error", "TimeoutError"]) {
+      const error = new Error(
+        "synthetic-private-detail https://example.org/private",
+      );
+      error.name = name;
+      const diagnostics = [];
+      await assert.rejects(
+        configureKimiSearch(
+          configurationPage(stage, error),
+          MODEL,
+          true,
+          (entry) => diagnostics.push(entry),
+        ),
+        (thrown) => thrown === error,
+      );
+      assert.deepEqual(diagnostics, [
+        {
+          kind: "observation_diagnostic",
+          schema_version: "geo.observation.diagnostic.v1",
+          stage,
+          code: name === "TimeoutError" ? "timeout" : "unexpected_exception",
+        },
+      ]);
+    }
+  }
+});
+
+test("configuration readback retains false return and emits safe timeout diagnostic", async () => {
+  const diagnostics = [];
+  const error = new DOMException("synthetic-private-detail", "TimeoutError");
+  assert.equal(
+    await configureKimiSearch(
+      configurationPage("config_search_setting", error, { failReadback: true }),
+      MODEL,
+      false,
+      (entry) => diagnostics.push(entry),
+    ),
+    false,
+  );
+  assert.equal(diagnostics[0].stage, "config_search_setting");
+  assert.equal(diagnostics[0].code, "timeout");
+  assert.equal(await configureKimiSearch(configurationPage(), MODEL), true);
+});
+
+test("unknown adapter preserves fine configuration diagnostics before submitting", async () => {
+  const result = await measureKimi(
+    configurationPage(
+      "config_search_menu",
+      new DOMException("synthetic-private-detail", "TimeoutError"),
+    ),
+    frozen,
+    { expectedAccountId: "synthetic-private-account" },
+  );
+  assert.equal(result.status, "unknown");
+  assert.equal(result.evidence[0].stage, "config_search_menu");
+  assert.equal(result.evidence[0].code, "timeout");
+  assert.equal(Object.hasOwn(result.evidence[0], "route"), false);
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-private/u);
+});
 
 test("unknown adapter evidence keeps safe stage diagnostics without successful observation", async () => {
   let navigations = 0;
