@@ -4,13 +4,14 @@ use crate::rich_content::{MediaReference, RichContent};
 use crate::{
     AppError, ContentReuseBinding, ContentReuseCandidate, ContentReuseDecision,
     ContentReuseRequest, ContentSemanticDescriptor, DocumentManifest, DocumentManifestItemState,
-    EvidenceRef, ProjectId, TenantScope,
+    EvidenceRef, MediaObjectKey, MemoryContentMediaRepository, ProjectId, TenantScope,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -104,13 +105,7 @@ impl StructuredDocument {
         sections
     }
     pub fn validate(&self, evidence: &[EvidenceRef]) -> Result<(), AppError> {
-        self.validate_structure(evidence)?;
-        if !self.media_references().is_empty() {
-            return Err(AppError::invalid_request(
-                "media requires authorized object binding; rich media writes are not yet supported",
-            ));
-        }
-        Ok(())
+        self.validate_structure(evidence)
     }
     /// Structural validation alone does not authorize referenced media objects.
     pub fn validate_structure(&self, evidence: &[EvidenceRef]) -> Result<(), AppError> {
@@ -307,6 +302,112 @@ impl StructuredDocument {
         }
         Ok(output)
     }
+}
+
+/// Only new revisions and revisions newly selected for readiness or a new
+/// handoff need fresh media authorization. Historical revisions remain intact
+/// after withdrawal so deleting withdrawn images is always possible.
+fn affected_media_keys(previous: &ContentState, next: &ContentState) -> Vec<MediaObjectKey> {
+    let old_ids: std::collections::HashSet<_> = previous
+        .revisions
+        .iter()
+        .map(|revision| revision.revision_id)
+        .collect();
+    let mut selected: std::collections::HashSet<Uuid> = next
+        .revisions
+        .iter()
+        .filter(|revision| !old_ids.contains(&revision.revision_id))
+        .map(|revision| revision.revision_id)
+        .collect();
+    for item in &next.items {
+        let prior = previous
+            .items
+            .iter()
+            .find(|old| old.item_id == item.item_id);
+        if item.status == ContentItemStatus::Ready
+            && item.ready_revision_id.is_some()
+            && prior.is_none_or(|old| {
+                old.status != ContentItemStatus::Ready
+                    || old.ready_revision_id != item.ready_revision_id
+            })
+        {
+            selected.extend(item.ready_revision_id);
+        }
+    }
+    for handoff in next.handoffs.iter().skip(previous.handoffs.len()) {
+        selected.extend(
+            handoff
+                .items
+                .iter()
+                .filter(|item| item.status == ContentItemStatus::Ready)
+                .filter_map(|item| item.revision_id),
+        );
+    }
+    media_keys_for_revisions(&next.revisions, &selected)
+}
+
+fn media_keys_for_revisions(
+    revisions: &[ContentRevision],
+    selected: &std::collections::HashSet<Uuid>,
+) -> Vec<MediaObjectKey> {
+    let mut keys: Vec<_> = revisions
+        .iter()
+        .filter(|revision| selected.contains(&revision.revision_id))
+        .flat_map(|revision| revision.document.media_references())
+        .map(|media| MediaObjectKey {
+            object_id: media.object_id,
+            object_version: media.object_version,
+            sha256: media.sha256.clone(),
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn media_keys_for_revision(revision: &ContentRevision) -> Vec<MediaObjectKey> {
+    media_keys_for_revisions(
+        std::slice::from_ref(revision),
+        &std::collections::HashSet::from([revision.revision_id]),
+    )
+}
+fn selected_media_keys(
+    states: &HashMap<Uuid, (TenantScope, ContentState)>,
+    scope: &TenantScope,
+    state: &ContentState,
+    item: &ContentItem,
+) -> Result<Vec<MediaObjectKey>, AppError> {
+    let revision_id = item
+        .ready_revision_id
+        .ok_or_else(|| AppError::conflict("ready revision is missing"))?;
+    if let Some(revision) = state
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+    {
+        return Ok(media_keys_for_revision(revision));
+    }
+    let origin_id = item
+        .reuse_binding
+        .as_ref()
+        .or_else(|| {
+            item.reuse_history
+                .iter()
+                .find(|r| r.revision_id == revision_id)
+        })
+        .filter(|binding| binding.revision_id == revision_id)
+        .map(|binding| binding.origin_execution_id)
+        .ok_or_else(|| AppError::conflict("ready revision is unavailable"))?;
+    let (_, origin) = states
+        .get(&origin_id)
+        .filter(|(stored_scope, _)| stored_scope == scope)
+        .ok_or_else(|| AppError::conflict("reuse origin is outside project scope"))?;
+    let revision = origin
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .ok_or_else(|| AppError::conflict("reuse origin revision is unavailable"))?;
+    Ok(media_keys_for_revision(revision))
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentBrief {
@@ -1704,11 +1805,17 @@ pub trait ContentRepository: Send + Sync {
     ) -> Result<ContentExecution, AppError>;
 }
 
-#[derive(Default)]
 pub struct MemoryContentRepository {
     state: RwLock<HashMap<Uuid, (TenantScope, ContentState)>>,
     candidates: std::sync::Mutex<HashMap<(TenantScope, String), ContentReuseCandidate>>,
     reservations: std::sync::Mutex<HashMap<(TenantScope, String), ContentProducerReservation>>,
+    media_repository: Arc<MemoryContentMediaRepository>,
+}
+
+impl Default for MemoryContentRepository {
+    fn default() -> Self {
+        Self::with_media_repository(Arc::new(MemoryContentMediaRepository::default()))
+    }
 }
 
 #[derive(Clone)]
@@ -1722,20 +1829,53 @@ impl MemoryContentRepository {
     pub fn new() -> Self {
         Self::default()
     }
+    pub fn with_media_repository(media_repository: Arc<MemoryContentMediaRepository>) -> Self {
+        Self {
+            state: RwLock::new(HashMap::new()),
+            candidates: std::sync::Mutex::new(HashMap::new()),
+            reservations: std::sync::Mutex::new(HashMap::new()),
+            media_repository,
+        }
+    }
     async fn mutate<T>(
         &self,
         scope: &TenantScope,
         id: Uuid,
         f: impl FnOnce(&mut ContentState) -> Result<T, AppError>,
     ) -> Result<T, AppError> {
+        let media = self.media_repository.read_guard().await;
         let mut guard = self.state.write().await;
         let (stored_scope, state) = guard
-            .get_mut(&id)
+            .get(&id)
             .ok_or_else(|| AppError::not_found("content execution not found"))?;
         if !scope.contains(stored_scope) {
             return Err(AppError::not_found("content execution not found"));
         }
-        f(state)
+        let mut candidate = state.clone();
+        let result = f(&mut candidate)?;
+        media.validate(stored_scope, &affected_media_keys(state, &candidate))?;
+        // A reused Ready item points at the origin execution's immutable
+        // revision, not a revision copied into this execution.
+        for item in candidate.items.iter().filter(|item| {
+            item.status == ContentItemStatus::Ready
+                && item.reuse_binding.is_some()
+                && (state
+                    .items
+                    .iter()
+                    .find(|prior| prior.item_id == item.item_id)
+                    .is_none_or(|prior| {
+                        prior.status != ContentItemStatus::Ready
+                            || prior.ready_revision_id != item.ready_revision_id
+                    })
+                    || candidate.handoffs.len() > state.handoffs.len())
+        }) {
+            media.validate(
+                stored_scope,
+                &selected_media_keys(&guard, stored_scope, &candidate, item)?,
+            )?;
+        }
+        guard.get_mut(&id).expect("previously checked").1 = candidate;
+        Ok(result)
     }
 }
 #[async_trait]
@@ -1775,6 +1915,7 @@ impl ContentRepository for MemoryContentRepository {
         scope: &TenantScope,
         request: ContentReuseRequest,
     ) -> Result<ContentReuseDecision, AppError> {
+        let media = self.media_repository.read_guard().await;
         if scope != &request.descriptor.scope {
             return Err(AppError::forbidden(
                 "semantic input is outside project scope",
@@ -1830,6 +1971,7 @@ impl ContentRepository for MemoryContentRepository {
         }
         if dest.status == ContentItemStatus::Ready {
             return if dest.semantic_fingerprint.as_deref() == Some(&fingerprint) {
+                media.validate(scope, &selected_media_keys(&states, scope, state, dest)?)?;
                 Ok(ContentReuseDecision::Ready(dest.clone()))
             } else {
                 Err(AppError::conflict("ready content input differs"))
@@ -1885,6 +2027,12 @@ impl ContentRepository for MemoryContentRepository {
             if !valid {
                 return Err(AppError::conflict("reuse origin is no longer current"));
             }
+            let origin_revision = origin
+                .revisions
+                .iter()
+                .find(|revision| revision.revision_id == candidate.revision_id)
+                .expect("validated origin revision");
+            media.validate(scope, &media_keys_for_revision(origin_revision))?;
             let binding = ContentReuseBinding {
                 origin_execution_id: candidate.origin_execution_id,
                 origin_item_id: candidate.origin_item_id,
@@ -2099,6 +2247,7 @@ impl ContentRepository for MemoryContentRepository {
         base_revision_id: Uuid,
         document: StructuredDocument,
     ) -> Result<ContentRevision, AppError> {
+        let media = self.media_repository.read_guard().await;
         let mut states = self.state.write().await;
         let (stored_scope, state) = states
             .get(&execution_id)
@@ -2135,7 +2284,11 @@ impl ContentRepository for MemoryContentRepository {
         let (_, state) = states
             .get_mut(&execution_id)
             .expect("destination was verified");
-        state.fork_reused_item(item_id, base_revision_id, &origin, document)
+        let mut next = state.clone();
+        let result = next.fork_reused_item(item_id, base_revision_id, &origin, document)?;
+        media.validate(scope, &affected_media_keys(state, &next))?;
+        *state = next;
+        Ok(result)
     }
     async fn get_execution(
         &self,
@@ -2424,6 +2577,7 @@ impl ContentRepository for MemoryContentRepository {
         lease: &StepLease,
         findings: Vec<ContentFinding>,
     ) -> Result<ContentItem, AppError> {
+        let media = self.media_repository.read_guard().await;
         let mut states = self.state.write().await;
         let (stored_scope, state) = states
             .get_mut(&lease.execution_id)
@@ -2465,7 +2619,9 @@ impl ContentRepository for MemoryContentRepository {
                 "content producer reservation was superseded",
             ));
         }
-        let result = state.complete_check(lease, findings)?;
+        let mut next = state.clone();
+        let result = next.complete_check(lease, findings)?;
+        media.validate(scope, &affected_media_keys(state, &next))?;
         if result.status == ContentItemStatus::Ready
             && let (Some(descriptor), Some(fingerprint), Some(asset_id), Some(revision_id)) = (
                 result.semantic_descriptor.clone(),
@@ -2474,7 +2630,7 @@ impl ContentRepository for MemoryContentRepository {
                 result.ready_revision_id,
             )
         {
-            let check = state
+            let check = next
                 .checks
                 .iter()
                 .find(|check| {
@@ -2511,6 +2667,7 @@ impl ContentRepository for MemoryContentRepository {
         {
             reservations.remove(&key);
         }
+        *state = next;
         Ok(result)
     }
     async fn complete_repair(
@@ -2539,6 +2696,7 @@ impl ContentRepository for MemoryContentRepository {
             .find(|(sc, s)| scope.contains(sc) && s.assets.iter().any(|a| a.asset_id == asset))
             .map(|(_, s)| s.execution.execution_id)
             .ok_or_else(|| AppError::not_found("asset not found"))?;
+        let media = self.media_repository.read_guard().await;
         let mut states = self.state.write().await;
         let (stored_scope, state) = states
             .get_mut(&id)
@@ -2555,7 +2713,9 @@ impl ContentRepository for MemoryContentRepository {
                     .as_ref()
                     .map(|fingerprint| ((stored_scope.clone(), fingerprint.clone()), item.item_id))
             });
-        let result = state.edit(asset, base, doc)?;
+        let mut next = state.clone();
+        let result = next.edit(asset, base, doc)?;
+        media.validate(scope, &affected_media_keys(state, &next))?;
         if let Some((key, edited_item_id)) = previous_candidate {
             let mut registry = self
                 .candidates
@@ -2577,6 +2737,7 @@ impl ContentRepository for MemoryContentRepository {
                 reservations.remove(&key);
             }
         }
+        *state = next;
         Ok(result)
     }
     async fn classify(

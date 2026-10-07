@@ -1,5 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 import type { RichNode } from "../api/content";
+import { validMediaReference } from "../api/contentMedia";
 
 const allowedMarks = new Set([
   "bold",
@@ -66,6 +67,40 @@ export function toRichNode(node: JSONContent, depth = 0): RichNode {
       return toRichNode(child, depth + 1);
     });
   switch (node.type) {
+    case "media": {
+      const value = attrs(node, [
+        "object_id",
+        "object_version",
+        "sha256",
+        "alt",
+        "caption",
+        "src",
+        "title",
+      ]);
+      if (
+        value.src != null ||
+        value.title != null ||
+        node.content?.length ||
+        node.marks?.length
+      )
+        throw new Error("Content contains an unsupported image source.");
+      const {
+        geoBlockId: _id,
+        geoCitations: _citations,
+        geoCaptionFor: _caption,
+        src: _src,
+        title: _title,
+        ...reference
+      } = value;
+      void _id;
+      void _citations;
+      void _caption;
+      void _src;
+      void _title;
+      if (!validMediaReference(reference))
+        throw new Error("Content contains an invalid image reference.");
+      return { type: "media", attrs: { ...reference } };
+    }
     case "paragraph":
       attrs(node, []);
       return {

@@ -4,11 +4,67 @@ use geo_domain::{
     AppError, ContentAsset, ContentBrief, ContentCheck, ContentExecution, ContentFinding,
     ContentHandoff, ContentItem, ContentItemStatus, ContentRepository, ContentReuseBinding,
     ContentReuseDecision, ContentReuseRequest, ContentRevision, ContentSemanticDescriptor,
-    ContentState, ContentStep, DocumentManifest, ErrorCode, StepLease, StructuredDocument,
-    TenantScope, start_content_state,
+    ContentState, ContentStep, DocumentManifest, ErrorCode, MediaObjectKey, StepLease,
+    StructuredDocument, TenantScope, start_content_state,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
+
+fn revision_media_keys(revision: &ContentRevision) -> Vec<MediaObjectKey> {
+    let mut keys: Vec<_> = revision
+        .document
+        .media_references()
+        .into_iter()
+        .map(|reference| MediaObjectKey {
+            object_id: reference.object_id,
+            object_version: reference.object_version,
+            sha256: reference.sha256.clone(),
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn affected_media_keys(old: &ContentState, next: &ContentState) -> Vec<MediaObjectKey> {
+    let old_ids: std::collections::HashSet<_> =
+        old.revisions.iter().map(|r| r.revision_id).collect();
+    let mut selected: std::collections::HashSet<_> = next
+        .revisions
+        .iter()
+        .filter(|r| !old_ids.contains(&r.revision_id))
+        .map(|r| r.revision_id)
+        .collect();
+    for item in &next.items {
+        let prior = old.items.iter().find(|i| i.item_id == item.item_id);
+        if item.status == ContentItemStatus::Ready
+            && prior.is_none_or(|prior| {
+                prior.status != ContentItemStatus::Ready
+                    || prior.ready_revision_id != item.ready_revision_id
+            })
+        {
+            selected.extend(item.ready_revision_id);
+        }
+    }
+    for handoff in next.handoffs.iter().skip(old.handoffs.len()) {
+        selected.extend(
+            handoff
+                .items
+                .iter()
+                .filter(|i| i.status == ContentItemStatus::Ready)
+                .filter_map(|i| i.revision_id),
+        );
+    }
+    let mut keys: Vec<_> = next
+        .revisions
+        .iter()
+        .filter(|r| selected.contains(&r.revision_id))
+        .flat_map(revision_media_keys)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
 
 // Only work that can still create a coverage row or a logical publication
 // intent is a closed-stage dispatch candidate. Unknown/sent intents and
@@ -51,6 +107,54 @@ impl PgContentRepository {
     }
     pub fn from_database(database: &crate::Database) -> Self {
         Self::new(database.pool().clone())
+    }
+    async fn selected_media_keys(
+        tx: &mut Transaction<'_, Postgres>,
+        scope: &TenantScope,
+        state: &ContentState,
+        item: &ContentItem,
+    ) -> Result<Vec<MediaObjectKey>, AppError> {
+        let revision_id = item
+            .ready_revision_id
+            .ok_or_else(|| AppError::conflict("ready revision is missing"))?;
+        if let Some(revision) = state
+            .revisions
+            .iter()
+            .find(|revision| revision.revision_id == revision_id)
+        {
+            return Ok(revision_media_keys(revision));
+        }
+        let origin_execution_id = item
+            .reuse_binding
+            .as_ref()
+            .or_else(|| {
+                item.reuse_history
+                    .iter()
+                    .find(|r| r.revision_id == revision_id)
+            })
+            .filter(|binding| binding.revision_id == revision_id)
+            .map(|binding| binding.origin_execution_id)
+            .ok_or_else(|| AppError::conflict("ready revision is unavailable"))?;
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::invalid_request("project scope required"))?;
+        let body: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT body FROM content_revisions WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND execution_id=$4 AND revision_id=$5",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(origin_execution_id)
+        .bind(revision_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?;
+        let revision: ContentRevision = serde_json::from_value(
+            body.ok_or_else(|| AppError::conflict("reuse origin revision is missing"))?,
+        )
+        .map_err(|_| AppError::new(ErrorCode::Internal, "stored revision invalid"))?;
+        Ok(revision_media_keys(&revision))
     }
     /// Keyset enumeration is independent of dispatch claims so one failed
     /// execution cannot starve later executions in the same scan.
@@ -452,6 +556,7 @@ impl PgContentRepository {
             .bind(id).fetch_optional(&mut *tx).await.map_err(db)?;
         let mut state =
             decode(json.ok_or_else(|| AppError::not_found("content execution not found"))?)?;
+        let old_state = state.clone();
         let was_running = state.execution.status == geo_domain::ContentExecutionStatus::Running;
         let previous_briefs: Vec<Uuid> = state
             .items
@@ -592,6 +697,28 @@ impl PgContentRepository {
                 .await?;
             }
         }
+        // Resolve bytes under locks held until content commit, only after
+        // source/knowledge eligibility locks have been acquired.
+        let mut media_keys = affected_media_keys(&old_state, &state);
+        for item in state.items.iter().filter(|item| {
+            item.status == ContentItemStatus::Ready
+                && item.reuse_binding.is_some()
+                && (state.handoffs.len() > old_state.handoffs.len()
+                    || old_state
+                        .items
+                        .iter()
+                        .find(|prior| prior.item_id == item.item_id)
+                        .is_none_or(|prior| {
+                            prior.status != ContentItemStatus::Ready
+                                || prior.ready_revision_id != item.ready_revision_id
+                        }))
+        }) {
+            media_keys.extend(Self::selected_media_keys(&mut tx, scope, &state, item).await?);
+        }
+        media_keys.sort();
+        media_keys.dedup();
+        crate::content_media::validate_content_media_in_transaction(&mut tx, scope, &media_keys)
+            .await?;
         // The first producer's reservation is held through the successful
         // independent check. A late model result can never become ready after
         // another execution has taken over the fingerprint.
@@ -846,6 +973,9 @@ impl ContentRepository for PgContentRepository {
                     "ready item has different semantic input",
                 ));
             }
+            let keys = Self::selected_media_keys(&mut tx, scope, &state, &item).await?;
+            crate::content_media::validate_content_media_in_transaction(&mut tx, scope, &keys)
+                .await?;
             tx.commit().await.map_err(db)?;
             return Ok(ContentReuseDecision::Ready(item));
         }
@@ -919,6 +1049,19 @@ impl ContentRepository for PgContentRepository {
                 .iter()
                 .any(|a| a.asset_id == asset_id && a.current_revision_id == revision_id);
             if valid {
+                let origin_revision = origin
+                    .revisions
+                    .iter()
+                    .find(|revision| {
+                        revision.revision_id == revision_id && revision.asset_id == asset_id
+                    })
+                    .ok_or_else(|| AppError::conflict("reuse origin revision is missing"))?;
+                crate::content_media::validate_content_media_in_transaction(
+                    &mut tx,
+                    scope,
+                    &revision_media_keys(origin_revision),
+                )
+                .await?;
                 let binding = ContentReuseBinding {
                     origin_execution_id,
                     origin_item_id,

@@ -18,6 +18,8 @@ pub use connector_capabilities::PgConnectorCapabilityRepository;
 mod config;
 mod content;
 pub use content::{ContentDispatchCandidate, ContentDispatchLease, PgContentRepository};
+mod content_media;
+pub use content_media::PgContentMediaRepository;
 mod database;
 mod distribution;
 pub use distribution::PgDistributionRepository;

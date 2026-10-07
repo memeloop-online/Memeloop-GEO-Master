@@ -139,11 +139,14 @@ jobs:
         run: |
           set -o pipefail
           failed=0
-          for suite in postgres reports channels standalone_measurements channel_identity successor_cycles channel_dispatcher bootstrap model_routes operator_appearance content rich_content content_reuse questions distribution connector_capabilities publication_lookup publication_bindings pdf_parse office_parse import_progress knowledge_text_revisions attachment_bytes; do
+          for suite in postgres reports channels standalone_measurements channel_identity successor_cycles channel_dispatcher bootstrap model_routes operator_appearance content rich_content content_reuse content_media content_media_authority questions distribution connector_capabilities publication_lookup publication_bindings pdf_parse office_parse import_progress knowledge_text_revisions attachment_bytes; do
             if ! cargo test -p geo-persistence --test "$suite" -- --ignored 2>&1 | tee "logs/cargo-${suite}-postgres.log"; then
               failed=1
             fi
           done
+          if ! cargo test -p geo-persistence --lib content_validation_holds_object_and_binding_until_caller_commits -- --ignored 2>&1 | tee "logs/cargo-media-lock-postgres.log"; then
+            failed=1
+          fi
           exit "$failed"
 
       - name: Diagnose V8 heap pressure with isolated and concurrent probes

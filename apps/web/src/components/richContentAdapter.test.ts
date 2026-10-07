@@ -18,6 +18,63 @@ const prior: StructuredDocument = {
 };
 
 describe("generated rich content adapter", () => {
+  it("roundtrips a verified media block with its caption, identity and evidence envelope", () => {
+    const reference = {
+      object_id: "1e47ee2e-534a-4695-a998-46a32639d0b2",
+      object_version: 2,
+      sha256: "a".repeat(64),
+      alt: "A sample diagram",
+      caption: "Figure one",
+    };
+    const media: StructuredDocument = {
+      title: "Guide",
+      schema_version: 2,
+      blocks: [
+        {
+          block_id: "media-block",
+          kind: "rich",
+          citation_ids: ["evidence-1"],
+          text: "",
+          items: [],
+          rich: { version: 1, node: { type: "media", attrs: reference } },
+        },
+      ],
+    };
+    expect(editorToDocument(documentToEditor(media), media)).toEqual(media);
+    const inserted = editorToDocument(
+      {
+        ...documentToEditor(prior),
+        content: [
+          ...documentToEditor(prior).content!,
+          { type: "media", attrs: { ...reference, geoCitations: [] } },
+        ],
+      },
+      prior,
+    );
+    expect(inserted.blocks[0]).toEqual(prior.blocks[0]);
+    expect(inserted.blocks[1]).toMatchObject({
+      kind: "rich",
+      citation_ids: [],
+      rich: { node: { type: "media", attrs: reference } },
+    });
+    expect(inserted.blocks[1].block_id).not.toBe(prior.blocks[0].block_id);
+    expect(() =>
+      toRichNode({
+        type: "media",
+        attrs: { ...reference, src: "https://example.test/image.png" },
+      }),
+    ).toThrow();
+    expect(() =>
+      toRichNode({ type: "media", attrs: { ...reference, alt: "" } }),
+    ).toThrow();
+    expect(() =>
+      fromRichNode({
+        type: "media",
+        attrs: { ...reference, caption: undefined },
+      }),
+    ).toThrow();
+  });
+
   it("keeps legacy documents exactly unchanged when opened and saved without a rich edit", () => {
     expect(editorToDocument(documentToEditor(prior), prior)).toEqual(prior);
   });

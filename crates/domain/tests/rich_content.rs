@@ -311,7 +311,7 @@ fn standard_relative_anchor_and_mail_links_preserve_optional_title() {
     }
 }
 #[test]
-fn media_references_are_typed_but_cannot_be_saved_or_distributed_without_authorization() {
+fn media_references_are_structurally_valid_but_require_a_media_publication_adapter() {
     let object_id = Uuid::new_v4();
     let doc = rich(json!({"type":"media","attrs":{
         "object_id":object_id,"object_version":2,
@@ -329,10 +329,7 @@ fn media_references_are_typed_but_cannot_be_saved_or_distributed_without_authori
     );
     assert!(doc.check_sections()[1].1.contains("A < device"));
     assert!(doc.check_sections()[1].1.contains("Caption & detail"));
-    assert_eq!(
-        doc.validate(&[]).unwrap_err().code,
-        ErrorCode::InvalidRequest
-    );
+    doc.validate(&[]).unwrap();
     let revision = revision(doc);
     assert_eq!(
         prepare_rich_variant(&revision, &placement(vec![RICH_MARKDOWN_FORMAT]))

@@ -20,6 +20,7 @@ import { ApiError } from "../api/client";
 import {
   type ContentItem,
   type ContentRevision,
+  type RichNode,
   type StructuredDocument,
   exportContentRevision,
   useAppendContentRevisionMutation,
@@ -61,6 +62,10 @@ const planLabels = {
 
 function mayEdit(role: string | undefined) {
   return role === "tenant_admin" || role === "member";
+}
+
+function containsMedia(node: RichNode): boolean {
+  return node.type === "media" || (node.content?.some(containsMedia) ?? false);
 }
 
 function apiTitle(error: Error, fallback: string) {
@@ -650,6 +655,7 @@ function RevisionEditor({
       </Field>
       <StructuredContentEditor
         key={editorEpoch}
+        mediaScope={{ tenantId, projectId }}
         document={draft}
         baselineDocument={baselineDocument}
         readonly={
@@ -809,8 +815,12 @@ function AssetContent({
     contextualItem.asset_id === assetId &&
     contextualItem.reuse_binding.asset_id !== assetId;
   const validContext = isReusedSource || isForkedCurrent;
+  const selectedHasMedia =
+    selected?.document.blocks.some(
+      (block) => block.rich && containsMedia(block.rich.node),
+    ) ?? false;
   const download = async (format: "markdown" | "html") => {
-    if (!selected || exporting) return;
+    if (!selected || exporting || selectedHasMedia) return;
     setExportError(null);
     setExporting(format);
     try {
@@ -966,7 +976,19 @@ function AssetContent({
           ) : (
             <Card className="panel-card">
               <h2>历史版本 v{selected.revision}</h2>
-              <pre style={{ whiteSpace: "pre-wrap" }}>{selected.markdown}</pre>
+              {selectedHasMedia ? (
+                <StructuredContentEditor
+                  key={selected.revision_id}
+                  document={selected.document}
+                  readonly
+                  mediaScope={{ tenantId, projectId }}
+                  onChange={() => {}}
+                />
+              ) : (
+                <pre style={{ whiteSpace: "pre-wrap" }}>
+                  {selected.markdown}
+                </pre>
+              )}
               <p>历史版本只读。返回当前版本才能追加修订。</p>
             </Card>
           )}
@@ -982,7 +1004,14 @@ function AssetContent({
                           ? "primary"
                           : "subtle"
                       }
-                      onClick={() => setSelectedId(revision.revision_id)}
+                      onClick={() =>
+                        setSelectedId(
+                          !hasReuseContext &&
+                            revision.revision_id === current.revision_id
+                            ? undefined
+                            : revision.revision_id,
+                        )
+                      }
                     >
                       v{revision.revision} · {formatUiDate(revision.created_at)}
                       {revision.revision_id === current.revision_id
@@ -993,18 +1022,24 @@ function AssetContent({
                 ))}
               </ul>
               <div className="content-export-actions">
-                <Button
-                  disabled={!!exporting}
-                  onClick={() => void download("markdown")}
-                >
-                  {t("generatedEditor.exportMarkdown")}
-                </Button>
-                <Button
-                  disabled={!!exporting}
-                  onClick={() => void download("html")}
-                >
-                  {t("generatedEditor.exportHtml")}
-                </Button>
+                {selectedHasMedia ? (
+                  <p>{t("generatedEditor.mediaExportUnavailable")}</p>
+                ) : (
+                  <>
+                    <Button
+                      disabled={!!exporting}
+                      onClick={() => void download("markdown")}
+                    >
+                      {t("generatedEditor.exportMarkdown")}
+                    </Button>
+                    <Button
+                      disabled={!!exporting}
+                      onClick={() => void download("html")}
+                    >
+                      {t("generatedEditor.exportHtml")}
+                    </Button>
+                  </>
+                )}
               </div>
               {exportError && (
                 <MessageBar intent="error">

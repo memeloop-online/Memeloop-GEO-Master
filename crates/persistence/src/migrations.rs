@@ -144,6 +144,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 33,
         description: "authored text invariants",
     },
+    MigrationMetadata {
+        version: 34,
+        description: "content media bindings",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

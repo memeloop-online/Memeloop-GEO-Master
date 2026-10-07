@@ -1455,11 +1455,11 @@ fn render_revision_export(
     revision: ContentRevision,
     format: &str,
 ) -> Result<ExportResponse, AppError> {
-    // The resolver/binding for packaged media is not available yet. Never
-    // manufacture a public URL from an object identifier.
+    // This text-only endpoint cannot package bound media. Never manufacture
+    // a public URL from an object identifier or return an incomplete export.
     if !revision.document.media_references().is_empty() {
         return Err(AppError::invalid_request(
-            "media export requires authorized object binding",
+            "this export format cannot include image files",
         ));
     }
     let (media_type, extension, content) = match format {

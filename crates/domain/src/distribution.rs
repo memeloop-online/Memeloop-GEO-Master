@@ -335,6 +335,11 @@ fn prepare_versioned_variant(
     policy: &str,
 ) -> Result<ChannelVariant, AppError> {
     revision.document.validate(&revision.evidence)?;
+    if !revision.document.media_references().is_empty() {
+        return Err(AppError::invalid_request(
+            "media publication requires a media-capable channel adapter",
+        ));
+    }
     if revision.markdown != revision.document.markdown() {
         return Err(AppError::invalid_request(
             "content revision markdown is inconsistent",

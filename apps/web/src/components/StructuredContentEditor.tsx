@@ -19,8 +19,13 @@ import { Extension, type JSONContent } from "@tiptap/core";
 import { Plugin } from "@tiptap/pm/state";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import Image from "@tiptap/extension-image";
 import { useTranslation } from "react-i18next";
 import type { ContentBlock, StructuredDocument } from "../api/content";
+import type { MediaReference } from "../api/contentMedia";
+import { ContentMediaPicker } from "./ContentMediaPicker";
+import { ContentMediaNode, MediaContext } from "./ContentMediaNode";
+import { ReactNodeViewRenderer } from "@tiptap/react";
 import { fromRichNode, isSimpleLegacy, toRichNode } from "./richContentAdapter";
 import "./StructuredContentEditor.css";
 
@@ -43,6 +48,7 @@ const metadata = Extension.create({
                 "orderedList",
                 "codeBlock",
                 "table",
+                "media",
               ].includes(node.type.name)
             )
               return;
@@ -84,6 +90,7 @@ const metadata = Extension.create({
           "orderedList",
           "codeBlock",
           "table",
+          "media",
         ],
         attributes: {
           geoBlockId: {
@@ -128,6 +135,21 @@ const extensions = [
     link: { openOnClick: false },
   }),
   TableKit,
+  Image.extend({
+    name: "media",
+    addAttributes() {
+      return {
+        object_id: { default: null, parseHTML: () => null },
+        object_version: { default: null, parseHTML: () => null },
+        sha256: { default: null, parseHTML: () => null },
+        alt: { default: "", parseHTML: () => "" },
+        caption: { default: "", parseHTML: () => "" },
+      };
+    },
+    addNodeView() {
+      return ReactNodeViewRenderer(ContentMediaNode);
+    },
+  }).configure({ inline: false, allowBase64: false }),
   Extension.create({
     name: "geoLinkTitle",
     addGlobalAttributes() {
@@ -386,6 +408,7 @@ interface Props {
   baselineDocument?: StructuredDocument;
   readonly: boolean;
   onChange: (document: StructuredDocument | null, error: string | null) => void;
+  mediaScope?: { tenantId: string; projectId: string };
 }
 
 export function StructuredContentEditor({
@@ -393,6 +416,7 @@ export function StructuredContentEditor({
   baselineDocument,
   readonly,
   onChange,
+  mediaScope,
 }: Props) {
   const { t } = useTranslation();
   const original = useRef(baselineDocument ?? document);
@@ -673,6 +697,23 @@ export function StructuredContentEditor({
           >
             {t("generatedEditor.table")}
           </ToolbarButton>
+          {mediaScope && (
+            <ContentMediaPicker
+              {...mediaScope}
+              onSelect={(reference: MediaReference) => {
+                if (!editor) return;
+                const position = editor.state.selection.$from.after(1);
+                editor
+                  .chain()
+                  .focus()
+                  .insertContentAt(position, {
+                    type: "media",
+                    attrs: reference,
+                  })
+                  .run();
+              }}
+            />
+          )}
           <ToolbarButton onClick={() => editor?.chain().focus().undo().run()}>
             {t("generatedEditor.undo")}
           </ToolbarButton>
@@ -681,7 +722,11 @@ export function StructuredContentEditor({
           </ToolbarButton>
         </Toolbar>
       )}
-      {!unsupported && <EditorContent editor={editor} />}
+      {!unsupported && (
+        <MediaContext.Provider value={mediaScope ?? null}>
+          <EditorContent editor={editor} />
+        </MediaContext.Provider>
+      )}
     </div>
   );
 }

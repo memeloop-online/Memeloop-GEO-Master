@@ -21,6 +21,8 @@ mod connector_capabilities;
 pub use connector_capabilities::*;
 mod content;
 pub use content::*;
+mod content_media;
+pub use content_media::*;
 mod rich_content;
 pub use rich_content::*;
 mod content_reuse;

@@ -5,6 +5,7 @@
 // GEO_SMOKE_API_PORT, GEO_SMOKE_WEB_PORT. GEO_SMOKE_CONTENT=1 additionally
 // requires approved local bundles and an unused GEO_SMOKE_PROVIDER_PORT.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { deflateSync } from "node:zlib";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createServer as createHttpServer } from "node:http";
@@ -66,6 +67,40 @@ const evidenceSentence = "Synthetic Acme sample widget has a blue cover.";
 const evidenceTitle = "Synthetic Acme sample widget";
 const uuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function syntheticPng() {
+  const crcTable = Array.from({ length: 256 }, (_, index) => {
+    let value = index;
+    for (let bit = 0; bit < 8; bit++)
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    return value >>> 0;
+  });
+  const chunk = (type, bytes) => {
+    const label = Buffer.from(type, "ascii");
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(bytes.length);
+    let crc = 0xffffffff;
+    for (const byte of Buffer.concat([label, bytes]))
+      crc = crcTable[(crc ^ byte) & 255] ^ (crc >>> 8);
+    const checksum = Buffer.alloc(4);
+    checksum.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
+    return Buffer.concat([length, label, bytes, checksum]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(2, 0);
+  header.writeUInt32BE(2, 4);
+  header[8] = 8; // RGB, eight bits per channel, non-interlaced.
+  header[9] = 2;
+  const pixels = Buffer.from([
+    0, 255, 0, 0, 0, 255, 0, 0, 0, 0, 255, 255, 255, 0,
+  ]);
+  return Buffer.concat([
+    Buffer.from("89504e470d0a1a0a", "hex"),
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(pixels)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
 
 async function approvedBundle(name) {
   const path = join(repository, "packages", "agent-runtime", "dist", name);
@@ -653,8 +688,276 @@ async function verifyGeneratedRichContent(
   await page.getByRole("heading", { name: "历史版本 v1" }).waitFor();
   await verifyDownload(original, "markdown");
   await verifyDownload(original, "html");
+  await history
+    .getByRole("button", { name: new RegExp(`^v${saved.revision} ·`) })
+    .click();
+  await input.waitFor();
+  assert(
+    (await input.getAttribute("contenteditable")) === "true",
+    "Returning to the current text revision did not restore its editor",
+  );
+  const png = syntheticPng();
+  const digest = createHash("sha256").update(png).digest("hex");
+  const alt = "Synthetic two-by-two color sample";
+  const caption = "Synthetic image for local verification";
+  const picker = page.getByRole("group", { name: "插入图片" });
+  await page.getByRole("button", { name: "插入图片" }).click();
+  await picker.locator('input[type="file"]').setInputFiles({
+    name: "synthetic-colors.png",
+    mimeType: "image/png",
+    buffer: png,
+  });
+  await picker.getByRole("textbox", { name: "图片说明（无障碍）" }).fill(alt);
+  await picker.getByRole("textbox", { name: "图片标题（可选）" }).fill(caption);
+  const completed = page.waitForResponse(
+    (response) =>
+      /\/agent\/attachments\/upload-sessions\/[^/]+\/complete$/.test(
+        new URL(response.url()).pathname,
+      ) && response.request().method() === "POST",
+  );
+  const bound = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname.endsWith(
+        `/projects/${projectId}/content-media/bindings`,
+      ) && response.request().method() === "POST",
+  );
+  const preview = page.waitForResponse(
+    (response) =>
+      /\/content-media\/bindings\/[^/]+\/bytes$/.test(
+        new URL(response.url()).pathname,
+      ) && response.request().method() === "GET",
+  );
+  const mediaSaved = page.waitForResponse(
+    (response) => {
+      if (
+        !/\/contents\/[^/]+\/revisions$/.test(
+          new URL(response.url()).pathname,
+        ) ||
+        response.request().method() !== "POST"
+      )
+        return false;
+      try {
+        return response
+          .request()
+          .postDataJSON()
+          .document?.blocks?.some(
+            (block) => block.rich?.node?.type === "media",
+          );
+      } catch {
+        return false;
+      }
+    },
+    { timeout: 20_000 },
+  );
+  await picker.getByRole("button", { name: "上传并插入" }).click();
+  const uploadResponse = await completed;
+  assert(uploadResponse.status() === 200, "Image upload did not complete");
+  const attachment = await uploadResponse.json();
+  assert(
+    uuidPattern.test(attachment.object_id) &&
+      /^\d+$/.test(attachment.object_version) &&
+      Number.isSafeInteger(Number(attachment.object_version)) &&
+      Number(attachment.object_version) > 0 &&
+      attachment.sha256 === digest,
+    "Committed image bytes do not match the upload receipt",
+  );
+  const bindingResponse = await bound;
+  assert(bindingResponse.status() === 201, "Image binding was not created");
+  const binding = await bindingResponse.json();
+  const key = {
+    object_id: attachment.object_id,
+    object_version: Number(attachment.object_version),
+    sha256: digest,
+  };
+  assert(
+    uuidPattern.test(binding.binding_id) &&
+      binding.state === "active" &&
+      JSON.stringify(binding.image?.key) === JSON.stringify(key) &&
+      binding.image.media_type === "image/png" &&
+      binding.image.byte_len === png.length &&
+      binding.image.width === 2 &&
+      binding.image.height === 2,
+    "Bound image identity, detected format, bytes, or dimensions differ from the upload",
+  );
+  const mediaResponse = await mediaSaved;
+  assert(mediaResponse.status() === 201, "Media insertion did not autosave");
+  const mediaRevision = await mediaResponse.json();
+  const mediaBlock = mediaRevision.document?.blocks?.find(
+    (block) => block.rich?.node?.type === "media",
+  );
+  assert(
+    mediaRevision.revision_id !== saved.revision_id &&
+      mediaBlock &&
+      uuidPattern.test(mediaBlock.block_id) &&
+      !saved.document.blocks.some(
+        (block) => block.block_id === mediaBlock.block_id,
+      ) &&
+      mediaBlock.citation_ids.length === 0 &&
+      JSON.stringify(mediaBlock.rich.node.attrs) ===
+        JSON.stringify({ ...key, alt, caption }) &&
+      saved.document.blocks.every((block) =>
+        mediaRevision.document.blocks.some(
+          (candidate) =>
+            candidate.block_id === block.block_id &&
+            JSON.stringify(candidate.citation_ids) ===
+              JSON.stringify(block.citation_ids),
+        ),
+      ),
+    "Media autosave changed existing citations/IDs or stored the wrong image reference",
+  );
+  await page
+    .getByText(new RegExp(`正在编辑 v${mediaRevision.revision}[。.]`))
+    .waitFor();
+  assert(
+    (await input.getAttribute("contenteditable")) === "true" &&
+      (await page
+        .getByRole("heading", {
+          name: `历史版本 v${saved.revision}`,
+        })
+        .count()) === 0,
+    "Media autosave unmounted the live current editor after history selection",
+  );
+  const previewResponse = await preview;
+  assert(
+    previewResponse.status() === 200 &&
+      new URL(previewResponse.url()).pathname.endsWith(
+        `/content-media/bindings/${binding.binding_id}/bytes`,
+      ),
+    "Authenticated image preview did not return the bound image",
+  );
+  assert(
+    previewResponse.headers()["content-type"] === "image/png" &&
+      previewResponse.headers()["x-content-type-options"] === "nosniff" &&
+      previewResponse.headers()["cache-control"] === "no-store",
+    "Authenticated image preview lacks its detected type or effective no-cache headers",
+  );
+  const previewBytes = await page.evaluate(
+    async ({ tenantId, projectId, bindingId }) => {
+      const { readContentMediaBytes } =
+        await import("/src/api/contentMedia.ts");
+      const blob = await readContentMediaBytes(tenantId, projectId, bindingId);
+      return [...new Uint8Array(await blob.arrayBuffer())];
+    },
+    { tenantId, projectId, bindingId: binding.binding_id },
+  );
+  assert(
+    previewBytes.length === png.length &&
+      previewBytes.every((byte, index) => png[index] === byte),
+    "Authenticated browser image read differed from committed PNG bytes",
+  );
+  const mediaImage = input.locator(".content-media-node img");
+  await mediaImage.waitFor();
+  await mediaImage.evaluate((image) => image.decode());
+  await page.reload();
+  await mediaImage.waitFor();
+  await mediaImage.evaluate((image) => image.decode());
+  assert(
+    (await mediaImage.getAttribute("alt")) === alt &&
+      (
+        await mediaImage.evaluate((image) => [
+          image.naturalWidth,
+          image.naturalHeight,
+        ])
+      ).join("x") === "2x2" &&
+      (await input.locator("figcaption").textContent()) === caption,
+    "Editor image did not render the authenticated two-by-two PNG",
+  );
+  await page.getByRole("button", { name: "插入图片" }).click();
+  const existingImage = picker.getByRole("button", {
+    name: /image\/png.*2.*2/,
+  });
+  await existingImage.scrollIntoViewIfNeeded();
+  await picker
+    .locator(".content-media-thumbnail img")
+    .evaluate((image) => image.decode());
+  await screenshot(page, runDir, "content-media-picker-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "content-media-picker-narrow", {
+    width: 390,
+    height: 844,
+  });
+  await page.getByRole("button", { name: "插入图片" }).click();
+  const mediaPersisted = (
+    await publicApi(page, revisionsPath, { tenantId, projectId })
+  ).find((revision) => revision.revision_id === mediaRevision.revision_id);
+  assert(
+    JSON.stringify(mediaPersisted?.document) ===
+      JSON.stringify(mediaRevision.document) &&
+      (await mediaImage.getAttribute("alt")) === alt,
+    "Image revision changed during reload or its preview disappeared",
+  );
+  const titleSaved = page.waitForResponse(
+    (response) =>
+      /\/contents\/[^/]+\/revisions$/.test(new URL(response.url()).pathname) &&
+      response.request().method() === "POST" &&
+      response.request().postDataJSON().document?.title ===
+        `${evidenceTitle} (with image)`,
+    { timeout: 20_000 },
+  );
+  await page
+    .getByRole("textbox", { name: "标题", exact: true })
+    .fill(`${evidenceTitle} (with image)`);
+  assert((await titleSaved).status() === 201, "Image title edit did not save");
+  await page.reload();
+  await mediaImage.waitFor();
+  await history
+    .locator("summary")
+    .getByText("版本历史", { exact: true })
+    .click();
+  await history
+    .getByRole("button", { name: new RegExp(`^v${mediaRevision.revision} ·`) })
+    .click();
+  await page
+    .getByRole("heading", {
+      name: `历史版本 v${mediaRevision.revision}`,
+    })
+    .waitFor();
+  const historicalImage = page
+    .locator(".panel-card")
+    .filter({
+      has: page.getByRole("heading", {
+        name: `历史版本 v${mediaRevision.revision}`,
+      }),
+    })
+    .locator(".content-media-node img");
+  await historicalImage.waitFor();
+  await historicalImage.evaluate((image) => image.decode());
+  assert(
+    (await historicalImage.getAttribute("alt")) === alt &&
+      (
+        await historicalImage.evaluate((image) => [
+          image.naturalWidth,
+          image.naturalHeight,
+        ])
+      ).join("x") === "2x2" &&
+      (await page.locator(".panel-card [contenteditable='true']").count()) ===
+        0 &&
+      (await page.getByRole("button", { name: "保存新版本" }).count()) === 0 &&
+      (await history.getByRole("button", { name: "下载 Markdown" }).count()) ===
+        0 &&
+      (await history.getByRole("button", { name: "下载 HTML" }).count()) ===
+        0 &&
+      (await history.getByText("含图片的版本暂不能下载完整文件。").count()) ===
+        1,
+    "Historical media revision was editable, lost preview, or offered incomplete exports",
+  );
+  await screenshot(page, runDir, "content-media-history-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "content-media-history-narrow", {
+    width: 390,
+    height: 844,
+  });
+  await history
+    .getByRole("button", { name: new RegExp(`^v${saved.revision} ·`) })
+    .click();
+  await verifyDownload(saved, "markdown");
+  await verifyDownload(saved, "html");
   console.log(
-    "Content: actual source-backed generation, title/block checks, Tiptap autosave, immutable history and downloaded exports verified",
+    "Content: source-backed rich text, authenticated media insertion/reload/history, and immutable text exports verified",
   );
 }
 
@@ -778,6 +1081,8 @@ async function screenshot(page, runDir, name, viewport) {
       ".question-sets-edit-row",
       ".content-evidence-quotes",
       ".content-evidence-quotes blockquote",
+      ".content-media-node",
+      ".content-media-picker",
     ].flatMap((selector) =>
       [...document.querySelectorAll(selector)].flatMap((element) => {
         const style = getComputedStyle(element);

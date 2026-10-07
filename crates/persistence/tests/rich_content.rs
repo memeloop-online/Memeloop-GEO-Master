@@ -608,7 +608,7 @@ async fn rich_edit_survives_reconnect_and_versioned_repair_preserves_history() {
             .await
             .unwrap_err()
             .code,
-        ErrorCode::InvalidRequest,
+        ErrorCode::Conflict,
         "unbound media cannot be committed"
     );
     assert_eq!(

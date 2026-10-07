@@ -1573,6 +1573,68 @@ describe("P09 content revision", () => {
     expect(within(body).getByText("原始正文先后")).toBeInTheDocument();
   });
 
+  it("follows the live current version after returning from history and keeps subsequent typing", async () => {
+    const requests = mockApi({ persistWrites: true });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    await userEvent.type(
+      await screen.findByRole("textbox", { name: "标题" }),
+      " updated",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() =>
+      expect(screen.getByText("当前版本 v2")).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText("版本历史"));
+    await userEvent.click(screen.getByRole("button", { name: /^v1 ·/ }));
+    expect(
+      screen.getByRole("heading", { name: "历史版本 v1" }),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: /v2 ·.*（当前）/ }),
+    );
+    const body = screen.getByRole("textbox", { name: "结构化正文" });
+    const paragraph = within(body).getByText("原始正文");
+    await userEvent.click(paragraph);
+    putCaretAtEnd(paragraph);
+    await userEvent.keyboard("先");
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() =>
+      expect(screen.getByText("当前版本 v3")).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole("heading", { name: "历史版本 v2" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "结构化正文" })).toBe(body);
+    expect(body).toHaveAttribute("contenteditable", "true");
+    const nextParagraph = within(body).getByText("原始正文先");
+    await userEvent.click(nextParagraph);
+    putCaretAtEnd(nextParagraph);
+    await userEvent.keyboard("后");
+    await waitFor(
+      () =>
+        expect(
+          requests.mock.calls.filter(
+            ([url, init]) =>
+              String(url).includes("/contents/asset-1/revisions?") &&
+              init?.method === "POST",
+          ),
+        ).toHaveLength(3),
+      { timeout: 4000 },
+    );
+    const writes = requests.mock.calls.filter(
+      ([url, init]) =>
+        String(url).includes("/contents/asset-1/revisions?") &&
+        init?.method === "POST",
+    );
+    expect(JSON.parse(String(writes[2][1]?.body))).toMatchObject({
+      base_revision_id: "revision-3",
+      document: {
+        blocks: [{ text: "原始正文先后" }],
+      },
+    });
+    expect(screen.getByRole("textbox", { name: "结构化正文" })).toBe(body);
+  });
+
   it("downloads the selected immutable revision, including reuse origin identity", async () => {
     const requests = mockApi({
       itemList: [reusedItem, items[1]],
@@ -1647,8 +1709,75 @@ describe("P09 content revision", () => {
       "只能查看，不能保存更改",
     );
     expect(screen.getByRole("textbox", { name: "标题" })).toBeDisabled();
+    await userEvent.click(screen.getByText("版本历史"));
+    expect(
+      screen.getByText("含图片的版本暂不能下载完整文件。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "下载 Markdown" }),
+    ).not.toBeInTheDocument();
     expect(
       requests.mock.calls.some(([, init]) => init?.method === "POST"),
     ).toBe(false);
+  });
+
+  it("hides plain downloads for a nested media reference even when the structure cannot be edited", async () => {
+    mockApi({
+      documentOverride: {
+        title: "Nested media",
+        schema_version: 2,
+        blocks: [
+          {
+            block_id: "block-1",
+            kind: "rich",
+            text: "",
+            items: [],
+            citation_ids: ["chunk-1"],
+            rich: {
+              version: 1,
+              node: {
+                type: "table",
+                content: [
+                  {
+                    type: "tableRow",
+                    content: [
+                      {
+                        type: "tableCell",
+                        content: [
+                          {
+                            type: "paragraph",
+                            content: [
+                              {
+                                type: "media",
+                                attrs: {
+                                  object_id:
+                                    "1e47ee2e-534a-4695-a998-46a32639d0b2",
+                                  object_version: 2,
+                                  sha256: "a".repeat(64),
+                                  alt: "Diagram",
+                                  caption: "",
+                                },
+                              },
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    await userEvent.click(await screen.findByText("版本历史"));
+    expect(
+      screen.getByText("含图片的版本暂不能下载完整文件。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "下载 Markdown" }),
+    ).not.toBeInTheDocument();
   });
 });

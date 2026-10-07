@@ -5,7 +5,7 @@ The following upstream components are used under the MIT license below.
 This notice does not change the license of the GEO application.
 
 Tiptap core, React integration, StarterKit, @tiptap/pm and extensions,
-including @tiptap/markdown and @tiptap/extension-table 3.31.4
+including @tiptap/markdown, @tiptap/extension-table and @tiptap/extension-image 3.31.4
 https://github.com/ueberdosis/tiptap
 Copyright (c) 2025, Tiptap GmbH
 

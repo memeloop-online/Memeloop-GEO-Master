@@ -194,6 +194,42 @@ export async function apiFetch<T>(
   return readJson<T>(response);
 }
 
+/** Authenticated binary read using the same session, scope and 401 handling as apiFetch. */
+export async function apiFetchBlob(
+  path: string,
+  {
+    tenantId,
+    projectId,
+    signal,
+  }: Pick<ApiRequestOptions, "tenantId" | "projectId" | "signal"> = {},
+): Promise<Blob> {
+  let response: Response;
+  try {
+    response = await fetch(apiRequestUrl(path, { tenantId, projectId }), {
+      method: "GET",
+      headers: { Accept: "image/png, image/jpeg, image/webp" },
+      credentials: "same-origin",
+      signal,
+    });
+  } catch (error) {
+    throw new ApiError(
+      0,
+      {},
+      error instanceof Error ? error.message : "无法连接到 API 服务",
+    );
+  }
+  if (!response.ok) {
+    const apiError = new ApiError(
+      response.status,
+      await readJson<ApiErrorBody>(response),
+      `请求失败（HTTP ${response.status}）`,
+    );
+    if (response.status === 401) void unauthorizedHandler?.();
+    throw apiError;
+  }
+  return response.blob();
+}
+
 async function readJson<T>(response: Response): Promise<T> {
   const text = await response.text();
   if (!text) return undefined as T;

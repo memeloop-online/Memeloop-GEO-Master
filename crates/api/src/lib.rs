@@ -10,6 +10,7 @@ mod channels;
 mod citation_insights;
 mod connector_capabilities;
 mod content;
+mod content_media;
 pub mod content_runtime;
 mod content_tools;
 mod desktop_gateway;
@@ -137,6 +138,7 @@ pub struct AppState {
     channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
     publication_lookup_repository: Option<Arc<dyn geo_domain::PublicationLookupRepository>>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
+    content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
     distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
     content_dispatch_repository: Option<geo_persistence::PgContentRepository>,
     content_model: Arc<std::sync::RwLock<Option<SharedModelProvider>>>,
@@ -158,6 +160,8 @@ impl AppState {
     }
 
     pub fn development_with_password(password: &str) -> Self {
+        let content_media_repository =
+            Arc::new(geo_domain::MemoryContentMediaRepository::default());
         Self {
             operation_store: Arc::new(MemoryOperationStore::default()),
             idempotency_store: Arc::new(MemoryIdempotencyStore::default()),
@@ -175,7 +179,12 @@ impl AppState {
             desktop_grants: desktop_gateway::DesktopGrants::default(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             publication_lookup_repository: None,
-            content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
+            content_repository: Arc::new(
+                geo_domain::MemoryContentRepository::with_media_repository(
+                    content_media_repository.clone(),
+                ),
+            ),
+            content_media_repository,
             distribution_repository: Arc::new(geo_domain::MemoryDistributionRepository::default()),
             content_dispatch_repository: None,
             content_model: Arc::new(std::sync::RwLock::new(None)),
@@ -278,6 +287,8 @@ impl AppState {
         events: EventBus,
         durable_storage: bool,
     ) -> Self {
+        let content_media_repository =
+            Arc::new(geo_domain::MemoryContentMediaRepository::default());
         Self {
             operation_store,
             idempotency_store,
@@ -295,7 +306,12 @@ impl AppState {
             desktop_grants: desktop_gateway::DesktopGrants::default(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             publication_lookup_repository: None,
-            content_repository: Arc::new(geo_domain::MemoryContentRepository::default()),
+            content_repository: Arc::new(
+                geo_domain::MemoryContentRepository::with_media_repository(
+                    content_media_repository.clone(),
+                ),
+            ),
+            content_media_repository,
             distribution_repository: Arc::new(geo_domain::MemoryDistributionRepository::default()),
             content_dispatch_repository: None,
             content_model: Arc::new(std::sync::RwLock::new(None)),
@@ -351,6 +367,9 @@ impl AppState {
         ))
         .with_content_repository(Arc::new(
             geo_persistence::PgContentRepository::from_database(database),
+        ))
+        .with_content_media_repository(Arc::new(
+            geo_persistence::PgContentMediaRepository::from_database(database),
         ))
         .with_distribution_repository(Arc::new(
             geo_persistence::PgDistributionRepository::from_database(database),
@@ -426,6 +445,18 @@ impl AppState {
 
     pub fn knowledge_repository(&self) -> Arc<dyn KnowledgeRepository> {
         Arc::clone(&self.knowledge_repository)
+    }
+
+    pub fn content_media_repository(&self) -> Arc<dyn geo_domain::ContentMediaRepository> {
+        Arc::clone(&self.content_media_repository)
+    }
+
+    pub fn with_content_media_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ContentMediaRepository>,
+    ) -> Self {
+        self.content_media_repository = repository;
+        self
     }
 
     pub fn question_repository(&self) -> Arc<dyn geo_domain::QuestionRepository> {
@@ -2129,6 +2160,18 @@ pub fn router(state: AppState) -> Router {
             post(content::cancel),
         )
         .route("/projects/{id}/contents", get(content::contents))
+        .route(
+            "/projects/{id}/content-media/bindings",
+            get(content_media::list_bindings).post(content_media::create_binding),
+        )
+        .route(
+            "/projects/{id}/content-media/bindings/{binding_id}",
+            axum::routing::delete(content_media::withdraw_binding),
+        )
+        .route(
+            "/projects/{id}/content-media/bindings/{binding_id}/bytes",
+            get(content_media::get_binding_bytes),
+        )
         .route("/projects/{id}/contents/{asset_id}", get(content::asset))
         .route(
             "/projects/{id}/contents/{asset_id}/revisions",
