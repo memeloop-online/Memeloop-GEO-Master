@@ -217,16 +217,39 @@ fn provider_bridge<T: Transport + 'static>(
     ai: &DevelopmentAiConfig,
     transport: Arc<T>,
 ) -> Result<ProviderClientBridge<T, LocalTokenCenter>, AssemblyError> {
+    injected_provider_bridge(&ai.base_url, &ai.api_key, &ai.model, transport)
+}
+
+/// Shared injected-credential construction; the caller owns its authorization
+/// wrapper. In particular the scoped deployment path must check exact scope
+/// before calling this bridge (which can resolve its token and send HTTP).
+pub(crate) fn injected_provider<T: Transport + 'static>(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    transport: Arc<T>,
+) -> Result<SharedModelProvider, AssemblyError> {
+    Ok(Arc::new(injected_provider_bridge(
+        base_url, api_key, model, transport,
+    )?))
+}
+
+fn injected_provider_bridge<T: Transport + 'static>(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    transport: Arc<T>,
+) -> Result<ProviderClientBridge<T, LocalTokenCenter>, AssemblyError> {
     let token =
-        ResolvedToken::new(ai.api_key.clone()).map_err(|_| AssemblyError::ProviderConfiguration)?;
+        ResolvedToken::new(api_key.to_owned()).map_err(|_| AssemblyError::ProviderConfiguration)?;
     let client = ProviderClient::new(
-        &ai.base_url,
+        base_url,
         SecretRef::new(LOCAL_SECRET_REF).expect("fixed secret reference is valid"),
         transport,
         Arc::new(LocalTokenCenter { token }),
     )
     .map_err(|_| AssemblyError::ProviderConfiguration)?;
-    let bridge = ProviderClientBridge::new(client, ai.model.clone(), Duration::from_secs(60))
+    let bridge = ProviderClientBridge::new(client, model.to_owned(), Duration::from_secs(60))
         .map_err(|_| AssemblyError::ProviderConfiguration)?;
     Ok(bridge)
 }

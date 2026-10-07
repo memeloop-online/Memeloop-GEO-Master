@@ -830,6 +830,7 @@ fn content_distribute_ref(request: geo_domain::ContentDistributionRequest) -> Co
         format: request.format,
         status: "accepted".to_owned(),
         publication_intent_id: request.publication_intent_id,
+        materialization_deferral: request.materialization_deferral,
         channel_target_id: None,
         attempt_id: None,
         outcome: None,
@@ -2015,6 +2016,67 @@ mod tests {
             AppError::conflict("publication account is not ready"),
         );
         assert_eq!(other.code, HostOpErrorCode::Conflict);
+    }
+
+    #[test]
+    fn single_article_projection_exposes_only_persisted_bounded_deferral() {
+        let scope = TenantScope::new(
+            geo_domain::DEVELOPMENT_OPERATOR_ID,
+            geo_domain::DEVELOPMENT_TENANT_ID,
+            Some(geo_domain::ProjectId::from(uuid::Uuid::new_v4())),
+        );
+        let request = geo_domain::ContentDistributionRequest {
+            request_id: uuid::Uuid::new_v4(),
+            scope,
+            schema_version: 1,
+            content_revision_id: uuid::Uuid::new_v4(),
+            content_asset_id: uuid::Uuid::new_v4(),
+            platform_id: "generic".into(),
+            placement_slot: "article".into(),
+            account_id: uuid::Uuid::new_v4(),
+            account_owner_kind: "customer".into(),
+            format: "markdown.v1".into(),
+            idempotency_key_hash: "sensitive-opaque-key-hash".into(),
+            request_hash: "sensitive-input-hash".into(),
+            publication_intent_id: None,
+            materialization_deferral: Some(geo_domain::ContentRequestDeferral {
+                reason: geo_domain::ContentRequestDeferralReason::ConnectorUnavailable,
+                attempts: 3,
+                next_retry_at: chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            }),
+            created_at: Utc::now(),
+        };
+        let receipt = content_distribute_ref(request.clone());
+        assert_eq!(receipt.request_id, request.request_id);
+        assert_eq!(receipt.status, "accepted");
+        assert!(receipt.publication_intent_id.is_none());
+        let visible = serde_json::to_value(receipt).unwrap();
+        assert_eq!(
+            visible["materialization_deferral"]["reason"],
+            "connector_unavailable"
+        );
+        assert_eq!(visible["materialization_deferral"]["attempts"], 3);
+        assert_eq!(
+            visible["materialization_deferral"]["next_retry_at"],
+            "2026-01-02T03:04:05Z"
+        );
+        assert!(visible.get("scope").is_none());
+        assert!(visible.get("account_owner_kind").is_none());
+        assert!(visible.get("idempotency_key_hash").is_none());
+        assert!(visible.get("request_hash").is_none());
+        assert!(visible.get("created_at").is_none());
+        assert!(!visible.to_string().contains("sensitive"));
+
+        let mut ready = request;
+        ready.materialization_deferral = None;
+        assert!(
+            serde_json::to_value(content_distribute_ref(ready))
+                .unwrap()
+                .get("materialization_deferral")
+                .is_none()
+        );
     }
 
     struct FakeModelProvider;

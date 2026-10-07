@@ -10,6 +10,7 @@ mod dispatch;
 mod production_runtime;
 mod publication_lookup_dispatch;
 mod runtime;
+mod scoped_test_runtime;
 mod verification_dispatch;
 
 use axum::Router;
@@ -88,6 +89,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let runtime = if let Some(ai) = production_ai.as_ref() {
             let provider = production_runtime::build_model_provider(&database, ai)?;
             runtime::assemble_with_provider(&state, &ai.bundle_path, &ai.bundle_sha256, provider)?
+        } else if let Some(ai) = config.scoped_test_ai.as_ref() {
+            scoped_test_runtime::assemble(&state, ai)?
         } else if let (Some(ai), Some(scope)) = (
             config.development_ai.as_ref(),
             config.persistent_dev_ai_scope.as_ref(),

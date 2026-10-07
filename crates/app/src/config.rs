@@ -1,4 +1,4 @@
-use geo_domain::TenantScope;
+use geo_domain::{OperatorId, ProjectId, TenantId, TenantScope};
 use std::{env, fmt, net::SocketAddr, str::FromStr};
 use thiserror::Error;
 
@@ -15,6 +15,42 @@ const PERSISTENT_DEV_AI_NAMES: [&str; 4] = [
     "GEO_DEV_AI_TENANT_ID",
     "GEO_DEV_AI_PROJECT_ID",
 ];
+const SCOPED_TEST_AI_NAMES: [&str; 9] = [
+    "GEO_SCOPED_TEST_AI",
+    "GEO_SCOPED_TEST_AI_OPERATOR_ID",
+    "GEO_SCOPED_TEST_AI_TENANT_ID",
+    "GEO_SCOPED_TEST_AI_PROJECT_ID",
+    "GEO_SCOPED_TEST_AI_BASE_URL",
+    "GEO_SCOPED_TEST_AI_API_KEY",
+    "GEO_SCOPED_TEST_AI_MODEL",
+    "GEO_SCOPED_TEST_AGENT_BUNDLE_PATH",
+    "GEO_SCOPED_TEST_AGENT_BUNDLE_SHA256",
+];
+const PRODUCTION_AI_NAMES: [&str; 5] = [
+    "GEO_PRODUCTION_AI_BASE_URL",
+    "GEO_TOKEN_CENTER_URL",
+    "GEO_TOKEN_CENTER_TOKEN",
+    "GEO_PRODUCTION_AGENT_BUNDLE_PATH",
+    "GEO_PRODUCTION_AGENT_BUNDLE_SHA256",
+];
+
+/// An explicit, exact-project deployment test using an injected credential.
+/// This is not a production Token Center grant or a tenant-wide fallback.
+#[derive(Clone)]
+pub struct ScopedTestAiConfig {
+    pub scope: TenantScope,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub bundle_path: String,
+    pub bundle_sha256: String,
+}
+
+impl fmt::Debug for ScopedTestAiConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ScopedTestAiConfig(***)")
+    }
+}
 
 #[derive(Clone)]
 pub struct DevelopmentAiConfig {
@@ -47,6 +83,7 @@ pub struct AppConfig {
     pub development_ai: Option<DevelopmentAiConfig>,
     /// Explicit local PostgreSQL development exception; never a production route.
     pub persistent_dev_ai_scope: Option<TenantScope>,
+    pub scoped_test_ai: Option<ScopedTestAiConfig>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -63,6 +100,7 @@ impl fmt::Debug for AppConfig {
                 "persistent_dev_ai_configured",
                 &self.persistent_dev_ai_scope.is_some(),
             )
+            .field("scoped_test_ai_configured", &self.scoped_test_ai.is_some())
             .finish()
     }
 }
@@ -82,6 +120,7 @@ impl Default for AppConfig {
             ],
             development_ai: None,
             persistent_dev_ai_scope: None,
+            scoped_test_ai: None,
         }
     }
 }
@@ -110,10 +149,24 @@ pub enum ConfigError {
     InvalidPersistentDevelopmentAi,
     #[error("development and production AI configurations cannot be combined")]
     MixedAiConfigurations,
+    #[error("scoped test AI requires all nine GEO_SCOPED_TEST_* variables")]
+    PartialScopedTestAi,
+    #[error("invalid scoped test AI configuration")]
+    InvalidScopedTestAi,
+    #[error("scoped test AI requires PostgreSQL")]
+    ScopedTestAiRequiresDatabase,
 }
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let scoped_test_ai = parse_scoped_test_ai(|name| match env::var(name) {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => Some(String::new()),
+        })?;
+        if scoped_test_ai.is_some() && old_ai_env_present(|name| env::var_os(name).is_some()) {
+            return Err(ConfigError::MixedAiConfigurations);
+        }
         let defaults = Self::default();
         let bind_addr = match env::var("GEO_BIND_ADDR") {
             Ok(value) => SocketAddr::from_str(&value).map_err(|_| ConfigError::Invalid {
@@ -178,6 +231,7 @@ impl AppConfig {
             allowed_origins,
             development_ai,
             persistent_dev_ai_scope,
+            scoped_test_ai,
         })
     }
 
@@ -202,6 +256,16 @@ impl AppConfig {
         durable_storage: bool,
         production_ai_configured: bool,
     ) -> Result<(), ConfigError> {
+        if self.scoped_test_ai.is_some()
+            && (self.development_ai.is_some()
+                || self.persistent_dev_ai_scope.is_some()
+                || production_ai_configured)
+        {
+            return Err(ConfigError::MixedAiConfigurations);
+        }
+        if self.scoped_test_ai.is_some() && !durable_storage {
+            return Err(ConfigError::ScopedTestAiRequiresDatabase);
+        }
         if production_ai_configured && self.development_ai.is_some() {
             return Err(ConfigError::MixedAiConfigurations);
         }
@@ -221,6 +285,72 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn parse_scoped_test_ai(
+    mut get: impl FnMut(&'static str) -> Option<String>,
+) -> Result<Option<ScopedTestAiConfig>, ConfigError> {
+    let values = SCOPED_TEST_AI_NAMES.map(&mut get);
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if values
+        .iter()
+        .any(|value| value.as_deref().is_none_or(|value| value.trim().is_empty()))
+    {
+        return Err(ConfigError::PartialScopedTestAi);
+    }
+    let [
+        Some(enabled),
+        Some(operator),
+        Some(tenant),
+        Some(project),
+        Some(base_url),
+        Some(api_key),
+        Some(model),
+        Some(bundle_path),
+        Some(bundle_sha256),
+    ] = values
+    else {
+        return Err(ConfigError::PartialScopedTestAi);
+    };
+    if enabled != "true"
+        || model.trim().is_empty()
+        || model.len() > 256
+        || model.contains("://")
+        || bundle_sha256.len() != 64
+        || hex::decode(&bundle_sha256).is_err()
+    {
+        return Err(ConfigError::InvalidScopedTestAi);
+    }
+    let operator: OperatorId = operator
+        .parse()
+        .map_err(|_| ConfigError::InvalidScopedTestAi)?;
+    let tenant: TenantId = tenant
+        .parse()
+        .map_err(|_| ConfigError::InvalidScopedTestAi)?;
+    let project: ProjectId = project
+        .parse()
+        .map_err(|_| ConfigError::InvalidScopedTestAi)?;
+    if operator.as_uuid().is_nil() || tenant.as_uuid().is_nil() || project.as_uuid().is_nil() {
+        return Err(ConfigError::InvalidScopedTestAi);
+    }
+    Ok(Some(ScopedTestAiConfig {
+        scope: TenantScope::new(operator, tenant, Some(project)),
+        base_url,
+        api_key,
+        model,
+        bundle_path,
+        bundle_sha256,
+    }))
+}
+
+fn old_ai_env_present(mut present: impl FnMut(&'static str) -> bool) -> bool {
+    AI_ENV_NAMES
+        .iter()
+        .chain(PERSISTENT_DEV_AI_NAMES.iter())
+        .chain(PRODUCTION_AI_NAMES.iter())
+        .any(|name| present(name))
 }
 
 fn parse_persistent_dev_ai(
@@ -325,7 +455,11 @@ fn env_bool(name: &'static str, default: bool) -> Result<bool, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, ConfigError, parse_development_ai, parse_persistent_dev_ai};
+    use super::{
+        AI_ENV_NAMES, AppConfig, ConfigError, PERSISTENT_DEV_AI_NAMES, PRODUCTION_AI_NAMES,
+        SCOPED_TEST_AI_NAMES, old_ai_env_present, parse_development_ai, parse_persistent_dev_ai,
+        parse_scoped_test_ai,
+    };
     use geo_domain::TenantScope;
 
     #[test]
@@ -506,5 +640,136 @@ mod tests {
             config.validate_ai_mode(true, false),
             Err(ConfigError::PersistentDevelopmentAiRequiresLocalDatabase)
         ));
+    }
+
+    fn scoped_test_values() -> Vec<(&'static str, String)> {
+        vec![
+            (SCOPED_TEST_AI_NAMES[0], "true".into()),
+            (SCOPED_TEST_AI_NAMES[1], uuid::Uuid::new_v4().to_string()),
+            (SCOPED_TEST_AI_NAMES[2], uuid::Uuid::new_v4().to_string()),
+            (SCOPED_TEST_AI_NAMES[3], uuid::Uuid::new_v4().to_string()),
+            (SCOPED_TEST_AI_NAMES[4], "http://127.0.0.1:1/v1".into()),
+            (SCOPED_TEST_AI_NAMES[5], "private-test-key".into()),
+            (SCOPED_TEST_AI_NAMES[6], "test-model".into()),
+            (SCOPED_TEST_AI_NAMES[7], "bundle.mjs".into()),
+            (SCOPED_TEST_AI_NAMES[8], "a".repeat(64)),
+        ]
+    }
+
+    #[test]
+    fn scoped_test_settings_require_exact_project_and_every_explicit_variable() {
+        assert!(parse_scoped_test_ai(|_| None).unwrap().is_none());
+        let values = scoped_test_values();
+        for omitted in 0..values.len() {
+            let parsed = parse_scoped_test_ai(|name| {
+                values
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (key, _))| *key == name)
+                    .and_then(|(index, (_, value))| (index != omitted).then(|| value.clone()))
+            });
+            assert!(matches!(parsed, Err(ConfigError::PartialScopedTestAi)));
+        }
+        let parse = |overrides: &[(&str, &str)]| {
+            parse_scoped_test_ai(|name| {
+                overrides
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).into())
+                    .or_else(|| {
+                        values
+                            .iter()
+                            .find(|(key, _)| *key == name)
+                            .map(|(_, value)| value.clone())
+                    })
+            })
+        };
+        for (name, value) in [
+            (SCOPED_TEST_AI_NAMES[0], "false"),
+            (SCOPED_TEST_AI_NAMES[0], "1"),
+            (SCOPED_TEST_AI_NAMES[1], "not-a-uuid"),
+        ] {
+            assert!(matches!(
+                parse(&[(name, value)]),
+                Err(ConfigError::InvalidScopedTestAi)
+            ));
+        }
+        assert!(matches!(
+            parse(&[(SCOPED_TEST_AI_NAMES[3], "")]),
+            Err(ConfigError::PartialScopedTestAi)
+        ));
+        let nil = uuid::Uuid::nil().to_string();
+        for name in SCOPED_TEST_AI_NAMES.iter().skip(1).take(3) {
+            assert!(matches!(
+                parse(&[(name, nil.as_str())]),
+                Err(ConfigError::InvalidScopedTestAi)
+            ));
+        }
+        let config = parse(&[]).unwrap().unwrap();
+        assert!(config.scope.project_id.is_some());
+        assert!(!format!("{config:?}").contains("private-test-key"));
+        let app = AppConfig {
+            scoped_test_ai: Some(config),
+            ..AppConfig::default()
+        };
+        assert!(!format!("{app:?}").contains("private-test-key"));
+        assert!(app.validate_ai_mode(true, false).is_ok());
+        assert!(matches!(
+            app.validate_ai_mode(false, false),
+            Err(ConfigError::ScopedTestAiRequiresDatabase)
+        ));
+        assert!(matches!(
+            app.validate_ai_mode(true, true),
+            Err(ConfigError::MixedAiConfigurations)
+        ));
+    }
+
+    #[test]
+    fn scoped_test_mode_rejects_any_other_ai_mode_even_if_false_or_partial() {
+        for name in AI_ENV_NAMES
+            .iter()
+            .chain(PERSISTENT_DEV_AI_NAMES.iter())
+            .chain(PRODUCTION_AI_NAMES.iter())
+        {
+            assert!(old_ai_env_present(|candidate| candidate == *name));
+        }
+        assert!(!old_ai_env_present(|_| false));
+        let scoped = parse_scoped_test_ai(|name| {
+            scoped_test_values()
+                .into_iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value)
+        })
+        .unwrap();
+        let dev = parse_development_ai(|name| {
+            Some(if name == "GEO_AGENT_BUNDLE_SHA256" {
+                "a".repeat(64)
+            } else {
+                "test".into()
+            })
+        })
+        .unwrap();
+        let mut app = AppConfig {
+            scoped_test_ai: scoped,
+            development_ai: dev,
+            ..AppConfig::default()
+        };
+        assert!(matches!(
+            app.validate_ai_mode(true, false),
+            Err(ConfigError::MixedAiConfigurations)
+        ));
+        app.development_ai = None;
+        app.persistent_dev_ai_scope = Some(TenantScope::new(
+            uuid::Uuid::new_v4().into(),
+            uuid::Uuid::new_v4().into(),
+            None,
+        ));
+        assert!(matches!(
+            app.validate_ai_mode(true, false),
+            Err(ConfigError::MixedAiConfigurations)
+        ));
+        app.persistent_dev_ai_scope = None;
+        app.bind_addr = "0.0.0.0:8080".parse().unwrap();
+        assert!(app.validate_ai_mode(true, false).is_ok());
     }
 }

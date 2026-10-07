@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { formatUiDate } from "../i18n";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Button,
@@ -37,6 +38,16 @@ const requiredCapability = {
   "markdown.v1": "plain_text_article.v1",
   "rich_markdown.v2": "rich_markdown.v2",
 } as const;
+const deferralReasons = [
+  "project_paused",
+  "account_unavailable",
+  "connector_unavailable",
+  "content_not_ready",
+  "source_unavailable",
+  "format_unsupported",
+  "temporary_failure",
+  "internal_error",
+] as const;
 
 interface PendingRequest {
   input: ContentDistributionInput;
@@ -160,7 +171,7 @@ export function ContentDistributionPanel({
   unsaved,
   onSelectRevision,
 }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { session } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestId = searchParams.get("distribution_request_id");
@@ -211,6 +222,8 @@ export function ContentDistributionPanel({
       getContentDistributionRequest(tenantId, projectId, requestId!),
     enabled: Boolean(scope && requestId),
     retry: false,
+    refetchInterval: (query) =>
+      query.state.data?.publication_intent_id ? false : 5000,
   });
   const validReceipt = Boolean(
     receipt.data &&
@@ -341,6 +354,27 @@ export function ContentDistributionPanel({
         return "unrecognized";
     }
   })();
+  const linkedPublication = Boolean(
+    receipt.data?.publication_intent_id ||
+    (publication.data?.request_id === receipt.data?.request_id &&
+      publication.data?.publication_intent_id),
+  );
+  const deferral =
+    validReceipt && !linkedPublication
+      ? receipt.data?.materialization_deferral
+      : null;
+  const deferralReason =
+    deferral && deferralReasons.some((reason) => reason === deferral.reason)
+      ? deferral.reason
+      : "fallback";
+  const retryDate = deferral ? new Date(deferral.next_retry_at) : null;
+  const locale = i18n.language === "en" ? "en" : "zh-CN";
+  const nextCheck =
+    retryDate && Number.isFinite(retryDate.getTime())
+      ? `${formatUiDate(retryDate, locale)} ${new Intl.DateTimeFormat(locale, {
+          timeStyle: "short",
+        }).format(retryDate)}`
+      : null;
   const publicUrl =
     publication.data?.request_id === receipt.data?.request_id &&
     !publication.data?.fixture
@@ -417,7 +451,22 @@ export function ContentDistributionPanel({
                     </MessageBarBody>
                   </MessageBar>
                 )}
-                {publicationKey && (
+                {deferral && (
+                  <MessageBar intent="warning">
+                    <MessageBarBody>
+                      {t(`contentDistribution.deferred.${deferralReason}`)}
+                      {nextCheck && (
+                        <span>
+                          {" "}
+                          {t("contentDistribution.deferred.nextCheck", {
+                            date: nextCheck,
+                          })}
+                        </span>
+                      )}
+                    </MessageBarBody>
+                  </MessageBar>
+                )}
+                {!deferral && publicationKey && (
                   <p role="status">
                     {t(`contentDistribution.${publicationKey}`)}
                   </p>

@@ -19,6 +19,84 @@ pub const CONTENT_DISTRIBUTION_REQUEST_SCHEMA_VERSION: i32 = 1;
 pub const TEXT_DISTRIBUTION_FORMAT: &str = "markdown.v1";
 pub const RICH_DISTRIBUTION_FORMAT: &str = "rich_markdown.v2";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentRequestDeferralReason {
+    ProjectPaused,
+    AccountUnavailable,
+    ConnectorUnavailable,
+    ContentNotReady,
+    SourceUnavailable,
+    FormatUnsupported,
+    TemporaryFailure,
+    InternalError,
+}
+
+impl ContentRequestDeferralReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProjectPaused => "project_paused",
+            Self::AccountUnavailable => "account_unavailable",
+            Self::ConnectorUnavailable => "connector_unavailable",
+            Self::ContentNotReady => "content_not_ready",
+            Self::SourceUnavailable => "source_unavailable",
+            Self::FormatUnsupported => "format_unsupported",
+            Self::TemporaryFailure => "temporary_failure",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentRequestDeferral {
+    pub reason: ContentRequestDeferralReason,
+    pub attempts: u32,
+    pub next_retry_at: DateTime<Utc>,
+}
+
+/// An explicitly classified live dependency failure. Arbitrary error text and
+/// generic conflicts are never persisted as a more specific diagnosis.
+pub struct ContentRequestMaterializationFailure {
+    pub error: AppError,
+    pub reason: ContentRequestDeferralReason,
+}
+
+impl From<AppError> for ContentRequestMaterializationFailure {
+    fn from(error: AppError) -> Self {
+        let reason = if error.code == crate::ErrorCode::DependencyUnavailable
+            || error.code == crate::ErrorCode::CapabilityMissing
+        {
+            ContentRequestDeferralReason::TemporaryFailure
+        } else {
+            ContentRequestDeferralReason::InternalError
+        };
+        Self { error, reason }
+    }
+}
+
+pub fn classified_request_failure(
+    reason: ContentRequestDeferralReason,
+    error: AppError,
+) -> ContentRequestMaterializationFailure {
+    ContentRequestMaterializationFailure { reason, error }
+}
+
+pub fn next_request_deferral(
+    reason: ContentRequestDeferralReason,
+    prior: Option<&ContentRequestDeferral>,
+    now: DateTime<Utc>,
+) -> ContentRequestDeferral {
+    let attempts = prior.map_or(1, |old| old.attempts.saturating_add(1));
+    let seconds = 2_i64
+        .saturating_mul(1_i64 << attempts.saturating_sub(1).min(8))
+        .min(300);
+    ContentRequestDeferral {
+        reason,
+        attempts,
+        next_retry_at: now + chrono::Duration::seconds(seconds),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AcceptContentDistributionRequest {
     /// These values are resolved from trusted, project-scoped Rust repositories,
@@ -47,6 +125,9 @@ pub struct ContentDistributionRequest {
     /// An existing intent; its attempt, unknown outcome and verification remain
     /// exclusively in the existing publication ledger.
     pub publication_intent_id: Option<Uuid>,
+    /// Mutable recovery metadata, not part of the accepted request identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_deferral: Option<ContentRequestDeferral>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -118,6 +199,7 @@ pub fn prepare_content_distribution_request(
             &input.format,
         ]),
         publication_intent_id: None,
+        materialization_deferral: None,
         created_at: Utc::now(),
     })
 }
@@ -295,11 +377,29 @@ impl MemoryContentDistributionRequestRepository {
         self
     }
 
+    async fn record_deferral(
+        &self,
+        scope: &TenantScope,
+        request_id: Uuid,
+        reason: ContentRequestDeferralReason,
+    ) {
+        let mut state = self.state.write().await;
+        if let Some(request) = state.by_id.get_mut(&(scope.clone(), request_id))
+            && request.publication_intent_id.is_none()
+        {
+            request.materialization_deferral = Some(next_request_deferral(
+                reason,
+                request.materialization_deferral.as_ref(),
+                Utc::now(),
+            ));
+        }
+    }
+
     async fn check_live(
         &self,
         request: &ContentDistributionRequest,
         accepted_revision: &ContentRevision,
-    ) -> Result<ContentRevision, AppError> {
+    ) -> Result<ContentRevision, ContentRequestMaterializationFailure> {
         let authority = self.authorities.as_ref().ok_or_else(|| {
             AppError::capability_missing("publication validation authorities unavailable")
         })?;
@@ -314,7 +414,10 @@ impl MemoryContentDistributionRequestRepository {
             project.status,
             ProjectStatus::Paused | ProjectStatus::Archived
         ) {
-            return Err(AppError::conflict("project is not active"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ProjectPaused,
+                AppError::conflict("project is not active"),
+            ));
         }
         let mut accounts = authority.channels.list_accounts(scope).await?;
         accounts.extend(
@@ -337,10 +440,16 @@ impl MemoryContentDistributionRequestRepository {
                     }
                 }
         }) {
-            return Err(AppError::conflict("publication account is not ready"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::AccountUnavailable,
+                AppError::conflict("publication account is not ready"),
+            ));
         }
         if request.format != TEXT_DISTRIBUTION_FORMAT {
-            return Err(AppError::conflict("publication format is not supported"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::FormatUnsupported,
+                AppError::conflict("publication format is not supported"),
+            ));
         }
         let key = ConnectorKey {
             platform_id: request.platform_id.clone(),
@@ -376,7 +485,12 @@ impl MemoryContentDistributionRequestRepository {
                     })
                 }
             })
-            .ok_or_else(|| AppError::conflict("publication format is not available"))?;
+            .ok_or_else(|| {
+                classified_request_failure(
+                    ContentRequestDeferralReason::ConnectorUnavailable,
+                    AppError::conflict("publication format is not available"),
+                )
+            })?;
         if !authority
             .connectors
             .history(scope.operator_id, &key)
@@ -384,13 +498,21 @@ impl MemoryContentDistributionRequestRepository {
             .iter()
             .any(|proof| proof.content_type == proof_format)
         {
-            return Err(AppError::conflict("publication format is not available"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ConnectorUnavailable,
+                AppError::conflict("publication format is not available"),
+            ));
         }
         let revision = authority
             .content
             .get_revision(scope, request.content_asset_id, request.content_revision_id)
             .await?
-            .ok_or_else(|| AppError::conflict("publication revision unavailable"))?;
+            .ok_or_else(|| {
+                classified_request_failure(
+                    ContentRequestDeferralReason::ContentNotReady,
+                    AppError::conflict("publication revision unavailable"),
+                )
+            })?;
         if revision != *accepted_revision
             || revision.findings.iter().any(|finding| finding.blocking)
             || !authority
@@ -403,11 +525,17 @@ impl MemoryContentDistributionRequestRepository {
                         && !check.findings.iter().any(|finding| finding.blocking)
                 })
         {
-            return Err(AppError::conflict("independent content check unavailable"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ContentNotReady,
+                AppError::conflict("independent content check unavailable"),
+            ));
         }
         let sources = authority.knowledge.list_sources(scope).await?;
         if revision.evidence.is_empty() || revision.quotes.is_empty() {
-            return Err(AppError::conflict("publication requires public evidence"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::SourceUnavailable,
+                AppError::conflict("publication requires public evidence"),
+            ));
         }
         for reference in &revision.evidence {
             let source = sources.iter().find(|source| {
@@ -415,18 +543,32 @@ impl MemoryContentDistributionRequestRepository {
                     && source.state == SourceState::Active
                     && source.purpose == KnowledgePurpose::Public
             });
-            let source =
-                source.ok_or_else(|| AppError::conflict("publication source is not public"))?;
+            let source = source.ok_or_else(|| {
+                classified_request_failure(
+                    ContentRequestDeferralReason::SourceUnavailable,
+                    AppError::conflict("publication source is not public"),
+                )
+            })?;
             let detail = authority
                 .knowledge
                 .get_source_detail(scope, source.source_id)
                 .await?
-                .ok_or_else(|| AppError::conflict("publication source unavailable"))?;
+                .ok_or_else(|| {
+                    classified_request_failure(
+                        ContentRequestDeferralReason::SourceUnavailable,
+                        AppError::conflict("publication source unavailable"),
+                    )
+                })?;
             let quote = revision
                 .quotes
                 .iter()
                 .find(|quote| quote.reference == *reference)
-                .ok_or_else(|| AppError::conflict("publication quote unavailable"))?;
+                .ok_or_else(|| {
+                    classified_request_failure(
+                        ContentRequestDeferralReason::SourceUnavailable,
+                        AppError::conflict("publication quote unavailable"),
+                    )
+                })?;
             if !detail.chunks.iter().any(|chunk| {
                 Some(chunk.chunk_id) == reference.chunk_id
                     && chunk.source_version_id == reference.source_version_id
@@ -442,7 +584,10 @@ impl MemoryContentDistributionRequestRepository {
                             == quote.exact_quote
                     }
             }) {
-                return Err(AppError::conflict("publication quote changed"));
+                return Err(classified_request_failure(
+                    ContentRequestDeferralReason::SourceUnavailable,
+                    AppError::conflict("publication quote changed"),
+                ));
             }
         }
         Ok(revision)
@@ -529,6 +674,7 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
             ));
         }
         request.publication_intent_id = Some(intent_id);
+        request.materialization_deferral = None;
         Ok(request.clone())
     }
 
@@ -537,44 +683,58 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
         scope: &TenantScope,
         request_id: Uuid,
     ) -> Result<ContentDistributionRequest, AppError> {
-        // Validate against live authorities without holding the request write
-        // lock through independent repository I/O. The accepted revision is
-        // immutable; the second read below serializes only linking and the
-        // shared distribution write (request → distribution lock order).
-        let (request, revision) = {
-            let state = self.state.read().await;
-            let request = state_get(&state, scope, request_id)?;
-            if request.publication_intent_id.is_some() {
-                return Ok(request);
+        let result: Result<_, ContentRequestMaterializationFailure> = async {
+            // Validate against live authorities without holding the request write
+            // lock through independent repository I/O. The accepted revision is
+            // immutable; the second read below serializes only linking and the
+            // shared distribution write (request → distribution lock order).
+            let (request, revision) = {
+                let state = self.state.read().await;
+                let request = state_get(&state, scope, request_id)?;
+                if request.publication_intent_id.is_some() {
+                    return Ok(request);
+                }
+                let revision = state
+                    .revisions
+                    .get(&(scope.clone(), request_id))
+                    .ok_or_else(|| AppError::not_found("accepted revision not found"))?
+                    .clone();
+                (request, revision)
+            };
+            let revision = self.check_live(&request, &revision).await?;
+            let mut state = self.state.write().await;
+            let latest = state_get(&state, scope, request_id)?;
+            if latest.publication_intent_id.is_some() {
+                return Ok(latest);
             }
-            let revision = state
-                .revisions
-                .get(&(scope.clone(), request_id))
-                .ok_or_else(|| AppError::not_found("accepted revision not found"))?
-                .clone();
-            (request, revision)
-        };
-        let revision = self.check_live(&request, &revision).await?;
-        let mut state = self.state.write().await;
-        let latest = state_get(&state, scope, request_id)?;
-        if latest.publication_intent_id.is_some() {
-            return Ok(latest);
+            if latest.request_hash != request.request_hash
+                || latest.content_revision_id != request.content_revision_id
+            {
+                return Err(
+                    AppError::conflict("accepted request changed during validation").into(),
+                );
+            }
+            let intent = self
+                .distribution
+                .materialize_accepted_request(scope, &request, &revision)
+                .await?;
+            let saved = state
+                .by_id
+                .get_mut(&(scope.clone(), request_id))
+                .expect("held request row");
+            saved.publication_intent_id = Some(intent.intent_id);
+            saved.materialization_deferral = None;
+            Ok(saved.clone())
         }
-        if latest != request {
-            return Err(AppError::conflict(
-                "accepted request changed during validation",
-            ));
+        .await;
+        match result {
+            Ok(request) => Ok(request),
+            Err(failure) => {
+                self.record_deferral(scope, request_id, failure.reason)
+                    .await;
+                Err(failure.error)
+            }
         }
-        let intent = self
-            .distribution
-            .materialize_accepted_request(scope, &request, &revision)
-            .await?;
-        let saved = state
-            .by_id
-            .get_mut(&(scope.clone(), request_id))
-            .expect("held request row");
-        saved.publication_intent_id = Some(intent.intent_id);
-        Ok(saved.clone())
     }
 
     async fn list_unlinked(
@@ -591,6 +751,10 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
             .values()
             .filter(|request| {
                 request.publication_intent_id.is_none()
+                    && request
+                        .materialization_deferral
+                        .as_ref()
+                        .is_none_or(|deferral| deferral.next_retry_at <= Utc::now())
                     && after_request_id.is_none_or(|after| request.request_id > after)
             })
             .cloned()
@@ -623,6 +787,24 @@ mod tests {
     };
 
     struct TestLookup(PublicationBundle);
+
+    #[test]
+    fn deferral_delay_grows_and_caps_without_a_terminal_retry_state() {
+        let now = Utc::now();
+        let mut previous = None;
+        for attempt in 1..=12 {
+            let current = next_request_deferral(
+                ContentRequestDeferralReason::ContentNotReady,
+                previous.as_ref(),
+                now,
+            );
+            assert_eq!(current.attempts, attempt);
+            let expected = (2_i64 * (1_i64 << (attempt - 1).min(8))).min(300);
+            assert_eq!((current.next_retry_at - now).num_seconds(), expected);
+            previous = Some(current);
+        }
+        assert_eq!(previous.unwrap().attempts, 12);
+    }
 
     #[async_trait]
     impl ContentDistributionIntentLookup for TestLookup {
@@ -795,6 +977,103 @@ mod tests {
         assert_eq!(
             repository.accept(&another, input).await.unwrap_err().code,
             ErrorCode::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_memory_requests_keep_only_allowlisted_reasons_and_due_paging() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let (input, bundle) = fixture(&scope);
+        let intent_id = bundle.intent.intent_id;
+        let repository =
+            MemoryContentDistributionRequestRepository::new(Arc::new(TestLookup(bundle)));
+        let first = repository.accept(&scope, input.clone()).await.unwrap();
+        assert!(
+            serde_json::to_string(&first)
+                .unwrap()
+                .find("materialization_deferral")
+                .is_none()
+        );
+        let error = repository
+            .materialize(&scope, first.request_id)
+            .await
+            .unwrap_err();
+        let deferred = repository.get(&scope, first.request_id).await.unwrap();
+        assert_eq!(
+            deferred.materialization_deferral.as_ref().unwrap().reason,
+            ContentRequestDeferralReason::TemporaryFailure
+        );
+        assert_eq!(
+            deferred.materialization_deferral.as_ref().unwrap().attempts,
+            1
+        );
+        let json = serde_json::to_string(&deferred).unwrap();
+        assert!(json.contains("temporary_failure"));
+        assert!(!json.contains(&error.message));
+
+        let mut second_input = input;
+        second_input.idempotency_key = "second-key".into();
+        let second = repository.accept(&scope, second_input).await.unwrap();
+        let due = repository.list_unlinked(None, 100).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].request_id, second.request_id);
+        assert!(
+            repository
+                .list_unlinked(Some(second.request_id), 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Expiring the clock is enough for automatic recovery; no terminal
+        // status or explicit retry toggle is needed.
+        repository
+            .state
+            .write()
+            .await
+            .by_id
+            .get_mut(&(scope.clone(), first.request_id))
+            .unwrap()
+            .materialization_deferral
+            .as_mut()
+            .unwrap()
+            .next_retry_at = Utc::now() - chrono::Duration::seconds(1);
+        assert!(
+            repository
+                .list_unlinked(None, 100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.request_id == first.request_id)
+        );
+        let linked = repository
+            .link_intent(&scope, first.request_id, intent_id)
+            .await
+            .unwrap();
+        assert!(linked.materialization_deferral.is_none());
+        // Model a slow, already-failed validator reaching persistence after
+        // another task completed the link. The stale result cannot regress it.
+        repository
+            .record_deferral(
+                &scope,
+                first.request_id,
+                ContentRequestDeferralReason::InternalError,
+            )
+            .await;
+        let still_linked = repository.get(&scope, first.request_id).await.unwrap();
+        assert_eq!(still_linked.publication_intent_id, Some(intent_id));
+        assert!(still_linked.materialization_deferral.is_none());
+        assert!(
+            repository
+                .list_unlinked(None, 100)
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.request_id != first.request_id)
         );
     }
 

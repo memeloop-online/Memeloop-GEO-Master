@@ -138,7 +138,14 @@ pub async fn accept_content_distribution_request(
                 error_code = ?error.code,
                 "single-article request accepted but not yet materialized"
             );
-            Ok(accepted)
+            // Materialization records a bounded reason and retry schedule in
+            // the already accepted row. Keep the durable receipt even if the
+            // follow-up scoped read is temporarily unavailable.
+            Ok(state
+                .content_distribution_request_repository()
+                .get(scope, accepted.request_id)
+                .await
+                .unwrap_or(accepted))
         }
     }
 }

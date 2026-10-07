@@ -164,6 +164,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 38,
         description: "independent publication origin",
     },
+    MigrationMetadata {
+        version: 39,
+        description: "content request deferrals",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

@@ -3,11 +3,12 @@ use chrono::Utc;
 use geo_domain::{
     AcceptContentDistributionRequest, CHANNEL_VARIANT_POLICY, ChannelAccount, ChannelJobRepository,
     ChannelOwnerKind, ChannelStatus, ChannelVariant, ChunkLocator, ContentBlock, ContentBlockKind,
-    ContentCheck, ContentDistributionRequestRepository, ContentEvidence, ContentRevision,
-    DistributionRepository, ErrorCode, EvidenceRef, InitialSource, InitialSourceKind,
-    InitialSourceVisibility, IntentVerification, ProjectCreate, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, PublicationIntent, PublicationOrigin, StructuredDocument,
-    TEXT_DISTRIBUTION_FORMAT, TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
+    ContentCheck, ContentDistributionRequestRepository, ContentEvidence,
+    ContentRequestDeferralReason, ContentRevision, DistributionRepository, ErrorCode, EvidenceRef,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, IntentVerification, ProjectCreate,
+    ProjectRepository, ProjectSettings, ProjectStartCommand, PublicationIntent, PublicationOrigin,
+    StructuredDocument, TEXT_DISTRIBUTION_FORMAT, TenantScope, hash_idempotency_key, settings_hash,
+    start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgChannelJobRepository, PgContentDistributionRequestRepository,
@@ -651,11 +652,95 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             .iter()
             .any(|request| request.request_id == first.request_id)
     );
+    sqlx::query(
+        "UPDATE connector_capability_settings SET enabled=false \
+         WHERE operator_id=$1 AND platform_id='platform' AND placement_slot='primary'",
+    )
+    .bind(operator)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        repository
+            .materialize(&scope, first.request_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    // A new repository instance observes the same persisted, allowlisted
+    // diagnosis, but the due scan skips this request until its short retry.
+    let restarted = PgContentDistributionRequestRepository::from_database(&database);
+    let deferred = restarted.get(&scope, first.request_id).await.unwrap();
+    let deferral = deferred.materialization_deferral.unwrap();
+    assert_eq!(
+        deferral.reason,
+        ContentRequestDeferralReason::ConnectorUnavailable
+    );
+    assert_eq!(deferral.attempts, 1);
+    assert!(deferral.next_retry_at > first.created_at);
+    // Pin the future due time for a timing-independent paging assertion.
+    sqlx::query(
+        "UPDATE content_distribution_requests \
+         SET materialization_next_retry_at=clock_timestamp()+interval '1 hour' \
+         WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND request_id=$4",
+    )
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .bind(first.request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let due = restarted.list_unlinked(None, 100).await.unwrap();
+    assert!(
+        due.iter()
+            .all(|request| request.request_id != first.request_id)
+    );
+    assert!(
+        due.iter()
+            .any(|request| request.request_id == second_request.request_id)
+    );
+    sqlx::query(
+        "UPDATE connector_capability_settings SET enabled=true \
+         WHERE operator_id=$1 AND platform_id='platform' AND placement_slot='primary'",
+    )
+    .bind(operator)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    // Direct recheck is allowed after restoring the prerequisite, without
+    // accepting another request or waiting for the automatic retry clock.
     let materialized = repository
         .materialize(&scope, first.request_id)
         .await
         .unwrap();
+    assert!(materialized.materialization_deferral.is_none());
     let first_intent = materialized.publication_intent_id.unwrap();
+    // A stale failure writer's scoped, unlinked-only update cannot alter the
+    // completed link. This uses the same predicate as record_deferral.
+    let stale = sqlx::query(
+        "UPDATE content_distribution_requests SET materialization_reason='internal_error', \
+         materialization_attempts=1,materialization_next_retry_at=clock_timestamp()+interval '2 seconds' \
+         WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND request_id=$4 \
+           AND publication_intent_id IS NULL",
+    )
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .bind(first.request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stale.rows_affected(), 0);
+    assert!(
+        repository
+            .get(&scope, first.request_id)
+            .await
+            .unwrap()
+            .materialization_deferral
+            .is_none()
+    );
     assert_eq!(
         repository
             .materialize(&scope, first.request_id)
@@ -764,6 +849,16 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             .code,
         ErrorCode::Conflict
     );
+    assert_eq!(
+        repository
+            .get(&scope, unsupported.request_id)
+            .await
+            .unwrap()
+            .materialization_deferral
+            .unwrap()
+            .reason,
+        ContentRequestDeferralReason::FormatUnsupported
+    );
     sqlx::query(
         "UPDATE knowledge_sources SET purpose='internal' \
          WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND source_id=$4",
@@ -793,6 +888,16 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             .unwrap()
             .publication_intent_id,
         None
+    );
+    assert_eq!(
+        repository
+            .get(&scope, revoked.request_id)
+            .await
+            .unwrap()
+            .materialization_deferral
+            .unwrap()
+            .reason,
+        ContentRequestDeferralReason::SourceUnavailable
     );
 }
 

@@ -7,7 +7,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 const PAGE_SIZE: usize = 100;
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn spawn(state: AppState) {
     let repository = state.content_distribution_request_repository();
@@ -173,6 +173,7 @@ mod tests {
                     idempotency_key_hash: "fixture".into(),
                     request_hash: "fixture".into(),
                     publication_intent_id: None,
+                    materialization_deferral: None,
                     created_at: chrono::Utc::now(),
                 })
                 .collect(),

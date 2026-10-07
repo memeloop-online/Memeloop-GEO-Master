@@ -2,9 +2,11 @@ use async_trait::async_trait;
 use geo_domain::{
     AcceptContentDistributionRequest, AppError, ChannelAccount, ChannelStatus, ChannelVariant,
     ContentCheck, ContentDistributionRequest, ContentDistributionRequestRepository,
+    ContentRequestDeferral, ContentRequestDeferralReason, ContentRequestMaterializationFailure,
     ContentRevision, ErrorCode, PlatformPlacement, PoolAccount, PublicationIntent, TenantScope,
-    distribution_request_key_hash, prepare_content_distribution_request,
-    prepare_request_publication_intent, prepare_variant, validate_distribution_request_intent,
+    classified_request_failure, distribution_request_key_hash,
+    prepare_content_distribution_request, prepare_request_publication_intent, prepare_variant,
+    validate_distribution_request_intent,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -30,6 +32,35 @@ impl PgContentDistributionRequestRepository {
         let mut tx = self.pool.begin().await.map_err(db)?;
         crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
         Ok(tx)
+    }
+
+    /// Called only after the materialization transaction has been dropped.
+    /// A concurrent successful link wins over this stale failure.
+    async fn record_deferral(
+        &self,
+        scope: &TenantScope,
+        request_id: Uuid,
+        reason: ContentRequestDeferralReason,
+    ) -> Result<(), AppError> {
+        let mut tx = self.transaction(scope).await?;
+        sqlx::query(
+            "UPDATE content_distribution_requests SET materialization_reason=$1, \
+             materialization_next_retry_at=clock_timestamp() + \
+                 make_interval(secs => LEAST(300, 2 * (1 << LEAST(materialization_attempts,8)))), \
+             materialization_attempts=LEAST(materialization_attempts + 1, 1000000) \
+             WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 AND request_id=$5 \
+               AND publication_intent_id IS NULL",
+        )
+        .bind(reason.as_str())
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(request_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
     }
 }
 
@@ -66,13 +97,27 @@ pub(crate) fn read_request(row: &sqlx::postgres::PgRow) -> ContentDistributionRe
         idempotency_key_hash: row.get("idempotency_key_hash"),
         request_hash: row.get("request_hash"),
         publication_intent_id: row.get("publication_intent_id"),
+        materialization_deferral: row.get::<Option<String>, _>("materialization_reason").map(
+            |reason| {
+                let reason = serde_json::from_value::<ContentRequestDeferralReason>(
+                    serde_json::Value::String(reason),
+                )
+                .expect("materialization reason constrained by migration");
+                ContentRequestDeferral {
+                    reason,
+                    attempts: row.get::<i32, _>("materialization_attempts") as u32,
+                    next_retry_at: row.get("materialization_next_retry_at"),
+                }
+            },
+        ),
         created_at: row.get("created_at"),
     }
 }
 
 pub(crate) const REQUEST_COLUMNS: &str = "request_id,operator_id,tenant_id,project_id,schema_version,\
 content_revision_id,content_asset_id,platform_id,placement_slot,account_id,account_owner_kind,\
-format,idempotency_key_hash,request_hash,publication_intent_id,created_at";
+format,idempotency_key_hash,request_hash,publication_intent_id,materialization_reason,\
+materialization_attempts,materialization_next_retry_at,created_at";
 
 fn decode<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> Result<T, AppError> {
     serde_json::from_value(json)
@@ -87,7 +132,7 @@ async fn live_request_account(
     tx: &mut Transaction<'_, Postgres>,
     scope: &TenantScope,
     request: &ContentDistributionRequest,
-) -> Result<(), AppError> {
+) -> Result<(), ContentRequestMaterializationFailure> {
     let metadata: Option<serde_json::Value> = if request.account_owner_kind == "customer" {
         sqlx::query_scalar(
             "SELECT metadata FROM channel_accounts WHERE operator_id=$1 AND tenant_id=$2 \
@@ -118,7 +163,10 @@ async fn live_request_account(
         .map_err(db)?
     };
     let Some(metadata) = metadata else {
-        return Err(AppError::conflict("publication account is not assigned"));
+        return Err(classified_request_failure(
+            ContentRequestDeferralReason::AccountUnavailable,
+            AppError::conflict("publication account is not assigned"),
+        ));
     };
     let account: ChannelAccount = if request.account_owner_kind == "customer" {
         decode(metadata)?
@@ -131,7 +179,10 @@ async fn live_request_account(
         || !account.enabled
         || account.status != ChannelStatus::Ready
     {
-        return Err(AppError::conflict("publication account is not ready"));
+        return Err(classified_request_failure(
+            ContentRequestDeferralReason::AccountUnavailable,
+            AppError::conflict("publication account is not ready"),
+        ));
     }
     Ok(())
 }
@@ -140,9 +191,12 @@ async fn live_request_evidence(
     tx: &mut Transaction<'_, Postgres>,
     scope: &TenantScope,
     revision: &ContentRevision,
-) -> Result<(), AppError> {
+) -> Result<(), ContentRequestMaterializationFailure> {
     if revision.evidence.is_empty() || revision.quotes.is_empty() {
-        return Err(AppError::conflict("publication requires public evidence"));
+        return Err(classified_request_failure(
+            ContentRequestDeferralReason::SourceUnavailable,
+            AppError::conflict("publication requires public evidence"),
+        ));
     }
     let mut versions = std::collections::BTreeSet::new();
     for reference in &revision.evidence {
@@ -163,12 +217,20 @@ async fn live_request_evidence(
         .fetch_optional(&mut **tx)
         .await
         .map_err(db)?
-        .ok_or_else(|| AppError::conflict("publication source is unavailable"))?;
+        .ok_or_else(|| {
+            classified_request_failure(
+                ContentRequestDeferralReason::SourceUnavailable,
+                AppError::conflict("publication source is unavailable"),
+            )
+        })?;
         if row.get::<Option<Uuid>, _>("current_version_id") != Some(version)
             || row.get::<String, _>("state") != "active"
             || row.get::<String, _>("purpose") != "public"
         {
-            return Err(AppError::conflict("publication source is no longer public"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::SourceUnavailable,
+                AppError::conflict("publication source is no longer public"),
+            ));
         }
     }
     for reference in &revision.evidence {
@@ -176,10 +238,18 @@ async fn live_request_evidence(
             .quotes
             .iter()
             .find(|quote| quote.reference == *reference)
-            .ok_or_else(|| AppError::conflict("publication evidence quote missing"))?;
-        let chunk_id = reference
-            .chunk_id
-            .ok_or_else(|| AppError::conflict("publication evidence chunk missing"))?;
+            .ok_or_else(|| {
+                classified_request_failure(
+                    ContentRequestDeferralReason::SourceUnavailable,
+                    AppError::conflict("publication evidence quote missing"),
+                )
+            })?;
+        let chunk_id = reference.chunk_id.ok_or_else(|| {
+            classified_request_failure(
+                ContentRequestDeferralReason::SourceUnavailable,
+                AppError::conflict("publication evidence chunk missing"),
+            )
+        })?;
         let row = sqlx::query(
             "SELECT text,locator FROM knowledge_chunks \
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
@@ -193,7 +263,12 @@ async fn live_request_evidence(
         .fetch_optional(&mut **tx)
         .await
         .map_err(db)?
-        .ok_or_else(|| AppError::conflict("publication evidence chunk unavailable"))?;
+        .ok_or_else(|| {
+            classified_request_failure(
+                ContentRequestDeferralReason::SourceUnavailable,
+                AppError::conflict("publication evidence chunk unavailable"),
+            )
+        })?;
         let text: String = row.get("text");
         let expected = if matches!(reference.locator, geo_domain::ChunkLocator::Csv { .. }) {
             text
@@ -206,7 +281,10 @@ async fn live_request_evidence(
             || expected != quote.exact_quote
             || quote.exact_quote.chars().count() > geo_domain::CONTENT_EVIDENCE_MAX_QUOTE_CHARS
         {
-            return Err(AppError::conflict("publication evidence quote has changed"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::SourceUnavailable,
+                AppError::conflict("publication evidence quote has changed"),
+            ));
         }
     }
     Ok(())
@@ -391,7 +469,8 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             ));
         }
         let query = format!(
-            "UPDATE content_distribution_requests SET publication_intent_id=$1 \
+            "UPDATE content_distribution_requests SET publication_intent_id=$1, \
+             materialization_reason=NULL, materialization_attempts=0, materialization_next_retry_at=NULL \
              WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 AND request_id=$5 \
              RETURNING {REQUEST_COLUMNS}"
         );
@@ -413,6 +492,7 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         scope: &TenantScope,
         request_id: Uuid,
     ) -> Result<ContentDistributionRequest, AppError> {
+        let result: Result<_, ContentRequestMaterializationFailure> = async {
         let mut tx = self.transaction(scope).await?;
         let project_id = project(scope)?;
         // Same project lock/order as cycle materialize: separate requests
@@ -429,7 +509,10 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .map_err(db)?;
         let status = status.ok_or_else(|| AppError::not_found("project not found"))?;
         if matches!(status.as_str(), "paused" | "archived") {
-            return Err(AppError::conflict("project is not active"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ProjectPaused,
+                AppError::conflict("project is not active"),
+            ));
         }
         let query = format!(
             "SELECT {REQUEST_COLUMNS} FROM content_distribution_requests \
@@ -450,7 +533,10 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             return Ok(request);
         }
         if request.format != geo_domain::TEXT_DISTRIBUTION_FORMAT {
-            return Err(AppError::conflict("publication format is not supported"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::FormatUnsupported,
+                AppError::conflict("publication format is not supported"),
+            ));
         }
         live_request_account(&mut tx, scope, &request).await?;
         // An account login is not format proof. The independent persisted
@@ -483,10 +569,16 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .await
         .map_err(db)?;
         let Some(configured) = configured else {
-            return Err(AppError::conflict("publication format is not available"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ConnectorUnavailable,
+                AppError::conflict("publication format is not available"),
+            ));
         };
         if !configured.get::<bool, _>("enabled") {
-            return Err(AppError::conflict("publication connector is disabled"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ConnectorUnavailable,
+                AppError::conflict("publication connector is disabled"),
+            ));
         }
         let types: Vec<String> = decode(configured.get("content_types"))?;
         let proof_format = if types
@@ -500,7 +592,10 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         }) {
             semantic.as_deref().expect("recognized semantic type")
         } else {
-            return Err(AppError::conflict("publication format is not available"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ConnectorUnavailable,
+                AppError::conflict("publication format is not available"),
+            ));
         };
         let has_proof: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM connector_capability_verifications \
@@ -515,8 +610,9 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .await
         .map_err(db)?;
         if !has_proof {
-            return Err(AppError::conflict(
-                "publication format has no verified connector",
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ConnectorUnavailable,
+                AppError::conflict("publication format has no verified connector"),
             ));
         }
         let row = sqlx::query(
@@ -535,7 +631,10 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .fetch_optional(&mut *tx)
         .await
         .map_err(db)?
-        .ok_or_else(|| AppError::conflict("independent content check is missing"))?;
+        .ok_or_else(|| classified_request_failure(
+            ContentRequestDeferralReason::ContentNotReady,
+            AppError::conflict("independent content check is missing"),
+        ))?;
         let mut revision: ContentRevision = decode(row.get("revision_body"))?;
         let check: ContentCheck = decode(row.get("check_body"))?;
         if revision.revision_id != request.content_revision_id
@@ -543,14 +642,18 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             || check.revision_id != revision.revision_id
             || check.findings.iter().any(|finding| finding.blocking)
         {
-            return Err(AppError::conflict(
-                "content revision has no passing independent check",
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ContentNotReady,
+                AppError::conflict("content revision has no passing independent check"),
             ));
         }
         revision.findings = check.findings;
         revision.document.validate(&revision.evidence)?;
         if revision.markdown != revision.document.markdown() {
-            return Err(AppError::conflict("content revision markdown differs"));
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::ContentNotReady,
+                AppError::conflict("content revision markdown differs"),
+            ));
         }
         live_request_evidence(&mut tx, scope, &revision).await?;
         let placement = PlatformPlacement {
@@ -577,7 +680,7 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .map_err(db)?;
         if let Some(stored) = existing_variant {
             if decode::<ChannelVariant>(stored)? != variant {
-                return Err(AppError::conflict("variant identity differs"));
+                return Err(AppError::conflict("variant identity differs").into());
             }
         } else {
             sqlx::query(
@@ -626,7 +729,7 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
                         .get::<Option<Uuid>, _>("origin_target_id")
                         .unwrap_or(Uuid::nil())
             {
-                return Err(AppError::conflict("existing publication identity differs"));
+                return Err(AppError::conflict("existing publication identity differs").into());
             }
             prior
         } else {
@@ -667,7 +770,8 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         // intent/command, including when it is claimed, unknown or verified.
         validate_distribution_request_intent(&request, &intent, &variant)?;
         let query = format!(
-            "UPDATE content_distribution_requests SET publication_intent_id=$1 \
+            "UPDATE content_distribution_requests SET publication_intent_id=$1, \
+             materialization_reason=NULL, materialization_attempts=0, materialization_next_retry_at=NULL \
              WHERE operator_id=$2 AND tenant_id=$3 AND project_id=$4 \
                 AND request_id=$5 AND publication_intent_id IS NULL RETURNING {REQUEST_COLUMNS}"
         );
@@ -682,6 +786,17 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             .map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(read_request(&linked))
+        }.await;
+        match result {
+            Ok(request) => Ok(request),
+            Err(failure) => {
+                // `result`'s async block has already dropped the uncommitted
+                // transaction before opening this independent write.
+                self.record_deferral(scope, request_id, failure.reason)
+                    .await?;
+                Err(failure.error)
+            }
+        }
     }
 
     async fn list_unlinked(
@@ -697,6 +812,7 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         let query = format!(
             "SELECT {REQUEST_COLUMNS} FROM content_distribution_requests \
              WHERE publication_intent_id IS NULL \
+                AND (materialization_next_retry_at IS NULL OR materialization_next_retry_at<=clock_timestamp()) \
                 AND ($1::uuid IS NULL OR request_id>$1) \
              ORDER BY request_id LIMIT $2"
         );

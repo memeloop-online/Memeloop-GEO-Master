@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -532,6 +532,78 @@ describe("ContentDistributionPanel", () => {
     mount({ path: "/?distribution_request_id=request-1" });
     expect(await screen.findByText("发布请求已提交")).toBeTruthy();
     expect(window.sessionStorage.length).toBe(1);
+    expect(submitContentDistributionRequest).not.toHaveBeenCalled();
+  });
+
+  it("refreshes a deferred unlinked request until it links, without another POST", async () => {
+    vi.useFakeTimers();
+    const deferred = {
+      reason: "account_unavailable",
+      attempts: 1,
+      next_retry_at: "2026-11-01T09:30:00Z",
+    };
+    vi.mocked(getContentDistributionRequest)
+      .mockResolvedValueOnce({
+        ...receipt,
+        materialization_deferral: deferred,
+      } as never)
+      .mockResolvedValueOnce({
+        ...receipt,
+        publication_intent_id: "intent-1",
+        materialization_deferral: deferred,
+      } as never);
+    let mounted: ReturnType<typeof mount> | undefined;
+    try {
+      mounted = mount({ path: "/?distribution_request_id=request-1" });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText(/发布账号暂不可用/)).toBeTruthy();
+      expect(screen.getByText(/下次自动检查/)).toBeTruthy();
+      expect(screen.queryByText("等待发布")).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(getContentDistributionRequest).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText(/发布账号暂不可用/)).toBeNull();
+      expect(screen.getByText("等待发布")).toBeTruthy();
+      expect(submitContentDistributionRequest).not.toHaveBeenCalled();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(getContentDistributionRequest).toHaveBeenCalledTimes(2);
+    } finally {
+      mounted?.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("suppresses a stale deferral when already linked and handles unknown codes safely", async () => {
+    vi.mocked(getContentDistributionRequest).mockResolvedValueOnce({
+      ...receipt,
+      publication_intent_id: "intent-1",
+      materialization_deferral: {
+        reason: "connector_unavailable",
+        attempts: 2,
+        next_retry_at: "2026-11-01T09:30:00Z",
+      },
+    } as never);
+    const mounted = mount({ path: "/?distribution_request_id=request-1" });
+    expect(await screen.findByText("等待发布")).toBeTruthy();
+    expect(screen.queryByText(/发布渠道暂不可用/)).toBeNull();
+    mounted.unmount();
+    vi.mocked(getContentDistributionRequest).mockResolvedValueOnce({
+      ...receipt,
+      materialization_deferral: {
+        reason: "new_unknown_reason",
+        attempts: 1,
+        next_retry_at: "invalid date",
+      },
+    } as never);
+    mount({ path: "/?distribution_request_id=request-1" });
+    expect(await screen.findByText(/发布暂未准备好/)).toBeTruthy();
+    expect(screen.queryByText(/new_unknown_reason|下次自动检查/)).toBeNull();
     expect(submitContentDistributionRequest).not.toHaveBeenCalled();
   });
 

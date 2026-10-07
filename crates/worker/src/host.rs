@@ -28,6 +28,7 @@ use uuid::Uuid;
 // The canonical domain vocabulary the surface speaks.  Re-exported so an
 // implementation of [`HostOps`] needs one import path, and so the worker never
 // grows a parallel set of types for the same concepts.
+pub use geo_domain::ContentRequestDeferral;
 use geo_domain::{
     AppError, AttachmentReference, ContentCoverage, ContentExecutionStatus, ContentItemStatus,
     DistributionTargetStatus, ImportStatus, KnowledgePurpose, PublicationLookupFinding,
@@ -359,7 +360,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v16";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v17";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1827,6 +1828,10 @@ pub struct ContentDistributeRef {
     pub format: String,
     pub status: String,
     pub publication_intent_id: Option<Uuid>,
+    /// Typed recovery metadata only. Never expose repository, SQL, provider
+    /// or connector error text through a model-visible receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_deferral: Option<ContentRequestDeferral>,
     /// These fields are present only when the existing ledger has an actual
     /// materialized channel target and send attempt. They are not inferred
     /// from request acceptance or outbox creation.
@@ -3938,6 +3943,75 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn single_article_deferral_is_optional_typed_and_has_no_secret_output() {
+        let receipt = ContentDistributeRef {
+            request_id: Uuid::new_v4(),
+            content_asset_id: Uuid::new_v4(),
+            content_revision_id: Uuid::new_v4(),
+            account_id: Uuid::new_v4(),
+            platform_id: "generic".into(),
+            placement_slot: "article".into(),
+            format: "markdown.v1".into(),
+            status: "accepted".into(),
+            publication_intent_id: None,
+            materialization_deferral: None,
+            channel_target_id: None,
+            attempt_id: None,
+            outcome: None,
+            fixture: None,
+        };
+        let legacy = serde_json::to_value(&receipt).unwrap();
+        assert!(legacy.get("materialization_deferral").is_none());
+        assert_eq!(
+            serde_json::from_value::<ContentDistributeRef>(legacy).unwrap(),
+            receipt
+        );
+
+        let expected_reasons = [
+            "project_paused",
+            "account_unavailable",
+            "connector_unavailable",
+            "content_not_ready",
+            "source_unavailable",
+            "format_unsupported",
+            "temporary_failure",
+            "internal_error",
+        ];
+        for reason in expected_reasons {
+            let mut raw = serde_json::to_value(&receipt).unwrap();
+            raw["materialization_deferral"] = serde_json::json!({
+                "reason": reason,
+                "attempts": 2,
+                "next_retry_at": "2026-01-02T03:04:05Z"
+            });
+            let projected: ContentDistributeRef = serde_json::from_value(raw).unwrap();
+            let visible = serde_json::to_value(projected).unwrap();
+            assert_eq!(visible["status"], "accepted");
+            assert_eq!(visible["materialization_deferral"]["reason"], reason);
+            assert_eq!(visible["materialization_deferral"]["attempts"], 2);
+            assert_eq!(
+                visible["materialization_deferral"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["attempts", "next_retry_at", "reason"]
+            );
+            assert!(!visible.to_string().contains("sql"));
+            assert!(!visible.to_string().contains("credential"));
+            assert!(!visible.to_string().contains("provider"));
+        }
+        let mut unknown = serde_json::to_value(&receipt).unwrap();
+        unknown["materialization_deferral"] = serde_json::json!({
+            "reason": "provider_error",
+            "attempts": 1,
+            "next_retry_at": "2026-01-02T03:04:05Z"
+        });
+        assert!(serde_json::from_value::<ContentDistributeRef>(unknown).is_err());
     }
 
     #[test]

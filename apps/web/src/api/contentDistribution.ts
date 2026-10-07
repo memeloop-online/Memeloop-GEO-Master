@@ -2,6 +2,15 @@ import { apiFetch } from "./client";
 import type { ContentRevision, RichNode } from "./content";
 
 export type DistributionFormat = "markdown.v1" | "rich_markdown.v2";
+export type MaterializationDeferralReason =
+  | "project_paused"
+  | "account_unavailable"
+  | "connector_unavailable"
+  | "content_not_ready"
+  | "source_unavailable"
+  | "format_unsupported"
+  | "temporary_failure"
+  | "internal_error";
 
 export interface ContentDistributionInput {
   content_asset_id: string;
@@ -24,6 +33,11 @@ export interface ContentDistributionRequest extends ContentDistributionInput {
   idempotency_key_hash: string;
   request_hash: string;
   publication_intent_id: string | null;
+  materialization_deferral?: {
+    reason: MaterializationDeferralReason | (string & {});
+    attempts: number;
+    next_retry_at: string;
+  } | null;
   created_at: string;
 }
 

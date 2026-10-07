@@ -460,6 +460,17 @@ async fn accepted_request_freezes_revision_and_account_without_claiming_delivery
     assert_eq!(first["platform_id"], "generic");
     assert_eq!(first["account_owner_kind"], "customer");
     assert_eq!(first["publication_intent_id"], Value::Null);
+    assert_eq!(
+        first["materialization_deferral"]["reason"],
+        "connector_unavailable"
+    );
+    assert_eq!(first["materialization_deferral"]["attempts"], 1);
+    assert!(first["materialization_deferral"]["next_retry_at"].is_string());
+    assert!(
+        !first
+            .to_string()
+            .contains("publication format is not available")
+    );
     let id = first["request_id"].as_str().unwrap();
     let (again_status, again) = f.post(Some("stable"), f.body()).await;
     assert_eq!(again_status, StatusCode::ACCEPTED);
@@ -641,6 +652,17 @@ async fn builder_authority_overrides_are_fresh_without_mutating_sibling_state() 
             .code,
         geo_domain::ErrorCode::Conflict
     );
+    assert_eq!(
+        f.state
+            .content_distribution_request_repository()
+            .get(&f.scope, id)
+            .await
+            .unwrap()
+            .materialization_deferral
+            .unwrap()
+            .reason,
+        geo_domain::ContentRequestDeferralReason::ConnectorUnavailable
+    );
     let original_distribution = f.state.distribution_repository();
     let fork_distribution = Arc::new(MemoryDistributionRepository::default());
     let fork = f
@@ -662,6 +684,16 @@ async fn builder_authority_overrides_are_fresh_without_mutating_sibling_state() 
         .await
         .unwrap();
     let intent_id = linked.publication_intent_id.unwrap();
+    assert!(linked.materialization_deferral.is_none());
+    assert!(
+        f.state
+            .content_distribution_request_repository()
+            .get(&f.scope, id)
+            .await
+            .unwrap()
+            .materialization_deferral
+            .is_none()
+    );
     assert_eq!(f.distribution.publication_commands(&f.scope).await.len(), 1);
     assert!(
         fork_distribution
@@ -715,6 +747,17 @@ async fn revoked_source_or_account_keeps_accepted_memory_request_unlinked() {
             .code,
         geo_domain::ErrorCode::Conflict
     );
+    assert_eq!(
+        f.state
+            .content_distribution_request_repository()
+            .get(&f.scope, id)
+            .await
+            .unwrap()
+            .materialization_deferral
+            .unwrap()
+            .reason,
+        geo_domain::ContentRequestDeferralReason::SourceUnavailable
+    );
     assert!(
         f.distribution
             .publication_commands(&f.scope)
@@ -738,6 +781,17 @@ async fn revoked_source_or_account_keeps_accepted_memory_request_unlinked() {
             .unwrap_err()
             .code,
         geo_domain::ErrorCode::Conflict
+    );
+    assert_eq!(
+        f.state
+            .content_distribution_request_repository()
+            .get(&f.scope, id)
+            .await
+            .unwrap()
+            .materialization_deferral
+            .unwrap()
+            .reason,
+        geo_domain::ContentRequestDeferralReason::AccountUnavailable
     );
     assert!(
         f.distribution
