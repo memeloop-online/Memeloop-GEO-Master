@@ -309,6 +309,47 @@ test("raw capture joins buffered and streamed bytes and refuses unrelated reques
   }
 });
 
+test("raw capture accepts a complete buffered body when loading finishes before the stream command", async () => {
+  const page = new EventEmitter();
+  const session = new EventEmitter();
+  let finishStream;
+  let detached = 0;
+  let submissions = 0;
+  session.send = (method) => {
+    if (method === "Network.enable") return Promise.resolve({});
+    assert.equal(method, "Network.streamResourceContent");
+    return new Promise((resolve) => {
+      finishStream = resolve;
+    });
+  };
+  session.detach = async () => {
+    detached++;
+  };
+  page.context = () => ({ newCDPSession: async () => session });
+  const result = await captureConnectExchange(
+    page,
+    options(async () => {
+      submissions++;
+      session.emit("Network.responseReceived", {
+        requestId: "buffered-1",
+        response: { url: endpoint },
+      });
+      page.emit(
+        "response",
+        response({ body: () => assert.fail("no decoded-body fallback") }),
+      );
+      session.emit("Network.loadingFinished", { requestId: "buffered-1" });
+      finishStream({ bufferedData: body.toString("base64") });
+    }),
+  );
+  assert.deepEqual(result?.messages, [
+    { message: { id: "message-1", text: "中文" } },
+  ]);
+  assert.equal(submissions, 1);
+  assert.equal(detached, 1);
+  assert.equal(page.listenerCount("response"), 0);
+});
+
 test("captures a real browser UI fetch without copying its session or submitting twice", async () => {
   // Force a length-header high byte that ordinary text-decoded response.body()
   // corrupts under application/connect+json.
@@ -317,6 +358,10 @@ test("captures a real browser UI fetch without copying its session or submitting
   };
   let sent = 0;
   let cookieSeen = false;
+  let releaseTail;
+  const streamReady = new Promise((resolve) => {
+    releaseTail = resolve;
+  });
   const server = createServer((request, reply) => {
     if (request.method === "GET" && request.url === "/") {
       reply.writeHead(200, {
@@ -334,12 +379,12 @@ test("captures a real browser UI fetch without copying its session or submitting
       reply.writeHead(200, { "content-type": "application/connect+json" });
       const encoded = frame(0, message);
       reply.write(encoded.subarray(0, 3));
-      setTimeout(() => {
+      void streamReady.then(() => {
         reply.write(encoded.subarray(3));
         reply.end(
           frame(2, { metadata: { "private-fixture": ["not-a-public-field"] } }),
         );
-      }, 30);
+      });
       return;
     }
     reply.writeHead(404).end();
@@ -351,7 +396,21 @@ test("captures a real browser UI fetch without copying its session or submitting
       headless: true,
       executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
     });
-    const page = await browser.newPage();
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const newCDPSession = context.newCDPSession.bind(context);
+    // Release the real server's tail only after Chromium enables raw streaming.
+    // A wall-clock gap races the CDP command under a loaded CI event loop.
+    context.newCDPSession = async (...args) => {
+      const session = await newCDPSession(...args);
+      const send = session.send.bind(session);
+      session.send = async (method, ...parameters) => {
+        const result = await send(method, ...parameters);
+        if (method === "Network.streamResourceContent") releaseTail();
+        return result;
+      };
+      return session;
+    };
     const origin = `http://127.0.0.1:${server.address().port}`;
     await page.goto(origin);
     const result = await captureConnectExchange(page, {

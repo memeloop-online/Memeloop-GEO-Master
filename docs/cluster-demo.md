@@ -3,7 +3,7 @@
 本文只描述可复用的容器包装和一次性身份初始化。旧本地演示数据不迁移；
 集群使用已经准备好的 PostgreSQL/PV 和受控的浏览器执行器。所有域名、账号、
 租户 ID、数据库凭据和模型凭据都由部署环境或 Secret 管理器提供，不写入镜像、
-仓库或命令日志。
+仓库或公开日志。
 
 ## 镜像内容
 
@@ -41,11 +41,11 @@ docker run --rm --entrypoint cat <registry>/geo-api:<commit> \
 ```
 
 这些命令不会创建或迁移本地演示数据。Docker 构建仍需要从锁定的基础镜像、
-Cargo registry 和 pnpm registry 获取依赖；本任务未执行构建或下载。
+Cargo registry 和 pnpm registry 获取依赖；默认使用镜像 CI 构建并按不可变摘要部署。
 
-本包装尚未在当前工作区执行 Docker 构建、镜像启动或 Nginx 配置检查。首次 CI
-应验证 Rust/V8 release 二进制在目标架构的动态库、bundle 摘要、WebSocket/SSE
-长连接、100 MB 上传和 API Service DNS（`api`）；失败时保持镜像未发布。
+应用镜像 CI 已覆盖构建、容器启动及生产前端渲染，隔离集群已验证同源登录和测量
+读回；当前版本及准确证据见 `HANDOFF.md`、`WORKLOG.md`。WebSocket/SSE 长连接、
+100 MB 上传和各真实渠道仍须分别验收，不能由容器就绪推断通过。
 
 ## 集群注入配置
 
