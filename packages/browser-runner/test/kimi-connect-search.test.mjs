@@ -177,6 +177,47 @@ test("framed UI request must preserve frozen question, model, fresh chat and exp
     true,
     "protobuf JSON may omit false and empty scalar defaults",
   );
+  const currentClient = {
+    ...request,
+    tools: [
+      { type: "TOOL_TYPE_SEARCH", search: { force: false } },
+      { type: "TOOL_TYPE_CRON_JOB" },
+    ],
+  };
+  assert.equal(
+    matchesKimiChatRequest(clientRequest(currentClient), QUESTION, MODEL),
+    true,
+    "the observed current UI includes a scheduling tool beside explicit search",
+  );
+  for (const tools of [
+    [{ type: "TOOL_TYPE_SEARCH", search: {} }],
+    [
+      { type: "TOOL_TYPE_SEARCH", search: { force: true } },
+      { type: "TOOL_TYPE_CRON_JOB" },
+    ],
+    [{ type: "TOOL_TYPE_SEARCH" }, { type: "TOOL_TYPE_CRON_JOB" }],
+    [{ type: "TOOL_TYPE_CRON_JOB" }, { type: "TOOL_TYPE_SEARCH", search: {} }],
+    [{ type: "TOOL_TYPE_SEARCH", search: {} }, { type: "OTHER_TOOL" }],
+    [
+      { type: "TOOL_TYPE_SEARCH", search: {} },
+      { type: "TOOL_TYPE_CRON_JOB", search: {} },
+    ],
+    [
+      { type: "TOOL_TYPE_SEARCH", search: {} },
+      { type: "TOOL_TYPE_CRON_JOB" },
+      { type: "OTHER_TOOL" },
+    ],
+  ]) {
+    assert.equal(
+      matchesKimiChatRequest(
+        clientRequest({ ...currentClient, tools }),
+        QUESTION,
+        MODEL,
+      ),
+      false,
+      "unobserved or unsafe tool combinations remain unverified",
+    );
+  }
   for (const wrong of [
     { ...request, chat_id: "existing-chat" },
     { ...request, tools: [] },

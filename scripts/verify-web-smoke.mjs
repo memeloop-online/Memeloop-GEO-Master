@@ -1600,7 +1600,9 @@ async function main() {
   await page
     .getByRole("combobox", { name: "查看证据版本" })
     .selectOption(originalVersion);
-  await page.getByText("正在查看已保存的历史证据", { exact: false }).waitFor();
+  await page
+    .getByText("正在查看历史版本的已保存内容。", { exact: true })
+    .waitFor();
   assert(
     (await page
       .locator(".source-detail-page [contenteditable='true']")

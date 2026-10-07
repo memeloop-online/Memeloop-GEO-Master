@@ -33,6 +33,18 @@ function requestBody(request, question, model) {
     const body = JSON.parse(
       new TextDecoder("utf-8", { fatal: true }).decode(post.subarray(5)),
     );
+    // The current client includes its scheduling tool alongside the search
+    // tool. This is still only request intent: the response must independently
+    // prove an actual search, answer ownership, completion and citations.
+    const search =
+      body?.tools?.length === 1 && body.tools[0]?.type === "SEARCH"
+        ? body.tools[0].search
+        : body?.tools?.length === 2 &&
+            body.tools[0]?.type === "TOOL_TYPE_SEARCH" &&
+            body.tools[1]?.type === "TOOL_TYPE_CRON_JOB" &&
+            !Object.hasOwn(body.tools[1], "search")
+          ? body.tools[0].search
+          : null;
     if (
       !object(body) ||
       body.options?.model !== model ||
@@ -41,11 +53,8 @@ function requestBody(request, question, model) {
       !["user", 2].includes(body.message.role) ||
       body.message.blocks[0]?.text?.content !== question ||
       !Array.isArray(body.tools) ||
-      body.tools.length !== 1 ||
-      body.tools[0]?.type !== "SEARCH" ||
-      !object(body.tools[0]?.search) ||
-      (body.tools[0].search.force !== undefined &&
-        body.tools[0].search.force !== false) ||
+      !object(search) ||
+      (search.force !== undefined && search.force !== false) ||
       (body.chat_id !== undefined && body.chat_id !== "")
     ) {
       return null;
