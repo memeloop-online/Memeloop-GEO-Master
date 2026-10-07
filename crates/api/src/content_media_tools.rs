@@ -172,10 +172,9 @@ pub(crate) async fn read(
     let revision = state
         .content_service()
         .repository()
-        .list_revisions(&scope, located.asset_id)
+        .get_revision(&scope, located.asset_id, revision_id)
         .await?
-        .into_iter()
-        .find(|revision| {
+        .filter(|revision| {
             revision.asset_id == located.asset_id && revision.revision_id == revision_id
         })
         .ok_or_else(|| AppError::not_found("content revision not found"))?;
@@ -303,14 +302,13 @@ async fn replay(
     } else {
         located.asset_id
     };
-    let revisions = state
+    let revision = state
         .content_service()
         .repository()
-        .list_revisions(scope, asset_id)
+        .find_exact_child_revision(scope, asset_id, request.base_revision_id, document)
         .await?;
-    Ok(revisions
-        .into_iter()
-        .find(|revision| is_exact_child(revision, asset_id, request.base_revision_id, document)))
+    Ok(revision
+        .filter(|revision| is_exact_child(revision, asset_id, request.base_revision_id, document)))
 }
 
 pub(crate) async fn insert(
@@ -341,10 +339,11 @@ pub(crate) async fn insert(
     };
     let base_asset = prior_origin.unwrap_or(located.asset_id);
     let base = repository
-        .list_revisions(&scope, base_asset)
+        .get_revision(&scope, base_asset, request.base_revision_id)
         .await?
-        .into_iter()
-        .find(|revision| revision.revision_id == request.base_revision_id)
+        .filter(|revision| {
+            revision.asset_id == base_asset && revision.revision_id == request.base_revision_id
+        })
         .ok_or_else(|| AppError::not_found("content base revision not found"))?;
     let binding = state
         .content_media_repository()

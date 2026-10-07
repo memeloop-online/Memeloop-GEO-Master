@@ -1778,6 +1778,19 @@ pub trait ContentRepository: Send + Sync {
         scope: &TenantScope,
         asset_id: Uuid,
     ) -> Result<Vec<ContentRevision>, AppError>;
+    async fn get_revision(
+        &self,
+        scope: &TenantScope,
+        asset_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<Option<ContentRevision>, AppError>;
+    async fn find_exact_child_revision(
+        &self,
+        scope: &TenantScope,
+        asset_id: Uuid,
+        base_revision_id: Uuid,
+        document: &StructuredDocument,
+    ) -> Result<Option<ContentRevision>, AppError>;
     async fn list_checks(
         &self,
         scope: &TenantScope,
@@ -2499,6 +2512,80 @@ impl ContentRepository for MemoryContentRepository {
             })
             .collect())
     }
+    async fn get_revision(
+        &self,
+        scope: &TenantScope,
+        asset_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<Option<ContentRevision>, AppError> {
+        if scope.project_id.is_none() {
+            return Err(AppError::invalid_request("project scope required"));
+        }
+        let states = self.state.read().await;
+        Ok(states
+            .values()
+            .filter(|(stored_scope, state)| {
+                scope == stored_scope && state.assets.iter().any(|a| a.asset_id == asset_id)
+            })
+            .find_map(|(_, state)| {
+                state
+                    .revisions
+                    .iter()
+                    .find(|r| r.asset_id == asset_id && r.revision_id == revision_id)
+                    .map(|revision| {
+                        let mut result = revision.clone();
+                        if let Some(check) = state
+                            .checks
+                            .iter()
+                            .find(|check| check.revision_id == revision_id)
+                        {
+                            result.findings = check.findings.clone();
+                        }
+                        result
+                    })
+            }))
+    }
+    async fn find_exact_child_revision(
+        &self,
+        scope: &TenantScope,
+        asset_id: Uuid,
+        base_revision_id: Uuid,
+        document: &StructuredDocument,
+    ) -> Result<Option<ContentRevision>, AppError> {
+        if scope.project_id.is_none() {
+            return Err(AppError::invalid_request("project scope required"));
+        }
+        let states = self.state.read().await;
+        let matched = states
+            .values()
+            .filter(|(stored_scope, state)| {
+                scope == stored_scope && state.assets.iter().any(|a| a.asset_id == asset_id)
+            })
+            .flat_map(|(_, state)| {
+                state
+                    .revisions
+                    .iter()
+                    .filter(move |revision| {
+                        revision.asset_id == asset_id
+                            && (revision.base_revision_id == Some(base_revision_id)
+                                || revision.derived_from_revision_id == Some(base_revision_id))
+                            && &revision.document == document
+                    })
+                    .map(move |revision| (state, revision))
+            })
+            .min_by_key(|(_, revision)| (revision.revision, revision.revision_id));
+        Ok(matched.map(|(state, revision)| {
+            let mut result = revision.clone();
+            if let Some(check) = state
+                .checks
+                .iter()
+                .find(|check| check.revision_id == revision.revision_id)
+            {
+                result.findings = check.findings.clone();
+            }
+            result
+        }))
+    }
     async fn list_checks(
         &self,
         scope: &TenantScope,
@@ -2973,5 +3060,369 @@ impl ContentRepository for MemoryContentRepository {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod revision_lookup_tests {
+    use super::*;
+    use crate::ErrorCode;
+
+    fn scope() -> TenantScope {
+        TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        )
+    }
+
+    fn document(text: &str) -> StructuredDocument {
+        StructuredDocument {
+            title: "Title".into(),
+            blocks: vec![ContentBlock {
+                block_id: Uuid::new_v4(),
+                kind: ContentBlockKind::Paragraph,
+                text: text.into(),
+                citation_ids: vec![],
+                items: vec![],
+                rich: None,
+            }],
+            schema_version: Some(2),
+        }
+    }
+
+    fn revision(
+        asset_id: Uuid,
+        revision: i32,
+        base_revision_id: Option<Uuid>,
+        derived_from_revision_id: Option<Uuid>,
+        document: StructuredDocument,
+    ) -> ContentRevision {
+        ContentRevision {
+            revision_id: Uuid::new_v4(),
+            asset_id,
+            revision,
+            base_revision_id,
+            derived_from_revision_id,
+            markdown: document.markdown(),
+            document,
+            evidence: vec![],
+            quotes: vec![],
+            findings: vec![],
+            created_at: Utc::now(),
+        }
+    }
+
+    async fn insert(
+        repo: &MemoryContentRepository,
+        scope: TenantScope,
+        asset_id: Uuid,
+        revisions: Vec<ContentRevision>,
+        checks: Vec<ContentCheck>,
+    ) {
+        let execution_id = Uuid::new_v4();
+        let coverage = ContentCoverage {
+            total: 0,
+            ready: 0,
+            blocked: 0,
+            deferred: 0,
+            not_applicable: 0,
+            cancelled: 0,
+            incomplete: 0,
+        };
+        let state = ContentState {
+            execution: ContentExecution {
+                execution_id,
+                project_id: scope.project_id.expect("test scope has a project"),
+                cycle_id: Uuid::new_v4(),
+                manifest_id: Uuid::new_v4(),
+                manifest_revision: 1,
+                policy_version: "test".into(),
+                input_hash: "test".into(),
+                status: ContentExecutionStatus::Running,
+                expected_count: 0,
+                coverage,
+                handoff_id: None,
+            },
+            items: vec![],
+            assets: vec![ContentAsset {
+                asset_id,
+                execution_id,
+                item_id: Uuid::new_v4(),
+                current_revision_id: revisions.last().expect("test has revisions").revision_id,
+                created_at: Utc::now(),
+            }],
+            revisions,
+            checks,
+            handoff: None,
+            handoffs: vec![],
+        };
+        repo.state
+            .write()
+            .await
+            .insert(execution_id, (scope, state));
+    }
+
+    #[tokio::test]
+    async fn get_revision_requires_owned_asset_and_exact_project_and_overlays_findings() {
+        let repo = MemoryContentRepository::new();
+        let scope = scope();
+        let foreign_project = TenantScope {
+            project_id: Some(Uuid::new_v4().into()),
+            ..scope.clone()
+        };
+        let foreign_tenant = TenantScope {
+            tenant_id: Uuid::new_v4().into(),
+            ..scope.clone()
+        };
+        let asset_id = Uuid::new_v4();
+        let foreign_asset = Uuid::new_v4();
+        let target = revision(asset_id, 1, None, None, document("target"));
+        let finding = ContentFinding {
+            finding_id: Uuid::new_v4(),
+            code: "checked".into(),
+            block_id: None,
+            evidence: vec![],
+            detail: "finding".into(),
+            blocking: false,
+        };
+        let checks = vec![ContentCheck {
+            check_id: Uuid::new_v4(),
+            revision_id: target.revision_id,
+            findings: vec![finding.clone()],
+            created_at: Utc::now(),
+        }];
+        let mut history = vec![target.clone()];
+        for index in 2..=1_000 {
+            history.push(revision(asset_id, index, None, None, document("history")));
+        }
+        insert(&repo, scope.clone(), asset_id, history, checks).await;
+        insert(
+            &repo,
+            foreign_project.clone(),
+            foreign_asset,
+            vec![revision(foreign_asset, 1, None, None, document("foreign"))],
+            vec![],
+        )
+        .await;
+        let found = repo
+            .get_revision(&scope, asset_id, target.revision_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.revision_id, target.revision_id);
+        assert_eq!(found.findings, vec![finding]);
+        assert!(
+            repo.get_revision(&scope, foreign_asset, target.revision_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_revision(&foreign_project, asset_id, target.revision_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_revision(&foreign_tenant, asset_id, target.revision_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_revision(&scope, asset_id, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let tenant_wide = TenantScope {
+            project_id: None,
+            ..scope.clone()
+        };
+        assert_eq!(
+            repo.get_revision(&tenant_wide, asset_id, target.revision_id)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_child_matches_whole_document_and_immediate_lineage_in_revision_order() {
+        let repo = MemoryContentRepository::new();
+        let scope = scope();
+        let foreign_scope = TenantScope {
+            project_id: Some(Uuid::new_v4().into()),
+            ..scope.clone()
+        };
+        let asset_id = Uuid::new_v4();
+        let wrong_asset_id = Uuid::new_v4();
+        let base = Uuid::new_v4();
+        let target_document = document("identical");
+        let mut changed_block = target_document.clone();
+        changed_block.blocks[0].block_id = Uuid::new_v4();
+        let mut changed_schema = target_document.clone();
+        changed_schema.schema_version = None;
+        let mut changed_citation = target_document.clone();
+        changed_citation.blocks[0].citation_ids.push(Uuid::new_v4());
+        let first = revision(asset_id, 12, Some(base), None, target_document.clone());
+        let derived = revision(asset_id, 13, None, Some(base), target_document.clone());
+        let derived_only_base = Uuid::new_v4();
+        let derived_only = revision(
+            asset_id,
+            14,
+            None,
+            Some(derived_only_base),
+            target_document.clone(),
+        );
+        let descendant = revision(
+            asset_id,
+            2,
+            Some(derived.revision_id),
+            None,
+            target_document.clone(),
+        );
+        let finding = ContentFinding {
+            finding_id: Uuid::new_v4(),
+            code: "checked".into(),
+            block_id: None,
+            evidence: vec![],
+            detail: "found".into(),
+            blocking: false,
+        };
+        let revisions = vec![
+            descendant,
+            revision(asset_id, 3, Some(base), None, changed_block.clone()),
+            revision(asset_id, 4, Some(base), None, changed_schema.clone()),
+            revision(asset_id, 5, Some(base), None, changed_citation.clone()),
+            derived.clone(),
+            first.clone(),
+            derived_only.clone(),
+        ];
+        insert(
+            &repo,
+            scope.clone(),
+            asset_id,
+            revisions,
+            vec![ContentCheck {
+                check_id: Uuid::new_v4(),
+                revision_id: first.revision_id,
+                findings: vec![finding.clone()],
+                created_at: Utc::now(),
+            }],
+        )
+        .await;
+        insert(
+            &repo,
+            scope.clone(),
+            wrong_asset_id,
+            vec![revision(
+                wrong_asset_id,
+                1,
+                Some(base),
+                None,
+                target_document.clone(),
+            )],
+            vec![],
+        )
+        .await;
+        insert(
+            &repo,
+            foreign_scope.clone(),
+            asset_id,
+            vec![revision(
+                asset_id,
+                1,
+                Some(base),
+                None,
+                target_document.clone(),
+            )],
+            vec![],
+        )
+        .await;
+        let found = repo
+            .find_exact_child_revision(&scope, asset_id, base, &target_document)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.revision_id, first.revision_id);
+        assert_eq!(found.findings, vec![finding]);
+        assert_eq!(
+            repo.find_exact_child_revision(&scope, asset_id, derived_only_base, &target_document)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision_id,
+            derived_only.revision_id
+        );
+        for altered in [&changed_block, &changed_schema, &changed_citation] {
+            assert!(
+                repo.find_exact_child_revision(&scope, asset_id, base, altered)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let mut changed_title = target_document.clone();
+        changed_title.title.push('!');
+        assert!(
+            repo.find_exact_child_revision(&scope, asset_id, base, &changed_title)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.find_exact_child_revision(&scope, asset_id, Uuid::new_v4(), &target_document)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.find_exact_child_revision(&foreign_scope, asset_id, base, &target_document)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.find_exact_child_revision(
+                &TenantScope {
+                    tenant_id: Uuid::new_v4().into(),
+                    ..scope.clone()
+                },
+                asset_id,
+                base,
+                &target_document
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            repo.find_exact_child_revision(&scope, wrong_asset_id, base, &target_document)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let tenant_wide = TenantScope {
+            project_id: None,
+            ..scope.clone()
+        };
+        assert_eq!(
+            repo.find_exact_child_revision(&tenant_wide, asset_id, base, &target_document)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            repo.find_exact_child_revision(&scope, asset_id, derived.revision_id, &target_document)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
     }
 }

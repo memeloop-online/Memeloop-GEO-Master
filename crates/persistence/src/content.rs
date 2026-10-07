@@ -1344,7 +1344,27 @@ impl ContentRepository for PgContentRepository {
         scope: &TenantScope,
         id: Uuid,
     ) -> Result<Option<ContentExecution>, AppError> {
-        Ok(self.read(scope, id).await?.map(|s| s.execution))
+        let Some(project) = scope.project_id else {
+            return Err(AppError::invalid_request("project scope required"));
+        };
+        let mut tx = self.transaction(scope).await?;
+        let json: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT COALESCE(state->'execution','null'::jsonb) FROM content_executions \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND execution_id=$4",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        json.map(|value| {
+            serde_json::from_value(value)
+                .map_err(|_| AppError::new(ErrorCode::Internal, "stored content state invalid"))
+        })
+        .transpose()
     }
     async fn get_handoff(
         &self,
@@ -1387,10 +1407,30 @@ impl ContentRepository for PgContentRepository {
         id: Uuid,
         item: Uuid,
     ) -> Result<Option<ContentItem>, AppError> {
-        Ok(self
-            .read(scope, id)
-            .await?
-            .and_then(|s| s.items.into_iter().find(|i| i.item_id == item)))
+        let Some(project) = scope.project_id else {
+            return Err(AppError::invalid_request("project scope required"));
+        };
+        let mut tx = self.transaction(scope).await?;
+        let json: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT entry FROM content_executions c, \
+             LATERAL jsonb_array_elements(c.state->'items') AS entry \
+             WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 \
+               AND c.execution_id=$4 AND entry->>'item_id'=$5 LIMIT 1",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(id)
+        .bind(item.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        json.map(|value| {
+            serde_json::from_value(value)
+                .map_err(|_| AppError::new(ErrorCode::Internal, "stored content state invalid"))
+        })
+        .transpose()
     }
     async fn list_items(
         &self,
@@ -1413,10 +1453,30 @@ impl ContentRepository for PgContentRepository {
             Err(error) if error.code == ErrorCode::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        Ok(self
-            .read(scope, id)
-            .await?
-            .and_then(|s| s.assets.into_iter().find(|a| a.asset_id == asset)))
+        let Some(project) = scope.project_id else {
+            return Err(AppError::invalid_request("project scope required"));
+        };
+        let mut tx = self.transaction(scope).await?;
+        let json: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT entry FROM content_executions c, \
+             LATERAL jsonb_array_elements(c.state->'assets') AS entry \
+             WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 \
+               AND c.execution_id=$4 AND entry->>'asset_id'=$5 LIMIT 1",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(id)
+        .bind(asset.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        json.map(|value| {
+            serde_json::from_value(value)
+                .map_err(|_| AppError::new(ErrorCode::Internal, "stored content state invalid"))
+        })
+        .transpose()
     }
     async fn list_assets(
         &self,
@@ -1489,6 +1549,129 @@ impl ContentRepository for PgContentRepository {
             }
         }
         Ok(revisions)
+    }
+    async fn get_revision(
+        &self,
+        scope: &TenantScope,
+        asset_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<Option<ContentRevision>, AppError> {
+        let Some(project) = scope.project_id else {
+            return Err(AppError::invalid_request("project scope required"));
+        };
+        let mut tx = self.transaction(scope).await?;
+        let body: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT body FROM content_revisions WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND asset_id=$4 AND revision_id=$5",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(asset_id)
+        .bind(revision_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let check: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT body FROM content_checks WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND revision_id=$4",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(revision_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        let mut revision: ContentRevision = serde_json::from_value(body)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "stored content revision invalid"))?;
+        if revision.asset_id != asset_id || revision.revision_id != revision_id {
+            return Err(AppError::new(
+                ErrorCode::Internal,
+                "stored content revision identity invalid",
+            ));
+        }
+        if let Some(check) = check {
+            let check: ContentCheck = serde_json::from_value(check)
+                .map_err(|_| AppError::new(ErrorCode::Internal, "stored content check invalid"))?;
+            if check.revision_id == revision_id {
+                revision.findings = check.findings;
+            }
+        }
+        Ok(Some(revision))
+    }
+    async fn find_exact_child_revision(
+        &self,
+        scope: &TenantScope,
+        asset_id: Uuid,
+        base_revision_id: Uuid,
+        document: &StructuredDocument,
+    ) -> Result<Option<ContentRevision>, AppError> {
+        let Some(project) = scope.project_id else {
+            return Err(AppError::invalid_request("project scope required"));
+        };
+        // The JSON predicate covers historical edits; derived_from covers
+        // copy-on-write revisions where the base is recorded separately.
+        // Bound each result page, not total history: a late exact match must
+        // remain discoverable regardless of the number of earlier children.
+        const PAGE_SIZE: i64 = 64;
+        let mut after_revision = 0;
+        loop {
+            let mut tx = self.transaction(scope).await?;
+            let rows: Vec<(Uuid, i32, serde_json::Value)> = sqlx::query_as(
+                "SELECT revision_id, revision, body FROM content_revisions \
+                 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND asset_id=$4 \
+                   AND revision>$5 \
+                   AND ((body->>'base_revision_id')=$6 OR derived_from_revision_id=$7) \
+                 ORDER BY revision LIMIT $8",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project.as_uuid())
+            .bind(asset_id)
+            .bind(after_revision)
+            .bind(base_revision_id.to_string())
+            .bind(base_revision_id)
+            .bind(PAGE_SIZE)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?;
+            tx.commit().await.map_err(db)?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let page_len = rows.len();
+            for (row_id, revision_number, body) in rows {
+                after_revision = revision_number;
+                let candidate: ContentRevision = serde_json::from_value(body).map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "stored content revision invalid")
+                })?;
+                if candidate.revision_id != row_id
+                    || candidate.asset_id != asset_id
+                    || candidate.revision != revision_number
+                {
+                    return Err(AppError::new(
+                        ErrorCode::Internal,
+                        "stored content revision identity invalid",
+                    ));
+                }
+                if candidate.base_revision_id != Some(base_revision_id)
+                    && candidate.derived_from_revision_id != Some(base_revision_id)
+                {
+                    continue;
+                }
+                if &candidate.document == document {
+                    return self.get_revision(scope, asset_id, row_id).await;
+                }
+            }
+            if page_len < PAGE_SIZE as usize {
+                return Ok(None);
+            }
+        }
     }
     async fn list_checks(
         &self,

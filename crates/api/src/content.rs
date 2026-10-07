@@ -1018,10 +1018,8 @@ impl ContentService {
     ) -> Result<ContentRevision, AppError> {
         let asset_id = asset_id.ok_or_else(|| AppError::conflict("content asset missing"))?;
         self.content
-            .list_revisions(scope, asset_id)
+            .get_revision(scope, asset_id, revision_id)
             .await?
-            .into_iter()
-            .find(|r| r.revision_id == revision_id)
             .ok_or_else(|| AppError::not_found("content revision not found"))
     }
 
@@ -1435,12 +1433,11 @@ pub(crate) async fn export(
         .and_then(|asset| asset.ok_or_else(|| AppError::not_found("content asset not found")))
         .map_err(|error| api_error(error, context.request_id))?;
     let revision = repository
-        .list_revisions(&scope, asset_id)
+        .get_revision(&scope, asset_id, revision_id)
         .await
-        .and_then(|revisions| {
-            revisions
-                .into_iter()
-                .find(|revision| {
+        .and_then(|revision| {
+            revision
+                .filter(|revision| {
                     revision.revision_id == revision_id && revision.asset_id == asset_id
                 })
                 .ok_or_else(|| AppError::not_found("content revision not found"))
