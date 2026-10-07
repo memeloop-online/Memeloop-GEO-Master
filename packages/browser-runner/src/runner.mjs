@@ -334,8 +334,8 @@ export function createRunner(options = {}) {
     const record = session(id);
     if (record.busy) throw new RunnerError(409, "session_busy");
     if (record.desktop) {
-      // RFB bypasses the old per-action guard: disconnect remote input before
-      // saving state, and recheck identity AFTER input is no longer possible.
+      // Disconnect remote input before saving state, then recheck identity
+      // after input is no longer possible.
       record.busy = true;
       let revokingInput = false;
       try {

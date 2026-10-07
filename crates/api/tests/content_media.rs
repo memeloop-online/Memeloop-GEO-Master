@@ -148,10 +148,7 @@ fn png() -> Vec<u8> {
 }
 
 fn alpha_wide_png() -> Vec<u8> {
-    let mut pixels = vec![0_u8; 640 * 320 * 4];
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&[251, 55, 21, 96]);
-    }
+    let pixels = [251_u8, 55, 21, 96].repeat(640 * 320);
     let mut result = Vec::new();
     PngEncoder::new(&mut result)
         .write_image(&pixels, 640, 320, ExtendedColorType::Rgba8)
