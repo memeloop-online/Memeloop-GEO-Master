@@ -367,9 +367,13 @@ impl ChannelJobRepository for PgChannelJobRepository {
         let mut tx = self.pool.begin().await.map_err(db)?;
         let rows = sqlx::query(
             "SELECT c.command_id,c.operator_id,c.tenant_id,c.project_id,c.intent_id,\
-                    c.origin_target_id,c.payload_hash,\
+                    c.origin_target_id,c.origin_request_id,c.payload_hash,\
                     i.body AS intent_body,v.body AS variant_body,r.body AS revision_body,\
-                    t.current_body AS distribution_body,m.cycle_id \
+                    t.current_body AS distribution_body,m.cycle_id, \
+                    q.publication_intent_id AS request_intent_id,q.content_revision_id AS request_revision_id, \
+                    q.platform_id AS request_platform_id,q.placement_slot AS request_slot, \
+                    q.account_id AS request_account_id,q.format AS request_format, \
+                    i.origin_target_id AS intent_origin_target_id,i.origin_request_id AS intent_origin_request_id \
              FROM distribution_publication_commands c \
              JOIN distribution_publication_intents i ON (i.operator_id,i.tenant_id,i.project_id,i.intent_id) = \
                 (c.operator_id,c.tenant_id,c.project_id,c.intent_id) \
@@ -377,10 +381,12 @@ impl ChannelJobRepository for PgChannelJobRepository {
                 (i.operator_id,i.tenant_id,i.project_id,i.variant_id) \
              JOIN content_revisions r ON (r.operator_id,r.tenant_id,r.project_id,r.revision_id) = \
                 (v.operator_id,v.tenant_id,v.project_id,v.content_revision_id) \
-             JOIN distribution_execution_targets t ON (t.operator_id,t.tenant_id,t.project_id,t.target_id) = \
+             LEFT JOIN distribution_execution_targets t ON (t.operator_id,t.tenant_id,t.project_id,t.target_id) = \
                 (c.operator_id,c.tenant_id,c.project_id,c.origin_target_id) \
-             JOIN distribution_execution_manifests m ON (m.operator_id,m.tenant_id,m.project_id,m.manifest_id) = \
+             LEFT JOIN distribution_execution_manifests m ON (m.operator_id,m.tenant_id,m.project_id,m.manifest_id) = \
                 (t.operator_id,t.tenant_id,t.project_id,t.manifest_id) \
+             LEFT JOIN content_distribution_requests q ON (q.operator_id,q.tenant_id,q.project_id,q.request_id) = \
+                (c.operator_id,c.tenant_id,c.project_id,c.origin_request_id) \
              WHERE c.materialized_target_id IS NULL AND c.status='pending' \
                 AND ($1::uuid IS NULL OR c.command_id>$1) \
              ORDER BY c.command_id LIMIT $2 FOR UPDATE OF c SKIP LOCKED",
@@ -394,7 +400,8 @@ impl ChannelJobRepository for PgChannelJobRepository {
         for row in rows {
             let command_id: Uuid = row.get("command_id");
             let intent_id: Uuid = row.get("intent_id");
-            let origin_target_id: Uuid = row.get("origin_target_id");
+            let origin_target_id: Option<Uuid> = row.get("origin_target_id");
+            let origin_request_id: Option<Uuid> = row.get("origin_request_id");
             let operator: Uuid = row.get("operator_id");
             let tenant: Uuid = row.get("tenant_id");
             let project_id: Uuid = row.get("project_id");
@@ -406,10 +413,12 @@ impl ChannelJobRepository for PgChannelJobRepository {
             let intent: geo_domain::PublicationIntent = decode(row.get("intent_body"))?;
             let variant: geo_domain::ChannelVariant = decode(row.get("variant_body"))?;
             let revision: geo_domain::ContentRevision = decode(row.get("revision_body"))?;
-            let coverage: geo_domain::DistributionTarget = decode(row.get("distribution_body"))?;
             let payload_hash: String = row.get("payload_hash");
             if intent.intent_id != intent_id
-                || intent.channel_target_id != origin_target_id
+                || origin_target_id.is_some() == origin_request_id.is_some()
+                || row.get::<Option<Uuid>, _>("intent_origin_target_id") != origin_target_id
+                || row.get::<Option<Uuid>, _>("intent_origin_request_id") != origin_request_id
+                || intent.channel_target_id != origin_target_id.unwrap_or(Uuid::nil())
                 || intent.project_id.as_uuid() != project_id
                 || intent.variant_id != variant.variant_id
                 || intent.content_revision_id != revision.revision_id
@@ -417,16 +426,38 @@ impl ChannelJobRepository for PgChannelJobRepository {
                 || variant.platform_id != intent.platform_id
                 || variant.payload_hash != payload_hash
                 || intent.payload_hash != payload_hash
-                || coverage.target_id != origin_target_id
-                || coverage.publication_intent_id != Some(intent_id)
-                || coverage.variant_id != Some(variant.variant_id)
-                || coverage.account_id != Some(intent.account_id)
-                || coverage.content_revision_id != Some(revision.revision_id)
-                || coverage.platform_id != variant.platform_id
             {
                 return Err(AppError::conflict(
                     "distribution command dependencies differ",
                 ));
+            }
+            if let Some(target_id) = origin_target_id {
+                let coverage: geo_domain::DistributionTarget =
+                    decode(row.get::<serde_json::Value, _>("distribution_body"))?;
+                if coverage.target_id != target_id
+                    || coverage.publication_intent_id != Some(intent_id)
+                    || coverage.variant_id != Some(variant.variant_id)
+                    || coverage.account_id != Some(intent.account_id)
+                    || coverage.content_revision_id != Some(revision.revision_id)
+                    || coverage.platform_id != variant.platform_id
+                    || row.get::<Option<Uuid>, _>("cycle_id").is_none()
+                {
+                    return Err(AppError::conflict("covered publication origin differs"));
+                }
+            } else if row.get::<Option<Uuid>, _>("request_intent_id") != Some(intent_id)
+                || row.get::<Option<Uuid>, _>("request_revision_id") != Some(revision.revision_id)
+                || row.get::<Option<Uuid>, _>("request_account_id") != Some(intent.account_id)
+                || row
+                    .get::<Option<String>, _>("request_platform_id")
+                    .as_deref()
+                    != Some(variant.platform_id.as_str())
+                || row.get::<Option<String>, _>("request_slot").as_deref()
+                    != Some(variant.placement_slot.as_str())
+                || row.get::<Option<String>, _>("request_format").as_deref()
+                    != Some(geo_domain::TEXT_DISTRIBUTION_FORMAT)
+                || row.get::<Option<Uuid>, _>("cycle_id").is_some()
+            {
+                return Err(AppError::conflict("requested publication origin differs"));
             }
             let target = ChannelTarget {
                 target_id: command_id,
@@ -434,7 +465,8 @@ impl ChannelJobRepository for PgChannelJobRepository {
                     content_revision_id: revision.revision_id,
                     variant_id: variant.variant_id,
                     publication_intent_id: intent_id,
-                    distribution_target_id: origin_target_id,
+                    distribution_target_id: origin_target_id.unwrap_or(Uuid::nil()),
+                    origin_request_id,
                     platform: variant.platform_id,
                     account_id: intent.account_id,
                     title: variant.title,
@@ -453,7 +485,7 @@ impl ChannelJobRepository for PgChannelJobRepository {
             .bind(operator)
             .bind(tenant)
             .bind(project_id)
-            .bind(row.get::<Uuid, _>("cycle_id"))
+            .bind(row.get::<Option<Uuid>, _>("cycle_id"))
             .bind(intent_id)
             .bind(encode(&target)?)
             .execute(&mut *tx)
@@ -1089,6 +1121,7 @@ mod tests {
             variant_id: Uuid::new_v4(),
             publication_intent_id: Uuid::new_v4(),
             distribution_target_id: Uuid::new_v4(),
+            origin_request_id: None,
             platform: "zhihu".into(),
             account_id: Uuid::new_v4(),
             title: "Frozen title".into(),

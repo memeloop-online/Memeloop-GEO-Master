@@ -10,17 +10,19 @@ use geo_api::{
     RepositoryHostOps, preview_cycle_report, reduce_cycle_report, router,
 };
 use geo_domain::{
-    AppError, ChannelPlan, ChannelTarget, ChannelTargetInput, ContentBlock, ContentBlockKind,
+    AcceptContentDistributionRequest, AppError, ChannelAccount, ChannelOwnerKind, ChannelPlan,
+    ChannelStatus, ChannelTarget, ChannelTargetInput, ChunkLocator, ContentBlock, ContentBlockKind,
     ContentCoverage, ContentExecution, ContentExecutionStatus, ContentHandoff, ContentHandoffItem,
     ContentItemStatus, ContentRevision, DEVELOPMENT_TENANT_ID, DEVELOPMENT_USER_EMAIL,
     DistributionRepository, DistributionTargetStatus, DocumentManifest, DocumentManifestCoverage,
-    DocumentManifestItem, DocumentManifestItemState, DocumentManifestState, ErrorCode,
+    DocumentManifestItem, DocumentManifestItemState, DocumentManifestState, ErrorCode, EvidenceRef,
     FreezeDistribution, IntentVerification, Membership, MemoryAuthRepository, PlatformPlacement,
     PreparedDistribution, ProjectCreate, ProjectSettings, ProjectStartCommand,
     PublicationLookupCandidate, PublicationLookupFinding, PublicationLookupJob,
     PublicationLookupObservation, PublicationLookupReportObservation, PublicationLookupRepository,
-    ReportAvailability, ReportManifestKind, Role, StructuredDocument, TenantScope, User,
-    hash_idempotency_key, settings_hash, sha256_hex, start_request_hash,
+    ReportAvailability, ReportManifestKind, Role, StructuredDocument, TEXT_DISTRIBUTION_FORMAT,
+    TenantScope, User, hash_idempotency_key, prepare_content_distribution_request, settings_hash,
+    sha256_hex, start_request_hash,
 };
 use geo_worker::{HostOps, ReportGetRequest, ReportReduceRequest};
 use serde_json::{Value, json};
@@ -1025,7 +1027,7 @@ async fn formal_reused_intent_maps_lookup_to_frozen_cell_not_original_send_id() 
     );
     assert_eq!(reused.intent.unwrap().channel_target_id, target.target_id);
     let row = report_lookup_row(
-        original.intent.channel_target_id,
+        original.command.command_id,
         original.intent.account_id,
         cutoff - Duration::seconds(1),
     );
@@ -1056,6 +1058,141 @@ async fn formal_reused_intent_maps_lookup_to_frozen_cell_not_original_send_id() 
             .iter()
             .any(|f| f.kind == "publication_asset_observed")
     );
+}
+
+#[tokio::test]
+async fn formal_cell_reusing_independent_request_maps_lookup_to_real_command_id() {
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let (repo, manifest_id) = freeze_formal_coverage(&state, &scope, cycle_id).await;
+    let page = repo
+        .expansion_page(&scope, manifest_id, 0, 6)
+        .await
+        .unwrap();
+    let target = page
+        .rows
+        .iter()
+        .find(|row| row.platform_id == "zhihu")
+        .unwrap()
+        .clone();
+    repo.commit_expansion_page(&scope, manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let document = StructuredDocument {
+        title: "Independent article".into(),
+        blocks: vec![ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Paragraph,
+            text: "Evidence-backed body".into(),
+            citation_ids: vec![],
+            items: vec![],
+            rich: None,
+        }],
+        schema_version: None,
+    };
+    let revision = ContentRevision {
+        revision_id: target.content_revision_id.unwrap(),
+        asset_id: Uuid::new_v4(),
+        revision: 1,
+        base_revision_id: None,
+        derived_from_revision_id: None,
+        markdown: document.markdown(),
+        document,
+        evidence: vec![EvidenceRef {
+            source_version_id: Uuid::new_v4(),
+            chunk_id: Some(Uuid::new_v4()),
+            locator: ChunkLocator::Text {
+                start_line: 1,
+                end_line: 1,
+                start_char: 0,
+                end_char: 4,
+            },
+        }],
+        quotes: vec![],
+        findings: vec![],
+        created_at: Utc::now(),
+    };
+    let account = ChannelAccount {
+        account_id: Uuid::new_v4(),
+        project_id,
+        owner_kind: ChannelOwnerKind::Customer,
+        platform: target.platform_id.clone(),
+        group_id: None,
+        status: ChannelStatus::Ready,
+        display_name: None,
+        platform_account_id: None,
+        avatar_url: None,
+        enabled: true,
+        proxy_configured: false,
+        proxy_server: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let request = prepare_content_distribution_request(
+        &scope,
+        &AcceptContentDistributionRequest {
+            revision: revision.clone(),
+            account: account.clone(),
+            placement_slot: target.placement_slot.clone(),
+            format: TEXT_DISTRIBUTION_FORMAT.into(),
+            idempotency_key: "independent-report-fixture".into(),
+        },
+    )
+    .unwrap();
+    let original = repo
+        .materialize_request_origin(&scope, &request, &revision)
+        .await
+        .unwrap();
+    assert!(original.channel_target_id.is_nil());
+    let command = repo
+        .get_publication_bundle(&scope, original.intent_id)
+        .await
+        .unwrap()
+        .command
+        .command_id;
+    let reused = repo
+        .materialize(
+            &scope,
+            PreparedDistribution {
+                manifest_id,
+                target_id: target.target_id,
+                revision: Some(revision),
+                account_id: Some(account.account_id),
+                defer_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused.intent.unwrap().intent_id, original.intent_id);
+    assert_eq!(
+        repo.list_targets(&scope, manifest_id, None, 100)
+            .await
+            .unwrap()
+            .expected_count,
+        6
+    );
+    let state = state.with_publication_lookup_repository(Arc::new(ReportLookup {
+        scope: scope.clone(),
+        row: report_lookup_row(command, account.account_id, cutoff - Duration::seconds(1)),
+        invalid_newer: false,
+    }));
+    let report = reduce_cycle_report(
+        &state,
+        &scope,
+        cycle_id,
+        None,
+        cutoff + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.publications.expected_count, Some(6));
+    assert!(report.evidence.iter().any(|e| {
+        e.kind == "publication_lookup_asset_observed" && e.resource_id == target.target_id
+    }));
 }
 
 #[tokio::test]

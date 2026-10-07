@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelStatus, ChannelTarget,
     ChannelTargetInput, ChannelTargetView, ConnectorAvailability, ConnectorKey, ErrorCode,
-    KnowledgePurpose, ProjectId, ProjectStatus, QuestionReference, SourceState, TenantScope,
-    sha256_hex,
+    KnowledgePurpose, ProjectId, ProjectStatus, PublicationOrigin, QuestionReference, SourceState,
+    TenantScope, sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -94,6 +94,7 @@ async fn generated_connector_available(
         platform,
         publication_intent_id,
         distribution_target_id,
+        origin_request_id,
         ..
     } = input
     else {
@@ -106,7 +107,73 @@ async fn generated_connector_available(
         .distribution_repository()
         .get_publication_bundle(scope, *publication_intent_id)
         .await?;
-    let frozen = bundle.target;
+    bundle.validate_origin()?;
+    let frozen = match bundle.origin {
+        PublicationOrigin::ContentRequest { request } => {
+            if Some(request.request_id) != *origin_request_id
+                || !distribution_target_id.is_nil()
+                || request.platform_id != *platform
+                || request.format != geo_domain::TEXT_DISTRIBUTION_FORMAT
+            {
+                return Ok(false);
+            }
+            let key = ConnectorKey {
+                platform_id: platform.clone(),
+                placement_slot: request.placement_slot,
+            };
+            let connectors = crate::connector_capabilities::deployed_versions(state).await;
+            let Some(version) = crate::connector_capabilities::deployed_version(&connectors, &key)
+            else {
+                return Ok(false);
+            };
+            let Some(settings) = state
+                .connector_capability_repository()
+                .get(scope.operator_id, &key)
+                .await?
+            else {
+                return Ok(false);
+            };
+            if !settings.enabled {
+                return Ok(false);
+            }
+            let content = state.content_repository();
+            let semantic =
+                if let Some(asset) = content.get_asset(scope, request.content_asset_id).await? {
+                    content
+                        .get_item(scope, asset.execution_id, asset.item_id)
+                        .await?
+                        .map(|item| item.content_type)
+                } else {
+                    None
+                };
+            let proof_format = if settings
+                .content_types
+                .iter()
+                .any(|format| format == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
+            {
+                geo_domain::PLAIN_TEXT_ARTICLE_FORMAT
+            } else if let Some(semantic) = semantic.as_deref().filter(|semantic| {
+                geo_domain::publication_format_for_semantic_type(semantic).is_some()
+                    && settings.content_types.iter().any(|item| item == *semantic)
+            }) {
+                semantic
+            } else {
+                return Ok(false);
+            };
+            return Ok(state
+                .connector_capability_repository()
+                .resolve(scope.operator_id, &key, version, proof_format)
+                .await?
+                .availability
+                == ConnectorAvailability::Available);
+        }
+        PublicationOrigin::CoverageTarget { target } => {
+            if origin_request_id.is_some() {
+                return Ok(false);
+            }
+            target
+        }
+    };
     let manifest = state
         .distribution_repository()
         .get(scope, frozen.manifest_id)
@@ -763,6 +830,7 @@ async fn generated_publication_preflight(
         variant_id,
         publication_intent_id,
         distribution_target_id,
+        origin_request_id,
         platform,
         account_id,
         title,
@@ -781,24 +849,17 @@ async fn generated_publication_preflight(
     let variant = &bundle.variant;
     let revision = &bundle.revision;
     let intent = &bundle.intent;
-    let target = &bundle.target;
     let command = &bundle.command;
+    bundle.validate_origin()?;
     if evidence.is_empty()
         || *content_revision_id != revision.revision_id
         || *variant_id != variant.variant_id
-        || *distribution_target_id != target.target_id
         || intent.intent_id != *publication_intent_id
         || intent.project_id != scope.project_id.expect("project scope checked")
-        || intent.channel_target_id != target.target_id
         || intent.variant_id != variant.variant_id
         || intent.content_revision_id != revision.revision_id
         || intent.platform_id != *platform
         || intent.account_id != *account_id
-        || target.content_revision_id != Some(revision.revision_id)
-        || target.variant_id != Some(variant.variant_id)
-        || target.publication_intent_id != Some(intent.intent_id)
-        || target.account_id != Some(*account_id)
-        || target.platform_id != *platform
         || variant.platform_id != *platform
         || variant.content_revision_id != revision.revision_id
         || variant.title != *title
@@ -813,11 +874,61 @@ async fn generated_publication_preflight(
         || intent.payload_hash != *payload_hash
         || command.payload_hash != *payload_hash
         || command.intent_id != intent.intent_id
-        || command.target_id != target.target_id
     {
         return Err(AppError::conflict(
             "generated publication differs from frozen distribution",
         ));
+    }
+    match &bundle.origin {
+        PublicationOrigin::CoverageTarget { target } => {
+            if origin_request_id.is_some()
+                || *distribution_target_id != target.target_id
+                || intent.channel_target_id != target.target_id
+                || command.target_id != target.target_id
+                || target.content_revision_id != Some(revision.revision_id)
+                || target.variant_id != Some(variant.variant_id)
+                || target.publication_intent_id != Some(intent.intent_id)
+                || target.account_id != Some(*account_id)
+                || target.platform_id != *platform
+            {
+                return Err(AppError::conflict("covered publication origin differs"));
+            }
+        }
+        PublicationOrigin::ContentRequest { request } => {
+            if !distribution_target_id.is_nil()
+                || *origin_request_id != Some(request.request_id)
+                || !intent.channel_target_id.is_nil()
+                || !command.target_id.is_nil()
+                || request.scope != *scope
+                || request.content_revision_id != revision.revision_id
+                || request.content_asset_id != revision.asset_id
+                || request.account_id != *account_id
+                || request.platform_id != *platform
+                || request.placement_slot != variant.placement_slot
+                || request.format != geo_domain::TEXT_DISTRIBUTION_FORMAT
+                || variant.policy_version != geo_domain::CHANNEL_VARIANT_POLICY
+                || revision.findings.iter().any(|finding| finding.blocking)
+            {
+                return Err(AppError::conflict("requested publication origin differs"));
+            }
+            let content = state.content_repository();
+            let stored = content
+                .get_revision(scope, request.content_asset_id, request.content_revision_id)
+                .await?
+                .ok_or_else(|| AppError::conflict("publication revision unavailable"))?;
+            if stored != *revision
+                || !content
+                    .list_checks(scope, request.content_revision_id)
+                    .await?
+                    .iter()
+                    .any(|check| {
+                        check.revision_id == request.content_revision_id
+                            && !check.findings.iter().any(|finding| finding.blocking)
+                    })
+            {
+                return Err(AppError::conflict("publication check no longer valid"));
+            }
+        }
     }
     if command.fixture {
         return Ok(true);
@@ -840,6 +951,34 @@ async fn generated_publication_preflight(
         {
             return Err(AppError::conflict("source version no longer available"));
         };
+        if matches!(bundle.origin, PublicationOrigin::ContentRequest { .. }) {
+            let detail = knowledge
+                .get_source_detail(scope, source.source_id)
+                .await?
+                .ok_or_else(|| AppError::conflict("source unavailable"))?;
+            let quote = revision
+                .quotes
+                .iter()
+                .find(|quote| quote.reference == *cited)
+                .ok_or_else(|| AppError::conflict("source quote unavailable"))?;
+            if !detail.chunks.iter().any(|chunk| {
+                Some(chunk.chunk_id) == cited.chunk_id
+                    && chunk.source_version_id == cited.source_version_id
+                    && chunk.locator == cited.locator
+                    && if matches!(chunk.locator, geo_domain::ChunkLocator::Csv { .. }) {
+                        chunk.text == quote.exact_quote
+                    } else {
+                        chunk
+                            .text
+                            .chars()
+                            .take(geo_domain::CONTENT_EVIDENCE_MAX_QUOTE_CHARS)
+                            .collect::<String>()
+                            == quote.exact_quote
+                    }
+            }) {
+                return Err(AppError::conflict("source evidence quote changed"));
+            }
+        }
     }
     Ok(false)
 }
@@ -2031,6 +2170,7 @@ mod tests {
             variant_id: Uuid::new_v4(),
             publication_intent_id: Uuid::new_v4(),
             distribution_target_id: Uuid::new_v4(),
+            origin_request_id: None,
             platform: "zhihu".into(),
             account_id: Uuid::new_v4(),
             title: "Frozen title".into(),

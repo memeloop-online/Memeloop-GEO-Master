@@ -17,7 +17,8 @@ use geo_domain::{
     DistributionManifest, DistributionRepository, DistributionScopeMode, DistributionTarget,
     DistributionTargetPage, DistributionTargetStatus, FreezeDistribution, KnowledgePurpose,
     KnowledgeRepository, PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository,
-    ProjectStatus, SourceState, TenantScope, publication_format_for_semantic_type,
+    ProjectStatus, PublicationOrigin, SourceState, TenantScope,
+    publication_format_for_semantic_type,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -274,15 +275,26 @@ impl DistributionService {
             .distribution
             .get_publication_bundle(scope, intent_id)
             .await?;
+        bundle.validate_origin()?;
         if target.target_id != target_id
             || target.manifest_id != manifest.manifest_id
             || bundle.intent.intent_id != intent_id
             || bundle.intent.project_id != manifest.project_id
-            || bundle.intent.channel_target_id != bundle.target.target_id
-            || bundle.command.target_id != bundle.target.target_id
             || Some(bundle.intent.content_revision_id) != target.content_revision_id
             || bundle.intent.platform_id != target.platform_id
             || bundle.intent.placement_slot != target.placement_slot
+            || !match &bundle.origin {
+                PublicationOrigin::CoverageTarget { target: original } => {
+                    bundle.intent.channel_target_id == original.target_id
+                        && bundle.command.target_id == original.target_id
+                }
+                PublicationOrigin::ContentRequest { request } => {
+                    request.scope == *scope
+                        && request.publication_intent_id == Some(intent_id)
+                        && bundle.intent.channel_target_id.is_nil()
+                        && bundle.command.target_id.is_nil()
+                }
+            }
         {
             return Err(AppError::conflict(
                 "publication target binding is inconsistent",
@@ -291,7 +303,9 @@ impl DistributionService {
         Ok(Some(PublicationTargetReference {
             distribution_target_id: target.target_id,
             publication_intent_id: intent_id,
-            channel_target_id: bundle.intent.channel_target_id,
+            // Channel jobs use command_id. channel_target_id on the old
+            // intent JSON is a COVERAGE target, not a channel job identity.
+            channel_target_id: bundle.command.command_id,
         }))
     }
 

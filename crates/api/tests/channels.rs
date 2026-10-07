@@ -379,48 +379,35 @@ async fn legacy_snapshot_and_action_routes_are_removed() {
     let (app, _project, cookie, csrf) = fixture().await;
     let session_id = Uuid::new_v4();
 
-    for path in [
-        format!("/api/v1/channel-login-sessions/{session_id}/snapshot"),
-        format!("/api/v1/operator/channel-login-sessions/{session_id}/snapshot"),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                &path,
-                Some(&cookie),
-                Some(&csrf),
-                "{}".to_owned(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::NOT_FOUND,
-            "legacy snapshot route still registered: {path}"
-        );
-    }
-
-    for path in [
-        format!("/api/v1/channel-login-sessions/{session_id}/actions"),
-        format!("/api/v1/operator/channel-login-sessions/{session_id}/actions"),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(request(
-                "GET",
-                &path,
-                Some(&cookie),
-                Some(&csrf),
-                String::new(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::NOT_FOUND,
-            "legacy action route still registered: {path}"
-        );
+    for prefix in ["", "/operator"] {
+        for (method, suffix) in [
+            ("GET", "snapshot"),
+            ("POST", "snapshot"),
+            ("GET", "actions"),
+            ("POST", "actions"),
+        ] {
+            let path = format!("/api/v1{prefix}/channel-login-sessions/{session_id}/{suffix}");
+            let response = app
+                .clone()
+                .oneshot(request(
+                    method,
+                    &path,
+                    Some(&cookie),
+                    Some(&csrf),
+                    if method == "POST" {
+                        "{}".to_owned()
+                    } else {
+                        String::new()
+                    },
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "legacy {method} {path} route still registered"
+            );
+        }
     }
 }
 

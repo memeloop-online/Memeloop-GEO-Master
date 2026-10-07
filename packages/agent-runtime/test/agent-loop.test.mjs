@@ -779,6 +779,8 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "distribution_read",
         "distribution_resume",
         "distribution_targets_read",
+        "content_distribute_request",
+        "content_distribute_read",
       ],
     );
     assert.match(requests[1].messages.at(-1).content, /"status":"partial"/u);
@@ -1008,6 +1010,8 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "distribution_read",
         "distribution_resume",
         "distribution_targets_read",
+        "content_distribute_request",
+        "content_distribute_read",
       ],
     );
     const importSchema = modelRequests[0].tools[0].function.parameters;
@@ -2302,6 +2306,119 @@ test("formal distribution tools pass only scoped selectors and expose a paged co
       ["targets", { manifest_id: manifestId, limit: 1 }],
       ["resume", { manifest_id: manifestId, after_ordinal: 0 }],
     ]);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("single-article distribution pins revision/account/key and reports only accepted status", async () => {
+  const ids = [
+    "00000000-0000-4000-8000-000000000101",
+    "00000000-0000-4000-8000-000000000102",
+    "00000000-0000-4000-8000-000000000103",
+    "00000000-0000-4000-8000-000000000104",
+  ];
+  const command = {
+    content_asset_id: ids[0],
+    content_revision_id: ids[1],
+    account_id: ids[2],
+    placement_slot: "article",
+    format: "markdown.v1",
+    idempotency_key: "same-retry-key",
+  };
+  let completions = 0;
+  const writes = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected search");
+    },
+    async contentDistributeRequest(request) {
+      writes.push(request);
+      return {
+        request_id: ids[3],
+        status: "accepted",
+        publication_intent_id: null,
+      };
+    },
+    async contentDistributeRead(request) {
+      assert.deepEqual(request, { request_id: ids[3] });
+      return {
+        request_id: ids[3],
+        status: "accepted",
+        publication_intent_id: null,
+      };
+    },
+    async modelComplete(request) {
+      const schemas = Object.fromEntries(
+        request.tools.map((tool) => [
+          tool.function.name,
+          tool.function.parameters,
+        ]),
+      );
+      assert.deepEqual(
+        schemas.content_distribute_request.required,
+        Object.keys(command),
+      );
+      assert.equal(
+        schemas.content_distribute_request.additionalProperties,
+        false,
+      );
+      assert.deepEqual(
+        schemas.content_distribute_request.properties.format.enum,
+        ["markdown.v1", "rich_markdown.v2"],
+      );
+      assert.equal(
+        schemas.content_distribute_request.properties.tenant_id,
+        undefined,
+      );
+      assert.equal(
+        schemas.content_distribute_request.properties.project_id,
+        undefined,
+      );
+      assert.deepEqual(schemas.content_distribute_read.required, [
+        "request_id",
+      ]);
+      const index = completions++;
+      const tool = ["content_distribute_request", "content_distribute_read"][
+        index
+      ];
+      return index < 2
+        ? {
+            text: "",
+            tool_calls: [
+              {
+                id: `single-article-${index}`,
+                type: "function",
+                function: {
+                  name: tool,
+                  arguments: JSON.stringify(
+                    index === 0 ? command : { request_id: ids[3] },
+                  ),
+                },
+              },
+            ],
+            model: "stub-model",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "tool_calls",
+          }
+        : finalModelAnswer("Request accepted, not published.");
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?singleArticle=${Date.now()}`
+    );
+    const result = await main({
+      conversation_id: "single-article",
+      prompt: "Distribute this specific revision",
+      run_id: "run-single-article",
+      turn_id: "turn-single-article",
+    });
+    assert.match(result.answer, /accepted, not published/u);
+    assert.deepEqual(writes, [command]);
+    assert.equal(completions, 3);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

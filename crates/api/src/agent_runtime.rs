@@ -42,7 +42,8 @@ use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryPage, ChannelExecutionResult, ChannelManifestPage,
     ChannelManifestReadRequest, ChannelPlanReceipt, ChannelPlanRequest,
     ChannelPublicationLookupObservation, ChannelPublicationLookupSummary,
-    ChannelTargetExecuteRequest, DistributionManifestRef, DistributionReadRequest,
+    ChannelTargetExecuteRequest, ContentDistributeReadRequest, ContentDistributeRef,
+    ContentDistributeRequest, DistributionManifestRef, DistributionReadRequest,
     DistributionResumeRequest, DistributionStartRequest, DistributionTargetRef,
     DistributionTargetsPage, DistributionTargetsReadRequest, HOST_BUNDLE, HOST_MAIN_MODULE,
     HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOps,
@@ -818,6 +819,24 @@ fn distribution_ref(manifest: DistributionManifest) -> DistributionManifestRef {
     }
 }
 
+fn content_distribute_ref(request: geo_domain::ContentDistributionRequest) -> ContentDistributeRef {
+    ContentDistributeRef {
+        request_id: request.request_id,
+        content_asset_id: request.content_asset_id,
+        content_revision_id: request.content_revision_id,
+        account_id: request.account_id,
+        platform_id: request.platform_id,
+        placement_slot: request.placement_slot,
+        format: request.format,
+        status: "accepted".to_owned(),
+        publication_intent_id: request.publication_intent_id,
+        channel_target_id: None,
+        attempt_id: None,
+        outcome: None,
+        fixture: None,
+    }
+}
+
 fn distribution_target_ref(target: DistributionTarget) -> DistributionTargetRef {
     DistributionTargetRef {
         target_id: target.target_id,
@@ -938,6 +957,18 @@ fn worker_error(op: HostOp, error: AppError) -> HostOpError {
     }
 }
 
+fn single_article_error(op: HostOp, error: AppError) -> HostOpError {
+    if error.code == ErrorCode::Conflict {
+        if error.message == "idempotency key reused for another request" {
+            HostOpError::idempotency_conflict(op, error.message)
+        } else {
+            HostOpError::conflict(op, error.message)
+        }
+    } else {
+        worker_error(op, error)
+    }
+}
+
 #[async_trait]
 impl HostOps for RepositoryHostOps {
     async fn source_recommendations(
@@ -1007,6 +1038,57 @@ impl HostOps for RepositoryHostOps {
         )
         .await
         .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_distribute_request(
+        &self,
+        scope: &TenantScope,
+        request: ContentDistributeRequest,
+    ) -> Result<ContentDistributeRef, HostOpError> {
+        let op = HostOp::ContentDistributeRequest;
+        let accepted = crate::accept_content_distribution_request(
+            self.content_state(op)?,
+            scope,
+            crate::SingleArticleDistributionRequest {
+                content_asset_id: request.content_asset_id,
+                content_revision_id: request.content_revision_id,
+                account_id: request.account_id,
+                placement_slot: request.placement_slot,
+                format: request.format,
+            },
+            request.idempotency_key,
+        )
+        .await
+        .map_err(|error| single_article_error(op, error))?;
+        Ok(content_distribute_ref(accepted))
+    }
+
+    async fn content_distribute_read(
+        &self,
+        scope: &TenantScope,
+        request: ContentDistributeReadRequest,
+    ) -> Result<ContentDistributeRef, HostOpError> {
+        let op = HostOp::ContentDistributeRead;
+        let state = self.content_state(op)?;
+        let mut result = crate::read_content_distribution_request(state, scope, request.request_id)
+            .await
+            .map(content_distribute_ref)
+            .map_err(|error| single_article_error(op, error))?;
+        let publication =
+            crate::read_content_distribution_publication(state, scope, request.request_id)
+                .await
+                .map_err(|error| single_article_error(op, error))?;
+        result.channel_target_id = publication.channel_target_id;
+        result.attempt_id = publication.attempt_id;
+        result.outcome = publication.outcome.map(|outcome| {
+            serde_json::to_value(outcome)
+                .expect("known publication outcome")
+                .as_str()
+                .expect("known outcome serialized as string")
+                .to_owned()
+        });
+        result.fixture = publication.fixture;
+        Ok(result)
     }
 
     async fn distribution_start(
@@ -1920,6 +2002,20 @@ mod tests {
     use async_trait::async_trait;
     use geo_worker::HostOpErrorCode;
     use std::sync::Arc;
+
+    #[test]
+    fn single_article_idempotency_conflicts_are_typed_for_model_retries() {
+        let duplicate = single_article_error(
+            HostOp::ContentDistributeRequest,
+            AppError::conflict("idempotency key reused for another request"),
+        );
+        assert_eq!(duplicate.code, HostOpErrorCode::IdempotencyConflict);
+        let other = single_article_error(
+            HostOp::ContentDistributeRequest,
+            AppError::conflict("publication account is not ready"),
+        );
+        assert_eq!(other.code, HostOpErrorCode::Conflict);
+    }
 
     struct FakeModelProvider;
 

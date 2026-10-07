@@ -192,31 +192,30 @@ test("auth, fixed platform list, and retired control routes", async () => {
     }),
     { status: 503, body: { error: "capability_missing" } },
   );
-  await request("/v1/sessions", "POST", {
-    session_id: "control",
-    platform: "fixture",
-    storage_state: { cookies: [], origins: [] },
-  });
   assert.deepEqual(
-    (
-      await request("/v1/sessions/control/actions", "POST", {
-        kind: "navigate",
-        url,
-      })
-    ).body,
-    { error: "not_found" },
+    await request("/v1/sessions", "POST", {
+      session_id: "control",
+      platform: "fixture",
+      storage_state: { cookies: [], origins: [] },
+    }),
+    { status: 201, body: { session_id: "control", phase: "login_required" } },
   );
-  assert.deepEqual(
-    (
-      await request("/v1/sessions/control/actions", "POST", {
-        kind: "key",
-        key: "ControlOrMeta+L",
-      })
-    ).body,
-    { error: "not_found" },
-  );
-  assert.deepEqual((await request("/v1/sessions/control/snapshot")).body, {
-    error: "not_found",
+  for (const [method, suffix, body] of [
+    ["GET", "snapshot"],
+    ["POST", "snapshot", {}],
+    ["GET", "actions"],
+    ["POST", "actions", { kind: "navigate", url }],
+    ["POST", "actions", { kind: "key", key: "ControlOrMeta+L" }],
+  ]) {
+    assert.deepEqual(
+      await request(`/v1/sessions/control/${suffix}`, method, body),
+      { status: 404, body: { error: "not_found" } },
+      `retired ${method} /${suffix} endpoint must remain unavailable`,
+    );
+  }
+  assert.deepEqual(await request("/v1/sessions/control/status"), {
+    status: 200,
+    body: { phase: "login_required" },
   });
   assert.deepEqual(
     (await request("/v1/sessions/control/complete", "POST")).body,

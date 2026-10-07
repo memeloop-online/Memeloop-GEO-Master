@@ -656,12 +656,59 @@ async fn the_reference_bundle_declares_the_surface_it_expects() {
         "distributionRead",
         "distributionResume",
         "distributionTargetsRead",
+        "contentDistributeRequest",
+        "contentDistributeRead",
     ] {
         assert!(
             declared.iter().any(|entry| entry == capability),
             "`{capability}` must be declared by the bundle: {declared:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn single_article_ops_reject_scope_injection_and_unknown_format_before_capability() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        const base = {
+          content_asset_id: "00000000-0000-4000-8000-000000000001",
+          content_revision_id: "00000000-0000-4000-8000-000000000002",
+          account_id: "00000000-0000-4000-8000-000000000003",
+          placement_slot: "article",
+          format: "markdown.v1",
+          idempotency_key: "one-article"
+        };
+        await attempt("scope-injection", () => Deno.core.ops.op_host_content_distribute_request_v1(
+          JSON.stringify({...base, tenant_id: "00000000-0000-4000-8000-000000000004"})
+        ));
+        await attempt("unknown-format", () => Deno.core.ops.op_host_content_distribute_request_v1(
+          JSON.stringify({...base, format:"unknown"})
+        ));
+        await attempt("valid-unconfigured", () => Deno.core.ops.op_host_content_distribute_request_v1(
+          JSON.stringify(base)
+        ));
+        await attempt("read-injection", () => Deno.core.ops.op_host_content_distribute_read_v1(
+          JSON.stringify({request_id: base.content_revision_id, project_id:base.account_id})
+        ));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for label in ["scope-injection", "unknown-format", "read-injection"] {
+        let result = outcome(&runtime.host_state(), label);
+        assert_eq!(result["error"]["code"], "invalid_request", "{result}");
+    }
+    let result = outcome(&runtime.host_state(), "valid-unconfigured");
+    assert_eq!(result["error"]["code"], "capability_missing", "{result}");
+    assert!(
+        ops.scopes().is_empty(),
+        "unconfigured ops must not fabricate a request"
+    );
 }
 
 // ---------------------------------------------------------------------------

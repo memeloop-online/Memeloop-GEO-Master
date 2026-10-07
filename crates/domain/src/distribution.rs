@@ -1,9 +1,9 @@
 //! Frozen second-stage coverage. The legacy channel plan is not a distribution manifest.
 //! Persistence must commit targets, variants, intents and commands in ONE transaction.
 use crate::{
-    AppError, ContentExecution, ContentExecutionStatus, ContentHandoff, ContentItemStatus,
-    ContentRevision, DocumentManifest, EvidenceRef, ProjectId, ReportEvidenceReference,
-    ReportPublicationStatus, TenantScope,
+    AppError, ContentDistributionRequest, ContentExecution, ContentExecutionStatus, ContentHandoff,
+    ContentItemStatus, ContentRevision, DocumentManifest, EvidenceRef, ProjectId,
+    ReportEvidenceReference, ReportPublicationStatus, TenantScope,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -127,6 +127,8 @@ pub struct ChannelVariant {
 pub struct PublicationIntent {
     pub intent_id: Uuid,
     pub project_id: ProjectId,
+    /// Historical coverage-target projection. Nil for an independently
+    /// requested publication; the typed bundle origin is authoritative.
     pub channel_target_id: Uuid,
     pub variant_id: Uuid,
     pub content_revision_id: Uuid,
@@ -154,9 +156,19 @@ pub enum IntentVerification {
 pub struct PublicationCommand {
     pub command_id: Uuid,
     pub intent_id: Uuid,
+    /// Historical coverage-target projection; nil for a request origin.
     pub target_id: Uuid,
     pub payload_hash: String,
     pub fixture: bool,
+}
+
+/// A publication originates from exactly one frozen coverage cell OR from an
+/// accepted single-article request. A request is not a fake coverage cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicationOrigin {
+    CoverageTarget { target: DistributionTarget },
+    ContentRequest { request: ContentDistributionRequest },
 }
 
 /// Trusted read of the immutable payload and its authoritative dependencies.
@@ -165,8 +177,44 @@ pub struct PublicationBundle {
     pub revision: ContentRevision,
     pub variant: ChannelVariant,
     pub intent: PublicationIntent,
-    pub target: DistributionTarget,
+    pub origin: PublicationOrigin,
     pub command: PublicationCommand,
+}
+
+impl PublicationBundle {
+    pub fn validate_origin(&self) -> Result<(), AppError> {
+        let expected = match &self.origin {
+            PublicationOrigin::CoverageTarget { target }
+                if target.publication_intent_id == Some(self.intent.intent_id)
+                    && target.variant_id == Some(self.variant.variant_id)
+                    && target.content_revision_id == Some(self.revision.revision_id)
+                    && target.account_id == Some(self.intent.account_id) =>
+            {
+                target.target_id
+            }
+            PublicationOrigin::ContentRequest { request }
+                if request.publication_intent_id == Some(self.intent.intent_id)
+                    && request.scope.project_id == Some(self.intent.project_id)
+                    && request.content_revision_id == self.revision.revision_id
+                    && request.account_id == self.intent.account_id
+                    && request.platform_id == self.variant.platform_id
+                    && request.placement_slot == self.variant.placement_slot =>
+            {
+                Uuid::nil()
+            }
+            _ => return Err(AppError::conflict("publication origin is inconsistent")),
+        };
+        if self.intent.channel_target_id != expected
+            || self.command.target_id != expected
+            || self.command.intent_id != self.intent.intent_id
+            || self.command.payload_hash != self.intent.payload_hash
+            || self.intent.payload_hash != self.variant.payload_hash
+            || self.intent.variant_id != self.variant.variant_id
+        {
+            return Err(AppError::conflict("publication origin binding differs"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,12 +641,77 @@ pub fn prepare_publication_intent(
     account_id: Uuid,
     at: DateTime<Utc>,
 ) -> (PublicationIntent, PublicationCommand) {
+    prepare_publication_identity(
+        scope,
+        manifest.project_id,
+        target.platform_id.as_str(),
+        target.placement_slot.as_str(),
+        target.target_id,
+        variant,
+        account_id,
+        manifest.platform_scope.iter().any(|placement| {
+            placement.platform_id == target.platform_id
+                && placement.placement_slot == target.placement_slot
+                && placement.fixture
+        }),
+        at,
+    )
+}
+
+/// Same logical identity as a covered publication, with no cycle or
+/// fabricated distribution target. Nil is only the inactive legacy JSON
+/// projection; persisted origin_request_id is authoritative.
+pub fn prepare_request_publication_intent(
+    scope: &TenantScope,
+    request: &ContentDistributionRequest,
+    variant: &ChannelVariant,
+    at: DateTime<Utc>,
+) -> Result<(PublicationIntent, PublicationCommand), AppError> {
+    check_scope(
+        scope,
+        request
+            .scope
+            .project_id
+            .ok_or_else(|| AppError::forbidden("project scope required"))?,
+    )?;
+    if request.scope != *scope
+        || request.content_revision_id != variant.content_revision_id
+        || request.platform_id != variant.platform_id
+        || request.placement_slot != variant.placement_slot
+    {
+        return Err(AppError::conflict("request variant binding differs"));
+    }
+    Ok(prepare_publication_identity(
+        scope,
+        scope.project_id.expect("checked"),
+        &request.platform_id,
+        &request.placement_slot,
+        Uuid::nil(),
+        variant,
+        request.account_id,
+        false,
+        at,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_publication_identity(
+    scope: &TenantScope,
+    project_id: ProjectId,
+    platform_id: &str,
+    placement_slot: &str,
+    origin_target_id: Uuid,
+    variant: &ChannelVariant,
+    account_id: Uuid,
+    fixture: bool,
+    at: DateTime<Utc>,
+) -> (PublicationIntent, PublicationCommand) {
     let logical_key = digest(&[
         &scope.storage_key(),
         &variant.content_revision_id.to_string(),
         &variant.variant_id.to_string(),
-        &target.platform_id,
-        &target.placement_slot,
+        platform_id,
+        placement_slot,
         &account_id.to_string(),
         &variant.payload_hash,
     ]);
@@ -606,12 +719,12 @@ pub fn prepare_publication_intent(
     (
         PublicationIntent {
             intent_id,
-            project_id: manifest.project_id,
-            channel_target_id: target.target_id,
+            project_id,
+            channel_target_id: origin_target_id,
             variant_id: variant.variant_id,
             content_revision_id: variant.content_revision_id,
-            platform_id: target.platform_id.clone(),
-            placement_slot: target.placement_slot.clone(),
+            platform_id: platform_id.into(),
+            placement_slot: placement_slot.into(),
             account_id,
             payload_hash: variant.payload_hash.clone(),
             logical_key,
@@ -622,13 +735,9 @@ pub fn prepare_publication_intent(
         PublicationCommand {
             command_id: identity(&[&intent_id.to_string(), "publish"]),
             intent_id,
-            target_id: target.target_id,
+            target_id: origin_target_id,
             payload_hash: variant.payload_hash.clone(),
-            fixture: manifest.platform_scope.iter().any(|placement| {
-                placement.platform_id == target.platform_id
-                    && placement.placement_slot == target.placement_slot
-                    && placement.fixture
-            }),
+            fixture,
         },
     )
 }
@@ -686,6 +795,20 @@ pub trait DistributionRepository: Send + Sync {
         scope: &TenantScope,
         prepared: PreparedDistribution,
     ) -> Result<MaterializedDistribution, AppError>;
+    /// Atomically reuse or create one logical publication for a request.
+    /// The request repository holds the acceptance row lock while delegating
+    /// in-memory materialization; PostgreSQL implements both in one transaction.
+    async fn materialize_request_origin(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+    ) -> Result<PublicationIntent, AppError> {
+        let _ = (scope, request, revision);
+        Err(AppError::capability_missing(
+            "request materialization requires atomic repository support",
+        ))
+    }
     /// Trusted receipt adapter only: supply the evidence ID of a persisted
     /// external check before changing the reuse classification.
     async fn record_intent_verification(
@@ -732,6 +855,7 @@ struct MemoryDistributionState {
     variants: HashMap<(String, Uuid), ChannelVariant>,
     revisions: HashMap<(String, Uuid), ContentRevision>,
     commands: HashMap<(String, Uuid), PublicationCommand>,
+    requests: HashMap<(String, Uuid), ContentDistributionRequest>,
 }
 
 impl MemoryDistributionRepository {
@@ -815,19 +939,33 @@ impl DistributionRepository for MemoryDistributionRepository {
             .find(|((owner, _), command)| owner == &key && command.intent_id == intent_id)
             .map(|(_, command)| command.clone())
             .ok_or_else(|| AppError::not_found("publication command not found"))?;
-        let target = state
-            .histories
-            .get(&(key, command.target_id))
-            .and_then(|history| history.last())
-            .map(|version| version.target.clone())
-            .ok_or_else(|| AppError::not_found("distribution target not found"))?;
-        Ok(PublicationBundle {
+        let origin = if command.target_id.is_nil() {
+            PublicationOrigin::ContentRequest {
+                request: state
+                    .requests
+                    .get(&(key, intent.intent_id))
+                    .cloned()
+                    .ok_or_else(|| AppError::not_found("distribution request not found"))?,
+            }
+        } else {
+            PublicationOrigin::CoverageTarget {
+                target: state
+                    .histories
+                    .get(&(key, command.target_id))
+                    .and_then(|history| history.last())
+                    .map(|version| version.target.clone())
+                    .ok_or_else(|| AppError::not_found("distribution target not found"))?,
+            }
+        };
+        let bundle = PublicationBundle {
             revision,
             variant,
             intent,
-            target,
+            origin,
             command,
-        })
+        };
+        bundle.validate_origin()?;
+        Ok(bundle)
     }
 
     async fn freeze(
@@ -1199,6 +1337,95 @@ impl DistributionRepository for MemoryDistributionRepository {
         })
     }
 
+    async fn materialize_request_origin(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+    ) -> Result<PublicationIntent, AppError> {
+        if request.scope != *scope
+            || request.content_revision_id != revision.revision_id
+            || request.content_asset_id != revision.asset_id
+            || revision.findings.iter().any(|finding| finding.blocking)
+            || revision.evidence.is_empty()
+        {
+            return Err(AppError::conflict("request revision is not eligible"));
+        }
+        if request.format != crate::TEXT_DISTRIBUTION_FORMAT {
+            return Err(AppError::conflict("publication format is not supported"));
+        }
+        let placement = PlatformPlacement {
+            platform_id: request.platform_id.clone(),
+            placement_slot: request.placement_slot.clone(),
+            capability_version: "request-text-v1".into(),
+            supported_formats: vec![request.format.clone()],
+            unavailable_reason: None,
+            fixture: false,
+        };
+        let variant = prepare_variant(revision, &placement)?;
+        let (candidate, command) =
+            prepare_request_publication_intent(scope, request, &variant, Utc::now())?;
+        let key = scope.storage_key();
+        let mut state = self.state.write().await;
+        let prior = state
+            .intents
+            .get(&(key.clone(), candidate.logical_key.clone()))
+            .cloned();
+        let intent = prior.unwrap_or_else(|| candidate.clone());
+        if intent.intent_id != candidate.intent_id
+            || intent.account_id != request.account_id
+            || intent.variant_id != variant.variant_id
+            || request
+                .publication_intent_id
+                .is_some_and(|id| id != intent.intent_id)
+        {
+            return Err(AppError::conflict(
+                "logical publication differs from request",
+            ));
+        }
+        if state
+            .variants
+            .get(&(key.clone(), variant.variant_id))
+            .is_some_and(|stored| *stored != variant)
+            || state
+                .revisions
+                .get(&(key.clone(), revision.revision_id))
+                .is_some_and(|stored| *stored != *revision)
+        {
+            return Err(AppError::conflict("immutable publication payload differs"));
+        }
+        if !state
+            .intents
+            .contains_key(&(key.clone(), candidate.logical_key.clone()))
+        {
+            state
+                .commands
+                .insert((key.clone(), command.command_id), command);
+            state
+                .intents
+                .insert((key.clone(), candidate.logical_key), intent.clone());
+        }
+        state
+            .variants
+            .entry((key.clone(), variant.variant_id))
+            .or_insert(variant);
+        state
+            .revisions
+            .entry((key.clone(), revision.revision_id))
+            .or_insert(revision.clone());
+        if intent.channel_target_id.is_nil() {
+            let mut bound = request.clone();
+            bound.publication_intent_id = Some(intent.intent_id);
+            // A later request may reuse this intent, but only the original
+            // request is its immutable origin and outbox dependency.
+            state
+                .requests
+                .entry((key, intent.intent_id))
+                .or_insert(bound);
+        }
+        Ok(intent)
+    }
+
     async fn record_intent_verification(
         &self,
         scope: &TenantScope,
@@ -1310,6 +1537,11 @@ impl DistributionRepository for MemoryDistributionRepository {
 #[cfg(test)]
 mod report_evidence_tests {
     use super::*;
+    use crate::{
+        AcceptContentDistributionRequest, ChannelAccount, ChannelOwnerKind, ChannelStatus,
+        ChunkLocator, ContentBlock, ContentBlockKind, EvidenceRef, StructuredDocument,
+        TEXT_DISTRIBUTION_FORMAT, prepare_content_distribution_request,
+    };
 
     #[test]
     fn reused_receipt_retains_times_but_has_distinct_target_associations() {
@@ -1351,5 +1583,98 @@ mod report_evidence_tests {
         assert_eq!(right.resource_id, second);
         assert_eq!(left.occurred_at, right.occurred_at);
         assert_eq!(left.received_at, right.received_at);
+    }
+
+    #[tokio::test]
+    async fn memory_reused_request_retains_first_origin_even_when_other_request_links() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let document = StructuredDocument {
+            title: "Example".into(),
+            blocks: vec![ContentBlock {
+                block_id: Uuid::new_v4(),
+                kind: ContentBlockKind::Paragraph,
+                text: "Cited text".into(),
+                citation_ids: vec![],
+                items: vec![],
+                rich: None,
+            }],
+            schema_version: None,
+        };
+        let revision = ContentRevision {
+            revision_id: Uuid::new_v4(),
+            asset_id: Uuid::new_v4(),
+            revision: 1,
+            base_revision_id: None,
+            derived_from_revision_id: None,
+            markdown: document.markdown(),
+            document,
+            evidence: vec![EvidenceRef {
+                source_version_id: Uuid::new_v4(),
+                chunk_id: Some(Uuid::new_v4()),
+                locator: ChunkLocator::Text {
+                    start_line: 1,
+                    end_line: 1,
+                    start_char: 0,
+                    end_char: 10,
+                },
+            }],
+            quotes: vec![],
+            findings: vec![],
+            created_at: Utc::now(),
+        };
+        let account = ChannelAccount {
+            account_id: Uuid::new_v4(),
+            project_id: scope.project_id.expect("project"),
+            owner_kind: ChannelOwnerKind::Customer,
+            platform: "test".into(),
+            group_id: None,
+            status: ChannelStatus::Ready,
+            display_name: None,
+            platform_account_id: None,
+            avatar_url: None,
+            enabled: true,
+            proxy_configured: false,
+            proxy_server: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let storage = MemoryDistributionRepository::new();
+        let make_request = |key: &str| {
+            prepare_content_distribution_request(
+                &scope,
+                &AcceptContentDistributionRequest {
+                    revision: revision.clone(),
+                    account: account.clone(),
+                    placement_slot: "primary".into(),
+                    format: TEXT_DISTRIBUTION_FORMAT.into(),
+                    idempotency_key: key.into(),
+                },
+            )
+            .unwrap()
+        };
+        let first = make_request("first");
+        let second = make_request("second");
+        let intent = storage
+            .materialize_request_origin(&scope, &first, &revision)
+            .await
+            .unwrap();
+        let reused = storage
+            .materialize_request_origin(&scope, &second, &revision)
+            .await
+            .unwrap();
+        assert_eq!(intent.intent_id, reused.intent_id);
+        assert_eq!(storage.publication_commands(&scope).await.len(), 1);
+        let bundle = storage
+            .get_publication_bundle(&scope, intent.intent_id)
+            .await
+            .unwrap();
+        assert!(
+            matches!(bundle.origin, PublicationOrigin::ContentRequest { request }
+            if request.request_id == first.request_id)
+        );
     }
 }

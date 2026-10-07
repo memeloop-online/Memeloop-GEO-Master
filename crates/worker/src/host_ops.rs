@@ -23,18 +23,19 @@ use serde::de::DeserializeOwned;
 
 use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
-    ChannelTargetExecuteRequest, ContentCloseRequest, ContentDocumentReadRequest,
-    ContentExecutionReadRequest, ContentItemsReadRequest, ContentMediaBindRequest,
-    ContentMediaInsertRequest, ContentMediaListRequest, ContentStartRequest, ContentStepRequest,
-    CreateQuestionSet, DistributionReadRequest, DistributionResumeRequest,
-    DistributionStartRequest, DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge,
-    HostOp, HostOpError, KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest,
-    KnowledgeSearchRequest, KnowledgeSearchResult, KnowledgeTextReadRequest,
-    KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
-    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
-    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
-    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
-    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
+    ChannelTargetExecuteRequest, ContentCloseRequest, ContentDistributeReadRequest,
+    ContentDistributeRequest, ContentDocumentReadRequest, ContentExecutionReadRequest,
+    ContentItemsReadRequest, ContentMediaBindRequest, ContentMediaInsertRequest,
+    ContentMediaListRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
+    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
+    DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
+    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeSearchRequest,
+    KnowledgeSearchResult, KnowledgeTextReadRequest, KnowledgeTextReviseRequest,
+    ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest, MeasurementPlanCreateRequest,
+    MeasurementPlanReadRequest, ModelCompletionRequest, ProjectCurrentRequest,
+    ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest, PublishRequest,
+    QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest, ReportPreviewRequest,
+    ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -408,6 +409,36 @@ distribution_op!(
             .is_some_and(|limit| !(1..=100).contains(&limit))
     {
         Err("invalid manifest reference or page limit")
+    } else {
+        Ok(())
+    }
+);
+distribution_op!(
+    op_host_content_distribute_request_v1,
+    ContentDistributeRequest,
+    ContentDistributeRequest,
+    content_distribute_request,
+    |request: &ContentDistributeRequest| if request.content_asset_id.is_nil()
+        || request.content_revision_id.is_nil()
+        || request.account_id.is_nil()
+        || request.placement_slot.is_empty()
+        || request.placement_slot.len() > 120
+        || !["markdown.v1", "rich_markdown.v2"].contains(&request.format.as_str())
+        || request.idempotency_key.is_empty()
+        || request.idempotency_key.len() > 256
+    {
+        Err("invalid single-article distribution request")
+    } else {
+        Ok(())
+    }
+);
+distribution_op!(
+    op_host_content_distribute_read_v1,
+    ContentDistributeRead,
+    ContentDistributeReadRequest,
+    content_distribute_read,
+    |request: &ContentDistributeReadRequest| if request.request_id.is_nil() {
+        Err("request reference must be non-zero")
     } else {
         Ok(())
     }
@@ -1110,6 +1141,8 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::DistributionRead.op_name(),
     HostOp::DistributionResume.op_name(),
     HostOp::DistributionTargetsRead.op_name(),
+    HostOp::ContentDistributeRequest.op_name(),
+    HostOp::ContentDistributeRead.op_name(),
     // Rust-owned run state: the loop's emit contract and the checkpoint probe.
     "op_host_emit",
     "op_host_checkpoint",

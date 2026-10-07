@@ -3,6 +3,7 @@ mod bootstrap;
 mod channels;
 mod config;
 mod content_dispatch;
+mod content_request_dispatch;
 #[cfg(test)]
 mod content_runtime_tests;
 mod dispatch;
@@ -187,6 +188,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         content_dispatch::spawn(state.clone(), scanner, cycles);
     }
     dispatch::spawn(state.clone());
+    content_request_dispatch::spawn(state.clone());
     let app: Router = router(state);
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(

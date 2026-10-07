@@ -149,6 +149,7 @@ async fn generated_input_without_a_frozen_authoritative_bundle_never_claims() {
                     variant_id: Uuid::new_v4(),
                     publication_intent_id: Uuid::new_v4(),
                     distribution_target_id: Uuid::new_v4(),
+                    origin_request_id: None,
                     platform: "zhihu".into(),
                     account_id: Uuid::new_v4(),
                     title: "untrusted".into(),
@@ -674,6 +675,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
         variant_id: variant.variant_id,
         publication_intent_id: intent.intent_id,
         distribution_target_id: target.target_id,
+        origin_request_id: None,
         platform: "zhihu".into(),
         account_id,
         title: variant.title.clone(),
@@ -897,7 +899,13 @@ async fn deployed_version_drift_preserves_frozen_coverage_and_blocks_send() {
         fixture
             .state
             .distribution_repository()
-            .get(&fixture.scope, before.target.manifest_id)
+            .get(
+                &fixture.scope,
+                match &before.origin {
+                    geo_domain::PublicationOrigin::CoverageTarget { target } => target.manifest_id,
+                    _ => panic!("fixture must retain its coverage origin"),
+                },
+            )
             .await
             .unwrap()
             .platform_scope[0]

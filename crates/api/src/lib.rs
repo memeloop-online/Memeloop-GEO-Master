@@ -10,6 +10,7 @@ mod channels;
 mod citation_insights;
 mod connector_capabilities;
 mod content;
+mod content_distribution_requests;
 mod content_export;
 mod content_media;
 mod content_media_tools;
@@ -19,6 +20,11 @@ mod desktop_gateway;
 pub mod distribution;
 mod source_channel_recommendations;
 pub use content::ContentService;
+pub use content_distribution_requests::{
+    SingleArticleDistributionRequest, SingleArticlePublication,
+    accept_content_distribution_request, read_content_distribution_publication,
+    read_content_distribution_request,
+};
 mod context;
 mod cycles;
 mod error;
@@ -142,6 +148,9 @@ pub struct AppState {
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
     distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
+    content_distribution_request_repository:
+        Arc<dyn geo_domain::ContentDistributionRequestRepository>,
+    distribution_intent_lookup: Arc<DistributionIntentLookupAdapter>,
     content_dispatch_repository: Option<geo_persistence::PgContentRepository>,
     content_model: Arc<std::sync::RwLock<Option<SharedModelProvider>>>,
     content_executor:
@@ -151,6 +160,34 @@ pub struct AppState {
     durable_storage: bool,
     origin_scheme: Arc<str>,
     origin_config: OriginConfig,
+}
+
+struct DistributionIntentLookupAdapter(
+    std::sync::RwLock<Arc<dyn geo_domain::DistributionRepository>>,
+);
+
+#[async_trait::async_trait]
+impl geo_domain::ContentDistributionIntentLookup for DistributionIntentLookupAdapter {
+    async fn get_existing_publication(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+    ) -> Result<geo_domain::PublicationBundle, AppError> {
+        let repository = self.0.read().expect("distribution lookup lock").clone();
+        repository.get_publication_bundle(scope, intent_id).await
+    }
+
+    async fn materialize_accepted_request(
+        &self,
+        scope: &TenantScope,
+        request: &geo_domain::ContentDistributionRequest,
+        revision: &geo_domain::ContentRevision,
+    ) -> Result<geo_domain::PublicationIntent, AppError> {
+        let repository = self.0.read().expect("distribution lookup lock").clone();
+        repository
+            .materialize_request_origin(scope, request, revision)
+            .await
+    }
 }
 
 impl AppState {
@@ -172,6 +209,11 @@ impl AppState {
         password: &str,
         knowledge_repository: Arc<dyn KnowledgeRepository>,
     ) -> Self {
+        let distribution_repository: Arc<dyn geo_domain::DistributionRepository> =
+            Arc::new(geo_domain::MemoryDistributionRepository::default());
+        let distribution_intent_lookup = Arc::new(DistributionIntentLookupAdapter(
+            std::sync::RwLock::new(distribution_repository.clone()),
+        ));
         let content_media_repository = Arc::new(
             geo_domain::MemoryContentMediaRepository::with_knowledge_repository(
                 knowledge_repository.clone(),
@@ -200,7 +242,13 @@ impl AppState {
                 ),
             ),
             content_media_repository,
-            distribution_repository: Arc::new(geo_domain::MemoryDistributionRepository::default()),
+            distribution_repository,
+            content_distribution_request_repository: Arc::new(
+                geo_domain::MemoryContentDistributionRequestRepository::new(
+                    distribution_intent_lookup.clone(),
+                ),
+            ),
+            distribution_intent_lookup,
             content_dispatch_repository: None,
             content_model: Arc::new(std::sync::RwLock::new(None)),
             content_executor: Arc::new(std::sync::RwLock::new(None)),
@@ -303,6 +351,11 @@ impl AppState {
         events: EventBus,
         durable_storage: bool,
     ) -> Self {
+        let distribution_repository: Arc<dyn geo_domain::DistributionRepository> =
+            Arc::new(geo_domain::MemoryDistributionRepository::default());
+        let distribution_intent_lookup = Arc::new(DistributionIntentLookupAdapter(
+            std::sync::RwLock::new(distribution_repository.clone()),
+        ));
         let content_media_repository = Arc::new(
             geo_domain::MemoryContentMediaRepository::with_knowledge_repository(
                 knowledge_repository.clone(),
@@ -331,7 +384,13 @@ impl AppState {
                 ),
             ),
             content_media_repository,
-            distribution_repository: Arc::new(geo_domain::MemoryDistributionRepository::default()),
+            distribution_repository,
+            content_distribution_request_repository: Arc::new(
+                geo_domain::MemoryContentDistributionRequestRepository::new(
+                    distribution_intent_lookup.clone(),
+                ),
+            ),
+            distribution_intent_lookup,
             content_dispatch_repository: None,
             content_model: Arc::new(std::sync::RwLock::new(None)),
             content_executor: Arc::new(std::sync::RwLock::new(None)),
@@ -392,6 +451,9 @@ impl AppState {
         ))
         .with_distribution_repository(Arc::new(
             geo_persistence::PgDistributionRepository::from_database(database),
+        ))
+        .with_content_distribution_request_repository(Arc::new(
+            geo_persistence::PgContentDistributionRequestRepository::from_database(database),
         ))
         .with_content_dispatch_repository(geo_persistence::PgContentRepository::from_database(
             database,
@@ -470,6 +532,10 @@ impl AppState {
         Arc::clone(&self.content_media_repository)
     }
 
+    pub fn content_repository(&self) -> Arc<dyn geo_domain::ContentRepository> {
+        Arc::clone(&self.content_repository)
+    }
+
     pub fn with_content_media_repository(
         mut self,
         repository: Arc<dyn geo_domain::ContentMediaRepository>,
@@ -540,6 +606,20 @@ impl AppState {
         Arc::clone(&self.distribution_repository)
     }
 
+    pub fn content_distribution_request_repository(
+        &self,
+    ) -> Arc<dyn geo_domain::ContentDistributionRequestRepository> {
+        Arc::clone(&self.content_distribution_request_repository)
+    }
+
+    pub fn with_content_distribution_request_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ContentDistributionRequestRepository>,
+    ) -> Self {
+        self.content_distribution_request_repository = repository;
+        self
+    }
+
     pub fn distribution_service(&self) -> distribution::DistributionService {
         distribution::DistributionService::new(
             Arc::clone(&self.distribution_repository),
@@ -558,6 +638,11 @@ impl AppState {
         mut self,
         repository: Arc<dyn geo_domain::DistributionRepository>,
     ) -> Self {
+        *self
+            .distribution_intent_lookup
+            .0
+            .write()
+            .expect("distribution lookup lock") = repository.clone();
         self.distribution_repository = repository;
         self
     }
@@ -2179,6 +2264,18 @@ pub fn router(state: AppState) -> Router {
             post(content::cancel),
         )
         .route("/projects/{id}/contents", get(content::contents))
+        .route(
+            "/projects/{id}/content-distribution-requests",
+            post(content_distribution_requests::accept),
+        )
+        .route(
+            "/projects/{id}/content-distribution-requests/{request_id}",
+            get(content_distribution_requests::get_request),
+        )
+        .route(
+            "/projects/{id}/content-distribution-requests/{request_id}/publication",
+            get(content_distribution_requests::get_publication),
+        )
         .route(
             "/projects/{id}/content-media/bindings",
             get(content_media::list_bindings).post(content_media::create_binding),

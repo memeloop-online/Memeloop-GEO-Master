@@ -506,6 +506,148 @@ async fn add_account(fixture: &Fixture) {
 }
 
 #[tokio::test]
+async fn formal_coverage_reuses_request_origin_and_its_actual_command() {
+    let fixture = setup(true).await;
+    add_account(&fixture).await;
+    let manifest = fixture
+        .service
+        .freeze(&fixture.scope, fixture.cycle_id)
+        .await
+        .unwrap();
+    let page = fixture
+        .distribution
+        .expansion_page(&fixture.scope, manifest.manifest_id, 0, 100)
+        .await
+        .unwrap();
+    fixture
+        .distribution
+        .commit_expansion_page(&fixture.scope, manifest.manifest_id, 0, page.rows)
+        .await
+        .unwrap();
+    let rows = fixture
+        .distribution
+        .list_targets(&fixture.scope, manifest.manifest_id, None, 100)
+        .await
+        .unwrap();
+    let target = rows
+        .rows
+        .iter()
+        .find(|row| row.platform_id == "a" && row.content_revision_id.is_some())
+        .unwrap();
+    let item = fixture
+        .content
+        .get_item(
+            &fixture.scope,
+            manifest.content_execution_id,
+            target.document_item_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let revision = fixture
+        .content
+        .get_revision(
+            &fixture.scope,
+            item.asset_id.unwrap(),
+            target.content_revision_id.unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let account = fixture
+        .channels
+        .list_accounts(&fixture.scope)
+        .await
+        .unwrap()[0]
+        .clone();
+    let input = geo_domain::AcceptContentDistributionRequest {
+        revision: revision.clone(),
+        account: account.clone(),
+        placement_slot: "primary".into(),
+        format: geo_domain::TEXT_DISTRIBUTION_FORMAT.into(),
+        idempotency_key: "request-before-coverage".into(),
+    };
+    let first = geo_domain::prepare_content_distribution_request(&fixture.scope, &input).unwrap();
+    let original = fixture
+        .distribution
+        .materialize_request_origin(&fixture.scope, &first, &revision)
+        .await
+        .unwrap();
+    fixture
+        .distribution
+        .record_intent_verification(
+            &fixture.scope,
+            original.intent_id,
+            IntentVerification::Unknown,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    let second = geo_domain::prepare_content_distribution_request(
+        &fixture.scope,
+        &geo_domain::AcceptContentDistributionRequest {
+            idempotency_key: "second-request-same-article".into(),
+            ..input
+        },
+    )
+    .unwrap();
+    let reused_request = fixture
+        .distribution
+        .materialize_request_origin(&fixture.scope, &second, &revision)
+        .await
+        .unwrap();
+    assert_eq!(reused_request.intent_id, original.intent_id);
+    let materialized = fixture
+        .distribution
+        .materialize(
+            &fixture.scope,
+            PreparedDistribution {
+                manifest_id: manifest.manifest_id,
+                target_id: target.target_id,
+                revision: Some(revision),
+                account_id: Some(account.account_id),
+                defer_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(materialized.publication_commands.is_empty());
+    assert_eq!(
+        materialized.target.status,
+        DistributionTargetStatus::ReusedUnknown
+    );
+    let bundle = fixture
+        .distribution
+        .get_publication_bundle(&fixture.scope, original.intent_id)
+        .await
+        .unwrap();
+    bundle.validate_origin().unwrap();
+    match &bundle.origin {
+        geo_domain::PublicationOrigin::ContentRequest { request } => {
+            assert_eq!(request.request_id, first.request_id);
+            assert_ne!(request.request_id, second.request_id);
+        }
+        _ => panic!("the original request must remain the publication origin"),
+    }
+    let binding = fixture
+        .service
+        .publication_target(&fixture.scope, manifest.manifest_id, target.target_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.channel_target_id, bundle.command.command_id);
+    assert!(!binding.channel_target_id.is_nil());
+    assert_ne!(binding.channel_target_id, target.target_id);
+    let after = fixture
+        .distribution
+        .list_targets(&fixture.scope, manifest.manifest_id, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(after.expected_count, rows.expected_count);
+    assert_eq!(after.rows.len(), rows.rows.len());
+}
+
+#[tokio::test]
 async fn publication_target_resolves_original_across_cycles_without_mutation_or_scope_leak() {
     let fixture = setup(true).await;
     add_account(&fixture).await;
@@ -536,7 +678,16 @@ async fn publication_target_resolves_original_across_cycles_without_mutation_or_
         .unwrap()
         .unwrap();
     assert_eq!(binding.distribution_target_id, sent.target_id);
-    assert_eq!(binding.channel_target_id, sent.target_id);
+    let original_bundle = fixture
+        .distribution
+        .get_publication_bundle(&fixture.scope, binding.publication_intent_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        binding.channel_target_id,
+        original_bundle.command.command_id
+    );
+    assert_ne!(binding.channel_target_id, sent.target_id);
     assert_eq!(
         binding.publication_intent_id,
         sent.publication_intent_id.unwrap()
@@ -569,6 +720,38 @@ async fn publication_target_resolves_original_across_cycles_without_mutation_or_
         .await
         .unwrap()
         .revision;
+    // An independent request reuses the original coverage-origin intent,
+    // including its unknown outcome and original command.
+    let request = geo_domain::prepare_content_distribution_request(
+        &fixture.scope,
+        &geo_domain::AcceptContentDistributionRequest {
+            revision: revision.clone(),
+            account: fixture
+                .channels
+                .list_accounts(&fixture.scope)
+                .await
+                .unwrap()[0]
+                .clone(),
+            placement_slot: "primary".into(),
+            format: geo_domain::TEXT_DISTRIBUTION_FORMAT.into(),
+            idempotency_key: "reuse-coverage-origin".into(),
+        },
+    )
+    .unwrap();
+    let reused_by_request = fixture
+        .distribution
+        .materialize_request_origin(&fixture.scope, &request, &revision)
+        .await
+        .unwrap();
+    assert_eq!(reused_by_request.intent_id, binding.publication_intent_id);
+    assert_eq!(reused_by_request.verification, IntentVerification::Unknown);
+    let still_original = fixture
+        .distribution
+        .get_publication_bundle(&fixture.scope, binding.publication_intent_id)
+        .await
+        .unwrap();
+    assert_eq!(still_original.command, original_bundle.command);
+    assert_eq!(still_original.origin, original_bundle.origin);
     let execution = fixture
         .content
         .list_executions(&fixture.scope, fixture.cycle_id)
@@ -675,7 +858,10 @@ async fn publication_target_resolves_original_across_cycles_without_mutation_or_
         .unwrap()
         .unwrap();
     assert_eq!(resolved.distribution_target_id, reused.target.target_id);
-    assert_eq!(resolved.channel_target_id, sent.target_id);
+    assert_eq!(
+        resolved.channel_target_id,
+        original_bundle.command.command_id
+    );
     assert_eq!(
         resolved.publication_intent_id,
         binding.publication_intent_id
@@ -733,6 +919,7 @@ async fn publication_target_resolves_original_across_cycles_without_mutation_or_
         variant_id: bundle.variant.variant_id,
         publication_intent_id: bundle.intent.intent_id,
         distribution_target_id: sent.target_id,
+        origin_request_id: None,
         platform: sent.platform_id.clone(),
         account_id,
         title: bundle.variant.title.clone(),

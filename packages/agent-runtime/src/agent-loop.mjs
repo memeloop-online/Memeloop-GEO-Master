@@ -215,11 +215,15 @@ const DISTRIBUTION_START = "distribution_start";
 const DISTRIBUTION_READ = "distribution_read";
 const DISTRIBUTION_RESUME = "distribution_resume";
 const DISTRIBUTION_TARGETS_READ = "distribution_targets_read";
+const CONTENT_DISTRIBUTE_REQUEST = "content_distribute_request";
+const CONTENT_DISTRIBUTE_READ = "content_distribute_read";
 const DISTRIBUTION_TOOLS = [
   DISTRIBUTION_START,
   DISTRIBUTION_READ,
   DISTRIBUTION_RESUME,
   DISTRIBUTION_TARGETS_READ,
+  CONTENT_DISTRIBUTE_REQUEST,
+  CONTENT_DISTRIBUTE_READ,
 ];
 const CHANNEL_TOOLS = [
   ...Object.keys(PROJECT_TOOLS),
@@ -273,6 +277,10 @@ const TOOL_DESCRIPTIONS = {
     "Advance at most four durable pages of a frozen distribution manifest and revisit eligible pending/deferred targets. This does not directly send or claim successful publication.",
   [DISTRIBUTION_TARGETS_READ]:
     "Read one bounded page of the formal document-by-platform coverage matrix with target states and opaque references. Do not interpret ready as published.",
+  [CONTENT_DISTRIBUTE_REQUEST]:
+    "Request distribution of one exact content revision to one explicitly selected scoped account and placement. Use asset/revision/account IDs from scoped resources and a stable idempotency_key; retry the same request with exactly the same key and payload. The accepted request is not a send or public verification, does not change default channels or frozen coverage, and an unknown result must never be blindly resent.",
+  [CONTENT_DISTRIBUTE_READ]:
+    "Read a previously accepted single-article request by its request_id. An optional publication intent is only a ledger reference. Report a send outcome only when an actual attempt and ledger outcome are present; fixture outcomes are not verified live publication. No attempt or outcome is not publication success.",
   [CHANNEL_DISCOVER]:
     "Discover current-project public source versions or available publishing/measurement accounts. Use returned IDs as references in channel_plan.",
   [CHANNEL_PLAN]:
@@ -377,6 +385,32 @@ const DISTRIBUTION_TARGETS_READ_SCHEMA = {
     after_ordinal: { type: "integer", minimum: 0 },
     limit: { type: "integer", minimum: 1, maximum: 100 },
   },
+};
+const CONTENT_DISTRIBUTE_REQUEST_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "content_asset_id",
+    "content_revision_id",
+    "account_id",
+    "placement_slot",
+    "format",
+    "idempotency_key",
+  ],
+  properties: {
+    content_asset_id: { type: "string", format: "uuid" },
+    content_revision_id: { type: "string", format: "uuid" },
+    account_id: { type: "string", format: "uuid" },
+    placement_slot: { type: "string", minLength: 1, maxLength: 120 },
+    format: { type: "string", enum: ["markdown.v1", "rich_markdown.v2"] },
+    idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+  },
+};
+const CONTENT_DISTRIBUTE_READ_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["request_id"],
+  properties: { request_id: { type: "string", format: "uuid" } },
 };
 const CHANNEL_DISCOVER_SCHEMA = {
   type: "object",
@@ -1326,6 +1360,8 @@ function resolveHost(requireImport) {
     typeof denoOps.op_host_distribution_read_v1 !== "function" ||
     typeof denoOps.op_host_distribution_resume_v1 !== "function" ||
     typeof denoOps.op_host_distribution_targets_read_v1 !== "function" ||
+    typeof denoOps.op_host_content_distribute_request_v1 !== "function" ||
+    typeof denoOps.op_host_content_distribute_read_v1 !== "function" ||
     (requireImport &&
       typeof denoOps.op_host_knowledge_import_attachments_v1 !== "function") ||
     typeof denoOps.op_host_emit !== "function"
@@ -1519,6 +1555,20 @@ function resolveHost(requireImport) {
     async distributionTargetsRead(request) {
       return JSON.parse(
         await denoOps.op_host_distribution_targets_read_v1(
+          JSON.stringify(request),
+        ),
+      );
+    },
+    async contentDistributeRequest(request) {
+      return JSON.parse(
+        await denoOps.op_host_content_distribute_request_v1(
+          JSON.stringify(request),
+        ),
+      );
+    },
+    async contentDistributeRead(request) {
+      return JSON.parse(
+        await denoOps.op_host_content_distribute_read_v1(
           JSON.stringify(request),
         ),
       );
@@ -1854,6 +1904,14 @@ function createHostTools(host, failures, attachments) {
     DISTRIBUTION_TARGETS_READ,
     "distributionTargetsRead",
   );
+  const contentDistributeRequest = reportTool(
+    CONTENT_DISTRIBUTE_REQUEST,
+    "contentDistributeRequest",
+  );
+  const contentDistributeRead = reportTool(
+    CONTENT_DISTRIBUTE_READ,
+    "contentDistributeRead",
+  );
   const importSchema = {
     type: "object",
     additionalProperties: false,
@@ -1898,72 +1956,77 @@ function createHostTools(host, failures, attachments) {
   };
   return {
     getTool: (id) =>
-      id === CONTENT_MEDIA_LIST
-        ? contentMediaList
-        : id === CONTENT_MEDIA_BIND && attachments.length > 0
-          ? contentMediaBind
-          : id === CONTENT_DOCUMENT_READ
-            ? contentDocumentRead
-            : id === CONTENT_MEDIA_INSERT
-              ? contentMediaInsert
-              : Object.hasOwn(projectTools, id)
-                ? projectTools[id]
-                : id === KNOWLEDGE_SEARCH
-                  ? search
-                  : id === KNOWLEDGE_TEXT_READ
-                    ? textRead
-                    : id === KNOWLEDGE_TEXT_REVISE
-                      ? textRevise
-                      : id === KNOWLEDGE_IMPORT_STATUS
-                        ? importStatus
-                        : id === KNOWLEDGE_IMPORT_ATTACHMENTS &&
-                            attachments.length > 0
-                          ? importAttachments
-                          : id === REPORT_GET
-                            ? reportGet
-                            : id === REPORT_PREVIEW
-                              ? reportPreview
-                              : id === REPORT_REDUCE
-                                ? reportReduce
-                                : id === CHANNEL_DISCOVER
-                                  ? channelDiscover
-                                  : id === CHANNEL_PLAN
-                                    ? channelPlan
-                                    : id === QUESTION_DISCOVER
-                                      ? questionDiscover
-                                      : id === QUESTION_CREATE
-                                        ? questionCreate
-                                        : id === QUESTION_REVISE
-                                          ? questionRevise
-                                          : id === MEASUREMENT_OPTIONS
-                                            ? measurementOptions
-                                            : id === MEASUREMENT_PLAN_CREATE
-                                              ? measurementPlanCreate
-                                              : id === MEASUREMENT_PLAN_READ
-                                                ? measurementPlanRead
-                                                : id === CHANNEL_MANIFEST_READ
-                                                  ? channelManifestRead
-                                                  : id ===
-                                                      CHANNEL_TARGET_EXECUTE
-                                                    ? channelTargetExecute
-                                                    : id === CONTENT_START
-                                                      ? contentStart
+      id === CONTENT_DISTRIBUTE_REQUEST
+        ? contentDistributeRequest
+        : id === CONTENT_DISTRIBUTE_READ
+          ? contentDistributeRead
+          : id === CONTENT_MEDIA_LIST
+            ? contentMediaList
+            : id === CONTENT_MEDIA_BIND && attachments.length > 0
+              ? contentMediaBind
+              : id === CONTENT_DOCUMENT_READ
+                ? contentDocumentRead
+                : id === CONTENT_MEDIA_INSERT
+                  ? contentMediaInsert
+                  : Object.hasOwn(projectTools, id)
+                    ? projectTools[id]
+                    : id === KNOWLEDGE_SEARCH
+                      ? search
+                      : id === KNOWLEDGE_TEXT_READ
+                        ? textRead
+                        : id === KNOWLEDGE_TEXT_REVISE
+                          ? textRevise
+                          : id === KNOWLEDGE_IMPORT_STATUS
+                            ? importStatus
+                            : id === KNOWLEDGE_IMPORT_ATTACHMENTS &&
+                                attachments.length > 0
+                              ? importAttachments
+                              : id === REPORT_GET
+                                ? reportGet
+                                : id === REPORT_PREVIEW
+                                  ? reportPreview
+                                  : id === REPORT_REDUCE
+                                    ? reportReduce
+                                    : id === CHANNEL_DISCOVER
+                                      ? channelDiscover
+                                      : id === CHANNEL_PLAN
+                                        ? channelPlan
+                                        : id === QUESTION_DISCOVER
+                                          ? questionDiscover
+                                          : id === QUESTION_CREATE
+                                            ? questionCreate
+                                            : id === QUESTION_REVISE
+                                              ? questionRevise
+                                              : id === MEASUREMENT_OPTIONS
+                                                ? measurementOptions
+                                                : id === MEASUREMENT_PLAN_CREATE
+                                                  ? measurementPlanCreate
+                                                  : id === MEASUREMENT_PLAN_READ
+                                                    ? measurementPlanRead
+                                                    : id ===
+                                                        CHANNEL_MANIFEST_READ
+                                                      ? channelManifestRead
                                                       : id ===
-                                                          CONTENT_EXECUTION_READ
-                                                        ? contentExecutionRead
-                                                        : id ===
-                                                            DISTRIBUTION_START
-                                                          ? distributionStart
+                                                          CHANNEL_TARGET_EXECUTE
+                                                        ? channelTargetExecute
+                                                        : id === CONTENT_START
+                                                          ? contentStart
                                                           : id ===
-                                                              DISTRIBUTION_READ
-                                                            ? distributionRead
+                                                              CONTENT_EXECUTION_READ
+                                                            ? contentExecutionRead
                                                             : id ===
-                                                                DISTRIBUTION_RESUME
-                                                              ? distributionResume
+                                                                DISTRIBUTION_START
+                                                              ? distributionStart
                                                               : id ===
-                                                                  DISTRIBUTION_TARGETS_READ
-                                                                ? distributionTargetsRead
-                                                                : undefined,
+                                                                  DISTRIBUTION_READ
+                                                                ? distributionRead
+                                                                : id ===
+                                                                    DISTRIBUTION_RESUME
+                                                                  ? distributionResume
+                                                                  : id ===
+                                                                      DISTRIBUTION_TARGETS_READ
+                                                                    ? distributionTargetsRead
+                                                                    : undefined,
     listTools: () =>
       attachments.length > 0
         ? [
@@ -1993,72 +2056,77 @@ function createHostTools(host, failures, attachments) {
             ...DISTRIBUTION_TOOLS,
           ],
     getToolParameterSchema: (id) =>
-      id === CONTENT_MEDIA_LIST
-        ? CONTENT_MEDIA_LIST_SCHEMA
-        : id === CONTENT_MEDIA_BIND && attachments.length > 0
-          ? mediaBindSchema
-          : id === CONTENT_DOCUMENT_READ
-            ? CONTENT_DOCUMENT_READ_SCHEMA
-            : id === CONTENT_MEDIA_INSERT
-              ? CONTENT_MEDIA_INSERT_SCHEMA
-              : Object.hasOwn(PROJECT_TOOLS, id)
-                ? PROJECT_TOOLS[id][1]
-                : id === KNOWLEDGE_SEARCH
-                  ? KNOWLEDGE_SEARCH_SCHEMA
-                  : id === KNOWLEDGE_TEXT_READ
-                    ? KNOWLEDGE_TEXT_READ_SCHEMA
-                    : id === KNOWLEDGE_TEXT_REVISE
-                      ? KNOWLEDGE_TEXT_REVISE_SCHEMA
-                      : id === KNOWLEDGE_IMPORT_STATUS
-                        ? KNOWLEDGE_IMPORT_STATUS_SCHEMA
-                        : id === KNOWLEDGE_IMPORT_ATTACHMENTS &&
-                            attachments.length > 0
-                          ? importSchema
-                          : id === REPORT_GET
-                            ? REPORT_GET_SCHEMA
-                            : id === REPORT_PREVIEW
-                              ? REPORT_PREVIEW_SCHEMA
-                              : id === REPORT_REDUCE
-                                ? REPORT_REDUCE_SCHEMA
-                                : id === CHANNEL_DISCOVER
-                                  ? CHANNEL_DISCOVER_SCHEMA
-                                  : id === CHANNEL_PLAN
-                                    ? CHANNEL_PLAN_SCHEMA
-                                    : id === QUESTION_DISCOVER
-                                      ? QUESTION_DISCOVER_SCHEMA
-                                      : id === QUESTION_CREATE
-                                        ? QUESTION_CREATE_SCHEMA
-                                        : id === QUESTION_REVISE
-                                          ? QUESTION_REVISE_SCHEMA
-                                          : id === MEASUREMENT_OPTIONS
-                                            ? MEASUREMENT_OPTIONS_SCHEMA
-                                            : id === MEASUREMENT_PLAN_CREATE
-                                              ? MEASUREMENT_PLAN_CREATE_SCHEMA
-                                              : id === MEASUREMENT_PLAN_READ
-                                                ? MEASUREMENT_PLAN_READ_SCHEMA
-                                                : id === CHANNEL_MANIFEST_READ
-                                                  ? CHANNEL_MANIFEST_READ_SCHEMA
-                                                  : id ===
-                                                      CHANNEL_TARGET_EXECUTE
-                                                    ? CHANNEL_TARGET_EXECUTE_SCHEMA
-                                                    : id === CONTENT_START
-                                                      ? CONTENT_START_SCHEMA
+      id === CONTENT_DISTRIBUTE_REQUEST
+        ? CONTENT_DISTRIBUTE_REQUEST_SCHEMA
+        : id === CONTENT_DISTRIBUTE_READ
+          ? CONTENT_DISTRIBUTE_READ_SCHEMA
+          : id === CONTENT_MEDIA_LIST
+            ? CONTENT_MEDIA_LIST_SCHEMA
+            : id === CONTENT_MEDIA_BIND && attachments.length > 0
+              ? mediaBindSchema
+              : id === CONTENT_DOCUMENT_READ
+                ? CONTENT_DOCUMENT_READ_SCHEMA
+                : id === CONTENT_MEDIA_INSERT
+                  ? CONTENT_MEDIA_INSERT_SCHEMA
+                  : Object.hasOwn(PROJECT_TOOLS, id)
+                    ? PROJECT_TOOLS[id][1]
+                    : id === KNOWLEDGE_SEARCH
+                      ? KNOWLEDGE_SEARCH_SCHEMA
+                      : id === KNOWLEDGE_TEXT_READ
+                        ? KNOWLEDGE_TEXT_READ_SCHEMA
+                        : id === KNOWLEDGE_TEXT_REVISE
+                          ? KNOWLEDGE_TEXT_REVISE_SCHEMA
+                          : id === KNOWLEDGE_IMPORT_STATUS
+                            ? KNOWLEDGE_IMPORT_STATUS_SCHEMA
+                            : id === KNOWLEDGE_IMPORT_ATTACHMENTS &&
+                                attachments.length > 0
+                              ? importSchema
+                              : id === REPORT_GET
+                                ? REPORT_GET_SCHEMA
+                                : id === REPORT_PREVIEW
+                                  ? REPORT_PREVIEW_SCHEMA
+                                  : id === REPORT_REDUCE
+                                    ? REPORT_REDUCE_SCHEMA
+                                    : id === CHANNEL_DISCOVER
+                                      ? CHANNEL_DISCOVER_SCHEMA
+                                      : id === CHANNEL_PLAN
+                                        ? CHANNEL_PLAN_SCHEMA
+                                        : id === QUESTION_DISCOVER
+                                          ? QUESTION_DISCOVER_SCHEMA
+                                          : id === QUESTION_CREATE
+                                            ? QUESTION_CREATE_SCHEMA
+                                            : id === QUESTION_REVISE
+                                              ? QUESTION_REVISE_SCHEMA
+                                              : id === MEASUREMENT_OPTIONS
+                                                ? MEASUREMENT_OPTIONS_SCHEMA
+                                                : id === MEASUREMENT_PLAN_CREATE
+                                                  ? MEASUREMENT_PLAN_CREATE_SCHEMA
+                                                  : id === MEASUREMENT_PLAN_READ
+                                                    ? MEASUREMENT_PLAN_READ_SCHEMA
+                                                    : id ===
+                                                        CHANNEL_MANIFEST_READ
+                                                      ? CHANNEL_MANIFEST_READ_SCHEMA
                                                       : id ===
-                                                          CONTENT_EXECUTION_READ
-                                                        ? CONTENT_EXECUTION_READ_SCHEMA
-                                                        : id ===
-                                                            DISTRIBUTION_START
-                                                          ? DISTRIBUTION_START_SCHEMA
+                                                          CHANNEL_TARGET_EXECUTE
+                                                        ? CHANNEL_TARGET_EXECUTE_SCHEMA
+                                                        : id === CONTENT_START
+                                                          ? CONTENT_START_SCHEMA
                                                           : id ===
-                                                              DISTRIBUTION_READ
-                                                            ? DISTRIBUTION_READ_SCHEMA
+                                                              CONTENT_EXECUTION_READ
+                                                            ? CONTENT_EXECUTION_READ_SCHEMA
                                                             : id ===
-                                                                DISTRIBUTION_RESUME
-                                                              ? DISTRIBUTION_RESUME_SCHEMA
+                                                                DISTRIBUTION_START
+                                                              ? DISTRIBUTION_START_SCHEMA
                                                               : id ===
-                                                                  DISTRIBUTION_TARGETS_READ
-                                                                ? DISTRIBUTION_TARGETS_READ_SCHEMA
-                                                                : undefined,
+                                                                  DISTRIBUTION_READ
+                                                                ? DISTRIBUTION_READ_SCHEMA
+                                                                : id ===
+                                                                    DISTRIBUTION_RESUME
+                                                                  ? DISTRIBUTION_RESUME_SCHEMA
+                                                                  : id ===
+                                                                      DISTRIBUTION_TARGETS_READ
+                                                                    ? DISTRIBUTION_TARGETS_READ_SCHEMA
+                                                                    : undefined,
     registerTool: () => {
       throw new Error("The embedded loop cannot register tools.");
     },

@@ -160,6 +160,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 37,
         description: "measurement recency",
     },
+    MigrationMetadata {
+        version: 38,
+        description: "independent publication origin",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

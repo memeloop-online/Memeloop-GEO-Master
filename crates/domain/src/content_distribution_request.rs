@@ -1,9 +1,11 @@
 //! A single-article request is an immutable acceptance and an optional link to
 //! the existing publication ledger. It never represents delivery or success.
 use crate::{
-    AppError, CHANNEL_VARIANT_POLICY, ChannelAccount, ChannelVariant, ContentRevision,
-    DistributionRepository, PublicationBundle, PublicationIntent, RICH_CHANNEL_VARIANT_POLICY,
-    TenantScope,
+    AppError, CHANNEL_VARIANT_POLICY, ChannelAccount, ChannelRepository, ChannelStatus,
+    ChannelVariant, ConnectorCapabilityRepository, ConnectorKey, ContentRepository,
+    ContentRevision, DistributionRepository, KnowledgePurpose, KnowledgeRepository,
+    ProjectRepository, ProjectStatus, PublicationBundle, PublicationIntent,
+    RICH_CHANNEL_VARIANT_POLICY, SourceState, TenantScope,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -55,6 +57,14 @@ fn hash(parts: &[&str]) -> String {
         digest.update(part.as_bytes());
     }
     hex::encode(digest.finalize())
+}
+
+/// Hash the opaque idempotency key without consulting mutable resource state.
+pub fn distribution_request_key_hash(key: &str) -> Result<String, AppError> {
+    if key.is_empty() || key.len() > 256 {
+        return Err(AppError::invalid_request("invalid Idempotency-Key header"));
+    }
+    Ok(hash(&[key]))
 }
 
 pub fn prepare_content_distribution_request(
@@ -143,6 +153,13 @@ pub fn validate_distribution_request_intent(
 
 #[async_trait]
 pub trait ContentDistributionRequestRepository: Send + Sync {
+    /// Read an already accepted receipt before resolving mutable revision and
+    /// account authorities. Only this exact tenant/project may replay it.
+    async fn get_by_idempotency_key(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+    ) -> Result<Option<ContentDistributionRequest>, AppError>;
     async fn accept(
         &self,
         scope: &TenantScope,
@@ -161,6 +178,20 @@ pub trait ContentDistributionRequestRepository: Send + Sync {
         request_id: Uuid,
         intent_id: Uuid,
     ) -> Result<ContentDistributionRequest, AppError>;
+    /// Creates or reuses the project's original immutable publication intent
+    /// and command, linking this accepted request in the SAME storage commit.
+    async fn materialize(
+        &self,
+        scope: &TenantScope,
+        request_id: Uuid,
+    ) -> Result<ContentDistributionRequest, AppError>;
+    /// Global bounded scanner; each returned row contains its trusted scope.
+    /// An unlinked request is only accepted, not necessarily publishable.
+    async fn list_unlinked(
+        &self,
+        after_request_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ContentDistributionRequest>, AppError>;
 }
 
 #[async_trait]
@@ -170,6 +201,17 @@ pub trait ContentDistributionIntentLookup: Send + Sync {
         scope: &TenantScope,
         intent_id: Uuid,
     ) -> Result<PublicationBundle, AppError>;
+    async fn materialize_accepted_request(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+    ) -> Result<PublicationIntent, AppError> {
+        let _ = (scope, request, revision);
+        Err(AppError::capability_missing(
+            "request materialization unavailable",
+        ))
+    }
 }
 
 #[async_trait]
@@ -181,17 +223,36 @@ impl<T: DistributionRepository + ?Sized> ContentDistributionIntentLookup for T {
     ) -> Result<PublicationBundle, AppError> {
         self.get_publication_bundle(scope, intent_id).await
     }
+    async fn materialize_accepted_request(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+    ) -> Result<PublicationIntent, AppError> {
+        self.materialize_request_origin(scope, request, revision)
+            .await
+    }
 }
 
 #[derive(Default)]
 struct MemoryRequestState {
     by_key: HashMap<(TenantScope, String), Uuid>,
     by_id: HashMap<(TenantScope, Uuid), ContentDistributionRequest>,
+    revisions: HashMap<(TenantScope, Uuid), ContentRevision>,
 }
 
 pub struct MemoryContentDistributionRequestRepository {
     state: RwLock<MemoryRequestState>,
     distribution: Arc<dyn ContentDistributionIntentLookup>,
+    authorities: Option<MemoryRequestAuthorities>,
+}
+
+struct MemoryRequestAuthorities {
+    content: Arc<dyn ContentRepository>,
+    knowledge: Arc<dyn KnowledgeRepository>,
+    projects: Arc<dyn ProjectRepository>,
+    channels: Arc<dyn ChannelRepository>,
+    connectors: Arc<dyn ConnectorCapabilityRepository>,
 }
 
 impl MemoryContentDistributionRequestRepository {
@@ -199,12 +260,201 @@ impl MemoryContentDistributionRequestRepository {
         Self {
             state: RwLock::new(MemoryRequestState::default()),
             distribution,
+            authorities: None,
         }
+    }
+
+    pub fn with_authorities(
+        mut self,
+        content: Arc<dyn ContentRepository>,
+        knowledge: Arc<dyn KnowledgeRepository>,
+        projects: Arc<dyn ProjectRepository>,
+        channels: Arc<dyn ChannelRepository>,
+        connectors: Arc<dyn ConnectorCapabilityRepository>,
+    ) -> Self {
+        self.authorities = Some(MemoryRequestAuthorities {
+            content,
+            knowledge,
+            projects,
+            channels,
+            connectors,
+        });
+        self
+    }
+
+    async fn check_live(
+        &self,
+        request: &ContentDistributionRequest,
+        accepted_revision: &ContentRevision,
+    ) -> Result<ContentRevision, AppError> {
+        let authority = self.authorities.as_ref().ok_or_else(|| {
+            AppError::capability_missing("publication validation authorities unavailable")
+        })?;
+        let scope = &request.scope;
+        let project = scope.project_id.expect("validated request scope");
+        let project = authority
+            .projects
+            .get(scope, project)
+            .await?
+            .ok_or_else(|| AppError::not_found("project not found"))?;
+        if matches!(
+            project.status,
+            ProjectStatus::Paused | ProjectStatus::Archived
+        ) {
+            return Err(AppError::conflict("project is not active"));
+        }
+        let mut accounts = authority.channels.list_accounts(scope).await?;
+        accounts.extend(
+            authority
+                .channels
+                .list_assigned_pool_accounts(scope)
+                .await?
+                .iter()
+                .map(|account| account.assigned_view(project.id)),
+        );
+        if !accounts.iter().any(|account| {
+            account.account_id == request.account_id
+                && account.platform == request.platform_id
+                && account.enabled
+                && account.status == ChannelStatus::Ready
+                && match account.owner_kind {
+                    crate::ChannelOwnerKind::Customer => request.account_owner_kind == "customer",
+                    crate::ChannelOwnerKind::OperatorPool => {
+                        request.account_owner_kind == "operator_pool"
+                    }
+                }
+        }) {
+            return Err(AppError::conflict("publication account is not ready"));
+        }
+        if request.format != TEXT_DISTRIBUTION_FORMAT {
+            return Err(AppError::conflict("publication format is not supported"));
+        }
+        let key = ConnectorKey {
+            platform_id: request.platform_id.clone(),
+            placement_slot: request.placement_slot.clone(),
+        };
+        let configured = authority.connectors.get(scope.operator_id, &key).await?;
+        let semantic = if let Some(asset) = authority
+            .content
+            .get_asset(scope, request.content_asset_id)
+            .await?
+        {
+            authority
+                .content
+                .get_item(scope, asset.execution_id, asset.item_id)
+                .await?
+                .map(|item| item.content_type)
+        } else {
+            None
+        };
+        let proof_format = configured
+            .filter(|settings| settings.enabled)
+            .and_then(|settings| {
+                if settings
+                    .content_types
+                    .iter()
+                    .any(|format| format == crate::PLAIN_TEXT_ARTICLE_FORMAT)
+                {
+                    Some(crate::PLAIN_TEXT_ARTICLE_FORMAT.to_owned())
+                } else {
+                    semantic.filter(|semantic| {
+                        crate::publication_format_for_semantic_type(semantic).is_some()
+                            && settings.content_types.contains(semantic)
+                    })
+                }
+            })
+            .ok_or_else(|| AppError::conflict("publication format is not available"))?;
+        if !authority
+            .connectors
+            .history(scope.operator_id, &key)
+            .await?
+            .iter()
+            .any(|proof| proof.content_type == proof_format)
+        {
+            return Err(AppError::conflict("publication format is not available"));
+        }
+        let revision = authority
+            .content
+            .get_revision(scope, request.content_asset_id, request.content_revision_id)
+            .await?
+            .ok_or_else(|| AppError::conflict("publication revision unavailable"))?;
+        if revision != *accepted_revision
+            || revision.findings.iter().any(|finding| finding.blocking)
+            || !authority
+                .content
+                .list_checks(scope, request.content_revision_id)
+                .await?
+                .iter()
+                .any(|check| {
+                    check.revision_id == request.content_revision_id
+                        && !check.findings.iter().any(|finding| finding.blocking)
+                })
+        {
+            return Err(AppError::conflict("independent content check unavailable"));
+        }
+        let sources = authority.knowledge.list_sources(scope).await?;
+        if revision.evidence.is_empty() || revision.quotes.is_empty() {
+            return Err(AppError::conflict("publication requires public evidence"));
+        }
+        for reference in &revision.evidence {
+            let source = sources.iter().find(|source| {
+                source.current_version_id == Some(reference.source_version_id)
+                    && source.state == SourceState::Active
+                    && source.purpose == KnowledgePurpose::Public
+            });
+            let source =
+                source.ok_or_else(|| AppError::conflict("publication source is not public"))?;
+            let detail = authority
+                .knowledge
+                .get_source_detail(scope, source.source_id)
+                .await?
+                .ok_or_else(|| AppError::conflict("publication source unavailable"))?;
+            let quote = revision
+                .quotes
+                .iter()
+                .find(|quote| quote.reference == *reference)
+                .ok_or_else(|| AppError::conflict("publication quote unavailable"))?;
+            if !detail.chunks.iter().any(|chunk| {
+                Some(chunk.chunk_id) == reference.chunk_id
+                    && chunk.source_version_id == reference.source_version_id
+                    && chunk.locator == reference.locator
+                    && if matches!(chunk.locator, crate::ChunkLocator::Csv { .. }) {
+                        chunk.text == quote.exact_quote
+                    } else {
+                        chunk
+                            .text
+                            .chars()
+                            .take(crate::CONTENT_EVIDENCE_MAX_QUOTE_CHARS)
+                            .collect::<String>()
+                            == quote.exact_quote
+                    }
+            }) {
+                return Err(AppError::conflict("publication quote changed"));
+            }
+        }
+        Ok(revision)
     }
 }
 
 #[async_trait]
 impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRepository {
+    async fn get_by_idempotency_key(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+    ) -> Result<Option<ContentDistributionRequest>, AppError> {
+        if scope.project_id.is_none() {
+            return Err(AppError::forbidden("project scope required"));
+        }
+        let key_hash = distribution_request_key_hash(key)?;
+        let state = self.state.read().await;
+        Ok(state
+            .by_key
+            .get(&(scope.clone(), key_hash))
+            .and_then(|id| state.by_id.get(&(scope.clone(), *id)))
+            .cloned())
+    }
+
     async fn accept(
         &self,
         scope: &TenantScope,
@@ -227,6 +477,9 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
         state
             .by_id
             .insert((scope.clone(), request.request_id), request.clone());
+        state
+            .revisions
+            .insert((scope.clone(), request.request_id), input.revision);
         Ok(request)
     }
 
@@ -265,6 +518,59 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
         request.publication_intent_id = Some(intent_id);
         Ok(request.clone())
     }
+
+    async fn materialize(
+        &self,
+        scope: &TenantScope,
+        request_id: Uuid,
+    ) -> Result<ContentDistributionRequest, AppError> {
+        // All in-memory writers acquire request then distribution. A failure
+        // before returning leaves neither repository with a partial link.
+        let mut state = self.state.write().await;
+        let request = state_get(&state, scope, request_id)?;
+        if request.publication_intent_id.is_some() {
+            return Ok(request);
+        }
+        let revision = state
+            .revisions
+            .get(&(scope.clone(), request_id))
+            .ok_or_else(|| AppError::not_found("accepted revision not found"))?
+            .clone();
+        let revision = self.check_live(&request, &revision).await?;
+        let intent = self
+            .distribution
+            .materialize_accepted_request(scope, &request, &revision)
+            .await?;
+        let saved = state
+            .by_id
+            .get_mut(&(scope.clone(), request_id))
+            .expect("held request row");
+        saved.publication_intent_id = Some(intent.intent_id);
+        Ok(saved.clone())
+    }
+
+    async fn list_unlinked(
+        &self,
+        after_request_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ContentDistributionRequest>, AppError> {
+        if !(1..=1000).contains(&limit) {
+            return Err(AppError::invalid_request("invalid request scan page size"));
+        }
+        let state = self.state.read().await;
+        let mut rows: Vec<_> = state
+            .by_id
+            .values()
+            .filter(|request| {
+                request.publication_intent_id.is_none()
+                    && after_request_id.is_none_or(|after| request.request_id > after)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.request_id);
+        rows.truncate(limit);
+        Ok(rows)
+    }
 }
 
 fn state_get(
@@ -284,7 +590,8 @@ mod tests {
     use super::*;
     use crate::{
         ChannelOwnerKind, ChannelStatus, DistributionTarget, DistributionTargetStatus, ErrorCode,
-        IntentVerification, PublicationBundle, PublicationCommand, StructuredDocument,
+        IntentVerification, PublicationBundle, PublicationCommand, PublicationOrigin,
+        StructuredDocument,
     };
 
     struct TestLookup(PublicationBundle);
@@ -402,7 +709,7 @@ mod tests {
                 revision,
                 variant,
                 intent,
-                target,
+                origin: PublicationOrigin::CoverageTarget { target },
                 command,
             },
         )
@@ -421,6 +728,13 @@ mod tests {
         let first = repository.accept(&scope, input.clone()).await.unwrap();
         assert_eq!(first.publication_intent_id, None);
         assert_eq!(
+            repository
+                .get_by_idempotency_key(&scope, &input.idempotency_key)
+                .await
+                .unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
             repository.accept(&scope, input.clone()).await.unwrap(),
             first
         );
@@ -434,6 +748,13 @@ mod tests {
             scope.operator_id,
             scope.tenant_id,
             Some(Uuid::new_v4().into()),
+        );
+        assert_eq!(
+            repository
+                .get_by_idempotency_key(&another, &input.idempotency_key)
+                .await
+                .unwrap(),
+            None
         );
         assert_eq!(
             repository

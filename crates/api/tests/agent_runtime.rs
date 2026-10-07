@@ -940,6 +940,39 @@ async fn unimplemented_host_ops_report_capability_missing_rather_than_a_result()
     }
 }
 
+#[tokio::test]
+async fn single_article_host_ops_fail_closed_without_scoped_business_service() {
+    let ops = RepositoryHostOps::new(Arc::new(MemoryKnowledgeRepository::default()));
+    let run_scope = scope();
+    let refused = ops
+        .content_distribute_request(
+            &run_scope,
+            geo_worker::ContentDistributeRequest {
+                content_asset_id: uuid::Uuid::new_v4(),
+                content_revision_id: uuid::Uuid::new_v4(),
+                account_id: uuid::Uuid::new_v4(),
+                placement_slot: "article".to_owned(),
+                format: "markdown.v1".to_owned(),
+                idempotency_key: "same-request".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.op, HostOp::ContentDistributeRequest);
+    assert_eq!(refused.code, HostOpErrorCode::CapabilityMissing);
+    let refused = ops
+        .content_distribute_read(
+            &run_scope,
+            geo_worker::ContentDistributeReadRequest {
+                request_id: uuid::Uuid::new_v4(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.op, HostOp::ContentDistributeRead);
+    assert_eq!(refused.code, HostOpErrorCode::CapabilityMissing);
+}
+
 /// The one op the process does honour is delegated to the repository, and a
 /// repository refusal arrives as a typed failure rather than a plausible empty
 /// result.

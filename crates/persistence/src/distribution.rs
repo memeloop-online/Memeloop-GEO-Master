@@ -7,7 +7,7 @@ use geo_domain::{
     DistributionRepository, DistributionSnapshot, DistributionTarget, DistributionTargetPage,
     DistributionTargetStatus, ErrorCode, FreezeDistribution, IntentVerification,
     MaterializedDistribution, PreparedDistribution, PublicationBundle, PublicationCommand,
-    PublicationIntent, ReportPublicationStatus, TenantScope, distribution_cell,
+    PublicationIntent, PublicationOrigin, ReportPublicationStatus, TenantScope, distribution_cell,
     freeze_distribution, prepare_publication_intent, prepare_variant, target_publication_evidence,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -455,7 +455,7 @@ impl DistributionRepository for PgDistributionRepository {
         let row = sqlx::query(
             "SELECT i.body AS intent_body,i.verification,i.verification_evidence_id, \
                     v.body AS variant_body,r.body AS revision_body, \
-                    t.current_body AS target_body,c.command_id,c.origin_target_id, \
+                    t.current_body AS target_body,c.command_id,c.origin_target_id,c.origin_request_id, \
                     c.payload_hash,c.fixture \
              FROM distribution_publication_intents i \
              JOIN distribution_channel_variants v ON (v.operator_id,v.tenant_id,v.project_id,v.variant_id) = \
@@ -464,7 +464,7 @@ impl DistributionRepository for PgDistributionRepository {
                 (v.operator_id,v.tenant_id,v.project_id,v.content_revision_id) \
              JOIN distribution_publication_commands c ON (c.operator_id,c.tenant_id,c.project_id,c.intent_id) = \
                 (i.operator_id,i.tenant_id,i.project_id,i.intent_id) \
-             JOIN distribution_execution_targets t ON (t.operator_id,t.tenant_id,t.project_id,t.target_id) = \
+             LEFT JOIN distribution_execution_targets t ON (t.operator_id,t.tenant_id,t.project_id,t.target_id) = \
                 (c.operator_id,c.tenant_id,c.project_id,c.origin_target_id) \
              WHERE i.operator_id=$1 AND i.tenant_id=$2 AND i.project_id=$3 AND i.intent_id=$4",
         )
@@ -479,19 +479,47 @@ impl DistributionRepository for PgDistributionRepository {
         let mut intent: PublicationIntent = decode(row.get("intent_body"))?;
         intent.verification = decode(serde_json::Value::String(row.get("verification")))?;
         intent.verification_evidence_id = row.get("verification_evidence_id");
+        let origin_target_id: Option<Uuid> = row.get("origin_target_id");
+        let origin_request_id: Option<Uuid> = row.get("origin_request_id");
+        let origin = match (origin_target_id, origin_request_id) {
+            (Some(_), None) => PublicationOrigin::CoverageTarget {
+                target: decode(row.get::<serde_json::Value, _>("target_body"))?,
+            },
+            (None, Some(request_id)) => {
+                let query = format!(
+                    "SELECT {} FROM content_distribution_requests WHERE operator_id=$1 \
+                     AND tenant_id=$2 AND project_id=$3 AND request_id=$4",
+                    crate::content_distribution_request::REQUEST_COLUMNS
+                );
+                let request = sqlx::query(&query)
+                    .bind(scope.operator_id.as_uuid())
+                    .bind(scope.tenant_id.as_uuid())
+                    .bind(project(scope)?)
+                    .bind(request_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db)?
+                    .ok_or_else(|| AppError::not_found("publication origin request not found"))?;
+                PublicationOrigin::ContentRequest {
+                    request: crate::content_distribution_request::read_request(&request),
+                }
+            }
+            _ => return Err(AppError::conflict("publication origin columns differ")),
+        };
         let bundle = PublicationBundle {
             revision: decode(row.get("revision_body"))?,
             variant: decode(row.get("variant_body"))?,
-            target: decode(row.get("target_body"))?,
+            origin,
             command: PublicationCommand {
                 command_id: row.get("command_id"),
                 intent_id,
-                target_id: row.get("origin_target_id"),
+                target_id: origin_target_id.unwrap_or(Uuid::nil()),
                 payload_hash: row.get("payload_hash"),
                 fixture: row.get("fixture"),
             },
             intent,
         };
+        bundle.validate_origin()?;
         tx.commit().await.map_err(db)?;
         Ok(bundle)
     }

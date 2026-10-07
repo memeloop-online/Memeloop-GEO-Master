@@ -359,7 +359,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v15";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v16";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -812,6 +812,8 @@ pub enum HostOp {
     DistributionRead,
     DistributionResume,
     DistributionTargetsRead,
+    ContentDistributeRequest,
+    ContentDistributeRead,
     ProjectCurrent,
     SourceRecommendations,
     ProjectRevise,
@@ -821,7 +823,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 43;
+    pub const COUNT: usize = 45;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -863,6 +865,8 @@ impl HostOp {
         Self::DistributionRead,
         Self::DistributionResume,
         Self::DistributionTargetsRead,
+        Self::ContentDistributeRequest,
+        Self::ContentDistributeRead,
         Self::ProjectCurrent,
         Self::SourceRecommendations,
         Self::ProjectRevise,
@@ -911,6 +915,8 @@ impl HostOp {
             Self::DistributionRead => "distribution.read.v1",
             Self::DistributionResume => "distribution.resume.v1",
             Self::DistributionTargetsRead => "distribution.targets.read.v1",
+            Self::ContentDistributeRequest => "content.distribute.request.v1",
+            Self::ContentDistributeRead => "content.distribute.read.v1",
             Self::ProjectCurrent => "project.current.v1",
             Self::SourceRecommendations => "source.channel.recommendations.v1",
             Self::ProjectRevise => "project.revise.v1",
@@ -960,6 +966,8 @@ impl HostOp {
             Self::DistributionRead => "op_host_distribution_read_v1",
             Self::DistributionResume => "op_host_distribution_resume_v1",
             Self::DistributionTargetsRead => "op_host_distribution_targets_read_v1",
+            Self::ContentDistributeRequest => "op_host_content_distribute_request_v1",
+            Self::ContentDistributeRead => "op_host_content_distribute_read_v1",
             Self::ProjectCurrent => "op_host_project_current_v1",
             Self::SourceRecommendations => "op_host_source_recommendations_v1",
             Self::ProjectRevise => "op_host_project_revise_v1",
@@ -1069,6 +1077,8 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(15_000, 64),  // manifest state
                 HostOpLimits::new(120_000, 32), // bounded expansion/revisit
                 HostOpLimits::new(15_000, 128), // paged target reads
+                HostOpLimits::new(120_000, 16), // immutable article request acceptance
+                HostOpLimits::new(15_000, 64),  // scoped request status read
                 HostOpLimits::new(15_000, 16),  // project read
                 HostOpLimits::new(30_000, 16),  // optimization-only recommendation page
                 HostOpLimits::new(30_000, 8),   // project revision
@@ -1762,6 +1772,68 @@ pub trait HostOps: Send + Sync {
             "distribution is not configured",
         ))
     }
+
+    async fn content_distribute_request(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentDistributeRequest,
+    ) -> Result<ContentDistributeRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentDistributeRequest,
+            "single-article distribution is not configured",
+        ))
+    }
+
+    async fn content_distribute_read(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentDistributeReadRequest,
+    ) -> Result<ContentDistributeRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentDistributeRead,
+            "single-article distribution is not configured",
+        ))
+    }
+}
+
+/// The model chooses only explicit scoped resources. Rust resolves account,
+/// capability, current permission and frozen content from authoritative data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentDistributeRequest {
+    pub content_asset_id: Uuid,
+    pub content_revision_id: Uuid,
+    pub account_id: Uuid,
+    pub placement_slot: String,
+    pub format: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentDistributeReadRequest {
+    pub request_id: Uuid,
+}
+
+/// Bounded request projection: acceptance is never publication completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentDistributeRef {
+    pub request_id: Uuid,
+    pub content_asset_id: Uuid,
+    pub content_revision_id: Uuid,
+    pub account_id: Uuid,
+    pub platform_id: String,
+    pub placement_slot: String,
+    pub format: String,
+    pub status: String,
+    pub publication_intent_id: Option<Uuid>,
+    /// These fields are present only when the existing ledger has an actual
+    /// materialized channel target and send attempt. They are not inferred
+    /// from request acceptance or outbox creation.
+    pub channel_target_id: Option<Uuid>,
+    pub attempt_id: Option<Uuid>,
+    pub outcome: Option<String>,
+    pub fixture: Option<bool>,
 }
 
 /// Selectors only: the trusted service freezes handoff, platform capabilities
@@ -3829,6 +3901,42 @@ mod tests {
         assert_eq!(
             budgets.limits(HostOp::DistributionTargetsRead).max_calls,
             128
+        );
+        assert_eq!(
+            budgets.limits(HostOp::ContentDistributeRequest).max_calls,
+            16
+        );
+        assert_eq!(budgets.limits(HostOp::ContentDistributeRead).max_calls, 64);
+    }
+
+    #[test]
+    fn single_article_distribution_accepts_only_explicit_refs_and_frozen_format() {
+        let valid = serde_json::json!({
+            "content_asset_id": Uuid::new_v4(),
+            "content_revision_id": Uuid::new_v4(),
+            "account_id": Uuid::new_v4(),
+            "placement_slot": "article",
+            "format": "markdown.v1",
+            "idempotency_key": "same-retry-key"
+        });
+        assert!(serde_json::from_value::<ContentDistributeRequest>(valid.clone()).is_ok());
+        for forbidden in [
+            "tenant_id",
+            "project_id",
+            "member_id",
+            "budget",
+            "payload",
+            "cycle_id",
+        ] {
+            let mut injected = valid.clone();
+            injected[forbidden] = serde_json::json!("injected");
+            assert!(serde_json::from_value::<ContentDistributeRequest>(injected).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ContentDistributeReadRequest>(
+                serde_json::json!({"request_id": Uuid::new_v4(), "tenant_id": Uuid::new_v4()})
+            )
+            .is_err()
         );
     }
 

@@ -33,7 +33,10 @@ pub enum ChannelTargetInput {
         content_revision_id: Uuid,
         variant_id: Uuid,
         publication_intent_id: Uuid,
+        /// Historical coverage projection; nil when origin_request_id is set.
         distribution_target_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_request_id: Option<Uuid>,
         platform: String,
         account_id: Uuid,
         title: String,
@@ -1997,6 +2000,7 @@ mod tests {
                 variant_id: Uuid::new_v4(),
                 publication_intent_id: Uuid::new_v4(),
                 distribution_target_id: Uuid::new_v4(),
+                origin_request_id: None,
                 platform: "zhihu".into(),
                 account_id: account,
                 title: "title".into(),

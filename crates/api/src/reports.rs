@@ -331,8 +331,6 @@ async fn assemble_report_input(
                     if target.manifest_id != manifest.manifest_id
                         || bundle.intent.intent_id != intent_id
                         || bundle.intent.project_id != manifest.project_id
-                        || bundle.intent.channel_target_id != bundle.target.target_id
-                        || bundle.command.target_id != bundle.target.target_id
                         || Some(bundle.intent.content_revision_id) != target.content_revision_id
                         || bundle.intent.platform_id != target.platform_id
                         || bundle.intent.placement_slot != target.placement_slot
@@ -341,7 +339,8 @@ async fn assemble_report_input(
                             "publication target binding is inconsistent",
                         ));
                     }
-                    original_targets.push((target.target_id, bundle.intent.channel_target_id));
+                    bundle.validate_origin()?;
+                    original_targets.push((target.target_id, bundle.command.command_id));
                 }
             }
         } else if let Some(targets) = &channel_inputs.publications {

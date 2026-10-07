@@ -38,6 +38,7 @@ import { useDocumentManifestQuery } from "../api/documentManifests";
 import { useAuth } from "../auth/AuthProvider";
 import { membershipForTenant } from "../auth/types";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
+import { ContentDistributionPanel } from "../components/ContentDistributionPanel";
 import {
   documentToEditor,
   StructuredContentEditor,
@@ -525,6 +526,7 @@ function RevisionEditor({
   assetId,
   readonly,
   forkContext,
+  onDirtyChange,
 }: {
   revision: ContentRevision;
   tenantId: string;
@@ -532,6 +534,7 @@ function RevisionEditor({
   assetId: string;
   readonly: boolean;
   forkContext?: { executionId: string; itemId: string };
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const { t } = useTranslation();
   const unsupported = useMemo(() => {
@@ -581,6 +584,7 @@ function RevisionEditor({
     changeGeneration.current++;
     setDraft(next);
     setDirty(true);
+    onDirtyChange?.(true);
     setSaved(false);
   };
   const save = () => {
@@ -601,6 +605,7 @@ function RevisionEditor({
           setBaselineDocument(result.document);
           if (submittedGeneration === changeGeneration.current) {
             setDirty(false);
+            onDirtyChange?.(false);
             setSaved(true);
           }
           if (forkContext) {
@@ -679,6 +684,7 @@ function RevisionEditor({
           else if (error) {
             changeGeneration.current++;
             setDirty(true);
+            onDirtyChange?.(true);
             setSaved(false);
           }
         }}
@@ -743,6 +749,7 @@ function RevisionEditor({
           onClick={() => {
             setConflicted(false);
             setDirty(false);
+            onDirtyChange?.(false);
             setSaved(false);
             setDraft(structuredClone(revision.document));
             setBaselineDocument(revision.document);
@@ -785,6 +792,10 @@ function AssetContent({
   const asset = useContentAssetQuery(tenantId, projectId, assetId);
   const history = useContentRevisionsQuery(tenantId, projectId, assetId);
   const [selectedId, setSelectedId] = useState<string>();
+  const [editorState, setEditorState] = useState<{
+    revisionId: string;
+    dirty: boolean;
+  }>();
   const resolvedCurrent = history.data?.find(
     (revision) => revision.revision_id === asset.data?.current_revision_id,
   );
@@ -992,6 +1003,9 @@ function AssetContent({
               projectId={projectId}
               assetId={assetId}
               readonly={readonly}
+              onDirtyChange={(dirty) =>
+                setEditorState({ revisionId: selected.revision_id, dirty })
+              }
               forkContext={
                 isReusedSource &&
                 selected.revision_id ===
@@ -1021,6 +1035,19 @@ function AssetContent({
               <p>历史版本只读。返回当前版本才能追加修订。</p>
             </Card>
           )}
+          <ContentDistributionPanel
+            key={`${tenantId}/${projectId}/${assetId}/${selected.revision_id}`}
+            tenantId={tenantId}
+            projectId={projectId}
+            assetId={assetId}
+            revision={selected}
+            readonly={readonly}
+            unsaved={
+              editorState?.revisionId === selected.revision_id &&
+              editorState.dirty
+            }
+            onSelectRevision={(revisionId) => setSelectedId(revisionId)}
+          />
           <Card className="panel-card">
             <details className="content-history">
               <summary>{t("generatedEditor.history")}</summary>
