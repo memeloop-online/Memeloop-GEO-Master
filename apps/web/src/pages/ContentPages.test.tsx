@@ -1642,14 +1642,7 @@ describe("P09 content revision", () => {
   it("follows the live current version after returning from history and keeps subsequent typing", async () => {
     const requests = mockApi({ persistWrites: true });
     renderPage("/app/tenant-1/project-1/content/asset-1");
-    await userEvent.type(
-      await screen.findByRole("textbox", { name: "标题" }),
-      " updated",
-    );
-    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
-    await waitFor(() =>
-      expect(screen.getByText("当前版本 v2")).toBeInTheDocument(),
-    );
+    const title = await screen.findByRole("textbox", { name: "标题" });
     const nativeSetTimeout = window.setTimeout.bind(window);
     let autosave: (() => void) | undefined;
     const timeout = vi
@@ -1661,70 +1654,75 @@ describe("P09 content revision", () => {
         }
         return nativeSetTimeout(handler, delay, ...args);
       });
-    await userEvent.click(screen.getByText("版本历史"));
-    await userEvent.click(screen.getByRole("button", { name: /^v1 ·/ }));
-    expect(
-      screen.getByRole("heading", { name: "历史版本 v1" }),
-    ).toBeInTheDocument();
-    await userEvent.click(
-      screen.getByRole("button", { name: /v2 ·.*（当前）/ }),
-    );
-    const body = screen.getByRole("textbox", { name: "结构化正文" });
-    const paragraph = within(body).getByText("原始正文");
-    await userEvent.click(paragraph);
-    putCaretAtEnd(paragraph);
-    await userEvent.keyboard("先");
-    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
-    await waitFor(() =>
-      expect(screen.getByText("当前版本 v3")).toBeInTheDocument(),
-    );
-    expect(
-      screen.queryByRole("heading", { name: "历史版本 v2" }),
-    ).not.toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "结构化正文" })).toBe(body);
-    expect(body).toHaveAttribute("contenteditable", "true");
-    const nextParagraph = within(body).getByText("原始正文先");
-    await userEvent.click(nextParagraph);
-    putCaretAtEnd(nextParagraph);
-    await userEvent.keyboard("后");
-    expect(autosave).toBeDefined();
-    expect(
-      requests.mock.calls.filter(
-        ([url, init]) =>
-          String(url).includes("/contents/asset-1/revisions?") &&
-          init?.method === "POST",
-      ),
-    ).toHaveLength(2);
     try {
+      await userEvent.type(title, " updated");
+      await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+      await waitFor(() =>
+        expect(screen.getByText("当前版本 v2")).toBeInTheDocument(),
+      );
+      await userEvent.click(screen.getByText("版本历史"));
+      await userEvent.click(screen.getByRole("button", { name: /^v1 ·/ }));
+      expect(
+        screen.getByRole("heading", { name: "历史版本 v1" }),
+      ).toBeInTheDocument();
+      await userEvent.click(
+        screen.getByRole("button", { name: /v2 ·.*（当前）/ }),
+      );
+      const body = screen.getByRole("textbox", { name: "结构化正文" });
+      const paragraph = within(body).getByText("原始正文");
+      await userEvent.click(paragraph);
+      putCaretAtEnd(paragraph);
+      await userEvent.keyboard("先");
+      await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+      await waitFor(() =>
+        expect(screen.getByText("当前版本 v3")).toBeInTheDocument(),
+      );
+      expect(
+        screen.queryByRole("heading", { name: "历史版本 v2" }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByRole("textbox", { name: "结构化正文" })).toBe(body);
+      expect(body).toHaveAttribute("contenteditable", "true");
+      const nextParagraph = within(body).getByText("原始正文先");
+      await userEvent.click(nextParagraph);
+      putCaretAtEnd(nextParagraph);
+      await userEvent.keyboard("后");
+      expect(autosave).toBeDefined();
+      expect(
+        requests.mock.calls.filter(
+          ([url, init]) =>
+            String(url).includes("/contents/asset-1/revisions?") &&
+            init?.method === "POST",
+        ),
+      ).toHaveLength(2);
       await act(async () => {
         autosave?.();
       });
+      await waitFor(
+        () =>
+          expect(
+            requests.mock.calls.filter(
+              ([url, init]) =>
+                String(url).includes("/contents/asset-1/revisions?") &&
+                init?.method === "POST",
+            ),
+          ).toHaveLength(3),
+        { timeout: 4000 },
+      );
+      const writes = requests.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions?") &&
+          init?.method === "POST",
+      );
+      expect(JSON.parse(String(writes[2][1]?.body))).toMatchObject({
+        base_revision_id: "revision-3",
+        document: {
+          blocks: [{ text: "原始正文先后" }],
+        },
+      });
+      expect(screen.getByRole("textbox", { name: "结构化正文" })).toBe(body);
     } finally {
       timeout.mockRestore();
     }
-    await waitFor(
-      () =>
-        expect(
-          requests.mock.calls.filter(
-            ([url, init]) =>
-              String(url).includes("/contents/asset-1/revisions?") &&
-              init?.method === "POST",
-          ),
-        ).toHaveLength(3),
-      { timeout: 4000 },
-    );
-    const writes = requests.mock.calls.filter(
-      ([url, init]) =>
-        String(url).includes("/contents/asset-1/revisions?") &&
-        init?.method === "POST",
-    );
-    expect(JSON.parse(String(writes[2][1]?.body))).toMatchObject({
-      base_revision_id: "revision-3",
-      document: {
-        blocks: [{ text: "原始正文先后" }],
-      },
-    });
-    expect(screen.getByRole("textbox", { name: "结构化正文" })).toBe(body);
   });
 
   it("downloads the selected immutable revision, including reuse origin identity", async () => {

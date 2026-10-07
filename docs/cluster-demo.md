@@ -178,6 +178,26 @@ NetworkPolicy、TLS/Ingress、出口控制或 Secret 生命周期管理。当前
 5. 浏览器/账号执行和外部模型凭据继续使用独立的网络策略与 Secret；本包装不
    声称真实发布、官方搜索、计费或容量验收已完成。
 
-这是便携演示包装，不是完整生产基础设施清单。仓库内清单仍需部署者补充
+这是便携演示包装，不是完整生产基础设施清单。仓库内清单仍需部署者配置
 Ingress/TLS、持久卷、备份、网络策略、镜像 digest 和 Secret 引用；CI 发布流程
 负责构建并推送镜像，不替代集群验收。
+
+## 固定 HTTPS 入口
+
+可选模板 [`deploy/demo/ingress.yaml`](../deploy/demo/ingress.yaml) 将固定域名路由到
+Web ClusterIP，由 Web 继续同源代理 API、SSE 和远程桌面 WebSocket。
+实际域名、命名空间及证书引用仅保留在私有部署配置；模板使用保留示例域名。
+
+配置必须同时完成：
+
+1. DNS 指向现有网关，替换模板域名和 ingress class；不要公开 API、数据库或 runner Service。
+2. 在同命名空间提供覆盖该域名的 TLS Secret，并纳入已有自动续期及证书分发配置。
+   一次性复制证书不等于完成续期；检查最近成功时间和有效期。
+3. 在 `operator_hosts` 登记该 Host 到既有运营商的映射，不创建第二套用户、项目或账号。
+   已有不同映射必须先核对，不直接覆盖。
+4. 将新 HTTPS Origin 加入 API 的 `GEO_ALLOWED_ORIGINS`，保留仍需使用的既有入口；
+   配置更新需滚动 API，先确认没有正在进行的外部登录或执行。
+5. 在真实浏览器使用新域名登录，确认 Secure Cookie、原项目与持久账号/测量记录可读；
+   另验收附件上传、SSE 和远程桌面连接。旧域名的 Cookie 不自动共享到新域名。
+
+入口回滚只撤销本次 Ingress、Origin 与 Host 映射，不删除账号会话、项目、数据库或 PV。
