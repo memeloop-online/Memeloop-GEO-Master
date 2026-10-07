@@ -532,7 +532,9 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
             text: "Supported claim.".into(),
             citation_ids: vec![],
             items: vec![],
+            rich: None,
         }],
+        schema_version: None,
     };
     let revision = ContentRevision {
         revision_id: Uuid::new_v4(),

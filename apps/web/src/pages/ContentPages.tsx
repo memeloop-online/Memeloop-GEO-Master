@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { formatUiDate } from "../i18n";
 import {
   Badge,
   Button,
@@ -19,6 +21,7 @@ import {
   type ContentItem,
   type ContentRevision,
   type StructuredDocument,
+  exportContentRevision,
   useAppendContentRevisionMutation,
   useContentAssetQuery,
   useContentCycleQuery,
@@ -33,7 +36,10 @@ import { useDocumentManifestQuery } from "../api/documentManifests";
 import { useAuth } from "../auth/AuthProvider";
 import { membershipForTenant } from "../auth/types";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
-import { StructuredContentEditor } from "../components/StructuredContentEditor";
+import {
+  documentToEditor,
+  StructuredContentEditor,
+} from "../components/StructuredContentEditor";
 
 const stateLabels: Record<ContentItem["status"], string> = {
   pending: "等待准备",
@@ -192,6 +198,7 @@ function AssetsContent({
   tenantId: string;
   projectId: string;
 }) {
+  const { t } = useTranslation();
   const { session } = useAuth();
   const role = membershipForTenant(session, tenantId)?.role;
   const [searchParams] = useSearchParams();
@@ -271,11 +278,8 @@ function AssetsContent({
       <section className="page-hero">
         <div>
           <p className="eyebrow">内容资产</p>
-          <h1>本轮内容分支</h1>
-          <p>
-            周期 {cycleId} ·
-            规划与正文执行分别记录；未生成正文的项也不会从清单消失。
-          </p>
+          <h1>{t("generatedEditor.cycleTitle")}</h1>
+          <p>{t("generatedEditor.cycleDescription")}</p>
         </div>
         <Button
           onClick={() => {
@@ -323,7 +327,7 @@ function AssetsContent({
       {plan && (
         <>
           <Card className="panel-card">
-            <h2>冻结规划与正文进度</h2>
+            <h2>{t("generatedEditor.planProgress")}</h2>
             <p>
               清单 {plan.manifest_id} · 修订 {plan.revision} ·{" "}
               {plan.sealed ? "已封存" : "未封存"} · 规划分母{" "}
@@ -342,7 +346,7 @@ function AssetsContent({
                 · 交接 {active.handoff_id ?? "尚未形成"}
               </p>
             ) : (
-              <p>尚无正文执行；规划状态不能算作生成结果。</p>
+              <p>{t("generatedEditor.notStarted")}</p>
             )}
             {executions.isPending && (
               <LoadingState label="正在读取执行进度" compact />
@@ -374,9 +378,7 @@ function AssetsContent({
             )}
             {active?.status === "running" && (
               <>
-                <p>
-                  执行已持久化；恢复会重新派发未完成分支，不会覆盖就绪版本。
-                </p>
+                <p>{t("generatedEditor.resumeDescription")}</p>
                 <Button
                   disabled={
                     !mayEdit(role) || resume.isPending || cancel.isPending
@@ -518,10 +520,21 @@ function RevisionEditor({
   readonly: boolean;
   forkContext?: { executionId: string; itemId: string };
 }) {
+  const { t } = useTranslation();
+  const unsupported = useMemo(() => {
+    try {
+      documentToEditor(revision.document);
+      return false;
+    } catch {
+      return true;
+    }
+  }, [revision.document]);
   const navigate = useNavigate();
   const [draft, setDraft] = useState<StructuredDocument>(() =>
     structuredClone(revision.document),
   );
+  const [baselineDocument, setBaselineDocument] = useState(revision.document);
+  const changeGeneration = useRef(0);
   const [baseId, setBaseId] = useState(revision.revision_id);
   const [dirty, setDirty] = useState(false);
   const [conflicted, setConflicted] = useState(false);
@@ -540,7 +553,9 @@ function RevisionEditor({
   useEffect(() => {
     if (!dirty && !saved && revision.revision_id !== baseId) {
       setDraft(structuredClone(revision.document));
+      setBaselineDocument(revision.document);
       setBaseId(revision.revision_id);
+      setEditorEpoch((epoch) => epoch + 1);
     }
     if (saved && revision.revision_id === baseId) setSaved(false);
   }, [baseId, dirty, revision, saved]);
@@ -550,19 +565,31 @@ function RevisionEditor({
       | StructuredDocument
       | ((current: StructuredDocument) => StructuredDocument),
   ) => {
+    changeGeneration.current++;
     setDraft(next);
     setDirty(true);
     setSaved(false);
   };
   const save = () => {
-    if (!dirty || mutation.isPending || conflicted || editorError) return;
+    if (
+      !dirty ||
+      mutation.isPending ||
+      conflicted ||
+      editorError ||
+      unsupported
+    )
+      return;
+    const submittedGeneration = changeGeneration.current;
     mutation.mutate(
       { baseRevisionId: baseId, document: draft },
       {
         onSuccess: (result) => {
           setBaseId(result.revision_id);
-          setDirty(false);
-          setSaved(true);
+          setBaselineDocument(result.document);
+          if (submittedGeneration === changeGeneration.current) {
+            setDirty(false);
+            setSaved(true);
+          }
           if (forkContext) {
             navigate(
               `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/content/${encodeURIComponent(result.asset_id)}`,
@@ -577,58 +604,82 @@ function RevisionEditor({
     );
   };
   useEffect(() => {
-    if (!dirty || conflicted || editorError || readonly || mutation.isPending)
+    if (
+      !dirty ||
+      conflicted ||
+      editorError ||
+      unsupported ||
+      readonly ||
+      mutation.isPending
+    )
       return;
     const timer = window.setTimeout(save, 1000);
     return () => window.clearTimeout(timer);
     // The timeout restarts on every local edit; it submits the exact draft seen by this render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, dirty, conflicted, editorError, readonly, mutation.isPending]);
+  }, [
+    draft,
+    baseId,
+    dirty,
+    conflicted,
+    editorError,
+    unsupported,
+    readonly,
+    mutation.isPending,
+  ]);
 
   return (
     <Card className="panel-card">
-      <h2>结构化正文草稿</h2>
+      <h2>{t("generatedEditor.editTitle")}</h2>
       <p>
-        当前基线 v{revision.revision} · {baseId}。每次保存追加不可变版本，
-        不覆盖已发布内容；编辑后需要重新检查。
+        {t("generatedEditor.editingVersion", { revision: revision.revision })}
       </p>
-      <p>
-        所见即所得编辑仅覆盖现有结构化正文的段落、小标题与列表纯文本；
-        粗体、链接、表格及媒体尚无可持久化字段，粘贴时只接收纯文本。
-        引用片段与检查结果仍以服务端版本为准。
-      </p>
-      {forkContext && (
-        <p>
-          当前正文复用原资产。编辑会在本轮创建新资产和草稿，保留原版本及检查证据；新草稿须独立检查，不需要人工审批。
-        </p>
-      )}
+      <p>{t("generatedEditor.formatHint")}</p>
+      {forkContext && <p>{t("generatedEditor.reuseDescription")}</p>}
       {readonly && <p>当前成员只可查看正文。</p>}
       <Field label="标题">
         <Input
           value={draft.title}
-          disabled={readonly || mutation.isPending}
+          disabled={
+            readonly ||
+            unsupported ||
+            (Boolean(forkContext) && mutation.isPending)
+          }
           onChange={(_, data) => update({ ...draft, title: data.value })}
         />
       </Field>
       <StructuredContentEditor
-        key={`${baseId}/${editorEpoch}`}
+        key={editorEpoch}
         document={draft}
-        readonly={readonly || mutation.isPending || conflicted}
+        baselineDocument={baselineDocument}
+        readonly={
+          readonly ||
+          unsupported ||
+          (Boolean(forkContext) && mutation.isPending) ||
+          conflicted
+        }
         onChange={(document, error) => {
           setEditorError(error);
           if (document)
             update((current) => ({ ...document, title: current.title }));
+          else if (error) {
+            changeGeneration.current++;
+            setDirty(true);
+            setSaved(false);
+          }
         }}
       />
-      <p>
-        引用片段 ID：
-        {draft.blocks
-          .map(
-            (block) =>
-              `${block.block_id} · ${block.citation_ids.join("、") || "无"}`,
-          )
-          .join("；")}
-      </p>
+      <details className="content-technical-details">
+        <summary>{t("generatedEditor.evidenceIdentifiers")}</summary>
+        <p>
+          {draft.blocks
+            .map(
+              (block) =>
+                `${block.block_id} · ${block.citation_ids.join("、") || "无"}`,
+            )
+            .join("；")}
+        </p>
+      </details>
       {editorError && (
         <MessageBar intent="warning">
           <MessageBarBody>
@@ -636,7 +687,7 @@ function RevisionEditor({
           </MessageBarBody>
         </MessageBar>
       )}
-      {!readonly && (
+      {!readonly && !unsupported && (
         <div>
           <Button
             appearance="primary"
@@ -656,13 +707,15 @@ function RevisionEditor({
       <p aria-live="polite">
         {conflicted
           ? "服务器版本已改变；本地输入仍保留。请复制或比较草稿后再刷新，当前不会覆盖它。"
-          : mutation.isPending
-            ? "正在保存新版本"
-            : dirty
-              ? "本地草稿未保存；停止输入 1 秒后自动保存。"
-              : saved
-                ? "新版本已保存，自动检查尚未完成。"
-                : "无未保存更改"}
+          : editorError
+            ? t("generatedEditor.unsavedInvalid")
+            : mutation.isPending
+              ? "正在保存新版本"
+              : dirty
+                ? "本地草稿未保存；停止输入 1 秒后自动保存。"
+                : saved
+                  ? "新版本已保存，自动检查尚未完成。"
+                  : "无未保存更改"}
       </p>
       {mutation.isError && !conflicted && (
         <ErrorState
@@ -678,6 +731,7 @@ function RevisionEditor({
             setDirty(false);
             setSaved(false);
             setDraft(structuredClone(revision.document));
+            setBaselineDocument(revision.document);
             setBaseId(revision.revision_id);
             setEditorError(null);
             setEditorEpoch((epoch) => epoch + 1);
@@ -699,6 +753,9 @@ function AssetContent({
   projectId: string;
   assetId: string;
 }) {
+  const { t } = useTranslation();
+  const [exporting, setExporting] = useState<"markdown" | "html" | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
   const { session } = useAuth();
   const readonly = !mayEdit(membershipForTenant(session, tenantId)?.role);
   const [searchParams] = useSearchParams();
@@ -713,9 +770,14 @@ function AssetContent({
   const asset = useContentAssetQuery(tenantId, projectId, assetId);
   const history = useContentRevisionsQuery(tenantId, projectId, assetId);
   const [selectedId, setSelectedId] = useState<string>();
-  const current = history.data?.find(
+  const resolvedCurrent = history.data?.find(
     (revision) => revision.revision_id === asset.data?.current_revision_id,
   );
+  // Asset and revision queries can briefly resolve in different orders after
+  // a save; retain the last valid editor rather than remounting it mid-input.
+  const lastCurrent = useRef<ContentRevision | undefined>(undefined);
+  if (resolvedCurrent) lastCurrent.current = resolvedCurrent;
+  const current = resolvedCurrent ?? lastCurrent.current;
   const selected =
     history.data?.find((revision) => revision.revision_id === selectedId) ??
     (hasReuseContext
@@ -747,6 +809,41 @@ function AssetContent({
     contextualItem.asset_id === assetId &&
     contextualItem.reuse_binding.asset_id !== assetId;
   const validContext = isReusedSource || isForkedCurrent;
+  const download = async (format: "markdown" | "html") => {
+    if (!selected || exporting) return;
+    setExportError(null);
+    setExporting(format);
+    try {
+      // The asset and revision IDs come from the selected persisted history,
+      // including the original immutable revision in a reuse context.
+      const result = await exportContentRevision(
+        tenantId,
+        projectId,
+        selected.asset_id,
+        selected.revision_id,
+        format,
+      );
+      if (
+        result.revision_id !== selected.revision_id ||
+        result.format !== format
+      )
+        throw new Error(t("generatedEditor.exportError"));
+      const objectUrl = URL.createObjectURL(
+        new Blob([result.content], { type: result.media_type }),
+      );
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = result.filename;
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+    } catch {
+      setExportError(t("generatedEditor.exportError"));
+    } finally {
+      setExporting(null);
+    }
+  };
 
   if (
     asset.isPending ||
@@ -800,7 +897,9 @@ function AssetContent({
           <p className="eyebrow">内容编辑</p>
           <h1>{current.document.title}</h1>
           <p>
-            资产 {assetId} · 当前持久版本 v{current.revision}
+            {t("generatedEditor.currentVersion", {
+              revision: current.revision,
+            })}
           </p>
         </div>
         <Button
@@ -814,14 +913,16 @@ function AssetContent({
       {contextualItem?.reuse_binding && (
         <Card className="panel-card">
           <h2>复用来源与本轮覆盖</h2>
-          <p>
-            本轮执行 {contextualItem.execution_id} · 清单项{" "}
-            {contextualItem.item_id}； 复用原执行{" "}
-            {contextualItem.reuse_binding.origin_execution_id} · 原清单项{" "}
-            {contextualItem.reuse_binding.origin_item_id} · 检查{" "}
-            {contextualItem.reuse_binding.check_id}
-            。本轮覆盖独立记录，原资产和检查证据保持不变。
-          </p>
+          <p>{t("generatedEditor.reuseSummary")}</p>
+          <details className="content-technical-details">
+            <summary>{t("generatedEditor.evidenceIdentifiers")}</summary>
+            <p>
+              {contextualItem.execution_id} · {contextualItem.item_id} ·{" "}
+              {contextualItem.reuse_binding.origin_execution_id} ·{" "}
+              {contextualItem.reuse_binding.origin_item_id} ·{" "}
+              {contextualItem.reuse_binding.check_id}
+            </p>
+          </details>
           <Link
             to={`../content/${encodeURIComponent(contextualItem.reuse_binding.asset_id)}`}
           >
@@ -830,42 +931,23 @@ function AssetContent({
         </Card>
       )}
       {!hasReuseContext && current.derived_from_revision_id && (
-        <p>
-          此版本从其他资产的版本 {current.derived_from_revision_id}{" "}
-          派生；原资产与历史版本保持不变。
-        </p>
+        <details className="content-technical-details">
+          <summary>{t("generatedEditor.originalVersion")}</summary>
+          <p>{current.derived_from_revision_id}</p>
+        </details>
       )}
       {selected && (
         <>
-          <Card className="panel-card">
-            <h2>版本历史</h2>
-            <p>查看旧版本不会改写当前版本；修订和检查结果均由服务端记录。</p>
-            <ul>
-              {sorted.map((revision) => (
-                <li key={revision.revision_id}>
-                  <Button
-                    appearance={
-                      selected.revision_id === revision.revision_id
-                        ? "primary"
-                        : "subtle"
-                    }
-                    onClick={() => setSelectedId(revision.revision_id)}
-                  >
-                    v{revision.revision} · {revision.created_at}
-                    {revision.revision_id === current.revision_id
-                      ? "（当前）"
-                      : ""}
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          </Card>
           {(selected.revision_id === current.revision_id && !isReusedSource) ||
           (isReusedSource &&
             selected.revision_id ===
               contextualItem?.reuse_binding?.revision_id) ? (
             <RevisionEditor
-              key={`${assetId}/${selected.revision_id}`}
+              key={
+                isReusedSource
+                  ? `${assetId}/reuse/${selected.revision_id}`
+                  : `${assetId}/current`
+              }
               revision={selected}
               tenantId={tenantId}
               projectId={projectId}
@@ -889,24 +971,70 @@ function AssetContent({
             </Card>
           )}
           <Card className="panel-card">
+            <details className="content-history">
+              <summary>{t("generatedEditor.history")}</summary>
+              <ul>
+                {sorted.map((revision) => (
+                  <li key={revision.revision_id}>
+                    <Button
+                      appearance={
+                        selected.revision_id === revision.revision_id
+                          ? "primary"
+                          : "subtle"
+                      }
+                      onClick={() => setSelectedId(revision.revision_id)}
+                    >
+                      v{revision.revision} · {formatUiDate(revision.created_at)}
+                      {revision.revision_id === current.revision_id
+                        ? t("generatedEditor.current")
+                        : ""}
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+              <div className="content-export-actions">
+                <Button
+                  disabled={!!exporting}
+                  onClick={() => void download("markdown")}
+                >
+                  {t("generatedEditor.exportMarkdown")}
+                </Button>
+                <Button
+                  disabled={!!exporting}
+                  onClick={() => void download("html")}
+                >
+                  {t("generatedEditor.exportHtml")}
+                </Button>
+              </div>
+              {exportError && (
+                <MessageBar intent="error">
+                  <MessageBarBody>{exportError}</MessageBarBody>
+                </MessageBar>
+              )}
+            </details>
+          </Card>
+          <Card className="panel-card">
             <h2>知识证据与原文</h2>
             {selected.quotes.length ? (
-              <ol>
+              <ol className="content-evidence-quotes">
                 {selected.quotes.map((quote) => (
                   <li
                     key={`${quote.reference.source_version_id}/${quote.reference.chunk_id}`}
                   >
                     <blockquote>{quote.exact_quote}</blockquote>
-                    <p>
-                      来源版本 {quote.reference.source_version_id} · 片段{" "}
-                      {quote.reference.chunk_id ?? "未定位"} ·{" "}
-                      {locatorText(quote.reference.locator)}
-                    </p>
+                    <details className="content-technical-details">
+                      <summary>{t("generatedEditor.sourceDetails")}</summary>
+                      <p>
+                        {quote.reference.source_version_id} ·{" "}
+                        {quote.reference.chunk_id ?? "未定位"} ·{" "}
+                        {locatorText(quote.reference.locator)}
+                      </p>
+                    </details>
                   </li>
                 ))}
               </ol>
             ) : (
-              <p>此版本未提供可展示的原文摘录；不能声称有可核对的引用。</p>
+              <p>{t("generatedEditor.noQuotes")}</p>
             )}
           </Card>
           <Card className="panel-card">
@@ -915,15 +1043,19 @@ function AssetContent({
               <ul>
                 {selected.findings.map((finding) => (
                   <li key={finding.finding_id}>
-                    <strong>
-                      {finding.blocking ? "阻断" : "提示"} · {finding.code}
-                    </strong>
+                    <strong>{finding.blocking ? "阻断" : "提示"}</strong>
                     <p>{finding.detail}</p>
-                    <p>
-                      内容块 {finding.block_id ?? "整篇"} · 引用{" "}
-                      {finding.evidence.map((ref) => ref.chunk_id).join("、") ||
-                        "无"}
-                    </p>
+                    <details className="content-technical-details">
+                      <summary>
+                        {t("generatedEditor.evidenceIdentifiers")}
+                      </summary>
+                      <p>
+                        {finding.code} · {finding.block_id ?? "整篇"} ·{" "}
+                        {finding.evidence
+                          .map((ref) => ref.chunk_id)
+                          .join("、") || "无"}
+                      </p>
+                    </details>
                   </li>
                 ))}
               </ul>
@@ -933,11 +1065,6 @@ function AssetContent({
           </Card>
         </>
       )}
-      <MessageBar intent="info">
-        <MessageBarBody>
-          支持编辑标题、段落和列表；暂不支持文字样式、图片和表格。
-        </MessageBarBody>
-      </MessageBar>
     </div>
   );
 }

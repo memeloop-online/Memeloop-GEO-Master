@@ -1,10 +1,27 @@
-import { useEffect, useState } from "react";
-import { Button } from "@fluentui/react-components";
+import { useEffect, useRef, useState } from "react";
+import {
+  Button,
+  Input,
+  Menu,
+  MenuItem,
+  MenuList,
+  MenuPopover,
+  MenuTrigger,
+  Popover,
+  PopoverSurface,
+  PopoverTrigger,
+  Toolbar,
+  ToolbarButton,
+  ToolbarToggleButton,
+} from "@fluentui/react-components";
+import { TableKit } from "@tiptap/extension-table";
 import { Extension, type JSONContent } from "@tiptap/core";
 import { Plugin } from "@tiptap/pm/state";
-import { EditorContent, useEditor } from "@tiptap/react";
+import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import { useTranslation } from "react-i18next";
 import type { ContentBlock, StructuredDocument } from "../api/content";
+import { fromRichNode, isSimpleLegacy, toRichNode } from "./richContentAdapter";
 import "./StructuredContentEditor.css";
 
 const metadata = Extension.create({
@@ -19,13 +36,21 @@ const metadata = Extension.create({
             if (node.type.name === "paragraph" && node.attrs.geoCaptionFor)
               return;
             if (
-              !["heading", "paragraph", "bulletList"].includes(node.type.name)
+              ![
+                "heading",
+                "paragraph",
+                "bulletList",
+                "orderedList",
+                "codeBlock",
+                "table",
+              ].includes(node.type.name)
             )
               return;
-            const inherited =
-              node.type.name === "bulletList"
-                ? node.content.firstChild?.content.firstChild?.attrs
-                : undefined;
+            const inherited = ["bulletList", "orderedList"].includes(
+              node.type.name,
+            )
+              ? node.content.firstChild?.content.firstChild?.attrs
+              : undefined;
             const id = node.attrs.geoBlockId ?? inherited?.geoBlockId;
             if (typeof id === "string" && !seen.has(id)) {
               seen.add(id);
@@ -52,11 +77,18 @@ const metadata = Extension.create({
   addGlobalAttributes() {
     return [
       {
-        types: ["heading", "paragraph", "bulletList"],
+        types: [
+          "heading",
+          "paragraph",
+          "bulletList",
+          "orderedList",
+          "codeBlock",
+          "table",
+        ],
         attributes: {
           geoBlockId: {
             default: null,
-            parseHTML: (element) => element.getAttribute("data-geo-block-id"),
+            parseHTML: () => null,
             renderHTML: (attributes) =>
               attributes.geoBlockId
                 ? { "data-geo-block-id": attributes.geoBlockId }
@@ -64,15 +96,7 @@ const metadata = Extension.create({
           },
           geoCitations: {
             default: [],
-            parseHTML: (element) => {
-              try {
-                return JSON.parse(
-                  element.getAttribute("data-geo-citations") ?? "[]",
-                );
-              } catch {
-                return [];
-              }
-            },
+            parseHTML: () => [],
             renderHTML: (attributes) => ({
               "data-geo-citations": JSON.stringify(
                 attributes.geoCitations ?? [],
@@ -81,8 +105,7 @@ const metadata = Extension.create({
           },
           geoCaptionFor: {
             default: null,
-            parseHTML: (element) =>
-              element.getAttribute("data-geo-caption-for"),
+            parseHTML: () => null,
             renderHTML: (attributes) =>
               attributes.geoCaptionFor
                 ? { "data-geo-caption-for": attributes.geoCaptionFor }
@@ -97,20 +120,31 @@ const metadata = Extension.create({
 const extensions = [
   StarterKit.configure({
     blockquote: false,
-    bold: false,
-    code: false,
-    codeBlock: false,
     dropcursor: false,
     gapcursor: false,
-    hardBreak: false,
     horizontalRule: false,
-    italic: false,
-    link: false,
-    orderedList: false,
-    strike: false,
     trailingNode: false,
-    underline: false,
-    heading: { levels: [2] },
+    heading: { levels: [1, 2, 3, 4, 5, 6] },
+    link: { openOnClick: false },
+  }),
+  TableKit,
+  Extension.create({
+    name: "geoLinkTitle",
+    addGlobalAttributes() {
+      return [
+        {
+          types: ["link"],
+          attributes: {
+            title: {
+              default: null,
+              parseHTML: (element) => element.getAttribute("title"),
+              renderHTML: (attributes) =>
+                attributes.title ? { title: attributes.title } : {},
+            },
+          },
+        },
+      ];
+    },
   }),
   metadata,
 ];
@@ -130,6 +164,14 @@ export function documentToEditor(document: StructuredDocument): JSONContent {
   return {
     type: "doc",
     content: document.blocks.flatMap((block): JSONContent[] => {
+      if (block.kind === "rich") {
+        if (block.rich?.version !== 1)
+          throw new Error("This content version is not supported.");
+        const node = fromRichNode(block.rich.node);
+        return [{ ...node, attrs: { ...node.attrs, ...attributes(block) } }];
+      }
+      if (!["heading", "paragraph", "list"].includes(block.kind))
+        throw new Error("This content structure is not supported.");
       if (block.kind !== "list")
         return [
           {
@@ -206,7 +248,7 @@ export function editorToDocument(
   };
   for (let index = 0; index < nodes.length; index++) {
     const node = nodes[index];
-    if (node.type === "bulletList") {
+    if (node.type === "bulletList" || node.type === "orderedList") {
       const originalIds = new Set(
         (node.content ?? [])
           .flatMap((item) => item.content ?? [])
@@ -221,7 +263,7 @@ export function editorToDocument(
       node.attrs = {
         ...node.attrs,
         geoBlockId:
-          originalList?.kind === "list"
+          originalList?.kind === "list" || originalList?.kind === "rich"
             ? node.attrs?.geoBlockId
             : (firstId ?? node.attrs?.geoBlockId),
         geoCitations: [
@@ -237,7 +279,10 @@ export function editorToDocument(
     if (node.type === "paragraph" && node.attrs?.geoCaptionFor) {
       const next = nodes[index + 1];
       if (
+        isSimpleLegacy(node) &&
         next?.type === "bulletList" &&
+        isSimpleLegacy(next) &&
+        previousById.get(next.attrs?.geoBlockId)?.kind === "list" &&
         node.attrs.geoCaptionFor === next.attrs?.geoBlockId
       ) {
         const attrs = metadataFor(next);
@@ -252,27 +297,73 @@ export function editorToDocument(
       }
     }
     const attrs = metadataFor(node);
-    if (node.type === "heading" || node.type === "paragraph")
+    const {
+      geoBlockId: _id,
+      geoCitations: _citations,
+      geoCaptionFor: _caption,
+      ...nodeAttrs
+    } = node.attrs ?? {};
+    void _id;
+    void _citations;
+    void _caption;
+    const normalized = toRichNode({ ...node, attrs: nodeAttrs });
+    const prior = previousById.get(attrs.block_id);
+    if (
+      prior?.kind === "rich" &&
+      prior.rich?.version === 1 &&
+      JSON.stringify(toRichNode(prior.rich.node)) === JSON.stringify(normalized)
+    )
+      blocks.push({
+        ...prior,
+        citation_ids: attrs.citation_ids,
+      });
+    else if (
+      (node.type === "heading" || node.type === "paragraph") &&
+      isSimpleLegacy(node) &&
+      !!nodeText(node).trim() &&
+      (node.type !== "heading" || node.attrs?.level === 2) &&
+      prior?.kind !== "rich"
+    )
       blocks.push({
         ...attrs,
         kind: node.type,
         text: nodeText(node),
         items: [],
       });
-    else if (node.type === "bulletList")
+    else if (
+      node.type === "bulletList" &&
+      isSimpleLegacy(node) &&
+      prior?.kind !== "rich"
+    )
       blocks.push({ ...attrs, kind: "list", text: "", items: listItems(node) });
-    else throw new Error("正文包含当前版本不支持的结构，请移除后保存。");
+    else
+      blocks.push({
+        ...attrs,
+        kind: "rich",
+        text: "",
+        items: [],
+        rich: { version: 1, node: normalized },
+      });
   }
   if (
     !blocks.length ||
     blocks.some(
       (block) =>
         (block.kind === "list" && !block.items.length) ||
-        (!block.text.trim() && !block.items.some((item) => item.trim())),
+        (block.kind !== "rich" &&
+          !block.text.trim() &&
+          !block.items.some((item) => item.trim())),
     )
   )
     throw new Error("正文至少需要一个非空内容块；空白块尚不能保存。");
-  return { title: previous.title, blocks };
+  return {
+    title: previous.title,
+    blocks,
+    ...(previous.schema_version === 2 ||
+    blocks.some((block) => block.kind === "rich")
+      ? { schema_version: 2 as const }
+      : {}),
+  };
 }
 
 function listItems(list: JSONContent): string[] {
@@ -292,57 +383,88 @@ function listItems(list: JSONContent): string[] {
 
 interface Props {
   document: StructuredDocument;
+  baselineDocument?: StructuredDocument;
   readonly: boolean;
   onChange: (document: StructuredDocument | null, error: string | null) => void;
 }
 
 export function StructuredContentEditor({
   document,
+  baselineDocument,
   readonly,
   onChange,
 }: Props) {
-  const [original] = useState(document);
+  const { t } = useTranslation();
+  const original = useRef(baselineDocument ?? document);
+  original.current = baselineDocument ?? document;
+  const [linkHref, setLinkHref] = useState("");
+  const [linkError, setLinkError] = useState(false);
+  const [linkSelected, setLinkSelected] = useState(false);
+  const [pasteError, setPasteError] = useState(false);
+  let loaded: JSONContent | undefined;
+  let unsupported = false;
+  try {
+    loaded = documentToEditor(document);
+  } catch {
+    unsupported = true;
+  }
   const editor = useEditor({
     immediatelyRender: false,
     extensions,
-    editable: !readonly,
-    content: documentToEditor(document),
+    editable: !readonly && !unsupported,
+    content: loaded ?? { type: "doc", content: [{ type: "paragraph" }] },
     editorProps: {
       attributes: {
-        "aria-label": "结构化正文",
+        "aria-label": t("generatedEditor.input"),
         role: "textbox",
         class: "structured-content-input",
       },
       handlePaste: (_view, event) => {
-        const pasted = event.clipboardData?.getData("text/plain");
-        if (pasted === undefined) return false;
-        event.preventDefault();
-        // Untrusted HTML, marks, images and table structure have no persisted
-        // domain representation. Never accept their clipboard HTML payload.
-        if (pasted)
-          editor?.commands.insertContent({ type: "text", text: pasted });
-        return true;
+        if (event.clipboardData?.types.includes("text/html")) {
+          event.preventDefault();
+          setPasteError(true);
+          return true;
+        }
+        return false;
       },
     },
     onUpdate: ({ editor: current }) => {
       try {
-        onChange(editorToDocument(current.getJSON(), original), null);
-      } catch (error) {
-        onChange(null, (error as Error).message);
+        onChange(editorToDocument(current.getJSON(), original.current), null);
+      } catch {
+        onChange(null, t("generatedEditor.formatError"));
       }
     },
   });
 
   useEffect(() => {
-    if (editor && editor.isEditable === readonly)
-      editor.setEditable(!readonly, false);
-  }, [editor, readonly]);
+    if (editor && editor.isEditable === (readonly || unsupported))
+      editor.setEditable(!readonly && !unsupported, false);
+  }, [editor, readonly, unsupported]);
+  const active = useEditorState({
+    editor,
+    selector: ({ editor: current }) => ({
+      heading: current?.isActive("heading", { level: 2 }) ?? false,
+      bold: current?.isActive("bold") ?? false,
+      italic: current?.isActive("italic") ?? false,
+      strike: current?.isActive("strike") ?? false,
+      underline: current?.isActive("underline") ?? false,
+      code: current?.isActive("code") ?? false,
+      link: current?.isActive("link") ?? false,
+      bullets: current?.isActive("bulletList") ?? false,
+      numbered: current?.isActive("orderedList") ?? false,
+      codeBlock: current?.isActive("codeBlock") ?? false,
+    }),
+  });
 
   const toParagraph = () => {
     if (!editor) return;
     const selection = editor.state.selection.$from;
     let depth = selection.depth;
-    while (depth > 0 && selection.node(depth).type.name !== "bulletList")
+    while (
+      depth > 0 &&
+      !["bulletList", "orderedList"].includes(selection.node(depth).type.name)
+    )
       depth--;
     if (!depth) {
       editor.chain().focus().setParagraph().run();
@@ -369,49 +491,197 @@ export function StructuredContentEditor({
       itemPosition += item.nodeSize;
     });
     editor.view.dispatch(transaction);
-    editor.chain().focus().toggleBulletList().setParagraph().run();
+    if (list.type.name === "orderedList")
+      editor.chain().focus().toggleOrderedList().setParagraph().run();
+    else editor.chain().focus().toggleBulletList().setParagraph().run();
   };
 
   return (
-    <div className="structured-content-editor">
-      {!readonly && (
-        <div
+    <div className="structured-content-editor generated-content-editor">
+      {unsupported && <p role="alert">{t("generatedEditor.unsupported")}</p>}
+      {pasteError && (
+        <p role="alert">{t("generatedEditor.pasteUnsupported")}</p>
+      )}
+      {!readonly && !unsupported && (
+        <Toolbar
           className="structured-content-toolbar"
-          role="toolbar"
-          aria-label="正文格式"
+          aria-label={t("generatedEditor.toolbar")}
+          size="small"
+          checkedValues={{
+            format: Object.entries(active ?? {})
+              .filter(([, selected]) => selected)
+              .map(([key]) => key),
+          }}
         >
-          <Button size="small" onClick={toParagraph}>
-            段落
-          </Button>
-          <Button
-            size="small"
+          <ToolbarButton onClick={toParagraph}>
+            {t("generatedEditor.paragraph")}
+          </ToolbarButton>
+          <ToolbarToggleButton
+            name="format"
+            value="heading"
             onClick={() =>
               editor?.chain().focus().toggleHeading({ level: 2 }).run()
             }
           >
-            小标题
-          </Button>
-          <Button
-            size="small"
+            {t("generatedEditor.heading")}
+          </ToolbarToggleButton>
+          <Menu>
+            <MenuTrigger disableButtonEnhancement>
+              <ToolbarButton>{t("generatedEditor.headingLevel")}</ToolbarButton>
+            </MenuTrigger>
+            <MenuPopover>
+              <MenuList>
+                {([1, 2, 3, 4, 5, 6] as const).map((level) => (
+                  <MenuItem
+                    key={level}
+                    onClick={() =>
+                      editor?.chain().focus().setHeading({ level }).run()
+                    }
+                  >
+                    {t("generatedEditor.level", { level })}
+                  </MenuItem>
+                ))}
+              </MenuList>
+            </MenuPopover>
+          </Menu>
+          <ToolbarToggleButton
+            name="format"
+            value="bold"
+            onClick={() => editor?.chain().focus().toggleBold().run()}
+          >
+            {t("generatedEditor.bold")}
+          </ToolbarToggleButton>
+          <ToolbarToggleButton
+            name="format"
+            value="italic"
+            onClick={() => editor?.chain().focus().toggleItalic().run()}
+          >
+            {t("generatedEditor.italic")}
+          </ToolbarToggleButton>
+          <ToolbarToggleButton
+            name="format"
+            value="strike"
+            onClick={() => editor?.chain().focus().toggleStrike().run()}
+          >
+            {t("generatedEditor.strike")}
+          </ToolbarToggleButton>
+          <ToolbarToggleButton
+            name="format"
+            value="underline"
+            onClick={() => editor?.chain().focus().toggleUnderline().run()}
+          >
+            {t("generatedEditor.underline")}
+          </ToolbarToggleButton>
+          <ToolbarToggleButton
+            name="format"
+            value="code"
+            onClick={() => editor?.chain().focus().toggleCode().run()}
+          >
+            {t("generatedEditor.code")}
+          </ToolbarToggleButton>
+          <Popover
+            onOpenChange={(_, data) => {
+              if (data.open) {
+                const href = editor?.getAttributes("link").href;
+                setLinkHref(String(href ?? ""));
+                setLinkSelected(Boolean(href));
+                setLinkError(false);
+              }
+            }}
+          >
+            <PopoverTrigger disableButtonEnhancement>
+              <ToolbarButton aria-label={t("generatedEditor.link")}>
+                {t("generatedEditor.link")}
+              </ToolbarButton>
+            </PopoverTrigger>
+            <PopoverSurface className="generated-link-popover">
+              <Input
+                aria-label={t("generatedEditor.linkUrl")}
+                value={linkHref}
+                onChange={(_, data) => setLinkHref(data.value)}
+              />
+              <Button
+                onClick={() => {
+                  try {
+                    toRichNode({
+                      type: "text",
+                      text: "link",
+                      marks: [{ type: "link", attrs: { href: linkHref } }],
+                    });
+                    editor
+                      ?.chain()
+                      .focus()
+                      .extendMarkRange("link")
+                      .setLink({ href: linkHref })
+                      .run();
+                    setLinkError(false);
+                  } catch {
+                    setLinkError(true);
+                  }
+                }}
+              >
+                {t("generatedEditor.link")}
+              </Button>
+              {linkSelected && (
+                <Button
+                  onClick={() =>
+                    editor
+                      ?.chain()
+                      .focus()
+                      .extendMarkRange("link")
+                      .unsetLink()
+                      .run()
+                  }
+                >
+                  {t("generatedEditor.unlink")}
+                </Button>
+              )}
+              {linkError && (
+                <span role="alert">{t("generatedEditor.invalidLink")}</span>
+              )}
+            </PopoverSurface>
+          </Popover>
+          <ToolbarToggleButton
+            name="format"
+            value="bullets"
             onClick={() => editor?.chain().focus().toggleBulletList().run()}
           >
-            列表
-          </Button>
-          <Button
-            size="small"
-            onClick={() => editor?.chain().focus().undo().run()}
+            {t("generatedEditor.bullets")}
+          </ToolbarToggleButton>
+          <ToolbarToggleButton
+            name="format"
+            value="numbered"
+            onClick={() => editor?.chain().focus().toggleOrderedList().run()}
           >
-            撤销
-          </Button>
-          <Button
-            size="small"
-            onClick={() => editor?.chain().focus().redo().run()}
+            {t("generatedEditor.numbered")}
+          </ToolbarToggleButton>
+          <ToolbarToggleButton
+            name="format"
+            value="codeBlock"
+            onClick={() => editor?.chain().focus().toggleCodeBlock().run()}
           >
-            重做
-          </Button>
-        </div>
+            {t("generatedEditor.codeBlock")}
+          </ToolbarToggleButton>
+          <ToolbarButton
+            onClick={() =>
+              editor
+                ?.chain()
+                .focus()
+                .insertTable({ rows: 2, cols: 2, withHeaderRow: true })
+                .run()
+            }
+          >
+            {t("generatedEditor.table")}
+          </ToolbarButton>
+          <ToolbarButton onClick={() => editor?.chain().focus().undo().run()}>
+            {t("generatedEditor.undo")}
+          </ToolbarButton>
+          <ToolbarButton onClick={() => editor?.chain().focus().redo().run()}>
+            {t("generatedEditor.redo")}
+          </ToolbarButton>
+        </Toolbar>
       )}
-      <EditorContent editor={editor} />
+      {!unsupported && <EditorContent editor={editor} />}
     </div>
   );
 }

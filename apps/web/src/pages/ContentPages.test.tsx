@@ -230,6 +230,9 @@ function mockApi({
   forkStatus = 201,
   sourceAdvanced = false,
   documentOverride,
+  exportStatus = 200,
+  persistWrites = false,
+  editDeferred,
 }: {
   executionList?: ContentExecution[];
   itemList?: ContentItem[];
@@ -242,10 +245,15 @@ function mockApi({
   forkStatus?: number;
   sourceAdvanced?: boolean;
   documentOverride?: StructuredDocument;
+  exportStatus?: number;
+  persistWrites?: boolean;
+  editDeferred?: Promise<void>;
 } = {}) {
   let persistedExecutions = executionList;
   let persistedItems = itemList;
   let forkedRevision: ContentRevision | undefined;
+  let appendedRevision: ContentRevision | undefined;
+  const appendedRevisions: ContentRevision[] = [];
   const editingRevision = documentOverride
     ? { ...revision, document: documentOverride }
     : revision;
@@ -327,6 +335,31 @@ function mockApi({
     }
     if (path.endsWith("/document-executions/execution-1/items"))
       return Promise.resolve(json(persistedItems));
+    if (/\/contents\/[^/]+\/revisions\/[^/]+\/export$/.test(path)) {
+      if (exportStatus !== 200)
+        return Promise.resolve(
+          json(
+            { code: "export_unavailable", message: "无法导出此版本" },
+            exportStatus,
+          ),
+        );
+      const match = path.match(
+        /\/contents\/([^/]+)\/revisions\/([^/]+)\/export$/,
+      )!;
+      const format = new URL(String(url), "http://localhost").searchParams.get(
+        "format",
+      );
+      return Promise.resolve(
+        json({
+          revision_id: match[2],
+          format,
+          media_type: format === "html" ? "text/html" : "text/markdown",
+          filename: `content.${format === "html" ? "html" : "md"}`,
+          content:
+            format === "html" ? "<p>Exact revision</p>" : "Exact revision",
+        }),
+      );
+    }
     if (path.endsWith("/document-executions/execution-1/items/item-1/fork")) {
       if (forkStatus !== 201)
         return Promise.resolve(
@@ -361,41 +394,51 @@ function mockApi({
           asset_id: "asset-1",
           execution_id: "execution-1",
           item_id: "item-1",
-          current_revision_id: sourceAdvanced ? "revision-2" : "revision-1",
+          current_revision_id:
+            appendedRevision?.revision_id ??
+            (sourceAdvanced ? "revision-2" : "revision-1"),
           created_at: "2026-10-01T08:00:00Z",
         }),
       );
     if (path.endsWith("/contents/asset-1/revisions")) {
-      if (init?.method === "POST")
-        return Promise.resolve(
-          editStatus === 201
-            ? json(
-                {
-                  ...editingRevision,
-                  revision_id: "revision-2",
-                  revision: 2,
-                  base_revision_id: "revision-1",
-                  findings: [],
-                  document: JSON.parse(String(init.body)).document,
-                },
-                201,
-              )
-            : json({ code: "conflict", message: "基线版本已改变" }, editStatus),
-        );
+      if (init?.method === "POST") {
+        const respond = () => {
+          const saved: ContentRevision = {
+            ...editingRevision,
+            revision_id: `revision-${2 + appendedRevisions.length}`,
+            revision: 2 + appendedRevisions.length,
+            base_revision_id: JSON.parse(String(init.body)).base_revision_id,
+            findings: [],
+            document: JSON.parse(String(init.body)).document,
+          };
+          if (persistWrites && editStatus === 201) {
+            appendedRevision = saved;
+            appendedRevisions.push(saved);
+          }
+          return editStatus === 201
+            ? json(saved, 201)
+            : json({ code: "conflict", message: "基线版本已改变" }, editStatus);
+        };
+        return editDeferred
+          ? editDeferred.then(respond)
+          : Promise.resolve(respond());
+      }
       return Promise.resolve(
         json(
-          sourceAdvanced
-            ? [
-                editingRevision,
-                {
-                  ...editingRevision,
-                  revision_id: "revision-2",
-                  revision: 2,
-                  base_revision_id: "revision-1",
-                  document: { ...revision.document, title: "原资产后续修订" },
-                },
-              ]
-            : [editingRevision],
+          appendedRevision
+            ? [editingRevision, ...appendedRevisions]
+            : sourceAdvanced
+              ? [
+                  editingRevision,
+                  {
+                    ...editingRevision,
+                    revision_id: "revision-2",
+                    revision: 2,
+                    base_revision_id: "revision-1",
+                    document: { ...revision.document, title: "原资产后续修订" },
+                  },
+                ]
+              : [editingRevision],
         ),
       );
     }
@@ -553,7 +596,7 @@ describe("P08 content assets", () => {
   it("reports no execution separately and shows capability failure on start", async () => {
     const requests = mockApi({ executionList: [], editStatus: 503 });
     renderPage("/app/tenant-1/project-1/content");
-    expect(await screen.findByText(/尚无正文执行/)).toBeInTheDocument();
+    expect(await screen.findByText(/内容尚未开始生成/)).toBeInTheDocument();
     expect(screen.getAllByText(/尚无执行记录/)).toHaveLength(2);
     await userEvent.click(screen.getByRole("button", { name: "启动正文生成" }));
     expect(await screen.findByText("内容生成能力尚未配置")).toBeInTheDocument();
@@ -684,6 +727,25 @@ describe("P08 content assets", () => {
 });
 
 describe("P09 content revision", () => {
+  it("shows the editor before collapsed history and keeps record IDs in details", async () => {
+    mockApi();
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    const history = screen.getByText("版本历史").closest("details");
+    expect(history).not.toHaveAttribute("open");
+    expect(body.compareDocumentPosition(history!)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(
+      screen.getAllByText("查看记录标识")[0].closest("details"),
+    ).not.toHaveAttribute("open");
+    await userEvent.click(screen.getByText("版本历史"));
+    expect(
+      screen.getByRole("button", { name: "下载 HTML" }),
+    ).toBeInTheDocument();
+    expect(history).not.toHaveTextContent("2026-10-01T08:00:00Z");
+  });
+
   it("round-trips list captions and citations without touching the source version", () => {
     const original: StructuredDocument = {
       title: "有来源的指南",
@@ -758,7 +820,9 @@ describe("P09 content revision", () => {
     );
     expect(await screen.findByText("证据原文片段")).toBeInTheDocument();
     expect(screen.getByText("此处依据不足")).toBeInTheDocument();
-    expect(screen.getByText(/本轮覆盖独立记录/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/本轮使用已有内容，原内容与检查证据保持不变/),
+    ).toBeInTheDocument();
     expect(
       requests.mock.calls.some(([url]) =>
         String(url).endsWith(
@@ -796,9 +860,8 @@ describe("P09 content revision", () => {
           init?.method === "POST",
       ),
     ).toBe(false);
-    expect(
-      await screen.findByText(/此版本从其他资产的版本 revision-1 派生/),
-    ).toBeInTheDocument();
+    await userEvent.click(await screen.findByText("查看原版本标识"));
+    expect(screen.getByText("revision-1")).toBeInTheDocument();
   });
 
   it("keeps editing pinned to the checked source revision if the original asset advances", async () => {
@@ -1188,6 +1251,374 @@ describe("P09 content revision", () => {
     expect(
       screen.queryByRole("button", { name: "保存新版本" }),
     ).not.toBeInTheDocument();
+    expect(
+      requests.mock.calls.some(([, init]) => init?.method === "POST"),
+    ).toBe(false);
+  });
+
+  it("saves a bold edit as a rich node with the original block and citation", async () => {
+    const requests = mockApi();
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    const paragraph = within(body).getByText("原始正文");
+    await userEvent.click(paragraph);
+    putCaretAtEnd(paragraph);
+    await userEvent.click(screen.getByRole("button", { name: "加粗" }));
+    await userEvent.keyboard("新");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "保存新版本" })).toBeEnabled(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const write = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions?") &&
+          init?.method === "POST",
+      );
+      expect(write).toBeDefined();
+      const saved = JSON.parse(String(write?.[1]?.body)).document;
+      expect(saved.schema_version).toBe(2);
+      expect(saved.blocks[0]).toMatchObject({
+        block_id: "block-1",
+        citation_ids: ["chunk-1"],
+        kind: "rich",
+        text: "",
+        items: [],
+      });
+      expect(saved.blocks[0].rich.node.content).toContainEqual({
+        type: "text",
+        text: "新",
+        marks: [{ type: "bold" }],
+      });
+    });
+  });
+
+  it("saves and reloads a styled rich block without changing its nested node tree", async () => {
+    const richDocument: StructuredDocument = {
+      title: "Formatted guide",
+      schema_version: 2,
+      blocks: [
+        {
+          block_id: "block-1",
+          kind: "rich",
+          citation_ids: ["chunk-1"],
+          text: "",
+          items: [],
+          rich: {
+            version: 1,
+            node: {
+              type: "paragraph",
+              content: [
+                { type: "text", text: "Bold", marks: [{ type: "bold" }] },
+                {
+                  type: "text",
+                  text: " link",
+                  marks: [
+                    {
+                      type: "link",
+                      attrs: { href: "#section", title: "Section" },
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      ],
+    };
+    const requests = mockApi({
+      documentOverride: richDocument,
+      persistWrites: true,
+    });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    expect(within(body).getByText("Bold").tagName).toBe("STRONG");
+    expect(within(body).getByRole("link", { name: "link" })).toHaveAttribute(
+      "href",
+      "#section",
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "标题" }),
+      " updated",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const write = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions?") &&
+          init?.method === "POST",
+      );
+      expect(JSON.parse(String(write?.[1]?.body)).document.blocks).toEqual(
+        richDocument.blocks,
+      );
+    });
+    await userEvent.click(screen.getByRole("button", { name: "刷新版本" }));
+    expect(
+      await screen.findByRole("heading", { name: "Formatted guide updated" }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("textbox", { name: "结构化正文" })).getByText(
+        "Bold",
+      ).tagName,
+    ).toBe("STRONG");
+  });
+
+  it("preserves a link title while editing adjacent rich text", async () => {
+    const requests = mockApi({
+      documentOverride: {
+        title: "Linked guide",
+        schema_version: 2,
+        blocks: [
+          {
+            block_id: "block-1",
+            kind: "rich",
+            text: "",
+            items: [],
+            citation_ids: ["chunk-1"],
+            rich: {
+              version: 1,
+              node: {
+                type: "paragraph",
+                content: [
+                  {
+                    type: "text",
+                    text: "Visit",
+                    marks: [
+                      {
+                        type: "link",
+                        attrs: { href: "#section", title: "More details" },
+                      },
+                    ],
+                  },
+                  { type: "text", text: " later" },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    const ending = within(body).getByText(/later/);
+    await userEvent.click(ending);
+    putCaretAtEnd(ending);
+    await userEvent.keyboard(" today");
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const write = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions?") &&
+          init?.method === "POST",
+      );
+      expect(write).toBeDefined();
+      const node = JSON.parse(String(write?.[1]?.body)).document.blocks[0].rich
+        .node;
+      expect(node.content[0].marks).toEqual([
+        { type: "link", attrs: { href: "#section", title: "More details" } },
+      ]);
+    });
+  });
+
+  it("inserts a table and saves its cells without flattening the source paragraph", async () => {
+    const requests = mockApi();
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    await userEvent.click(within(body).getByText("原始正文"));
+    await userEvent.click(screen.getByRole("button", { name: "插入表格" }));
+    expect(body.querySelectorAll("tr")).toHaveLength(2);
+    expect(screen.queryByText(/本地编辑仍保留/)?.textContent).toBeUndefined();
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() => {
+      const write = requests.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes("/contents/asset-1/revisions?") &&
+          init?.method === "POST",
+      );
+      expect(write).toBeDefined();
+      const saved = JSON.parse(String(write?.[1]?.body))
+        .document as StructuredDocument;
+      expect(saved.schema_version).toBe(2);
+      expect(
+        saved.blocks.find((block) => block.block_id === "block-1"),
+      ).toEqual(revision.document.blocks[0]);
+      expect(
+        saved.blocks.find((block) => block.kind === "rich")?.rich?.node.type,
+      ).toBe("table");
+      expect(
+        saved.blocks.find((block) => block.kind === "rich")?.rich?.node
+          .content?.[0].content?.[0].type,
+      ).toBe("tableHeader");
+    });
+  });
+
+  it("keeps an empty paragraph created before a table as a valid rich block", async () => {
+    const source = documentToEditor(revision.document);
+    const afterEnter = {
+      ...source,
+      content: [
+        source.content![0],
+        {
+          type: "paragraph",
+          attrs: { geoBlockId: "new-paragraph", geoCitations: [] },
+        },
+        {
+          type: "table",
+          attrs: { geoBlockId: "new-table", geoCitations: [] },
+          content: [
+            {
+              type: "tableRow",
+              content: [
+                {
+                  type: "tableCell",
+                  content: [{ type: "paragraph" }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const result = editorToDocument(afterEnter, revision.document);
+    expect(result.blocks[0]).toEqual(revision.document.blocks[0]);
+    expect(result.blocks[1]).toMatchObject({
+      block_id: "new-paragraph",
+      kind: "rich",
+      text: "",
+      items: [],
+      rich: { node: { type: "paragraph" } },
+    });
+    expect(result.blocks[2].rich?.node.type).toBe("table");
+  });
+
+  it("keeps the same editor while saving and submits newer typing against the returned base", async () => {
+    let release!: () => void;
+    const editDeferred = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const requests = mockApi({ persistWrites: true, editDeferred });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    const body = await screen.findByRole("textbox", { name: "结构化正文" });
+    const paragraph = within(body).getByText("原始正文");
+    await userEvent.click(paragraph);
+    putCaretAtEnd(paragraph);
+    await userEvent.keyboard("先");
+    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await waitFor(() =>
+      expect(
+        requests.mock.calls.filter(
+          ([url, init]) =>
+            String(url).includes("/contents/asset-1/revisions?") &&
+            init?.method === "POST",
+        ),
+      ).toHaveLength(1),
+    );
+    expect(body).toHaveAttribute("contenteditable", "true");
+    const pendingParagraph = within(body).getByText("原始正文先");
+    await userEvent.click(pendingParagraph);
+    putCaretAtEnd(pendingParagraph);
+    await userEvent.keyboard("后");
+    release();
+    await waitFor(
+      () =>
+        expect(
+          requests.mock.calls.filter(
+            ([url, init]) =>
+              String(url).includes("/contents/asset-1/revisions?") &&
+              init?.method === "POST",
+          ),
+        ).toHaveLength(2),
+      { timeout: 4000 },
+    );
+    const writes = requests.mock.calls.filter(
+      ([url, init]) =>
+        String(url).includes("/contents/asset-1/revisions?") &&
+        init?.method === "POST",
+    );
+    const first = JSON.parse(String(writes[0][1]?.body));
+    const second = JSON.parse(String(writes[1][1]?.body));
+    expect(first.base_revision_id).toBe("revision-1");
+    expect(first.document.blocks[0].text).toBe("原始正文先");
+    expect(second.base_revision_id).toBe("revision-2");
+    expect(second.document.blocks[0].text).toBe("原始正文先后");
+    expect(screen.getByRole("textbox", { name: "结构化正文" })).toBe(body);
+    expect(within(body).getByText("原始正文先后")).toBeInTheDocument();
+  });
+
+  it("downloads the selected immutable revision, including reuse origin identity", async () => {
+    const requests = mockApi({
+      itemList: [reusedItem, items[1]],
+      sourceAdvanced: true,
+    });
+    const createObjectURL = vi.fn(() => "blob:local-export");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, { createObjectURL, revokeObjectURL }),
+    );
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    renderPage(
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    await userEvent.click(await screen.findByText("版本历史"));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "下载 Markdown" }),
+    );
+    await waitFor(() => expect(click).toHaveBeenCalledOnce());
+    expect(
+      requests.mock.calls.some(
+        ([url, init]) =>
+          String(url).includes(
+            "/contents/asset-1/revisions/revision-1/export?format=markdown&tenant_id=tenant-1&project_id=project-1",
+          ) && (init?.method ?? "GET") === "GET",
+      ),
+    ).toBe(true);
+    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+  });
+
+  it("shows export failures without downloading an unrelated version", async () => {
+    mockApi({ exportStatus: 422 });
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    await userEvent.click(await screen.findByText("版本历史"));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "下载 HTML" }),
+    );
+    expect(
+      await screen.findByText("无法导出所选版本，请重试。"),
+    ).toBeInTheDocument();
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it("leaves unsupported media-bearing revisions read-only without emitting writes", async () => {
+    const requests = mockApi({
+      documentOverride: {
+        title: "Media document",
+        schema_version: 2,
+        blocks: [
+          {
+            block_id: "block-1",
+            kind: "rich",
+            text: "",
+            items: [],
+            citation_ids: ["chunk-1"],
+            rich: {
+              version: 1,
+              node: { type: "media", attrs: { object_id: "opaque" } },
+            },
+          },
+        ],
+      },
+    });
+    renderPage("/app/tenant-1/project-1/content/asset-1");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "只能查看，不能保存更改",
+    );
+    expect(screen.getByRole("textbox", { name: "标题" })).toBeDisabled();
     expect(
       requests.mock.calls.some(([, init]) => init?.method === "POST"),
     ).toBe(false);

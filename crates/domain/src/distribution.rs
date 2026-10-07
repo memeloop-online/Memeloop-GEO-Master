@@ -14,6 +14,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub const CHANNEL_VARIANT_POLICY: &str = "deterministic-markdown-v1";
+pub const RICH_CHANNEL_VARIANT_POLICY: &str = "deterministic-rich-markdown-v2";
+pub const RICH_MARKDOWN_FORMAT: &str = "rich_markdown.v2";
 
 fn digest(parts: &[&str]) -> String {
     let mut hash = Sha256::new();
@@ -300,6 +302,39 @@ pub fn prepare_variant(
     revision: &ContentRevision,
     placement: &PlatformPlacement,
 ) -> Result<ChannelVariant, AppError> {
+    if revision.document.schema_version == Some(2) {
+        return Err(AppError::invalid_request(
+            "existing publication outbox cannot publish rich content",
+        ));
+    }
+    prepare_versioned_variant(revision, placement, CHANNEL_VARIANT_POLICY)
+}
+
+/// Prepares only the rich-format payload; callers must separately authorize
+/// publication format, media and the entire downstream connector/send path.
+/// The existing outbox intentionally does not call this function.
+pub fn prepare_rich_variant(
+    revision: &ContentRevision,
+    placement: &PlatformPlacement,
+) -> Result<ChannelVariant, AppError> {
+    if revision.document.schema_version != Some(2)
+        || !placement
+            .supported_formats
+            .iter()
+            .any(|f| f == RICH_MARKDOWN_FORMAT)
+    {
+        return Err(AppError::invalid_request(
+            "rich content requires an explicitly supported rich publication format",
+        ));
+    }
+    prepare_versioned_variant(revision, placement, RICH_CHANNEL_VARIANT_POLICY)
+}
+fn prepare_versioned_variant(
+    revision: &ContentRevision,
+    placement: &PlatformPlacement,
+    policy: &str,
+) -> Result<ChannelVariant, AppError> {
+    revision.document.validate(&revision.evidence)?;
     if revision.markdown != revision.document.markdown() {
         return Err(AppError::invalid_request(
             "content revision markdown is inconsistent",
@@ -312,7 +347,7 @@ pub fn prepare_variant(
         &revision.revision_id.to_string(),
         &placement.platform_id,
         &placement.placement_slot,
-        CHANNEL_VARIANT_POLICY,
+        policy,
         &payload_hash,
     ]);
     Ok(ChannelVariant {
@@ -320,7 +355,7 @@ pub fn prepare_variant(
         content_revision_id: revision.revision_id,
         platform_id: placement.platform_id.clone(),
         placement_slot: placement.placement_slot.clone(),
-        policy_version: CHANNEL_VARIANT_POLICY.into(),
+        policy_version: policy.into(),
         title,
         markdown,
         payload_hash,

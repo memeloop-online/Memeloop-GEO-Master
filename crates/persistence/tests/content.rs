@@ -573,7 +573,9 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             text: "Documented product capability.".into(),
             citation_ids: vec![chunk.chunk_id],
             items: vec![],
+            rich: None,
         }],
+        schema_version: None,
     };
     let revision = repository
         .complete_generate(&scope, &generated, document.clone())
@@ -726,7 +728,9 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
                     text: "Revised documented capability.".into(),
                     citation_ids: vec![chunk.chunk_id],
                     items: vec![],
+                    rich: None,
                 }],
+                schema_version: None,
             },
         )
         .await
@@ -1048,7 +1052,9 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             text: "Evidence-linked claim".into(),
             citation_ids: vec![reference.chunk_id.unwrap()],
             items: vec![],
+            rich: None,
         }],
+        schema_version: None,
     };
     let original = repository
         .complete_generate(&scope, &generation, repaired_document.clone())

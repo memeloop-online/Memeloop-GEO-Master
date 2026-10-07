@@ -298,7 +298,9 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
                     text: "Documented public capability.".into(),
                     citation_ids: vec![chunk.chunk_id],
                     items: vec![],
+                    rich: None,
                 }],
+                schema_version: None,
             },
         )
         .await
@@ -362,7 +364,9 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
                     text: "Documented public capability.".into(),
                     citation_ids: vec![chunk.chunk_id],
                     items: vec![],
+                    rich: None,
                 }],
+                schema_version: None,
             },
         )
         .await
@@ -433,7 +437,9 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
                     text: "Documented public capability.".into(),
                     citation_ids: vec![chunk.chunk_id],
                     items: vec![],
+                    rich: None,
                 }],
+                schema_version: None,
             },
         )
         .await
@@ -549,7 +555,9 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
                     text: "Documented public capability.".into(),
                     citation_ids: vec![chunk.chunk_id],
                     items: vec![],
+                    rich: None,
                 }],
+                schema_version: None,
             },
         )
         .await

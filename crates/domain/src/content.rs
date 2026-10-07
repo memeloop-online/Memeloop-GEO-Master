@@ -1,5 +1,6 @@
 //! Durable first-stage execution. Planning manifests are immutable inputs;
 //! all mutable progress lives in this separate aggregate.
+use crate::rich_content::{MediaReference, RichContent};
 use crate::{
     AppError, ContentReuseBinding, ContentReuseCandidate, ContentReuseDecision,
     ContentReuseRequest, ContentSemanticDescriptor, DocumentManifest, DocumentManifestItemState,
@@ -12,6 +13,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+pub const RICH_GENERATION_POLICY_VERSION: &str = "rich-content-generation-v2";
+pub const RICH_CHECK_POLICY_VERSION: &str = "rich-content-check-v2";
+pub const RICH_REPAIR_POLICY_VERSION: &str = "rich-content-repair-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +52,7 @@ pub enum ContentBlockKind {
     Heading,
     Paragraph,
     List,
+    Rich,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,23 +64,104 @@ pub struct ContentBlock {
     pub citation_ids: Vec<Uuid>,
     #[serde(default)]
     pub items: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich: Option<RichContent>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredDocument {
     pub title: String,
     pub blocks: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u8>,
 }
 impl StructuredDocument {
+    pub fn media_references(&self) -> Vec<&MediaReference> {
+        self.blocks
+            .iter()
+            .filter_map(|b| b.rich.as_ref())
+            .flat_map(RichContent::media_references)
+            .collect()
+    }
+    /// Text visible to factual checks, preserving the title and one evidence
+    /// envelope per top-level block. Includes nested tables, code and media
+    /// alternative text/captions; authorization remains separate.
+    pub fn check_sections(&self) -> Vec<(Option<Uuid>, String)> {
+        let mut sections = Vec::with_capacity(self.blocks.len() + 1);
+        sections.push((None, self.title.clone()));
+        sections.extend(self.blocks.iter().map(|block| {
+            let text = match &block.rich {
+                Some(rich) => rich.plain_text(),
+                None if block.kind == ContentBlockKind::List => {
+                    std::iter::once(block.text.as_str())
+                        .chain(block.items.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+                None => block.text.clone(),
+            };
+            (Some(block.block_id), text)
+        }));
+        sections
+    }
     pub fn validate(&self, evidence: &[EvidenceRef]) -> Result<(), AppError> {
+        self.validate_structure(evidence)?;
+        if !self.media_references().is_empty() {
+            return Err(AppError::invalid_request(
+                "media requires authorized object binding; rich media writes are not yet supported",
+            ));
+        }
+        Ok(())
+    }
+    /// Structural validation alone does not authorize referenced media objects.
+    pub fn validate_structure(&self, evidence: &[EvidenceRef]) -> Result<(), AppError> {
+        if !matches!(self.schema_version, None | Some(2)) {
+            return Err(AppError::invalid_request(
+                "unsupported content schema version",
+            ));
+        }
         if self.title.trim().is_empty() || self.blocks.is_empty() {
             return Err(AppError::invalid_request(
                 "document title and blocks are required",
             ));
         }
+        if self.schema_version == Some(2)
+            && (self.title.len() > 4096 || self.blocks.len() > crate::rich_content::MAX_NODES)
+        {
+            return Err(AppError::invalid_request(
+                "rich document title or block count limit exceeded",
+            ));
+        }
         let mut seen = std::collections::HashSet::new();
+        let (mut node_count, mut text_bytes) = (0usize, self.title.len());
         for block in &self.blocks {
             if !seen.insert(block.block_id) {
                 return Err(AppError::invalid_request("duplicate block id"));
+            }
+            if block.kind == ContentBlockKind::Rich {
+                if self.schema_version != Some(2)
+                    || !block.text.is_empty()
+                    || !block.items.is_empty()
+                {
+                    return Err(AppError::invalid_request(
+                        "rich block requires schema v2 and empty legacy text/items",
+                    ));
+                }
+                block
+                    .rich
+                    .as_ref()
+                    .ok_or_else(|| AppError::invalid_request("rich block requires a node"))?
+                    .validate()?;
+                let (nodes, bytes) = block
+                    .rich
+                    .as_ref()
+                    .expect("rich node is present")
+                    .complexity();
+                node_count = node_count.saturating_add(nodes);
+                text_bytes = text_bytes.saturating_add(bytes);
+            } else if block.rich.is_some() {
+                return Err(AppError::invalid_request(
+                    "only rich blocks contain rich nodes",
+                ));
             }
             if block.kind != ContentBlockKind::List && !block.items.is_empty() {
                 return Err(AppError::invalid_request("only list blocks contain items"));
@@ -82,8 +169,25 @@ impl StructuredDocument {
             if block.kind == ContentBlockKind::List && block.items.is_empty() {
                 return Err(AppError::invalid_request("list blocks require items"));
             }
-            if block.text.trim().is_empty() && block.items.is_empty() {
+            if block.kind != ContentBlockKind::Rich
+                && block.text.trim().is_empty()
+                && block.items.is_empty()
+            {
                 return Err(AppError::invalid_request("empty block"));
+            }
+            if self.schema_version == Some(2) {
+                node_count = node_count.saturating_add(1);
+                text_bytes = text_bytes.saturating_add(block.text.len());
+                for item in &block.items {
+                    text_bytes = text_bytes.saturating_add(item.len());
+                }
+                if node_count > crate::rich_content::MAX_NODES
+                    || text_bytes > crate::rich_content::MAX_TEXT_BYTES
+                {
+                    return Err(AppError::invalid_request(
+                        "rich document node or text limit exceeded",
+                    ));
+                }
             }
             if block
                 .citation_ids
@@ -98,6 +202,9 @@ impl StructuredDocument {
         Ok(())
     }
     pub fn markdown(&self) -> String {
+        if self.schema_version == Some(2) {
+            return self.rich_markdown();
+        }
         let mut result = format!("# {}\n\n", self.title);
         for block in &self.blocks {
             match block.kind {
@@ -112,9 +219,93 @@ impl StructuredDocument {
                     }
                     result.push('\n');
                 }
+                ContentBlockKind::Rich => unreachable!("v1 rich blocks are rejected by validation"),
             }
         }
         result.trim_end().to_owned()
+    }
+    fn rich_markdown(&self) -> String {
+        let mut result = format!(
+            "# {}\n\n",
+            crate::rich_content::escape_markdown(&self.title)
+        );
+        for block in &self.blocks {
+            match block.kind {
+                ContentBlockKind::Rich => result.push_str(
+                    &block
+                        .rich
+                        .as_ref()
+                        .expect("validated rich block")
+                        .markdown(),
+                ),
+                ContentBlockKind::Heading => result.push_str(&format!(
+                    "## {}\n\n",
+                    crate::rich_content::escape_markdown(&block.text)
+                )),
+                ContentBlockKind::Paragraph => result.push_str(&format!(
+                    "{}\n\n",
+                    crate::rich_content::escape_markdown(&block.text)
+                )),
+                ContentBlockKind::List => {
+                    if !block.text.is_empty() {
+                        result.push_str(&format!(
+                            "{}\n\n",
+                            crate::rich_content::escape_markdown(&block.text)
+                        ));
+                    }
+                    for item in &block.items {
+                        result.push_str(&format!(
+                            "- {}\n",
+                            crate::rich_content::escape_markdown(item)
+                        ));
+                    }
+                    result.push('\n');
+                }
+            }
+        }
+        result.trim_end().to_owned()
+    }
+    /// Rendering requires valid structure. Authorization of media references remains a service responsibility.
+    pub fn checked_markdown(&self, evidence: &[EvidenceRef]) -> Result<String, AppError> {
+        self.validate(evidence)?;
+        Ok(self.markdown())
+    }
+    /// HTML contains relative media paths only. A caller must authorize and package all media before export.
+    pub fn html(&self, evidence: &[EvidenceRef]) -> Result<String, AppError> {
+        self.validate(evidence)?;
+        let mut output = format!("<h1>{}</h1>", crate::rich_content::escape_html(&self.title));
+        for block in &self.blocks {
+            match block.kind {
+                ContentBlockKind::Rich => {
+                    output.push_str(&block.rich.as_ref().expect("validated rich block").html())
+                }
+                ContentBlockKind::Heading => output.push_str(&format!(
+                    "<h2>{}</h2>",
+                    crate::rich_content::escape_html(&block.text)
+                )),
+                ContentBlockKind::Paragraph => output.push_str(&format!(
+                    "<p>{}</p>",
+                    crate::rich_content::escape_html(&block.text)
+                )),
+                ContentBlockKind::List => {
+                    if !block.text.is_empty() {
+                        output.push_str(&format!(
+                            "<p>{}</p>",
+                            crate::rich_content::escape_html(&block.text)
+                        ));
+                    }
+                    output.push_str("<ul>");
+                    for item in &block.items {
+                        output.push_str(&format!(
+                            "<li><p>{}</p></li>",
+                            crate::rich_content::escape_html(item)
+                        ));
+                    }
+                    output.push_str("</ul>");
+                }
+            }
+        }
+        Ok(output)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -676,6 +867,28 @@ impl ContentState {
         if owner.trim().is_empty() || !(1..=3600).contains(&ttl_seconds) {
             return Err(AppError::invalid_request("invalid lease owner or lifetime"));
         }
+        if matches!(step, ContentStep::Check | ContentStep::Repair) {
+            let item = self
+                .items
+                .iter()
+                .find(|item| item.item_id == item_id)
+                .ok_or_else(|| AppError::not_found("content item not found"))?;
+            if item.current_revision_id.is_some_and(|id| {
+                self.revisions
+                    .iter()
+                    .any(|r| r.revision_id == id && r.document.schema_version == Some(2))
+            }) && owner
+                != match step {
+                    ContentStep::Check => RICH_CHECK_POLICY_VERSION,
+                    ContentStep::Repair => RICH_REPAIR_POLICY_VERSION,
+                    _ => unreachable!(),
+                }
+            {
+                return Err(AppError::conflict(
+                    "rich content requires a versioned check and repair workflow",
+                ));
+            }
+        }
         if step == ContentStep::Repair {
             let item = self
                 .items
@@ -836,6 +1049,13 @@ impl ContentState {
         lease: &StepLease,
         document: StructuredDocument,
     ) -> Result<ContentRevision, AppError> {
+        if document.schema_version == Some(2)
+            && self.execution.policy_version != RICH_GENERATION_POLICY_VERSION
+        {
+            return Err(AppError::invalid_request(
+                "rich generation requires a versioned content policy",
+            ));
+        }
         let item = self
             .items
             .iter()
@@ -903,6 +1123,11 @@ impl ContentState {
             .iter()
             .find(|r| r.revision_id == revision_id)
             .ok_or_else(|| AppError::conflict("draft is missing"))?;
+        if revision.document.schema_version == Some(2) && lease.owner != RICH_CHECK_POLICY_VERSION {
+            return Err(AppError::conflict(
+                "rich content requires a versioned check workflow",
+            ));
+        }
         if lease.revision_id.is_some() && lease.revision_id != Some(revision_id) {
             return Err(AppError::conflict("check revision changed"));
         }
@@ -973,6 +1198,63 @@ impl ContentState {
             .iter()
             .find(|r| r.revision_id == revision_id)
             .ok_or_else(|| AppError::conflict("repair base revision is missing"))?;
+        if previous.document.schema_version != document.schema_version {
+            return Err(AppError::conflict(
+                "repair cannot change content schema version",
+            ));
+        }
+        if previous.document.schema_version == Some(2) {
+            if lease.owner != RICH_REPAIR_POLICY_VERSION {
+                return Err(AppError::conflict(
+                    "rich content requires a versioned repair workflow",
+                ));
+            }
+            let check = self
+                .checks
+                .iter()
+                .rev()
+                .find(|c| c.revision_id == revision_id && c.findings.iter().any(|f| f.blocking))
+                .ok_or_else(|| AppError::conflict("current revision has no blocking check"))?;
+            let title_flagged = check
+                .findings
+                .iter()
+                .any(|f| f.blocking && f.block_id.is_none());
+            let flagged: std::collections::HashSet<_> = check
+                .findings
+                .iter()
+                .filter(|f| f.blocking)
+                .filter_map(|f| f.block_id)
+                .collect();
+            let old_positions: std::collections::HashMap<_, _> = previous
+                .document
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(index, block)| (block.block_id, index))
+                .collect();
+            let mut next_position = 0;
+            let changed_illegally = document.blocks.iter().any(|new| {
+                let Some(&index) = old_positions.get(&new.block_id) else { return true; };
+                if index < next_position || previous.document.blocks[next_position..index].iter().any(|old| !flagged.contains(&old.block_id)) {
+                    return true;
+                }
+                next_position = index + 1;
+                let old = &previous.document.blocks[index];
+                old.kind != new.kind || old.citation_ids != new.citation_ids
+                    || (!flagged.contains(&old.block_id) && old != new)
+                    || matches!((&old.rich, &new.rich), (Some(before), Some(after)) if !before.preserves_survivor_structure(after))
+            });
+            if (!title_flagged && previous.document.title != document.title)
+                || changed_illegally
+                || previous.document.blocks[next_position..]
+                    .iter()
+                    .any(|old| !flagged.contains(&old.block_id))
+            {
+                return Err(AppError::invalid_request(
+                    "rich repair changed an unaffected block or evidence identity",
+                ));
+            }
+        }
         if !self
             .checks
             .iter()

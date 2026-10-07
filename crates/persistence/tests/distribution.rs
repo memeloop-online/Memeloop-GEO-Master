@@ -241,7 +241,9 @@ async fn fixture(pool: &PgPool) -> Fixture {
             text: text.into(),
             citation_ids: vec![chunk_id],
             items: vec![],
+            rich: None,
         }],
+        schema_version: None,
     };
     let revision = ContentRevision {
         revision_id: Uuid::new_v4(),
@@ -629,7 +631,11 @@ async fn frozen_denominator_page_resume_and_scoped_cutoff() {
     let mut changed_handoff = freeze(&fixture);
     changed_handoff.content_handoff.items[0].document_key = "mutated-handoff".into();
     assert!(repo.freeze(&fixture.scope, changed_handoff).await.is_err());
-    let before_page = Utc::now();
+    // Snapshot cutoffs must share the database clock used for recorded_at.
+    let before_page: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     let page1 = repo
         .expansion_page(&fixture.scope, manifest.manifest_id, 0, 2)
         .await
@@ -657,8 +663,12 @@ async fn frozen_denominator_page_resume_and_scoped_cutoff() {
         .commit_expansion_page(&fixture.scope, manifest.manifest_id, 2, page2.rows)
         .await
         .unwrap();
+    let after_page: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     let as_of = repo
-        .as_of(&fixture.scope, manifest.manifest_id, Utc::now())
+        .as_of(&fixture.scope, manifest.manifest_id, after_page)
         .await
         .unwrap();
     assert_eq!(as_of.targets.len(), 6);

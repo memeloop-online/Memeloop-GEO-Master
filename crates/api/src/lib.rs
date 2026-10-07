@@ -2134,6 +2134,10 @@ pub fn router(state: AppState) -> Router {
             "/projects/{id}/contents/{asset_id}/revisions",
             get(content::revisions).post(content::edit),
         )
+        .route(
+            "/projects/{id}/contents/{asset_id}/revisions/{revision_id}/export",
+            get(content::export),
+        )
         .layer(middleware::from_fn(no_store_middleware))
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(auth_scope_from_request));

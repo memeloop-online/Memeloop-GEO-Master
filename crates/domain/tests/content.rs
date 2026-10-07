@@ -381,7 +381,9 @@ fn document(citation: Uuid) -> StructuredDocument {
             text: "The product has a documented feature.".into(),
             citation_ids: vec![citation],
             items: vec![],
+            rich: None,
         }],
+        schema_version: None,
     }
 }
 
@@ -473,6 +475,231 @@ fn blocking_finding(block: Uuid, reference: &EvidenceRef) -> ContentFinding {
         detail: "Revise claim against quoted source".into(),
         blocking: true,
     }
+}
+#[tokio::test]
+async fn rich_checks_and_repairs_require_versioned_owners_and_preserve_structure() {
+    use geo_domain::{
+        RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION, RICH_REPAIR_POLICY_VERSION,
+    };
+    let repo = MemoryContentRepository::new();
+    let (scope, manifest, source, cycle) = fixture();
+    let item_id = manifest.items[0].document_manifest_item_id;
+    let reference = evidence(source);
+    let execution = repo
+        .start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
+        .await
+        .unwrap();
+    let prepare = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Prepare,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    repo.complete_prepare(
+        &scope,
+        &prepare,
+        ContentBrief {
+            brief_id: Uuid::new_v4(),
+            title: "Rich brief".into(),
+            objective: "Evidence-based".into(),
+            evidence: vec![reference.clone()],
+            quotes: vec![],
+            created_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let lease = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Generate,
+            "worker",
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let mut original = document(reference.chunk_id.unwrap());
+    original.schema_version = Some(2);
+    original.blocks[0].kind = ContentBlockKind::Rich;
+    original.blocks[0].text.clear();
+    original.blocks[0].rich = Some(geo_domain::RichContent {
+        version: 1,
+        node: geo_domain::RichNode::Paragraph {
+            content: vec![geo_domain::RichNode::Text {
+                text: "Original".into(),
+                marks: vec![geo_domain::RichMark::Bold],
+            }],
+        },
+    });
+    let unchanged = geo_domain::ContentBlock {
+        block_id: Uuid::new_v4(),
+        kind: ContentBlockKind::Paragraph,
+        text: "Unaffected claim".into(),
+        citation_ids: vec![reference.chunk_id.unwrap()],
+        items: vec![],
+        rich: None,
+    };
+    original.blocks.push(unchanged.clone());
+    let first = repo
+        .complete_generate(&scope, &lease, original.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Check,
+            "worker",
+            Utc::now(),
+            60
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+    let check = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Check,
+            RICH_CHECK_POLICY_VERSION,
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let finding = blocking_finding(first.document.blocks[0].block_id, &reference);
+    repo.complete_check(&scope, &check, vec![finding])
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Repair,
+            "worker",
+            Utc::now(),
+            60
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+    let repair = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Repair,
+            RICH_REPAIR_POLICY_VERSION,
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let mut downgraded = document(reference.chunk_id.unwrap());
+    downgraded.blocks[0].block_id = first.document.blocks[0].block_id;
+    assert_eq!(
+        repo.complete_repair(&scope, &repair, downgraded)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    let mut stripped = original.clone();
+    if let Some(geo_domain::RichContent {
+        node: geo_domain::RichNode::Paragraph { content },
+        ..
+    }) = &mut stripped.blocks[0].rich
+    {
+        *content = vec![geo_domain::RichNode::Text {
+            text: "Changed".into(),
+            marks: vec![],
+        }];
+    }
+    assert_eq!(
+        repo.complete_repair(&scope, &repair, stripped)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    let mut corrected = original;
+    if let Some(geo_domain::RichContent {
+        node: geo_domain::RichNode::Paragraph { content },
+        ..
+    }) = &mut corrected.blocks[0].rich
+    {
+        *content = vec![geo_domain::RichNode::Text {
+            text: "Corrected".into(),
+            marks: vec![geo_domain::RichMark::Bold],
+        }];
+    }
+    let next = repo
+        .complete_repair(&scope, &repair, corrected)
+        .await
+        .unwrap();
+    assert_eq!(next.base_revision_id, Some(first.revision_id));
+    assert_eq!(next.document.schema_version, Some(2));
+    assert_eq!(
+        next.document.blocks[0].citation_ids,
+        first.document.blocks[0].citation_ids
+    );
+    let check = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Check,
+            RICH_CHECK_POLICY_VERSION,
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    repo.complete_check(
+        &scope,
+        &check,
+        vec![blocking_finding(
+            next.document.blocks[0].block_id,
+            &reference,
+        )],
+    )
+    .await
+    .unwrap();
+    let repair = repo
+        .claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Repair,
+            RICH_REPAIR_POLICY_VERSION,
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    let mut deleted = next.document.clone();
+    deleted.blocks.remove(0);
+    let last = repo
+        .complete_repair(&scope, &repair, deleted)
+        .await
+        .unwrap();
+    assert_eq!(last.document.blocks, vec![unchanged]);
 }
 #[tokio::test]
 async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {

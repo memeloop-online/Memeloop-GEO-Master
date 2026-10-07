@@ -112,7 +112,9 @@ fn document(citation: Uuid, text: &str) -> StructuredDocument {
             text: text.into(),
             citation_ids: vec![citation],
             items: vec![],
+            rich: None,
         }],
+        schema_version: None,
     }
 }
 

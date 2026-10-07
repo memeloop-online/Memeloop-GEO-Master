@@ -97,15 +97,33 @@ export interface ContentAsset {
 
 export interface ContentBlock {
   block_id: string;
-  kind: "heading" | "paragraph" | "list";
+  kind: "heading" | "paragraph" | "list" | "rich";
   text: string;
   citation_ids: string[];
   items: string[];
+  rich?: { version: 1; node: RichNode } | null;
+}
+
+export interface RichNode {
+  type: string;
+  attrs?: Record<string, unknown>;
+  content?: RichNode[];
+  text?: string;
+  marks?: Array<{ type: string; attrs?: Record<string, unknown> }>;
 }
 
 export interface StructuredDocument {
   title: string;
   blocks: ContentBlock[];
+  schema_version?: 2;
+}
+
+export interface ContentRevisionExport {
+  revision_id: string;
+  format: "markdown" | "html";
+  media_type: string;
+  filename: string;
+  content: string;
 }
 
 export interface ContentFinding {
@@ -231,6 +249,19 @@ export function listContentRevisions(
 ) {
   return apiFetch<ContentRevision[]>(
     `${projectPath(projectId)}/contents/${encoded(assetId)}/revisions`,
+    scopeOptions(tenantId, projectId),
+  );
+}
+
+export function exportContentRevision(
+  tenantId: string,
+  projectId: string,
+  assetId: string,
+  revisionId: string,
+  format: "markdown" | "html",
+) {
+  return apiFetch<ContentRevisionExport>(
+    `${projectPath(projectId)}/contents/${encoded(assetId)}/revisions/${encoded(revisionId)}/export?format=${format}`,
     scopeOptions(tenantId, projectId),
   );
 }

@@ -138,7 +138,9 @@ fn content_revision(id: Uuid) -> ContentRevision {
             text: "An exact paragraph.".into(),
             citation_ids: vec![],
             items: vec![],
+            rich: None,
         }],
+        schema_version: None,
     };
     ContentRevision {
         derived_from_revision_id: None,

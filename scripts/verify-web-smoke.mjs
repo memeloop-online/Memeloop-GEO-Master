@@ -2,12 +2,14 @@
 // external provider requests, account connections, or reusable credentials.
 // Set GEO_SMOKE_APP_BINARY and GEO_SMOKE_OUTPUT_DIR (outside the repository).
 // Optional: PLAYWRIGHT_BROWSERS_PATH, GEO_SMOKE_TMP_DIR,
-// GEO_SMOKE_API_PORT, GEO_SMOKE_WEB_PORT; then run with Node.
-import { randomBytes, randomUUID } from "node:crypto";
+// GEO_SMOKE_API_PORT, GEO_SMOKE_WEB_PORT. GEO_SMOKE_CONTENT=1 additionally
+// requires approved local bundles and an unused GEO_SMOKE_PROVIDER_PORT.
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +31,17 @@ function configuredPort(name, fallback) {
 const apiPort = configuredPort("GEO_SMOKE_API_PORT", 8080);
 const webPort = configuredPort("GEO_SMOKE_WEB_PORT", 5173);
 if (apiPort === webPort) throw new Error("Smoke API and web ports must differ");
+const contentMode = process.env.GEO_SMOKE_CONTENT === "1";
+if (
+  process.env.GEO_SMOKE_CONTENT &&
+  !["0", "1"].includes(process.env.GEO_SMOKE_CONTENT)
+)
+  throw new Error("GEO_SMOKE_CONTENT must be 0 or 1");
+const providerPort = contentMode
+  ? configuredPort("GEO_SMOKE_PROVIDER_PORT", 18081)
+  : null;
+if (contentMode && [apiPort, webPort].includes(providerPort))
+  throw new Error("Smoke provider port must differ from API and web ports");
 const apiUrl = `http://127.0.0.1:${apiPort}`;
 const webUrl = `http://127.0.0.1:${webPort}`;
 const browserCache = process.env.PLAYWRIGHT_BROWSERS_PATH;
@@ -43,9 +56,607 @@ const processes = [];
 const visualIssues = [];
 let browser;
 let browserServer;
+let providerServer;
 let deadline;
 let screenshotsDirectory;
 let ephemeralPassword;
+let ephemeralProviderKey;
+
+const evidenceSentence = "Synthetic Acme sample widget has a blue cover.";
+const evidenceTitle = "Synthetic Acme sample widget";
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function approvedBundle(name) {
+  const path = join(repository, "packages", "agent-runtime", "dist", name);
+  const data = await readFile(path);
+  assert(data.length > 0, `Approved bundle ${name} is empty`);
+  return { path, digest: createHash("sha256").update(data).digest("hex") };
+}
+
+function fixtureCompletion(body, model) {
+  assert(
+    body?.model === model && Array.isArray(body.messages),
+    "Fixture received an unsupported model request",
+  );
+  const system = body.messages.find(
+    (entry) => entry.role === "system",
+  )?.content;
+  const user = body.messages.findLast(
+    (entry) => entry.role === "user",
+  )?.content;
+  assert(
+    typeof system === "string" && typeof user === "string",
+    "Fixture received an incomplete model request",
+  );
+  const input = JSON.parse(user);
+  assert(
+    Array.isArray(input.evidence),
+    "Fixture requires actual supplied source evidence",
+  );
+  const quotes = input.evidence.filter(
+    (entry) =>
+      uuidPattern.test(entry.chunk_id) && typeof entry.quote === "string",
+  );
+  let content;
+  if (system.includes("source-grounded content generator")) {
+    const source = quotes.find((entry) =>
+      entry.quote.includes(evidenceSentence),
+    );
+    assert(
+      source,
+      "Generated content must cite the imported public source quote",
+    );
+    content = {
+      title: evidenceTitle,
+      blocks: [
+        {
+          kind: "heading",
+          text: evidenceTitle,
+          items: [],
+          citation_ids: [source.chunk_id],
+        },
+        {
+          kind: "paragraph",
+          text: evidenceSentence,
+          items: [],
+          citation_ids: [source.chunk_id],
+        },
+      ],
+    };
+  } else if (system.includes("independent factual checker")) {
+    const document = input.document;
+    assert(
+      uuidPattern.test(input.title_check_id) && Array.isArray(document?.blocks),
+      "Checker needs the persisted title and blocks",
+    );
+    const claims = [
+      {
+        block_id: input.title_check_id,
+        text: document.title,
+        citation_ids: quotes.map((entry) => entry.chunk_id),
+      },
+      ...document.blocks.map((block) => ({
+        block_id: block.block_id,
+        text: block.text,
+        citation_ids: block.citation_ids,
+      })),
+    ];
+    assert(
+      claims.length >= 3 &&
+        claims.every((claim) => uuidPattern.test(claim.block_id)),
+      "Checker must receive title and every block",
+    );
+    content = {
+      checks: claims.map((claim) => {
+        const exact = quotes.find(
+          (entry) =>
+            claim.citation_ids.includes(entry.chunk_id) &&
+            entry.quote.includes(claim.text),
+        );
+        return {
+          block_id: claim.block_id,
+          verdict: exact ? "supported" : "unsupported",
+          citation_ids: exact ? [exact.chunk_id] : [],
+          detail: exact
+            ? "Claim occurs in the supplied exact source quote"
+            : "Claim absent from the supplied exact source quotes",
+        };
+      }),
+    };
+    assert(
+      content.checks.every((entry) => entry.verdict === "supported"),
+      "Fixture refuses claims absent from supplied evidence",
+    );
+  } else {
+    throw new Error("Fixture refuses non-content model requests");
+  }
+  return {
+    id: randomUUID(),
+    model,
+    choices: [
+      {
+        message: { role: "assistant", content: JSON.stringify(content) },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  };
+}
+
+async function startFixtureProvider(port, key) {
+  const model = "synthetic-content-smoke";
+  const server = createHttpServer(async (request, response) => {
+    try {
+      assert(
+        request.method === "POST" && request.url === "/v1/chat/completions",
+        "Fixture accepts only local completions",
+      );
+      assert(
+        request.headers.authorization === `Bearer ${key}`,
+        "Fixture rejected authentication",
+      );
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of request) {
+        size += chunk.length;
+        assert(size <= 1_000_000, "Fixture request exceeded limit");
+        chunks.push(chunk);
+      }
+      const result = fixtureCompletion(
+        JSON.parse(Buffer.concat(chunks).toString("utf8")),
+        model,
+      );
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(result));
+    } catch {
+      // Never print incoming prompts, credentials, or response bodies.
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(
+        '{"error":{"message":"unsupported synthetic fixture request"}}',
+      );
+    }
+  });
+  await new Promise((accept, reject) => {
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, accept);
+  });
+  providerServer = server;
+  return {
+    GEO_AI_BASE_URL: `http://127.0.0.1:${port}/v1/`,
+    GEO_AI_API_KEY: key,
+    GEO_AI_MODEL: model,
+  };
+}
+
+async function publicApi(page, path, options = {}) {
+  return page.evaluate(
+    async ({ path, options }) => {
+      const { apiFetch } = await import("/src/api/client.ts");
+      return apiFetch(path, options);
+    },
+    { path, options },
+  );
+}
+
+async function verifyGeneratedRichContent(
+  page,
+  base,
+  tenantId,
+  projectId,
+  runDir,
+) {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  // Public import/plan APIs create real source evidence and a frozen input;
+  // neither generated assets nor revision/check state are seeded directly.
+  const imported = await publicApi(page, "/knowledge/imports", {
+    method: "POST",
+    tenantId,
+    projectId,
+    body: {
+      items: [
+        {
+          client_item_id: randomUUID(),
+          kind: "text",
+          name: "Synthetic public content evidence",
+          purpose: "public",
+          text: evidenceSentence,
+        },
+      ],
+    },
+  });
+  const acceptance = imported.items?.[0];
+  assert(
+    acceptance?.status === "succeeded" &&
+      acceptance.release?.knowledge_release_id,
+    "Synthetic public source was not imported and released",
+  );
+  const cycle = await publicApi(page, `/projects/${projectId}/cycles/current`, {
+    tenantId,
+    projectId,
+  });
+  const manifestId = cycle?.document_manifest?.manifest_id;
+  assert(
+    uuidPattern.test(cycle?.cycle_id) && uuidPattern.test(manifestId),
+    "Started project lacks a current cycle and document manifest handle",
+  );
+  const plan = await publicApi(page, "/knowledge/document-manifests/plan", {
+    method: "POST",
+    tenantId,
+    projectId,
+    body: {
+      manifest_id: manifestId,
+      knowledge_release_id: acceptance.release.knowledge_release_id,
+    },
+  });
+  assert(
+    plan?.sealed &&
+      plan.items?.some(
+        (item) =>
+          item.state === "planned" &&
+          item.source_version_refs.includes(
+            acceptance.source_version.source_version_id,
+          ),
+      ),
+    "Public source did not enter the sealed generation manifest",
+  );
+
+  await page.goto(`${base}/content`);
+  await page.getByRole("heading", { name: "本轮内容", exact: true }).waitFor();
+  const started = page.waitForResponse(
+    (response) =>
+      /\/document-executions$/.test(new URL(response.url()).pathname) &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "启动正文生成" }).click();
+  const startResponse = await started;
+  assert(
+    startResponse.status() === 202,
+    "Rust content workflow did not accept generation",
+  );
+  const execution = await startResponse.json();
+  assert(
+    uuidPattern.test(execution.execution_id),
+    "Generation returned no execution identity",
+  );
+  const itemsPath = `/projects/${projectId}/document-executions/${execution.execution_id}/items`;
+  let generated;
+  const end = Date.now() + 80_000;
+  while (Date.now() < end) {
+    const items = await publicApi(page, itemsPath, { tenantId, projectId });
+    generated = items.find(
+      (item) => item.status === "ready" && uuidPattern.test(item.asset_id),
+    );
+    if (generated) break;
+    assert(
+      !items.every((item) =>
+        ["blocked", "deferred", "not_applicable", "cancelled"].includes(
+          item.status,
+        ),
+      ),
+      "No generated content branch reached ready",
+    );
+    await page.waitForTimeout(650);
+  }
+  assert(
+    generated,
+    "Source-backed Rust generation and independent checks did not complete",
+  );
+  const assetId = generated.asset_id;
+  await page.goto(`${base}/content/${assetId}`);
+  const input = page.getByRole("textbox", { name: "结构化正文" });
+  await input.waitFor();
+  const revisionsPath = `/projects/${projectId}/contents/${assetId}/revisions`;
+  const original = (
+    await publicApi(page, revisionsPath, { tenantId, projectId })
+  ).find((revision) => revision.revision === 1);
+  assert(
+    original?.document?.title === evidenceTitle &&
+      original.document.blocks.length === 2 &&
+      original.document.blocks.every(
+        (block) =>
+          block.citation_ids.length && uuidPattern.test(block.block_id),
+      ) &&
+      original.findings?.length === 3,
+    "Persisted model generation lacks exact citations or independent title/block checks",
+  );
+  console.log(
+    "Content: source-backed generation and title/block checks persisted",
+  );
+  const contentParagraph = input
+    .locator("p")
+    .filter({ hasText: evidenceSentence });
+  await contentParagraph.click({ clickCount: 3 });
+  let selectedText = await page.evaluate(() => getSelection()?.toString());
+  if (selectedText?.trim() !== evidenceSentence) {
+    // Browser triple-click selection depends on line wrapping. Select exactly
+    // the visible paragraph via the DOM Selection API; formatting still runs
+    // through the installed Tiptap toolbar and its real persistence path.
+    await contentParagraph.evaluate((paragraph) => {
+      const selection = document.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(paragraph);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    });
+    selectedText = await page.evaluate(() => getSelection()?.toString());
+  }
+  assert(
+    selectedText?.trim() === evidenceSentence,
+    "Could not select source-grounded paragraph",
+  );
+  const toolbar = page.getByRole("toolbar", { name: "正文格式" });
+  const boldSaved = page.waitForResponse(
+    (response) =>
+      /\/contents\/[^/]+\/revisions$/.test(new URL(response.url()).pathname) &&
+      response.request().method() === "POST" &&
+      response
+        .request()
+        .postDataJSON()
+        .document?.blocks?.some((block) =>
+          JSON.stringify(block.rich?.node ?? null).includes('"type":"bold"'),
+        ),
+    { timeout: 20_000 },
+  );
+  await toolbar.getByRole("button", { name: "加粗" }).click();
+  assert(
+    (await input
+      .locator("strong")
+      .filter({ hasText: evidenceSentence })
+      .count()) > 0,
+    "Tiptap bold mark was not applied",
+  );
+  console.log("Content: Tiptap bold mark visible; awaiting autosave");
+  assert((await boldSaved).status() === 201, "Rich mark autosave failed");
+  console.log("Content: rich mark autosaved");
+  await page.reload();
+  await input.locator("strong").waitFor();
+  const listSaved = page.waitForResponse(
+    (response) =>
+      /\/contents\/[^/]+\/revisions$/.test(new URL(response.url()).pathname) &&
+      response.request().method() === "POST" &&
+      response
+        .request()
+        .postDataJSON()
+        .document?.blocks?.some(
+          (block) => block.rich?.node?.type === "bulletList",
+        ),
+    { timeout: 20_000 },
+  );
+  await input.locator("p").filter({ hasText: evidenceSentence }).click();
+  await toolbar.getByRole("button", { name: "列表", exact: true }).click();
+  assert(
+    (await input.locator("ul li").count()) > 0,
+    "Tiptap list was not created",
+  );
+  assert((await listSaved).status() === 201, "Rich list autosave failed");
+  console.log("Content: rich list autosaved");
+  await page.reload();
+  await input.locator("ul li").waitFor();
+  const tableInserted = page.waitForResponse(
+    (response) =>
+      /\/contents\/[^/]+\/revisions$/.test(new URL(response.url()).pathname) &&
+      response.request().method() === "POST" &&
+      response
+        .request()
+        .postDataJSON()
+        .document?.blocks?.some((block) => block.rich?.node?.type === "table"),
+    { timeout: 20_000 },
+  );
+  await input.locator("h2").first().click();
+  await page.keyboard.press("End");
+  await toolbar.getByRole("button", { name: "插入表格" }).click();
+  await input.locator("table").waitFor();
+  assert(
+    (await input.getAttribute("contenteditable")) === "true",
+    "Table editor was explicitly disabled",
+  );
+  assert(
+    (await page.getByText(/本地编辑仍保留/).count()) === 0,
+    "Tiptap table insertion triggered an unsupported local draft",
+  );
+  assert(
+    (await tableInserted).status() === 201,
+    "Tiptap table insertion did not autosave",
+  );
+  await page.reload();
+  await input.locator("table th").first().waitFor();
+  const autosaved = page.waitForResponse(
+    (response) => {
+      if (
+        !/\/contents\/[^/]+\/revisions$/.test(
+          new URL(response.url()).pathname,
+        ) ||
+        response.request().method() !== "POST"
+      )
+        return false;
+      try {
+        const payload = response.request().postDataJSON();
+        return payload.document?.blocks?.some(
+          (block) =>
+            block.rich?.node?.type === "table" &&
+            JSON.stringify(block.rich.node).includes(evidenceTitle),
+        );
+      } catch {
+        return false;
+      }
+    },
+    { timeout: 20_000 },
+  );
+  await input.locator("table th").first().click();
+  await page.keyboard.insertText(evidenceTitle);
+  assert(
+    (await input.locator("table th").first().textContent()).includes(
+      evidenceTitle,
+    ),
+    "Accepted table cell input was immediately lost",
+  );
+  console.log("Content: Tiptap table text inserted; awaiting autosave");
+  const save = await autosaved;
+  assert(
+    save.status() === 201,
+    "Rich Tiptap autosave did not persist a new revision",
+  );
+  let saved = await save.json();
+  assert(
+    saved.revision_id !== original.revision_id &&
+      saved.document.schema_version === 2 &&
+      saved.document.blocks.some(
+        (block) =>
+          block.block_id === original.document.blocks[1].block_id &&
+          JSON.stringify(block.citation_ids) ===
+            JSON.stringify(original.document.blocks[1].citation_ids),
+      ) &&
+      saved.document.blocks.some(
+        (block) => block.rich?.node?.type === "bulletList",
+      ) &&
+      saved.document.blocks.some(
+        (block) => block.rich?.node?.type === "table",
+      ) &&
+      saved.document.blocks.some((block) =>
+        JSON.stringify(block.rich?.node ?? null).includes('"type":"bold"'),
+      ),
+    "Autosaved rich document lost marks, list, table, or schema version",
+  );
+  await page.reload();
+  await input.locator("table").waitFor();
+  assert(
+    (await input.locator("ul li").count()) > 0 &&
+      (await input.locator("strong").count()) > 0,
+    "Rich structure did not survive page reload",
+  );
+  const secondTableSaved = page.waitForResponse(
+    (response) =>
+      /\/contents\/[^/]+\/revisions$/.test(new URL(response.url()).pathname) &&
+      response.request().method() === "POST" &&
+      response
+        .request()
+        .postDataJSON()
+        .document?.blocks?.filter((block) => block.rich?.node?.type === "table")
+        .length >= 2,
+    { timeout: 20_000 },
+  );
+  await input.locator("h2").first().click();
+  await page.keyboard.press("End");
+  await page.keyboard.press("Enter");
+  await toolbar.getByRole("button", { name: "插入表格" }).click();
+  assert(
+    (await input.locator("table").count()) === 2,
+    "Table insertion after a new paragraph lost structure",
+  );
+  assert(
+    (await page.getByText(/本地编辑仍保留/).count()) === 0,
+    "Heading-to-table editing produced an unsupported draft",
+  );
+  const secondTableResponse = await secondTableSaved;
+  assert(
+    secondTableResponse.status() === 201,
+    "Heading-to-table autosave failed",
+  );
+  saved = await secondTableResponse.json();
+  await page.reload();
+  await input.locator("table").first().waitFor();
+  assert(
+    (await input.locator("table").count()) === 2 &&
+      (await input.locator("table").allTextContents()).some((value) =>
+        value.includes(evidenceTitle),
+      ),
+    "Table insertion after an empty paragraph changed previously saved rich text",
+  );
+  const persisted = await publicApi(page, revisionsPath, {
+    tenantId,
+    projectId,
+  });
+  assert(
+    persisted.some(
+      (entry) =>
+        entry.revision_id === saved.revision_id &&
+        JSON.stringify(entry.document) === JSON.stringify(saved.document),
+    ),
+    "Reloaded revision changed block IDs or citation bindings",
+  );
+  const unchanged = persisted.find(
+    (entry) => entry.revision_id === original.revision_id,
+  );
+  assert(
+    JSON.stringify(unchanged?.document) === JSON.stringify(original.document) &&
+      JSON.stringify(unchanged?.findings) === JSON.stringify(original.findings),
+    "Editing mutated original immutable revision or checks",
+  );
+  await screenshot(page, runDir, "content-rich-desktop", {
+    width: 1440,
+    height: 900,
+  });
+  await screenshot(page, runDir, "content-rich-narrow", {
+    width: 390,
+    height: 844,
+  });
+  await toolbar.getByRole("button", { name: "加粗" }).focus();
+  await page.keyboard.press("ArrowRight");
+  assert(
+    await toolbar
+      .getByRole("button", { name: "斜体" })
+      .evaluate((element) => element === document.activeElement),
+    "Rich formatting toolbar is not keyboard navigable",
+  );
+  const history = page.locator("details.content-history");
+  await history
+    .locator("summary")
+    .getByText("版本历史", { exact: true })
+    .click();
+  assert(
+    await history.getByRole("button", { name: "下载 Markdown" }).isVisible(),
+    "Immutable export controls did not open with version history",
+  );
+  const verifyDownload = async (revision, format) => {
+    const path = `/projects/${projectId}/contents/${assetId}/revisions/${revision.revision_id}/export?format=${format}`;
+    const expected = await publicApi(page, path, { tenantId, projectId });
+    assert(
+      expected.revision_id === revision.revision_id &&
+        expected.format === format &&
+        expected.content.includes(evidenceTitle),
+      "Selected immutable export endpoint returned unexpected revision or content",
+    );
+    const responsePromise = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname.endsWith(
+          `/revisions/${revision.revision_id}/export`,
+        ) && new URL(response.url()).searchParams.get("format") === format,
+    );
+    const downloadPromise = page.waitForEvent("download");
+    await history
+      .getByRole("button", {
+        name: format === "html" ? "下载 HTML" : "下载 Markdown",
+      })
+      .click();
+    const [response, download] = await Promise.all([
+      responsePromise,
+      downloadPromise,
+    ]);
+    assert(
+      response.status() === 200 &&
+        JSON.stringify(await response.json()) === JSON.stringify(expected) &&
+        download.suggestedFilename() === expected.filename,
+      "Browser downloaded a different revision or format",
+    );
+    const stream = await download.createReadStream();
+    let bytes = "";
+    for await (const chunk of stream) bytes += chunk.toString("utf8");
+    assert(
+      bytes === expected.content,
+      "Downloaded bytes differ from exact selected immutable revision",
+    );
+  };
+  await verifyDownload(saved, "markdown");
+  await verifyDownload(saved, "html");
+  await history.getByRole("button", { name: /^v1 ·/ }).click();
+  await page.getByRole("heading", { name: "历史版本 v1" }).waitFor();
+  await verifyDownload(original, "markdown");
+  await verifyDownload(original, "html");
+  console.log(
+    "Content: actual source-backed generation, title/block checks, Tiptap autosave, immutable history and downloaded exports verified",
+  );
+}
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -165,6 +776,8 @@ async function screenshot(page, runDir, name, viewport) {
       ".report-preview",
       ".question-sets-page",
       ".question-sets-edit-row",
+      ".content-evidence-quotes",
+      ".content-evidence-quotes blockquote",
     ].flatMap((selector) =>
       [...document.querySelectorAll(selector)].flatMap((element) => {
         const style = getComputedStyle(element);
@@ -218,12 +831,32 @@ async function main() {
     await portIsFree(webPort),
     "Smoke web port is occupied; refusing to touch another service",
   );
+  if (contentMode)
+    assert(
+      await portIsFree(providerPort),
+      "Smoke provider port is occupied; refusing to touch another service",
+    );
   const runDir = join(resolve(outputRoot), `run-${randomUUID()}`);
   screenshotsDirectory = runDir;
   await mkdir(scratch, { recursive: true });
   await mkdir(runDir, { recursive: true });
   const password = randomBytes(36).toString("base64url");
   ephemeralPassword = password;
+  let modelEnvironment = {};
+  if (contentMode) {
+    const [agent, content] = await Promise.all([
+      approvedBundle("memeloop-agent-loop.bundle.mjs"),
+      approvedBundle("memeloop-content-workflow.bundle.mjs"),
+    ]);
+    ephemeralProviderKey = randomBytes(36).toString("base64url");
+    modelEnvironment = {
+      ...(await startFixtureProvider(providerPort, ephemeralProviderKey)),
+      GEO_AGENT_BUNDLE_PATH: agent.path,
+      GEO_AGENT_BUNDLE_SHA256: agent.digest,
+      GEO_CONTENT_BUNDLE_PATH: content.path,
+      GEO_CONTENT_BUNDLE_SHA256: content.digest,
+    };
+  }
   const api = ownedChild(
     binary,
     [],
@@ -233,6 +866,7 @@ async function main() {
       GEO_DEV_LOGIN_NAME: "demo@localhost",
       GEO_BIND_ADDR: `127.0.0.1:${apiPort}`,
       GEO_ALLOWED_ORIGINS: `${webUrl},${apiUrl}`,
+      ...modelEnvironment,
     }),
   );
   await untilReady(`${apiUrl}/health/ready`, api, "Rust API");
@@ -459,6 +1093,17 @@ async function main() {
     "Knowledge editor formatting toolbar must support arrow-key navigation",
   );
   await visualEditor.locator("a").click();
+  await visualEditor.locator("a").evaluate((anchor) => {
+    const selection = document.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(anchor);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  });
+  assert(
+    (await page.evaluate(() => getSelection()?.toString())) === "示例链接",
+    "Existing linked text was not selected before revising its URL",
+  );
   await editorToolbar.getByRole("button", { name: "添加链接" }).click();
   const linkPopover = page.locator(".source-link-popover");
   const linkInput = linkPopover.getByRole("textbox", { name: "链接地址" });
@@ -535,6 +1180,9 @@ async function main() {
   console.log(
     "P04: actual Markdown visual edit, persisted reload and immutable history verified",
   );
+  if (contentMode) {
+    await verifyGeneratedRichContent(page, base, tenantId, projectId, runDir);
+  }
 
   await page.goto(`${base}/measurement`);
   await page
@@ -727,27 +1375,32 @@ async function main() {
     );
   }
   console.log(
-    `PASS: synthetic in-memory browser smoke; screenshots: ${runDir}`,
+    `PASS: synthetic in-memory browser smoke${contentMode ? " + source-backed rich-content" : ""}; screenshots: ${runDir}`,
   );
   console.log(
-    "Scope: local Rust API and UI only; no external publishing, AI, or account acceptance.",
+    `Scope: local Rust API and UI${contentMode ? " with loopback-only synthetic provider" : ""}; no external publishing, AI, or account acceptance.`,
   );
 }
 
 try {
-  deadline = setTimeout(() => {
-    console.error("Smoke test exceeded its 180s deadline");
-    process.exitCode = 1;
-    for (const child of processes) {
-      if (child.exitCode === null && child.signalCode === null) child.kill();
-    }
-  }, 180_000);
+  deadline = setTimeout(
+    () => {
+      console.error(
+        `Smoke test exceeded its ${contentMode ? 300 : 180}s deadline`,
+      );
+      process.exitCode = 1;
+      for (const child of processes) {
+        if (child.exitCode === null && child.signalCode === null) child.kill();
+      }
+    },
+    contentMode ? 300_000 : 180_000,
+  );
   await main();
 } catch (error) {
   // Do not include child output, request bodies, tokens, or raw environment.
   const message = error instanceof Error ? error.message : "unknown error";
   console.error(
-    `FAIL: ${ephemeralPassword ? message.replaceAll(ephemeralPassword, "[redacted]") : message}`,
+    `FAIL: ${[ephemeralPassword, ephemeralProviderKey].filter(Boolean).reduce((text, key) => text.replaceAll(key, "[redacted]"), message)}`,
   );
   if (screenshotsDirectory)
     console.error(`Screenshots: ${screenshotsDirectory}`);
@@ -765,6 +1418,12 @@ try {
       await Promise.race([
         browserServer.close().catch(() => undefined),
         new Promise((accept) => setTimeout(accept, 5_000)),
+      ]);
+    }
+    if (providerServer) {
+      await Promise.race([
+        new Promise((accept) => providerServer.close(accept)),
+        new Promise((accept) => setTimeout(accept, 2_000)),
       ]);
     }
   } finally {
