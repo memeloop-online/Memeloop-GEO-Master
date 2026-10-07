@@ -5,6 +5,41 @@ import type { UiLocale } from "../api/appearance";
 export const resources = {
   "zh-CN": {
     translation: {
+      workspace: {
+        emptyTitle: "还没有可用工作区",
+        emptyDetail: "请联系工作区管理员获取访问权限。",
+        eyebrow: "工作区",
+        title: "选择工作区",
+        description: "选择工作区，查看项目或创建新项目。",
+        manageAccounts: "管理运营账号池",
+        listLabel: "可用工作区",
+        roleLabel: "角色：{{role}}",
+        roles: {
+          tenant_admin: "工作区管理员",
+          member: "成员",
+          viewer: "只读成员",
+          operator_agent: "运营人员",
+          operator_admin: "运营管理员",
+          oem_admin: "品牌管理员",
+          resource_admin: "资源管理员",
+        },
+        loadingProjects: "正在加载项目",
+        projectsUnavailable: "无法加载项目",
+        projectsUnavailableDetail: "仍可创建新项目。",
+        noProjects: "此工作区还没有项目。",
+        projectsFor: "{{name}} 的项目",
+        createProject: "创建项目",
+        createHint: "从对话开始，描述目标或上传资料。",
+      },
+      asyncState: {
+        loading: "正在加载",
+        loadError: "暂时无法加载",
+        checkConnection: "请检查连接后重试。",
+        retry: "重试",
+        accessDenied: "权限不足",
+        workspaceForbidden: "你已登录，但没有访问此工作区的权限。",
+        cannotAccessTenant: "无法访问“{{name}}”。",
+      },
       login: {
         checking: "正在确认登录状态",
         unavailableTitle: "身份服务暂时不可用",
@@ -266,6 +301,43 @@ export const resources = {
   },
   en: {
     translation: {
+      workspace: {
+        emptyTitle: "No workspaces available",
+        emptyDetail: "Contact a workspace administrator for access.",
+        eyebrow: "Workspaces",
+        title: "Choose a workspace",
+        description: "Choose a workspace to open or create a project.",
+        manageAccounts: "Manage operator account pool",
+        listLabel: "Available workspaces",
+        roleLabel: "Role: {{role}}",
+        roles: {
+          tenant_admin: "Workspace administrator",
+          member: "Member",
+          viewer: "Read-only member",
+          operator_agent: "Operator",
+          operator_admin: "Operator administrator",
+          oem_admin: "Brand administrator",
+          resource_admin: "Resource administrator",
+        },
+        loadingProjects: "Loading projects",
+        projectsUnavailable: "Couldn't load projects",
+        projectsUnavailableDetail: "You can still create a project.",
+        noProjects: "No projects in this workspace yet.",
+        projectsFor: "Projects in {{name}}",
+        createProject: "Create project",
+        createHint:
+          "Start a conversation, describe your goal, or upload files.",
+      },
+      asyncState: {
+        loading: "Loading",
+        loadError: "Unable to load right now",
+        checkConnection: "Check your connection and try again.",
+        retry: "Retry",
+        accessDenied: "Access denied",
+        workspaceForbidden:
+          "You're signed in but don't have access to this workspace.",
+        cannotAccessTenant: "Can't access “{{name}}”.",
+      },
       login: {
         checking: "Checking your session",
         unavailableTitle: "Sign-in service is unavailable",

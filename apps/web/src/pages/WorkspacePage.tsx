@@ -4,6 +4,7 @@ import {
   ArrowRightRegular,
   BuildingRegular,
 } from "@fluentui/react-icons";
+import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useProjectsQuery } from "../api/projects";
 import { useAuth } from "../auth/AuthProvider";
@@ -19,6 +20,7 @@ function setupHref(tenantId: string, returnTo: string | null) {
 }
 
 export function WorkspacePage() {
+  const { t } = useTranslation();
   const { session } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
@@ -29,8 +31,8 @@ export function WorkspacePage() {
     return (
       <main className="workspace-page">
         <EmptyState
-          title="还没有可用工作区"
-          detail="请联系工作区管理员，为你的账号分配客户组织。"
+          title={t("workspace.emptyTitle")}
+          detail={t("workspace.emptyDetail")}
         />
       </main>
     );
@@ -40,19 +42,19 @@ export function WorkspacePage() {
     <main className="workspace-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">工作区</p>
-          <h1>选择客户工作区</h1>
-          <p>工作区决定项目、资料、费用和测量数据的租户边界。</p>
+          <p className="eyebrow">{t("workspace.eyebrow")}</p>
+          <h1>{t("workspace.title")}</h1>
+          <p>{t("workspace.description")}</p>
         </div>
         {memberships.some((membership) =>
           ["operator_admin", "resource_admin"].includes(membership.role),
         ) && (
           <Button onClick={() => navigate("/ops/channels")}>
-            管理运营账号池
+            {t("workspace.manageAccounts")}
           </Button>
         )}
       </section>
-      <section className="workspace-grid" aria-label="已授权工作区">
+      <section className="workspace-grid" aria-label={t("workspace.listLabel")}>
         {memberships.map((membership) => (
           <WorkspaceCard
             key={membership.tenant_id}
@@ -72,6 +74,7 @@ function WorkspaceCard({
   membership: TenantMembership;
   returnTo: string | null;
 }) {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const {
     data: projects,
@@ -91,23 +94,31 @@ function WorkspaceCard({
           </div>
         }
       />
-      <p>角色：{membership.role}</p>
-      {isPending && <LoadingState compact label="正在加载项目" />}
+      <p>
+        {t("workspace.roleLabel", {
+          role: t(`workspace.roles.${membership.role}`),
+        })}
+      </p>
+      {isPending && (
+        <LoadingState compact label={t("workspace.loadingProjects")} />
+      )}
       {isError && (
         <ErrorState
-          title="无法加载项目"
-          detail="你仍可创建新项目。"
+          title={t("workspace.projectsUnavailable")}
+          detail={t("workspace.projectsUnavailableDetail")}
           onRetry={() => void refetch()}
           intent="warning"
         />
       )}
       {!isPending && !isError && projects?.items.length === 0 && (
-        <p className="workspace-project-empty">该工作区还没有项目。</p>
+        <p className="workspace-project-empty">{t("workspace.noProjects")}</p>
       )}
       {projects && projects.items.length > 0 && (
         <div
           className="workspace-project-list"
-          aria-label={`${membership.tenant_display_name} 的项目`}
+          aria-label={t("workspace.projectsFor", {
+            name: membership.tenant_display_name,
+          })}
         >
           {projects.items.map((project) => (
             <Button
@@ -129,12 +140,10 @@ function WorkspaceCard({
           appearance="primary"
           icon={<AddRegular />}
         >
-          创建项目
+          {t("workspace.createProject")}
         </Button>
       </div>
-      <p className="workspace-project-empty">
-        直接进入 AI 对话，上传资料或描述目标；无需先填写项目表单。
-      </p>
+      <p className="workspace-project-empty">{t("workspace.createHint")}</p>
     </Card>
   );
 }

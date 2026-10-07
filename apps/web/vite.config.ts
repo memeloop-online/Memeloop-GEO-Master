@@ -68,21 +68,6 @@ export default defineConfig(({ mode }) => {
     build: {
       // noVNC 1.7 uses top-level await for its WebCodecs capability probe.
       target: "es2022",
-      rollupOptions: {
-        output: {
-          manualChunks(id) {
-            if (id.includes("@fluentui")) return "fluent";
-            if (id.includes("@tanstack")) return "query";
-            if (id.includes("react-router")) return "router";
-            if (
-              id.includes("/node_modules/react") ||
-              id.includes("/node_modules/scheduler")
-            ) {
-              return "react";
-            }
-          },
-        },
-      },
     },
     test: {
       // Keep heavyweight jsdom/font suites from starving one another on CI.
