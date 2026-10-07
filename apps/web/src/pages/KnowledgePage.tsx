@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Badge,
   Button,
@@ -45,16 +46,18 @@ import {
 } from "../api/knowledge";
 import { ErrorState, EmptyState, LoadingState } from "../components/AsyncState";
 import { StatusPill, type StatusKind } from "../components/StatusPill";
+import i18n from "../i18n";
+import "../i18n/knowledgePage";
 
-const capabilityLabels: Record<CapabilityName, string> = {
-  pdf_parser: "PDF 文本解析",
-  docx_parser: "DOCX 结构解析",
-  xlsx_parser: "XLSX 工作表解析",
-  ocr: "OCR 扫描识别",
-  vector: "向量检索",
-  llm: "LLM 问答",
-  url_fetch: "网页抓取",
-};
+const capabilityNames: CapabilityName[] = [
+  "pdf_parser",
+  "docx_parser",
+  "xlsx_parser",
+  "ocr",
+  "vector",
+  "llm",
+  "url_fetch",
+];
 
 type ImportItemState = {
   id: string;
@@ -77,44 +80,46 @@ function factValue(value: unknown) {
 }
 
 function sourceKindLabel(kind: SourceKind) {
-  const labels: Record<SourceKind, string> = {
-    file: "文件",
-    url: "网页",
-    text: "文本",
-    object: "已有对象",
-    knowledge_collection: "知识集合",
-    manual: "手工资料",
-  };
-  return labels[kind];
+  return i18n.t(`sourceKind.${kind}`, { ns: "knowledgePage" });
 }
 
 function importStatusLabel(state: ImportItemState["state"]) {
-  const labels: Record<ImportItemState["state"], string> = {
-    waiting: "待提交",
-    submitting: "正在提交",
-    accepted: "已受理",
-    failed: "失败",
-  };
-  return labels[state];
+  return i18n.t(`importPanel.state.${state}`, { ns: "knowledgePage" });
 }
 
 function processingLabel(status: ImportStatus | null | undefined) {
-  switch (status) {
-    case "queued":
-      return "已受理，等待解析";
-    case "running":
-      return "正在解析";
-    case "partial":
-      return "部分解析完成，部分单元失败";
-    case "succeeded":
-      return "解析完成";
-    case "failed":
-      return "解析失败";
-    case "cancelled":
-      return "处理已取消";
-    default:
-      return "已受理，等待处理状态";
-  }
+  return i18n.t(
+    `importPanel.state.${status === "failed" ? "parseFailed" : (status ?? "unknown")}`,
+    { ns: "knowledgePage" },
+  );
+}
+
+function sourceStatusLabel(status: string | null | undefined) {
+  const known = [
+    "queued",
+    "running",
+    "partial",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "available",
+    "ready",
+    "complete",
+    "completed",
+    "blocked",
+    "removed",
+    "conflicted",
+    "superseded",
+    "active",
+    "processing",
+    "unknown",
+  ];
+  return i18n.t(
+    `sourceState.${known.includes(status ?? "") ? status : "unknown"}`,
+    {
+      ns: "knowledgePage",
+    },
+  );
 }
 
 function formatBytes(value: number) {
@@ -154,29 +159,22 @@ export function KnowledgeCapabilitiesNotice({
 }: {
   capabilities: KnowledgeCapabilities | undefined;
 }) {
+  const { t } = useTranslation("knowledgePage");
   if (!capabilities) return null;
-  const missing = (Object.keys(capabilityLabels) as CapabilityName[]).filter(
+  const missing = capabilityNames.filter(
     (name) => !capabilities[name].available,
   );
   if (missing.length === 0) return null;
   return (
     <MessageBar intent="warning" className="knowledge-capability-notice">
       <MessageBarBody>
-        <b>部分知识能力尚未配置</b>
+        <b>{t("missingTitle")}</b>
         <span>
-          {missing
-            .map((name) => {
-              if (name === "pdf_parser")
-                return "PDF 文本解析未配置；PDF 上传受理不表示可解析";
-              if (name === "docx_parser")
-                return "DOCX 结构解析未配置；上传受理不表示可解析";
-              if (name === "xlsx_parser")
-                return "XLSX 工作表解析未配置；上传受理不表示可解析";
-              const detail = capabilities[name].reason;
-              return `${capabilityLabels[name]}${detail ? `：${detail}` : ""}`;
-            })
-            .join("；")}
-          。系统不会以空结果代替未运行的处理。
+          {t("unavailable", {
+            names: missing
+              .map((name) => t(`capability.${name}`))
+              .join(t("separator")),
+          })}
         </span>
       </MessageBarBody>
     </MessageBar>
@@ -192,6 +190,7 @@ function ImportSidebar({
   projectId: string | undefined;
   onClose: () => void;
 }) {
+  const { t } = useTranslation("knowledgePage");
   const fileInput = useRef<HTMLInputElement>(null);
   const [purpose, setPurpose] = useState<KnowledgePurpose>("public");
   const [files, setFiles] = useState<FileItem[]>([]);
@@ -241,10 +240,10 @@ function ImportSidebar({
       next.push({
         client_item_id: clientItemId("text", text.trim()),
         kind: "text",
-        name: "粘贴文本",
+        name: t("importPanel.pastedText"),
         text: text.trim(),
         purpose,
-        label: "粘贴文本",
+        label: t("importPanel.pastedText"),
       });
     }
     if (objectRef.trim()) {
@@ -254,7 +253,7 @@ function ImportSidebar({
         name: objectRef.trim(),
         object_id: objectRef.trim(),
         purpose,
-        label: `对象：${objectRef.trim()}`,
+        label: t("importPanel.objectLabel", { name: objectRef.trim() }),
       });
     }
     if (collectionRef.trim()) {
@@ -267,11 +266,11 @@ function ImportSidebar({
         name: collectionRef.trim(),
         knowledge_release_id: collectionRef.trim(),
         purpose,
-        label: `集合：${collectionRef.trim()}`,
+        label: t("importPanel.collectionLabel", { name: collectionRef.trim() }),
       });
     }
     return next;
-  }, [collectionRef, objectRef, purpose, text, urls]);
+  }, [collectionRef, objectRef, purpose, t, text, urls]);
 
   const busy = uploadFiles.isPending || importBatch.isPending;
   const settled = Object.values(states);
@@ -356,7 +355,7 @@ function ImportSidebar({
                     : "failed",
                 detail:
                   item.status === "partial"
-                    ? "资料已受理，但只有部分单元完成处理"
+                    ? t("importPanel.partial")
                     : (item.error?.message ?? item.error?.reason),
                 sourceId: item.source?.source_id,
                 importStatus: item.status,
@@ -369,7 +368,9 @@ function ImportSidebar({
                 label: item.label,
                 state: "failed",
                 detail:
-                  error instanceof Error ? error.message : "导入请求失败。",
+                  error instanceof Error
+                    ? error.message
+                    : t("importPanel.failed"),
               });
             }
           })
@@ -378,37 +379,42 @@ function ImportSidebar({
   }
 
   return (
-    <aside className="knowledge-import-sidebar" aria-label="导入资料">
+    <aside
+      className="knowledge-import-sidebar"
+      aria-label={t("importPanel.title")}
+    >
       <div className="knowledge-sidebar-heading">
         <div>
-          <p className="eyebrow">资料中心</p>
-          <h2>导入资料</h2>
-          <p>每项独立受理；单项失败不会撤销已经受理的资料。</p>
+          <p className="eyebrow">{t("sources")}</p>
+          <h2>{t("importPanel.title")}</h2>
+          <p>{t("importPanel.description")}</p>
         </div>
         <Button
           appearance="subtle"
           icon={<DismissRegular />}
-          aria-label="关闭导入资料"
+          aria-label={t("importPanel.close")}
           onClick={onClose}
         />
       </div>
       <div className="knowledge-import-form">
-        <Field label="用途">
+        <Field label={t("purpose")}>
           <Select
             value={purpose}
             onChange={(_, data) => setPurpose(data.value as KnowledgePurpose)}
           >
-            <option value="public">公开资料</option>
-            <option value="internal">内部资料</option>
+            <option value="public">{t("public")}</option>
+            <option value="internal">{t("internal")}</option>
           </Select>
         </Field>
         <section className="knowledge-import-section">
           <div className="knowledge-inline-heading">
             <div>
-              <b>文件</b>
+              <b>{t("importPanel.files")}</b>
               <small>
-                PDF、DOCX、XLSX、CSV、Markdown 或 TXT，单文件最多{" "}
-                {formatBytes(maxUploadBytes)}，每批最多 {maxBatchFiles} 个文件。
+                {t("importPanel.fileLimits", {
+                  size: formatBytes(maxUploadBytes),
+                  count: maxBatchFiles,
+                })}
               </small>
             </div>
             <Button
@@ -416,12 +422,12 @@ function ImportSidebar({
               icon={<ArrowUploadRegular />}
               onClick={() => fileInput.current?.click()}
             >
-              选择文件
+              {t("importPanel.choose")}
             </Button>
             <input
               ref={fileInput}
               hidden
-              aria-label="选择资料文件"
+              aria-label={t("importPanel.chooseLabel")}
               type="file"
               multiple
               accept=".pdf,.docx,.xlsx,.csv,.md,.markdown,.txt"
@@ -440,14 +446,16 @@ function ImportSidebar({
                     appearance="subtle"
                     size="small"
                     disabled={busy}
-                    aria-label={`移除 ${item.file.name}`}
+                    aria-label={t("importPanel.removeFile", {
+                      name: item.file.name,
+                    })}
                     onClick={() =>
                       setFiles((previous) =>
                         previous.filter((entry) => entry.id !== item.id),
                       )
                     }
                   >
-                    移除
+                    {t("importPanel.remove")}
                   </Button>
                 </li>
               ))}
@@ -456,30 +464,27 @@ function ImportSidebar({
         </section>
         <MessageBar intent="info">
           <MessageBarBody>
-            文件会先上传，再由服务端按当前适配器决定能否解析。
-            {!capabilities.data?.pdf_parser.available
-              ? " PDF 文本解析未配置；扫描 PDF 还需要 OCR，当前不能保证识别。"
-              : !capabilities.data.ocr.available
-                ? " PDF 仅支持有文字层的页面；扫描页需 OCR，当前未配置。"
-                : " PDF 解析与 OCR 是独立能力；只有实际处理完成的页面才可引用。"}
-            {!capabilities.data?.docx_parser.available
-              ? " DOCX 解析未配置；上传不等于资料可用。"
-              : " DOCX 按标题、段落及真实表格单元格定位。"}
-            {!capabilities.data?.xlsx_parser.available
-              ? " XLSX 解析未配置；上传不等于资料可用。"
-              : " XLSX 按工作表及实际单元格定位；不会执行公式。"}
+            {t("importPanel.fileHelp")}{" "}
+            {capabilities.data && !capabilities.data.pdf_parser.available
+              ? ` ${t("importPanel.pdfUnavailable")}`
+              : capabilities.data && !capabilities.data.ocr.available
+                ? ` ${t("importPanel.pdfTextOnly")}`
+                : ""}
+            {capabilities.data && !capabilities.data.docx_parser.available
+              ? ` ${t("importPanel.docxUnavailable")}`
+              : ""}
+            {capabilities.data && !capabilities.data.xlsx_parser.available
+              ? ` ${t("importPanel.xlsxUnavailable")}`
+              : ""}
             {acceptedMediaTypes.length > 0
-              ? ` 当前可接收：${acceptedMediaTypes.join("、")}。`
+              ? ` ${t("importPanel.acceptedTypes", { types: acceptedMediaTypes.join(t("separator")) })}`
               : ""}
             {parsableMediaTypes.length > 0
-              ? ` 当前已配置解析：${parsableMediaTypes.join("、")}。`
-              : " 当前未报告可解析格式；上传被受理不表示已经解析。"}
+              ? ` ${t("importPanel.parsableTypes", { types: parsableMediaTypes.join(t("separator")) })}`
+              : ` ${t("importPanel.noParsableTypes")}`}
           </MessageBarBody>
         </MessageBar>
-        <Field
-          label="多个网页 URL"
-          hint="每行一个；网页抓取未配置时会明确返回能力缺失。"
-        >
+        <Field label={t("importPanel.urls")} hint={t("importPanel.urlHint")}>
           <Textarea
             resize="vertical"
             value={urls}
@@ -489,26 +494,26 @@ function ImportSidebar({
             }
           />
         </Field>
-        <Field label="粘贴文本">
+        <Field label={t("importPanel.paste")}>
           <Textarea
             resize="vertical"
             value={text}
             onChange={(_, data) => setText(data.value)}
-            placeholder="粘贴 FAQ、产品资料或说明。较长文本应作为文件上传。"
+            placeholder={t("importPanel.pastePlaceholder")}
           />
         </Field>
-        <Field label="已有对象引用">
+        <Field label={t("importPanel.object")}>
           <Input
             value={objectRef}
             onChange={(_, data) => setObjectRef(data.value)}
-            placeholder="输入当前授权范围内的对象 ID"
+            placeholder={t("importPanel.objectPlaceholder")}
           />
         </Field>
-        <Field label="已有知识集合引用">
+        <Field label={t("importPanel.collection")}>
           <Input
             value={collectionRef}
             onChange={(_, data) => setCollectionRef(data.value)}
-            placeholder="输入要冻结的知识集合 / release 引用"
+            placeholder={t("importPanel.collectionPlaceholder")}
           />
         </Field>
         <Button
@@ -516,12 +521,15 @@ function ImportSidebar({
           disabled={busy}
           onClick={() => void submit()}
         >
-          {busy ? "正在受理…" : "开始导入"}
+          {busy ? t("importPanel.submitting") : t("importPanel.submit")}
         </Button>
         {settled.length > 0 && (
           <section className="knowledge-import-results" aria-live="polite">
             <b>
-              已受理 {acceptedCount} 项，失败 {failedCount} 项
+              {t("importPanel.results", {
+                accepted: acceptedCount,
+                failed: failedCount,
+              })}
             </b>
             <ul>
               {settled.map((item) => {
@@ -544,14 +552,14 @@ function ImportSidebar({
                         ? processingLabel(progress)
                         : importStatusLabel(item.state)}
                       {item.state !== "accepted" && item.detail
-                        ? `：${item.detail}`
+                        ? `${i18n.language === "en" ? ": " : "："}${item.detail}`
                         : ""}
                     </small>
                     {item.sourceId && tenantId && projectId && (
                       <Link
                         to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/knowledge/sources/${encodeURIComponent(item.sourceId)}`}
                       >
-                        查看处理详情
+                        {t("importPanel.details")}
                       </Link>
                     )}
                   </li>
@@ -566,6 +574,7 @@ function ImportSidebar({
 }
 
 export function KnowledgePage() {
+  const { t, i18n: locale } = useTranslation("knowledgePage");
   const { tenantId, projectId } = useParams();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -608,9 +617,9 @@ export function KnowledgePage() {
     <div className="knowledge-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">P03 · 企业知识库</p>
-          <h1>企业知识库</h1>
-          <p>原始资料、可定位片段、产品事实与使用影响保留在同一项目范围内。</p>
+          <p className="eyebrow">{t("eyebrow")}</p>
+          <h1>{t("title")}</h1>
+          <p>{t("description")}</p>
         </div>
         <div className="knowledge-hero-actions">
           <Button
@@ -618,21 +627,21 @@ export function KnowledgePage() {
             icon={<AddRegular />}
             onClick={() => setImportOpen(true)}
           >
-            导入资料
+            {t("import")}
           </Button>
           <Button
             appearance="secondary"
             icon={<SearchRegular />}
             onClick={() => navigate("ask")}
           >
-            知识问答
+            {t("ask")}
           </Button>
         </div>
       </section>
       {capabilities.isError && (
         <ErrorState
-          title="无法读取知识处理能力"
-          detail="资料仍可查看；新导入是否需要 OCR、向量、网页抓取或 LLM 暂时未知。"
+          title={t("capabilitiesFailed")}
+          detail={t("capabilitiesFailedDetail")}
           intent="warning"
           onRetry={() => void capabilities.refetch()}
         />
@@ -641,8 +650,7 @@ export function KnowledgePage() {
       {release.data && (
         <MessageBar intent="info" className="knowledge-release-note">
           <MessageBarBody>
-            当前知识版本 #{release.data.sequence}
-            。后续问答和检索会绑定这个不可变版本。
+            {t("release", { sequence: release.data.sequence })}
             {release.data.coverage?.note
               ? ` ${release.data.coverage.note}`
               : ""}
@@ -656,29 +664,35 @@ export function KnowledgePage() {
             setFilter({ view: data.value as string, product: null, q: null })
           }
         >
-          <Tab value="sources">资料中心</Tab>
-          <Tab value="facts">产品与事实</Tab>
+          <Tab value="sources">{t("sources")}</Tab>
+          <Tab value="facts">{t("facts")}</Tab>
         </TabList>
         <Input
-          aria-label={view === "sources" ? "搜索资料" : "搜索事实"}
+          aria-label={
+            view === "sources" ? t("searchSources") : t("searchFacts")
+          }
           contentBefore={<SearchRegular />}
           value={query}
-          placeholder={view === "sources" ? "搜索资料名称" : "搜索属性或值"}
+          placeholder={
+            view === "sources" ? t("searchSourceName") : t("searchAttribute")
+          }
           onChange={(_, data) => setFilter({ q: data.value || null })}
         />
       </section>
       <section className="knowledge-workbench">
         <Card className="knowledge-column knowledge-navigation">
-          <h2>资料与产品</h2>
+          <h2>{t("navTitle")}</h2>
           <Button
             appearance={view === "sources" ? "primary" : "subtle"}
             onClick={() => setFilter({ view: "sources", product: null })}
           >
-            全部资料
+            {t("allSources")}
           </Button>
           <div className="knowledge-nav-group">
-            <b>产品</b>
-            {products.isPending && <Spinner size="tiny" label="正在加载产品" />}
+            <b>{t("products")}</b>
+            {products.isPending && (
+              <Spinner size="tiny" label={t("loadingProducts")} />
+            )}
             {products.data?.items.map((product) => (
               <Button
                 key={product.product_id}
@@ -698,31 +712,33 @@ export function KnowledgePage() {
                 appearance="subtle"
                 onClick={() => void products.refetch()}
               >
-                重新加载产品
+                {t("retryProducts")}
               </Button>
             )}
           </div>
           <div className="knowledge-nav-group">
-            <b>导入任务</b>
+            <b>{t("tasks")}</b>
             <small>
-              {sources.data?.items.filter(
-                (source) => source.import_status === "succeeded",
-              ).length ?? 0}
-              {" 完成 / "}
-              {sources.data?.items.filter(
-                (source) =>
-                  source.import_status === "running" ||
-                  source.import_status === "queued",
-              ).length ?? 0}
-              {" 处理中 / "}
-              {sources.data?.items.filter(
-                (source) => source.import_status === "partial",
-              ).length ?? 0}
-              {" 部分完成 / "}
-              {sources.data?.items.filter(
-                (source) => source.import_status === "failed",
-              ).length ?? 0}
-              {" 失败"}
+              {t("taskCounts", {
+                done:
+                  sources.data?.items.filter(
+                    (source) => source.import_status === "succeeded",
+                  ).length ?? 0,
+                active:
+                  sources.data?.items.filter(
+                    (source) =>
+                      source.import_status === "running" ||
+                      source.import_status === "queued",
+                  ).length ?? 0,
+                partial:
+                  sources.data?.items.filter(
+                    (source) => source.import_status === "partial",
+                  ).length ?? 0,
+                failed:
+                  sources.data?.items.filter(
+                    (source) => source.import_status === "failed",
+                  ).length ?? 0,
+              })}
             </small>
           </div>
         </Card>
@@ -731,28 +747,30 @@ export function KnowledgePage() {
             <>
               <div className="knowledge-panel-heading">
                 <div>
-                  <h2>资料中心</h2>
-                  <p>查看用途、解析进度与提取结果。</p>
+                  <h2>{t("sources")}</h2>
+                  <p>{t("sourcesDescription")}</p>
                 </div>
-                {sources.isFetching && sources.data && <small>正在更新</small>}
+                {sources.isFetching && sources.data && (
+                  <small>{t("updating")}</small>
+                )}
               </div>
               {sourceLoading ? (
-                <LoadingState compact label="正在加载资料" />
+                <LoadingState compact label={t("loadingSources")} />
               ) : sources.isError ? (
                 <ErrorState
-                  title="资料列表暂时无法加载"
+                  title={t("sourcesError")}
                   onRetry={() => void sources.refetch()}
                 />
               ) : sources.data?.items.length === 0 ? (
                 <EmptyState
-                  title="还没有资料"
-                  detail="导入文件、网页、粘贴文本或已有对象后，系统会独立处理每项资料。"
+                  title={t("noSources")}
+                  detail={t("noSourcesDetail")}
                   action={
                     <Button
                       appearance="primary"
                       onClick={() => setImportOpen(true)}
                     >
-                      导入第一份资料
+                      {t("firstSource")}
                     </Button>
                   }
                 />
@@ -761,12 +779,12 @@ export function KnowledgePage() {
                   <table className="knowledge-table">
                     <thead>
                       <tr>
-                        <th>名称</th>
-                        <th>类型</th>
-                        <th>用途</th>
-                        <th>处理状态</th>
-                        <th>片段 / 事实</th>
-                        <th>最近同步</th>
+                        <th>{t("name")}</th>
+                        <th>{t("type")}</th>
+                        <th>{t("purpose")}</th>
+                        <th>{t("processState")}</th>
+                        <th>{t("chunksFacts")}</th>
+                        <th>{t("lastSync")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -787,21 +805,25 @@ export function KnowledgePage() {
                           <td>
                             <b>{source.name}</b>
                             {source.product_names?.length ? (
-                              <small>{source.product_names.join("、")}</small>
+                              <small>
+                                {source.product_names.join(t("separator"))}
+                              </small>
                             ) : null}
                           </td>
                           <td>{sourceKindLabel(source.kind)}</td>
                           <td>
                             {source.purpose === "internal"
-                              ? "内部资料"
-                              : "公开资料"}
+                              ? t("internal")
+                              : t("public")}
                           </td>
                           <td>
                             <StatusPill
                               status={statusKind(
                                 source.import_status ?? source.state,
                               )}
-                              text={source.import_status ?? source.state}
+                              text={sourceStatusLabel(
+                                source.import_status ?? source.state,
+                              )}
                             />
                           </td>
                           <td>
@@ -810,7 +832,9 @@ export function KnowledgePage() {
                           </td>
                           <td>
                             {source.last_sync_at
-                              ? new Date(source.last_sync_at).toLocaleString()
+                              ? new Date(source.last_sync_at).toLocaleString(
+                                  locale.language,
+                                )
                               : "—"}
                           </td>
                         </tr>
@@ -824,30 +848,30 @@ export function KnowledgePage() {
             <>
               <div className="knowledge-panel-heading">
                 <div>
-                  <h2>{activeProduct ? activeProduct.name : "产品与事实"}</h2>
-                  <p>事实保留型号、市场、币种和来源；冲突不被自动覆盖。</p>
+                  <h2>{activeProduct ? activeProduct.name : t("facts")}</h2>
+                  <p>{t("factsDescription")}</p>
                 </div>
-                {facts.isFetching && facts.data && <small>正在更新</small>}
+                {facts.isFetching && facts.data && (
+                  <small>{t("updating")}</small>
+                )}
               </div>
               {factLoading ? (
-                <LoadingState compact label="正在加载事实" />
+                <LoadingState compact label={t("loadingFacts")} />
               ) : facts.isError ? (
                 <ErrorState
-                  title="事实暂时无法加载"
+                  title={t("factsError")}
                   onRetry={() => void facts.refetch()}
                 />
               ) : visibleFacts.length === 0 ? (
                 <EmptyState
-                  title={
-                    activeProduct ? "此产品尚未提取事实" : "还没有可用事实"
-                  }
-                  detail="资料解析完成后，产品属性、价格和场景会保留其准确来源与适用范围。"
+                  title={activeProduct ? t("productNoFacts") : t("noFacts")}
+                  detail={t("noFactsDetail")}
                   action={
                     <Button
                       appearance="primary"
                       onClick={() => setImportOpen(true)}
                     >
-                      导入资料
+                      {t("import")}
                     </Button>
                   }
                 />
@@ -856,10 +880,10 @@ export function KnowledgePage() {
                   <table className="knowledge-table">
                     <thead>
                       <tr>
-                        <th>属性</th>
-                        <th>当前值</th>
-                        <th>型号 / 市场</th>
-                        <th>状态</th>
+                        <th>{t("attribute")}</th>
+                        <th>{t("currentValue")}</th>
+                        <th>{t("modelMarket")}</th>
+                        <th>{t("state")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -867,7 +891,7 @@ export function KnowledgePage() {
                         <tr key={fact.fact_id}>
                           <td>
                             <b>{fact.attribute}</b>
-                            {fact.pinned && <small>客户固定</small>}
+                            {fact.pinned && <small>{t("pinned")}</small>}
                           </td>
                           <td>
                             {factValue(fact.typed_value)}
@@ -881,7 +905,7 @@ export function KnowledgePage() {
                           <td>
                             <StatusPill
                               status={statusKind(fact.status)}
-                              text={fact.status}
+                              text={sourceStatusLabel(fact.status)}
                             />
                           </td>
                         </tr>
@@ -894,10 +918,10 @@ export function KnowledgePage() {
           )}
         </Card>
         <Card className="knowledge-column knowledge-context">
-          <h2>来源与影响</h2>
+          <h2>{t("context")}</h2>
           {view === "sources" ? (
             <>
-              <p>打开一份资料可查看原文、版本、定位片段和受影响的内容。</p>
+              <p>{t("sourceContext")}</p>
               <Button
                 appearance="secondary"
                 icon={<OpenRegular />}
@@ -907,16 +931,16 @@ export function KnowledgePage() {
                   if (source) navigate(`sources/${source.source_id}`);
                 }}
               >
-                打开最近资料
+                {t("openRecent")}
               </Button>
             </>
           ) : (
             <>
-              <p>选择事实后可沿证据引用回到资料详情；内部资料会被标记用途。</p>
+              <p>{t("factContext")}</p>
               {visibleFacts.slice(0, 3).map((fact) => (
                 <div className="knowledge-evidence-chip" key={fact.fact_id}>
                   <Badge appearance="tint">
-                    {fact.evidence_refs.length} 条来源
+                    {t("evidenceCount", { count: fact.evidence_refs.length })}
                   </Badge>
                   <span>{fact.attribute}</span>
                 </div>
@@ -932,7 +956,7 @@ export function KnowledgePage() {
                 void facts.refetch();
               }}
             >
-              刷新数据
+              {t("refresh")}
             </Button>
           </div>
         </Card>

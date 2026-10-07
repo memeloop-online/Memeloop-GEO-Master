@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
@@ -14,6 +15,7 @@ const STATUSES = new Set([
   "unknown",
   "completed",
 ]);
+const RESTORED_KIMI_IDENTITY_WAIT_MS = 4_000;
 
 export class RunnerError extends Error {
   constructor(status, code) {
@@ -98,6 +100,7 @@ export function createRunner(options = {}) {
     browserChannel = process.env.GEO_BROWSER_CHANNEL,
     interactiveRuntime = process.env.GEO_BROWSER_INTERACTIVE_RUNTIME,
     desktopRuntime,
+    restoredKimiIdentityWaitMs = RESTORED_KIMI_IDENTITY_WAIT_MS,
     sessionIdleMs = 15 * 60_000,
     executionRetentionMs = 5 * 60_000,
     executionTimeoutMs = 120_000,
@@ -127,7 +130,9 @@ export function createRunner(options = {}) {
       executionRetentionMs,
       executionTimeoutMs,
       maintenanceIntervalMs,
-    ].every((value) => Number.isFinite(value) && value > 0)
+      restoredKimiIdentityWaitMs,
+    ].every((value) => Number.isFinite(value) && value > 0) ||
+    restoredKimiIdentityWaitMs > RESTORED_KIMI_IDENTITY_WAIT_MS
   ) {
     throw new Error("invalid_runner_retention");
   }
@@ -314,6 +319,7 @@ export function createRunner(options = {}) {
         desktop: desktopSession,
         desktopClients: new Set(),
         proxy,
+        restoredKimi: input.platform === "kimi" && !!storageState,
         identity: null,
         completed: false,
         busy: false,
@@ -330,6 +336,28 @@ export function createRunner(options = {}) {
     }
   }
 
+  async function identityForCompletion(record) {
+    // Restored Kimi storage may need the website's hydration/refresh before
+    // its saved access token verifies. Wait only for a missing identity, on
+    // the existing page, regardless of the runner's desktop/headless mode.
+    const deadline = performance.now() + restoredKimiIdentityWaitMs;
+    for (;;) {
+      if (isChallenge(record.page)) throw new RunnerError(409, "challenge");
+      const identity = await record.adapter.identify(record.page);
+      if (validateIdentity(identity)) {
+        if (
+          record.identity &&
+          record.identity.platform_account_id !== identity.platform_account_id
+        )
+          throw new RunnerError(409, "account_mismatch");
+        return identity;
+      }
+      if (!record.restoredKimi || performance.now() >= deadline)
+        throw new RunnerError(409, "login_required");
+      await delay(Math.min(250, Math.max(1, deadline - performance.now())));
+    }
+  }
+
   async function complete(id) {
     const record = session(id);
     if (record.busy) throw new RunnerError(409, "session_busy");
@@ -339,15 +367,7 @@ export function createRunner(options = {}) {
       record.busy = true;
       let revokingInput = false;
       try {
-        if (isChallenge(record.page)) throw new RunnerError(409, "challenge");
-        const identity = await record.adapter.identify(record.page);
-        if (!validateIdentity(identity))
-          throw new RunnerError(409, "login_required");
-        if (
-          record.identity &&
-          record.identity.platform_account_id !== identity.platform_account_id
-        )
-          throw new RunnerError(409, "account_mismatch");
+        const identity = await identityForCompletion(record);
         revokingInput = true;
         for (const client of record.desktopClients) client.terminate();
         record.desktopClients.clear();
@@ -373,19 +393,16 @@ export function createRunner(options = {}) {
         record.busy = false;
       }
     }
-    if (isChallenge(record.page)) throw new RunnerError(409, "challenge");
-    const identity = await record.adapter.identify(record.page);
-    if (!validateIdentity(identity))
-      throw new RunnerError(409, "login_required");
-    if (
-      record.identity &&
-      record.identity.platform_account_id !== identity.platform_account_id
-    ) {
-      throw new RunnerError(409, "account_mismatch");
+    // A restored desktop session uses the same bounded readiness path above.
+    if (record.restoredKimi) record.busy = true;
+    try {
+      const identity = await identityForCompletion(record);
+      record.identity = identity;
+      record.completed = true;
+      return { identity, storage_state: await record.context.storageState() };
+    } finally {
+      if (record.restoredKimi) record.busy = false;
     }
-    record.identity = identity;
-    record.completed = true;
-    return { identity, storage_state: await record.context.storageState() };
   }
 
   // Trusted gateway only. Never serialize this value in runner HTTP responses.

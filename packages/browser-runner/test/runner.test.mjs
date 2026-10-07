@@ -339,6 +339,168 @@ test("headless sessions require storage state and preserve the execution ledger"
   });
 });
 
+test("restored Kimi identity waits on the same page for website hydration", async () => {
+  let ready = false;
+  let newPages = 0;
+  let navigations = 0;
+  let attempts = 0;
+  const originalUrl = "https://www.kimi.com/";
+  const userInput = "unfinished input";
+  const state = { cookies: [], origins: [] };
+  const page = {
+    draftInput: userInput,
+    url: () => originalUrl,
+    async goto() {
+      navigations++;
+    },
+  };
+  const restored = createRunner({
+    restoredKimiIdentityWaitMs: 800,
+    browserType: {
+      async launch() {
+        return {
+          async newContext() {
+            return {
+              async newPage() {
+                newPages++;
+                return page;
+              },
+              async storageState() {
+                return state;
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    },
+    platformAdapters: {
+      kimi: {
+        entry: originalUrl,
+        async identify(received) {
+          assert.equal(received, page);
+          attempts++;
+          return ready
+            ? { platform_account_id: "own", display_name: "Own account" }
+            : null;
+        },
+      },
+    },
+  });
+  try {
+    assert.deepEqual(
+      await restored.create({
+        session_id: "hydrate",
+        platform: "kimi",
+        storage_state: state,
+      }),
+      { session_id: "hydrate", phase: "login_required" },
+    );
+    setTimeout(() => {
+      ready = true;
+    }, 100);
+    assert.deepEqual(await restored.complete("hydrate"), {
+      identity: { platform_account_id: "own", display_name: "Own account" },
+      storage_state: state,
+    });
+    assert.ok(
+      attempts >= 3,
+      "completion retried the transient missing identity",
+    );
+    assert.equal(newPages, 1);
+    assert.equal(navigations, 1);
+    assert.equal(page.url(), originalUrl);
+    assert.equal(page.draftInput, "unfinished input");
+  } finally {
+    await restored.shutdown();
+  }
+});
+
+test("restored Kimi identity stops at the deadline and never retries a different account", async () => {
+  let identity = null;
+  let attempts = 0;
+  let pages = 0;
+  let navigations = 0;
+  const page = {
+    url: () => "https://www.kimi.com/",
+    async goto() {
+      navigations++;
+    },
+  };
+  const restored = createRunner({
+    restoredKimiIdentityWaitMs: 90,
+    browserType: {
+      async launch() {
+        return {
+          async newContext() {
+            return {
+              async newPage() {
+                pages++;
+                return page;
+              },
+              async storageState() {
+                return { cookies: [], origins: [] };
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    },
+    platformAdapters: {
+      kimi: {
+        entry: "https://www.kimi.com/",
+        async identify() {
+          attempts++;
+          return identity;
+        },
+      },
+    },
+  });
+  try {
+    await restored.create({
+      session_id: "never-ready",
+      platform: "kimi",
+      storage_state: { cookies: [], origins: [] },
+    });
+    const began = performance.now();
+    await assert.rejects(
+      restored.complete("never-ready"),
+      (error) =>
+        error instanceof RunnerError && error.code === "login_required",
+    );
+    assert.ok(performance.now() - began < 1_000);
+    assert.ok(attempts >= 3 && attempts <= 5);
+    assert.equal(pages, 1);
+    assert.equal(navigations, 1);
+
+    identity = { platform_account_id: "own", display_name: "Own account" };
+    await restored.create({
+      session_id: "changed",
+      platform: "kimi",
+      storage_state: { cookies: [], origins: [] },
+    });
+    identity = { platform_account_id: "other", display_name: "Other account" };
+    const before = attempts;
+    await assert.rejects(
+      restored.complete("changed"),
+      (error) =>
+        error instanceof RunnerError && error.code === "account_mismatch",
+    );
+    assert.equal(
+      attempts,
+      before + 1,
+      "a mismatched identity is never retried",
+    );
+    assert.equal(pages, 2);
+    assert.equal(navigations, 2);
+  } finally {
+    await restored.shutdown();
+  }
+});
+
 test("proxy is passed to isolated browser context without direct retry", async () => {
   const proxy = {
     server: "http://127.0.0.1:9999",

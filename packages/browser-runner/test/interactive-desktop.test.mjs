@@ -8,6 +8,8 @@ function harness({
   sessionIdleMs = 60_000,
   identify,
   failGoto = false,
+  platform = "fixture",
+  restoredKimiIdentityWaitMs,
 } = {}) {
   const events = [];
   let loggedIn = false;
@@ -59,7 +61,7 @@ function harness({
       },
     },
     platformAdapters: {
-      fixture: {
+      [platform]: {
         entry: "https://fixture.invalid/login",
         connectorVersion: "fixture.v1",
         operations: ["measure"],
@@ -74,6 +76,9 @@ function harness({
     },
     clock,
     sessionIdleMs,
+    ...(restoredKimiIdentityWaitMs === undefined
+      ? {}
+      : { restoredKimiIdentityWaitMs }),
   });
   return {
     runner,
@@ -84,6 +89,88 @@ function harness({
     },
   };
 }
+
+test("restored Kimi desktop waits for hydration before revoking input and keeps its page", async () => {
+  let ready = false;
+  const { runner, events, state } = harness({
+    platform: "kimi",
+    restoredKimiIdentityWaitMs: 800,
+    identify: () =>
+      ready ? { platform_account_id: "own", display_name: "Owner" } : null,
+  });
+  try {
+    const created = await runner.create({
+      session_id: "restored-kimi-desktop",
+      platform: "kimi",
+      storage_state: state,
+    });
+    assert.equal(created.phase, "login_required");
+    setTimeout(() => {
+      ready = true;
+    }, 100);
+    const completed = await runner.complete("restored-kimi-desktop");
+    assert.equal(completed.identity.platform_account_id, "own");
+    assert.equal(completed.storage_state, state);
+    assert.equal(events.filter((event) => event === "goto").length, 1);
+    assert.equal(
+      events.filter((event) => event === "identify").length >= 4,
+      true,
+      "a final identity check still occurs after input is revoked",
+    );
+    assert.equal(events.filter((event) => event === "closeInput").length, 1);
+    assert.deepEqual(
+      events.filter((event) => typeof event === "string").slice(-3),
+      ["closeInput", "identify", "storageState"],
+    );
+  } finally {
+    await runner.shutdown();
+  }
+});
+
+test("restored Kimi desktop never revokes input for missing or changed identity", async () => {
+  let identity = null;
+  const { runner, events, state } = harness({
+    platform: "kimi",
+    restoredKimiIdentityWaitMs: 80,
+    identify: () => identity,
+  });
+  try {
+    await runner.create({
+      session_id: "missing-kimi-desktop",
+      platform: "kimi",
+      storage_state: state,
+    });
+    const begun = performance.now();
+    await assert.rejects(
+      runner.complete("missing-kimi-desktop"),
+      (error) => error.code === "login_required",
+    );
+    assert.ok(performance.now() - begun < 1_000);
+    assert.equal(events.includes("closeInput"), false);
+
+    identity = { platform_account_id: "own", display_name: "Owner" };
+    await runner.create({
+      session_id: "changed-kimi-desktop",
+      platform: "kimi",
+      storage_state: state,
+    });
+    identity = { platform_account_id: "other", display_name: "Other" };
+    const before = events.filter((event) => event === "identify").length;
+    await assert.rejects(
+      runner.complete("changed-kimi-desktop"),
+      (error) => error.code === "account_mismatch",
+    );
+    assert.equal(
+      events.filter((event) => event === "identify").length,
+      before + 1,
+      "a changed account is rejected without retry",
+    );
+    assert.equal(events.includes("closeInput"), false);
+    assert.equal(events.filter((event) => event === "goto").length, 2);
+  } finally {
+    await runner.shutdown();
+  }
+});
 
 test("interactive login pending retains input, then revokes input before final identity and storage", async () => {
   const { runner, events, state, login } = harness();

@@ -14,6 +14,9 @@ import {
   OpenRegular,
 } from "@fluentui/react-icons";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
+import "../i18n/sourceDetail";
 import {
   type ImportJob,
   useRetryImportJobMutation,
@@ -53,22 +56,22 @@ function statusKind(value: string | null | undefined): StatusKind {
 }
 
 const pdfFailureReasons: Record<string, string> = {
-  ocr_required: "该页没有可提取的文字层；扫描内容需要 OCR",
-  empty_text: "该页未提取到文字",
-  parse_failed: "该页解析失败",
-  page_limit: "页面超过解析限制",
-  invalid_pdf: "PDF 文件无效或无法读取",
-  encrypted_pdf: "PDF 已加密，无法解析",
+  ocr_required: "ocr_required",
+  empty_text: "empty_text",
+  parse_failed: "parse_failed",
+  page_limit: "page_limit",
+  invalid_pdf: "invalid_pdf",
+  encrypted_pdf: "encrypted_pdf",
 };
 
 const officeFailureReasons: Record<string, string> = {
-  invalid_docx: "DOCX 文件无效或无法读取",
-  invalid_xlsx: "XLSX 文件无效或无法读取",
-  encrypted_office: "Office 文件已加密，无法解析",
-  parse_failed: "该解析单元失败",
-  unit_limit: "解析单元超过限制",
-  unsupported_content: "该解析单元含不支持的内容",
-  empty_text: "该解析单元没有可提取文字",
+  invalid_docx: "invalid_docx",
+  invalid_xlsx: "invalid_xlsx",
+  encrypted_office: "encrypted_office",
+  parse_failed: "office_parse_failed",
+  unit_limit: "unit_limit",
+  unsupported_content: "unsupported_content",
+  empty_text: "office_empty_text",
 };
 
 type SourceFormat = "pdf" | "docx" | "xlsx" | "other";
@@ -76,15 +79,17 @@ type SourceFormat = "pdf" | "docx" | "xlsx" | "other";
 function safeFailure(
   error: NonNullable<ImportJob["errors"]>[number],
   format: SourceFormat,
+  t: TFunction,
 ) {
   if (format === "docx" || format === "xlsx") {
     const id =
       Number.isInteger(error.unit_id) && (error.unit_id ?? -1) >= 0
-        ? `解析单元 ${(error.unit_id ?? 0) + 1}：`
+        ? t("sourceDetail.failure.unit", { unit: (error.unit_id ?? 0) + 1 })
         : "";
-    return `${id}${officeFailureReasons[error.code ?? ""] ?? "Office 解析失败；请检查该单元或文件"}`;
+    const reason = officeFailureReasons[error.code ?? ""];
+    return `${id}${t(`sourceDetail.failure.${reason ?? "officeFallback"}`)}`;
   }
-  if (format !== "pdf") return "解析失败；请检查该单元或文件";
+  if (format !== "pdf") return t("sourceDetail.failure.fallback");
   const unit = typeof error.unit === "string" ? error.unit : "";
   const unitPage = /^page[:_ -]?([1-9]\d{0,5})$/.exec(unit);
   const page =
@@ -96,23 +101,28 @@ function safeFailure(
       : unitPage
         ? Number(unitPage[1])
         : null;
-  const position = page ? `第 ${page} 页：` : "";
-  return `${position}${pdfFailureReasons[error.code ?? ""] ?? "解析失败；请检查该单元或文件"}`;
+  const position = page ? t("sourceDetail.failure.page", { page }) : "";
+  const reason = pdfFailureReasons[error.code ?? ""];
+  return `${position}${t(`sourceDetail.failure.${reason ?? "fallback"}`)}`;
 }
 
-function importStatusLabel(value: string | null | undefined) {
+function importStatusLabel(value: string | null | undefined, t: TFunction) {
   const labels: Record<string, string> = {
-    queued: "等待解析",
-    running: "正在解析",
-    partial: "部分完成",
-    succeeded: "解析完成",
-    failed: "解析失败",
-    cancelled: "已取消",
+    queued: "queued",
+    running: "running",
+    partial: "partial",
+    succeeded: "succeeded",
+    failed: "failed",
+    cancelled: "cancelled",
   };
-  return labels[value ?? ""] ?? value ?? "等待处理";
+  const known = labels[value ?? ""];
+  return known
+    ? t(`sourceDetail.status.${known}`)
+    : (value ?? t("sourceDetail.status.default"));
 }
 
 export function SourceDetailPage() {
+  const { t } = useTranslation();
   const { tenantId, projectId, id } = useParams();
   const { session } = useAuth();
   const membership = membershipForTenant(session, tenantId ?? "");
@@ -132,7 +142,7 @@ export function SourceDetailPage() {
   const detail = sourceQuery.data;
 
   if (sourceQuery.isPending && !detail) {
-    return <LoadingState label="正在加载来源详情" />;
+    return <LoadingState label={t("sourceDetail.loading")} />;
   }
   if (sourceQuery.isError || !detail) {
     return (
@@ -142,11 +152,11 @@ export function SourceDetailPage() {
           icon={<ArrowLeftRegular />}
           onClick={() => navigate(knowledgePath)}
         >
-          返回资料中心
+          {t("sourceDetail.back")}
         </Button>
         <ErrorState
-          title="无法加载这份资料"
-          detail="资料可能已被移除、当前项目无权访问，或服务暂时不可用。"
+          title={t("sourceDetail.loadError")}
+          detail={t("sourceDetail.loadErrorDetail")}
           onRetry={() => void sourceQuery.refetch()}
         />
       </div>
@@ -164,13 +174,16 @@ export function SourceDetailPage() {
       : isXlsx
         ? "xlsx"
         : "other";
-  const unitLabel = isPdf
-    ? "页"
-    : isDocx
-      ? "个正文区块"
-      : isXlsx
-        ? "个工作表行区块"
-        : "个单元";
+  const unitFor = (count: number) =>
+    t(`sourceDetail.unit.${format}`, { count });
+  const completed = latestJob?.completed_units ?? 0;
+  const failed = latestJob?.failed_units ?? 0;
+  const progressValues = {
+    completed,
+    failed,
+    completedUnit: unitFor(completed),
+    failedUnit: unitFor(failed),
+  };
   const currentVersion =
     versions.find(
       (version) => version.source_version_id === source.current_version_id,
@@ -214,20 +227,27 @@ export function SourceDetailPage() {
     <div className="source-detail-page">
       <section className="page-hero source-detail-hero">
         <div>
-          <p className="eyebrow">资料详情</p>
+          <p className="eyebrow">{t("sourceDetail.eyebrow")}</p>
           <Link className="back-link" to={knowledgePath}>
-            <ArrowLeftRegular /> 返回资料中心
+            <ArrowLeftRegular /> {t("sourceDetail.back")}
           </Link>
           <h1>{source.name}</h1>
           <div className="source-status-line">
-            {source.purpose === "internal" ? "内部资料" : "公开资料"} · 当前版本
-            {currentVersion ? ` ${currentVersion.version}` : "尚未形成"} ·{" "}
+            {source.purpose === "internal"
+              ? t("sourceDetail.internal")
+              : t("sourceDetail.public")}{" "}
+            · {t("sourceDetail.currentVersion")}{" "}
+            {currentVersion
+              ? currentVersion.version
+              : t("sourceDetail.noVersion")}{" "}
+            ·{" "}
             <StatusPill
               status={statusKind(
                 latestJob?.status ?? source.import_status ?? source.state,
               )}
               text={importStatusLabel(
                 latestJob?.status ?? source.import_status ?? source.state,
+                t,
               )}
             />
           </div>
@@ -239,10 +259,10 @@ export function SourceDetailPage() {
             disabled={!mayRetry || retryJob.isPending}
             title={
               !canRetry
-                ? "当前成员只有读取权限。"
+                ? t("sourceDetail.readOnly")
                 : !mayRetry
-                  ? "只有部分完成或失败的最新任务可以重试。"
-                  : "仅重试失败的解析单元；不会删除已完成的证据或旧版本。"
+                  ? t("sourceDetail.retryUnavailable")
+                  : t("sourceDetail.retryHint")
             }
             onClick={() => {
               if (latestJob && mayRetry) {
@@ -252,87 +272,81 @@ export function SourceDetailPage() {
               }
             }}
           >
-            {retryJob.isPending ? "正在受理重试…" : "重试失败部分"}
+            {retryJob.isPending
+              ? t("sourceDetail.retrying")
+              : t("sourceDetail.retry")}
           </Button>
         </div>
       </section>
       {sourceQuery.isFetching && (
         <MessageBar intent="info">
-          <MessageBarBody>
-            正在更新来源处理进度，当前已显示的版本与片段仍可查看。
-          </MessageBarBody>
+          <MessageBarBody>{t("sourceDetail.refreshing")}</MessageBarBody>
         </MessageBar>
       )}
       {retryJob.isError && (
         <MessageBar intent="error">
-          <MessageBarBody>
-            无法受理重试。请确认任务仍为部分完成或失败，并检查当前项目权限后重试。
-          </MessageBarBody>
+          <MessageBarBody>{t("sourceDetail.retryError")}</MessageBarBody>
         </MessageBar>
       )}
       {retryJob.isSuccess && (
         <MessageBar intent="info">
-          <MessageBarBody>
-            重试已受理；只会补处理失败单元，已有证据和历史版本保持不变。
-          </MessageBarBody>
+          <MessageBarBody>{t("sourceDetail.retryAccepted")}</MessageBarBody>
         </MessageBar>
       )}
       {isParsing && (
         <MessageBar intent="info">
           <MessageBarBody>
-            {latestJob.status === "queued" ? "已受理，等待解析" : "正在解析"}。
-            当前已完成 {latestJob.completed_units ?? 0} {unitLabel}，失败{" "}
-            {latestJob.failed_units ?? 0} {unitLabel}
-            ；完成前不代表全文已可用，知识版本只在实际发布后更新。
+            {t(
+              latestJob.status === "queued"
+                ? "sourceDetail.queuedProgress"
+                : "sourceDetail.runningProgress",
+              progressValues,
+            )}
           </MessageBarBody>
         </MessageBar>
       )}
       {latestJob?.status === "partial" && (
         <MessageBar intent="warning">
           <MessageBarBody>
-            <b>部分处理完成</b>
-            <span>
-              已完成 {latestJob.completed_units ?? 0} {unitLabel}，失败{" "}
-              {latestJob.failed_units ?? 0} {unitLabel}
-              。仅成功单元的证据可用；失败单元不会计入。
-            </span>
+            <b>{t("sourceDetail.partial")}</b>
+            <span>{t("sourceDetail.partialProgress", progressValues)}</span>
           </MessageBarBody>
         </MessageBar>
       )}
       {latestJob?.status === "failed" && (
         <MessageBar intent="error">
           <MessageBarBody>
-            解析失败：已完成 {latestJob.completed_units ?? 0} {unitLabel}，失败{" "}
-            {latestJob.failed_units ?? 0} {unitLabel}
-            。旧来源版本与已保存证据不会因此删除。
+            {t("sourceDetail.failedProgress", progressValues)}
           </MessageBarBody>
         </MessageBar>
       )}
       {latestJob?.status === "succeeded" && isPdf && (
         <MessageBar intent="success">
           <MessageBarBody>
-            PDF 页面文字解析完成，共 {latestJob.completed_units ?? 0}{" "}
-            页。页面文字可按页定位； 这不表示扫描页 OCR、结构化事实或 PDF
-            原件可视预览已完成。
+            {t("sourceDetail.pdfComplete", progressValues)}
           </MessageBarBody>
         </MessageBar>
       )}
       {latestJob?.status === "succeeded" && (isDocx || isXlsx) && (
         <MessageBar intent="success">
           <MessageBarBody>
-            {isDocx ? "DOCX 正文结构" : "XLSX 工作表单元格"}解析完成，共{" "}
-            {latestJob.completed_units ?? 0} {unitLabel}
-            。证据可按结构化位置查看； 不提供 Office 原件预览或原文高亮。
+            {t("sourceDetail.officeComplete", progressValues)}
           </MessageBarBody>
         </MessageBar>
       )}
       {latestJob?.errors && latestJob.errors.length > 0 && (
-        <section aria-label={isPdf ? "失败页面与原因" : "失败解析单元与原因"}>
-          <b>{isPdf ? "失败页面与原因" : "失败解析单元与原因"}</b>
+        <section
+          aria-label={t(
+            isPdf ? "sourceDetail.failedPages" : "sourceDetail.failedUnits",
+          )}
+        >
+          <b>
+            {t(isPdf ? "sourceDetail.failedPages" : "sourceDetail.failedUnits")}
+          </b>
           <ul>
             {latestJob.errors.map((error, index) => (
               <li key={`${error.unit ?? "unit"}-${index}`}>
-                {safeFailure(error, error.format ?? format)}
+                {safeFailure(error, error.format ?? format, t)}
               </li>
             ))}
           </ul>
@@ -345,19 +359,18 @@ export function SourceDetailPage() {
         <Card className="source-original-panel" style={{ minWidth: 0 }}>
           <div className="knowledge-panel-heading">
             <div>
-              <h2>原文与快照</h2>
-              <p>
-                点击片段可查看结构化定位；按来源版本分别浏览证据。
-                当前只显示提取内容，不提供原件预览或区域高亮。
-              </p>
+              <h2>{t("sourceDetail.originals")}</h2>
+              <p>{t("sourceDetail.originalsHint")}</p>
             </div>
-            <Badge appearance="tint">{visibleChunks.length} 个片段</Badge>
+            <Badge appearance="tint">
+              {t("sourceDetail.chunkCount", { count: visibleChunks.length })}
+            </Badge>
           </div>
           {versions.length > 0 && (
             <label>
-              查看证据版本{" "}
+              {t("sourceDetail.viewVersion")}{" "}
               <Select
-                aria-label="查看证据版本"
+                aria-label={t("sourceDetail.viewVersion")}
                 value={activeVersionId ?? ""}
                 onChange={(_, data) => {
                   setSelectedVersionId(data.value);
@@ -371,8 +384,8 @@ export function SourceDetailPage() {
                   >
                     v{version.version}
                     {version.source_version_id === source.current_version_id
-                      ? "（当前）"
-                      : "（历史不可变版本）"}
+                      ? t("sourceDetail.versionCurrent")
+                      : t("sourceDetail.versionHistory")}
                   </option>
                 ))}
               </Select>
@@ -380,12 +393,12 @@ export function SourceDetailPage() {
           )}
           {selectedVersionId &&
             selectedVersionId !== source.current_version_id && (
-              <p>正在查看已保存的历史证据；新的解析不会覆盖这个版本。</p>
+              <p>{t("sourceDetail.viewingHistory")}</p>
             )}
           {visibleChunks.length === 0 ? (
             <EmptyState
-              title="原文尚未可用"
-              detail="资料正在获取或解析；不会以空白内容冒充已解析原文。"
+              title={t("sourceDetail.noExtractedText")}
+              detail={t("sourceDetail.noExtractedTextHint")}
             />
           ) : (
             <ol className="source-chunk-list">
@@ -399,10 +412,13 @@ export function SourceDetailPage() {
                     onClick={() => setSelectedChunkId(chunk.chunk_id)}
                   >
                     <small>
-                      片段 {chunk.ordinal + 1} · {chunk.kind}
+                      {t("sourceDetail.chunk", { index: chunk.ordinal + 1 })} ·{" "}
+                      {t(`sourceDetail.kind.${chunk.kind}`, {
+                        defaultValue: chunk.kind,
+                      })}
                       {chunk.extraction_method ===
                       "deterministic_csv_evidence_v1"
-                        ? " · 生成证据分片"
+                        ? ` · ${t("sourceDetail.generatedSlice")}`
                         : ""}
                     </small>
                     <span style={{ overflowWrap: "anywhere" }}>
@@ -419,19 +435,30 @@ export function SourceDetailPage() {
         <Card className="source-extraction-panel" style={{ minWidth: 0 }}>
           <div className="knowledge-panel-heading">
             <div>
-              <h2>提取结果</h2>
-              <p>证据按所选的不可变来源版本查看；事实保留服务端记录。</p>
+              <h2>{t("sourceDetail.results")}</h2>
+              <p>{t("sourceDetail.resultsHint")}</p>
             </div>
-            {isParsing && <Spinner size="tiny" label="正在处理" />}
+            {isParsing && (
+              <Spinner size="tiny" label={t("sourceDetail.processing")} />
+            )}
           </div>
           {selectedChunk && (
             <section className="source-selected-chunk">
-              <b>当前定位</b>
+              <b>{t("sourceDetail.selectedPosition")}</b>
               <KnowledgeLocator locator={selectedChunk.locator} />
               <small>
                 {selectedChunk.extraction_method
-                  ? `提取方式：${selectedChunk.extraction_method}`
-                  : "正在等待提取方式记录"}
+                  ? t("sourceDetail.extractionMethod", {
+                      method:
+                        selectedChunk.extraction_method ===
+                        "deterministic_csv_evidence_v1"
+                          ? t("sourceDetail.csvSliceMethod")
+                          : selectedChunk.extraction_method ===
+                              "deterministic_paragraph_v1"
+                            ? t("sourceDetail.paragraphMethod")
+                            : selectedChunk.extraction_method,
+                    })
+                  : t("sourceDetail.extractionPending")}
               </small>
               {selectedChunk.kind === "table" &&
                 selectedChunk.locator?.kind === "csv" &&
@@ -448,14 +475,12 @@ export function SourceDetailPage() {
               )}
               {selectedChunk.extraction_method ===
                 "deterministic_csv_evidence_v1" && (
-                <p>
-                  这是供生成使用的有界证据分片；完整记录仍保存在原始片段中。
-                </p>
+                <p>{t("sourceDetail.generatedSliceHint")}</p>
               )}
             </section>
           )}
           {facts.length === 0 ? (
-            <p className="source-empty-inline">尚未从此来源提取到事实。</p>
+            <p className="source-empty-inline">{t("sourceDetail.noFacts")}</p>
           ) : (
             <ul className="source-fact-list">
               {facts.map((fact) => (
@@ -471,7 +496,7 @@ export function SourceDetailPage() {
                     <small>
                       {[fact.model, fact.market, fact.currency]
                         .filter(Boolean)
-                        .join(" · ") || "适用范围待确认"}
+                        .join(" · ") || t("sourceDetail.scopeUnknown")}
                     </small>
                   </div>
                   <StatusPill
@@ -488,7 +513,7 @@ export function SourceDetailPage() {
                         )
                       }
                     >
-                      定位
+                      {t("sourceDetail.locate")}
                     </Button>
                   )}
                 </li>
@@ -497,49 +522,58 @@ export function SourceDetailPage() {
           )}
         </Card>
         <Card className="source-impact-panel" style={{ minWidth: 0 }}>
-          <h2>版本、用途与影响</h2>
+          <h2>{t("sourceDetail.impact")}</h2>
           <dl className="source-metadata">
             <div>
-              <dt>来源用途</dt>
+              <dt>{t("sourceDetail.purpose")}</dt>
               <dd>
                 {source.purpose === "internal"
-                  ? "内部资料，不进入公开生成"
-                  : "公开资料"}
+                  ? t("sourceDetail.internalUse")
+                  : t("sourceDetail.public")}
               </dd>
             </div>
             <div>
-              <dt>版本</dt>
+              <dt>{t("sourceDetail.version")}</dt>
               <dd>
                 {currentVersion
                   ? `v${currentVersion.version}`
-                  : "尚未形成可用版本"}
+                  : t("sourceDetail.noUsableVersion")}
               </dd>
             </div>
             <div>
-              <dt>处理进度</dt>
+              <dt>{t("sourceDetail.progress")}</dt>
               <dd>
                 {latestJob
-                  ? `${latestJob.stage}：${importStatusLabel(latestJob.status)}，已完成 ${latestJob.completed_units ?? 0} ${unitLabel}，失败 ${latestJob.failed_units ?? 0} ${unitLabel}`
-                  : "等待导入任务"}
+                  ? t("sourceDetail.progressDetail", {
+                      stage: t(`sourceDetail.stage.${latestJob.stage}`, {
+                        defaultValue: latestJob.stage,
+                      }),
+                      status: importStatusLabel(latestJob.status, t),
+                      ...progressValues,
+                    })
+                  : t("sourceDetail.awaitingImport")}
               </dd>
             </div>
             <div>
-              <dt>内容哈希</dt>
-              <dd>{currentVersion?.content_sha256 ?? "等待完成核验"}</dd>
+              <dt>{t("sourceDetail.hash")}</dt>
+              <dd>
+                {currentVersion?.content_sha256 ??
+                  t("sourceDetail.awaitingHash")}
+              </dd>
             </div>
           </dl>
           {impact.document_manifest_items?.length ||
           impact.content?.length ||
           impact.publications?.length ? (
             <section className="source-impact-list">
-              <b>影响链</b>
+              <b>{t("sourceDetail.relatedContent")}</b>
               {impact.document_manifest_items?.map((item) => (
                 <p key={item.id}>
                   <StatusPill
                     status={statusKind(item.status)}
                     text={item.status}
                   />{" "}
-                  文档清单：{item.label}
+                  {t("sourceDetail.document")}：{item.label}
                 </p>
               ))}
               {impact.content?.map((item) => (
@@ -548,7 +582,7 @@ export function SourceDetailPage() {
                     status={statusKind(item.status ?? "processing")}
                     text={item.status ?? "processing"}
                   />{" "}
-                  主文档：{item.title}
+                  {t("sourceDetail.mainDocument")}：{item.title}
                   {item.revision ? ` v${item.revision}` : ""}
                 </p>
               ))}
@@ -558,13 +592,13 @@ export function SourceDetailPage() {
                     status={statusKind(item.status)}
                     text={item.status}
                   />{" "}
-                  发布证据：{item.label}
+                  {t("sourceDetail.publication")}：{item.label}
                 </p>
               ))}
             </section>
           ) : (
             <p className="source-empty-inline">
-              还没有引用这份资料的文档、渠道变体或发布证据。
+              {t("sourceDetail.noRelatedContent")}
             </p>
           )}
           {currentVersion?.original_url && (
@@ -573,7 +607,7 @@ export function SourceDetailPage() {
               target="_blank"
               rel="noreferrer"
             >
-              <OpenRegular /> 打开原始 URL
+              <OpenRegular /> {t("sourceDetail.openOriginal")}
             </a>
           )}
         </Card>

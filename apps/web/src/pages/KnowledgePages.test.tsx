@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -8,6 +8,7 @@ import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import type { AuthSession } from "../auth/types";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
+import i18n from "../i18n";
 
 const session: AuthSession = {
   user: {
@@ -166,7 +167,8 @@ function renderPath(path: string) {
   );
 }
 
-afterEach(() => {
+afterEach(async () => {
+  await act(() => i18n.changeLanguage("zh-CN"));
   setCsrfToken(undefined);
   setUnauthorizedHandler(undefined);
   vi.unstubAllGlobals();
@@ -194,16 +196,15 @@ describe("knowledge workbench", () => {
       await screen.findByRole("heading", { name: "企业知识库" }),
     ).toBeInTheDocument();
     expect(await screen.findByText("还没有资料")).toBeInTheDocument();
-    expect(screen.getByText(/OCR 扫描识别/)).toBeInTheDocument();
-    expect(screen.getByText(/向量检索/)).toBeInTheDocument();
-    expect(screen.getByText(/LLM 问答/)).toBeInTheDocument();
-    expect(screen.getByText(/网页抓取/)).toBeInTheDocument();
-    expect(screen.getByText(/PDF 文本解析未配置/)).toBeInTheDocument();
+    expect(screen.getByText("部分功能暂不可用")).toBeInTheDocument();
+    expect(screen.getByText(/扫描件识别/)).toBeInTheDocument();
+    expect(screen.getByText(/相似内容检索/)).toBeInTheDocument();
+    expect(screen.getAllByText(/知识问答/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/网页导入/)).toBeInTheDocument();
+    expect(screen.getByText(/PDF 解析/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "导入资料" }));
-    expect(
-      screen.getByText(/PDF 文本解析未配置；扫描 PDF/),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/当前未报告可解析格式/)).toBeInTheDocument();
+    expect(screen.getByText(/PDF 解析不可用/)).toBeInTheDocument();
+    expect(screen.getByText(/当前无法确认可解析格式/)).toBeInTheDocument();
   });
 
   it("renders source data and marks internal material instead of treating it as public", async () => {
@@ -366,7 +367,7 @@ describe("knowledge workbench", () => {
     );
     renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
     await userEvent.click(await screen.findByText(text));
-    expect(screen.getByText(/完整记录仍保存在原始片段中/)).toBeInTheDocument();
+    expect(screen.getByText(/完整记录可在原始片段中查看/)).toBeInTheDocument();
     expect(screen.getAllByText(/单元格字符 4–8/)).toHaveLength(2);
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
   });
@@ -512,7 +513,9 @@ describe("knowledge workbench", () => {
     });
     await user.upload(screen.getByLabelText("选择资料文件"), file);
     // Bulk URL import is a paste interaction; avoid a render per character.
-    await user.click(screen.getByRole("textbox", { name: "多个网页 URL" }));
+    await user.click(
+      screen.getByRole("textbox", { name: "网页地址（每行一个）" }),
+    );
     await user.paste("https://example.com/a\nhttps://example.com/b");
     await user.click(screen.getByRole("button", { name: "开始导入" }));
 
@@ -674,11 +677,11 @@ describe("knowledge workbench", () => {
     });
     await user.upload(screen.getByLabelText("选择资料文件"), file);
     await user.click(screen.getByRole("button", { name: "开始导入" }));
-    expect(await screen.findByText("已受理，等待解析")).toBeInTheDocument();
+    expect((await screen.findAllByText("等待解析")).length).toBeGreaterThan(0);
     expect(screen.queryByText("解析完成")).not.toBeInTheDocument();
     await user.click(await screen.findByRole("link", { name: "查看处理详情" }));
     expect(
-      await screen.findByText(/完成前不代表全文已可用/),
+      await screen.findByText(/等待解析。已完成 0 页，失败 0 页/),
     ).toBeInTheDocument();
     expect(screen.queryByText("已提取的 PDF 正文")).not.toBeInTheDocument();
     expect(
@@ -764,7 +767,7 @@ describe("knowledge workbench", () => {
     renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
     expect(
       await screen.findByText(
-        "第 2 页：该页没有可提取的文字层；扫描内容需要 OCR",
+        "第 2 页：该页没有可提取的文字；扫描内容需要 OCR",
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("上一轮保存的第 1 页证据")).toBeInTheDocument();
@@ -773,7 +776,7 @@ describe("knowledge workbench", () => {
     ).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "重试失败部分" }));
     await waitFor(() =>
-      expect(screen.getByText(/重试已受理/)).toBeInTheDocument(),
+      expect(screen.getByText(/重试请求已受理/)).toBeInTheDocument(),
     );
     await waitFor(() =>
       expect(screen.getByText("上一轮保存的第 1 页证据")).toBeInTheDocument(),
@@ -963,7 +966,7 @@ describe("knowledge workbench", () => {
     expect(screen.getByText("旧证据仍可查看")).toBeInTheDocument();
     expect(screen.queryByText("规格说明")).not.toBeInTheDocument();
     expect(
-      screen.getByText(/历史证据；新的解析不会覆盖这个版本/),
+      screen.getByText(/正在查看历史版本的已保存内容/),
     ).toBeInTheDocument();
   });
 
@@ -1046,7 +1049,7 @@ describe("knowledge workbench", () => {
     );
     renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
     expect(
-      await screen.findByText(/已完成 1 个工作表行区块/),
+      await screen.findByText(/已解析 1 个工作表行区块/),
     ).toBeInTheDocument();
     await userEvent.click(screen.getByText("12.50"));
     expect(screen.getByRole("table")).toHaveTextContent("A12");
@@ -1131,12 +1134,8 @@ describe("knowledge workbench", () => {
     await userEvent.click(
       await screen.findByRole("button", { name: "导入资料" }),
     );
-    expect(
-      screen.getByText(/DOCX 按标题、段落及真实表格单元格定位/),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/XLSX 解析未配置；上传不等于资料可用/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/文件上传后仍需解析/)).toBeInTheDocument();
+    expect(screen.getByText(/XLSX 解析不可用/)).toBeInTheDocument();
     const file = new File(["synthetic"], "manual.docx", { type: "" });
     Object.defineProperty(file, "arrayBuffer", {
       value: vi
@@ -1145,12 +1144,93 @@ describe("knowledge workbench", () => {
     });
     await userEvent.upload(screen.getByLabelText("选择资料文件"), file);
     await userEvent.click(screen.getByRole("button", { name: "开始导入" }));
-    expect(await screen.findByText("已受理，等待解析")).toBeInTheDocument();
+    expect((await screen.findAllByText("等待解析")).length).toBeGreaterThan(0);
     expect(screen.queryByText("解析完成")).not.toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(([request]) =>
         routePath(request).endsWith("/office-upload/complete"),
       ),
     ).toBe(true);
+  });
+
+  it("shows English source progress, failed-page details, and available saved versions", async () => {
+    await act(() => i18n.changeLanguage("en"));
+    vi.stubGlobal(
+      "fetch",
+      requestHandler({
+        sourceDetail: {
+          source: {
+            ...source,
+            current_version_id: "version-a",
+            import_status: "partial",
+          },
+          versions: [
+            {
+              source_version_id: "version-old",
+              source_id: "source-a",
+              version: 1,
+            },
+            {
+              source_version_id: "version-a",
+              source_id: "source-a",
+              version: 2,
+            },
+          ],
+          chunks: [
+            {
+              chunk_id: "saved-page",
+              source_version_id: "version-a",
+              ordinal: 0,
+              kind: "paragraph",
+              text: "Saved text from the first page",
+              locator: { kind: "pdf", page: 1 },
+              product_ids: [],
+            },
+          ],
+          facts: [],
+          import_jobs: [
+            {
+              import_job_id: "job-partial",
+              source_id: "source-a",
+              stage: "parse",
+              status: "partial",
+              completed_units: 1,
+              failed_units: 1,
+              errors: [
+                {
+                  page: 2,
+                  code: "ocr_required",
+                  message: "private parser details",
+                },
+              ],
+            },
+          ],
+          impact: {},
+        },
+      }),
+    );
+    renderPath("/app/tenant-a/project-a/knowledge/sources/source-a");
+
+    expect(await screen.findByText("Partially parsed")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Completed 1 page; failed 1 page/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Page 2: No extractable text on this page; scanned content needs OCR",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Saved text from the first page"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Retry failed parts" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("combobox", { name: "View evidence version" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("private parser details"),
+    ).not.toBeInTheDocument();
   });
 });
