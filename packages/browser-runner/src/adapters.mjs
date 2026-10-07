@@ -408,7 +408,7 @@ function validKimiMeasurementPayload(payload) {
 export async function measureKimi(
   page,
   payload,
-  { searchFlow, expectedAccountId } = {},
+  { searchFlow, expectedAccountId, deadlineAt, signal } = {},
 ) {
   if (!validKimiMeasurementPayload(payload))
     return unsupported("invalid_measurement_payload");
@@ -424,7 +424,10 @@ export async function measureKimi(
     return unknown("official_search_provenance_unverified", "measure");
   }
   if (!page) return unsupported("official_web_search_unverified");
-  const observation = await observeKimiConnectSearch(page, payload);
+  const observation = await observeKimiConnectSearch(page, payload, {
+    deadlineAt,
+    signal,
+  });
   if (observation?.reason === "requested_model_unavailable")
     return unsupported("requested_model_unavailable");
   if (!observation)

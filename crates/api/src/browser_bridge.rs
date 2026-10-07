@@ -14,6 +14,19 @@ pub struct BrowserBridge {
 }
 
 impl BrowserBridge {
+    const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const EXECUTE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(130);
+
+    fn execute_request(&self) -> reqwest::RequestBuilder {
+        self.client
+            .post(format!("{}/v1/executions", self.base_url))
+            // The runner owns a 120s hard execution deadline. Only this
+            // one-shot request may wait longer than the client's usual 60s,
+            // so Rust can receive its completed or unknown receipt.
+            .timeout(Self::EXECUTE_REQUEST_TIMEOUT)
+            .bearer_auth(&self.token)
+    }
+
     pub(crate) fn desktop_connection(&self, id: Uuid) -> Result<(String, String), AppError> {
         let mut url = reqwest::Url::parse(&self.endpoint(id, "/desktop"))
             .map_err(|_| AppError::new(ErrorCode::Internal, "browser runner URL invalid"))?;
@@ -82,7 +95,7 @@ impl BrowserBridge {
         }
         let base_url = base_url.trim_end_matches('/').to_string();
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(Self::DEFAULT_REQUEST_TIMEOUT)
             // Bearer credentials never follow a redirect, including one to
             // another origin.
             .redirect(reqwest::redirect::Policy::none())
@@ -261,9 +274,7 @@ impl BrowserBridge {
             return Err(AppError::invalid_request("unsupported browser operation"));
         }
         let response = self
-            .client
-            .post(format!("{}/v1/executions", self.base_url))
-            .bearer_auth(&self.token)
+            .execute_request()
             .json(&serde_json::json!({
                 "execution_id":execution_id,
                 "session_id":session_id,
@@ -420,6 +431,31 @@ pub struct VerifiedBrowserSession {
 #[cfg(test)]
 mod measurement_options_tests {
     use super::*;
+
+    #[test]
+    fn execute_timeout_outlives_runner_without_extending_other_requests() {
+        let bridge =
+            BrowserBridge::new("http://127.0.0.1:1234".into(), "fixture-token".into()).unwrap();
+        assert_eq!(
+            BrowserBridge::DEFAULT_REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(60)
+        );
+        assert!(BrowserBridge::EXECUTE_REQUEST_TIMEOUT > std::time::Duration::from_secs(120));
+        assert_eq!(
+            bridge.execute_request().build().unwrap().timeout(),
+            Some(&BrowserBridge::EXECUTE_REQUEST_TIMEOUT)
+        );
+        assert_eq!(
+            bridge
+                .client
+                .get(format!("{}/v1/capabilities", bridge.base_url))
+                .build()
+                .unwrap()
+                .timeout(),
+            None,
+            "ordinary requests inherit the client's 60-second timeout"
+        );
+    }
 
     #[test]
     fn model_menu_rejects_unobserved_selection_and_duplicate_or_unsafe_ids() {

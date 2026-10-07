@@ -748,6 +748,8 @@ test("idle contexts and settled cache expire, but active execution is never reap
 
 test("a stalled execution expires as unknown and closes its context", async () => {
   let closed = 0;
+  let executionSignal;
+  let executionDeadlineAt;
   const stalled = createRunner({
     browserType: {
       async launch() {
@@ -780,7 +782,9 @@ test("a stalled execution expires as unknown and closes its context", async () =
         async identify() {
           return { platform_account_id: "own-1", display_name: "Owner" };
         },
-        async execute() {
+        async execute(_page, _operation, _payload, network) {
+          executionSignal = network.signal;
+          executionDeadlineAt = network.deadlineAt;
           return new Promise(() => {});
         },
       },
@@ -808,6 +812,9 @@ test("a stalled execution expires as unknown and closes its context", async () =
       reason: "execution_deadline",
       evidence: [],
     });
+    assert.equal(executionSignal.aborted, true);
+    assert.ok(Number.isFinite(executionDeadlineAt));
+    assert.ok(performance.now() >= executionDeadlineAt);
     assert.equal(closed, 1);
     await assert.rejects(
       stalled.status("stalled"),

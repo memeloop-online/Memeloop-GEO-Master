@@ -509,9 +509,14 @@ export function createRunner(options = {}) {
     const entry = { fingerprint, promise: null, settledAt: null };
     const promise = (async () => {
       const deadline = Symbol("execution_deadline");
+      const deadlineAt = performance.now() + executionTimeoutMs;
+      const controller = new AbortController();
       let timer;
       const timeout = new Promise((resolve) => {
-        timer = setTimeout(() => resolve(deadline), executionTimeoutMs);
+        timer = setTimeout(() => {
+          controller.abort();
+          resolve(deadline);
+        }, executionTimeoutMs);
       });
       function timedOut() {
         // The external side effect may have happened. Closing this browser
@@ -552,6 +557,8 @@ export function createRunner(options = {}) {
           record.adapter.execute(record.page, input.operation, input.payload, {
             proxy: record.proxy,
             expectedAccountId: record.identity.platform_account_id,
+            deadlineAt,
+            signal: controller.signal,
           }),
           timeout,
         ]);

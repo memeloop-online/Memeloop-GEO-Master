@@ -366,7 +366,7 @@ async function configureKimiSearch(page, model) {
 export async function observeKimiConnectSearch(
   page,
   payload,
-  { trustedOrigin = ORIGIN, timeoutMs = 30_000 } = {},
+  { trustedOrigin = ORIGIN, timeoutMs = 30_000, deadlineAt, signal } = {},
 ) {
   if (
     !page ||
@@ -401,10 +401,20 @@ export async function observeKimiConnectSearch(
       '[role="textbox"][contenteditable="true"].chat-input-editor',
     );
     if (!(await composer.isVisible())) return null;
+    if (signal?.aborted) return null;
     await composer.fill(payload.question);
+    // The runner's monotonic deadline includes its identity and UI setup.
+    // Standalone fixture calls retain their explicit/default capture timeout.
+    if (deadlineAt !== undefined) {
+      const remaining = deadlineAt - performance.now();
+      if (!Number.isFinite(remaining) || remaining <= 0) return null;
+      timeoutMs = Math.min(120_000, Math.max(1, Math.floor(remaining)));
+    }
+    if (signal?.aborted) return null;
     const captured = await captureConnectExchange(page, {
       endpoint: `${trustedOrigin}${CHAT_PATH}`,
       timeoutMs,
+      signal,
       maxMessages: 32_768,
       matchRequest(candidate) {
         const body = requestBody(candidate, payload.question, payload.model);

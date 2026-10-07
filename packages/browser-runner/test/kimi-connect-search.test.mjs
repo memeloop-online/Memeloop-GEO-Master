@@ -360,17 +360,22 @@ test("browser UI submits exactly once and its captured framed request creates v2
   let sends = 0;
   let cookieSeen = false;
   let alreadyEnabled = false;
+  let responseDelayMs = 0;
+  let omitEnd = false;
+  let navigationDelayMs = 0;
+  let abortOnRequest;
   const server = createServer((incoming, reply) => {
     if (incoming.url === "/" && incoming.method === "GET") {
       reply.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "set-cookie": "session=fixture-only; HttpOnly; SameSite=Lax",
       });
-      reply.end(
-        alreadyEnabled
-          ? pageHtml.replace('aria-checked="false"', 'aria-checked="true"')
-          : pageHtml,
-      );
+      const html = alreadyEnabled
+        ? pageHtml.replace('aria-checked="false"', 'aria-checked="true"')
+        : pageHtml;
+      if (navigationDelayMs)
+        setTimeout(() => reply.end(html), navigationDelayMs);
+      else reply.end(html);
       return;
     }
     if (
@@ -379,9 +384,14 @@ test("browser UI submits exactly once and its captured framed request creates v2
     ) {
       sends += 1;
       cookieSeen = incoming.headers.cookie === "session=fixture-only";
+      if (abortOnRequest) setTimeout(() => abortOnRequest.abort(), 0);
       reply.writeHead(200, { "content-type": "application/connect+json" });
-      for (const event of messages) reply.write(frame(0, event));
-      reply.end(frame(2, {}));
+      const finish = () => {
+        for (const event of messages) reply.write(frame(0, event));
+        reply.end(omitEnd ? undefined : frame(2, {}));
+      };
+      if (responseDelayMs) setTimeout(finish, responseDelayMs);
+      else finish();
       return;
     }
     reply.writeHead(404).end();
@@ -416,6 +426,72 @@ test("browser UI submits exactly once and its captured framed request creates v2
     });
     assert.equal(alreadyOn?.raw_answer, "An answer.");
     assert.equal(sends, 2, "each independent observation submits once");
+    responseDelayMs = 75;
+    const afterDefaultCapture = await observeKimiConnectSearch(page, frozen, {
+      trustedOrigin: origin,
+      timeoutMs: 10,
+      deadlineAt: performance.now() + 6_000,
+    });
+    assert.equal(afterDefaultCapture?.raw_answer, "An answer.");
+    assert.equal(sends, 3, "the runner's remaining budget bounds capture");
+    navigationDelayMs = 150;
+    assert.equal(
+      await observeKimiConnectSearch(page, frozen, {
+        trustedOrigin: origin,
+        deadlineAt: performance.now() + 30,
+      }),
+      null,
+      "a budget consumed during UI setup cannot submit",
+    );
+    navigationDelayMs = 0;
+    assert.equal(sends, 3);
+    assert.equal(
+      await observeKimiConnectSearch(page, frozen, {
+        trustedOrigin: origin,
+        deadlineAt: performance.now() - 1,
+      }),
+      null,
+      "an expired runner budget cannot submit another question",
+    );
+    assert.equal(sends, 3);
+    const cancelledBeforeSetup = new AbortController();
+    cancelledBeforeSetup.abort();
+    assert.equal(
+      await observeKimiConnectSearch(page, frozen, {
+        trustedOrigin: origin,
+        signal: cancelledBeforeSetup.signal,
+      }),
+      null,
+    );
+    assert.equal(sends, 3, "an aborted runner cannot submit");
+    responseDelayMs = 0;
+    omitEnd = true;
+    assert.equal(
+      await observeKimiConnectSearch(page, frozen, {
+        trustedOrigin: origin,
+        deadlineAt: performance.now() + 1_000,
+      }),
+      null,
+      "a streamed answer without the Connect end frame is not evidence",
+    );
+    assert.equal(sends, 4);
+    omitEnd = false;
+    responseDelayMs = 150;
+    abortOnRequest = new AbortController();
+    const responseListeners = page.listenerCount("response");
+    assert.equal(
+      await observeKimiConnectSearch(page, frozen, {
+        trustedOrigin: origin,
+        deadlineAt: performance.now() + 6_000,
+        signal: abortOnRequest.signal,
+      }),
+      null,
+      "a cancelled capture cannot accept a later valid response",
+    );
+    assert.equal(abortOnRequest.signal.aborted, true);
+    assert.equal(sends, 5);
+    assert.equal(page.listenerCount("response"), responseListeners);
+    abortOnRequest = undefined;
     // Runner stays fixture-stamped; a synthetic trace cannot verify a real account.
     assert.equal(
       (await measureKimi(null, frozen, { expectedAccountId: "fixture" }))
