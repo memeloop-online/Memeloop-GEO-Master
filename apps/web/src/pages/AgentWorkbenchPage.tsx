@@ -107,18 +107,18 @@ function orderedRuns(runs: readonly AgentRun[]) {
   );
 }
 
-function unavailableRuntimeNotice(
-  runs: readonly AgentRun[],
+function terminalRunNotice(
+  run: AgentRun | undefined,
   missing: string,
   unavailable: string,
+  failed: string,
+  cancelled: string,
 ) {
-  const failedRun = orderedRuns(runs).find(
-    (run) =>
-      run.status === "failed" &&
-      ["missing", "unavailable"].includes(run.capability.status),
-  );
-  if (!failedRun) return undefined;
-  return failedRun.capability.status === "missing" ? missing : unavailable;
+  if (run?.status === "cancelled") return cancelled;
+  if (run?.status !== "failed") return undefined;
+  if (run.capability.status === "missing") return missing;
+  if (run.capability.status === "unavailable") return unavailable;
+  return failed;
 }
 
 interface PendingAttachment {
@@ -255,17 +255,30 @@ function AgentChat({
     { signature: string; key: string } | undefined
   >(undefined);
   const selectedFile = attachments[0]?.file;
-  const activeRun = orderedRuns(conversation.runs).find((run) =>
-    ["queued", "running"].includes(run.status),
+  const latestRun = orderedRuns(conversation.runs)[0];
+  const activeRun =
+    latestRun && ["queued", "running"].includes(latestRun.status)
+      ? latestRun
+      : undefined;
+  const localTurnIsTerminal = conversation.runs.some(
+    (run) =>
+      run.turn_id === localTurnId &&
+      ["succeeded", "failed", "cancelled"].includes(run.status),
   );
-  const activeTurnId = activeRun?.turn_id ?? localTurnId;
-  const capabilityNotice = unavailableRuntimeNotice(
-    conversation.runs,
+  const activeTurnId =
+    activeRun?.turn_id ?? (localTurnIsTerminal ? undefined : localTurnId);
+  const persistedNotice = terminalRunNotice(
+    latestRun,
     t("chatWorkbench.runtimeMissing"),
     t("chatWorkbench.runtimeUnavailable"),
+    t("chatWorkbench.runFailed"),
+    t("chatWorkbench.runCancelled"),
   );
   const displayedRuntimeNotice =
-    capabilityNotice ?? (runtimeNotice ? t(runtimeNotice) : undefined);
+    persistedNotice ?? (runtimeNotice ? t(runtimeNotice) : undefined);
+  useEffect(() => {
+    if (localTurnId && localTurnIsTerminal) setLocalTurnId(undefined);
+  }, [localTurnId, localTurnIsTerminal]);
   const latestAnswer = [...conversation.messages]
     .filter((message) => message.role === "assistant")
     .sort((a, b) => b.sequence - a.sequence)[0];
@@ -365,7 +378,11 @@ function AgentChat({
       messages: conversation.messages.map(projectMessage),
       isRunning: Boolean(activeTurnId),
       isLoading: false,
-      error: null,
+      error:
+        latestRun?.status === "failed" &&
+        latestRun.capability.status === "available"
+          ? new Error(t("chatWorkbench.runFailed"))
+          : null,
       sendMessage: async ({ text, file }) => {
         if (submissionInFlight.current) return;
         const content = text.trim();
@@ -473,12 +490,15 @@ function AgentChat({
       activeTurnId,
       conversation.conversation.id,
       conversation.messages,
+      latestRun?.status,
+      latestRun?.capability.status,
       onRefresh,
       onFirstMessage,
       projectId,
       attachments,
       attachmentNotice,
       tenantId,
+      t,
     ],
   );
 
@@ -514,7 +534,11 @@ function AgentChat({
         </div>
         {activeTurnId && (
           <span className="agent-run-state" aria-live="polite">
-            {t("chatWorkbench.running")}
+            {t(
+              activeRun?.status === "queued"
+                ? "chatWorkbench.queued"
+                : "chatWorkbench.running",
+            )}
           </span>
         )}
       </div>
@@ -591,7 +615,19 @@ function AgentChat({
       )}
       {displayedRuntimeNotice && (
         <MessageBar intent="warning" className="agent-runtime-notice">
-          <MessageBarBody>{displayedRuntimeNotice}</MessageBarBody>
+          <MessageBarBody>
+            {displayedRuntimeNotice}
+            {persistedNotice && (
+              <Button
+                appearance="subtle"
+                size="small"
+                icon={<ArrowSyncRegular />}
+                onClick={() => void onRefresh()}
+              >
+                {t("chatWorkbench.reload")}
+              </Button>
+            )}
+          </MessageBarBody>
         </MessageBar>
       )}
       <div className="agent-chat-surface">
@@ -636,7 +672,11 @@ function AgentChat({
             }}
             emptyMessage={t("chatWorkbench.noMessages")}
             loadingMessage={t("chatWorkbench.reading")}
-            genericErrorMessage={t("chatWorkbench.readFailed")}
+            genericErrorMessage={
+              latestRun?.status === "failed"
+                ? t("chatWorkbench.runFailed")
+                : t("chatWorkbench.readFailed")
+            }
             operationErrorMessage={t("chatWorkbench.noReply")}
             showTurnActions={false}
             showTimeline={false}

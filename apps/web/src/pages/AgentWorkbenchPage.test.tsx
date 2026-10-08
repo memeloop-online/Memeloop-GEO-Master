@@ -97,6 +97,277 @@ afterEach(async () => {
 });
 
 describe("P00 AI workbench routing", () => {
+  it.each([
+    ["failed", "这次回复未完成。请刷新查看最新状态，或编辑后发送新消息。"],
+    ["cancelled", "这次运行已取消。你可以编辑后发送新消息。"],
+  ])(
+    "shows a persisted %s turn after loading the conversation",
+    async (status, notice) => {
+      const conversation = {
+        id: "conversation-a",
+        title: "对话",
+        status: "active",
+        revision: 1,
+        created_at: "2026-09-19T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+      };
+      const fetchMock = vi.fn(
+        (request: RequestInfo | URL, _init?: RequestInit) => {
+          const path = new URL(String(request), "http://localhost").pathname;
+          if (path.endsWith("/auth/session"))
+            return Promise.resolve(response(session));
+          if (path.endsWith("/agent/conversations/conversation-a")) {
+            return Promise.resolve(
+              response({
+                conversation,
+                messages: [
+                  {
+                    id: "message-a",
+                    conversation_id: conversation.id,
+                    turn_id: "turn-a",
+                    role: "user",
+                    content: "Help with this task",
+                    attachments: [],
+                    metadata: {},
+                    sequence: 1,
+                    created_at: conversation.created_at,
+                  },
+                ],
+                turns: [{ id: "turn-a", status }],
+                runs: [
+                  {
+                    id: "run-a",
+                    conversation_id: conversation.id,
+                    turn_id: "turn-a",
+                    status,
+                    capability: { status: "available", runtime: "deno_core" },
+                    error: status === "failed" ? { code: "internal" } : null,
+                    cancel_version: 0,
+                    created_at: conversation.created_at,
+                    updated_at: conversation.updated_at,
+                  },
+                ],
+              }),
+            );
+          }
+          if (path.endsWith("/agent/conversations"))
+            return Promise.resolve(
+              response({ items: [conversation], next_cursor: null }),
+            );
+          return Promise.resolve(response({ items: [], next_cursor: null }));
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      renderApp("/app/tenant-a/project-a/chat/conversation-a");
+      expect(await screen.findByText(notice)).toBeInTheDocument();
+      expect(screen.getByText("Help with this task")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "取消运行" })).toBeNull();
+      const before = fetchMock.mock.calls.length;
+      await userEvent
+        .setup()
+        .click(screen.getByRole("button", { name: "重新加载对话" }));
+      await waitFor(() =>
+        expect(fetchMock.mock.calls.length).toBeGreaterThan(before),
+      );
+      expect(
+        fetchMock.mock.calls.some(
+          ([, init]) => (init as RequestInit | undefined)?.method === "POST",
+        ),
+      ).toBe(false);
+      await act(async () => {
+        await i18n.changeLanguage("en");
+      });
+      expect(
+        screen.getByText(
+          status === "failed"
+            ? "This reply did not finish. Refresh for the latest status, or edit and send a new message."
+            : "This run was cancelled. You can edit and send a new message.",
+        ),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it.each(["queued", "running"])(
+    "keeps the native cancel action for a persisted %s run",
+    async (status) => {
+      const conversation = {
+        id: "conversation-a",
+        title: "对话",
+        status: "active",
+        revision: 1,
+        created_at: "2026-09-19T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+      };
+      let cancelled = false;
+      const requests: Array<{ path: string; method?: string }> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(request), "http://localhost").pathname;
+          requests.push({ path, method: init?.method });
+          if (path.endsWith("/auth/session"))
+            return Promise.resolve(response(session));
+          if (path.endsWith("/agent/turns/turn-a/cancel")) {
+            cancelled = true;
+            return Promise.resolve(response({ status: "cancelled" }));
+          }
+          if (path.endsWith("/agent/conversations/conversation-a"))
+            return Promise.resolve(
+              response({
+                conversation,
+                messages: [],
+                turns: [],
+                runs: [
+                  {
+                    id: "run-a",
+                    conversation_id: conversation.id,
+                    turn_id: "turn-a",
+                    status: cancelled ? "cancelled" : status,
+                    capability: { status: "available", runtime: "deno_core" },
+                    cancel_version: 0,
+                    created_at: conversation.created_at,
+                    updated_at: conversation.updated_at,
+                  },
+                ],
+              }),
+            );
+          return Promise.resolve(
+            response({ items: [conversation], next_cursor: null }),
+          );
+        }),
+      );
+      renderApp("/app/tenant-a/project-a/chat/conversation-a");
+      expect(
+        await screen.findByText(status === "queued" ? "等待运行" : "正在运行"),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "取消运行" }),
+      ).toBeInTheDocument();
+      await userEvent
+        .setup()
+        .click(screen.getByRole("button", { name: "取消运行" }));
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: "取消运行" })).toBeNull(),
+      );
+      expect(
+        requests.filter(
+          ({ path, method }) =>
+            path.endsWith("/agent/turns/turn-a/cancel") && method === "POST",
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("reconciles a local accepted turn with its later persisted failure", async () => {
+    const conversation = {
+      id: "conversation-a",
+      title: "对话",
+      status: "active",
+      revision: 1,
+      created_at: "2026-09-19T00:00:00Z",
+      updated_at: "2026-09-19T00:00:00Z",
+    };
+    let terminal = false;
+    let stream:
+      | { onmessage?: (event: { data: string; lastEventId: string }) => void }
+      | undefined;
+    vi.stubGlobal(
+      "EventSource",
+      class {
+        onmessage?: (event: { data: string; lastEventId: string }) => void;
+        constructor() {
+          stream = this;
+        }
+        close() {}
+      },
+    );
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(request), "http://localhost").pathname;
+        if (path.endsWith("/auth/session"))
+          return Promise.resolve(response(session));
+        if (init?.method === "POST")
+          return Promise.resolve(
+            response({
+              conversation_id: conversation.id,
+              turn_id: "turn-a",
+              run_id: "run-a",
+              run_status: "queued",
+              status: "accepted",
+              events_url: "/events",
+            }),
+          );
+        if (path.endsWith("/agent/conversations/conversation-a"))
+          return Promise.resolve(
+            response({
+              conversation,
+              messages: terminal
+                ? [
+                    {
+                      id: "message-a",
+                      conversation_id: conversation.id,
+                      turn_id: "turn-a",
+                      role: "user",
+                      content: "One request",
+                      attachments: [],
+                      metadata: {},
+                      sequence: 1,
+                      created_at: conversation.created_at,
+                    },
+                  ]
+                : [],
+              turns: [],
+              runs: terminal
+                ? [
+                    {
+                      id: "run-a",
+                      conversation_id: conversation.id,
+                      turn_id: "turn-a",
+                      status: "failed",
+                      capability: { status: "available", runtime: "deno_core" },
+                      error: { code: "internal" },
+                      cancel_version: 0,
+                      created_at: conversation.created_at,
+                      updated_at: conversation.updated_at,
+                    },
+                  ]
+                : [],
+            }),
+          );
+        return Promise.resolve(
+          response({ items: [conversation], next_cursor: null }),
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp("/app/tenant-a/project-a/chat/conversation-a");
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("输入任务"), "One request");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    expect(
+      await screen.findByRole("button", { name: "取消运行" }),
+    ).toBeInTheDocument();
+    terminal = true;
+    await act(async () => {
+      stream?.onmessage?.({ data: "{}", lastEventId: "1" });
+    });
+    expect(
+      await screen.findByText(
+        "这次回复未完成。请刷新查看最新状态，或编辑后发送新消息。",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "取消运行" })).toBeNull(),
+    );
+    await user.type(screen.getByLabelText("输入任务"), "Next message");
+    expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([, init]) => (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(1);
+  });
+
   it.each([3, 0, -1, "3", null])(
     "shows an omission notice only for a valid latest assistant count (%s)",
     async (count) => {

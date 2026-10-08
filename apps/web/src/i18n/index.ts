@@ -95,7 +95,10 @@ export const resources = {
         loading: "正在加载对话",
         reload: "重新加载对话",
         noConversations: "还没有对话。",
+        queued: "等待运行",
         running: "正在运行",
+        runFailed: "这次回复未完成。请刷新查看最新状态，或编辑后发送新消息。",
+        runCancelled: "这次运行已取消。你可以编辑后发送新消息。",
         emptyTitle: "从你的资料或想法开始",
         emptyHint: "拖入文件、粘贴资料，或告诉 AI 你想完成的事。",
         emptyDetail: "可以在对话中逐步补充必要信息。",
@@ -404,7 +407,12 @@ export const resources = {
         loading: "Loading conversations",
         reload: "Reload conversations",
         noConversations: "No conversations yet.",
+        queued: "Waiting to run",
         running: "Running",
+        runFailed:
+          "This reply did not finish. Refresh for the latest status, or edit and send a new message.",
+        runCancelled:
+          "This run was cancelled. You can edit and send a new message.",
         emptyTitle: "Start with your files or ideas",
         emptyHint:
           "Drop files, paste information, or tell AI what you want to do.",
