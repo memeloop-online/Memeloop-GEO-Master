@@ -273,10 +273,10 @@ fn completion_inventory<'a>(
             }
             state.role = Some(role);
         }
-        if let Some(chat) = message.get("chat_id") {
-            if chat.as_str() != Some(chat_id) {
-                return None;
-            }
+        if let Some(chat) = message.get("chat_id")
+            && chat.as_str() != Some(chat_id)
+        {
+            return None;
         }
         if let Some(status) = message.get("status") {
             state.completed = matches!(

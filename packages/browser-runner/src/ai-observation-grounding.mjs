@@ -109,12 +109,17 @@ function auditValue(value) {
  * Fixed-vocabulary explanation of a rejected candidate. This is diagnostic
  * only: the validator below remains the sole authority for acceptance.
  */
-export function observationRejectionReason(document, extracted) {
+export function observationRejectionReason(document, extracted, options = {}) {
   let reason;
-  validateObservation(document, extracted, (code) => {
-    reason ??= code;
-    return null;
-  });
+  validateObservation(
+    document,
+    extracted,
+    (code) => {
+      reason ??= code;
+      return null;
+    },
+    options,
+  );
   return reason ?? "grounding_rejected";
 }
 
@@ -123,28 +128,72 @@ export function observationRejectionReason(document, extracted) {
  * optionally, read-only page text. This proves source paths and exact bytes,
  * not the model's semantic judgment that those fields mean official search.
  */
-export function validateAiObservation(document, extracted) {
-  return validateObservation(document, extracted, () => null);
+export function validateAiObservation(document, extracted, options = {}) {
+  return validateObservation(document, extracted, () => null, options);
 }
 
 // Acceptance and diagnostics share the exact checks; the callback receives
 // fixed vocabulary only, never source values, paths, quotes or identifiers.
-function validateObservation(document, extracted, reject) {
-  if (extracted?.decision === "unverified") return reject("model_unverified");
+function validateObservation(
+  document,
+  extracted,
+  reject,
+  { semanticOnly = false } = {},
+) {
+  // Historical v3 replay remains available, but live interpretation explicitly
+  // requires the semantic schema and cannot accept the old identifier contract.
+  const semantic = semanticOnly || !Object.hasOwn(extracted ?? {}, "decision");
+  if (!semantic && extracted?.decision === "unverified")
+    return reject("model_unverified");
   if (
     !object(document) ||
     !Array.isArray(document.messages) ||
     !object(extracted) ||
-    extracted.decision !== "searched_answer" ||
+    (!semantic && extracted.decision !== "searched_answer") ||
     !Array.isArray(extracted.answer_segments) ||
-    extracted.answer_segments.length < 1 ||
+    (!semantic && extracted.answer_segments.length < 1) ||
     extracted.answer_segments.length > MAX_SEGMENTS ||
     !Array.isArray(extracted.citations) ||
     extracted.citations.length > MAX_CITATIONS
   )
     return reject("shape_rejected");
+  if (semantic) {
+    const keys = new Set([
+      "completion",
+      "completion_evidence",
+      "search_used",
+      "search_evidence",
+      "answer_segments",
+      "citations",
+    ]);
+    if (
+      Object.keys(extracted).some((key) => !keys.has(key)) ||
+      !["complete", "incomplete", "unknown"].includes(extracted.completion) ||
+      !["yes", "no", "unknown"].includes(extracted.search_used) ||
+      !Array.isArray(extracted.completion_evidence) ||
+      !Array.isArray(extracted.search_evidence) ||
+      extracted.completion_evidence.length > 256 ||
+      extracted.search_evidence.length > 256
+    )
+      return reject("shape_rejected");
+    if (extracted.completion !== "complete" || extracted.search_used !== "yes")
+      return reject("model_unverified");
+    if (
+      !extracted.completion_evidence.length ||
+      !extracted.search_evidence.length
+    )
+      return reject("evidence_empty");
+  }
 
   const refs = [];
+  // Scalars including false/0 can be exact evidence; interpreting their meaning
+  // belongs to the model, not a provider-field/status allowlist.
+  const selectedEvidence = (value) =>
+    typeof value === "number"
+      ? Number.isFinite(value)
+      : typeof value === "boolean"
+        ? true
+        : nonempty(value);
   const resolve = (
     candidate,
     role,
@@ -154,6 +203,11 @@ function validateObservation(document, extracted, reject) {
   ) => {
     if (!object(candidate) || typeof candidate.path !== "string")
       return reject("path_rejected");
+    if (
+      semantic &&
+      Object.keys(candidate).some((key) => !["path", "quote"].includes(key))
+    )
+      return reject("shape_rejected");
     const found = pointer(document, candidate.path);
     if (!found) return reject("path_rejected");
     let selected = found.value;
@@ -166,7 +220,9 @@ function validateObservation(document, extracted, reject) {
         selected.indexOf(candidate.quote) !==
           selected.lastIndexOf(candidate.quote)
       )
-        return reject("citation_rejected");
+        return reject(
+          role === "citation_url" ? "citation_rejected" : "quote_rejected",
+        );
       selected = candidate.quote;
     }
     if (!valid(selected)) return reject(invalidReason);
@@ -182,25 +238,36 @@ function validateObservation(document, extracted, reject) {
     });
     return selected;
   };
-  const validId = (value) => typeof value === "string" && ID.test(value);
-  const resolveId = (candidate, role) =>
-    resolve(candidate, role, validId, false, "identifier_rejected");
-  const chatId = resolveId(extracted.chat_id, "chat_id");
-  const messageId = resolveId(extracted.message_id, "message_id");
-  const answerOwner = resolveId(extracted.answer_owner, "answer_owner");
-  const searchOwner = resolveId(extracted.search_owner, "search_owner");
-  const blockId = resolveId(extracted.search_block_id, "search_block_id");
-  if (
-    !chatId ||
-    !messageId ||
-    !blockId ||
-    blockId === messageId ||
-    answerOwner !== messageId ||
-    searchOwner !== messageId ||
-    resolve(extracted.completion, "completion") === null ||
-    resolve(extracted.search_activity, "search_activity") === null
-  )
-    return reject("owner_rejected");
+  let chatId, messageId, blockId;
+  if (semantic) {
+    for (const [entries, role] of [
+      [extracted.completion_evidence, "completion"],
+      [extracted.search_evidence, "search_activity"],
+    ]) {
+      for (const entry of entries)
+        if (resolve(entry, role, selectedEvidence, true) === null) return null;
+    }
+  } else {
+    const validId = (value) => typeof value === "string" && ID.test(value);
+    const resolveId = (candidate, role) =>
+      resolve(candidate, role, validId, false, "identifier_rejected");
+    chatId = resolveId(extracted.chat_id, "chat_id");
+    messageId = resolveId(extracted.message_id, "message_id");
+    const answerOwner = resolveId(extracted.answer_owner, "answer_owner");
+    const searchOwner = resolveId(extracted.search_owner, "search_owner");
+    blockId = resolveId(extracted.search_block_id, "search_block_id");
+    if (
+      !chatId ||
+      !messageId ||
+      !blockId ||
+      blockId === messageId ||
+      answerOwner !== messageId ||
+      searchOwner !== messageId ||
+      resolve(extracted.completion, "completion") === null ||
+      resolve(extracted.search_activity, "search_activity") === null
+    )
+      return reject("owner_rejected");
+  }
 
   const segments = [];
   for (const segment of extracted.answer_segments) {
@@ -263,6 +330,11 @@ function validateObservation(document, extracted, reject) {
   const citations = [];
   for (const citation of extracted.citations) {
     if (!object(citation)) return reject("shape_rejected");
+    if (
+      semantic &&
+      Object.keys(citation).some((key) => !["url", "usage"].includes(key))
+    )
+      return reject("shape_rejected");
     const url = resolve(
       citation.url,
       "citation_url",
@@ -270,16 +342,21 @@ function validateObservation(document, extracted, reject) {
       true,
       "citation_rejected",
     );
-    const usage = resolve(citation.usage, "citation_usage");
+    const usage = resolve(
+      citation.usage,
+      "citation_usage",
+      semantic ? selectedEvidence : nonempty,
+      semantic,
+    );
     if (!url || usage === null) return null;
     if (!citations.includes(url)) citations.push(url);
   }
   return {
     raw_answer: rawAnswer,
     citations,
-    chat_id: chatId,
-    message_id: messageId,
-    block_id: blockId,
+    ...(semantic
+      ? { completion: "complete", search_used: "yes" }
+      : { chat_id: chatId, message_id: messageId, block_id: blockId }),
     audit: { method: "llm_grounded", refs },
   };
 }

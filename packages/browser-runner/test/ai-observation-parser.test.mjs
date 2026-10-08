@@ -26,14 +26,10 @@ const exchange = {
   ],
 };
 const extracted = {
-  decision: "searched_answer",
-  chat_id: { path: "/messages/0/conversation" },
-  message_id: { path: "/messages/1/id" },
-  answer_owner: { path: "/messages/3/owner" },
-  search_owner: { path: "/messages/2/owner" },
-  search_block_id: { path: "/messages/2/id" },
-  completion: { path: "/messages/1/state" },
-  search_activity: { path: "/messages/2/result" },
+  completion: "complete",
+  completion_evidence: [{ path: "/messages/1/state" }],
+  search_used: "yes",
+  search_evidence: [{ path: "/messages/2/result" }],
   answer_segments: [{ path: "/messages/3/text" }],
   citations: [
     {
@@ -42,6 +38,7 @@ const extracted = {
     },
   ],
 };
+const unverified = { ...extracted, search_used: "unknown" };
 const config = {
   base: "https://example.org/v1",
   key: "synthetic-test-key",
@@ -131,7 +128,7 @@ test("specific grounding diagnostics persist and emit without source values", as
   const records = [];
   const diagnostics = [];
   const source = structuredClone(exchange);
-  source.messages[1].state = false;
+  source.messages[1].state = "";
   assert.equal(
     await interpretObservation(source, {
       onEvidence: async (record) => records.push(record),
@@ -168,12 +165,39 @@ test("specific grounding diagnostics persist and emit without source values", as
   assert.equal(diagnostics.length, count);
 });
 
+test("non-search and incomplete semantic candidates retain their observed answer before rejection", async () => {
+  for (const changes of [
+    { search_used: "no" },
+    { search_used: "unknown" },
+    { completion: "incomplete" },
+    { completion: "unknown" },
+    { completion: "unknown", answer_segments: [] },
+  ]) {
+    const candidate = { ...extracted, ...changes };
+    const records = [];
+    const result = await interpretObservation(exchange, {
+      onEvidence: async (record) => records.push(record),
+      apiExtract: async () => extraction({ extracted: candidate }),
+    });
+    assert.equal(result, null);
+    assert.deepEqual(
+      records.map((record) => record.phase),
+      ["source", "candidate"],
+    );
+    assert.deepEqual(JSON.parse(records[1].candidate_json), candidate);
+    assert.equal(records[1].grounding_reason, "model_unverified");
+    assert.equal(
+      JSON.parse(records[0].source_json).messages[3].text,
+      exchange.messages[3].text,
+    );
+  }
+});
+
 test("failed extraction emits only allowlisted route diagnostics and preserves null", async () => {
   const diagnostics = [];
   const result = await interpretObservation(exchange, {
     browserExtract: async () => null,
-    apiExtract: async () =>
-      extraction({ extracted: { decision: "unverified" } }),
+    apiExtract: async () => extraction({ extracted: unverified }),
     onDiagnostic: (entry) => diagnostics.push(entry),
   });
   assert.equal(result, null);
@@ -527,7 +551,7 @@ test("browser extraction succeeds first without API and records a document-bound
   assert.equal(result.audit.surface, "consumer_web");
   assert.equal(result.audit.kind, "observation_extraction");
   assert.equal(result.audit.method, "llm_grounded");
-  assert.equal(result.audit.prompt_version, "geo.observation.extract.v1");
+  assert.equal(result.audit.prompt_version, "geo.observation.extract.v2");
   assert.deepEqual(result.audit.attempts, [
     {
       route: "signed_in_browser",
@@ -551,7 +575,6 @@ test("source is delivered before either extractor and rejected candidates remain
   const invalid = {
     ...extracted,
     answer_segments: [{ path: "/messages/99/missing" }],
-    api_key: "synthetic-secret",
   };
   const source = structuredClone(exchange);
   source.messages[0].authorization = "synthetic-secret";
@@ -564,8 +587,7 @@ test("source is delivered before either extractor and rejected candidates remain
       assert.equal(records.length, 1, "source precedes any extraction request");
       return extraction({ extracted: invalid, key: "synthetic-secret" });
     },
-    apiExtract: async () =>
-      extraction({ extracted: { decision: "unverified" } }),
+    apiExtract: async () => extraction({ extracted: unverified }),
   });
   assert.equal(result, null);
   assert.deepEqual(
@@ -620,7 +642,7 @@ test("browser failure or ungrounded output falls back to API on the same source"
       throw new Error("synthetic browser failure");
     },
     async () => null,
-    async () => extraction({ extracted: { decision: "unverified" } }),
+    async () => extraction({ extracted: unverified }),
     async () =>
       extraction({
         extracted: {
@@ -663,7 +685,7 @@ test("invented answers and citation sources from either extraction route stay un
         { url: { path: "/invented/url" }, usage: extracted.citations[0].usage },
       ],
     },
-    { ...extracted, message_id: { path: "/messages/0/conversation" } },
+    { ...extracted, completion_evidence: [{ path: "/invented" }] },
   ]) {
     const result = await interpretObservation(exchange, {
       browserExtract: async () => extraction({ extracted: invalid }),

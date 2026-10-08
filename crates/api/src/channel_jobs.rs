@@ -649,12 +649,37 @@ struct AiConnectSearchEvent {
     source_sha256: String,
 }
 
+/// Browser-response interpretation is independent of provider protocol IDs.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiBrowserSearchEvent {
+    kind: String,
+    source: String,
+    provenance: String,
+    search_used: SearchUsed,
+    observed_at: DateTime<Utc>,
+    request_model: String,
+    request_question_sha256: String,
+    extraction_model: String,
+    extraction_prompt_version: String,
+    source_sha256: String,
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SearchUsed {
+    Yes,
+    No,
+    Unknown,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum SearchEvent {
     Provider(OfficialSearchEvent),
     Connect(ConnectSearchEvent),
     AiConnect(AiConnectSearchEvent),
+    AiBrowser(AiBrowserSearchEvent),
 }
 
 fn extraction_label(value: &str) -> bool {
@@ -727,6 +752,38 @@ impl SearchEvent {
             {
                 Some(event.observed_at)
             }
+            Self::AiBrowser(event)
+                if schema == "geo.measure.official_search.v4"
+                    && event.kind == "official_search_event"
+                    && event.source == "browser_response_ai"
+                    && event.provenance == "live"
+                    && event.search_used == SearchUsed::Yes
+                    && event.request_model == model
+                    && extraction_label(&event.request_model)
+                    && event.request_question_sha256 == question_sha256
+                    && extraction_sha256(&event.request_question_sha256)
+                    && extraction_label(&event.extraction_model)
+                    && event.extraction_prompt_version == "geo.observation.extract.v2"
+                    && extraction_sha256(&event.source_sha256) =>
+            {
+                Some(event.observed_at)
+            }
+            _ => None,
+        }
+    }
+
+    fn extraction_audit_binding(&self) -> Option<(&str, &str, &str)> {
+        match self {
+            Self::AiConnect(event) => Some((
+                &event.extraction_model,
+                &event.extraction_prompt_version,
+                &event.source_sha256,
+            )),
+            Self::AiBrowser(event) => Some((
+                &event.extraction_model,
+                &event.extraction_prompt_version,
+                &event.source_sha256,
+            )),
             _ => None,
         }
     }
@@ -839,12 +896,16 @@ pub(crate) fn measurement_observation(
             .observed_at(&proof.schema_version, model, &proof.question_sha256)?;
     if matches!(
         proof.schema_version.as_str(),
-        "geo.measure.official_search.v2" | "geo.measure.official_search.v3"
+        "geo.measure.official_search.v2"
+            | "geo.measure.official_search.v3"
+            | "geo.measure.official_search.v4"
     ) && (surface != "consumer_web" || search_mode != "web_search")
     {
         return None;
     }
-    if let SearchEvent::AiConnect(event) = &proof.search_event {
+    if let Some((extraction_model, prompt_version, source_sha256)) =
+        proof.search_event.extraction_audit_binding()
+    {
         let mut audits = result
             .evidence
             .iter()
@@ -853,8 +914,7 @@ pub(crate) fn measurement_observation(
         // Sanitized runner input is retained only in tenant-scoped evidence,
         // allowing replay without promoting model interpretation to raw facts.
         let source_json = audit["source_json"].as_str()?;
-        if source_json.len() > 750_000 || sha256_hex(source_json.as_bytes()) != event.source_sha256
-        {
+        if source_json.len() > 750_000 || sha256_hex(source_json.as_bytes()) != source_sha256 {
             return None;
         }
         let source: serde_json::Value = serde_json::from_str(source_json).ok()?;
@@ -863,9 +923,9 @@ pub(crate) fn measurement_observation(
         }
         if audits.next().is_some()
             || audit["method"] != "llm_grounded"
-            || audit["model"].as_str() != Some(event.extraction_model.as_str())
-            || audit["prompt_version"].as_str() != Some(event.extraction_prompt_version.as_str())
-            || audit["source_sha256"].as_str() != Some(event.source_sha256.as_str())
+            || audit["model"].as_str() != Some(extraction_model)
+            || audit["prompt_version"].as_str() != Some(prompt_version)
+            || audit["source_sha256"].as_str() != Some(source_sha256)
             // This is the extractor's surface. API-based interpretation of
             // captured browser bytes does not change the measured surface.
             || !matches!(

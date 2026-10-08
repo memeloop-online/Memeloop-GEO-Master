@@ -60,6 +60,10 @@ enum Receipt {
     AiWrongSchema,
     AiFuture,
     AiFixture,
+    AiBrowser,
+    AiBrowserEventValue(&'static str, &'static str),
+    AiBrowserAuditMismatch(&'static str),
+    AiBrowserFuture,
 }
 
 impl Receipt {
@@ -80,6 +84,20 @@ impl Receipt {
                 | Self::AiWrongSchema
                 | Self::AiFuture
                 | Self::AiFixture
+                | Self::AiBrowser
+                | Self::AiBrowserEventValue(_, _)
+                | Self::AiBrowserAuditMismatch(_)
+                | Self::AiBrowserFuture
+        )
+    }
+
+    fn is_ai_browser(self) -> bool {
+        matches!(
+            self,
+            Self::AiBrowser
+                | Self::AiBrowserEventValue(_, _)
+                | Self::AiBrowserAuditMismatch(_)
+                | Self::AiBrowserFuture
         )
     }
 }
@@ -209,6 +227,28 @@ async fn runner(
                 if matches!(case, Receipt::AiFuture) {
                     proof["search_event"]["observed_at"] = json!(completed_at + Duration::days(1));
                 }
+                if case.is_ai_browser() {
+                    proof["schema_version"] = json!("geo.measure.official_search.v4");
+                    let event = proof["search_event"].as_object_mut().unwrap();
+                    for field in ["chat_id", "message_id", "block_id"] {
+                        event.remove(field);
+                    }
+                    event.insert("source".into(), json!("browser_response_ai"));
+                    event.insert("search_used".into(), json!("yes"));
+                    event.insert(
+                        "extraction_prompt_version".into(),
+                        json!("geo.observation.extract.v2"),
+                    );
+                    if let Receipt::AiBrowserEventValue(field, value) = case {
+                        event.insert(field.into(), json!(value));
+                    }
+                    if matches!(case, Receipt::AiBrowserFuture) {
+                        event.insert(
+                            "observed_at".into(),
+                            json!(completed_at + Duration::days(1)),
+                        );
+                    }
+                }
             }
             let mut evidence = if matches!(case, Receipt::AnswerAlone | Receipt::Unsupported) {
                 vec![]
@@ -237,6 +277,12 @@ async fn runner(
                 });
                 if let Receipt::AiAuditMismatch(field) = case {
                     audit[field] = json!("invalid value");
+                }
+                if case.is_ai_browser() {
+                    audit["prompt_version"] = json!("geo.observation.extract.v2");
+                    if let Receipt::AiBrowserAuditMismatch(field) = case {
+                        audit[field] = json!("invalid value");
+                    }
                 }
                 if matches!(case, Receipt::AiMissingSource) {
                     audit.as_object_mut().unwrap().remove("source_json");
@@ -543,6 +589,59 @@ async fn connect_search_uses_actual_stream_correlation_without_synthetic_request
         assert_eq!(outcome.status, ChannelOutcomeStatus::Missing, "{case:?}");
         assert!(outcome.raw_answer.is_none());
     }
+}
+
+#[tokio::test]
+async fn browser_ai_search_requires_yes_and_bound_audit_without_provider_ids() {
+    let outcome = run(Receipt::AiBrowser).await;
+    assert_eq!(outcome.status, ChannelOutcomeStatus::Observed);
+    assert_eq!(outcome.raw_answer.as_deref(), Some("Original answer"));
+    let event = &outcome.runner_evidence[0]["search_event"];
+    assert_eq!(event["source"], "browser_response_ai");
+    for field in ["chat_id", "message_id", "block_id", "request_id"] {
+        assert!(event.get(field).is_none());
+    }
+    for (field, value) in [
+        ("search_used", "no"),
+        ("search_used", "unknown"),
+        ("search_used", "invalid"),
+        ("kind", "invalid"),
+        ("source", "provider_connect_stream_ai"),
+        ("provenance", "fixture"),
+        ("request_model", "other-model"),
+        ("request_question_sha256", "invalid"),
+        ("extraction_model", ""),
+        ("extraction_prompt_version", "observation.v1"),
+        ("source_sha256", "invalid"),
+        ("chat_id", "unexpected-provider-id"),
+    ] {
+        let outcome = run(Receipt::AiBrowserEventValue(field, value)).await;
+        assert_eq!(
+            outcome.status,
+            ChannelOutcomeStatus::Missing,
+            "{field}={value}"
+        );
+        assert!(outcome.raw_answer.is_none());
+    }
+    for field in [
+        "method",
+        "model",
+        "prompt_version",
+        "source_sha256",
+        "source_json",
+        "surface",
+        "refs",
+    ] {
+        assert_eq!(
+            run(Receipt::AiBrowserAuditMismatch(field)).await.status,
+            ChannelOutcomeStatus::Missing,
+            "{field}"
+        );
+    }
+    assert_eq!(
+        run(Receipt::AiBrowserFuture).await.status,
+        ChannelOutcomeStatus::Missing
+    );
 }
 
 #[tokio::test]

@@ -367,7 +367,12 @@ pub fn optimization_eligible_projection(
                         proof
                             .get("schema_version")
                             .and_then(serde_json::Value::as_str),
-                        Some("geo.measure.official_search.v1" | "geo.measure.official_search.v2")
+                        Some(
+                            "geo.measure.official_search.v1"
+                                | "geo.measure.official_search.v2"
+                                | "geo.measure.official_search.v3"
+                                | "geo.measure.official_search.v4"
+                        )
                     )
                     && proof
                         .get("search_event")
@@ -377,10 +382,25 @@ pub fn optimization_eligible_projection(
                                 == Some("official_search_event")
                                 && event.get("provenance").and_then(serde_json::Value::as_str)
                                     == Some("live")
-                                && matches!(
-                                    event.get("source").and_then(serde_json::Value::as_str),
-                                    Some("provider_search_event" | "provider_connect_stream")
-                                )
+                                && match proof["schema_version"].as_str() {
+                                    Some("geo.measure.official_search.v1") => {
+                                        event.get("source").and_then(serde_json::Value::as_str)
+                                            == Some("provider_search_event")
+                                    }
+                                    Some("geo.measure.official_search.v2") => {
+                                        event.get("source").and_then(serde_json::Value::as_str)
+                                            == Some("provider_connect_stream")
+                                    }
+                                    Some(
+                                        "geo.measure.official_search.v3"
+                                        | "geo.measure.official_search.v4",
+                                    ) => {
+                                        surface == "consumer_web"
+                                            && search_mode == "web_search"
+                                            && semantic_search_projection_valid(proof, outcome)
+                                    }
+                                    _ => false,
+                                }
                                 && event
                                     .get("occurred_at")
                                     .or_else(|| event.get("observed_at"))
@@ -413,6 +433,79 @@ pub fn optimization_eligible_projection(
         cycle_id: plan.cycle_id,
         observations,
     })
+}
+
+/// Re-check semantic provenance when projecting persisted evidence. This does
+/// not interpret provider responses; only the authenticated extractor does.
+fn semantic_search_projection_valid(proof: &serde_json::Value, outcome: &ChannelOutcome) -> bool {
+    let event = &proof["search_event"];
+    let label = |value: &serde_json::Value| {
+        value.as_str().is_some_and(|text| {
+            !text.trim().is_empty() && text.len() <= 200 && !text.chars().any(char::is_control)
+        })
+    };
+    let digest = |value: &serde_json::Value| {
+        value.as_str().is_some_and(|text| {
+            text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    };
+    let version_valid = match proof["schema_version"].as_str() {
+        Some("geo.measure.official_search.v3") => {
+            event["source"] == "provider_connect_stream_ai"
+                && ["chat_id", "message_id", "block_id"].iter().all(|field| {
+                    event[field].as_str().is_some_and(|text| {
+                        !text.is_empty()
+                            && text.len() <= 128
+                            && text.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+                            })
+                    })
+                })
+                && label(&event["extraction_prompt_version"])
+        }
+        Some("geo.measure.official_search.v4") => {
+            event["source"] == "browser_response_ai"
+                && event["search_used"] == "yes"
+                && event["extraction_prompt_version"] == "geo.observation.extract.v2"
+        }
+        _ => false,
+    };
+    if !version_valid
+        || event["request_model"] != proof["model"]
+        || !label(&event["request_model"])
+        || event["request_question_sha256"] != proof["question_sha256"]
+        || !digest(&event["request_question_sha256"])
+        || !label(&event["extraction_model"])
+        || !digest(&event["source_sha256"])
+    {
+        return false;
+    }
+    let mut audits = outcome
+        .runner_evidence
+        .iter()
+        .filter(|value| value["kind"] == "observation_extraction");
+    let Some(audit) = audits.next() else {
+        return false;
+    };
+    let Some(source_json) = audit["source_json"].as_str() else {
+        return false;
+    };
+    audits.next().is_none()
+        && source_json.len() <= 750_000
+        && Some(sha256_hex(source_json.as_bytes()).as_str()) == event["source_sha256"].as_str()
+        && serde_json::from_str::<serde_json::Value>(source_json)
+            .is_ok_and(|source| source.is_object() && source["messages"].is_array())
+        && audit["method"] == "llm_grounded"
+        && audit["model"] == event["extraction_model"]
+        && audit["prompt_version"] == event["extraction_prompt_version"]
+        && audit["source_sha256"] == event["source_sha256"]
+        && matches!(
+            audit["surface"].as_str(),
+            Some("signed_in_browser" | "model_api")
+        )
+        && audit["refs"]
+            .as_array()
+            .is_some_and(|refs| !refs.is_empty())
 }
 
 #[async_trait]
@@ -2030,6 +2123,103 @@ mod tests {
         let serialized = serde_json::to_string(&projected).unwrap();
         for canary in ["HELDOUT", "CANARY", "observed answer", "eligible"] {
             assert!(!serialized.contains(canary));
+        }
+        // Historical and provider-independent AI evidence both require their
+        // retained extraction audit, not merely a recognized schema name.
+        for schema in [
+            "geo.measure.official_search.v3",
+            "geo.measure.official_search.v4",
+        ] {
+            let mut semantic_attempts = attempts.clone();
+            let outcome = semantic_attempts.get_mut(&targets[0].target_id).unwrap()[0]
+                .outcome
+                .as_mut()
+                .unwrap();
+            let source = r#"{"messages":[]}"#;
+            let digest = sha256_hex(source.as_bytes());
+            let proof = &mut outcome.runner_evidence[0];
+            proof["schema_version"] = serde_json::json!(schema);
+            proof["search_event"] = serde_json::json!({
+                "kind":"official_search_event",
+                "provenance":"live",
+                "source":"browser_response_ai",
+                "search_used":"yes",
+                "observed_at":now,
+                "request_model":proof["model"],
+                "request_question_sha256":proof["question_sha256"],
+                "extraction_model":"synthetic-extractor",
+                "extraction_prompt_version":"geo.observation.extract.v2",
+                "source_sha256":digest
+            });
+            if schema.ends_with("v3") {
+                proof["search_event"]["source"] = serde_json::json!("provider_connect_stream_ai");
+                for field in ["chat_id", "message_id", "block_id"] {
+                    proof["search_event"][field] = serde_json::json!("synthetic-id");
+                }
+                proof["search_event"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("search_used");
+            }
+            outcome.runner_evidence.push(serde_json::json!({
+                "kind":"observation_extraction",
+                "method":"llm_grounded",
+                "model":"synthetic-extractor",
+                "prompt_version":"geo.observation.extract.v2",
+                "source_sha256":digest,
+                "source_json":source,
+                "surface":"model_api",
+                "refs":[{"pointer":"/messages","quote":"synthetic"}]
+            }));
+            assert_eq!(
+                optimization_eligible_projection(&scope, &plan, &semantic_attempts, now)
+                    .unwrap()
+                    .observations
+                    .len(),
+                1,
+                "{schema}"
+            );
+            let mut mutations = vec![
+                ("request_model", "different"),
+                ("request_question_sha256", "different"),
+                ("source_sha256", "different"),
+                ("extraction_model", ""),
+                ("source", "different"),
+            ];
+            if schema.ends_with("v4") {
+                mutations.extend([
+                    ("search_used", "no"),
+                    ("search_used", "unknown"),
+                    ("extraction_prompt_version", "old"),
+                ]);
+            }
+            for (field, value) in mutations {
+                let mut invalid = semantic_attempts.clone();
+                invalid.get_mut(&targets[0].target_id).unwrap()[0]
+                    .outcome
+                    .as_mut()
+                    .unwrap()
+                    .runner_evidence[0]["search_event"][field] = serde_json::json!(value);
+                assert!(
+                    optimization_eligible_projection(&scope, &plan, &invalid, now)
+                        .unwrap()
+                        .observations
+                        .is_empty(),
+                    "{schema}: {field}"
+                );
+            }
+            semantic_attempts.get_mut(&targets[0].target_id).unwrap()[0]
+                .outcome
+                .as_mut()
+                .unwrap()
+                .runner_evidence
+                .pop();
+            assert!(
+                optimization_eligible_projection(&scope, &plan, &semantic_attempts, now)
+                    .unwrap()
+                    .observations
+                    .is_empty()
+            );
         }
     }
 

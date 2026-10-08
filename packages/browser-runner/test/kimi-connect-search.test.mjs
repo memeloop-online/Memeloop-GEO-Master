@@ -746,14 +746,17 @@ test("browser UI submits exactly once and its captured framed request creates v2
             kind: "observation_extraction",
             method: "llm_grounded",
             model: "extraction-model",
-            prompt_version: "extract.v1",
+            prompt_version: "geo.observation.extract.v2",
             source_sha256: "b".repeat(64),
           },
         };
       },
     });
     assert.equal(aiObserved.raw_answer, "An answer.");
-    assert.equal(aiObserved.search_event.source, "provider_connect_stream_ai");
+    assert.equal(aiObserved.search_event.source, "browser_response_ai");
+    assert.equal(aiObserved.search_event.search_used, "yes");
+    for (const field of ["chat_id", "message_id", "block_id"])
+      assert.equal(Object.hasOwn(aiObserved.search_event, field), false);
     assert.equal(aiObserved.search_event.request_model, MODEL);
     assert.equal(aiObserved.search_event.extraction_model, "extraction-model");
     assert.equal(aiObserved.search_event.source_sha256, "b".repeat(64));

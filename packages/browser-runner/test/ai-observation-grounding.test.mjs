@@ -69,6 +69,95 @@ const modernExtracted = {
 const validate = (overrides = {}, document = modern) =>
   validateAiObservation(document, { ...modernExtracted, ...overrides });
 
+const semanticSource = {
+  messages: [
+    {
+      finished: false,
+      searched: 0,
+      answer: "Exact observed answer.",
+      reference: "Used https://example.org/source in this answer.",
+    },
+  ],
+};
+const semanticCandidate = {
+  completion: "complete",
+  completion_evidence: [{ path: "/messages/0/finished" }],
+  search_used: "yes",
+  search_evidence: [{ path: "/messages/0/searched" }],
+  answer_segments: [{ path: "/messages/0/answer" }],
+  citations: [
+    {
+      url: {
+        path: "/messages/0/reference",
+        quote: "https://example.org/source",
+      },
+      usage: { path: "/messages/0/reference", quote: "in this answer" },
+    },
+  ],
+};
+
+test("semantic v4 grounds selections without provider identities or status interpretation", () => {
+  const result = validateAiObservation(semanticSource, semanticCandidate, {
+    semanticOnly: true,
+  });
+  assert.equal(result.raw_answer, "Exact observed answer.");
+  assert.deepEqual(result.citations, ["https://example.org/source"]);
+  assert.equal(result.search_used, "yes");
+  assert.equal(result.completion, "complete");
+  for (const field of ["chat_id", "message_id", "block_id"])
+    assert.equal(Object.hasOwn(result, field), false);
+  assert.equal(
+    result.audit.refs.find((ref) => ref.role === "completion").value,
+    false,
+  );
+  assert.equal(
+    result.audit.refs.find((ref) => ref.role === "search_activity").value,
+    0,
+  );
+  const source = structuredClone(semanticSource);
+  source.messages[0].finished = { any_provider_shape: ["final evidence"] };
+  source.messages[0].searched = "Observed search in arbitrary schema";
+  assert.ok(validateAiObservation(source, semanticCandidate));
+  const quoted = structuredClone(semanticCandidate);
+  quoted.search_evidence[0].quote = "Observed search";
+  assert.ok(validateAiObservation(source, quoted));
+  quoted.search_evidence[0].quote = "invented";
+  assert.equal(validateAiObservation(source, quoted), null);
+});
+
+test("semantic v4 rejects ungrounded fields and does not silently accept the legacy contract", () => {
+  for (const change of [
+    (candidate) => (candidate.search_used = "no"),
+    (candidate) => (candidate.search_used = "unknown"),
+    (candidate) => (candidate.completion = "incomplete"),
+    (candidate) => (candidate.completion = "unknown"),
+    (candidate) => (candidate.completion_evidence = []),
+    (candidate) => (candidate.search_evidence = []),
+    (candidate) =>
+      (candidate.search_evidence = Array(257).fill({
+        path: "/messages/0/searched",
+      })),
+    (candidate) => (candidate.search_evidence[0].path = "/messages/99/missing"),
+    (candidate) => (candidate.answer_segments[0].start = 0),
+    (candidate) => (candidate.chat_id = { path: "/messages/0/answer" }),
+    (candidate) => (candidate.citations[0].usage.quote = "invented"),
+    (candidate) =>
+      (candidate.citations[0].url.quote = "https://localhost/private"),
+  ]) {
+    const candidate = structuredClone(semanticCandidate);
+    change(candidate);
+    assert.equal(validateAiObservation(semanticSource, candidate), null);
+  }
+  assert.equal(
+    validateAiObservation(modern, modernExtracted, { semanticOnly: true }),
+    null,
+  );
+  assert.ok(
+    validateAiObservation(modern, modernExtracted),
+    "historical replay remains valid",
+  );
+});
+
 test("every residual grounding failure has a fixed diagnostic without relaxing validation", () => {
   const scenarios = [
     ["identifier_rejected", (document) => (document.messages[0].chat.id = 123)],

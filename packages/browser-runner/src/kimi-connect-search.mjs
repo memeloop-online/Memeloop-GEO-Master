@@ -578,11 +578,9 @@ export async function observeKimiConnectSearch(
       extraction_audit: observation.audit,
       search_event: observation.search_event ?? {
         kind: "official_search_event",
-        source: "provider_connect_stream_ai",
+        source: "browser_response_ai",
         provenance: "live",
-        chat_id: observation.chat_id,
-        message_id: observation.message_id,
-        block_id: observation.block_id,
+        search_used: "yes",
         extraction_model: observation.audit.model,
         extraction_prompt_version: observation.audit.prompt_version,
         source_sha256: observation.audit.source_sha256,

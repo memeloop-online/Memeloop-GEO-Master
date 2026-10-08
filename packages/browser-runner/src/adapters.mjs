@@ -496,7 +496,7 @@ export async function measureKimi(
       {
         kind: "official_search_observation",
         schema_version: observation.extraction_audit
-          ? "geo.measure.official_search.v3"
+          ? "geo.measure.official_search.v4"
           : "geo.measure.official_search.v2",
         target_id: payload.target_id,
         account_id: payload.account_id,
