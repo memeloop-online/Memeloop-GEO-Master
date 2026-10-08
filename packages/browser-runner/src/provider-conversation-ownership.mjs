@@ -36,6 +36,61 @@ export function capturedNewConversationId(exchange) {
 }
 
 /**
+ * Narrow transport lifecycle evidence, not semantic answer extraction.
+ * Incremental messages inherit identity fields, but every explicitly observed
+ * status replaces the earlier status, including unknown/non-final values.
+ * Neither model output nor a terminal Connect frame alone proves completion.
+ */
+export function capturedConversationCompletion(exchange) {
+  if (exchange?.connect_json_terminal !== true) return null;
+  const chatId = capturedNewConversationId(exchange);
+  if (!chatId) return null;
+  const messages = new Map();
+  for (const envelope of exchange.messages) {
+    if (envelope.message == null) continue;
+    const message = envelope.message;
+    if (
+      typeof message !== "object" ||
+      Array.isArray(message) ||
+      typeof message.id !== "string" ||
+      !CHAT_ID.test(message.id)
+    )
+      return null;
+    const state = messages.get(message.id) ?? {};
+    if (Object.hasOwn(message, "role")) {
+      const role = ["assistant", 3].includes(message.role)
+        ? "assistant"
+        : ["user", 2].includes(message.role)
+          ? "user"
+          : null;
+      if (!role || (state.role && state.role !== role)) return null;
+      state.role = role;
+    }
+    if (Object.hasOwn(message, "chat_id")) {
+      if (message.chat_id !== chatId) return null;
+      state.chatId = chatId;
+    }
+    if (Object.hasOwn(message, "status")) state.status = message.status;
+    messages.set(message.id, state);
+  }
+  const assistantIds = [];
+  for (const [id, state] of messages) {
+    if (!state.role || state.chatId !== chatId) return null;
+    if (state.role !== "assistant") continue;
+    if (state.chatId !== chatId || !["COMPLETED", 2].includes(state.status))
+      return null;
+    assistantIds.push(id);
+  }
+  return assistantIds.length
+    ? {
+        protocol: "connect_json",
+        terminal: true,
+        assistant_message_ids: assistantIds,
+      }
+    : null;
+}
+
+/**
  * The optional caller hook is an integration seam for an independently
  * durable resource ledger. A returned { durable: true } acknowledges only
  * the ownership receipt, never the original answer/evidence checkpoint.

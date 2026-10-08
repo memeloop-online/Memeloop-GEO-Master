@@ -13,9 +13,9 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, CapturedConversation, ObservationCaptureInput, ObservationCaptureReceipt,
-    ObservationCaptureRepository, ObservationCaptureSnapshot, ObservationProviderIdentity,
-    TenantScope,
+    AppError, CapturedConversation, ObservationCaptureCompletion, ObservationCaptureInput,
+    ObservationCaptureReceipt, ObservationCaptureRepository, ObservationCaptureSnapshot,
+    ObservationProviderIdentity, TenantScope,
 };
 use geo_provider::SecretEnvelope;
 use ring::{digest, hmac};
@@ -73,6 +73,8 @@ struct CaptureRequest {
     snapshot: ObservationCaptureSnapshot,
     #[serde(default)]
     owned_conversation: Option<CapturedConversation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion: Option<ObservationCaptureCompletion>,
 }
 
 impl ObservationCaptureCallbackService {
@@ -210,6 +212,7 @@ impl ObservationCaptureCallbackService {
                 .ok_or(StatusCode::BAD_REQUEST)?,
             snapshot: request.snapshot,
             owned_conversation: request.owned_conversation,
+            completion: request.completion,
         };
         // Repository checks exact persisted attempt/account and commits bytes
         // before yielding a receipt. Interpretation or remote deletion is not
@@ -404,6 +407,10 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_for_provider("synthetic")
+    }
+
+    fn fixture_for_provider(provider: &str) -> Fixture {
         let scope = TenantScope::new(
             OperatorId::new(Uuid::new_v4()),
             TenantId::new(Uuid::new_v4()),
@@ -425,7 +432,7 @@ mod tests {
                     account_id: Uuid::new_v4(),
                     runner_session_id: Uuid::new_v4(),
                     original_identity: ObservationProviderIdentity {
-                        provider: "synthetic".into(),
+                        provider: provider.into(),
                         platform_account_id: "synthetic-account".into(),
                     },
                 },
@@ -521,6 +528,57 @@ mod tests {
             submit(&fixture.service, &changed, Some(BEARER)).await.0,
             StatusCode::CONFLICT
         );
+    }
+
+    #[tokio::test]
+    async fn completion_is_forwarded_and_bound_to_sealed_provider_identity() {
+        for provider in ["kimi", "synthetic"] {
+            let fixture = fixture_for_provider(provider);
+            let mut request = fixture.body.clone();
+            let source_json = serde_json::json!({"messages": [
+                {"chat": {"id": "synthetic-chat"}},
+                {"message": {"id": "synthetic-message", "chat_id": "synthetic-chat", "role": "assistant", "status": "COMPLETED"}}
+            ]}).to_string();
+            request["snapshot"]["source_sha256"] =
+                serde_json::json!(geo_domain::sha256_hex(source_json.as_bytes()));
+            request["snapshot"]["source_json"] = serde_json::json!(source_json);
+            request["owned_conversation"] = serde_json::json!({
+                "provider": provider, "external_conversation_id": "synthetic-chat",
+                "purpose": "measurement", "correlation": "create_response"
+            });
+            request["completion"] = serde_json::json!({
+                "protocol": "connect_json", "terminal": true,
+                "assistant_message_ids": ["synthetic-message"]
+            });
+            let (status, body) = submit(&fixture.service, &request, Some(BEARER)).await;
+            if provider != "kimi" {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                continue;
+            }
+            assert_eq!(status, StatusCode::OK);
+            let receipt: ObservationCaptureReceipt = serde_json::from_str(&body).unwrap();
+            let stored = fixture
+                .store
+                .get(&fixture.scope, receipt.capture_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.has_complete_conversation_evidence(&fixture.scope));
+            assert_eq!(
+                serde_json::to_value(stored.input.completion).unwrap(),
+                request["completion"]
+            );
+            request["completion"]["terminal"] = serde_json::json!(false);
+            assert_eq!(
+                submit(&fixture.service, &request, Some(BEARER)).await.0,
+                StatusCode::BAD_REQUEST
+            );
+            request["completion"]["protocol"] = serde_json::json!("unknown");
+            assert_eq!(
+                submit(&fixture.service, &request, Some(BEARER)).await.0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
     }
 
     #[tokio::test]

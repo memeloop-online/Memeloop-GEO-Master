@@ -1,4 +1,5 @@
 import { probeKimiAccount } from "./adapters.mjs";
+import { createHash } from "node:crypto";
 
 const ORIGIN = "https://www.kimi.com";
 const CHAT_SERVICE = "/apiv2/kimi.gateway.chat.v1.ChatService/";
@@ -9,6 +10,41 @@ const CHAT_ID = /^[\w-]{1,128}$/u;
 const MAX_RESPONSE_BYTES = 256_000;
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
+const DELETE_CLOSE_MARGIN_MS = 2_000;
+const INVENTORY_SHA256 = /^[0-9a-f]{64}$/;
+
+function retainedMessageInventory(pages) {
+  const inventory = [];
+  const seen = new Set();
+  for (const page of pages) {
+    for (const message of page.messages) {
+      const role =
+        message.role === "user" || message.role === 2
+          ? "user"
+          : message.role === "assistant" || message.role === 3
+            ? "assistant"
+            : null;
+      if (
+        !validId(message.id) ||
+        seen.has(message.id) ||
+        role === null ||
+        (role === "assistant" && !["COMPLETED", 2].includes(message.status))
+      )
+        return null;
+      seen.add(message.id);
+      inventory.push([message.id, role]);
+    }
+  }
+  if (
+    !inventory.some(([, role]) => role === "user") ||
+    !inventory.some(([, role]) => role === "assistant")
+  )
+    return null;
+  inventory.sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
+  return createHash("sha256").update(JSON.stringify(inventory)).digest("hex");
+}
 
 function validId(value) {
   return typeof value === "string" && CHAT_ID.test(value);
@@ -44,14 +80,32 @@ function generating(value) {
 
 // Every request is constructed and executed inside the existing Playwright
 // page. No token, arbitrary URL, or browser navigation is exposed to Node.
-async function connect(page, { trustedOrigin, path, body, timeoutMs }) {
+async function connect(
+  page,
+  { trustedOrigin, path, body, timeoutMs, deleteNotAfterMs },
+) {
   return page.evaluate(
-    async ({ origin, path, body, timeoutMs, limit }) => {
+    async ({
+      origin,
+      path,
+      body,
+      timeoutMs,
+      limit,
+      deleteNotAfterMs,
+      closeMarginMs,
+    }) => {
       if (location.origin !== origin) return { kind: "wrong_origin" };
       const token = localStorage.getItem("access_token");
       const refresh = localStorage.getItem("refresh_token");
       if (!token || !refresh) return { kind: "reauth_required" };
       try {
+        // Include dispatch latency in the absolute grant budget. Do not send
+        // when the full request timeout plus lock-release margin cannot fit.
+        if (deleteNotAfterMs !== undefined) {
+          const remaining = deleteNotAfterMs - Date.now() - closeMarginMs;
+          if (remaining < timeoutMs) return { kind: "authorization_expired" };
+          timeoutMs = Math.min(timeoutMs, remaining);
+        }
         const response = await fetch(path, {
           method: "POST",
           credentials: "same-origin",
@@ -102,6 +156,8 @@ async function connect(page, { trustedOrigin, path, body, timeoutMs }) {
       body,
       timeoutMs,
       limit: MAX_RESPONSE_BYTES,
+      deleteNotAfterMs,
+      closeMarginMs: DELETE_CLOSE_MARGIN_MS,
     },
   );
 }
@@ -190,6 +246,9 @@ export async function recoverKimiConversation(
       if (
         !Array.isArray(data?.messages) ||
         data.messages.length > PAGE_SIZE ||
+        (data.has_more !== undefined && typeof data.has_more !== "boolean") ||
+        (data.next_page_token !== undefined &&
+          typeof data.next_page_token !== "string") ||
         (data.chat_id != null && data.chat_id !== chatId) ||
         generating(data) ||
         data.messages.some(
@@ -267,18 +326,43 @@ export async function deleteKimiConversation(
     if (
       authority?.authorized !== true ||
       authority.platform_account_id !== expectedUserId ||
-      authority.external_conversation_id !== chatId
+      authority.external_conversation_id !== chatId ||
+      typeof authority.retained_message_inventory_sha256 !== "string" ||
+      !INVENTORY_SHA256.test(authority.retained_message_inventory_sha256)
     )
       return { status: "retained", reason: "authorization_required" };
     // Re-check after the awaited ledger authorization: the account or
     // conversation may have changed while the caller consulted durable state.
-    const second = await inspect(page, options);
-    if (second.status !== "matched") return second;
+    const second = await recoverKimiConversation(page, options);
+    if (second.status !== "recovered") return second;
+    // Ownership of the chat does not imply ownership/durability of every turn:
+    // a user may have appended messages since the original capture. Require
+    // complete bounded pagination and an exact retained-message inventory.
+    // This cannot atomically exclude edits between this read and provider delete.
+    const inventory = retainedMessageInventory(second.message_pages);
+    if (!inventory || inventory !== authority.retained_message_inventory_sha256)
+      return { status: "retained", reason: "message_inventory_mismatch" };
+    // Production authority carries the claim/ticket deadline. Recheck after
+    // the final read, immediately before the only destructive request.
+    const deleteNotAfterMs =
+      authority.delete_not_after === undefined
+        ? undefined
+        : Date.parse(authority.delete_not_after);
+    if (
+      authority.delete_not_after !== undefined &&
+      (typeof authority.delete_not_after !== "string" ||
+        !Number.isFinite(deleteNotAfterMs) ||
+        deleteNotAfterMs - Date.now() < timeoutMs + DELETE_CLOSE_MARGIN_MS)
+    )
+      return { status: "retained", reason: "authorization_required" };
     const response = await connect(page, {
       ...options,
       path: DELETE_CHAT,
       body: { chat_id: chatId },
+      deleteNotAfterMs,
     });
+    if (response.kind === "authorization_expired")
+      return { status: "retained", reason: "authorization_required" };
     if (response.kind !== "ok")
       return {
         status:

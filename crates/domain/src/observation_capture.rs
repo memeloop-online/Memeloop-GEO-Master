@@ -75,6 +75,21 @@ pub struct ObservationProviderIdentity {
     pub platform_account_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationCompletionProtocol {
+    ConnectJson,
+}
+
+/// Transport lifecycle proof, independent of answer interpretation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationCaptureCompletion {
+    pub protocol: ObservationCompletionProtocol,
+    pub terminal: bool,
+    pub assistant_message_ids: Vec<String>,
+}
+
 impl ObservationProviderIdentity {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.provider.is_empty()
@@ -112,6 +127,8 @@ pub struct ObservationCaptureInput {
     pub observed_at: DateTime<Utc>,
     pub snapshot: ObservationCaptureSnapshot,
     pub owned_conversation: Option<CapturedConversation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<ObservationCaptureCompletion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +143,161 @@ pub struct ObservationCaptureReceipt {
 pub struct ObservationCapture {
     pub input: ObservationCaptureInput,
     pub receipt: ObservationCaptureReceipt,
+}
+
+impl ObservationCapture {
+    /// This is necessary, not sufficient, for cleanup: callers must still
+    /// authorize the exact persisted owner, attempt and original account.
+    pub fn has_complete_conversation_evidence(&self, scope: &TenantScope) -> bool {
+        self.input.completion.is_some()
+            && self.receipt.capture_id == self.input.capture_id
+            && self.receipt.schema_version == 1
+            && self
+                .input
+                .validate(scope)
+                .is_ok_and(|digest| digest == self.receipt.digest_sha256)
+    }
+
+    /// Canonical inventory of all retained messages, including user turns.
+    /// The remote adapter must compare its fully paginated inventory before
+    /// deletion; assistant completion alone does not cover later added turns.
+    pub fn retained_message_inventory_sha256(&self, scope: &TenantScope) -> Option<String> {
+        if !self.has_complete_conversation_evidence(scope) {
+            return None;
+        }
+        let source_json = match &self.input.snapshot {
+            ObservationCaptureSnapshot::Source { source_json, .. }
+            | ObservationCaptureSnapshot::Extraction { source_json, .. } => source_json,
+            ObservationCaptureSnapshot::Candidate { .. } => return None,
+        };
+        let document = serde_json::from_str(source_json).ok()?;
+        let inventory = completion_inventory(
+            &document,
+            &self
+                .input
+                .owned_conversation
+                .as_ref()?
+                .external_conversation_id,
+            self.input.completion.as_ref()?,
+        )?;
+        Some(hex::encode(Sha256::digest(
+            serde_json::to_vec(&inventory).ok()?,
+        )))
+    }
+}
+
+fn valid_message_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn completion_matches(
+    document: &serde_json::Value,
+    chat_id: &str,
+    completion: &ObservationCaptureCompletion,
+) -> bool {
+    completion_inventory(document, chat_id, completion).is_some()
+}
+
+fn completion_inventory<'a>(
+    document: &'a serde_json::Value,
+    chat_id: &str,
+    completion: &ObservationCaptureCompletion,
+) -> Option<Vec<(&'a str, &'static str)>> {
+    use serde_json::Value;
+    if !completion.terminal
+        || completion.assistant_message_ids.is_empty()
+        || completion.assistant_message_ids.len() > 256
+        || completion
+            .assistant_message_ids
+            .iter()
+            .any(|id| !valid_message_id(id))
+    {
+        return None;
+    }
+    let envelopes = document.get("messages").and_then(Value::as_array)?;
+    #[derive(Default)]
+    struct MessageState {
+        role: Option<bool>,
+        bound: bool,
+        completed: bool,
+    }
+    let mut states: HashMap<&str, MessageState> = HashMap::new();
+    let mut order = Vec::new();
+    let mut saw_chat = false;
+    for envelope in envelopes {
+        let fields = envelope.as_object()?;
+        if fields.get("error").is_some_and(|value| !value.is_null())
+            || ["chat", "message", "block", "ref", "done"]
+                .iter()
+                .filter(|key| fields.get(**key).is_some_and(|value| !value.is_null()))
+                .count()
+                > 1
+        {
+            return None;
+        }
+        if let Some(chat) = fields.get("chat").filter(|value| !value.is_null()) {
+            if chat.get("id").and_then(Value::as_str) != Some(chat_id) {
+                return None;
+            }
+            saw_chat = true;
+        }
+        let Some(message) = fields.get("message").filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let message = message.as_object()?;
+        let id = message
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| valid_message_id(id))?;
+        if !states.contains_key(id) {
+            order.push(id);
+        }
+        let state = states.entry(id).or_default();
+        if let Some(role) = message.get("role") {
+            let role = match (role.as_str(), role.as_u64()) {
+                (Some("assistant"), _) | (_, Some(3)) => true,
+                (Some("user"), _) | (_, Some(2)) => false,
+                _ => return None,
+            };
+            if state.role.is_some_and(|prior| prior != role) {
+                return None;
+            }
+            state.role = Some(role);
+        }
+        if let Some(chat) = message.get("chat_id") {
+            if chat.as_str() != Some(chat_id) {
+                return None;
+            }
+            state.bound = true;
+        }
+        if let Some(status) = message.get("status") {
+            state.completed = status.as_str() == Some("COMPLETED") || status.as_u64() == Some(2);
+        }
+    }
+    let mut assistants = Vec::new();
+    let mut inventory = Vec::new();
+    for id in order {
+        let state = &states[id];
+        match state.role {
+            Some(true) if state.bound && state.completed => {
+                assistants.push(id);
+                inventory.push((id, "assistant"));
+            }
+            Some(false) if state.bound => inventory.push((id, "user")),
+            _ => return None,
+        }
+    }
+    let matched = saw_chat
+        && assistants
+            .iter()
+            .copied()
+            .eq(completion.assistant_message_ids.iter().map(String::as_str));
+    inventory.sort_unstable_by_key(|(id, _)| *id);
+    matched.then_some(inventory)
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -297,6 +469,22 @@ impl ObservationCaptureInput {
                 {
                     return Err(AppError::invalid_request("invalid source document"));
                 }
+                if let Some(completion) = &self.completion {
+                    let owned = self.owned_conversation.as_ref().filter(|owned| {
+                        owned.provider == "kimi"
+                            && self
+                                .original_identity
+                                .as_ref()
+                                .is_some_and(|identity| identity.provider == owned.provider)
+                    });
+                    if !owned.is_some_and(|owned| {
+                        completion_matches(&document, &owned.external_conversation_id, completion)
+                    }) {
+                        return Err(AppError::invalid_request(
+                            "invalid observation completion evidence",
+                        ));
+                    }
+                }
             }
             ObservationCaptureSnapshot::Candidate {
                 source_capture_id,
@@ -305,6 +493,11 @@ impl ObservationCaptureInput {
                 grounding_reason,
                 ..
             } => {
+                if self.completion.is_some() {
+                    return Err(AppError::invalid_request(
+                        "candidate cannot prove conversation completion",
+                    ));
+                }
                 if self.ordinal == 0
                     || source_capture_id.is_nil()
                     || grounding_reason.as_ref().is_some_and(|reason| {
@@ -503,6 +696,7 @@ mod tests {
                 source_json,
             },
             owned_conversation: None,
+            completion: None,
         }
     }
 
@@ -684,7 +878,15 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("original_identity");
         let decoded: ObservationCaptureInput = serde_json::from_value(legacy.clone()).unwrap();
         assert!(decoded.original_identity.is_none());
+        assert!(decoded.completion.is_none());
         assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        // Exact pre-extension serialized bytes remain the digest input.
+        let serialized = serde_json::to_string(&decoded).unwrap();
+        assert!(!serialized.contains("\"completion\""));
+        assert_eq!(
+            decoded.validate(&scope).unwrap(),
+            hex::encode(Sha256::digest(serialized.as_bytes()))
+        );
         assert!(decoded.validate(&scope).is_ok());
         input.owned_conversation = Some(CapturedConversation {
             provider: "other".into(),
@@ -709,6 +911,259 @@ mod tests {
             .platform_account_id = "synthetic-account".into();
         input.original_identity.as_mut().unwrap().provider = "invalid/provider".into();
         assert!(input.validate(&scope).is_err());
+    }
+
+    fn completed_capture() -> (TenantScope, ObservationCaptureInput, serde_json::Value) {
+        let scope = TenantScope::new(
+            OperatorId::new(Uuid::new_v4()),
+            TenantId::new(Uuid::new_v4()),
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let mut input = source(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        input.original_identity.as_mut().unwrap().provider = "kimi".into();
+        input.owned_conversation = Some(CapturedConversation {
+            provider: "kimi".into(),
+            external_conversation_id: "synthetic-chat".into(),
+            purpose: CapturedConversationPurpose::Measurement,
+            correlation: ConversationCorrelation::CreateResponse,
+        });
+        input.completion = Some(ObservationCaptureCompletion {
+            protocol: ObservationCompletionProtocol::ConnectJson,
+            terminal: true,
+            assistant_message_ids: vec!["synthetic-message".into()],
+        });
+        let document = serde_json::json!({"messages": [
+            {"chat": {"id": "synthetic-chat"}},
+            {"message": {"id": "synthetic-message", "chat_id": "synthetic-chat", "role": "assistant", "status": "COMPLETED"}}
+        ]});
+        replace_source(&mut input, &document);
+        (scope, input, document)
+    }
+
+    fn replace_source(input: &mut ObservationCaptureInput, document: &serde_json::Value) {
+        let raw = document.to_string();
+        input.snapshot = ObservationCaptureSnapshot::Source {
+            source_sha256: hex::encode(Sha256::digest(raw.as_bytes())),
+            source_json: raw,
+        };
+    }
+
+    #[test]
+    fn completion_verifies_raw_source_and_extraction_and_receipt_integrity() {
+        let (scope, input, _) = completed_capture();
+        let digest = input.validate(&scope).unwrap();
+        let mut capture = ObservationCapture {
+            receipt: ObservationCaptureReceipt {
+                capture_id: input.capture_id,
+                schema_version: 1,
+                digest_sha256: digest,
+                stored_at: Utc::now(),
+            },
+            input,
+        };
+        assert!(capture.has_complete_conversation_evidence(&scope));
+        capture.receipt.digest_sha256 = "0".repeat(64);
+        assert!(!capture.has_complete_conversation_evidence(&scope));
+        assert!(capture.retained_message_inventory_sha256(&scope).is_none());
+        capture.input.ordinal = 1;
+        capture.input.owned_conversation.as_mut().unwrap().purpose =
+            CapturedConversationPurpose::Extraction;
+        let ObservationCaptureSnapshot::Source {
+            source_json,
+            source_sha256,
+        } = capture.input.snapshot
+        else {
+            unreachable!();
+        };
+        capture.input.snapshot = ObservationCaptureSnapshot::Extraction {
+            source_capture_id: Uuid::new_v4(),
+            source_json,
+            source_sha256,
+        };
+        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
+        assert!(capture.has_complete_conversation_evidence(&scope));
+        capture.input.completion = None;
+        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
+        assert!(!capture.has_complete_conversation_evidence(&scope));
+    }
+
+    #[test]
+    fn completion_latest_explicit_status_wins_without_interpreting_text() {
+        let (scope, mut input, mut document) = completed_capture();
+        document["messages"][1]["message"]["status"] = serde_json::json!("STREAMING");
+        document["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "message": {"id": "synthetic-message", "status": 2}
+            }));
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_ok());
+        document["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "message": {"id": "synthetic-message", "status": "STREAMING", "text": "COMPLETED"}
+            }));
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_err());
+        input.completion = None;
+        assert!(
+            input.validate(&scope).is_ok(),
+            "partial raw evidence remains retainable"
+        );
+    }
+
+    #[test]
+    fn retained_inventory_is_sorted_deduplicated_and_covers_user_turns() {
+        let (scope, mut input, mut document) = completed_capture();
+        document["messages"].as_array_mut().unwrap().extend([
+            serde_json::json!({"message": {"id": "a-user", "chat_id": "synthetic-chat", "role": 2}}),
+            serde_json::json!({"message": {"id": "synthetic-message", "status": 2}}),
+            serde_json::json!({"message": {"id": "a-user", "text": "incremental"}}),
+        ]);
+        replace_source(&mut input, &document);
+        let mut capture = ObservationCapture {
+            receipt: ObservationCaptureReceipt {
+                capture_id: input.capture_id,
+                schema_version: 1,
+                digest_sha256: input.validate(&scope).unwrap(),
+                stored_at: Utc::now(),
+            },
+            input,
+        };
+        let expected = hex::encode(Sha256::digest(
+            br#"[["a-user","user"],["synthetic-message","assistant"]]"#,
+        ));
+        assert_eq!(
+            capture.retained_message_inventory_sha256(&scope),
+            Some(expected.clone())
+        );
+        document["messages"].as_array_mut().unwrap().push(
+            serde_json::json!({"message": {"id": "z-user", "chat_id": "synthetic-chat", "role": "user"}}),
+        );
+        replace_source(&mut capture.input, &document);
+        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
+        assert_ne!(
+            capture.retained_message_inventory_sha256(&scope),
+            Some(expected)
+        );
+        document["messages"][2]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("chat_id");
+        replace_source(&mut capture.input, &document);
+        assert!(
+            capture.input.validate(&scope).is_err(),
+            "users need exact chat binding too"
+        );
+        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
+        capture.input.completion = None;
+        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
+        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
+    }
+
+    #[test]
+    fn completion_rejects_missing_identity_status_and_unclaimed_assistants() {
+        let (scope, valid, document) = completed_capture();
+        for field in ["id", "role", "status", "chat_id"] {
+            let mut document = document.clone();
+            document["messages"][1]["message"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let mut input = valid.clone();
+            replace_source(&mut input, &document);
+            assert!(input.validate(&scope).is_err(), "{field}");
+        }
+        for field in ["status", "role", "chat_id"] {
+            let mut document = document.clone();
+            document["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "message": {"id": "synthetic-message", (field): null}
+                }));
+            let mut input = valid.clone();
+            replace_source(&mut input, &document);
+            assert!(input.validate(&scope).is_err(), "{field}");
+        }
+        let mut extra = document.clone();
+        extra["messages"].as_array_mut().unwrap().push(serde_json::json!({
+            "message": {"id": "other-message", "role": 3, "chat_id": "synthetic-chat", "status": 2}
+        }));
+        let mut input = valid.clone();
+        replace_source(&mut input, &extra);
+        assert!(input.validate(&scope).is_err());
+        input
+            .completion
+            .as_mut()
+            .unwrap()
+            .assistant_message_ids
+            .push("other-message".into());
+        assert!(input.validate(&scope).is_ok());
+        for ids in [
+            vec![],
+            vec!["forged".into()],
+            vec!["synthetic-message".into(), "synthetic-message".into()],
+            vec!["invalid/id".into()],
+            vec!["x".repeat(129)],
+            vec!["synthetic-message".into(); 257],
+        ] {
+            let mut input = valid.clone();
+            input.completion.as_mut().unwrap().assistant_message_ids = ids;
+            assert!(input.validate(&scope).is_err());
+        }
+    }
+
+    #[test]
+    fn completion_requires_owned_provider_raw_phase_and_terminal_protocol() {
+        let (scope, input, document) = completed_capture();
+        let mut invalid = input.clone();
+        invalid.original_identity = None;
+        assert!(invalid.validate(&scope).is_err());
+        invalid = input.clone();
+        invalid.owned_conversation = None;
+        assert!(invalid.validate(&scope).is_err());
+        invalid = input.clone();
+        invalid.original_identity.as_mut().unwrap().provider = "other".into();
+        invalid.owned_conversation.as_mut().unwrap().provider = "other".into();
+        assert!(invalid.validate(&scope).is_err());
+        invalid = input.clone();
+        invalid.completion.as_mut().unwrap().terminal = false;
+        assert!(invalid.validate(&scope).is_err());
+        invalid = input.clone();
+        invalid
+            .owned_conversation
+            .as_mut()
+            .unwrap()
+            .external_conversation_id = "other-chat".into();
+        assert!(invalid.validate(&scope).is_err());
+        invalid = input.clone();
+        let mut no_chat = document.clone();
+        no_chat["messages"].as_array_mut().unwrap().remove(0);
+        replace_source(&mut invalid, &no_chat);
+        assert!(invalid.validate(&scope).is_err());
+        invalid = input.clone();
+        invalid.ordinal = 1;
+        invalid.owned_conversation.as_mut().unwrap().purpose =
+            CapturedConversationPurpose::Extraction;
+        invalid.snapshot = ObservationCaptureSnapshot::Candidate {
+            source_capture_id: Uuid::new_v4(),
+            route: ExtractionRoute::SignedInBrowser,
+            candidate_json: "{}".into(),
+            candidate_sha256: hex::encode(Sha256::digest(b"{}")),
+            grounding_reason: None,
+        };
+        assert!(invalid.validate(&scope).is_err());
+        let mut serialized = serde_json::to_value(input).unwrap();
+        serialized["completion"]["protocol"] = serde_json::json!("other");
+        assert!(serde_json::from_value::<ObservationCaptureInput>(serialized).is_err());
     }
 
     #[test]

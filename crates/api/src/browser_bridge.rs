@@ -316,6 +316,71 @@ impl BrowserBridge {
         Self::response(response).await
     }
 
+    /// Exact-account cleanup is separate from generic browser execution.
+    /// A lost response is ambiguous; callers must reconcile, never retry delete.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn cleanup_conversation(
+        &self,
+        session_id: Uuid,
+        execution_id: Uuid,
+        expected_identity: &CleanupExpectedIdentity,
+        chat_id: &str,
+        action: CleanupAction,
+        ticket: Option<&str>,
+    ) -> Result<CleanupResult, AppError> {
+        let valid_id = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+        };
+        if expected_identity.provider != "kimi"
+            || !valid_id(&expected_identity.platform_account_id)
+            || !valid_id(chat_id)
+            || ticket.is_some_and(|value| {
+                value.is_empty()
+                    || value.len() > 4096
+                    || !value.len().is_multiple_of(2)
+                    || !value
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            })
+        {
+            return Err(AppError::invalid_request(
+                "invalid conversation cleanup scope",
+            ));
+        }
+        let response = self
+            .client
+            .post(self.endpoint(session_id, "/cleanup-conversation"))
+            .timeout(std::time::Duration::from_secs(65))
+            .bearer_auth(&self.token)
+            .json(&CleanupRequest {
+                execution_id,
+                expected_identity,
+                external_conversation_id: chat_id,
+                action,
+                authorization_ticket: ticket,
+            })
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser runner unavailable",
+                )
+            })?;
+        let result: CleanupResult = Self::response(response).await?;
+        if result.execution_id != execution_id || result.external_conversation_id != chat_id {
+            return Err(AppError::new(
+                ErrorCode::DependencyUnavailable,
+                "cleanup response identity differs",
+            ));
+        }
+        Ok(result)
+    }
+
     /// A separate bounded binary protocol: neither the general JSON execute
     /// endpoint nor a model-supplied payload may carry media bytes or a ticket.
     pub async fn execute_rich(
@@ -428,6 +493,47 @@ impl BrowserBridge {
             })?;
         Self::response(response).await
     }
+}
+
+#[derive(Serialize)]
+pub(crate) struct CleanupExpectedIdentity {
+    pub provider: String,
+    pub platform_account_id: String,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CleanupAction {
+    Delete,
+    Reconcile,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CleanupStatus {
+    Deleted,
+    Present,
+    Unknown,
+    Retained,
+    NeedsLogin,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CleanupResult {
+    pub execution_id: Uuid,
+    pub external_conversation_id: String,
+    pub status: CleanupStatus,
+}
+
+#[derive(Serialize)]
+struct CleanupRequest<'a> {
+    execution_id: Uuid,
+    expected_identity: &'a CleanupExpectedIdentity,
+    external_conversation_id: &'a str,
+    action: CleanupAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_ticket: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -595,6 +701,57 @@ pub struct VerifiedBrowserSession {
 #[cfg(test)]
 mod measurement_options_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_wire_is_scoped_and_rejects_mismatched_receipts() {
+        use axum::{Router, body::to_bytes, extract::Request, routing::post};
+        for mismatch in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let session_id = Uuid::new_v4();
+            let execution_id = Uuid::new_v4();
+            let app = Router::new().route(
+                &format!("/v1/sessions/{session_id}/cleanup-conversation"),
+                post(move |request: Request| async move {
+                    assert_eq!(request.headers()["authorization"], "Bearer fixture-token");
+                    let bytes = to_bytes(request.into_body(), 8192).await.unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(body, serde_json::json!({
+                        "execution_id": execution_id,
+                        "expected_identity": { "provider": "kimi", "platform_account_id": "fixture-account" },
+                        "external_conversation_id": "fixture-chat",
+                        "action": "delete", "authorization_ticket": "aabb"
+                    }));
+                    axum::Json(serde_json::json!({
+                        "execution_id": if mismatch { Uuid::new_v4() } else { execution_id },
+                        "external_conversation_id": "fixture-chat", "status": "deleted"
+                    }))
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let bridge =
+                BrowserBridge::new(format!("http://{addr}"), "fixture-token".into()).unwrap();
+            let result = bridge
+                .cleanup_conversation(
+                    session_id,
+                    execution_id,
+                    &CleanupExpectedIdentity {
+                        provider: "kimi".into(),
+                        platform_account_id: "fixture-account".into(),
+                    },
+                    "fixture-chat",
+                    CleanupAction::Delete,
+                    Some("aabb"),
+                )
+                .await;
+            if mismatch {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().status, CleanupStatus::Deleted);
+            }
+            server.abort();
+        }
+    }
 
     #[test]
     fn source_capture_ticket_is_absent_from_legacy_execute_request() {

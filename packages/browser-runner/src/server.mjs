@@ -7,6 +7,7 @@ import { readRichMultipart } from "./rich-transport.mjs";
 
 const CALLBACK_PATH = "/internal/v1/publication-send/authorize";
 const CAPTURE_PATH = "/internal/v1/observation-captures";
+const CLEANUP_PATH = "/internal/v1/provider-conversation-cleanup/authorize";
 
 function serviceCallback(origin, token, path, maxResponseBytes) {
   // Deployment configuration only, never a model/request-selected URL.
@@ -118,6 +119,12 @@ export function createRunnerServer({
     CAPTURE_PATH,
     8192,
   );
+  const authorizeCleanup = serviceCallback(
+    callbackOrigin,
+    callbackToken,
+    CLEANUP_PATH,
+    8192,
+  );
   const server = createServer(async (request, response) => {
     try {
       if (!authorized(request.headers.authorization, token)) {
@@ -135,6 +142,22 @@ export function createRunnerServer({
           response,
           200,
           await runner.execute(await readJson(request), persistCapture),
+        );
+      } else if (
+        parts.length === 4 &&
+        parts[0] === "v1" &&
+        parts[1] === "sessions" &&
+        parts[3] === "cleanup-conversation" &&
+        request.method === "POST"
+      ) {
+        send(
+          response,
+          200,
+          await runner.cleanupConversation(
+            parts[2],
+            await readJson(request),
+            authorizeCleanup,
+          ),
         );
       } else if (
         parts.length === 4 &&

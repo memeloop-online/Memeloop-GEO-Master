@@ -43,6 +43,10 @@ mod project_tools;
 mod provider_bridge;
 mod publication_lookup;
 pub use publication_lookup::dispatch_publication_lookup;
+mod provider_conversation_cleanup;
+pub use provider_conversation_cleanup::dispatch_provider_conversation_cleanup;
+mod provider_cleanup_callback;
+pub use provider_cleanup_callback::ProviderCleanupCallbackService;
 mod publication_send_callback;
 pub use publication_send_callback::PublicationSendCallbackService;
 mod observation_capture_callback;
@@ -151,6 +155,7 @@ pub struct AppState {
     publication_lookup_repository: Option<Arc<dyn geo_domain::PublicationLookupRepository>>,
     publication_send_callback: Option<PublicationSendCallbackService>,
     observation_capture_callback: Option<ObservationCaptureCallbackService>,
+    provider_cleanup_callback: Option<ProviderCleanupCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
     distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
@@ -261,6 +266,7 @@ impl AppState {
             publication_lookup_repository: None,
             publication_send_callback: None,
             observation_capture_callback: None,
+            provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
                     content_media_repository.clone(),
@@ -407,6 +413,7 @@ impl AppState {
             publication_lookup_repository: None,
             publication_send_callback: None,
             observation_capture_callback: None,
+            provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
                     content_media_repository.clone(),
@@ -856,6 +863,18 @@ impl AppState {
 
     pub fn observation_capture_callback(&self) -> Option<&ObservationCaptureCallbackService> {
         self.observation_capture_callback.as_ref()
+    }
+
+    pub fn with_provider_cleanup_callback(
+        mut self,
+        service: ProviderCleanupCallbackService,
+    ) -> Self {
+        self.provider_cleanup_callback = Some(service);
+        self
+    }
+
+    pub fn provider_cleanup_callback(&self) -> Option<&ProviderCleanupCallbackService> {
+        self.provider_cleanup_callback.as_ref()
     }
 
     pub fn with_channel_job_repository(
@@ -2419,6 +2438,8 @@ pub fn router(state: AppState) -> Router {
         publication_send_callback::routes(state.publication_send_callback.clone());
     let observation_callback =
         observation_capture_callback::routes(state.observation_capture_callback.clone());
+    let cleanup_callback =
+        provider_cleanup_callback::routes(state.provider_cleanup_callback.clone());
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -2445,4 +2466,5 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
         .merge(publication_callback)
         .merge(observation_callback)
+        .merge(cleanup_callback)
 }

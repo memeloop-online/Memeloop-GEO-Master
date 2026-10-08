@@ -8,6 +8,7 @@ mod content_request_dispatch;
 mod content_runtime_tests;
 mod dispatch;
 mod production_runtime;
+mod provider_conversation_cleanup_dispatch;
 mod publication_lookup_dispatch;
 mod runtime;
 mod scoped_test_runtime;
@@ -112,6 +113,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         publication_lookup_dispatch::spawn(
             state.clone(),
             geo_persistence::PgPublicationLookupRepository::from_database(&database),
+        );
+        provider_conversation_cleanup_dispatch::spawn(
+            state.clone(),
+            geo_persistence::PgProviderConversationCleanupRepository::from_database(&database),
         );
         spawn_due_report_scanner(state.clone(), report_scanner, cycle_scanner.clone());
         verification_dispatch::spawn(verification_scanner);

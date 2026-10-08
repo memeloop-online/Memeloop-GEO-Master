@@ -400,6 +400,33 @@ impl ChannelService {
         .then_some(original.connector_version)
     }
 
+    /// Restore current authorization, but never adopt a replacement identity.
+    /// The caller owns the supplied session ID and must close even if start fails.
+    pub(crate) async fn resume_provider_cleanup_browser(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        identity: &geo_domain::ObservationProviderIdentity,
+        session_id: Uuid,
+    ) -> Result<(), AppError> {
+        identity.validate()?;
+        let current = self.prepare_available_browser(scope, account_id).await?;
+        if current.platform != identity.provider
+            || current.platform_account_id != identity.platform_account_id
+        {
+            return Err(AppError::conflict("cleanup browser identity has changed"));
+        }
+        self.browser()?
+            .start(
+                session_id,
+                &current.platform,
+                current.proxy,
+                Some(&current.storage_state),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn publication_connector_version(
         &self,
         platform: &str,
@@ -2199,6 +2226,7 @@ mod publication_binding_tests {
     struct RunnerStub {
         starts: Arc<Mutex<Vec<Value>>>,
         version: Arc<Mutex<String>>,
+        cleanup_events: Arc<Mutex<Vec<&'static str>>>,
     }
 
     async fn runner(
@@ -2218,12 +2246,43 @@ mod publication_binding_tests {
             );
         }
         if method == axum::http::Method::POST && uri.path() == "/v1/sessions" {
+            stub.cleanup_events.lock().await.push("start");
             let payload: Value = serde_json::from_slice(&body).unwrap();
             stub.starts.lock().await.push(payload.clone());
             return (
                 StatusCode::OK,
                 Json(json!({"session_id":payload["session_id"]})),
             );
+        }
+        if uri.path().ends_with("/complete") {
+            stub.cleanup_events.lock().await.push("complete");
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "identity":{"platform_account_id":"original-identity","display_name":"Account","avatar_url":null},
+                    "storage_state":{}
+                })),
+            );
+        }
+        if uri.path().ends_with("/cleanup-conversation") {
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                payload["authorization_ticket"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+            );
+            stub.cleanup_events.lock().await.push("rpc");
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "execution_id":payload["execution_id"],
+                    "external_conversation_id":payload["external_conversation_id"],
+                    "status":"deleted"
+                })),
+            );
+        }
+        if method == axum::http::Method::DELETE {
+            stub.cleanup_events.lock().await.push("close");
         }
         (StatusCode::OK, Json(json!({"closed":true})))
     }
@@ -2289,6 +2348,255 @@ mod publication_binding_tests {
             .await
             .unwrap();
         (service, scope, account_id, stub, server)
+    }
+
+    #[tokio::test]
+    async fn cleanup_restore_checks_original_identity_before_starting() {
+        let (service, scope, account_id, stub, server) = fixture().await;
+        let mut identity = geo_domain::ObservationProviderIdentity {
+            provider: "zhihu".into(),
+            platform_account_id: "different-identity".into(),
+        };
+        assert!(
+            service
+                .resume_provider_cleanup_browser(&scope, account_id, &identity, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        assert!(stub.starts.lock().await.is_empty());
+        identity.platform_account_id = "original-identity".into();
+        identity.provider = "other".into();
+        assert!(
+            service
+                .resume_provider_cleanup_browser(&scope, account_id, &identity, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        assert!(stub.starts.lock().await.is_empty());
+        identity.provider = "zhihu".into();
+        let session_id = Uuid::new_v4();
+        service
+            .resume_provider_cleanup_browser(&scope, account_id, &identity, session_id)
+            .await
+            .unwrap();
+        assert_eq!(stub.starts.lock().await.len(), 1);
+        assert_eq!(
+            stub.starts.lock().await[0]["session_id"],
+            session_id.to_string()
+        );
+        server.abort();
+    }
+
+    struct CleanupStore {
+        claim: geo_domain::ProviderCleanupClaim,
+        jobs: Arc<dyn geo_domain::ChannelJobRepository>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        complete_evidence: bool,
+        finished: tokio::sync::Notify,
+        outcome: Mutex<Option<geo_domain::ProviderCleanupOutcome>>,
+    }
+
+    #[async_trait::async_trait]
+    impl geo_domain::ProviderConversationCleanupRepository for CleanupStore {
+        async fn scan_unqueued(
+            &self,
+            _: chrono::DateTime<Utc>,
+            _: Option<Uuid>,
+            _: usize,
+        ) -> Result<Vec<geo_domain::ProviderCleanupBackfillItem>, AppError> {
+            unreachable!()
+        }
+        async fn scan_due(
+            &self,
+            _: chrono::DateTime<Utc>,
+            _: Option<Uuid>,
+            _: usize,
+        ) -> Result<Vec<geo_domain::ProviderCleanupDueItem>, AppError> {
+            unreachable!()
+        }
+        async fn enqueue(&self, _: &TenantScope, _: Uuid) -> Result<Uuid, AppError> {
+            unreachable!()
+        }
+        async fn claim(
+            &self,
+            _: &TenantScope,
+            cleanup_id: Uuid,
+        ) -> Result<Option<geo_domain::ProviderCleanupClaim>, AppError> {
+            assert_eq!(cleanup_id, self.claim.cleanup_id);
+            self.events.lock().await.push("claim");
+            Ok(Some(self.claim.clone()))
+        }
+        async fn claim_due(
+            &self,
+            _: &TenantScope,
+        ) -> Result<Option<geo_domain::ProviderCleanupClaim>, AppError> {
+            unreachable!()
+        }
+        async fn authorize_delete(
+            &self,
+            scope: &TenantScope,
+            cleanup_id: Uuid,
+            lease_id: Uuid,
+            reservation_id: Uuid,
+        ) -> Result<geo_domain::ProviderCleanupClaim, AppError> {
+            assert_eq!(cleanup_id, self.claim.cleanup_id);
+            assert_eq!(lease_id, self.claim.lease_id);
+            assert!(!reservation_id.is_nil());
+            let now = Utc::now();
+            // A competing execution really is excluded before authorization.
+            let conflict = self
+                .jobs
+                .reserve_account(
+                    scope,
+                    self.claim.account_id,
+                    Uuid::new_v4(),
+                    now,
+                    now + Duration::minutes(2),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(conflict.code, ErrorCode::Conflict);
+            self.events.lock().await.extend(["reserve", "authorize"]);
+            if self.complete_evidence {
+                Ok(self.claim.clone())
+            } else {
+                Err(AppError::conflict("retained evidence incomplete"))
+            }
+        }
+        async fn finish(
+            &self,
+            scope: &TenantScope,
+            cleanup_id: Uuid,
+            lease_id: Uuid,
+            outcome: geo_domain::ProviderCleanupOutcome,
+        ) -> Result<(), AppError> {
+            assert_eq!(cleanup_id, self.claim.cleanup_id);
+            assert_eq!(lease_id, self.claim.lease_id);
+            let reservation = Uuid::new_v4();
+            let now = Utc::now();
+            // Finish occurs after close/release, or after preflight rejects
+            // incomplete evidence without ever starting a browser.
+            self.jobs
+                .reserve_account(
+                    scope,
+                    self.claim.account_id,
+                    reservation,
+                    now,
+                    now + Duration::minutes(2),
+                )
+                .await
+                .unwrap();
+            self.jobs
+                .release_account(scope, self.claim.account_id, reservation)
+                .await
+                .unwrap();
+            self.events.lock().await.extend(["release", "finish"]);
+            *self.outcome.lock().await = Some(outcome);
+            self.finished.notify_one();
+            Ok(())
+        }
+    }
+
+    async fn cleanup_dispatch_fixture(complete_evidence: bool) {
+        use geo_domain::{
+            ObservationProviderIdentity, ProviderCleanupAction, ProviderCleanupClaim,
+            ProviderCleanupOutcome,
+        };
+        let (service, scope, account_id, stub, server) = fixture().await;
+        let mut account = service
+            .repository
+            .get_account(&scope, account_id)
+            .await
+            .unwrap();
+        account.account.platform = "kimi".into();
+        service
+            .repository
+            .save_account(&scope, account)
+            .await
+            .unwrap();
+        let state = AppState::development().with_channel_service(service);
+        let repository = Arc::new(CleanupStore {
+            claim: ProviderCleanupClaim {
+                cleanup_id: Uuid::new_v4(),
+                capture_id: Uuid::new_v4(),
+                account_id,
+                provider: "kimi".into(),
+                external_conversation_id: "system-conversation".into(),
+                retained_message_inventory_sha256: Some(geo_domain::sha256_hex(
+                    br#"[["synthetic-message","assistant"]]"#,
+                )),
+                original_identity: ObservationProviderIdentity {
+                    provider: "kimi".into(),
+                    platform_account_id: "original-identity".into(),
+                },
+                lease_id: Uuid::new_v4(),
+                lease_until: Utc::now() + Duration::minutes(2),
+                action: ProviderCleanupAction::Delete,
+            },
+            jobs: state.channel_job_repository(),
+            events: stub.cleanup_events.clone(),
+            complete_evidence,
+            finished: tokio::sync::Notify::new(),
+            outcome: Mutex::new(None),
+        });
+        let callbacks = crate::ProviderCleanupCallbackService::new(
+            repository.clone(),
+            Arc::new(SecretEnvelope::from_hex_key(&"12".repeat(32)).unwrap()),
+            &"service-test-token".repeat(3),
+        )
+        .unwrap();
+        let state = state.with_provider_cleanup_callback(callbacks);
+        assert!(
+            crate::dispatch_provider_conversation_cleanup(
+                state,
+                repository.clone(),
+                scope,
+                repository.claim.cleanup_id
+            )
+            .await
+            .unwrap()
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            repository.finished.notified(),
+        )
+        .await
+        .unwrap();
+        let expected = if complete_evidence {
+            vec![
+                "claim",
+                "reserve",
+                "authorize",
+                "start",
+                "complete",
+                "rpc",
+                "close",
+                "release",
+                "finish",
+            ]
+        } else {
+            vec!["claim", "reserve", "authorize", "release", "finish"]
+        };
+        assert_eq!(*stub.cleanup_events.lock().await, expected);
+        assert_eq!(
+            *repository.outcome.lock().await,
+            Some(if complete_evidence {
+                ProviderCleanupOutcome::Deleted
+            } else {
+                ProviderCleanupOutcome::Failed
+            })
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cleanup_dispatch_orders_reservation_authorization_identity_rpc_close_and_finish() {
+        cleanup_dispatch_fixture(true).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_dispatch_incomplete_evidence_releases_without_start_or_model_call() {
+        cleanup_dispatch_fixture(false).await;
     }
 
     async fn set_default_proxy(

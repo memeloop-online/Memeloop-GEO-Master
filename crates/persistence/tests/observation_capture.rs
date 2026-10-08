@@ -1,6 +1,8 @@
 use chrono::Utc;
 use geo_domain::{
-    ErrorCode, ObservationCaptureInput, ObservationCaptureRepository, ObservationCaptureSnapshot,
+    CapturedConversation, CapturedConversationPurpose, ChannelTargetInput, ConversationCorrelation,
+    ErrorCode, ObservationCaptureCompletion, ObservationCaptureInput, ObservationCaptureRepository,
+    ObservationCaptureSnapshot, ObservationCompletionProtocol, ObservationProviderIdentity,
     TenantScope, sha256_hex,
 };
 use geo_persistence::{Database, DatabaseConfig, PgObservationCaptureRepository};
@@ -83,6 +85,7 @@ async fn capture_commit_replay_scope_and_attempt_binding() {
             source_json,
         },
         owned_conversation: None,
+        completion: None,
     };
     let receipt = store.save(&scope, input.clone()).await.unwrap();
     assert_eq!(store.save(&scope, input.clone()).await.unwrap(), receipt);
@@ -99,6 +102,81 @@ async fn capture_commit_replay_scope_and_attempt_binding() {
     };
     let raw_receipt = store.save(&scope, raw.clone()).await.unwrap();
     assert_eq!(store.save(&scope, raw.clone()).await.unwrap(), raw_receipt);
+    let frozen = ChannelTargetInput::Measure {
+        account_id: account,
+        provider: "kimi".into(),
+        model: "synthetic".into(),
+        surface: "consumer_web".into(),
+        search_mode: "web_search".into(),
+        protocol_version: "v1".into(),
+        question_set_version: "adhoc".into(),
+        question: "Synthetic question?".into(),
+        market: "global".into(),
+        language: "en".into(),
+        scheduled_at: Utc::now(),
+        sample_ordinal: 0,
+        question_binding: None,
+    };
+    sqlx::query("UPDATE channel_execution_targets SET frozen_input=$1 WHERE target_id=$2")
+        .bind(serde_json::to_value(frozen).unwrap())
+        .bind(target)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let complete_json = serde_json::json!({"messages": [
+        {"chat": {"id": "synthetic-chat"}},
+        {"message": {"id": "synthetic-message", "chat_id": "synthetic-chat", "role": "assistant", "status": "COMPLETED"}}
+    ]}).to_string();
+    let mut completed = ObservationCaptureInput {
+        capture_id: Uuid::new_v4(),
+        runner_session_id: Uuid::new_v4(),
+        original_identity: Some(ObservationProviderIdentity {
+            provider: "kimi".into(),
+            platform_account_id: "synthetic-account".into(),
+        }),
+        owned_conversation: Some(CapturedConversation {
+            provider: "kimi".into(),
+            external_conversation_id: "synthetic-chat".into(),
+            purpose: CapturedConversationPurpose::Measurement,
+            correlation: ConversationCorrelation::CreateResponse,
+        }),
+        completion: Some(ObservationCaptureCompletion {
+            protocol: ObservationCompletionProtocol::ConnectJson,
+            terminal: true,
+            assistant_message_ids: vec!["synthetic-message".into()],
+        }),
+        snapshot: ObservationCaptureSnapshot::Source {
+            source_sha256: sha256_hex(complete_json.as_bytes()),
+            source_json: complete_json.clone(),
+        },
+        ..input.clone()
+    };
+    let completed_source_id = completed.capture_id;
+    for ordinal in 0..=1 {
+        if ordinal == 1 {
+            completed.capture_id = Uuid::new_v4();
+            completed.ordinal = ordinal;
+            completed.owned_conversation.as_mut().unwrap().purpose =
+                CapturedConversationPurpose::Extraction;
+            completed.snapshot = ObservationCaptureSnapshot::Extraction {
+                source_capture_id: completed_source_id,
+                source_sha256: sha256_hex(complete_json.as_bytes()),
+                source_json: complete_json.clone(),
+            };
+        }
+        let receipt = store.save(&scope, completed.clone()).await.unwrap();
+        assert_eq!(
+            store.save(&scope, completed.clone()).await.unwrap(),
+            receipt
+        );
+        let reread = store
+            .get(&scope, completed.capture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.input, completed);
+        assert!(reread.has_complete_conversation_evidence(&scope));
+    }
     assert_eq!(
         store
             .get(&scope, raw.capture_id)

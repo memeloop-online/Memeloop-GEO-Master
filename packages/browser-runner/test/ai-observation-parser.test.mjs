@@ -5,6 +5,7 @@ import { validateAiObservation } from "../src/ai-observation-grounding.mjs";
 import {
   configuredExtractionModel,
   extractionPrompt,
+  extractionCaptureRecord,
   interpretObservation,
   invokeExtractionApi,
   observationDocument,
@@ -69,6 +70,62 @@ const api = (fetchImpl, options = {}) =>
     fetchImpl,
     ...options,
   });
+
+test("source and extraction checkpoints share lifecycle proof outside source JSON", async () => {
+  const source = {
+    connect_json_terminal: true,
+    messages: [
+      { chat: { id: "synthetic-chat" } },
+      {
+        message: {
+          id: "synthetic-answer",
+          chat_id: "synthetic-chat",
+          role: "assistant",
+          status: "COMPLETED",
+        },
+      },
+    ],
+  };
+  for (const terminal of [true, false, undefined]) {
+    source.connect_json_terminal = terminal;
+    const records = [];
+    await interpretObservation(source, {
+      onEvidence: async (record) => records.push(record),
+      apiExtract: async () => null,
+    });
+    const extraction = extractionCaptureRecord(source);
+    assert.equal(records.length, 1);
+    assert.deepEqual(records[0].completion, extraction.completion);
+    assert.equal(Object.hasOwn(extraction, "completion"), terminal === true);
+    if (terminal === true)
+      assert.deepEqual(extraction.completion, {
+        protocol: "connect_json",
+        terminal: true,
+        assistant_message_ids: ["synthetic-answer"],
+      });
+    assert.equal(records[0].source_json, extraction.source_json);
+    assert.deepEqual(JSON.parse(extraction.source_json), {
+      messages: source.messages,
+    });
+  }
+});
+
+test("model completion claims cannot upgrade raw lifecycle proof", async () => {
+  const records = [];
+  await interpretObservation(exchange, {
+    onEvidence: async (record) => records.push(record),
+    apiExtract: async () =>
+      extraction({
+        completion: {
+          protocol: "connect_json",
+          terminal: true,
+          assistant_message_ids: ["invented"],
+        },
+      }),
+  });
+  assert.ok(records.length > 0);
+  assert.ok(records.every((record) => !Object.hasOwn(record, "completion")));
+});
 
 test("failed extraction emits only allowlisted route diagnostics and preserves null", async () => {
   const diagnostics = [];

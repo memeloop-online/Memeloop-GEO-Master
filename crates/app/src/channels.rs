@@ -37,12 +37,20 @@ fn callbacks_with_credentials(
         std::sync::Arc::new(
             geo_persistence::PgPublicationSendAuthorizationRepository::from_database(database),
         ),
+        cipher.clone(),
+        token,
+    )?;
+    let cleanup = geo_api::ProviderCleanupCallbackService::new(
+        std::sync::Arc::new(
+            geo_persistence::PgProviderConversationCleanupRepository::from_database(database),
+        ),
         cipher,
         token,
     )?;
     Ok(state
         .with_observation_capture_callback(captures)
-        .with_publication_send_callback(publication))
+        .with_publication_send_callback(publication)
+        .with_provider_cleanup_callback(cleanup))
 }
 
 pub fn configure(state: AppState) -> Result<AppState, Box<dyn Error>> {

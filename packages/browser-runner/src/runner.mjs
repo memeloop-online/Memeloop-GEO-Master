@@ -4,6 +4,10 @@ import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
 import {
+  recoverKimiConversation,
+  deleteKimiConversation,
+} from "./provider-conversation-cleanup.mjs";
+import {
   stageRichPublication,
   executeAuthorizedRichPublication,
   RichPublicationError,
@@ -323,6 +327,7 @@ export function createRunner(options = {}) {
         timeout: 30_000,
       });
       const record = {
+        platform: input.platform,
         adapter,
         // Snapshot host configuration before executing any adapter code.
         connectorVersion: adapter.connectorVersion,
@@ -659,6 +664,9 @@ export function createRunner(options = {}) {
                               purpose: "measurement",
                               correlation: "create_response",
                             },
+                            ...(evidence.completion === undefined
+                              ? {}
+                              : { completion: evidence.completion }),
                           }
                         : {}),
                     };
@@ -698,6 +706,9 @@ export function createRunner(options = {}) {
                                 purpose: "extraction",
                                 correlation: "create_response",
                               },
+                              ...(evidence.completion === undefined
+                                ? {}
+                                : { completion: evidence.completion }),
                             }
                           : {}),
                       }),
@@ -990,6 +1001,145 @@ export function createRunner(options = {}) {
     return promise;
   }
 
+  async function cleanupConversation(sessionId, input, authorizeDeletion) {
+    if (
+      !validId(sessionId) ||
+      !fields(input, [
+        "execution_id",
+        "expected_identity",
+        "external_conversation_id",
+        "action",
+        "authorization_ticket",
+      ]) ||
+      typeof input.execution_id !== "string" ||
+      !UUID.test(input.execution_id) ||
+      !fields(input.expected_identity, ["provider", "platform_account_id"]) ||
+      input.expected_identity.provider !== "kimi" ||
+      !validId(input.expected_identity.platform_account_id) ||
+      !validId(input.external_conversation_id) ||
+      !["delete", "reconcile"].includes(input.action) ||
+      (input.authorization_ticket !== undefined &&
+        (typeof input.authorization_ticket !== "string" ||
+          !/^(?:[0-9a-f]{2}){1,2048}$/.test(input.authorization_ticket)))
+    )
+      throw new RunnerError(400, "invalid_cleanup");
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify({ cleanup_session_id: sessionId, ...input }))
+      .digest("hex");
+    const previous = executions.get(input.execution_id);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint)
+        throw new RunnerError(409, "execution_conflict");
+      return previous.promise;
+    }
+    const record = session(sessionId);
+    const reply = (status) => ({
+      execution_id: input.execution_id,
+      external_conversation_id: input.external_conversation_id,
+      status,
+    });
+    if (record.platform !== "kimi") return reply("retained");
+    if (!record.completed) return reply("needs_login");
+    if (record.busy) throw new RunnerError(409, "session_busy");
+    if (
+      input.action === "delete" &&
+      (!input.authorization_ticket || typeof authorizeDeletion !== "function")
+    )
+      return reply("retained");
+    record.busy = true;
+    const entry = { fingerprint, promise: null, settledAt: null };
+    const deadlineAt = performance.now() + Math.min(60_000, executionTimeoutMs);
+    const expired = () => performance.now() >= deadlineAt;
+    // No operation may start after the lifecycle deadline. Already-dispatched
+    // requests remain ambiguous and keep the session reserved until settled.
+    const page = {
+      async evaluate(fn, args) {
+        if (expired()) throw new Error("cleanup_deadline");
+        return record.page.evaluate(fn, args);
+      },
+    };
+    let timer;
+    const work = (async () => {
+      try {
+        const identity = await record.adapter.identify(record.page);
+        if (expired()) return reply("unknown");
+        if (!validateIdentity(identity)) return reply("needs_login");
+        if (
+          identity.platform_account_id !==
+            input.expected_identity.platform_account_id ||
+          identity.platform_account_id !== record.identity.platform_account_id
+        )
+          return reply("retained");
+        const options = {
+          expectedUserId: input.expected_identity.platform_account_id,
+          chatId: input.external_conversation_id,
+          timeoutMs: Math.max(
+            1,
+            Math.min(12_000, Math.floor(deadlineAt - performance.now())),
+          ),
+        };
+        const result =
+          input.action === "reconcile"
+            ? await recoverKimiConversation(page, options)
+            : await deleteKimiConversation(page, {
+                ...options,
+                async authorizeDeletion() {
+                  if (expired()) throw new Error("cleanup_deadline");
+                  const authority = await authorizeDeletion({
+                    schema_version: 1,
+                    authorization_ticket: input.authorization_ticket,
+                    runner_session_id: sessionId,
+                    platform_account_id: options.expectedUserId,
+                    external_conversation_id: options.chatId,
+                  });
+                  if (expired()) throw new Error("cleanup_deadline");
+                  if (
+                    typeof authority?.delete_not_after !== "string" ||
+                    !Number.isFinite(Date.parse(authority.delete_not_after)) ||
+                    Date.parse(authority.delete_not_after) <= Date.now()
+                  )
+                    throw new Error("cleanup_authorization_expired");
+                  if (
+                    typeof authority.retained_message_inventory_sha256 !==
+                      "string" ||
+                    !SHA256.test(authority.retained_message_inventory_sha256)
+                  )
+                    throw new Error("cleanup_inventory_required");
+                  return authority;
+                },
+              });
+        if (expired()) return reply("unknown");
+        return reply(
+          {
+            deleted: "deleted",
+            recovered: "present",
+            unknown: "unknown",
+            retained: "retained",
+            reauth_required: "needs_login",
+          }[result.status] ?? "unknown",
+        );
+      } catch {
+        return reply("unknown");
+      } finally {
+        clearTimeout(timer);
+        record.busy = false;
+        record.lastTouched = clock();
+        entry.settledAt = clock();
+      }
+    })();
+    entry.promise = Promise.race([
+      work,
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve(reply("unknown")),
+          Math.max(1, Math.ceil(deadlineAt - performance.now())),
+        );
+      }),
+    ]);
+    executions.set(input.execution_id, entry);
+    return entry.promise;
+  }
+
   async function close(id) {
     const record = session(id);
     if (record.busy) throw new RunnerError(409, "session_busy");
@@ -1022,6 +1172,7 @@ export function createRunner(options = {}) {
     measurementOptions,
     execute,
     executeRich,
+    cleanupConversation,
     close,
     shutdown,
     reap,

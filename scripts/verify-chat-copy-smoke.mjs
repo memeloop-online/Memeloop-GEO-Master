@@ -2,6 +2,7 @@
 // Set GEO_SMOKE_APP_BINARY to a copied development binary and
 // GEO_SMOKE_OUTPUT_DIR outside the repository; optionally set isolated
 // GEO_SMOKE_API_PORT/GEO_SMOKE_WEB_PORT and PLAYWRIGHT_BROWSERS_PATH.
+// GEO_TEST_CHROMIUM_PATH optionally selects an existing Chromium executable.
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
@@ -175,6 +176,9 @@ async function main() {
   const { chromium } = requireBrowser("playwright");
   browserServer = await chromium.launchServer({
     headless: true,
+    ...(process.env.GEO_TEST_CHROMIUM_PATH
+      ? { executablePath: process.env.GEO_TEST_CHROMIUM_PATH }
+      : {}),
     env: safeEnvironment(),
     timeout: 15_000,
   });
@@ -225,22 +229,22 @@ async function main() {
         new URL(response.url()).pathname,
       ) && response.request().method() === "POST",
   );
-  const created = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname.endsWith("/agent/conversations") &&
-      response.request().method() === "POST",
-  );
+  const created = page
+    .waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname.endsWith("/agent/conversations") &&
+        response.request().method() === "POST",
+    )
+    .then(async (response) => {
+      assert(response.status() < 300, "First send did not create conversation");
+      return response.json();
+    });
   await attachmentGroup.getByRole("button", { name: "仅发送附件" }).click();
   assert(
     (await completed).status() === 200,
     "Synthetic attachment did not upload",
   );
-  const createdResponse = await created;
-  assert(
-    createdResponse.status() < 300,
-    "First send did not create conversation",
-  );
-  const conversation = await createdResponse.json();
+  const conversation = await created;
   await page.waitForURL(/\/chat\/[0-9a-f-]+$/);
   const runtimeNotice = page.locator(".agent-runtime-notice");
   // The persisted notice includes a reload action, not just the limitation copy.
@@ -251,16 +255,34 @@ async function main() {
   await runtimeNotice
     .getByRole("button", { name: "重新加载对话", exact: true })
     .waitFor({ state: "visible" });
-  const restored = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname.endsWith(
-        `/agent/conversations/${conversation.id}`,
-      ) && response.request().method() === "GET",
-  );
-  await page.reload();
-  const restoredResponse = await restored;
-  assert(restoredResponse.ok(), "Could not restore the no-model conversation");
-  const restoredConversation = await restoredResponse.json();
+  // The send flow can still have a detail GET in flight. Only accept a request
+  // issued after the reload commits, not an old document's late response whose
+  // body Chromium discards on navigation.
+  let reloadCommitted = false;
+  const onReload = (frame) => {
+    if (frame === page.mainFrame()) reloadCommitted = true;
+  };
+  page.on("framenavigated", onReload);
+  const restored = page
+    .waitForRequest(
+      (request) =>
+        reloadCommitted &&
+        new URL(request.url()).pathname.endsWith(
+          `/agent/conversations/${conversation.id}`,
+        ) &&
+        request.method() === "GET",
+    )
+    .then(async (request) => {
+      const response = await request.response();
+      assert(response?.ok(), "Could not restore the no-model conversation");
+      return response.json();
+    });
+  let restoredConversation;
+  try {
+    [restoredConversation] = await Promise.all([restored, page.reload()]);
+  } finally {
+    page.off("framenavigated", onReload);
+  }
   assert(
     restoredConversation.runs.length === 1 &&
       restoredConversation.runs[0].status === "failed" &&

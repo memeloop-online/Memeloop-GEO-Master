@@ -193,6 +193,9 @@ export async function captureConnectExchange(
         const decoded = decoder.finish();
         return {
           messages: decoded.messages,
+          // Only finish() proves a complete, error-free terminal frame.
+          // Provider assistant completion is checked separately.
+          connect_json_terminal: true,
           // These timestamps are local observation times, not provider time.
           started_at: startedAt,
           received_at: new Date().toISOString(),

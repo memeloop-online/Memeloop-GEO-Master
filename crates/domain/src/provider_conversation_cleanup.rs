@@ -27,6 +27,10 @@ pub struct ProviderCleanupClaim {
     pub lease_id: Uuid,
     pub lease_until: DateTime<Utc>,
     pub action: ProviderCleanupAction,
+    /// Recomputed from immutable, complete retained raw evidence. Missing on
+    /// legacy/incomplete claims, which never authorize destructive cleanup.
+    #[serde(default)]
+    pub retained_message_inventory_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,8 +68,38 @@ impl ProviderCleanupOutcome {
 
 #[async_trait]
 pub trait ProviderConversationCleanupRepository: Send + Sync {
+    /// Service-only global discovery; writes must bind the returned scope.
+    /// Keep `as_of` fixed across pages; UUID cursors are exclusive.
+    async fn scan_unqueued(
+        &self,
+        as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ProviderCleanupBackfillItem>, AppError>;
+    /// Scheduling candidates only, never permission for remote deletion.
+    async fn scan_due(
+        &self,
+        as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ProviderCleanupDueItem>, AppError>;
     /// No caller-supplied account, provider or remote ID is accepted.
     async fn enqueue(&self, scope: &TenantScope, capture_id: Uuid) -> Result<Uuid, AppError>;
+    /// Atomically claim the exact discovered job, rechecking its eligibility.
+    async fn claim(
+        &self,
+        scope: &TenantScope,
+        cleanup_id: Uuid,
+    ) -> Result<Option<ProviderCleanupClaim>, AppError>;
+    /// Verify complete retained evidence under the shared account reservation
+    /// immediately before deletion; a scheduling claim alone never authorizes it.
+    async fn authorize_delete(
+        &self,
+        scope: &TenantScope,
+        cleanup_id: Uuid,
+        lease_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<ProviderCleanupClaim, AppError>;
     /// Claims at most one item. Expired leases are always reconciled.
     async fn claim_due(
         &self,
@@ -79,6 +113,18 @@ pub trait ProviderConversationCleanupRepository: Send + Sync {
         lease_id: Uuid,
         outcome: ProviderCleanupOutcome,
     ) -> Result<(), AppError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCleanupBackfillItem {
+    pub scope: TenantScope,
+    pub capture_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCleanupDueItem {
+    pub scope: TenantScope,
+    pub cleanup_id: Uuid,
 }
 
 #[cfg(test)]

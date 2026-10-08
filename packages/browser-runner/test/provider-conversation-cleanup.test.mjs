@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { chromium } from "playwright";
 import {
@@ -10,6 +11,23 @@ import {
 const SELF = "/apiv2/kimi.gateway.account.v1.UserService/GetCurrentUser";
 const CHAT = "/apiv2/kimi.gateway.chat.v1.ChatService/";
 const SCOPE = { expectedUserId: "own-1", chatId: "task-chat-1" };
+const RETAINED_MESSAGES = [
+  { id: "user-1", role: "user", chat_id: SCOPE.chatId },
+  {
+    id: "assistant-1",
+    role: "assistant",
+    status: "COMPLETED",
+    chat_id: SCOPE.chatId,
+  },
+];
+const INVENTORY = createHash("sha256")
+  .update(
+    JSON.stringify([
+      ["assistant-1", "assistant"],
+      ["user-1", "user"],
+    ]),
+  )
+  .digest("hex");
 
 async function fixture(run) {
   const calls = [];
@@ -18,7 +36,10 @@ async function fixture(run) {
     chat: { chat: { id: SCOPE.chatId, status: "complete" } },
     messages: ({ page_token }) => ({
       chat_id: SCOPE.chatId,
-      messages: [{ chat_id: SCOPE.chatId, text: `answer-${page_token}` }],
+      messages: RETAINED_MESSAGES.map((message) => ({
+        ...message,
+        text: `answer-${page_token}`,
+      })),
     }),
     deletion: { chat_id: SCOPE.chatId },
   };
@@ -109,8 +130,156 @@ function authority() {
     authorized: true,
     platform_account_id: SCOPE.expectedUserId,
     external_conversation_id: SCOPE.chatId,
+    retained_message_inventory_sha256: INVENTORY,
   };
 }
+
+test("expired deletion authority is checked again after the final inspection", async () => {
+  await fixture(async ({ page, calls, trustedOrigin }) => {
+    const result = await deleteKimiConversation(page, {
+      ...SCOPE,
+      trustedOrigin,
+      authorizeDeletion: async () => ({
+        ...authority(),
+        delete_not_after: new Date(0).toISOString(),
+      }),
+    });
+    assert.equal(result.status, "retained");
+    assert.equal(
+      calls.filter(({ path }) => path.endsWith("GetChat")).length,
+      2,
+    );
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+  });
+});
+
+test("still-valid grant cannot delete without request timeout and close margin", async (t) => {
+  await fixture(async ({ page, calls, trustedOrigin }) => {
+    const now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const result = await deleteKimiConversation(page, {
+      ...SCOPE,
+      trustedOrigin,
+      timeoutMs: 12_000,
+      authorizeDeletion: async () => ({
+        ...authority(),
+        delete_not_after: new Date(now + 13_999).toISOString(),
+      }),
+    });
+    assert.equal(result.status, "retained");
+    assert.equal(
+      calls.filter(({ path }) => path.endsWith("GetChat")).length,
+      2,
+    );
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+  });
+});
+
+test("browser dispatch rechecks the absolute deletion grant budget", async () => {
+  await fixture(async ({ page, calls, trustedOrigin }) => {
+    const now = Date.now();
+    await page.clock.install({ time: now + 20_000 });
+    const result = await deleteKimiConversation(page, {
+      ...SCOPE,
+      trustedOrigin,
+      timeoutMs: 12_000,
+      authorizeDeletion: async () => ({
+        ...authority(),
+        delete_not_after: new Date(now + 30_000).toISOString(),
+      }),
+    });
+    assert.equal(result.status, "retained");
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+  });
+});
+
+test("only the exact durable inventory may delete, never appended or unknown messages", async () => {
+  await fixture(async ({ page, state, calls, trustedOrigin }) => {
+    const options = {
+      ...SCOPE,
+      trustedOrigin,
+      authorizeDeletion: async () => authority(),
+    };
+    for (const messages of [
+      [
+        ...RETAINED_MESSAGES,
+        { id: "new-user", role: "user" },
+        { id: "new-assistant", role: "assistant", status: "COMPLETED" },
+      ],
+      [...RETAINED_MESSAGES, RETAINED_MESSAGES[0]],
+      RETAINED_MESSAGES.map((message) => ({ ...message, status: undefined })),
+      RETAINED_MESSAGES.map((message) => ({ ...message, status: "completed" })),
+      RETAINED_MESSAGES.map((message) => ({ ...message, role: "unknown" })),
+      RETAINED_MESSAGES.map((message) => ({ ...message, id: undefined })),
+    ]) {
+      state.messages = () => ({ messages });
+      assert.equal(
+        (await deleteKimiConversation(page, options)).status,
+        "retained",
+      );
+    }
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+    state.messages = () => ({ messages: RETAINED_MESSAGES });
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "deleted",
+    );
+    assert.equal(
+      calls.filter(({ path }) => path.endsWith("DeleteChat")).length,
+      1,
+    );
+  });
+});
+
+test("inventory checks every page and rejects incomplete or changed pagination", async () => {
+  await fixture(async ({ page, state, calls, trustedOrigin }) => {
+    const options = {
+      ...SCOPE,
+      trustedOrigin,
+      authorizeDeletion: async () => authority(),
+    };
+    state.messages = ({ page_token }) =>
+      page_token
+        ? { messages: [{ id: "appended-user", role: 2 }] }
+        : { messages: RETAINED_MESSAGES, next_page_token: "second" };
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "retained",
+    );
+    state.messages = () => ({ messages: RETAINED_MESSAGES, has_more: true });
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "retained",
+    );
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+    state.messages = ({ page_token }) =>
+      page_token
+        ? { messages: [{ ...RETAINED_MESSAGES[1], role: 3, status: 2 }] }
+        : {
+            messages: [{ ...RETAINED_MESSAGES[0], role: 2 }],
+            next_page_token: "second",
+          };
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "deleted",
+    );
+  });
+});
 
 test("passive recovery paginates bounded message reads, without deletion or generation", async () => {
   await fixture(async ({ page, state, calls, trustedOrigin }) => {
@@ -214,6 +383,19 @@ test("missing durable authorization or switched account cannot delete", async ()
     assert.deepEqual(
       await deleteKimiConversation(page, { ...SCOPE, trustedOrigin }),
       { status: "retained", reason: "authorization_required" },
+    );
+    assert.equal(
+      (
+        await deleteKimiConversation(page, {
+          ...SCOPE,
+          trustedOrigin,
+          authorizeDeletion: async () => ({
+            ...authority(),
+            retained_message_inventory_sha256: undefined,
+          }),
+        })
+      ).status,
+      "retained",
     );
     assert.equal(
       (

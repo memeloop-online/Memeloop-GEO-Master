@@ -58,10 +58,12 @@ test("captures only the exact browser request without metadata or search claims"
     { message: { id: "message-1", text: "中文" } },
   ]);
   assert.deepEqual(Object.keys(result).sort(), [
+    "connect_json_terminal",
     "messages",
     "received_at",
     "started_at",
   ]);
+  assert.equal(result.connect_json_terminal, true);
   assert.ok(Date.parse(result.received_at) >= Date.parse(result.started_at));
   assert.equal(page.listenerCount("response"), 0);
 });
