@@ -42,7 +42,11 @@ test("legacy, ambiguous, incomplete and unknown statuses never prove completion"
     (exchange) => (exchange.connect_json_terminal = false),
     (exchange) => (exchange.connect_json_terminal = "true"),
     (exchange) => (exchange.messages = [{ chat: { id: "new-chat" } }]),
-    (exchange) => delete exchange.messages[1].message.chat_id,
+    (exchange) =>
+      ([exchange.messages[0], exchange.messages[1]] = [
+        exchange.messages[1],
+        exchange.messages[0],
+      ]),
     (exchange) => (exchange.messages[1].message.chat_id = "other-chat"),
     (exchange) => delete exchange.messages[1].message.role,
     (exchange) => delete exchange.messages[1].message.id,
@@ -59,6 +63,8 @@ test("legacy, ambiguous, incomplete and unknown statuses never prove completion"
       }),
     ...[
       "GENERATING",
+      "MESSAGE_STATUS_GENERATING",
+      "MESSAGE_STATUS_UNKNOWN",
       "UNSPECIFIED",
       "completed",
       "SUCCESS",
@@ -76,6 +82,74 @@ test("legacy, ambiguous, incomplete and unknown statuses never prove completion"
     change(exchange);
     assert.equal(capturedConversationCompletion(exchange), null);
   }
+});
+
+test("preceding chat scopes system, user and incremental assistant lifecycle envelopes", () => {
+  const exchange = {
+    connect_json_terminal: true,
+    messages: [
+      { chat: { id: "synthetic-chat" } },
+      {
+        message: {
+          id: "synthetic-system",
+          role: "system",
+          status: "MESSAGE_STATUS_COMPLETED",
+        },
+      },
+      {
+        message: {
+          id: "synthetic-user",
+          role: "user",
+          status: "MESSAGE_STATUS_COMPLETED",
+        },
+      },
+      {
+        message: {
+          id: "synthetic-assistant",
+          role: "assistant",
+          status: "MESSAGE_STATUS_GENERATING",
+        },
+      },
+      { message: { id: "synthetic-assistant", refs: {} } },
+      {
+        message: {
+          id: "synthetic-assistant",
+          status: "MESSAGE_STATUS_COMPLETED",
+        },
+      },
+    ],
+  };
+  assert.deepEqual(capturedConversationCompletion(exchange), {
+    protocol: "connect_json",
+    terminal: true,
+    assistant_message_ids: ["synthetic-assistant"],
+  });
+  for (const change of [
+    (source) => source.messages.splice(0, 1),
+    (source) => source.messages.push(source.messages.shift()),
+    (source) => (source.messages[2].message.chat_id = "other-chat"),
+    (source) => (source.messages[1].message.role = 1),
+    (source) =>
+      (source.messages[5].message.status = "MESSAGE_STATUS_GENERATING"),
+    (source) => (source.messages[5].message.role = "user"),
+  ]) {
+    const invalid = structuredClone(exchange);
+    change(invalid);
+    assert.equal(capturedConversationCompletion(invalid), null);
+  }
+});
+
+test("completion metadata stays bounded even with oversized structural fixtures", () => {
+  const exchange = completedExchange();
+  for (let index = 2; index <= 257; index++)
+    exchange.messages.push({
+      message: {
+        id: `answer-${index}`,
+        role: "assistant",
+        status: "COMPLETED",
+      },
+    });
+  assert.equal(capturedConversationCompletion(exchange), null);
 });
 
 test("only a consistent transport chat envelope identifies the new conversation", () => {

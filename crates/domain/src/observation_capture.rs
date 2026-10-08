@@ -221,8 +221,7 @@ fn completion_inventory<'a>(
     let envelopes = document.get("messages").and_then(Value::as_array)?;
     #[derive(Default)]
     struct MessageState {
-        role: Option<bool>,
-        bound: bool,
+        role: Option<&'static str>,
         completed: bool,
     }
     let mut states: HashMap<&str, MessageState> = HashMap::new();
@@ -248,6 +247,11 @@ fn completion_inventory<'a>(
         let Some(message) = fields.get("message").filter(|value| !value.is_null()) else {
             continue;
         };
+        // The exact preceding chat envelope establishes the stream's scope.
+        // Message-local chat IDs are optional in this provider's transport.
+        if !saw_chat {
+            return None;
+        }
         let message = message.as_object()?;
         let id = message
             .get("id")
@@ -259,8 +263,9 @@ fn completion_inventory<'a>(
         let state = states.entry(id).or_default();
         if let Some(role) = message.get("role") {
             let role = match (role.as_str(), role.as_u64()) {
-                (Some("assistant"), _) | (_, Some(3)) => true,
-                (Some("user"), _) | (_, Some(2)) => false,
+                (Some("assistant"), _) | (_, Some(3)) => "assistant",
+                (Some("user"), _) | (_, Some(2)) => "user",
+                (Some("system"), _) => "system",
                 _ => return None,
             };
             if state.role.is_some_and(|prior| prior != role) {
@@ -272,10 +277,12 @@ fn completion_inventory<'a>(
             if chat.as_str() != Some(chat_id) {
                 return None;
             }
-            state.bound = true;
         }
         if let Some(status) = message.get("status") {
-            state.completed = status.as_str() == Some("COMPLETED") || status.as_u64() == Some(2);
+            state.completed = matches!(
+                status.as_str(),
+                Some("COMPLETED" | "MESSAGE_STATUS_COMPLETED")
+            ) || status.as_u64() == Some(2);
         }
     }
     let mut assistants = Vec::new();
@@ -283,11 +290,11 @@ fn completion_inventory<'a>(
     for id in order {
         let state = &states[id];
         match state.role {
-            Some(true) if state.bound && state.completed => {
+            Some("assistant") if state.completed => {
                 assistants.push(id);
                 inventory.push((id, "assistant"));
             }
-            Some(false) if state.bound => inventory.push((id, "user")),
+            Some(role @ ("user" | "system")) => inventory.push((id, role)),
             _ => return None,
         }
     }
@@ -1053,14 +1060,11 @@ mod tests {
             capture.retained_message_inventory_sha256(&scope),
             Some(expected)
         );
-        document["messages"][2]["message"]
-            .as_object_mut()
-            .unwrap()
-            .remove("chat_id");
+        document["messages"][2]["message"]["chat_id"] = serde_json::json!("different-chat");
         replace_source(&mut capture.input, &document);
         assert!(
             capture.input.validate(&scope).is_err(),
-            "users need exact chat binding too"
+            "explicit user chat bindings must match"
         );
         assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
         capture.input.completion = None;
@@ -1071,7 +1075,7 @@ mod tests {
     #[test]
     fn completion_rejects_missing_identity_status_and_unclaimed_assistants() {
         let (scope, valid, document) = completed_capture();
-        for field in ["id", "role", "status", "chat_id"] {
+        for field in ["id", "role", "status"] {
             let mut document = document.clone();
             document["messages"][1]["message"]
                 .as_object_mut()
@@ -1119,6 +1123,65 @@ mod tests {
             input.completion.as_mut().unwrap().assistant_message_ids = ids;
             assert!(input.validate(&scope).is_err());
         }
+    }
+
+    #[test]
+    fn completion_binds_observed_incremental_schema_to_preceding_chat() {
+        let (scope, mut input, _) = completed_capture();
+        let mut document = serde_json::json!({"messages": [
+            {"chat": {"id": "synthetic-chat"}},
+            {"message": {"id": "synthetic-system", "role": "system", "status": "MESSAGE_STATUS_COMPLETED", "scenario": "synthetic", "createTime": "2026-01-01T00:00:00Z"}},
+            {"message": {"id": "synthetic-user", "role": "user", "blocks": [], "isGoal": false, "status": "MESSAGE_STATUS_COMPLETED", "parentId": "synthetic-system", "createTime": "2026-01-01T00:00:00Z"}},
+            {"message": {"id": "synthetic-message", "role": "assistant", "status": "MESSAGE_STATUS_GENERATING"}},
+            {"message": {"id": "synthetic-message", "refs": []}},
+            {"message": {"id": "synthetic-message", "status": "MESSAGE_STATUS_COMPLETED"}}
+        ]});
+        replace_source(&mut input, &document);
+        let capture = ObservationCapture {
+            receipt: ObservationCaptureReceipt {
+                capture_id: input.capture_id,
+                schema_version: 1,
+                digest_sha256: input.validate(&scope).unwrap(),
+                stored_at: Utc::now(),
+            },
+            input: input.clone(),
+        };
+        assert_eq!(capture.retained_message_inventory_sha256(&scope), Some(hex::encode(Sha256::digest(
+            br#"[["synthetic-message","assistant"],["synthetic-system","system"],["synthetic-user","user"]]"#
+        ))));
+        for status in [
+            "MESSAGE_STATUS_GENERATING",
+            "MESSAGE_STATUS_UNKNOWN",
+            "completed",
+        ] {
+            document["messages"][5]["message"]["status"] = serde_json::json!(status);
+            replace_source(&mut input, &document);
+            assert!(input.validate(&scope).is_err());
+        }
+        document["messages"][5]["message"]["status"] =
+            serde_json::json!("MESSAGE_STATUS_COMPLETED");
+        document["messages"].as_array_mut().unwrap().swap(0, 1);
+        for explicit_chat in [false, true] {
+            if explicit_chat {
+                document["messages"][0]["message"]["chat_id"] = serde_json::json!("synthetic-chat");
+            }
+            replace_source(&mut input, &document);
+            assert!(
+                input.validate(&scope).is_err(),
+                "message before chat must not authorize completion"
+            );
+        }
+        document["messages"].as_array_mut().unwrap().swap(0, 1);
+        document["messages"][1]["message"]["role"] = serde_json::json!(1);
+        replace_source(&mut input, &document);
+        assert!(
+            input.validate(&scope).is_err(),
+            "unobserved numeric system role remains unknown"
+        );
+        document["messages"][1]["message"]["role"] = serde_json::json!("system");
+        document["messages"][1]["message"]["chat_id"] = serde_json::json!("different-chat");
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_err());
     }
 
     #[test]

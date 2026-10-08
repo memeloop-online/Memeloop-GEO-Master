@@ -23,12 +23,17 @@ function retainedMessageInventory(pages) {
           ? "user"
           : message.role === "assistant" || message.role === 3
             ? "assistant"
-            : null;
+            : message.role === "system"
+              ? "system"
+              : null;
       if (
         !validId(message.id) ||
         seen.has(message.id) ||
         role === null ||
-        (role === "assistant" && !["COMPLETED", 2].includes(message.status))
+        ((role === "assistant" || role === "system") &&
+          !["COMPLETED", "MESSAGE_STATUS_COMPLETED", 2].includes(
+            message.status,
+          ))
       )
         return null;
       seen.add(message.id);
@@ -74,7 +79,9 @@ function generating(value) {
   return states.some(
     (state) =>
       typeof state === "string" &&
-      /^(generating|streaming|running|pending|in_progress)$/iu.test(state),
+      /^(generating|streaming|running|pending|in_progress|MESSAGE_STATUS_GENERATING)$/iu.test(
+        state,
+      ),
   );
 }
 
@@ -249,13 +256,13 @@ export async function recoverKimiConversation(
         (data.has_more !== undefined && typeof data.has_more !== "boolean") ||
         (data.next_page_token !== undefined &&
           typeof data.next_page_token !== "string") ||
-        (data.chat_id != null && data.chat_id !== chatId) ||
+        (data.chat_id !== undefined && data.chat_id !== chatId) ||
         generating(data) ||
         data.messages.some(
           (message) =>
             !message ||
             typeof message !== "object" ||
-            (message.chat_id != null && message.chat_id !== chatId) ||
+            (message.chat_id !== undefined && message.chat_id !== chatId) ||
             generating(message),
         )
       )

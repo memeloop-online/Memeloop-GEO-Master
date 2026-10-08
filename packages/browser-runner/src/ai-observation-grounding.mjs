@@ -110,75 +110,12 @@ function auditValue(value) {
  * only: the validator below remains the sole authority for acceptance.
  */
 export function observationRejectionReason(document, extracted) {
-  if (extracted?.decision === "unverified") return "model_unverified";
-  if (
-    !object(document) ||
-    !Array.isArray(document.messages) ||
-    !object(extracted) ||
-    extracted.decision !== "searched_answer" ||
-    !Array.isArray(extracted.answer_segments) ||
-    extracted.answer_segments.length < 1 ||
-    extracted.answer_segments.length > MAX_SEGMENTS ||
-    !Array.isArray(extracted.citations) ||
-    extracted.citations.length > MAX_CITATIONS
-  )
-    return "shape_rejected";
-  const required = [
-    "chat_id",
-    "message_id",
-    "answer_owner",
-    "search_owner",
-    "search_block_id",
-    "completion",
-    "search_activity",
-  ];
-  const sources = [
-    ...required.map((key) => extracted[key]),
-    ...extracted.answer_segments,
-    ...extracted.citations.flatMap((citation) =>
-      object(citation) ? [citation.url, citation.usage] : [citation],
-    ),
-  ];
-  if (sources.some((entry) => !object(entry) || !pointer(document, entry.path)))
-    return "path_rejected";
-  const selected = (entry) => pointer(document, entry.path)?.value;
-  const messageId = selected(extracted.message_id);
-  if (
-    selected(extracted.answer_owner) !== messageId ||
-    selected(extracted.search_owner) !== messageId ||
-    selected(extracted.search_block_id) === messageId
-  )
-    return "owner_rejected";
-  if (
-    extracted.answer_segments.some((entry) => {
-      if (entry.quote === undefined) return false;
-      const source = selected(entry);
-      return (
-        typeof source !== "string" ||
-        typeof entry.quote !== "string" ||
-        !entry.quote ||
-        source.indexOf(entry.quote) < 0 ||
-        source.indexOf(entry.quote) !== source.lastIndexOf(entry.quote)
-      );
-    })
-  )
-    return "quote_rejected";
-  if (
-    extracted.citations.some((entry) => {
-      const source = selected(entry.url);
-      const quote = entry.url.quote;
-      const url = quote === undefined ? source : quote;
-      return (
-        !publicUrl(url) ||
-        (quote !== undefined &&
-          (typeof source !== "string" ||
-            source.indexOf(quote) < 0 ||
-            source.indexOf(quote) !== source.lastIndexOf(quote)))
-      );
-    })
-  )
-    return "citation_rejected";
-  return "grounding_rejected";
+  let reason;
+  validateObservation(document, extracted, (code) => {
+    reason ??= code;
+    return null;
+  });
+  return reason ?? "grounding_rejected";
 }
 
 /**
@@ -187,7 +124,13 @@ export function observationRejectionReason(document, extracted) {
  * not the model's semantic judgment that those fields mean official search.
  */
 export function validateAiObservation(document, extracted) {
-  if (extracted?.decision === "unverified") return null;
+  return validateObservation(document, extracted, () => null);
+}
+
+// Acceptance and diagnostics share the exact checks; the callback receives
+// fixed vocabulary only, never source values, paths, quotes or identifiers.
+function validateObservation(document, extracted, reject) {
+  if (extracted?.decision === "unverified") return reject("model_unverified");
   if (
     !object(document) ||
     !Array.isArray(document.messages) ||
@@ -199,13 +142,20 @@ export function validateAiObservation(document, extracted) {
     !Array.isArray(extracted.citations) ||
     extracted.citations.length > MAX_CITATIONS
   )
-    return null;
+    return reject("shape_rejected");
 
   const refs = [];
-  const resolve = (candidate, role, valid = nonempty, allowQuote = false) => {
-    if (!object(candidate) || typeof candidate.path !== "string") return null;
+  const resolve = (
+    candidate,
+    role,
+    valid = nonempty,
+    allowQuote = false,
+    invalidReason = "evidence_empty",
+  ) => {
+    if (!object(candidate) || typeof candidate.path !== "string")
+      return reject("path_rejected");
     const found = pointer(document, candidate.path);
-    if (!found) return null;
+    if (!found) return reject("path_rejected");
     let selected = found.value;
     if (allowQuote && Object.hasOwn(candidate, "quote")) {
       if (
@@ -216,12 +166,12 @@ export function validateAiObservation(document, extracted) {
         selected.indexOf(candidate.quote) !==
           selected.lastIndexOf(candidate.quote)
       )
-        return null;
+        return reject("citation_rejected");
       selected = candidate.quote;
     }
-    if (!valid(selected)) return null;
+    if (!valid(selected)) return reject(invalidReason);
     const value = auditValue(selected);
-    if (!value) return null;
+    if (!value) return reject("shape_rejected");
     refs.push({
       role,
       path: found.path,
@@ -233,21 +183,13 @@ export function validateAiObservation(document, extracted) {
     return selected;
   };
   const validId = (value) => typeof value === "string" && ID.test(value);
-  const chatId = resolve(extracted.chat_id, "chat_id", validId);
-  const messageId = resolve(extracted.message_id, "message_id", (value) =>
-    validId(value),
-  );
-  const answerOwner = resolve(extracted.answer_owner, "answer_owner", (value) =>
-    validId(value),
-  );
-  const searchOwner = resolve(extracted.search_owner, "search_owner", (value) =>
-    validId(value),
-  );
-  const blockId = resolve(
-    extracted.search_block_id,
-    "search_block_id",
-    (value) => validId(value),
-  );
+  const resolveId = (candidate, role) =>
+    resolve(candidate, role, validId, false, "identifier_rejected");
+  const chatId = resolveId(extracted.chat_id, "chat_id");
+  const messageId = resolveId(extracted.message_id, "message_id");
+  const answerOwner = resolveId(extracted.answer_owner, "answer_owner");
+  const searchOwner = resolveId(extracted.search_owner, "search_owner");
+  const blockId = resolveId(extracted.search_block_id, "search_block_id");
   if (
     !chatId ||
     !messageId ||
@@ -258,27 +200,31 @@ export function validateAiObservation(document, extracted) {
     resolve(extracted.completion, "completion") === null ||
     resolve(extracted.search_activity, "search_activity") === null
   )
-    return null;
+    return reject("owner_rejected");
 
   const segments = [];
   for (const segment of extracted.answer_segments) {
-    if (!object(segment)) return null;
+    if (!object(segment)) return reject("shape_rejected");
     const source = resolve(
       segment,
       "answer_source",
       (value) => typeof value === "string" && value.length > 0,
+      false,
+      "answer_type_rejected",
     );
     if (source === null) return null;
     const hasQuote = Object.hasOwn(segment, "quote");
     const hasOffset =
       Object.hasOwn(segment, "start") || Object.hasOwn(segment, "end");
-    if (hasQuote && hasOffset) return null;
+    if (hasQuote && hasOffset) return reject("answer_bounds_rejected");
     let start = 0;
     let end = source.length;
     if (hasQuote) {
-      if (typeof segment.quote !== "string" || !segment.quote) return null;
+      if (typeof segment.quote !== "string" || !segment.quote)
+        return reject("quote_rejected");
       start = source.indexOf(segment.quote);
-      if (start < 0 || source.lastIndexOf(segment.quote) !== start) return null;
+      if (start < 0 || source.lastIndexOf(segment.quote) !== start)
+        return reject("quote_rejected");
       end = start + segment.quote.length;
     } else if (hasOffset) {
       if (
@@ -288,7 +234,7 @@ export function validateAiObservation(document, extracted) {
         segment.end > source.length ||
         segment.start >= segment.end
       )
-        return null;
+        return reject("answer_bounds_rejected");
       start = segment.start;
       end = segment.end;
     }
@@ -299,7 +245,7 @@ export function validateAiObservation(document, extracted) {
       /^[\uDC00-\uDFFF]/u.test(source.slice(start)) ||
       /[\uD800-\uDBFF]$/u.test(exact)
     )
-      return null;
+      return reject("unicode_rejected");
     segments.push(exact);
     refs.push({
       role: "answer_segment",
@@ -310,16 +256,20 @@ export function validateAiObservation(document, extracted) {
     });
   }
   const rawAnswer = segments.join("");
-  if (
-    !rawAnswer.trim() ||
-    Buffer.byteLength(rawAnswer, "utf8") > MAX_ANSWER_BYTES
-  )
-    return null;
+  if (!rawAnswer.trim()) return reject("answer_empty");
+  if (Buffer.byteLength(rawAnswer, "utf8") > MAX_ANSWER_BYTES)
+    return reject("answer_too_large");
 
   const citations = [];
   for (const citation of extracted.citations) {
-    if (!object(citation)) return null;
-    const url = resolve(citation.url, "citation_url", publicUrl, true);
+    if (!object(citation)) return reject("shape_rejected");
+    const url = resolve(
+      citation.url,
+      "citation_url",
+      publicUrl,
+      true,
+      "citation_rejected",
+    );
     const usage = resolve(citation.usage, "citation_usage");
     if (!url || usage === null) return null;
     if (!citations.includes(url)) citations.push(url);

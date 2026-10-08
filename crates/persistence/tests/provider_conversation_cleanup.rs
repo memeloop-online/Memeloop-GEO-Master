@@ -345,7 +345,14 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
             .await
             .is_err()
     );
-    let source_json = r#"{"messages":[{"chat":{"id":"synthetic-complete"}},{"message":{"id":"synthetic-user","chat_id":"synthetic-complete","role":"user"}},{"message":{"id":"synthetic-message","chat_id":"synthetic-complete","role":"assistant","status":"COMPLETED"}}]}"#.to_owned();
+    let source_json = serde_json::json!({"messages": [
+        {"chat": {"id": "synthetic-complete"}},
+        {"message": {"id": "synthetic-system", "role": "system", "status": "MESSAGE_STATUS_COMPLETED", "scenario": "synthetic", "createTime": "2026-01-01T00:00:00Z"}},
+        {"message": {"id": "synthetic-user", "role": "user", "blocks": [], "isGoal": false, "status": "MESSAGE_STATUS_COMPLETED", "parentId": "synthetic-system"}},
+        {"message": {"id": "synthetic-message", "role": "assistant", "status": "MESSAGE_STATUS_GENERATING"}},
+        {"message": {"id": "synthetic-message", "refs": []}},
+        {"message": {"id": "synthetic-message", "status": "MESSAGE_STATUS_COMPLETED"}}
+    ]}).to_string();
     let complete = ObservationCaptureInput {
         capture_id: Uuid::new_v4(),
         runner_session_id: Uuid::new_v4(),
@@ -372,7 +379,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     assert_eq!(
         complete_claim.retained_message_inventory_sha256,
         Some(sha256_hex(
-            br#"[["synthetic-message","assistant"],["synthetic-user","user"]]"#
+            br#"[["synthetic-message","assistant"],["synthetic-system","system"],["synthetic-user","user"]]"#
         ))
     );
     assert!(

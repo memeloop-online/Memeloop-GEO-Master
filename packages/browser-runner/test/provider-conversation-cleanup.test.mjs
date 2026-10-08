@@ -243,6 +243,79 @@ test("only the exact durable inventory may delete, never appended or unknown mes
   });
 });
 
+test("observed completed system and assistant states join the exact canonical inventory", async () => {
+  await fixture(async ({ page, state, calls, trustedOrigin }) => {
+    const messages = [
+      { id: "system-1", role: "system", status: "MESSAGE_STATUS_COMPLETED" },
+      { id: "user-1", role: "user" },
+      {
+        id: "assistant-1",
+        role: "assistant",
+        status: "MESSAGE_STATUS_COMPLETED",
+      },
+    ];
+    const retained_message_inventory_sha256 = createHash("sha256")
+      .update(
+        JSON.stringify([
+          ["assistant-1", "assistant"],
+          ["system-1", "system"],
+          ["user-1", "user"],
+        ]),
+      )
+      .digest("hex");
+    const options = {
+      ...SCOPE,
+      trustedOrigin,
+      authorizeDeletion: async () => ({
+        ...authority(),
+        retained_message_inventory_sha256,
+      }),
+    };
+    for (const status of [undefined, "MESSAGE_STATUS_GENERATING", "unknown"]) {
+      state.messages = () => ({
+        messages: messages.map((message) =>
+          message.role === "system" ? { ...message, status } : message,
+        ),
+      });
+      assert.equal(
+        (await deleteKimiConversation(page, options)).status,
+        "retained",
+      );
+    }
+    state.messages = () => ({
+      messages: messages.map((message) =>
+        message.role === "assistant"
+          ? { ...message, status: "MESSAGE_STATUS_GENERATING" }
+          : message,
+      ),
+    });
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "retained",
+    );
+    state.messages = () => ({
+      messages: messages.map((message) => ({
+        ...message,
+        chat_id: "other-chat",
+      })),
+    });
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "retained",
+    );
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+    // Exact scoped ListMessages/GetChat responses can omit per-message chat_id.
+    state.messages = () => ({ messages });
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "deleted",
+    );
+  });
+});
+
 test("inventory checks every page and rejects incomplete or changed pagination", async () => {
   await fixture(async ({ page, state, calls, trustedOrigin }) => {
     const options = {

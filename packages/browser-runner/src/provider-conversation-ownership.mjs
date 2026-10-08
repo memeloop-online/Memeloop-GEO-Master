@@ -46,8 +46,13 @@ export function capturedConversationCompletion(exchange) {
   const chatId = capturedNewConversationId(exchange);
   if (!chatId) return null;
   const messages = new Map();
+  let precedingChat = null;
   for (const envelope of exchange.messages) {
+    if (envelope.chat != null) precedingChat = envelope.chat.id;
     if (envelope.message == null) continue;
+    // An omitted chat_id is scoped by a prior transport chat envelope, never
+    // by a later envelope or inferred from the page/model response.
+    if (precedingChat !== chatId) return null;
     const message = envelope.message;
     if (
       typeof message !== "object" ||
@@ -62,14 +67,16 @@ export function capturedConversationCompletion(exchange) {
         ? "assistant"
         : ["user", 2].includes(message.role)
           ? "user"
-          : null;
+          : message.role === "system"
+            ? "system"
+            : null;
       if (!role || (state.role && state.role !== role)) return null;
       state.role = role;
     }
     if (Object.hasOwn(message, "chat_id")) {
       if (message.chat_id !== chatId) return null;
-      state.chatId = chatId;
     }
+    state.chatId = precedingChat;
     if (Object.hasOwn(message, "status")) state.status = message.status;
     messages.set(message.id, state);
   }
@@ -77,11 +84,11 @@ export function capturedConversationCompletion(exchange) {
   for (const [id, state] of messages) {
     if (!state.role || state.chatId !== chatId) return null;
     if (state.role !== "assistant") continue;
-    if (state.chatId !== chatId || !["COMPLETED", 2].includes(state.status))
+    if (!["COMPLETED", "MESSAGE_STATUS_COMPLETED", 2].includes(state.status))
       return null;
     assistantIds.push(id);
   }
-  return assistantIds.length
+  return assistantIds.length && assistantIds.length <= 256
     ? {
         protocol: "connect_json",
         terminal: true,

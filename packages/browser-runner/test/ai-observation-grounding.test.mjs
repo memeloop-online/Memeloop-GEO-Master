@@ -69,6 +69,86 @@ const modernExtracted = {
 const validate = (overrides = {}, document = modern) =>
   validateAiObservation(document, { ...modernExtracted, ...overrides });
 
+test("every residual grounding failure has a fixed diagnostic without relaxing validation", () => {
+  const scenarios = [
+    ["identifier_rejected", (document) => (document.messages[0].chat.id = 123)],
+    [
+      "identifier_rejected",
+      (document) => (document.messages[2].block.id = "private:id"),
+    ],
+    [
+      "evidence_empty",
+      (document) => (document.messages[1].message.status = ""),
+    ],
+    [
+      "evidence_empty",
+      (document) => (document.messages[2].block.tool.contents = []),
+    ],
+    [
+      "evidence_empty",
+      (document) =>
+        (document.messages[1].message.refs.searchChunks[0].id = false),
+    ],
+    [
+      "answer_type_rejected",
+      (document) =>
+        (document.messages[3].block.text.content = { private_value: "hidden" }),
+    ],
+    [
+      "answer_type_rejected",
+      (document) => (document.messages[3].block.text.content = ""),
+    ],
+    [
+      "answer_empty",
+      (document) => (document.messages[3].block.text.content = " \n"),
+    ],
+    [
+      "answer_too_large",
+      (document) =>
+        (document.messages[3].block.text.content = "界".repeat(33_334)),
+    ],
+    [
+      "unicode_rejected",
+      (document) => (document.messages[3].block.text.content = "\uD800"),
+    ],
+    [
+      "answer_bounds_rejected",
+      (_document, candidate) =>
+        Object.assign(candidate.answer_segments[0], { start: -1, end: 2 }),
+    ],
+    [
+      "answer_bounds_rejected",
+      (_document, candidate) =>
+        Object.assign(candidate.answer_segments[0], {
+          quote: "Answer",
+          start: 0,
+          end: 6,
+        }),
+    ],
+    [
+      "quote_rejected",
+      (_document, candidate) =>
+        (candidate.answer_segments[0].quote = undefined),
+    ],
+    [
+      "citation_rejected",
+      (_document, candidate) => (candidate.citations[0].url.quote = undefined),
+    ],
+    [
+      "shape_rejected",
+      (_document, candidate) => (candidate.citations = [null]),
+    ],
+  ];
+  for (const [reason, change] of scenarios) {
+    const document = structuredClone(modern);
+    const candidate = structuredClone(modernExtracted);
+    change(document, candidate);
+    assert.equal(validateAiObservation(document, candidate), null, reason);
+    assert.equal(observationRejectionReason(document, candidate), reason);
+  }
+  assert.ok(validateAiObservation(modern, modernExtracted));
+});
+
 test("rejection reasons are fixed vocabulary without accepting any candidate", () => {
   const explain = (overrides) =>
     observationRejectionReason(modern, {

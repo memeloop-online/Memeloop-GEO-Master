@@ -127,6 +127,47 @@ test("model completion claims cannot upgrade raw lifecycle proof", async () => {
   assert.ok(records.every((record) => !Object.hasOwn(record, "completion")));
 });
 
+test("specific grounding diagnostics persist and emit without source values", async () => {
+  const records = [];
+  const diagnostics = [];
+  const source = structuredClone(exchange);
+  source.messages[1].state = false;
+  assert.equal(
+    await interpretObservation(source, {
+      onEvidence: async (record) => records.push(record),
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      apiExtract: async () => extraction(),
+    }),
+    null,
+  );
+  assert.equal(records[1].grounding_reason, "evidence_empty");
+  assert.equal(diagnostics[0].code, "evidence_empty");
+  for (const code of [
+    "identifier_rejected",
+    "evidence_empty",
+    "answer_type_rejected",
+    "answer_bounds_rejected",
+    "answer_empty",
+    "answer_too_large",
+    "unicode_rejected",
+  ]) {
+    const entries = [];
+    reportObservationDiagnostic(
+      (entry) => entries.push(entry),
+      "extraction",
+      code,
+    );
+    assert.equal(entries[0].code, code);
+  }
+  const count = diagnostics.length;
+  reportObservationDiagnostic(
+    (entry) => diagnostics.push(entry),
+    "extraction",
+    "private unrecognized diagnostic",
+  );
+  assert.equal(diagnostics.length, count);
+});
+
 test("failed extraction emits only allowlisted route diagnostics and preserves null", async () => {
   const diagnostics = [];
   const result = await interpretObservation(exchange, {
