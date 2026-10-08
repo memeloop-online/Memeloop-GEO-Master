@@ -3,7 +3,7 @@ use chrono::Utc;
 use geo_domain::{
     ChannelJobRepository, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelTarget,
     ChannelTargetInput, ConnectorAvailability, ConnectorCapabilityRepository, ConnectorKey,
-    ConnectorVerification, ErrorCode, PLAIN_TEXT_ARTICLE_FORMAT, TenantScope,
+    ConnectorVerification, ErrorCode, PLAIN_TEXT_ARTICLE_FORMAT, RICH_MARKDOWN_FORMAT, TenantScope,
     plain_text_article_readback_hash,
 };
 use geo_persistence::{Database, PgChannelJobRepository, PgConnectorCapabilityRepository};
@@ -11,7 +11,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 fn verification() -> ConnectorVerification {
-    let now = Utc::now();
+    // PostgreSQL persists timestamptz at microsecond precision. Use the same
+    // precision for the JSON receipt and verification row so their ordering
+    // remains valid when the proof is reloaded from durable history.
+    let now =
+        chrono::DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
     let url = "https://example.com/posts/123".to_string();
     let hash = "c".repeat(64);
     let publication_receipt = ChannelOutcome {
@@ -41,7 +45,7 @@ fn verification() -> ConnectorVerification {
             placement_slot: "primary".into(),
         },
         connector_version: "trusted.v1".into(),
-        content_type: "article".into(),
+        content_type: PLAIN_TEXT_ARTICLE_FORMAT.into(),
         publication_receipt,
         public_readback,
         verified_at: now,
@@ -86,7 +90,7 @@ async fn operator_registry_is_durable_revisioned_and_immutable() {
     let operator = operator.into();
     let other = other.into();
     assert_eq!(
-        repo.resolve(operator, &key, "trusted.v1", "article")
+        repo.resolve(operator, &key, "trusted.v1", PLAIN_TEXT_ARTICLE_FORMAT)
             .await
             .unwrap()
             .availability,
@@ -98,7 +102,7 @@ async fn operator_registry_is_durable_revisioned_and_immutable() {
             key.clone(),
             0,
             true,
-            vec!["article".into()],
+            vec![PLAIN_TEXT_ARTICLE_FORMAT.into()],
             "trusted.v1"
         )
         .await
@@ -132,7 +136,7 @@ async fn operator_registry_is_durable_revisioned_and_immutable() {
             key.clone(),
             0,
             true,
-            vec!["article".into()],
+            vec![PLAIN_TEXT_ARTICLE_FORMAT.into()],
             "trusted.v1"
         )
         .await
@@ -150,25 +154,43 @@ async fn operator_registry_is_durable_revisioned_and_immutable() {
         .await
         .is_err()
     );
+    // Text-only evidence is format-specific. It cannot enable a semantic
+    // catch-all or claim structure and image readback for rich publication.
+    for unproven in ["article", RICH_MARKDOWN_FORMAT] {
+        assert_eq!(
+            repo.configure(
+                operator,
+                key.clone(),
+                0,
+                true,
+                vec![unproven.into()],
+                "trusted.v1",
+            )
+            .await
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidRequest
+        );
+    }
     repo.configure(
         operator,
         key.clone(),
         0,
         true,
-        vec!["article".into()],
+        vec![PLAIN_TEXT_ARTICLE_FORMAT.into()],
         "trusted.v1",
     )
     .await
     .unwrap();
     assert_eq!(
-        repo.resolve(operator, &key, "trusted.v1", "article")
+        repo.resolve(operator, &key, "trusted.v1", PLAIN_TEXT_ARTICLE_FORMAT)
             .await
             .unwrap()
             .availability,
         ConnectorAvailability::Available
     );
     assert_eq!(
-        repo.resolve(operator, &key, "trusted.v2", "article")
+        repo.resolve(operator, &key, "trusted.v2", PLAIN_TEXT_ARTICLE_FORMAT)
             .await
             .unwrap()
             .availability,
@@ -182,7 +204,7 @@ async fn operator_registry_is_durable_revisioned_and_immutable() {
         ConnectorAvailability::UnsupportedContentType
     );
     assert_eq!(
-        repo.resolve(other, &key, "trusted.v1", "article")
+        repo.resolve(other, &key, "trusted.v1", PLAIN_TEXT_ARTICLE_FORMAT)
             .await
             .unwrap()
             .availability,
@@ -203,7 +225,7 @@ async fn operator_registry_is_durable_revisioned_and_immutable() {
         2
     );
     assert_eq!(
-        repo.resolve(operator, &key, "trusted.v1", "article")
+        repo.resolve(operator, &key, "trusted.v1", PLAIN_TEXT_ARTICLE_FORMAT)
             .await
             .unwrap()
             .availability,
