@@ -6,12 +6,14 @@ use geo_domain::{
     ContentExecution, ContentExecutionStatus, ContentHandoff, ContentHandoffItem,
     ContentItemStatus, ContentRevision, DistributionRepository, DistributionTargetStatus,
     DocumentManifest, DocumentManifestItemState, ErrorCode, EvidenceRef, FreezeDistribution,
-    InitialSource, InitialSourceKind, InitialSourceVisibility, PlatformPlacement,
-    PreparedDistribution, ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand,
-    StructuredDocument, TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, MediaObjectKey, MediaReference,
+    PlatformPlacement, PreparedDistribution, ProjectCreate, ProjectRepository, ProjectSettings,
+    ProjectStartCommand, RICH_MARKDOWN_FORMAT, RichContent, RichNode, StructuredDocument,
+    TenantScope, VerifiedImage, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{
-    Database, DatabaseConfig, PgChannelJobRepository, PgDistributionRepository, PgProjectRepository,
+    Database, DatabaseConfig, PgChannelJobRepository, PgContentMediaRepository,
+    PgDistributionRepository, PgProjectRepository,
 };
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -381,6 +383,462 @@ fn freeze(fixture: &Fixture) -> FreezeDistribution {
             .collect(),
         sealed_at: Utc::now() - Duration::days(30),
     }
+}
+
+async fn media_revision(db: &Database, fixture: &mut Fixture) -> (MediaObjectKey, Uuid) {
+    let scope = &fixture.scope;
+    let project_id = scope.project_id.unwrap().as_uuid();
+    let session_id = Uuid::new_v4();
+    let object_id = Uuid::new_v4();
+    let bytes = b"fixture-immutable-image";
+    let sha256 = hex::encode(Sha256::digest(bytes));
+    sqlx::query(
+        "INSERT INTO knowledge_upload_sessions \
+         (upload_session_id,operator_id,tenant_id,project_id,revision,filename,\
+          declared_media_type,expected_size,expected_sha256,purpose,state,expires_at,\
+          committed_object_id,staging_object_ref) \
+         VALUES ($1,$2,$3,$4,2,'image.png','image/png',$5,$6,'internal','committed',\
+                 now()+interval '1 day',$7,'agent-attachment')",
+    )
+    .bind(session_id)
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project_id)
+    .bind(bytes.len() as i64)
+    .bind(&sha256)
+    .bind(object_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_upload_blobs (upload_session_id,content,actual_size,sha256) \
+         VALUES ($1,$2,$3,$4)",
+    )
+    .bind(session_id)
+    .bind(bytes.as_slice())
+    .bind(bytes.len() as i64)
+    .bind(&sha256)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_stored_objects \
+         (object_id,operator_id,tenant_id,project_id,object_version,backend,opaque_key,\
+          actual_size,detected_media_type,sha256,state) \
+         VALUES ($1,$2,$3,$4,1,'postgres_blob',$5,$6,'image/png',$7,'committed')",
+    )
+    .bind(object_id)
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project_id)
+    .bind(format!("upload/{session_id}"))
+    .bind(bytes.len() as i64)
+    .bind(&sha256)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let key = MediaObjectKey {
+        object_id,
+        object_version: 1,
+        sha256,
+    };
+    let binding_id = geo_domain::ContentMediaRepository::create_binding(
+        &PgContentMediaRepository::from_database(db),
+        scope,
+        VerifiedImage {
+            key: key.clone(),
+            media_type: "image/png".into(),
+            byte_len: bytes.len() as u64,
+            width: 1,
+            height: 1,
+        },
+    )
+    .await
+    .unwrap()
+    .binding_id;
+    let chunk_id = fixture.revision.evidence[0].chunk_id.unwrap();
+    fixture.revision.revision_id = Uuid::new_v4();
+    fixture.revision.asset_id = Uuid::new_v4();
+    fixture.revision.created_at = Utc::now();
+    fixture.revision.document.schema_version = Some(2);
+    fixture.revision.document.blocks = vec![
+        ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Rich,
+            text: String::new(),
+            citation_ids: vec![chunk_id],
+            items: vec![],
+            rich: Some(RichContent {
+                version: 1,
+                node: RichNode::Paragraph {
+                    content: vec![RichNode::Text {
+                        text: "Documented public capability.".into(),
+                        marks: vec![],
+                    }],
+                },
+            }),
+        },
+        ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Rich,
+            text: String::new(),
+            citation_ids: vec![chunk_id],
+            items: vec![],
+            rich: Some(RichContent {
+                version: 1,
+                node: RichNode::Media {
+                    attrs: MediaReference {
+                        object_id,
+                        object_version: 1,
+                        sha256: key.sha256.clone(),
+                        alt: "Diagram".into(),
+                        caption: "A documented diagram".into(),
+                    },
+                },
+            }),
+        },
+    ];
+    fixture.revision.markdown = fixture.revision.document.markdown();
+    let old_handoff_id = fixture.handoff.handoff_id;
+    fixture.handoff.handoff_id = Uuid::new_v4();
+    fixture.handoff.revision += 1;
+    fixture.handoff.supersedes_handoff_id = Some(old_handoff_id);
+    fixture.handoff.created_at = Utc::now();
+    for item in &mut fixture.handoff.items {
+        item.revision_id = Some(fixture.revision.revision_id);
+    }
+    fixture.execution.handoff_id = Some(fixture.handoff.handoff_id);
+    sqlx::query(
+        "INSERT INTO content_revisions \
+         (revision_id,operator_id,tenant_id,project_id,execution_id,asset_id,revision,body,created_at) \
+         VALUES($1,$2,$3,$4,$5,$6,1,$7,$8)",
+    )
+    .bind(fixture.revision.revision_id)
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project_id)
+    .bind(fixture.execution.execution_id)
+    .bind(fixture.revision.asset_id)
+    .bind(serde_json::to_value(&fixture.revision).unwrap())
+    .bind(fixture.revision.created_at)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let check = ContentCheck {
+        check_id: Uuid::new_v4(),
+        revision_id: fixture.revision.revision_id,
+        findings: vec![],
+        created_at: Utc::now(),
+    };
+    sqlx::query(
+        "INSERT INTO content_checks \
+         (check_id,operator_id,tenant_id,project_id,execution_id,revision_id,body,created_at) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(check.check_id)
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project_id)
+    .bind(fixture.execution.execution_id)
+    .bind(fixture.revision.revision_id)
+    .bind(serde_json::to_value(&check).unwrap())
+    .bind(check.created_at)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO content_handoffs \
+         (handoff_id,operator_id,tenant_id,project_id,execution_id,revision,\
+          supersedes_handoff_id,body,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(fixture.handoff.handoff_id)
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project_id)
+    .bind(fixture.execution.execution_id)
+    .bind(fixture.handoff.revision)
+    .bind(old_handoff_id)
+    .bind(serde_json::to_value(&fixture.handoff).unwrap())
+    .bind(fixture.handoff.created_at)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE content_executions SET state=$1 WHERE operator_id=$2 AND tenant_id=$3 \
+         AND project_id=$4 AND execution_id=$5",
+    )
+    .bind(serde_json::json!({"execution":fixture.execution}))
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project_id)
+    .bind(fixture.execution.execution_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    (key, binding_id)
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL in GEO_TEST_DATABASE_URL"]
+async fn rich_media_outbox_survives_restart_reuse_and_rejects_withdrawal_or_foreign_binding() {
+    let url = std::env::var("GEO_TEST_DATABASE_URL").unwrap();
+    let admin = PgPool::connect(&url).await.unwrap();
+    let schema = format!("distribution_rich_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .unwrap()
+        .options([("search_path", schema.as_str())]);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    let db = Database::from_pool(pool);
+    db.migrate().await.unwrap();
+    let mut fixture = fixture(db.pool()).await;
+    let (key, binding_id) = media_revision(&db, &mut fixture).await;
+    let binding = geo_domain::ContentMediaRepository::get_binding(
+        &PgContentMediaRepository::from_database(&db),
+        &fixture.scope,
+        binding_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let repo = PgDistributionRepository::from_database(&db);
+    let jobs = PgChannelJobRepository::from_database(&db);
+    let mut frozen = freeze(&fixture);
+    for placement in &mut frozen.placements {
+        placement
+            .supported_formats
+            .push(RICH_MARKDOWN_FORMAT.into());
+    }
+    let manifest = repo.freeze(&fixture.scope, frozen.clone()).await.unwrap();
+    let page = repo
+        .expansion_page(&fixture.scope, manifest.manifest_id, 0, 6)
+        .await
+        .unwrap();
+    repo.commit_expansion_page(&fixture.scope, manifest.manifest_id, 0, page.rows.clone())
+        .await
+        .unwrap();
+    let target = page.rows[0].target_id;
+    let blocked_target = page.rows[1].target_id;
+    let first_manifest_id = manifest.manifest_id;
+    let account_id = Uuid::new_v4();
+    let prepared = PreparedDistribution {
+        manifest_id: manifest.manifest_id,
+        target_id: target,
+        revision: Some(fixture.revision.clone()),
+        account_id: Some(account_id),
+        defer_reason: None,
+    };
+    assert_eq!(
+        repo.materialize(&fixture.scope, prepared.clone())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    let initial = repo
+        .materialize_rich(&fixture.scope, prepared.clone(), vec![binding.clone()])
+        .await
+        .unwrap();
+    let variant = initial.variant.clone().unwrap();
+    let payload = variant.rich_payload.clone().unwrap();
+    assert_eq!(payload.document, fixture.revision.document);
+    assert_eq!(payload.media.len(), 1);
+    assert_eq!(payload.media[0].binding_id, binding_id);
+    assert_eq!(payload.media[0].object, key);
+    assert_eq!(initial.publication_commands.len(), 1);
+    let restarted = PgDistributionRepository::from_database(&db);
+    assert_eq!(
+        restarted
+            .get_publication_bundle(&fixture.scope, initial.intent.as_ref().unwrap().intent_id)
+            .await
+            .unwrap()
+            .variant,
+        variant
+    );
+    let outbox = jobs.materialize_pending_commands(None, 100).await.unwrap();
+    assert_eq!(outbox.len(), 1);
+    let frozen_input = jobs
+        .get_target(&fixture.scope, outbox[0].target_id)
+        .await
+        .unwrap();
+    let ChannelTargetInput::GeneratedPublish {
+        rich_payload,
+        payload_hash,
+        body,
+        ..
+    } = frozen_input.target.input
+    else {
+        panic!("generated target expected");
+    };
+    assert_eq!(rich_payload, Some(payload));
+    assert_eq!(payload_hash, variant.payload_hash);
+    assert_eq!(body, variant.markdown);
+    assert!(
+        jobs.materialize_pending_commands(None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A claimed rich attempt without its durable one-shot send authorization
+    // must not accept a reported platform success or advance the command.
+    let now = Utc::now();
+    let reservation_id = Uuid::new_v4();
+    jobs.reserve_account(
+        &fixture.scope,
+        account_id,
+        reservation_id,
+        now,
+        now + Duration::seconds(30),
+    )
+    .await
+    .unwrap();
+    let attempt_id = Uuid::new_v4();
+    jobs.claim_reserved(
+        &fixture.scope,
+        outbox[0].target_id,
+        attempt_id,
+        reservation_id,
+        now,
+    )
+    .await
+    .unwrap();
+    let fabricated = ChannelOutcome {
+        status: ChannelOutcomeStatus::Published,
+        detail: None,
+        occurred_at: now,
+        raw_answer: None,
+        citations: vec![],
+        public_url: None,
+        screenshot_ref: None,
+        connector_version: None,
+        runner_evidence: vec![],
+        fixture: false,
+    };
+    assert_eq!(
+        jobs.finish(
+            &fixture.scope,
+            outbox[0].target_id,
+            attempt_id,
+            fabricated,
+            now,
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        jobs.get_target(&fixture.scope, outbox[0].target_id)
+            .await
+            .unwrap()
+            .attempts[0]
+            .outcome,
+        None
+    );
+    let successor = next_cycle(db.pool(), &fixture).await;
+    let manifest = repo
+        .freeze(&successor.scope, {
+            let mut next = freeze(&successor);
+            for placement in &mut next.placements {
+                placement
+                    .supported_formats
+                    .push(RICH_MARKDOWN_FORMAT.into());
+            }
+            next
+        })
+        .await
+        .unwrap();
+    let page = repo
+        .expansion_page(&successor.scope, manifest.manifest_id, 0, 6)
+        .await
+        .unwrap();
+    repo.commit_expansion_page(&successor.scope, manifest.manifest_id, 0, page.rows.clone())
+        .await
+        .unwrap();
+    let reuse = repo
+        .materialize_rich(
+            &successor.scope,
+            PreparedDistribution {
+                manifest_id: manifest.manifest_id,
+                target_id: page.rows[0].target_id,
+                revision: Some(successor.revision.clone()),
+                account_id: Some(account_id),
+                defer_reason: None,
+            },
+            vec![binding.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reuse.intent.unwrap().intent_id,
+        initial.intent.unwrap().intent_id
+    );
+    assert!(reuse.publication_commands.is_empty());
+    let wrong_scope = TenantScope::new(
+        fixture.scope.operator_id,
+        fixture.scope.tenant_id,
+        Some(Uuid::new_v4().into()),
+    );
+    assert_eq!(
+        geo_domain::ContentMediaRepository::get_binding(
+            &PgContentMediaRepository::from_database(&db),
+            &wrong_scope,
+            binding_id,
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    let mut foreign_binding = binding.clone();
+    foreign_binding.project_id = Uuid::new_v4().into();
+    assert_eq!(
+        repo.materialize_rich(
+            &fixture.scope,
+            PreparedDistribution {
+                manifest_id: first_manifest_id,
+                target_id: blocked_target,
+                revision: Some(fixture.revision.clone()),
+                account_id: Some(account_id),
+                defer_reason: None,
+            },
+            vec![foreign_binding],
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+    geo_domain::ContentMediaRepository::withdraw_binding(
+        &PgContentMediaRepository::from_database(&db),
+        &fixture.scope,
+        binding_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.materialize_rich(
+            &fixture.scope,
+            PreparedDistribution {
+                manifest_id: first_manifest_id,
+                target_id: blocked_target,
+                revision: Some(fixture.revision.clone()),
+                account_id: Some(account_id),
+                defer_reason: None,
+            },
+            vec![binding],
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
 }
 
 #[tokio::test]

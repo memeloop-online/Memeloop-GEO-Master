@@ -5,8 +5,8 @@ use geo_domain::{
     ContentRequestDeferral, ContentRequestDeferralReason, ContentRequestMaterializationFailure,
     ContentRevision, ErrorCode, PlatformPlacement, PoolAccount, PublicationIntent, TenantScope,
     classified_request_failure, distribution_request_key_hash,
-    prepare_content_distribution_request, prepare_request_publication_intent, prepare_variant,
-    validate_distribution_request_intent,
+    prepare_content_distribution_request, prepare_request_publication_intent,
+    prepare_rich_variant_authorized, prepare_variant, validate_distribution_request_intent,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -532,15 +532,42 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             tx.commit().await.map_err(db)?;
             return Ok(request);
         }
-        if request.format != geo_domain::TEXT_DISTRIBUTION_FORMAT {
+        if ![
+            geo_domain::TEXT_DISTRIBUTION_FORMAT,
+            geo_domain::RICH_DISTRIBUTION_FORMAT,
+        ]
+        .contains(&request.format.as_str())
+        {
             return Err(classified_request_failure(
                 ContentRequestDeferralReason::FormatUnsupported,
                 AppError::conflict("publication format is not supported"),
             ));
         }
         live_request_account(&mut tx, scope, &request).await?;
-        // An account login is not format proof. The independent persisted
-        // connector evidence and current settings must both permit text.
+        if request.format == geo_domain::RICH_DISTRIBUTION_FORMAT {
+            let schema_version: Option<i32> = sqlx::query_scalar(
+                "SELECT (body->'document'->>'schema_version')::int \
+                 FROM content_revisions WHERE operator_id=$1 AND tenant_id=$2 \
+                   AND project_id=$3 AND revision_id=$4 AND asset_id=$5",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project_id)
+            .bind(request.content_revision_id)
+            .bind(request.content_asset_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            .flatten();
+            if schema_version != Some(2) {
+                return Err(classified_request_failure(
+                    ContentRequestDeferralReason::FormatUnsupported,
+                    AppError::conflict("rich publication requires structured content"),
+                ));
+            }
+        }
+        // An account login is not format proof. Persisted connector evidence
+        // and current settings must both permit the exact requested format.
         let semantic: Option<String> = sqlx::query_scalar(
             "SELECT entry->>'content_type' FROM content_revisions r \
              JOIN content_executions e ON (e.operator_id,e.tenant_id,e.project_id,e.execution_id)= \
@@ -581,7 +608,16 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             ));
         }
         let types: Vec<String> = decode(configured.get("content_types"))?;
-        let proof_format = if types
+        let proof_format = if request.format == geo_domain::RICH_DISTRIBUTION_FORMAT {
+            if types.iter().any(|item| item == geo_domain::RICH_MARKDOWN_FORMAT) {
+                geo_domain::RICH_MARKDOWN_FORMAT
+            } else {
+                return Err(classified_request_failure(
+                    ContentRequestDeferralReason::ConnectorUnavailable,
+                    AppError::conflict("rich publication format is not available"),
+                ));
+            }
+        } else if types
             .iter()
             .any(|item| item == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
         {
@@ -659,12 +695,44 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         let placement = PlatformPlacement {
             platform_id: request.platform_id.clone(),
             placement_slot: request.placement_slot.clone(),
-            capability_version: "request-text-v1".into(),
-            supported_formats: vec![geo_domain::TEXT_DISTRIBUTION_FORMAT.into()],
+            capability_version: if request.format == geo_domain::RICH_DISTRIBUTION_FORMAT {
+                "request-rich-v2"
+            } else {
+                "request-text-v1"
+            }
+            .into(),
+            supported_formats: vec![request.format.clone()],
             unavailable_reason: None,
             fixture: false,
         };
-        let variant = prepare_variant(&revision, &placement)?;
+        let variant = if request.format == geo_domain::RICH_DISTRIBUTION_FORMAT {
+            if revision.document.schema_version != Some(2) {
+                return Err(classified_request_failure(
+                    ContentRequestDeferralReason::FormatUnsupported,
+                    AppError::conflict("rich publication requires structured content"),
+                ));
+            }
+            let keys = revision
+                .document
+                .media_references()
+                .into_iter()
+                .map(|reference| geo_domain::MediaObjectKey {
+                    object_id: reference.object_id,
+                    object_version: reference.object_version,
+                    sha256: reference.sha256.clone(),
+                })
+                .collect::<Vec<_>>();
+            let bindings = crate::content_media::validate_content_media_in_transaction(
+                &mut tx, scope, &keys,
+            )
+            .await
+            .map_err(|error| {
+                classified_request_failure(ContentRequestDeferralReason::ContentNotReady, error)
+            })?;
+            prepare_rich_variant_authorized(&revision, &placement, scope, &bindings)?
+        } else {
+            prepare_variant(&revision, &placement)?
+        };
         let (candidate, command) =
             prepare_request_publication_intent(scope, &request, &variant, chrono::Utc::now())?;
         let existing_variant: Option<serde_json::Value> = sqlx::query_scalar(

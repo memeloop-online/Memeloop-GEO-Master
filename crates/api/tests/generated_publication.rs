@@ -157,6 +157,7 @@ async fn generated_input_without_a_frozen_authoritative_bundle_never_claims() {
                     body_sha256: "untrusted".into(),
                     payload_hash: "untrusted".into(),
                     evidence: vec![],
+                    rich_payload: None,
                 },
             },
         )
@@ -683,6 +684,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
         body: variant.markdown,
         payload_hash: variant.payload_hash,
         evidence: revision.evidence.clone(),
+        rich_payload: None,
     };
     state
         .channel_job_repository()

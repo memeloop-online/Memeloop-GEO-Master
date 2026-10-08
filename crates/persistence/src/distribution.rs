@@ -2,13 +2,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelVariant, ContentCheck, ContentExecution,
-    ContentHandoff, ContentRevision, DistributionCycleInputs, DistributionDeferralReason,
-    DistributionExpansionPage, DistributionManifest, DistributionPublicationResult,
-    DistributionRepository, DistributionSnapshot, DistributionTarget, DistributionTargetPage,
-    DistributionTargetStatus, ErrorCode, FreezeDistribution, IntentVerification,
-    MaterializedDistribution, PreparedDistribution, PublicationBundle, PublicationCommand,
-    PublicationIntent, PublicationOrigin, ReportPublicationStatus, TenantScope, distribution_cell,
-    freeze_distribution, prepare_publication_intent, prepare_variant, target_publication_evidence,
+    ContentHandoff, ContentMediaBinding, ContentRevision, DistributionCycleInputs,
+    DistributionDeferralReason, DistributionExpansionPage, DistributionManifest,
+    DistributionPublicationResult, DistributionRepository, DistributionSnapshot,
+    DistributionTarget, DistributionTargetPage, DistributionTargetStatus, ErrorCode,
+    FreezeDistribution, IntentVerification, MaterializedDistribution, PreparedDistribution,
+    PublicationBundle, PublicationCommand, PublicationIntent, PublicationOrigin,
+    ReportPublicationStatus, TenantScope, distribution_cell, freeze_distribution,
+    prepare_publication_intent, prepare_rich_variant_authorized, prepare_variant,
+    target_publication_evidence,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -816,6 +818,34 @@ impl DistributionRepository for PgDistributionRepository {
         scope: &TenantScope,
         prepared: PreparedDistribution,
     ) -> Result<MaterializedDistribution, AppError> {
+        if prepared
+            .revision
+            .as_ref()
+            .is_some_and(|revision| revision.document.schema_version == Some(2))
+        {
+            return Err(AppError::invalid_request(
+                "rich distribution requires authorized rich materialization",
+            ));
+        }
+        self.materialize_rich(scope, prepared, vec![]).await
+    }
+
+    async fn materialize_rich(
+        &self,
+        scope: &TenantScope,
+        prepared: PreparedDistribution,
+        bindings: Vec<ContentMediaBinding>,
+    ) -> Result<MaterializedDistribution, AppError> {
+        if !bindings.is_empty()
+            && !prepared
+                .revision
+                .as_ref()
+                .is_some_and(|revision| revision.document.schema_version == Some(2))
+        {
+            return Err(AppError::invalid_request(
+                "media bindings require rich publication",
+            ));
+        }
         let mut tx = self.transaction(scope).await?;
         // Project-scoped serialization is necessary because two different
         // cycle manifests can race to create the same logical publication.
@@ -1004,7 +1034,42 @@ impl DistributionRepository for PgDistributionRepository {
                 publication_commands: vec![],
             });
         }
-        let variant = prepare_variant(revision, placement)?;
+        let variant = if revision.document.schema_version == Some(2) {
+            if !placement
+                .supported_formats
+                .iter()
+                .any(|format| format == geo_domain::RICH_MARKDOWN_FORMAT)
+            {
+                return Err(AppError::conflict(
+                    "placement has no rich publication capability",
+                ));
+            }
+            let keys = revision
+                .document
+                .media_references()
+                .into_iter()
+                .map(|reference| geo_domain::MediaObjectKey {
+                    object_id: reference.object_id,
+                    object_version: reference.object_version,
+                    sha256: reference.sha256.clone(),
+                })
+                .collect::<Vec<_>>();
+            let authoritative =
+                crate::content_media::validate_content_media_in_transaction(&mut tx, scope, &keys)
+                    .await?;
+            if bindings.len() != authoritative.len()
+                || bindings
+                    .iter()
+                    .any(|binding| !authoritative.contains(binding))
+            {
+                return Err(AppError::conflict(
+                    "media binding differs from current project authority",
+                ));
+            }
+            prepare_rich_variant_authorized(revision, placement, scope, &authoritative)?
+        } else {
+            prepare_variant(revision, placement)?
+        };
         if let Some(stored) = sqlx::query_scalar::<_, serde_json::Value>(
             "SELECT body FROM distribution_channel_variants WHERE operator_id=$1 AND tenant_id=$2 \
              AND project_id=$3 AND variant_id=$4",

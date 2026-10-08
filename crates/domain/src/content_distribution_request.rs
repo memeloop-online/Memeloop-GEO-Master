@@ -2,10 +2,11 @@
 //! the existing publication ledger. It never represents delivery or success.
 use crate::{
     AppError, CHANNEL_VARIANT_POLICY, ChannelAccount, ChannelRepository, ChannelStatus,
-    ChannelVariant, ConnectorCapabilityRepository, ConnectorKey, ContentRepository,
-    ContentRevision, DistributionRepository, KnowledgePurpose, KnowledgeRepository,
-    ProjectRepository, ProjectStatus, PublicationBundle, PublicationIntent,
-    RICH_CHANNEL_VARIANT_POLICY, SourceState, TenantScope,
+    ChannelVariant, ConnectorCapabilityRepository, ConnectorKey, ContentMediaBinding,
+    ContentMediaRepository, ContentRepository, ContentRevision, DistributionRepository,
+    KnowledgePurpose, KnowledgeRepository, MediaObjectKey, ProjectRepository, ProjectStatus,
+    PublicationBundle, PublicationIntent, RICH_CHANNEL_VARIANT_POLICY, RICH_MARKDOWN_FORMAT,
+    SourceState, TenantScope,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -170,6 +171,13 @@ pub fn prepare_content_distribution_request(
             "invalid single-article distribution request",
         ));
     }
+    if (input.revision.document.schema_version == Some(2))
+        != (input.format == RICH_DISTRIBUTION_FORMAT)
+    {
+        return Err(AppError::invalid_request(
+            "single-article format does not match content schema",
+        ));
+    }
     Ok(ContentDistributionRequest {
         request_id: Uuid::new_v4(),
         scope: scope.clone(),
@@ -225,10 +233,14 @@ pub fn validate_distribution_request_intent(
         || variant.platform_id != request.platform_id
         || variant.placement_slot != request.placement_slot
         || variant.policy_version != policy
+        || (request.format == RICH_DISTRIBUTION_FORMAT) != variant.rich_payload.is_some()
     {
         return Err(AppError::conflict(
             "publication intent differs from frozen request",
         ));
+    }
+    if variant.rich_payload.is_some() {
+        crate::validate_rich_publication_payload(variant)?;
     }
     Ok(())
 }
@@ -294,6 +306,18 @@ pub trait ContentDistributionIntentLookup: Send + Sync {
             "request materialization unavailable",
         ))
     }
+    async fn materialize_accepted_rich_request(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+        bindings: Vec<ContentMediaBinding>,
+    ) -> Result<PublicationIntent, AppError> {
+        let _ = (scope, request, revision, bindings);
+        Err(AppError::capability_missing(
+            "rich request materialization unavailable",
+        ))
+    }
 }
 
 #[async_trait]
@@ -312,6 +336,16 @@ impl<T: DistributionRepository + ?Sized> ContentDistributionIntentLookup for T {
         revision: &ContentRevision,
     ) -> Result<PublicationIntent, AppError> {
         self.materialize_request_origin(scope, request, revision)
+            .await
+    }
+    async fn materialize_accepted_rich_request(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+        bindings: Vec<ContentMediaBinding>,
+    ) -> Result<PublicationIntent, AppError> {
+        self.materialize_rich_request_origin(scope, request, revision, bindings)
             .await
     }
 }
@@ -337,6 +371,7 @@ struct MemoryRequestAuthorities {
     projects: Arc<dyn ProjectRepository>,
     channels: Arc<dyn ChannelRepository>,
     connectors: Arc<dyn ConnectorCapabilityRepository>,
+    media: Option<Arc<dyn ContentMediaRepository>>,
 }
 
 impl MemoryContentDistributionRequestRepository {
@@ -373,8 +408,90 @@ impl MemoryContentDistributionRequestRepository {
             projects,
             channels,
             connectors,
+            media: None,
         });
         self
+    }
+
+    pub fn with_media_repository(mut self, media: Arc<dyn ContentMediaRepository>) -> Self {
+        if let Some(authority) = self.authorities.as_mut() {
+            authority.media = Some(media);
+        }
+        self
+    }
+
+    async fn rich_media_bindings(
+        &self,
+        scope: &TenantScope,
+        revision: &ContentRevision,
+    ) -> Result<Vec<ContentMediaBinding>, AppError> {
+        let references = revision.document.media_references();
+        let keys: Vec<_> = references
+            .iter()
+            .map(|reference| MediaObjectKey {
+                object_id: reference.object_id,
+                object_version: reference.object_version,
+                sha256: reference.sha256.clone(),
+            })
+            .collect();
+        let ordered = crate::ordered_media_snapshot_keys(&keys)?;
+        if ordered.is_empty() {
+            return Ok(Vec::new());
+        }
+        let repository = self
+            .authorities
+            .as_ref()
+            .and_then(|authority| authority.media.as_ref())
+            .ok_or_else(|| AppError::capability_missing("media authority unavailable"))?;
+        // Validates actual committed bytes, digest and active project binding.
+        // This preparation snapshot is NOT authorization to send after a
+        // concurrent withdrawal; the send bridge must recheck atomically.
+        let snapshots = repository
+            .snapshot_authorized_images(scope, &ordered)
+            .await?;
+        if snapshots.len() != ordered.len() {
+            return Err(AppError::conflict(
+                "publication media snapshot is incomplete",
+            ));
+        }
+        let verified: HashMap<_, _> = snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.image.key.clone(), snapshot.image))
+            .collect();
+        let mut found = HashMap::new();
+        let mut after = None;
+        // Existing repository pagination is by binding ID, not by object key.
+        // Keep the metadata walk bounded, including for unexpectedly large
+        // projects, and fail explicitly if an exact binding cannot be found.
+        for _ in 0..1000 {
+            let page = repository.list_bindings(scope, after, 100).await?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|binding| binding.binding_id);
+            for binding in page.iter() {
+                if let Some(image) = verified.get(&binding.image.key) {
+                    if &binding.image != image {
+                        return Err(AppError::conflict("publication image metadata changed"));
+                    }
+                    found.insert(binding.image.key.clone(), binding.clone());
+                }
+            }
+            if found.len() == verified.len() {
+                break;
+            }
+            if page.len() < 100 {
+                break;
+            }
+        }
+        ordered
+            .iter()
+            .map(|key| {
+                found
+                    .remove(key)
+                    .ok_or_else(|| AppError::conflict("publication media binding unavailable"))
+            })
+            .collect()
     }
 
     async fn record_deferral(
@@ -445,7 +562,8 @@ impl MemoryContentDistributionRequestRepository {
                 AppError::conflict("publication account is not ready"),
             ));
         }
-        if request.format != TEXT_DISTRIBUTION_FORMAT {
+        if request.format != TEXT_DISTRIBUTION_FORMAT && request.format != RICH_DISTRIBUTION_FORMAT
+        {
             return Err(classified_request_failure(
                 ContentRequestDeferralReason::FormatUnsupported,
                 AppError::conflict("publication format is not supported"),
@@ -472,6 +590,12 @@ impl MemoryContentDistributionRequestRepository {
         let proof_format = configured
             .filter(|settings| settings.enabled)
             .and_then(|settings| {
+                if request.format == RICH_DISTRIBUTION_FORMAT {
+                    return settings
+                        .content_types
+                        .contains(&RICH_MARKDOWN_FORMAT.to_owned())
+                        .then(|| RICH_MARKDOWN_FORMAT.to_owned());
+                }
                 if settings
                     .content_types
                     .iter()
@@ -513,6 +637,14 @@ impl MemoryContentDistributionRequestRepository {
                     AppError::conflict("publication revision unavailable"),
                 )
             })?;
+        if (revision.document.schema_version == Some(2))
+            != (request.format == RICH_DISTRIBUTION_FORMAT)
+        {
+            return Err(classified_request_failure(
+                ContentRequestDeferralReason::FormatUnsupported,
+                AppError::conflict("publication format differs from revision schema"),
+            ));
+        }
         if revision != *accepted_revision
             || revision.findings.iter().any(|finding| finding.blocking)
             || !authority
@@ -702,6 +834,11 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
                 (request, revision)
             };
             let revision = self.check_live(&request, &revision).await?;
+            let rich_bindings = if request.format == RICH_DISTRIBUTION_FORMAT {
+                Some(self.rich_media_bindings(scope, &revision).await?)
+            } else {
+                None
+            };
             let mut state = self.state.write().await;
             let latest = state_get(&state, scope, request_id)?;
             if latest.publication_intent_id.is_some() {
@@ -714,10 +851,15 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
                     AppError::conflict("accepted request changed during validation").into(),
                 );
             }
-            let intent = self
-                .distribution
-                .materialize_accepted_request(scope, &request, &revision)
-                .await?;
+            let intent = if let Some(bindings) = rich_bindings {
+                self.distribution
+                    .materialize_accepted_rich_request(scope, &request, &revision, bindings)
+                    .await?
+            } else {
+                self.distribution
+                    .materialize_accepted_request(scope, &request, &revision)
+                    .await?
+            };
             let saved = state
                 .by_id
                 .get_mut(&(scope.clone(), request_id))
@@ -875,6 +1017,7 @@ mod tests {
             markdown: "# Example".into(),
             payload_hash: "payload".into(),
             evidence: vec![],
+            rich_payload: None,
         };
         let intent = PublicationIntent {
             intent_id: Uuid::new_v4(),
@@ -950,6 +1093,12 @@ mod tests {
         );
         let mut changed = input.clone();
         changed.format = RICH_DISTRIBUTION_FORMAT.into();
+        assert_eq!(
+            repository.accept(&scope, changed).await.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let mut changed = input.clone();
+        changed.placement_slot = "different".into();
         assert_eq!(
             repository.accept(&scope, changed).await.unwrap_err().code,
             ErrorCode::Conflict

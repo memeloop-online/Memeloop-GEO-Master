@@ -927,6 +927,7 @@ async fn publication_target_resolves_original_across_cycles_without_mutation_or_
         body: bundle.variant.markdown.clone(),
         payload_hash: bundle.variant.payload_hash.clone(),
         evidence: bundle.revision.evidence.clone(),
+        rich_payload: None,
     };
     let original_jobs = Arc::new(MemoryChannelJobRepository::default());
     original_jobs

@@ -9,8 +9,9 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelStatus, ChannelTarget,
     ChannelTargetInput, ChannelTargetView, ConnectorAvailability, ConnectorKey, ErrorCode,
-    KnowledgePurpose, ProjectId, ProjectStatus, PublicationOrigin, QuestionReference, SourceState,
-    TenantScope, sha256_hex,
+    KnowledgePurpose, ProjectId, ProjectStatus, PublicationOrigin, QuestionReference,
+    RICH_DISTRIBUTION_FORMAT, RICH_MARKDOWN_FORMAT, SourceState, TenantScope, sha256_hex,
+    validate_rich_publication_payload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -85,6 +86,25 @@ pub enum ChannelDispatchDeferred {
     FixtureOnly,
 }
 
+/// This transport currently only sends title/body JSON. The rich runner
+/// staging code is not an authenticated, withdrawal-safe media send bridge;
+/// enabling this requires its typed authorization callback, byte delivery
+/// and structured public-readback contract to be wired into this dispatcher.
+/// Do not infer readiness from a connector's plain `publish` operation.
+fn rich_send_bridge_available(_state: &AppState) -> bool {
+    false
+}
+
+fn rich_send_required(input: &ChannelTargetInput) -> bool {
+    matches!(
+        input,
+        ChannelTargetInput::GeneratedPublish {
+            rich_payload: Some(_),
+            ..
+        }
+    )
+}
+
 async fn generated_connector_available(
     state: &AppState,
     scope: &TenantScope,
@@ -95,6 +115,7 @@ async fn generated_connector_available(
         publication_intent_id,
         distribution_target_id,
         origin_request_id,
+        rich_payload,
         ..
     } = input
     else {
@@ -113,7 +134,12 @@ async fn generated_connector_available(
             if Some(request.request_id) != *origin_request_id
                 || !distribution_target_id.is_nil()
                 || request.platform_id != *platform
-                || request.format != geo_domain::TEXT_DISTRIBUTION_FORMAT
+                || request.format
+                    != if rich_payload.is_some() {
+                        RICH_DISTRIBUTION_FORMAT
+                    } else {
+                        geo_domain::TEXT_DISTRIBUTION_FORMAT
+                    }
             {
                 return Ok(false);
             }
@@ -146,18 +172,21 @@ async fn generated_connector_available(
                 } else {
                     None
                 };
-            let proof_format = if settings
+            let proof_format = if rich_payload.is_some() {
+                crate::connector_capabilities::configured_rich_publication_format(&settings)
+            } else if settings
                 .content_types
                 .iter()
                 .any(|format| format == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
             {
-                geo_domain::PLAIN_TEXT_ARTICLE_FORMAT
-            } else if let Some(semantic) = semantic.as_deref().filter(|semantic| {
-                geo_domain::publication_format_for_semantic_type(semantic).is_some()
-                    && settings.content_types.iter().any(|item| item == *semantic)
-            }) {
-                semantic
+                Some(geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
             } else {
+                semantic.as_deref().filter(|semantic| {
+                    geo_domain::publication_format_for_semantic_type(semantic).is_some()
+                        && settings.content_types.iter().any(|item| item == *semantic)
+                })
+            };
+            let Some(proof_format) = proof_format else {
                 return Ok(false);
             };
             return Ok(state
@@ -203,7 +232,13 @@ async fn generated_connector_available(
         || placement.capability_version != version
         || placement.fixture
         || placement.unavailable_reason.is_some()
-        || !placement.supported_formats.contains(&document.content_type)
+        || !placement
+            .supported_formats
+            .contains(&if rich_payload.is_some() {
+                RICH_MARKDOWN_FORMAT.to_owned()
+            } else {
+                document.content_type.clone()
+            })
     {
         return Ok(false);
     }
@@ -214,10 +249,15 @@ async fn generated_connector_available(
     let Some(settings) = settings else {
         return Ok(false);
     };
-    let Some(proof_format) = crate::connector_capabilities::configured_publication_format(
-        &settings,
-        &document.content_type,
-    ) else {
+    let proof_format = if rich_payload.is_some() {
+        crate::connector_capabilities::configured_rich_publication_format(&settings)
+    } else {
+        crate::connector_capabilities::configured_publication_format(
+            &settings,
+            &document.content_type,
+        )
+    };
+    let Some(proof_format) = proof_format else {
         return Ok(false);
     };
     if state
@@ -349,6 +389,16 @@ fn publication_candidate(
     received_at: DateTime<Utc>,
     connector_version: &str,
 ) -> Option<serde_json::Value> {
+    // A title/body hint says nothing about a structured tree or its images.
+    if matches!(
+        &target.input,
+        ChannelTargetInput::GeneratedPublish {
+            rich_payload: Some(_),
+            ..
+        }
+    ) {
+        return None;
+    }
     let hint: PublicationCandidate = serde_json::from_value(value.clone()).ok()?;
     let (platform, title, body) = match &target.input {
         ChannelTargetInput::Publish {
@@ -445,6 +495,17 @@ pub(crate) fn publication_readback(
     result: &crate::browser_bridge::BrowserExecution,
     target: &ChannelTargetInput,
 ) -> bool {
+    // Until the runner supplies a separately typed structured/media readback,
+    // the legacy title/body hash must never verify a rich send or lookup.
+    if matches!(
+        target,
+        ChannelTargetInput::GeneratedPublish {
+            rich_payload: Some(_),
+            ..
+        }
+    ) {
+        return false;
+    }
     if result.provenance != Some(crate::browser_bridge::BrowserReceiptProvenance::Live)
         || result.connector_version.as_deref().is_none_or(|version| {
             version.trim().is_empty() || version.len() > 100 || version.starts_with("fixture")
@@ -838,6 +899,7 @@ async fn generated_publication_preflight(
         body_sha256,
         evidence,
         payload_hash,
+        rich_payload,
     } = input
     else {
         return Ok(false);
@@ -871,12 +933,32 @@ async fn generated_publication_preflight(
         || revision.markdown != revision.document.markdown()
         || sha256_hex(body.as_bytes()) != *body_sha256
         || variant.payload_hash != *payload_hash
+        || variant.rich_payload.as_ref() != rich_payload.as_ref()
         || intent.payload_hash != *payload_hash
         || command.payload_hash != *payload_hash
         || command.intent_id != intent.intent_id
     {
         return Err(AppError::conflict(
             "generated publication differs from frozen distribution",
+        ));
+    }
+    if rich_payload.is_some() {
+        validate_rich_publication_payload(variant).map_err(|_| {
+            AppError::conflict("generated rich publication payload differs from frozen variant")
+        })?;
+        if revision.document.schema_version != Some(2)
+            || variant
+                .rich_payload
+                .as_ref()
+                .is_none_or(|payload| payload.document != revision.document)
+        {
+            return Err(AppError::conflict(
+                "generated rich publication revision differs from frozen variant",
+            ));
+        }
+    } else if revision.document.schema_version == Some(2) || variant.rich_payload.is_some() {
+        return Err(AppError::conflict(
+            "generated publication format differs from frozen revision",
         ));
     }
     match &bundle.origin {
@@ -905,8 +987,18 @@ async fn generated_publication_preflight(
                 || request.account_id != *account_id
                 || request.platform_id != *platform
                 || request.placement_slot != variant.placement_slot
-                || request.format != geo_domain::TEXT_DISTRIBUTION_FORMAT
-                || variant.policy_version != geo_domain::CHANNEL_VARIANT_POLICY
+                || request.format
+                    != if rich_payload.is_some() {
+                        RICH_DISTRIBUTION_FORMAT
+                    } else {
+                        geo_domain::TEXT_DISTRIBUTION_FORMAT
+                    }
+                || variant.policy_version
+                    != if rich_payload.is_some() {
+                        geo_domain::RICH_CHANNEL_VARIANT_POLICY
+                    } else {
+                        geo_domain::CHANNEL_VARIANT_POLICY
+                    }
                 || revision.findings.iter().any(|finding| finding.blocking)
             {
                 return Err(AppError::conflict("requested publication origin differs"));
@@ -1391,6 +1483,11 @@ pub async fn execute_channel_target(
             }
             Err(error) => return Err(error),
         }
+        if rich_send_required(&planned.target.input) && !rich_send_bridge_available(state) {
+            return Ok(ChannelDispatchResult::Deferred(
+                ChannelDispatchDeferred::ConnectorUnavailable,
+            ));
+        }
         if !generated_connector_available(state, scope, &planned.target.input).await? {
             return Ok(ChannelDispatchResult::Deferred(
                 ChannelDispatchDeferred::ConnectorUnavailable,
@@ -1548,6 +1645,11 @@ async fn execute_reserved_channel_target(
             }
             Err(error) => return Err(error),
         }
+        if rich_send_required(&planned.target.input) && !rich_send_bridge_available(state) {
+            return Ok(ChannelDispatchResult::Deferred(
+                ChannelDispatchDeferred::ConnectorUnavailable,
+            ));
+        }
         if !generated_connector_available(state, scope, &planned.target.input).await? {
             return Ok(ChannelDispatchResult::Deferred(
                 ChannelDispatchDeferred::ConnectorUnavailable,
@@ -1615,8 +1717,22 @@ async fn execute_reserved_channel_target(
         ChannelTargetInput::Publish { title, body, .. } => {
             ("publish", json!({"title":title,"body":body}))
         }
-        ChannelTargetInput::GeneratedPublish { title, body, .. } => {
-            ("publish", json!({"title":title,"body":body}))
+        ChannelTargetInput::GeneratedPublish {
+            title,
+            body,
+            rich_payload: None,
+            ..
+        } => ("publish", json!({"title":title,"body":body})),
+        // There is no authorized rich upload protocol at the bridge yet.
+        // This is a defensive guard if a target bypasses the pre-claim gate.
+        ChannelTargetInput::GeneratedPublish {
+            rich_payload: Some(_),
+            ..
+        } => {
+            if bridge.close(session).await.is_err() {
+                tracing::warn!("browser execution session cleanup failed");
+            }
+            return Err(AppError::conflict("rich publication transport unavailable"));
         }
         ChannelTargetInput::Measure {
             account_id,
@@ -2178,6 +2294,7 @@ mod tests {
             body_sha256: sha256_hex(b"Frozen body"),
             payload_hash: "frozen".into(),
             evidence: vec![],
+            rich_payload: None,
         };
         let exact_hash = sha256_hex(b"Frozen title\nFrozen body");
         let proof = |hash: &str| {
@@ -2202,6 +2319,44 @@ mod tests {
             stage: Some("public_readback".into()),
         };
         assert!(publication_readback(&receipt, &input));
+        let mut rich = input.clone();
+        if let ChannelTargetInput::GeneratedPublish {
+            content_revision_id,
+            rich_payload,
+            ..
+        } = &mut rich
+        {
+            *rich_payload = Some(geo_domain::RichPublicationPayload {
+                schema_version: 2,
+                format: RICH_MARKDOWN_FORMAT.into(),
+                content_revision_id: *content_revision_id,
+                policy_version: geo_domain::RICH_CHANNEL_VARIANT_POLICY.into(),
+                document: geo_domain::StructuredDocument {
+                    title: "Frozen title".into(),
+                    blocks: vec![],
+                    schema_version: Some(2),
+                },
+                media: vec![],
+            });
+        }
+        assert!(rich_send_required(&rich));
+        assert!(!rich_send_bridge_available(&AppState::development()));
+        assert!(!publication_readback(&receipt, &rich));
+        let probe = ChannelTarget {
+            target_id: Uuid::new_v4(),
+            input: rich,
+        };
+        assert!(
+            publication_candidate(
+                &json!({"kind":"publication_candidate"}),
+                &probe,
+                Uuid::new_v4(),
+                Utc::now(),
+                Utc::now(),
+                "test-runner",
+            )
+            .is_none()
+        );
         let fixture = BrowserExecution {
             provenance: Some(crate::browser_bridge::BrowserReceiptProvenance::Fixture),
             ..receipt

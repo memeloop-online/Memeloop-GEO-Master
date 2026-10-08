@@ -1,8 +1,12 @@
 use chrono::Utc;
 use geo_domain::{
-    CHANNEL_VARIANT_POLICY, ContentBlock, ContentBlockKind, ContentRevision, ErrorCode,
-    MediaObjectKey, PlatformPlacement, RICH_CHANNEL_VARIANT_POLICY, RICH_MARKDOWN_FORMAT,
-    StructuredDocument, prepare_rich_variant, prepare_variant,
+    CHANNEL_VARIANT_POLICY, ContentBlock, ContentBlockKind, ContentMediaBinding,
+    ContentMediaBindingState, ContentRevision, DistributionRepository, ErrorCode, MediaObjectKey,
+    MemoryDistributionRepository, OperatorId, PlatformPlacement, ProjectId,
+    RICH_CHANNEL_VARIANT_POLICY, RICH_DISTRIBUTION_FORMAT, RICH_MARKDOWN_FORMAT,
+    StructuredDocument, TenantId, TenantScope, VerifiedImage, prepare_rich_variant,
+    prepare_rich_variant_authorized, prepare_variant, rich_publication_structured_sha256,
+    validate_rich_publication_payload,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -96,6 +100,273 @@ fn legacy_serialization_markdown_and_variant_identity_are_frozen() {
     assert_eq!(
         variant.variant_id.to_string(),
         "c6afef61-ae57-5843-bae4-6e02accf4d24"
+    );
+    assert!(variant.rich_payload.is_none());
+    let saved = serde_json::to_value(&variant).unwrap();
+    assert!(saved.get("rich_payload").is_none());
+    assert_eq!(
+        serde_json::from_value::<geo_domain::ChannelVariant>(saved).unwrap(),
+        variant
+    );
+}
+
+fn media_scope() -> TenantScope {
+    TenantScope::new(
+        OperatorId::new(Uuid::from_u128(11)),
+        TenantId::new(Uuid::from_u128(12)),
+        Some(ProjectId::new(Uuid::from_u128(13))),
+    )
+}
+
+fn media_binding(scope: &TenantScope, object: Uuid, sha256: String) -> ContentMediaBinding {
+    ContentMediaBinding {
+        binding_id: Uuid::from_u128(14),
+        operator_id: scope.operator_id,
+        tenant_id: scope.tenant_id,
+        project_id: scope.project_id.unwrap(),
+        image: VerifiedImage {
+            key: MediaObjectKey {
+                object_id: object,
+                object_version: 1,
+                sha256,
+            },
+            media_type: "image/png".into(),
+            byte_len: 160,
+            width: 8,
+            height: 7,
+        },
+        state: ContentMediaBindingState::Active,
+        created_at: Utc::now(),
+        withdrawn_at: None,
+    }
+}
+
+#[test]
+fn rich_identity_binds_tree_and_exact_ordered_verified_images() {
+    let scope = media_scope();
+    let object = Uuid::from_u128(21);
+    let mut document = valid(json!({"type":"media","attrs":{
+        "object_id":object,"object_version":1,"sha256":"a".repeat(64),
+        "alt":"Detail","caption":"Image one"
+    }}));
+    let original_revision = revision(document.clone());
+    let binding = media_binding(&scope, object, "a".repeat(64));
+    let placement = placement(vec![RICH_MARKDOWN_FORMAT]);
+    let original = prepare_rich_variant_authorized(
+        &original_revision,
+        &placement,
+        &scope,
+        std::slice::from_ref(&binding),
+    )
+    .unwrap();
+    validate_rich_publication_payload(&original).unwrap();
+    let payload = original.rich_payload.as_ref().unwrap();
+    assert_eq!(payload.media.len(), 1);
+    assert_eq!(payload.media[0].object, binding.image.key);
+    assert_eq!(payload.media[0].binding_id, binding.binding_id);
+    assert_eq!(payload.media[0].width, 8);
+    assert_eq!(payload.media[0].height, 7);
+    assert_eq!(
+        payload.media[0].role,
+        geo_domain::PublicationMediaRole::Image
+    );
+    assert_eq!(
+        serde_json::from_value::<geo_domain::ChannelVariant>(
+            serde_json::to_value(&original).unwrap()
+        )
+        .unwrap(),
+        original
+    );
+    assert_eq!(
+        rich_publication_structured_sha256(payload).unwrap(),
+        "8a715d3f4176af43d5c3377764c0371985755bdac71dd96be901e6bd4316016e"
+    );
+    assert_eq!(
+        original.payload_hash,
+        "79ea2c42c4bfec9550ef7356c9a475686941bad1f8c676520e5577007d7f4874"
+    );
+    let generated = geo_domain::ChannelTargetInput::GeneratedPublish {
+        content_revision_id: original.content_revision_id,
+        variant_id: original.variant_id,
+        publication_intent_id: Uuid::from_u128(31),
+        distribution_target_id: Uuid::from_u128(32),
+        origin_request_id: None,
+        platform: original.platform_id.clone(),
+        account_id: Uuid::from_u128(33),
+        title: original.title.clone(),
+        body: original.markdown.clone(),
+        body_sha256: "c".repeat(64),
+        payload_hash: original.payload_hash.clone(),
+        evidence: vec![],
+        rich_payload: original.rich_payload.clone(),
+    };
+    assert_eq!(
+        serde_json::from_value::<geo_domain::ChannelTargetInput>(
+            serde_json::to_value(&generated).unwrap()
+        )
+        .unwrap(),
+        generated
+    );
+    let mut legacy_input = generated.clone();
+    if let geo_domain::ChannelTargetInput::GeneratedPublish { rich_payload, .. } = &mut legacy_input
+    {
+        *rich_payload = None;
+    }
+    let legacy_json = serde_json::to_value(&legacy_input).unwrap();
+    assert!(legacy_json.get("rich_payload").is_none());
+    assert_eq!(
+        serde_json::from_value::<geo_domain::ChannelTargetInput>(legacy_json).unwrap(),
+        legacy_input
+    );
+
+    // The Markdown path has only object/version; changed bytes and digest
+    // cannot replay the old variant even if rendered Markdown is identical.
+    if let geo_domain::RichNode::Media { attrs } =
+        &mut document.blocks[0].rich.as_mut().unwrap().node
+    {
+        attrs.sha256 = "b".repeat(64);
+    }
+    let changed_revision = revision(document);
+    assert_eq!(original_revision.markdown, changed_revision.markdown);
+    let changed = prepare_rich_variant_authorized(
+        &changed_revision,
+        &placement,
+        &scope,
+        &[media_binding(&scope, object, "b".repeat(64))],
+    )
+    .unwrap();
+    assert_ne!(original.payload_hash, changed.payload_hash);
+    assert_ne!(original.variant_id, changed.variant_id);
+    let mut altered_manifest = original.clone();
+    altered_manifest.rich_payload.as_mut().unwrap().media[0].width = 9;
+    assert!(validate_rich_publication_payload(&altered_manifest).is_err());
+
+    let mut unsplit = revision(valid(paragraph("same")));
+    let mut split = unsplit.clone();
+    split.document.blocks[0].rich.as_mut().unwrap().node =
+        serde_json::from_value(json!({"type":"paragraph","content":[text("sa"),text("me")]}))
+            .unwrap();
+    split.markdown = split.document.markdown();
+    assert_eq!(unsplit.markdown, split.markdown);
+    let first = prepare_rich_variant(&unsplit, &placement).unwrap();
+    let second = prepare_rich_variant(&split, &placement).unwrap();
+    assert_ne!(first.payload_hash, second.payload_hash);
+    assert_ne!(first.variant_id, second.variant_id);
+    unsplit.markdown.push_str("changed");
+    assert!(prepare_rich_variant(&unsplit, &placement).is_err());
+}
+
+#[test]
+fn rich_media_requires_exact_active_scoped_binding_and_strict_payload() {
+    let scope = media_scope();
+    let object = Uuid::from_u128(21);
+    let revision = revision(valid(json!({"type":"media","attrs":{
+        "object_id":object,"object_version":1,"sha256":"a".repeat(64),
+        "alt":"Detail","caption":"Image one"
+    }})));
+    let placement = placement(vec![RICH_MARKDOWN_FORMAT]);
+    let binding = media_binding(&scope, object, "a".repeat(64));
+    for bindings in [
+        vec![],
+        vec![media_binding(&scope, object, "b".repeat(64))],
+        vec![ContentMediaBinding {
+            tenant_id: TenantId::new(Uuid::new_v4()),
+            ..binding.clone()
+        }],
+        vec![ContentMediaBinding {
+            state: ContentMediaBindingState::Withdrawn,
+            ..binding.clone()
+        }],
+        vec![ContentMediaBinding {
+            image: VerifiedImage {
+                width: 0,
+                ..binding.image.clone()
+            },
+            ..binding.clone()
+        }],
+        vec![ContentMediaBinding {
+            image: VerifiedImage {
+                media_type: "image/svg+xml".into(),
+                ..binding.image.clone()
+            },
+            ..binding.clone()
+        }],
+        vec![binding.clone(), binding.clone()],
+    ] {
+        assert!(prepare_rich_variant_authorized(&revision, &placement, &scope, &bindings).is_err());
+    }
+    let variant =
+        prepare_rich_variant_authorized(&revision, &placement, &scope, &[binding]).unwrap();
+    let mut payload = serde_json::to_value(variant.rich_payload.unwrap()).unwrap();
+    payload["media"][0]["unknown"] = json!(true);
+    assert!(serde_json::from_value::<geo_domain::RichPublicationPayload>(payload).is_err());
+}
+
+#[tokio::test]
+async fn rich_single_request_reuses_original_intent_and_outbox() {
+    let scope = media_scope();
+    let object = Uuid::from_u128(21);
+    let mut revision = revision(valid(json!({"type":"media","attrs":{
+        "object_id":object,"object_version":1,"sha256":"a".repeat(64),
+        "alt":"Detail","caption":"Image one"
+    }})));
+    revision.evidence.push(geo_domain::EvidenceRef {
+        source_version_id: Uuid::from_u128(50),
+        chunk_id: None,
+        locator: geo_domain::ChunkLocator::Text {
+            start_line: 1,
+            end_line: 1,
+            start_char: 0,
+            end_char: 1,
+        },
+    });
+    let request = geo_domain::ContentDistributionRequest {
+        request_id: Uuid::from_u128(51),
+        scope: scope.clone(),
+        schema_version: 1,
+        content_revision_id: revision.revision_id,
+        content_asset_id: revision.asset_id,
+        platform_id: "test".into(),
+        placement_slot: "main".into(),
+        account_id: Uuid::from_u128(52),
+        account_owner_kind: "customer".into(),
+        format: RICH_DISTRIBUTION_FORMAT.into(),
+        idempotency_key_hash: "key".into(),
+        request_hash: "request".into(),
+        publication_intent_id: None,
+        materialization_deferral: None,
+        created_at: Utc::now(),
+    };
+    let binding = media_binding(&scope, object, "a".repeat(64));
+    let repository = MemoryDistributionRepository::new();
+    let intent = repository
+        .materialize_rich_request_origin(&scope, &request, &revision, vec![binding.clone()])
+        .await
+        .unwrap();
+    let bundle = repository
+        .get_publication_bundle(&scope, intent.intent_id)
+        .await
+        .unwrap();
+    bundle.validate_origin().unwrap();
+    assert_eq!(
+        bundle.variant.rich_payload.as_ref().unwrap().media[0].binding_id,
+        binding.binding_id
+    );
+    let mut next = request;
+    next.request_id = Uuid::from_u128(53);
+    let reused = repository
+        .materialize_rich_request_origin(&scope, &next, &revision, vec![binding])
+        .await
+        .unwrap();
+    assert_eq!(intent.intent_id, reused.intent_id);
+    assert_eq!(repository.publication_commands(&scope).await.len(), 1);
+    let still_original = repository
+        .get_publication_bundle(&scope, intent.intent_id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(still_original.origin, geo_domain::PublicationOrigin::ContentRequest { request }
+        if request.request_id == Uuid::from_u128(51))
     );
 }
 #[test]

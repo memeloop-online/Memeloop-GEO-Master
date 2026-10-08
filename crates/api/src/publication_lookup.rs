@@ -88,6 +88,15 @@ pub(crate) async fn public_observed_url(
     observation: &PublicationLookupObservation,
     job: &PublicationLookupJob,
 ) -> Option<String> {
+    if matches!(
+        &job.frozen_input,
+        ChannelTargetInput::GeneratedPublish {
+            rich_payload: Some(_),
+            ..
+        }
+    ) {
+        return None;
+    }
     if observation.finding != PublicationLookupFinding::AssetObserved
         || observation.attempt_id != job.attempt_id
         || observation.observed_at > observation.received_at
@@ -364,6 +373,17 @@ async fn lookup_once(
     claimed_at: DateTime<Utc>,
 ) -> (PublicationLookupFinding, Value, Option<&'static str>) {
     let unknown = |code| (PublicationLookupFinding::Unknown, json!({}), Some(code));
+    // Existing lookup only compares normalized title/body. It must not
+    // establish a rich public-readback or media capability.
+    if matches!(
+        &job.frozen_input,
+        ChannelTargetInput::GeneratedPublish {
+            rich_payload: Some(_),
+            ..
+        }
+    ) {
+        return unknown("lookup_unavailable");
+    }
     let (platform, title, body) = match &job.frozen_input {
         ChannelTargetInput::Publish {
             platform,
@@ -547,6 +567,15 @@ fn observed_asset(
     claimed_at: DateTime<Utc>,
     received_at: DateTime<Utc>,
 ) -> Option<Value> {
+    if matches!(
+        &job.frozen_input,
+        ChannelTargetInput::GeneratedPublish {
+            rich_payload: Some(_),
+            ..
+        }
+    ) {
+        return None;
+    }
     let at = receipt.occurred_at?;
     let version = bound_version;
     let (platform, title, body) = match &job.frozen_input {
@@ -1262,6 +1291,72 @@ mod tests {
             query_count: 0,
             last_error_code: None,
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_text_lookup_never_projects_rich_as_public_verification() {
+        let state = AppState::development();
+        let scope = TenantScope::new(
+            OperatorId::new(Uuid::new_v4()),
+            TenantId::new(Uuid::new_v4()),
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        let mut job = job();
+        job.frozen_input = ChannelTargetInput::GeneratedPublish {
+            content_revision_id: Uuid::new_v4(),
+            variant_id: Uuid::new_v4(),
+            publication_intent_id: Uuid::new_v4(),
+            distribution_target_id: Uuid::nil(),
+            origin_request_id: Some(Uuid::new_v4()),
+            platform: "zhihu".into(),
+            account_id: job.account_id,
+            title: "Original title".into(),
+            body: "Original body".into(),
+            body_sha256: sha256_hex(b"Original body"),
+            payload_hash: "rich-frozen".into(),
+            evidence: vec![],
+            rich_payload: Some(geo_domain::RichPublicationPayload {
+                schema_version: 2,
+                format: geo_domain::RICH_MARKDOWN_FORMAT.into(),
+                content_revision_id: Uuid::new_v4(),
+                policy_version: geo_domain::RICH_CHANNEL_VARIANT_POLICY.into(),
+                document: geo_domain::StructuredDocument {
+                    title: "Original title".into(),
+                    blocks: vec![],
+                    schema_version: Some(2),
+                },
+                media: vec![],
+            }),
+        };
+        let observed_at = Utc::now();
+        let observation = PublicationLookupObservation {
+            execution_id: Uuid::new_v4(),
+            attempt_id: job.attempt_id,
+            finding: PublicationLookupFinding::AssetObserved,
+            evidence: json!({
+                "schema_version":"geo.publication.asset_observation.v1",
+                "provenance":"live",
+                "original_attempt_id":job.attempt_id,
+                "target_id":job.target_id,
+                "account_id":job.account_id,
+                "connector_version":job.connector_version,
+                "content_sha256":sha256_hex(b"Original title\nOriginal body"),
+                "observed_at":observed_at,
+                "public_url":job.candidate_public_url,
+            }),
+            observed_at,
+            received_at: observed_at,
+            error_code: None,
+        };
+        assert!(
+            public_observed_url(&state, &scope, &observation, &job)
+                .await
+                .is_none()
+        );
+        let (finding, _, code) =
+            lookup_once(&state, &scope, &job, Uuid::new_v4(), Utc::now()).await;
+        assert_eq!(finding, PublicationLookupFinding::Unknown);
+        assert_eq!(code, Some("lookup_unavailable"));
     }
 
     #[test]

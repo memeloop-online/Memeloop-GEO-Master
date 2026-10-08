@@ -13,11 +13,12 @@ use chrono::Utc;
 use geo_domain::{
     AppError, ChannelAccount, ChannelRepository, ChannelStatus, ConnectorAvailability,
     ConnectorCapabilityRepository, ConnectorKey, ContentExecutionStatus, ContentItemStatus,
-    ContentPublicEligibility, ContentRepository, ContentRevision, DistributionDeferralReason,
-    DistributionManifest, DistributionRepository, DistributionScopeMode, DistributionTarget,
-    DistributionTargetPage, DistributionTargetStatus, FreezeDistribution, KnowledgePurpose,
-    KnowledgeRepository, PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository,
-    ProjectStatus, PublicationOrigin, SourceState, TenantScope,
+    ContentMediaBinding, ContentMediaRepository, ContentPublicEligibility, ContentRepository,
+    ContentRevision, DistributionDeferralReason, DistributionManifest, DistributionRepository,
+    DistributionScopeMode, DistributionTarget, DistributionTargetPage, DistributionTargetStatus,
+    ErrorCode, FreezeDistribution, KnowledgePurpose, KnowledgeRepository, MediaObjectKey,
+    PlatformPlacement, PreparedDistribution, ProjectId, ProjectRepository, ProjectStatus,
+    PublicationOrigin, RICH_MARKDOWN_FORMAT, SourceState, TenantScope,
     publication_format_for_semantic_type,
 };
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,7 @@ pub struct DistributionService {
     projects: Arc<dyn ProjectRepository>,
     channels: Arc<dyn ChannelRepository>,
     capabilities: Arc<Vec<PlatformPlacement>>,
+    media: Option<Arc<dyn ContentMediaRepository>>,
     registry: Option<Arc<dyn ConnectorCapabilityRepository>>,
     browser: Option<crate::BrowserBridge>,
 }
@@ -80,6 +82,7 @@ impl DistributionService {
             projects,
             channels,
             capabilities: Arc::new(default_capabilities()),
+            media: None,
             registry: None,
             browser: None,
         }
@@ -102,6 +105,11 @@ impl DistributionService {
     /// request JSON and never inferred from the number of attached accounts.
     pub fn with_capability_snapshot(mut self, capabilities: Vec<PlatformPlacement>) -> Self {
         self.capabilities = Arc::new(capabilities);
+        self
+    }
+
+    pub fn with_media_repository(mut self, media: Arc<dyn ContentMediaRepository>) -> Self {
+        self.media = Some(media);
         self
     }
 
@@ -153,11 +161,16 @@ impl DistributionService {
                 Some(settings) => {
                     let mut failure = Some("connector_unverified");
                     for semantic in semantic_types {
-                        let Some(proof_format) =
+                        let proof_format = if semantic == RICH_MARKDOWN_FORMAT {
+                            crate::connector_capabilities::configured_rich_publication_format(
+                                &settings,
+                            )
+                        } else {
                             crate::connector_capabilities::configured_publication_format(
                                 &settings, semantic,
                             )
-                        else {
+                        };
+                        let Some(proof_format) = proof_format else {
                             continue;
                         };
                         let resolved = registry
@@ -373,12 +386,17 @@ impl DistributionService {
             .await?
             .ok_or_else(|| AppError::conflict("frozen cycle settings unavailable"))?;
         let platforms = &settings.distribution_scope;
-        let semantic_types = document_manifest
+        let mut semantic_types: BTreeSet<String> = document_manifest
             .items
             .iter()
             .map(|item| item.content_type.clone())
             .filter(|semantic| publication_format_for_semantic_type(semantic).is_some())
             .collect();
+        // The same semantic (for example, article) may have a schema-2
+        // revision. Its rich wire proof is distinct from the plain proof.
+        if !document_manifest.items.is_empty() {
+            semantic_types.insert(RICH_MARKDOWN_FORMAT.to_owned());
+        }
         let capabilities = self
             .current_capabilities(scope.operator_id, &semantic_types)
             .await?;
@@ -541,13 +559,65 @@ impl DistributionService {
             })
             .map(|account| account.account_id);
         let checked = self.checked_revision(scope, manifest, &row).await?;
-        let (revision, eligibility, defer_reason) = match checked {
+        let (mut revision, mut eligibility, mut defer_reason) = match checked {
             Ok((revision, eligibility)) if account_id.is_some() => {
                 (Some(revision), Some(eligibility), None)
             }
             Ok(_) => (None, None, None),
             Err(reason) => (None, None, Some(reason)),
         };
+        let is_rich = revision
+            .as_ref()
+            .is_some_and(|revision| revision.document.schema_version == Some(2));
+        let rich_supported = manifest.platform_scope.iter().any(|placement| {
+            placement.platform_id == row.platform_id
+                && placement.placement_slot == row.placement_slot
+                && placement.unavailable_reason.is_none()
+                && placement
+                    .supported_formats
+                    .iter()
+                    .any(|format| format == RICH_MARKDOWN_FORMAT)
+        });
+        let rich_bindings = if is_rich && !rich_supported {
+            revision = None;
+            eligibility = None;
+            defer_reason = Some(DistributionDeferralReason::ContentUnsupported);
+            Vec::new()
+        } else if is_rich
+            && revision
+                .as_ref()
+                .is_some_and(|revision| !revision.document.media_references().is_empty())
+        {
+            let media = self
+                .media
+                .as_ref()
+                .ok_or_else(|| AppError::capability_missing("rich media authority unavailable"))?;
+            match self
+                .rich_bindings(
+                    scope,
+                    revision.as_ref().expect("rich revision exists"),
+                    media.as_ref(),
+                )
+                .await
+            {
+                Ok(bindings) => bindings,
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ErrorCode::Conflict | ErrorCode::InvalidRequest | ErrorCode::NotFound
+                    ) =>
+                {
+                    revision = None;
+                    eligibility = None;
+                    defer_reason = Some(DistributionDeferralReason::ContentUnsupported);
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
+        };
+        let materialize_rich = revision.is_some() && is_rich;
         let prepared = PreparedDistribution {
             manifest_id: manifest.manifest_id,
             target_id: row.target_id,
@@ -568,7 +638,13 @@ impl DistributionService {
                 .knowledge
                 .hold_content_evidence(scope, &[eligibility])
                 .await?;
-            let materialized = self.distribution.materialize(scope, prepared).await;
+            let materialized = if materialize_rich {
+                self.distribution
+                    .materialize_rich(scope, prepared, rich_bindings)
+                    .await
+            } else {
+                self.distribution.materialize(scope, prepared).await
+            };
             drop(knowledge_guard);
             drop(project_guard);
             materialized?;
@@ -576,6 +652,66 @@ impl DistributionService {
             self.distribution.materialize(scope, prepared).await?;
         }
         Ok(())
+    }
+
+    /// Preliminary scoped snapshot. The repository still has to revalidate
+    /// under its own commit lock/transaction; a read here never authorizes a
+    /// later external send.
+    async fn rich_bindings(
+        &self,
+        scope: &TenantScope,
+        revision: &ContentRevision,
+        media: &dyn ContentMediaRepository,
+    ) -> Result<Vec<ContentMediaBinding>, AppError> {
+        let keys: BTreeSet<MediaObjectKey> = revision
+            .document
+            .media_references()
+            .into_iter()
+            .map(|reference| MediaObjectKey {
+                object_id: reference.object_id,
+                object_version: reference.object_version,
+                sha256: reference.sha256.clone(),
+            })
+            .collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Verify committed bytes as well as metadata before preparing a
+        // frozen payload. Never retain image bytes in a channel target.
+        let snapshots = media
+            .snapshot_authorized_images(scope, &keys.iter().cloned().collect::<Vec<_>>())
+            .await?;
+        if snapshots.len() != keys.len()
+            || snapshots
+                .iter()
+                .any(|snapshot| !keys.contains(&snapshot.image.key))
+        {
+            return Err(AppError::conflict("rich publication media differs"));
+        }
+        drop(snapshots);
+        let mut selected = Vec::with_capacity(keys.len());
+        let mut cursor = None;
+        loop {
+            let page = media.list_bindings(scope, cursor, 100).await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|binding| binding.binding_id);
+            for binding in &page {
+                if keys.contains(&binding.image.key) {
+                    selected.push(binding.clone());
+                }
+            }
+            if selected.len() == keys.len() || page.len() < 100 {
+                break;
+            }
+        }
+        if selected.len() != keys.len() {
+            return Err(AppError::conflict(
+                "rich publication media binding unavailable",
+            ));
+        }
+        Ok(selected)
     }
 
     async fn checked_revision(

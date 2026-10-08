@@ -34,6 +34,8 @@ pub use model_routes::PgModelRouteRepository;
 mod projects;
 mod publication_lookup;
 pub use publication_lookup::{PgPublicationLookupRepository, PublicationLookupDiscoveryCandidate};
+mod publication_send_authorization;
+pub use publication_send_authorization::PgPublicationSendAuthorizationRepository;
 mod questions;
 pub use questions::PgQuestionRepository;
 mod report;

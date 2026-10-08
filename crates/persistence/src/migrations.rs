@@ -168,6 +168,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 39,
         description: "content request deferrals",
     },
+    MigrationMetadata {
+        version: 40,
+        description: "publication send authorization",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

@@ -12,17 +12,23 @@ use geo_api::{
 };
 use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
-    ChannelRepository, ChannelStatus, ConnectorKey, ConnectorVerification, ContentRepository,
-    ContentStep, DistributionRepository, DocumentManifestPlanRequest, DocumentScope, ImportItem,
-    InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
-    KnowledgeRepository, Membership, MemoryAuthRepository, MemoryChannelRepository,
-    MemoryConnectorCapabilityRepository, MemoryContentRepository, MemoryDistributionRepository,
+    ChannelRepository, ChannelStatus, ConnectorCapabilityRepository, ConnectorKey,
+    ConnectorSettings, ConnectorVerification, ContentBlock, ContentBlockKind,
+    ContentMediaRepository, ContentRepository, ContentStep, DistributionRepository,
+    DocumentManifestPlanRequest, DocumentScope, ImportItem, InitialSource, InitialSourceKind,
+    InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, Membership,
+    MemoryAuthRepository, MemoryChannelRepository, MemoryConnectorCapabilityRepository,
+    MemoryContentMediaRepository, MemoryContentRepository, MemoryDistributionRepository,
     MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate, ProjectRepository,
-    ProjectSettings, ProjectStartCommand, ReviseSourceTextCommand, Role, SourceKind, TenantScope,
-    User, hash_idempotency_key, settings_hash, start_request_hash,
+    ProjectSettings, ProjectStartCommand, RICH_CHECK_POLICY_VERSION, RICH_MARKDOWN_FORMAT,
+    ReviseSourceTextCommand, RichContent, RichNode, Role, SourceKind, StructuredDocument,
+    TenantScope, UploadSessionCommand, User, VerifiedImage, hash_idempotency_key, settings_hash,
+    start_request_hash,
 };
 use geo_worker::{HostOpError, ModelCompletion, ModelCompletionRequest};
+use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -56,6 +62,8 @@ struct Fixture {
     state: AppState,
     distribution: Arc<MemoryDistributionRepository>,
     knowledge: Arc<MemoryKnowledgeRepository>,
+    content: Arc<MemoryContentRepository>,
+    media: Arc<MemoryContentMediaRepository>,
     channels: Arc<MemoryChannelRepository>,
     scope: TenantScope,
     project: String,
@@ -234,7 +242,12 @@ async fn fixture() -> Fixture {
         )
         .await
         .unwrap();
-    let content = Arc::new(MemoryContentRepository::default());
+    let media = Arc::new(MemoryContentMediaRepository::with_knowledge_repository(
+        knowledge.clone(),
+    ));
+    let content = Arc::new(MemoryContentRepository::with_media_repository(
+        media.clone(),
+    ));
     let service = ContentService::new(content.clone(), knowledge.clone(), projects.clone())
         .with_model_provider(Arc::new(FixtureModel));
     let execution = service.start(&scope, started.cycle_id).await.unwrap();
@@ -306,7 +319,8 @@ async fn fixture() -> Fixture {
         EventBus::default(),
         false,
     )
-    .with_content_repository(content)
+    .with_content_repository(content.clone())
+    .with_content_media_repository(media.clone())
     .with_channel_service(ChannelService::unconfigured(channels.clone()))
     .with_distribution_repository(distribution.clone());
     let app = router(state.clone());
@@ -316,6 +330,8 @@ async fn fixture() -> Fixture {
         state,
         distribution,
         knowledge,
+        content,
+        media,
         channels,
         scope,
         project: project.id.to_string(),
@@ -444,6 +460,274 @@ impl Fixture {
         )
         .await
     }
+}
+
+async fn image_backed_checked_revision(f: &Fixture) -> (Uuid, Uuid) {
+    let mut bytes = Vec::new();
+    PngEncoder::new(&mut bytes)
+        .write_image(
+            &[251, 55, 21, 21, 251, 68, 46, 33, 250, 19, 66, 255],
+            2,
+            2,
+            ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    let digest = hex::encode(Sha256::digest(&bytes));
+    let session = f
+        .knowledge
+        .create_upload_session(
+            &f.scope,
+            UploadSessionCommand {
+                filename: "generic-image.png".into(),
+                declared_media_type: "image/png".into(),
+                expected_size: bytes.len() as u64,
+                expected_sha256: digest,
+                purpose: KnowledgePurpose::Internal,
+            },
+        )
+        .await
+        .unwrap();
+    f.knowledge
+        .put_upload_content(&f.scope, session.upload_session_id, bytes.clone())
+        .await
+        .unwrap();
+    let (object, _) = f
+        .knowledge
+        .complete_attachment_upload(&f.scope, session.upload_session_id, "rich-fixture-upload")
+        .await
+        .unwrap();
+    let key = geo_domain::MediaObjectKey {
+        object_id: object.object_id,
+        object_version: object.object_version,
+        sha256: object.sha256,
+    };
+    let binding = f
+        .media
+        .create_binding(
+            &f.scope,
+            VerifiedImage {
+                key: key.clone(),
+                media_type: "image/png".into(),
+                byte_len: bytes.len() as u64,
+                width: 2,
+                height: 2,
+            },
+        )
+        .await
+        .unwrap();
+    let prior = f
+        .content
+        .get_revision(&f.scope, f.content_asset_id, f.content_revision_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut blocks = prior.document.blocks.clone();
+    blocks.push(ContentBlock {
+        block_id: Uuid::new_v4(),
+        kind: ContentBlockKind::Rich,
+        text: String::new(),
+        citation_ids: blocks[0].citation_ids.clone(),
+        items: vec![],
+        rich: Some(RichContent {
+            version: 1,
+            node: RichNode::Media {
+                attrs: geo_domain::MediaReference {
+                    object_id: key.object_id,
+                    object_version: key.object_version,
+                    sha256: key.sha256,
+                    alt: "Public example".into(),
+                    caption: String::new(),
+                },
+            },
+        }),
+    });
+    let edited = f
+        .content
+        .edit(
+            &f.scope,
+            prior.asset_id,
+            prior.revision_id,
+            StructuredDocument {
+                title: prior.document.title,
+                blocks,
+                schema_version: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+    let asset = f
+        .content
+        .get_asset(&f.scope, edited.asset_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let lease = f
+        .content
+        .claim(
+            &f.scope,
+            asset.execution_id,
+            asset.item_id,
+            ContentStep::Check,
+            RICH_CHECK_POLICY_VERSION,
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    f.content
+        .complete_check(&f.scope, &lease, vec![])
+        .await
+        .unwrap();
+    (edited.revision_id, binding.binding_id)
+}
+
+/// An injected authority double exercises AppState's adapter wiring only.
+/// Its placeholder proof is deliberately not persisted, validated, or
+/// presented as evidence of a real rich publication.
+struct RichCapabilityTestDouble {
+    key: ConnectorKey,
+    placeholder: ConnectorVerification,
+}
+
+#[async_trait]
+impl ConnectorCapabilityRepository for RichCapabilityTestDouble {
+    async fn get(
+        &self,
+        _: geo_domain::OperatorId,
+        key: &ConnectorKey,
+    ) -> Result<Option<ConnectorSettings>, geo_domain::AppError> {
+        Ok((key == &self.key).then(|| ConnectorSettings {
+            key: key.clone(),
+            revision: 1,
+            enabled: true,
+            content_types: vec![RICH_MARKDOWN_FORMAT.into()],
+        }))
+    }
+
+    async fn list(
+        &self,
+        _: geo_domain::OperatorId,
+    ) -> Result<Vec<ConnectorSettings>, geo_domain::AppError> {
+        Ok(Vec::new())
+    }
+
+    async fn history(
+        &self,
+        _: geo_domain::OperatorId,
+        key: &ConnectorKey,
+    ) -> Result<Vec<ConnectorVerification>, geo_domain::AppError> {
+        Ok(if key == &self.key {
+            vec![self.placeholder.clone()]
+        } else {
+            vec![]
+        })
+    }
+
+    async fn configure(
+        &self,
+        _: geo_domain::OperatorId,
+        _: ConnectorKey,
+        _: i32,
+        _: bool,
+        _: Vec<String>,
+        _: &str,
+    ) -> Result<ConnectorSettings, geo_domain::AppError> {
+        Err(geo_domain::AppError::capability_missing(
+            "test double cannot configure a connector",
+        ))
+    }
+
+    async fn insert_verification(
+        &self,
+        _: geo_domain::OperatorId,
+        _: ConnectorVerification,
+    ) -> Result<(), geo_domain::AppError> {
+        Err(geo_domain::AppError::capability_missing(
+            "test double cannot save a publication proof",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn image_backed_rich_request_is_recoverable_and_never_sends_via_plain_bridge() {
+    let f = fixture().await;
+    f.prove_text_connector().await;
+    let (revision_id, binding_id) = image_backed_checked_revision(&f).await;
+    let mut body = f.body();
+    body["content_revision_id"] = json!(revision_id);
+    body["format"] = json!(RICH_MARKDOWN_FORMAT);
+    let (status, accepted) = f.post(Some("image-backed-rich"), body.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert!(accepted["publication_intent_id"].is_null());
+    assert_eq!(
+        accepted["materialization_deferral"]["reason"],
+        "connector_unavailable"
+    );
+    assert_eq!(f.post(Some("image-backed-rich"), body).await.1, accepted);
+    assert!(
+        f.distribution
+            .publication_commands(&f.scope)
+            .await
+            .is_empty()
+    );
+    assert!(
+        f.media
+            .get_binding(&f.scope, binding_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let proof = f
+        .state
+        .connector_capability_repository()
+        .history(
+            f.scope.operator_id,
+            &ConnectorKey {
+                platform_id: "generic".into(),
+                placement_slot: "primary".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut placeholder = proof;
+    placeholder.content_type = RICH_MARKDOWN_FORMAT.into();
+    placeholder.publication_receipt.fixture = true;
+    placeholder.public_readback.fixture = true;
+    let test_state = f
+        .state
+        .clone()
+        .with_connector_capability_repository(Arc::new(RichCapabilityTestDouble {
+            key: placeholder.key.clone(),
+            placeholder,
+        }));
+    let request_id = Uuid::parse_str(accepted["request_id"].as_str().unwrap()).unwrap();
+    let linked = test_state
+        .content_distribution_request_repository()
+        .materialize(&f.scope, request_id)
+        .await
+        .unwrap();
+    assert!(linked.publication_intent_id.is_some());
+    let commands = f.distribution.publication_commands(&f.scope).await;
+    assert_eq!(commands.len(), 1);
+    let bundle = f
+        .distribution
+        .get_publication_bundle(&f.scope, linked.publication_intent_id.unwrap())
+        .await
+        .unwrap();
+    let payload = bundle.variant.rich_payload.unwrap();
+    assert_eq!(payload.media.len(), 1);
+    assert_eq!(payload.media[0].binding_id, binding_id);
+    // Materialization creates durable intent, never an external send attempt.
+    assert!(
+        test_state
+            .channel_job_repository()
+            .get_target(&f.scope, commands[0].command_id)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

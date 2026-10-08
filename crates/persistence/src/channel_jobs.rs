@@ -6,7 +6,7 @@ use geo_domain::{
     AppError, ChannelAttempt, ChannelCycleInputs, ChannelDispatchCandidate, ChannelJobRepository,
     ChannelOutcome, ChannelPlan, ChannelSecret, ChannelTarget, ChannelTargetInput,
     ChannelTargetView, ErrorCode, OperatorId, ProjectId, StandaloneMeasurementPlan, TenantId,
-    TenantScope, frozen_cycle_inputs,
+    TenantScope, frozen_cycle_inputs, validate_rich_publication_payload,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -159,11 +159,17 @@ fn owned_verified_readback(input: &ChannelTargetInput, outcome: &ChannelOutcome)
         platform,
         title,
         body,
+        rich_payload,
         ..
     } = input
     else {
         return false;
     };
+    // Text-only readback cannot prove a schema-2 tree or its media manifest.
+    // Rich verification requires an independent structured proof contract.
+    if rich_payload.is_some() {
+        return false;
+    }
     let Some(url) = outcome.public_url.as_deref() else {
         return false;
     };
@@ -431,6 +437,23 @@ impl ChannelJobRepository for PgChannelJobRepository {
                     "distribution command dependencies differ",
                 ));
             }
+            if variant.rich_payload.is_some() {
+                validate_rich_publication_payload(&variant)?;
+                if variant
+                    .rich_payload
+                    .as_ref()
+                    .is_none_or(|payload| payload.document != revision.document)
+                    || variant.evidence != revision.evidence
+                    || variant.markdown != revision.markdown
+                    || variant.title != revision.document.title
+                {
+                    return Err(AppError::conflict(
+                        "rich publication revision differs from frozen payload",
+                    ));
+                }
+            } else if revision.document.schema_version == Some(2) {
+                return Err(AppError::conflict("rich publication payload is missing"));
+            }
             if let Some(target_id) = origin_target_id {
                 let coverage: geo_domain::DistributionTarget =
                     decode(row.get::<serde_json::Value, _>("distribution_body"))?;
@@ -454,7 +477,11 @@ impl ChannelJobRepository for PgChannelJobRepository {
                 || row.get::<Option<String>, _>("request_slot").as_deref()
                     != Some(variant.placement_slot.as_str())
                 || row.get::<Option<String>, _>("request_format").as_deref()
-                    != Some(geo_domain::TEXT_DISTRIBUTION_FORMAT)
+                    != Some(if variant.rich_payload.is_some() {
+                        geo_domain::RICH_DISTRIBUTION_FORMAT
+                    } else {
+                        geo_domain::TEXT_DISTRIBUTION_FORMAT
+                    })
                 || row.get::<Option<Uuid>, _>("cycle_id").is_some()
             {
                 return Err(AppError::conflict("requested publication origin differs"));
@@ -474,6 +501,7 @@ impl ChannelJobRepository for PgChannelJobRepository {
                     body: variant.markdown,
                     payload_hash,
                     evidence: variant.evidence,
+                    rich_payload: variant.rich_payload,
                 },
             };
             sqlx::query(
@@ -793,6 +821,44 @@ impl ChannelJobRepository for PgChannelJobRepository {
     ) -> Result<ChannelTargetView, AppError> {
         let target = self.get_target(scope, target_id).await?.target;
         let mut tx = self.pool.begin().await.map_err(db)?;
+        if matches!(
+            &target.input,
+            ChannelTargetInput::GeneratedPublish {
+                rich_payload: Some(_),
+                ..
+            }
+        ) && matches!(
+            outcome.status,
+            geo_domain::ChannelOutcomeStatus::Published
+                | geo_domain::ChannelOutcomeStatus::Verified
+        ) {
+            // A text-only readback is never proof of a rich tree/media render.
+            // Even a merely published outcome must belong to this attempt's
+            // durable one-shot send authorization, not just a claimed command.
+            let authorized: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
+                "SELECT send_authorized_at FROM channel_execution_attempts \
+                 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+                   AND target_id=$4 AND attempt_id=$5 FOR UPDATE",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project(scope)?)
+            .bind(target_id)
+            .bind(attempt_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+            if authorized.flatten().is_none() {
+                return Err(AppError::conflict(
+                    "rich publication attempt has no authorized send",
+                ));
+            }
+            if outcome.status == geo_domain::ChannelOutcomeStatus::Verified {
+                return Err(AppError::conflict(
+                    "rich public readback requires structured verification",
+                ));
+            }
+        }
         let updated = sqlx::query(
             "UPDATE channel_execution_attempts SET outcome=$1,received_at=$2 WHERE operator_id=$3 AND tenant_id=$4 AND project_id=$5 AND target_id=$6 AND attempt_id=$7 AND outcome IS NULL"
         ).bind(encode(&outcome)?).bind(received_at).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
@@ -1116,7 +1182,7 @@ mod tests {
 
     #[test]
     fn generated_verification_requires_owned_matching_non_fixture_readback() {
-        let input = ChannelTargetInput::GeneratedPublish {
+        let mut input = ChannelTargetInput::GeneratedPublish {
             content_revision_id: Uuid::new_v4(),
             variant_id: Uuid::new_v4(),
             publication_intent_id: Uuid::new_v4(),
@@ -1129,6 +1195,7 @@ mod tests {
             body_sha256: hex::encode(Sha256::digest(b"Frozen body")),
             payload_hash: "immutable".into(),
             evidence: vec![],
+            rich_payload: None,
         };
         let hash = hex::encode(Sha256::digest(b"Frozen title\nFrozen body"));
         let url = "https://zhuanlan.zhihu.com/p/12345";
@@ -1148,6 +1215,32 @@ mod tests {
             fixture: false,
         };
         assert!(owned_verified_readback(&input, &outcome));
+        if let ChannelTargetInput::GeneratedPublish {
+            content_revision_id,
+            rich_payload,
+            ..
+        } = &mut input
+        {
+            *rich_payload = Some(geo_domain::RichPublicationPayload {
+                schema_version: 2,
+                format: geo_domain::RICH_MARKDOWN_FORMAT.into(),
+                content_revision_id: *content_revision_id,
+                policy_version: geo_domain::RICH_CHANNEL_VARIANT_POLICY.into(),
+                document: geo_domain::StructuredDocument {
+                    title: "Frozen title".into(),
+                    blocks: vec![],
+                    schema_version: Some(2),
+                },
+                media: vec![],
+            });
+        }
+        assert!(
+            !owned_verified_readback(&input, &outcome),
+            "text readback must not verify a structured publication"
+        );
+        if let ChannelTargetInput::GeneratedPublish { rich_payload, .. } = &mut input {
+            *rich_payload = None;
+        }
         outcome.fixture = true;
         assert!(!owned_verified_readback(&input, &outcome));
         outcome.fixture = false;

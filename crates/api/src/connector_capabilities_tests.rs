@@ -32,6 +32,7 @@ fn configured_publication_format_is_explicit_and_excludes_media() {
     for semantic in ["image", "video", "rich_text", "plain_text_article.v1"] {
         assert_eq!(configured_publication_format(&settings, semantic), None);
     }
+    assert_eq!(configured_rich_publication_format(&settings), None);
 
     let legacy = ConnectorSettings {
         content_types: vec!["faq".into()],
@@ -43,6 +44,16 @@ fn configured_publication_format_is_explicit_and_excludes_media() {
         None
     );
     assert_eq!(configured_source_format(&legacy), None);
+    let rich = ConnectorSettings {
+        content_types: vec![RICH_MARKDOWN_FORMAT.into()],
+        ..legacy
+    };
+    assert_eq!(
+        configured_rich_publication_format(&rich),
+        Some(RICH_MARKDOWN_FORMAT)
+    );
+    assert_eq!(configured_publication_format(&rich, "article"), None);
+    assert_eq!(configured_source_format(&rich), None);
 }
 
 #[tokio::test]
@@ -130,7 +141,12 @@ async fn saved_wire_proof_resolves_known_semantics_but_not_media_or_old_source_p
     let supported = service
         .current_capabilities(
             operator,
-            &BTreeSet::from(["faq".into(), "company_profile".into(), "image".into()]),
+            &BTreeSet::from([
+                "faq".into(),
+                "company_profile".into(),
+                "image".into(),
+                RICH_MARKDOWN_FORMAT.into(),
+            ]),
         )
         .await
         .unwrap();
@@ -143,6 +159,7 @@ async fn saved_wire_proof_resolves_known_semantics_but_not_media_or_old_source_p
         vec!["company_profile", "faq"],
         "manifest snapshot retains semantic content types, never the wire key"
     );
+    assert_eq!(configured_rich_publication_format(&settings), None);
     assert_eq!(frozen.unavailable_reason, None);
     runner.abort();
     for semantic in ["faq", "company_profile"] {

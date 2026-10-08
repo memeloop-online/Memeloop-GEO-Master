@@ -2,14 +2,15 @@
 //! Persistence must commit targets, variants, intents and commands in ONE transaction.
 use crate::{
     AppError, ContentDistributionRequest, ContentExecution, ContentExecutionStatus, ContentHandoff,
-    ContentItemStatus, ContentRevision, DocumentManifest, EvidenceRef, ProjectId,
-    ReportEvidenceReference, ReportPublicationStatus, TenantScope,
+    ContentItemStatus, ContentMediaBinding, ContentMediaBindingState, ContentRevision,
+    DocumentManifest, EvidenceRef, MediaObjectKey, ProjectId, ReportEvidenceReference,
+    ReportPublicationStatus, StructuredDocument, TenantScope,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -119,6 +120,42 @@ pub struct ChannelVariant {
     pub markdown: String,
     pub payload_hash: String,
     pub evidence: Vec<EvidenceRef>,
+    /// Absent on every legacy publication; the complete frozen input for schema 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_payload: Option<RichPublicationPayload>,
+}
+
+/// Structure and ordered image occurrences belong to the frozen variant, not
+/// to a mutable attachment lookup or an implicit Markdown representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RichPublicationPayload {
+    pub schema_version: u8,
+    pub format: String,
+    pub content_revision_id: Uuid,
+    pub policy_version: String,
+    pub document: StructuredDocument,
+    pub media: Vec<PublicationMediaItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationMediaRole {
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationMediaItem {
+    pub binding_id: Uuid,
+    pub object: MediaObjectKey,
+    pub media_type: String,
+    pub byte_len: u64,
+    pub width: u32,
+    pub height: u32,
+    pub alt: String,
+    pub caption: String,
+    pub role: PublicationMediaRole,
 }
 
 /// A logical project-scoped asset; cycle and coverage target are deliberately
@@ -183,6 +220,20 @@ pub struct PublicationBundle {
 
 impl PublicationBundle {
     pub fn validate_origin(&self) -> Result<(), AppError> {
+        if self.variant.rich_payload.is_some() {
+            validate_rich_publication_payload(&self.variant)?;
+            if self.variant.content_revision_id != self.revision.revision_id
+                || self
+                    .variant
+                    .rich_payload
+                    .as_ref()
+                    .map(|payload| &payload.document)
+                    != Some(&self.revision.document)
+                || self.variant.markdown != self.revision.markdown
+            {
+                return Err(AppError::conflict("rich publication revision differs"));
+            }
+        }
         let expected = match &self.origin {
             PublicationOrigin::CoverageTarget { target }
                 if target.publication_intent_id == Some(self.intent.intent_id)
@@ -358,12 +409,90 @@ pub fn prepare_variant(
     prepare_versioned_variant(revision, placement, CHANNEL_VARIANT_POLICY)
 }
 
-/// Prepares only the rich-format payload; callers must separately authorize
-/// publication format, media and the entire downstream connector/send path.
-/// The existing outbox intentionally does not call this function.
+/// Compatibility entry point for rich content without media. Media references
+/// require an explicit, scoped authority snapshot supplied by the caller.
 pub fn prepare_rich_variant(
     revision: &ContentRevision,
     placement: &PlatformPlacement,
+) -> Result<ChannelVariant, AppError> {
+    if !revision.document.media_references().is_empty() {
+        return Err(AppError::invalid_request(
+            "media publication requires scoped active media bindings",
+        ));
+    }
+    prepare_rich_variant_with_media(revision, placement, &[])
+}
+
+/// Bind each occurrence in document order to an active, verified image in the
+/// same operator/tenant/project. This is preparation, NOT send authorization:
+/// the actual send must revalidate media under a withdrawal-safe protocol.
+pub fn prepare_rich_variant_authorized(
+    revision: &ContentRevision,
+    placement: &PlatformPlacement,
+    scope: &TenantScope,
+    bindings: &[ContentMediaBinding],
+) -> Result<ChannelVariant, AppError> {
+    if scope.project_id.is_none() {
+        return Err(AppError::forbidden(
+            "rich publication requires project scope",
+        ));
+    }
+    let mut by_key = HashMap::new();
+    for binding in bindings {
+        if binding.operator_id != scope.operator_id
+            || binding.tenant_id != scope.tenant_id
+            || Some(binding.project_id) != scope.project_id
+            || binding.state != ContentMediaBindingState::Active
+            || binding.withdrawn_at.is_some()
+            || binding.binding_id.is_nil()
+        {
+            return Err(AppError::forbidden(
+                "media binding is not active in project",
+            ));
+        }
+        binding.image.validate()?;
+        if by_key.insert(binding.image.key.clone(), binding).is_some() {
+            return Err(AppError::invalid_request("duplicate media binding"));
+        }
+    }
+    let references = revision.document.media_references();
+    let mut media = Vec::with_capacity(references.len());
+    let mut used = HashSet::new();
+    for reference in references {
+        let object = MediaObjectKey {
+            object_id: reference.object_id,
+            object_version: reference.object_version,
+            sha256: reference.sha256.clone(),
+        };
+        object.validate()?;
+        let binding = by_key.get(&object).ok_or_else(|| {
+            AppError::invalid_request("media binding missing or media identity differs")
+        })?;
+        used.insert(object.clone());
+        media.push(PublicationMediaItem {
+            binding_id: binding.binding_id,
+            object,
+            media_type: binding.image.media_type.clone(),
+            byte_len: binding.image.byte_len,
+            width: binding.image.width,
+            height: binding.image.height,
+            alt: reference.alt.clone(),
+            caption: reference.caption.clone(),
+            role: PublicationMediaRole::Image,
+        });
+    }
+    if used.len() != by_key.len() {
+        return Err(AppError::invalid_request(
+            "media binding is not referenced by publication",
+        ));
+    }
+    prepare_rich_variant_with_media(revision, placement, &media)
+}
+
+fn prepare_rich_variant_with_media(
+    revision: &ContentRevision,
+    placement: &PlatformPlacement,
+    media: &[PublicationMediaItem],
 ) -> Result<ChannelVariant, AppError> {
     if revision.document.schema_version != Some(2)
         || !placement
@@ -375,7 +504,200 @@ pub fn prepare_rich_variant(
             "rich content requires an explicitly supported rich publication format",
         ));
     }
-    prepare_versioned_variant(revision, placement, RICH_CHANNEL_VARIANT_POLICY)
+    revision.document.validate(&revision.evidence)?;
+    if revision.markdown != revision.document.markdown() {
+        return Err(AppError::invalid_request(
+            "content revision markdown is inconsistent",
+        ));
+    }
+    let title = revision.document.title.clone();
+    let markdown = revision.markdown.clone();
+    let rich_payload = RichPublicationPayload {
+        schema_version: 2,
+        format: RICH_MARKDOWN_FORMAT.into(),
+        content_revision_id: revision.revision_id,
+        policy_version: RICH_CHANNEL_VARIANT_POLICY.into(),
+        document: revision.document.clone(),
+        media: media.to_vec(),
+    };
+    validate_rich_media(&rich_payload)?;
+    let payload_hash = rich_payload_hash(&rich_payload, &title, &markdown)?;
+    let variant_id = identity(&[
+        &revision.revision_id.to_string(),
+        &placement.platform_id,
+        &placement.placement_slot,
+        RICH_CHANNEL_VARIANT_POLICY,
+        &payload_hash,
+    ]);
+    Ok(ChannelVariant {
+        variant_id,
+        content_revision_id: revision.revision_id,
+        platform_id: placement.platform_id.clone(),
+        placement_slot: placement.placement_slot.clone(),
+        policy_version: RICH_CHANNEL_VARIANT_POLICY.into(),
+        title,
+        markdown,
+        payload_hash,
+        evidence: revision.evidence.clone(),
+        rich_payload: Some(rich_payload),
+    })
+}
+
+/// SHA-256 of compact JSON with recursively lexicographic object keys and
+/// unchanged array order. The object contains no arbitrary URLs or secrets.
+pub fn rich_publication_structured_sha256(
+    payload: &RichPublicationPayload,
+) -> Result<String, AppError> {
+    let bytes = rich_publication_canonical_json(payload)?;
+    Ok(hex::encode(Sha256::digest(bytes.as_bytes())))
+}
+
+fn rich_publication_canonical_json(payload: &RichPublicationPayload) -> Result<String, AppError> {
+    fn sort_objects(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    sort_objects(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for child in map.values_mut() {
+                    sort_objects(child);
+                }
+                let ordered: BTreeMap<_, _> = std::mem::take(map).into_iter().collect();
+                map.extend(ordered);
+            }
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(payload)
+        .map_err(|_| AppError::invalid_request("invalid rich publication payload"))?;
+    sort_objects(&mut value);
+    serde_json::to_string(&value)
+        .map_err(|_| AppError::invalid_request("invalid rich publication payload"))
+}
+
+fn rich_payload_hash(
+    payload: &RichPublicationPayload,
+    title: &str,
+    markdown: &str,
+) -> Result<String, AppError> {
+    // serde_json::Value maps sort object keys recursively; media arrays remain
+    // in document traversal order, including repeated occurrences.
+    let canonical = rich_publication_canonical_json(payload)?;
+    Ok(digest(&[
+        "rich-publication-payload-v2",
+        title,
+        markdown,
+        &canonical,
+    ]))
+}
+
+fn validate_rich_media(payload: &RichPublicationPayload) -> Result<(), AppError> {
+    let references = payload.document.media_references();
+    if references.len() != payload.media.len() {
+        return Err(AppError::invalid_request(
+            "rich publication media count differs",
+        ));
+    }
+    let mut identities = HashMap::new();
+    let mut aggregate_bytes = 0u64;
+    for (reference, item) in references.iter().zip(&payload.media) {
+        if item.binding_id.is_nil()
+            || item.role != PublicationMediaRole::Image
+            || item.object.object_id != reference.object_id
+            || item.object.object_version != reference.object_version
+            || item.object.sha256 != reference.sha256
+            || item.alt != reference.alt
+            || item.caption != reference.caption
+        {
+            return Err(AppError::invalid_request("rich publication media differs"));
+        }
+        crate::VerifiedImage {
+            key: item.object.clone(),
+            media_type: item.media_type.clone(),
+            byte_len: item.byte_len,
+            width: item.width,
+            height: item.height,
+        }
+        .validate()?;
+        let identity = (item.object.object_id, item.object.object_version);
+        if identities
+            .insert(
+                identity,
+                (
+                    &item.object.sha256,
+                    item.binding_id,
+                    &item.media_type,
+                    item.byte_len,
+                    item.width,
+                    item.height,
+                ),
+            )
+            .is_some_and(|previous| {
+                previous
+                    != (
+                        &item.object.sha256,
+                        item.binding_id,
+                        &item.media_type,
+                        item.byte_len,
+                        item.width,
+                        item.height,
+                    )
+            })
+        {
+            return Err(AppError::invalid_request(
+                "conflicting media object identity in publication",
+            ));
+        }
+        if identities.len() > crate::MAX_MEDIA_SNAPSHOT_IMAGES {
+            return Err(AppError::invalid_request(
+                "too many distinct publication images",
+            ));
+        }
+    }
+    for (_, (_, _, _, byte_len, _, _)) in identities {
+        aggregate_bytes = crate::add_media_snapshot_bytes(aggregate_bytes, byte_len)?;
+    }
+    Ok(())
+}
+
+/// Validate the immutable rich variant after storage/readback. This checks
+/// internal structure and identity, not whether media is still authorized.
+pub fn validate_rich_publication_payload(variant: &ChannelVariant) -> Result<(), AppError> {
+    let payload = variant
+        .rich_payload
+        .as_ref()
+        .ok_or_else(|| AppError::invalid_request("rich publication payload missing"))?;
+    if payload.schema_version != 2
+        || payload.format != RICH_MARKDOWN_FORMAT
+        || payload.policy_version != RICH_CHANNEL_VARIANT_POLICY
+        || variant.policy_version != payload.policy_version
+        || variant.content_revision_id != payload.content_revision_id
+        || payload.document.schema_version != Some(2)
+        || payload.document.title != variant.title
+    {
+        return Err(AppError::invalid_request(
+            "rich publication format or revision differs",
+        ));
+    }
+    payload.document.validate(&variant.evidence)?;
+    validate_rich_media(payload)?;
+    if payload.document.markdown() != variant.markdown
+        || rich_payload_hash(payload, &variant.title, &variant.markdown)? != variant.payload_hash
+        || identity(&[
+            &variant.content_revision_id.to_string(),
+            &variant.platform_id,
+            &variant.placement_slot,
+            &variant.policy_version,
+            &variant.payload_hash,
+        ]) != variant.variant_id
+    {
+        return Err(AppError::invalid_request(
+            "rich publication identity differs",
+        ));
+    }
+    Ok(())
 }
 fn prepare_versioned_variant(
     revision: &ContentRevision,
@@ -413,6 +735,7 @@ fn prepare_versioned_variant(
         markdown,
         payload_hash,
         evidence: revision.evidence.clone(),
+        rich_payload: None,
     })
 }
 
@@ -795,6 +1118,20 @@ pub trait DistributionRepository: Send + Sync {
         scope: &TenantScope,
         prepared: PreparedDistribution,
     ) -> Result<MaterializedDistribution, AppError>;
+    /// Rich variants use the same target/intent/outbox ledger, but require an
+    /// exact media-authority input; production repositories re-resolve it
+    /// transactionally rather than trusting this preparation snapshot.
+    async fn materialize_rich(
+        &self,
+        scope: &TenantScope,
+        prepared: PreparedDistribution,
+        bindings: Vec<ContentMediaBinding>,
+    ) -> Result<MaterializedDistribution, AppError> {
+        let _ = (scope, prepared, bindings);
+        Err(AppError::capability_missing(
+            "rich distribution materialization unavailable",
+        ))
+    }
     /// Atomically reuse or create one logical publication for a request.
     /// The request repository holds the acceptance row lock while delegating
     /// in-memory materialization; PostgreSQL implements both in one transaction.
@@ -807,6 +1144,18 @@ pub trait DistributionRepository: Send + Sync {
         let _ = (scope, request, revision);
         Err(AppError::capability_missing(
             "request materialization requires atomic repository support",
+        ))
+    }
+    async fn materialize_rich_request_origin(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+        bindings: Vec<ContentMediaBinding>,
+    ) -> Result<PublicationIntent, AppError> {
+        let _ = (scope, request, revision, bindings);
+        Err(AppError::capability_missing(
+            "rich request materialization requires atomic repository support",
         ))
     }
     /// Trusted receipt adapter only: supply the evidence ID of a persisted
@@ -861,6 +1210,75 @@ struct MemoryDistributionState {
 impl MemoryDistributionRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    async fn materialize_prepared_request(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+        variant: ChannelVariant,
+    ) -> Result<PublicationIntent, AppError> {
+        let (candidate, command) =
+            prepare_request_publication_intent(scope, request, &variant, Utc::now())?;
+        let key = scope.storage_key();
+        let mut state = self.state.write().await;
+        let prior = state
+            .intents
+            .get(&(key.clone(), candidate.logical_key.clone()))
+            .cloned();
+        let intent = prior.unwrap_or_else(|| candidate.clone());
+        if intent.intent_id != candidate.intent_id
+            || intent.account_id != request.account_id
+            || intent.variant_id != variant.variant_id
+            || request
+                .publication_intent_id
+                .is_some_and(|id| id != intent.intent_id)
+        {
+            return Err(AppError::conflict(
+                "logical publication differs from request",
+            ));
+        }
+        if state
+            .variants
+            .get(&(key.clone(), variant.variant_id))
+            .is_some_and(|stored| *stored != variant)
+            || state
+                .revisions
+                .get(&(key.clone(), revision.revision_id))
+                .is_some_and(|stored| *stored != *revision)
+        {
+            return Err(AppError::conflict("immutable publication payload differs"));
+        }
+        if !state
+            .intents
+            .contains_key(&(key.clone(), candidate.logical_key.clone()))
+        {
+            state
+                .commands
+                .insert((key.clone(), command.command_id), command);
+            state
+                .intents
+                .insert((key.clone(), candidate.logical_key), intent.clone());
+        }
+        state
+            .variants
+            .entry((key.clone(), variant.variant_id))
+            .or_insert(variant);
+        state
+            .revisions
+            .entry((key.clone(), revision.revision_id))
+            .or_insert(revision.clone());
+        if intent.channel_target_id.is_nil() {
+            let mut bound = request.clone();
+            bound.publication_intent_id = Some(intent.intent_id);
+            // Keep the first request as immutable origin across later replays.
+            state
+                .requests
+                .entry((key, intent.intent_id))
+                .or_insert(bound);
+        }
+        Ok(intent)
     }
 
     /// In-memory diagnostic view. Production dispatch must consume a durable
@@ -1154,6 +1572,24 @@ impl DistributionRepository for MemoryDistributionRepository {
         scope: &TenantScope,
         prepared: PreparedDistribution,
     ) -> Result<MaterializedDistribution, AppError> {
+        if prepared
+            .revision
+            .as_ref()
+            .is_some_and(|revision| revision.document.schema_version == Some(2))
+        {
+            return Err(AppError::invalid_request(
+                "rich distribution requires explicit media authorization",
+            ));
+        }
+        self.materialize_rich(scope, prepared, Vec::new()).await
+    }
+
+    async fn materialize_rich(
+        &self,
+        scope: &TenantScope,
+        prepared: PreparedDistribution,
+        bindings: Vec<ContentMediaBinding>,
+    ) -> Result<MaterializedDistribution, AppError> {
         let mut state = self.state.write().await;
         let manifest = scoped_manifest(&state, scope, prepared.manifest_id)?.clone();
         let key = (scope.storage_key(), prepared.target_id);
@@ -1258,7 +1694,16 @@ impl DistributionRepository for MemoryDistributionRepository {
                 "content revision differs from frozen handoff",
             ));
         }
-        let variant = prepare_variant(revision, placement)?;
+        let variant = if revision.document.schema_version == Some(2) {
+            prepare_rich_variant_authorized(revision, placement, scope, &bindings)?
+        } else {
+            if !bindings.is_empty() {
+                return Err(AppError::invalid_request(
+                    "legacy publication cannot contain rich media bindings",
+                ));
+            }
+            prepare_variant(revision, placement)?
+        };
         if state
             .revisions
             .get(&(scope.storage_key(), revision.revision_id))
@@ -1363,67 +1808,37 @@ impl DistributionRepository for MemoryDistributionRepository {
             fixture: false,
         };
         let variant = prepare_variant(revision, &placement)?;
-        let (candidate, command) =
-            prepare_request_publication_intent(scope, request, &variant, Utc::now())?;
-        let key = scope.storage_key();
-        let mut state = self.state.write().await;
-        let prior = state
-            .intents
-            .get(&(key.clone(), candidate.logical_key.clone()))
-            .cloned();
-        let intent = prior.unwrap_or_else(|| candidate.clone());
-        if intent.intent_id != candidate.intent_id
-            || intent.account_id != request.account_id
-            || intent.variant_id != variant.variant_id
-            || request
-                .publication_intent_id
-                .is_some_and(|id| id != intent.intent_id)
+        self.materialize_prepared_request(scope, request, revision, variant)
+            .await
+    }
+
+    async fn materialize_rich_request_origin(
+        &self,
+        scope: &TenantScope,
+        request: &ContentDistributionRequest,
+        revision: &ContentRevision,
+        bindings: Vec<ContentMediaBinding>,
+    ) -> Result<PublicationIntent, AppError> {
+        if request.scope != *scope
+            || request.content_revision_id != revision.revision_id
+            || request.content_asset_id != revision.asset_id
+            || request.format != crate::RICH_DISTRIBUTION_FORMAT
+            || revision.findings.iter().any(|finding| finding.blocking)
+            || revision.evidence.is_empty()
         {
-            return Err(AppError::conflict(
-                "logical publication differs from request",
-            ));
+            return Err(AppError::conflict("rich request revision is not eligible"));
         }
-        if state
-            .variants
-            .get(&(key.clone(), variant.variant_id))
-            .is_some_and(|stored| *stored != variant)
-            || state
-                .revisions
-                .get(&(key.clone(), revision.revision_id))
-                .is_some_and(|stored| *stored != *revision)
-        {
-            return Err(AppError::conflict("immutable publication payload differs"));
-        }
-        if !state
-            .intents
-            .contains_key(&(key.clone(), candidate.logical_key.clone()))
-        {
-            state
-                .commands
-                .insert((key.clone(), command.command_id), command);
-            state
-                .intents
-                .insert((key.clone(), candidate.logical_key), intent.clone());
-        }
-        state
-            .variants
-            .entry((key.clone(), variant.variant_id))
-            .or_insert(variant);
-        state
-            .revisions
-            .entry((key.clone(), revision.revision_id))
-            .or_insert(revision.clone());
-        if intent.channel_target_id.is_nil() {
-            let mut bound = request.clone();
-            bound.publication_intent_id = Some(intent.intent_id);
-            // A later request may reuse this intent, but only the original
-            // request is its immutable origin and outbox dependency.
-            state
-                .requests
-                .entry((key, intent.intent_id))
-                .or_insert(bound);
-        }
-        Ok(intent)
+        let placement = PlatformPlacement {
+            platform_id: request.platform_id.clone(),
+            placement_slot: request.placement_slot.clone(),
+            capability_version: "request-rich-v2".into(),
+            supported_formats: vec![RICH_MARKDOWN_FORMAT.into()],
+            unavailable_reason: None,
+            fixture: false,
+        };
+        let variant = prepare_rich_variant_authorized(revision, &placement, scope, &bindings)?;
+        self.materialize_prepared_request(scope, request, revision, variant)
+            .await
     }
 
     async fn record_intent_verification(

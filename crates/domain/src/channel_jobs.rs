@@ -13,7 +13,7 @@ use crate::{
     AppError, ChannelSecret, EvidenceRef, FrozenQuestionBinding, ProjectId, QuestionPurpose,
     QuestionReference, ReportEvidenceReference, ReportManifestKind, ReportManifestRef,
     ReportMeasurementStatus, ReportMeasurementTarget, ReportPublicationStatus,
-    ReportPublicationTarget, TenantScope, sha256_hex,
+    ReportPublicationTarget, RichPublicationPayload, TenantScope, sha256_hex,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +44,8 @@ pub enum ChannelTargetInput {
         body_sha256: String,
         payload_hash: String,
         evidence: Vec<EvidenceRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rich_payload: Option<RichPublicationPayload>,
     },
     Measure {
         account_id: Uuid,
@@ -719,6 +721,7 @@ struct MemoryCycle {
     generated: HashMap<Uuid, ChannelTarget>,
     attempts: HashMap<Uuid, Vec<ChannelAttempt>>,
     publication_bindings: HashMap<Uuid, ChannelSecret>,
+    publication_send: HashMap<Uuid, crate::publication_send_authorization::MemorySendRegistration>,
 }
 
 impl MemoryCycle {
@@ -740,6 +743,225 @@ impl MemoryCycle {
             .values()
             .chain(self.plan.iter().flat_map(|plan| plan.targets.iter()))
             .chain(self.measurement.iter().flat_map(|plan| plan.targets.iter()))
+    }
+}
+
+impl MemoryChannelJobRepository {
+    /// Internal trusted preflight only. This lock is shared with `finish`, so
+    /// completion cannot race a successful registration or a send grant.
+    pub(crate) async fn register_rich_send(
+        &self,
+        scope: &TenantScope,
+        request: &crate::RegisterPublicationSend,
+    ) -> Result<(), AppError> {
+        let key = scope_key(scope)?;
+        let mut all = self.0.lock().await;
+        let cycle = all
+            .iter_mut()
+            .find(|((o, t, p, _), cycle)| {
+                (*o, *t, *p) == key && cycle.target(request.target_id).is_some()
+            })
+            .map(|(_, cycle)| cycle)
+            .ok_or_else(|| AppError::not_found("publication target not found"))?;
+        let target = cycle
+            .target(request.target_id)
+            .ok_or_else(|| AppError::not_found("publication target not found"))?;
+        if !matches!(
+            &target.input,
+            ChannelTargetInput::GeneratedPublish {
+                rich_payload: Some(_),
+                ..
+            }
+        ) || target.input.account_id() != request.account_id
+        {
+            return Err(AppError::conflict("publication preflight target differs"));
+        }
+        let attempt = cycle
+            .attempts
+            .get(&request.target_id)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.attempt_id == request.attempt_id)
+            })
+            .ok_or_else(|| AppError::not_found("publication attempt not found"))?;
+        if attempt.outcome.is_some() || attempt.received_at.is_some() {
+            return Err(AppError::conflict("publication attempt already completed"));
+        }
+        let binding = cycle
+            .publication_bindings
+            .get(&request.attempt_id)
+            .ok_or_else(|| AppError::conflict("preflight binding is unavailable"))?;
+        if sha256_hex(binding.encrypted_bytes()) != request.encrypted_binding_sha256 {
+            return Err(AppError::conflict("preflight binding identity differs"));
+        }
+        if let Some(registered) = cycle.publication_send.get(&request.attempt_id) {
+            return if registered.session_id == request.runner_session_id
+                && registered.deadline == request.send_not_after
+                && registered.binding_sha256 == request.encrypted_binding_sha256
+            {
+                Ok(())
+            } else {
+                Err(AppError::conflict(
+                    "publication preflight already registered",
+                ))
+            };
+        }
+        let now = Utc::now();
+        if request.runner_session_id.is_nil()
+            || request.attempt_id.is_nil()
+            || request.send_not_after <= now
+            || request.send_not_after > now + chrono::Duration::minutes(5)
+            || request.send_not_after <= attempt.claimed_at
+            || attempt.claimed_at > now
+            || now - attempt.claimed_at > chrono::Duration::minutes(5)
+        {
+            return Err(AppError::conflict(
+                "publication preflight deadline or session invalid",
+            ));
+        }
+        cycle.publication_send.insert(
+            request.attempt_id,
+            crate::publication_send_authorization::MemorySendRegistration {
+                session_id: request.runner_session_id,
+                deadline: request.send_not_after,
+                binding_sha256: request.encrypted_binding_sha256.clone(),
+                send_authorized_at: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Called only while the common project and media guards are held; all
+    /// immutable payload and actual byte identities have been checked before
+    /// taking this short ledger lock. No I/O may occur under the ledger lock.
+    pub(crate) async fn authorize_rich_send(
+        &self,
+        scope: &TenantScope,
+        expected: &crate::AuthorizePublicationSend,
+        bundle: &crate::PublicationBundle,
+        verified: &[crate::ContentMediaBinding],
+    ) -> Result<crate::PublicationSendDecision, AppError> {
+        let key = scope_key(scope)?;
+        let mut all = self.0.lock().await;
+        let cycle = all
+            .iter_mut()
+            .find(|((o, t, p, _), cycle)| {
+                (*o, *t, *p) == key && cycle.target(expected.target_id).is_some()
+            })
+            .map(|(_, cycle)| cycle)
+            .ok_or_else(|| AppError::not_found("publication target not found"))?;
+        let target = cycle
+            .target(expected.target_id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("publication target not found"))?;
+        let ChannelTargetInput::GeneratedPublish {
+            content_revision_id,
+            variant_id,
+            publication_intent_id,
+            account_id,
+            platform,
+            title,
+            body,
+            body_sha256,
+            payload_hash,
+            distribution_target_id,
+            origin_request_id,
+            rich_payload: Some(frozen),
+            ..
+        } = &target.input
+        else {
+            return Err(AppError::conflict(
+                "only a frozen rich publication may be authorized",
+            ));
+        };
+        let attempt = cycle
+            .attempts
+            .get(&expected.target_id)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.attempt_id == expected.attempt_id)
+            })
+            .ok_or_else(|| AppError::not_found("publication attempt not found"))?;
+        let registered = cycle
+            .publication_send
+            .get(&expected.attempt_id)
+            .ok_or_else(|| AppError::conflict("publication preflight is unregistered"))?;
+        if attempt.outcome.is_some()
+            || attempt.received_at.is_some()
+            || *account_id != expected.account_id
+            || registered.session_id != expected.runner_session_id
+            || registered.binding_sha256 != expected.encrypted_binding_sha256
+            || expected.publication_intent_id != *publication_intent_id
+            || expected.payload_hash != *payload_hash
+            || bundle.intent.intent_id != *publication_intent_id
+            || bundle.intent.account_id != *account_id
+            || bundle.intent.platform_id != *platform
+            || bundle.intent.payload_hash != *payload_hash
+            || bundle.variant.variant_id != *variant_id
+            || bundle.variant.content_revision_id != *content_revision_id
+            || bundle.variant.title != *title
+            || bundle.variant.markdown != *body
+            || bundle.variant.rich_payload.as_ref() != Some(frozen)
+            || bundle.revision.revision_id != *content_revision_id
+            || bundle.revision.document != frozen.document
+            || bundle.command.command_id != expected.target_id
+            || bundle.command.target_id != *distribution_target_id
+            || (match &bundle.origin {
+                crate::PublicationOrigin::ContentRequest { request } => {
+                    Some(request.request_id) != *origin_request_id
+                }
+                crate::PublicationOrigin::CoverageTarget { .. } => origin_request_id.is_some(),
+            })
+            || bundle.command.fixture
+            || crate::sha256_hex(body.as_bytes()) != *body_sha256
+            || cycle
+                .publication_bindings
+                .get(&expected.attempt_id)
+                .is_none_or(|binding| {
+                    sha256_hex(binding.encrypted_bytes()) != expected.encrypted_binding_sha256
+                })
+        {
+            return Err(AppError::conflict(
+                "publication frozen intent or attempt differs",
+            ));
+        }
+        bundle.validate_origin()?;
+        crate::validate_rich_publication_payload(&bundle.variant)?;
+        for item in &frozen.media {
+            if !verified.iter().any(|binding| {
+                binding.binding_id == item.binding_id
+                    && binding.image.key == item.object
+                    && binding.image.media_type == item.media_type
+                    && binding.image.byte_len == item.byte_len
+                    && binding.image.width == item.width
+                    && binding.image.height == item.height
+            }) {
+                return Err(AppError::conflict("publication media grant differs"));
+            }
+        }
+        if registered.send_authorized_at.is_some() {
+            return Ok(crate::PublicationSendDecision::AlreadyConsumed);
+        }
+        let now = Utc::now();
+        if now > registered.deadline || now < attempt.claimed_at {
+            return Err(AppError::conflict("publication send authorization expired"));
+        }
+        let deadline = registered.deadline;
+        cycle
+            .publication_send
+            .get_mut(&expected.attempt_id)
+            .expect("checked registered send")
+            .send_authorized_at = Some(now);
+        Ok(crate::PublicationSendDecision::Granted(
+            crate::PublicationSendGrant {
+                attempt_id: expected.attempt_id,
+                runner_session_id: expected.runner_session_id,
+                payload_hash: payload_hash.clone(),
+                send_not_after: deadline,
+            },
+        ))
     }
 }
 
@@ -1188,6 +1410,26 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
             .target(target_id)
             .cloned()
             .ok_or_else(|| AppError::not_found("target not found"))?;
+        let mut outcome = outcome;
+        if matches!(
+            &target.input,
+            ChannelTargetInput::GeneratedPublish {
+                rich_payload: Some(_),
+                ..
+            }
+        ) {
+            let authorized = cycle
+                .publication_send
+                .get(&attempt_id)
+                .is_some_and(|registration| registration.send_authorized_at.is_some());
+            if outcome.status == ChannelOutcomeStatus::Verified
+                || (outcome.status == ChannelOutcomeStatus::Published && !authorized)
+            {
+                // Text-only readback never proves rich media. A published
+                // result cannot predate the one-shot send authorization.
+                outcome.status = ChannelOutcomeStatus::Unknown;
+            }
+        }
         let attempts = cycle
             .attempts
             .get_mut(&target_id)
@@ -2008,6 +2250,7 @@ mod tests {
                 body_sha256: "hash".into(),
                 payload_hash: "payload".into(),
                 evidence: vec![],
+                rich_payload: None,
             },
         };
         let measurement = ChannelPlan {

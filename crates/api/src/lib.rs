@@ -43,6 +43,8 @@ mod project_tools;
 mod provider_bridge;
 mod publication_lookup;
 pub use publication_lookup::dispatch_publication_lookup;
+mod publication_send_callback;
+pub use publication_send_callback::PublicationSendCallbackService;
 mod questions;
 mod questions_tools;
 mod reports;
@@ -145,6 +147,7 @@ pub struct AppState {
     desktop_grants: desktop_gateway::DesktopGrants,
     channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
     publication_lookup_repository: Option<Arc<dyn geo_domain::PublicationLookupRepository>>,
+    publication_send_callback: Option<PublicationSendCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
     distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
@@ -187,6 +190,19 @@ impl geo_domain::ContentDistributionIntentLookup for DistributionIntentLookupAda
         let repository = self.0.read().expect("distribution lookup lock").clone();
         repository
             .materialize_request_origin(scope, request, revision)
+            .await
+    }
+
+    async fn materialize_accepted_rich_request(
+        &self,
+        scope: &TenantScope,
+        request: &geo_domain::ContentDistributionRequest,
+        revision: &geo_domain::ContentRevision,
+        bindings: Vec<geo_domain::ContentMediaBinding>,
+    ) -> Result<geo_domain::PublicationIntent, AppError> {
+        let repository = self.0.read().expect("distribution lookup lock").clone();
+        repository
+            .materialize_rich_request_origin(scope, request, revision, bindings)
             .await
     }
 }
@@ -240,6 +256,7 @@ impl AppState {
             desktop_grants: desktop_gateway::DesktopGrants::default(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             publication_lookup_repository: None,
+            publication_send_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
                     content_media_repository.clone(),
@@ -384,6 +401,7 @@ impl AppState {
             desktop_grants: desktop_gateway::DesktopGrants::default(),
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             publication_lookup_repository: None,
+            publication_send_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
                     content_media_repository.clone(),
@@ -546,6 +564,7 @@ impl AppState {
         repository: Arc<dyn geo_domain::ContentMediaRepository>,
     ) -> Self {
         self.content_media_repository = repository;
+        self.refresh_memory_request_authorities();
         self
     }
 
@@ -632,13 +651,15 @@ impl AppState {
     /// replace another clone's content/account/source/capability authority.
     fn refresh_memory_request_authorities(&mut self) {
         if let Some(repository) = self.memory_request_repository.clone() {
-            let repository = repository.with_authorities(
-                Arc::clone(&self.content_repository),
-                Arc::clone(&self.knowledge_repository),
-                Arc::clone(&self.project_repository),
-                Arc::clone(&self.channel_service.repository),
-                Arc::clone(&self.connector_capability_repository),
-            );
+            let repository = repository
+                .with_authorities(
+                    Arc::clone(&self.content_repository),
+                    Arc::clone(&self.knowledge_repository),
+                    Arc::clone(&self.project_repository),
+                    Arc::clone(&self.channel_service.repository),
+                    Arc::clone(&self.connector_capability_repository),
+                )
+                .with_media_repository(Arc::clone(&self.content_media_repository));
             self.content_distribution_request_repository = Arc::new(repository.clone());
             self.memory_request_repository = Some(repository);
         }
@@ -656,6 +677,7 @@ impl AppState {
             self.connector_capability_repository(),
             self.channel_service.browser.clone(),
         )
+        .with_media_repository(self.content_media_repository())
     }
 
     pub fn with_distribution_repository(
@@ -806,6 +828,15 @@ impl AppState {
         repository: Arc<dyn geo_domain::PublicationLookupRepository>,
     ) -> Self {
         self.publication_lookup_repository = Some(repository);
+        self
+    }
+
+    /// Opt-in service-only callback; ordinary browser routes never issue tickets.
+    pub fn with_publication_send_callback(
+        mut self,
+        service: PublicationSendCallbackService,
+    ) -> Self {
+        self.publication_send_callback = Some(service);
         self
     }
 
@@ -2366,6 +2397,8 @@ pub fn router(state: AppState) -> Router {
         .merge(auth_session_routes)
         .layer(middleware::from_fn(no_store_middleware));
 
+    let publication_callback =
+        publication_send_callback::routes(state.publication_send_callback.clone());
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -2390,4 +2423,5 @@ pub fn router(state: AppState) -> Router {
         .layer(Extension(middleware_state))
         .layer(middleware::from_fn(context::request_context_middleware))
         .with_state(state)
+        .merge(publication_callback)
 }

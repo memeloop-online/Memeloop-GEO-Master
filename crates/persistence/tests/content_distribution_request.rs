@@ -7,8 +7,8 @@ use geo_domain::{
     ContentRequestDeferralReason, ContentRevision, DistributionRepository, ErrorCode, EvidenceRef,
     InitialSource, InitialSourceKind, InitialSourceVisibility, IntentVerification, ProjectCreate,
     ProjectRepository, ProjectSettings, ProjectStartCommand, PublicationIntent, PublicationOrigin,
-    StructuredDocument, TEXT_DISTRIBUTION_FORMAT, TenantScope, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    RichContent, RichNode, StructuredDocument, TEXT_DISTRIBUTION_FORMAT, TenantScope,
+    hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgChannelJobRepository, PgContentDistributionRequestRepository,
@@ -297,6 +297,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         markdown: "# Example".into(),
         payload_hash: "payload".into(),
         evidence: vec![],
+        rich_payload: None,
     };
     sqlx::query(
         "INSERT INTO distribution_channel_variants \
@@ -782,7 +783,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         serde_json::from_value(channel_row.get("frozen_input")).unwrap();
     assert!(
         matches!(frozen.input, geo_domain::ChannelTargetInput::GeneratedPublish {
-        origin_request_id: Some(id), distribution_target_id, ..
+        origin_request_id: Some(id), distribution_target_id, rich_payload: None, ..
     } if id == first.request_id && distribution_target_id.is_nil())
     );
     assert!(
@@ -840,25 +841,155 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
     let mut unsupported = first_input.clone();
     unsupported.idempotency_key = "rich-rejected".into();
     unsupported.format = geo_domain::RICH_DISTRIBUTION_FORMAT.into();
-    let unsupported = repository.accept(&scope, unsupported).await.unwrap();
     assert_eq!(
         repository
-            .materialize(&scope, unsupported.request_id)
+            .accept(&scope, unsupported)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    // A schema-2 request cannot use the otherwise verified plain-text
+    // connector. It needs separate exact rich-format capability evidence.
+    let mut rich_revision = eligible.clone();
+    rich_revision.revision_id = Uuid::new_v4();
+    rich_revision.asset_id = Uuid::new_v4();
+    rich_revision.document = StructuredDocument {
+        title: "Structured article".into(),
+        schema_version: Some(2),
+        blocks: vec![ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Rich,
+            text: String::new(),
+            citation_ids: vec![chunk_id],
+            items: vec![],
+            rich: Some(RichContent {
+                version: 1,
+                node: RichNode::Paragraph {
+                    content: vec![RichNode::Text {
+                        text: text.into(),
+                        marks: vec![],
+                    }],
+                },
+            }),
+        }],
+    };
+    rich_revision.markdown = rich_revision.document.markdown();
+    sqlx::query(
+        "INSERT INTO content_revisions (revision_id,operator_id,tenant_id,project_id,\
+         execution_id,asset_id,revision,body,created_at) VALUES ($1,$2,$3,$4,$5,$6,1,$7,$8)",
+    )
+    .bind(rich_revision.revision_id)
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .bind(execution_id)
+    .bind(rich_revision.asset_id)
+    .bind(serde_json::to_value(&rich_revision).unwrap())
+    .bind(rich_revision.created_at)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let rich_check = ContentCheck {
+        check_id: Uuid::new_v4(),
+        revision_id: rich_revision.revision_id,
+        findings: vec![],
+        created_at: Utc::now(),
+    };
+    sqlx::query(
+        "INSERT INTO content_checks \
+         (check_id,operator_id,tenant_id,project_id,execution_id,revision_id,body,created_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(rich_check.check_id)
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .bind(execution_id)
+    .bind(rich_revision.revision_id)
+    .bind(serde_json::to_value(&rich_check).unwrap())
+    .bind(rich_check.created_at)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let rich_request = repository
+        .accept(
+            &scope,
+            AcceptContentDistributionRequest {
+                revision: rich_revision.clone(),
+                account: ready_account.clone(),
+                placement_slot: "primary".into(),
+                format: geo_domain::RICH_DISTRIBUTION_FORMAT.into(),
+                idempotency_key: "rich-exact".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .materialize(&scope, rich_request.request_id)
             .await
             .unwrap_err()
             .code,
         ErrorCode::Conflict
     );
+    sqlx::query(
+        "UPDATE connector_capability_settings SET content_types=$1 \
+         WHERE operator_id=$2 AND platform_id='platform' AND placement_slot='primary'",
+    )
+    .bind(serde_json::json!([
+        "plain_text_article.v1",
+        "rich_markdown.v2"
+    ]))
+    .bind(operator)
+    .execute(database.pool())
+    .await
+    .unwrap();
     assert_eq!(
         repository
-            .get(&scope, unsupported.request_id)
+            .materialize(&scope, rich_request.request_id)
             .await
-            .unwrap()
-            .materialization_deferral
-            .unwrap()
-            .reason,
-        ContentRequestDeferralReason::FormatUnsupported
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
     );
+    sqlx::query(
+        "INSERT INTO connector_capability_verifications \
+         (verification_id,operator_id,platform_id,placement_slot,connector_version,content_type,\
+          publication_receipt,public_readback,verified_at) \
+         VALUES ($1,$2,'platform','primary','fixture-rich-v2','rich_markdown.v2',\
+                 '{}'::jsonb,'{}'::jsonb,now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(operator)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let rich_request = repository
+        .materialize(&scope, rich_request.request_id)
+        .await
+        .unwrap();
+    let rich_intent_id = rich_request.publication_intent_id.unwrap();
+    let rich_bundle = distribution
+        .get_publication_bundle(&scope, rich_intent_id)
+        .await
+        .unwrap();
+    let rich_payload = rich_bundle.variant.rich_payload.as_ref().unwrap();
+    assert_eq!(rich_payload.document, rich_revision.document);
+    let rich_jobs = jobs.materialize_pending_commands(None, 100).await.unwrap();
+    assert_eq!(rich_jobs.len(), 1);
+    let rich_target = jobs
+        .get_target(&scope, rich_jobs[0].target_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        rich_target.target.input,
+        geo_domain::ChannelTargetInput::GeneratedPublish {
+            origin_request_id: Some(id),
+            rich_payload: Some(ref payload),
+            ..
+        } if id == rich_request.request_id && payload == rich_payload
+    ));
     sqlx::query(
         "UPDATE knowledge_sources SET purpose='internal' \
          WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND source_id=$4",

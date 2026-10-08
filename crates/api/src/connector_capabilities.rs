@@ -9,7 +9,7 @@ use axum::{
 };
 use geo_domain::{
     AppError, ConnectorAvailability, ConnectorKey, ConnectorSettings, PLAIN_TEXT_ARTICLE_FORMAT,
-    ProjectId, TenantScope, publication_format_for_semantic_type,
+    ProjectId, RICH_MARKDOWN_FORMAT, TenantScope, publication_format_for_semantic_type,
 };
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +83,18 @@ pub(crate) fn configured_publication_format<'a>(
     } else {
         None
     }
+}
+
+/// Rich variants are a distinct wire format, never a semantic alias for the
+/// title/body proof. This key must have its own operator verification.
+pub(crate) fn configured_rich_publication_format(
+    settings: &ConnectorSettings,
+) -> Option<&'static str> {
+    settings
+        .content_types
+        .iter()
+        .any(|configured| configured == RICH_MARKDOWN_FORMAT)
+        .then_some(RICH_MARKDOWN_FORMAT)
 }
 
 /// Source articles carry no document semantic label. Unlike generated

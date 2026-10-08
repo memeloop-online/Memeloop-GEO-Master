@@ -6,8 +6,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use geo_domain::{
-    AcceptContentDistributionRequest, AppError, ChannelOutcomeStatus, ContentDistributionRequest,
-    ErrorCode, ProjectId, TenantScope,
+    AcceptContentDistributionRequest, AppError, ChannelOutcomeStatus, ChannelTargetInput,
+    ContentDistributionRequest, ErrorCode, ProjectId, RICH_DISTRIBUTION_FORMAT, TenantScope,
+    validate_rich_publication_payload,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -198,6 +199,25 @@ pub async fn read_content_distribution_publication(
         .await?;
     bundle.validate_origin()?;
     geo_domain::validate_distribution_request_intent(&request, &bundle.intent, &bundle.variant)?;
+    if request.format == RICH_DISTRIBUTION_FORMAT {
+        validate_rich_publication_payload(&bundle.variant).map_err(|_| {
+            AppError::conflict("requested rich publication differs from frozen variant")
+        })?;
+        if bundle
+            .variant
+            .rich_payload
+            .as_ref()
+            .is_none_or(|payload| payload.document != bundle.revision.document)
+        {
+            return Err(AppError::conflict(
+                "requested rich publication differs from frozen revision",
+            ));
+        }
+    } else if bundle.variant.rich_payload.is_some() {
+        return Err(AppError::conflict(
+            "requested publication format differs from frozen variant",
+        ));
+    }
     // Materialized channel targets use command_id. The intent's historical
     // channel_target_id can be nil for independent request origins.
     match state
@@ -206,7 +226,17 @@ pub async fn read_content_distribution_publication(
         .await
     {
         Ok(target) => {
-            if target.target.target_id != bundle.command.command_id {
+            if target.target.target_id != bundle.command.command_id
+                || !matches!(&target.target.input,
+                    ChannelTargetInput::GeneratedPublish {
+                        publication_intent_id,
+                        payload_hash,
+                        rich_payload,
+                        ..
+                    } if *publication_intent_id == bundle.intent.intent_id
+                        && payload_hash == &bundle.variant.payload_hash
+                        && rich_payload.as_ref() == bundle.variant.rich_payload.as_ref())
+            {
                 return Err(AppError::conflict(
                     "publication channel target differs from command",
                 ));
@@ -214,12 +244,26 @@ pub async fn read_content_distribution_publication(
             view.channel_target_id = Some(target.target.target_id);
             if let Some(attempt) = target.attempts.last() {
                 view.attempt_id = Some(attempt.attempt_id);
-                view.outcome = attempt.outcome.as_ref().map(|outcome| outcome.status);
+                // Legacy title/body-only receipts cannot prove a rich asset.
+                view.outcome = attempt.outcome.as_ref().map(|outcome| {
+                    if request.format == RICH_DISTRIBUTION_FORMAT
+                        && outcome.status == ChannelOutcomeStatus::Verified
+                    {
+                        ChannelOutcomeStatus::Unknown
+                    } else {
+                        outcome.status
+                    }
+                });
                 view.fixture = attempt.outcome.as_ref().map(|outcome| outcome.fixture);
-                view.public_url = attempt
-                    .outcome
-                    .as_ref()
-                    .and_then(|outcome| outcome.public_url.clone());
+                view.public_url = attempt.outcome.as_ref().and_then(|outcome| {
+                    if request.format == RICH_DISTRIBUTION_FORMAT
+                        && outcome.status == ChannelOutcomeStatus::Verified
+                    {
+                        None
+                    } else {
+                        outcome.public_url.clone()
+                    }
+                });
             }
         }
         Err(error) if error.code == ErrorCode::NotFound => {}

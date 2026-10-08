@@ -50,6 +50,8 @@ mod operation;
 mod project;
 mod publication_lookup;
 pub use publication_lookup::*;
+mod publication_send_authorization;
+pub use publication_send_authorization::*;
 mod questions;
 pub use questions::*;
 mod report;

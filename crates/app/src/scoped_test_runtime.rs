@@ -77,7 +77,14 @@ fn guarded_provider<T: Transport + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geo_domain::{AgentRuntime, AppendMessage, CreateConversation, RuntimeCapability};
+    use geo_api::{EventBus, MemoryIdempotencyStore, MemoryOperationStore};
+    use geo_domain::{
+        AgentRuntime, AppendMessage, ContentItemStatus, CreateConversation, DocumentScope,
+        ErrorCode, ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility,
+        KnowledgePurpose, MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
+        MemoryProjectRepository, ProjectCreate, ProjectSettings, ProjectStartCommand,
+        RuntimeCapability, SourceKind, hash_idempotency_key, settings_hash, start_request_hash,
+    };
     use geo_provider::{ProviderError, RequestControl, TransportRequest, TransportResponse};
     use geo_worker::HostOpErrorCode;
     use sha2::{Digest, Sha256};
@@ -100,6 +107,199 @@ mod tests {
                 body: r#"{"id":"test-request","model":"test-model","choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.into(),
             })
         }
+    }
+
+    #[derive(Default)]
+    struct ContentTransport(AtomicUsize);
+
+    #[async_trait]
+    impl Transport for ContentTransport {
+        async fn send(
+            &self,
+            request: TransportRequest,
+            _control: RequestControl,
+        ) -> Result<TransportResponse, ProviderError> {
+            assert_eq!(request.bearer_token(), "fake-test-secret");
+            assert_eq!(request.body["model"], "test-model");
+            let payload = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "user")
+                .and_then(|message| message["content"].as_str())
+                .expect("content generation sends a structured user message");
+            let input: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let quote = input["evidence"][0]["quote"].as_str().unwrap();
+            let citation = input["evidence"][0]["chunk_id"].as_str().unwrap();
+            let content = serde_json::json!({
+                "title": quote,
+                "blocks": [{"kind": "paragraph", "text": quote,
+                    "citation_ids": [citation], "items": []}]
+            })
+            .to_string();
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(TransportResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "id": "content-request",
+                    "model": "test-model",
+                    "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string(),
+            })
+        }
+    }
+
+    async fn prepared_content(
+        state: &AppState,
+        operator_id: geo_domain::OperatorId,
+        tenant_id: geo_domain::TenantId,
+    ) -> (TenantScope, uuid::Uuid, uuid::Uuid) {
+        let base = TenantScope::new(operator_id, tenant_id, None);
+        let projects = state.project_repository();
+        let project = projects
+            .create(
+                &base,
+                ProjectCreate {
+                    slug: None,
+                    display_name: "Scoped content".into(),
+                    settings: ProjectSettings {
+                        brand_name: "Example".into(),
+                        market: "US".into(),
+                        language: "en".into(),
+                        initial_sources: vec![InitialSource {
+                            kind: InitialSourceKind::Text,
+                            value: "Approved public description".into(),
+                            visibility: InitialSourceVisibility::Public,
+                            version_ref: None,
+                            content_hash: None,
+                        }],
+                        document_scope: DocumentScope {
+                            content_types: vec!["faq".into()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let scope = TenantScope::new(operator_id, tenant_id, Some(project.id));
+        let frozen = project.settings.clone().validate_start().unwrap();
+        let frozen_hash = settings_hash(&frozen).unwrap();
+        let started = projects
+            .start(
+                &base,
+                project.id,
+                ProjectStartCommand {
+                    expected_revision: project.revision,
+                    idempotency_key_hash: hash_idempotency_key(&uuid::Uuid::new_v4().to_string()),
+                    request_hash: start_request_hash(project.id, project.revision, &frozen_hash),
+                    settings_hash: frozen_hash,
+                    operation_id: uuid::Uuid::new_v4(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .knowledge_repository()
+            .import_batch(
+                &scope,
+                vec![ImportItem {
+                    client_item_id: "public-source".into(),
+                    kind: SourceKind::Text,
+                    name: "Approved public source".into(),
+                    purpose: KnowledgePurpose::Public,
+                    text: Some("Approved public description".into()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let service = state.content_service();
+        let execution = service.start(&scope, started.cycle_id).await.unwrap();
+        let item = service
+            .repository()
+            .list_items(&scope, execution.execution_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("one frozen content branch");
+        assert_eq!(
+            service
+                .prepare(&scope, execution.execution_id, item.item_id)
+                .await
+                .unwrap()
+                .status,
+            ContentItemStatus::Prepared
+        );
+        (scope, execution.execution_id, item.item_id)
+    }
+
+    #[tokio::test]
+    async fn assembled_content_generation_obeys_exact_project_scope() {
+        let state = AppState::with_stores_and_auth_and_projects_and_knowledge(
+            Arc::new(MemoryOperationStore::default()),
+            Arc::new(MemoryIdempotencyStore::default()),
+            Arc::new(MemoryAuthRepository::development_with_password(
+                "test-password",
+            )),
+            Arc::new(MemoryProjectRepository::default()),
+            Arc::new(MemoryKnowledgeRepository::default()),
+            EventBus::default(),
+            false,
+        )
+        .with_content_repository(Arc::new(MemoryContentRepository::default()));
+        let mut ai = config();
+        let allowed = prepared_content(&state, ai.scope.operator_id, ai.scope.tenant_id).await;
+        ai.scope = allowed.0.clone();
+        let other_operator =
+            prepared_content(&state, uuid::Uuid::new_v4().into(), ai.scope.tenant_id).await;
+        let other_tenant =
+            prepared_content(&state, ai.scope.operator_id, uuid::Uuid::new_v4().into()).await;
+        let other_project =
+            prepared_content(&state, ai.scope.operator_id, ai.scope.tenant_id).await;
+        // Assembly verifies the approved bundle before publishing this exact
+        // provider into AppState's content service.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("scoped-content-{}.mjs", uuid::Uuid::new_v4()));
+        let source = b"export async function main() {}";
+        std::fs::write(&path, source).unwrap();
+        ai.bundle_path = path.to_string_lossy().into_owned();
+        ai.bundle_sha256 = hex::encode(Sha256::digest(source));
+        let transport = Arc::new(ContentTransport::default());
+        let runtime = assemble_with_transport(&state, &ai, Arc::clone(&transport)).unwrap();
+        assert!(runtime.is_configured());
+        assert!(state.content_model_available());
+        std::fs::remove_file(path).unwrap();
+
+        let service = state.content_service();
+        let revision = service
+            .generate(&allowed.0, allowed.1, allowed.2)
+            .await
+            .expect("the configured project generates through the assembled content provider");
+        assert_eq!(revision.document.title, "Approved public description");
+        assert_eq!(transport.0.load(Ordering::SeqCst), 1);
+        for (scope, execution_id, item_id) in [other_operator, other_tenant, other_project] {
+            let error = service
+                .generate(&scope, execution_id, item_id)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::DependencyUnavailable);
+            assert_eq!(error.message, "content model failed: Denied");
+            assert_eq!(transport.0.load(Ordering::SeqCst), 1);
+        }
+        let no_project = TenantScope::new(ai.scope.operator_id, ai.scope.tenant_id, None);
+        let error = service
+            .generate(&no_project, allowed.1, allowed.2)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(transport.0.load(Ordering::SeqCst), 1);
     }
 
     fn config() -> ScopedTestAiConfig {

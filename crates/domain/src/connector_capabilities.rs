@@ -1,7 +1,7 @@
 //! Operator-wide connector availability. Account login is not publication proof.
 use crate::{
     AppError, ChannelAttempt, ChannelOutcome, ChannelOutcomeStatus, ChannelTarget,
-    ChannelTargetInput, OperatorId,
+    ChannelTargetInput, OperatorId, RICH_MARKDOWN_FORMAT,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -75,6 +75,17 @@ pub fn saved_publication_verification(
     target: &ChannelTarget,
     attempt: &ChannelAttempt,
 ) -> Result<Option<ConnectorVerification>, AppError> {
+    // A plain title/body readback does not prove the structure or images of a
+    // rich publication. A separate versioned rich readback proof is required.
+    if matches!(
+        &target.input,
+        ChannelTargetInput::GeneratedPublish {
+            rich_payload: Some(_),
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
     let (platform, title, body, frozen_hash) = match &target.input {
         ChannelTargetInput::Publish {
             platform,
@@ -263,6 +274,14 @@ impl ConnectorVerification {
 
     fn validate_inner(&self, legacy_version_policy: bool) -> Result<(), AppError> {
         self.key.validate()?;
+        // Current proofs attest to title/body only. Until a typed anonymous
+        // structure+image readback contract exists, even a trusted caller
+        // cannot turn that text-only marker into a rich-format capability.
+        if self.content_type == RICH_MARKDOWN_FORMAT {
+            return Err(AppError::invalid_request(
+                "rich publication requires structured and media readback proof",
+            ));
+        }
         if self.verification_id.is_nil()
             || (legacy_version_policy && !trusted_version(&self.connector_version))
             || (!legacy_version_policy
@@ -340,6 +359,10 @@ pub fn resolve_connector(
     let Some(ref current) = result.settings else {
         return result;
     };
+    if content_type == RICH_MARKDOWN_FORMAT {
+        result.availability = ConnectorAvailability::UnsupportedContentType;
+        return result;
+    }
     if !current.enabled {
         result.availability = ConnectorAvailability::Disabled;
     } else if !valid_label(deployed_version)
@@ -379,13 +402,18 @@ pub fn validate_connector_settings(
         return Err(AppError::invalid_request("invalid connector content types"));
     }
     if enabled
-        && (content_types.is_empty()
+        && (content_types
+            .iter()
+            .any(|kind| kind == RICH_MARKDOWN_FORMAT)
+            || content_types.is_empty()
             || !valid_label(deployed_version)
             || deployed_version.to_ascii_lowercase().contains("fixture")
             || content_types.iter().any(|kind| {
-                !verifications
-                    .iter()
-                    .any(|v| v.connector_version == deployed_version && &v.content_type == kind)
+                !verifications.iter().any(|v| {
+                    v.connector_version == deployed_version
+                        && &v.content_type == kind
+                        && v.validate().is_ok()
+                })
             }))
     {
         return Err(AppError::invalid_request(
@@ -643,6 +671,25 @@ mod tests {
         record.public_readback.occurred_at =
             record.publication_receipt.occurred_at - chrono::Duration::seconds(1);
         assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn title_body_only_readback_cannot_create_rich_publication_capability() {
+        let mut record = evidence();
+        record.content_type = RICH_MARKDOWN_FORMAT.into();
+        assert!(record.validate().is_err());
+        assert!(record.validate_saved().is_err());
+        let configured = ConnectorSettings {
+            key: record.key.clone(),
+            revision: 1,
+            enabled: true,
+            content_types: vec![RICH_MARKDOWN_FORMAT.into()],
+        };
+        assert_eq!(
+            resolve_connector(Some(configured), &[record], "live.v1", RICH_MARKDOWN_FORMAT)
+                .availability,
+            ConnectorAvailability::UnsupportedContentType
+        );
     }
 
     #[tokio::test]
