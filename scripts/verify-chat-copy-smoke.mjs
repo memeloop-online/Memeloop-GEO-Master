@@ -243,12 +243,42 @@ async function main() {
   const conversation = await createdResponse.json();
   await page.waitForURL(/\/chat\/[0-9a-f-]+$/);
   const runtimeNotice = page.locator(".agent-runtime-notice");
-  await runtimeNotice.waitFor();
-  assert(
-    (await runtimeNotice.innerText()) ===
-      "AI 服务未启用，请联系管理员完成配置。",
-    "No-model attachment send did not present its actual AI limitation",
+  // The persisted notice includes a reload action, not just the limitation copy.
+  const chineseLimitation = runtimeNotice.getByText(
+    /^AI 服务未启用，请联系管理员完成配置。\s*重新加载对话$/,
   );
+  await chineseLimitation.waitFor({ state: "visible" });
+  await runtimeNotice
+    .getByRole("button", { name: "重新加载对话", exact: true })
+    .waitFor({ state: "visible" });
+  const restored = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname.endsWith(
+        `/agent/conversations/${conversation.id}`,
+      ) && response.request().method() === "GET",
+  );
+  await page.reload();
+  const restoredResponse = await restored;
+  assert(restoredResponse.ok(), "Could not restore the no-model conversation");
+  const restoredConversation = await restoredResponse.json();
+  assert(
+    restoredConversation.runs.length === 1 &&
+      restoredConversation.runs[0].status === "failed" &&
+      restoredConversation.runs[0].capability.status === "missing" &&
+      restoredConversation.turns.length === 1 &&
+      restoredConversation.turns[0].status === "failed",
+    "No-model attachment send did not persist its actual AI limitation",
+  );
+  assert(
+    restoredConversation.messages.length === 1 &&
+      restoredConversation.messages[0].role === "user" &&
+      restoredConversation.messages[0].attachments.length === 1,
+    "No-model conversation lost its attachment or fabricated an assistant reply",
+  );
+  await chineseLimitation.waitFor({ state: "visible" });
+  await runtimeNotice
+    .getByRole("button", { name: "重新加载对话", exact: true })
+    .waitFor({ state: "visible" });
   assert(
     freshUrl !== page.url() &&
       (await page.getByRole("heading", { name: "AI 工作台" }).count()) >= 1,
@@ -273,11 +303,14 @@ async function main() {
   const englishList = page.getByRole("complementary", {
     name: "AI conversations",
   });
-  assert(
-    (await runtimeNotice.innerText()) ===
-      "AI service is not enabled. Contact your administrator to set it up.",
-    "English no-model limitation did not switch language",
-  );
+  await runtimeNotice
+    .getByText(
+      /^AI service is not enabled\. Contact your administrator to set it up\.\s*Reload conversations$/,
+    )
+    .waitFor({ state: "visible" });
+  await runtimeNotice
+    .getByRole("button", { name: "Reload conversations", exact: true })
+    .waitFor({ state: "visible" });
   const englishDate = new Intl.DateTimeFormat("en", {
     dateStyle: "medium",
   }).format(new Date(conversation.created_at));

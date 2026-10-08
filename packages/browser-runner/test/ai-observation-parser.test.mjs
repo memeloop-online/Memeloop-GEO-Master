@@ -91,7 +91,7 @@ test("failed extraction emits only allowlisted route diagnostics and preserves n
       kind: "observation_diagnostic",
       schema_version: "geo.observation.diagnostic.v1",
       stage: "extraction",
-      code: "grounding_rejected",
+      code: "model_unverified",
       route: "configured_model_api",
     },
   ]);
@@ -445,6 +445,75 @@ test("browser extraction succeeds first without API and records a document-bound
   assert.deepEqual(exchange, before);
   assert.equal(Object.hasOwn(result, "model"), false);
   assert.equal(Object.hasOwn(result, "surface"), false);
+});
+
+test("source is delivered before either extractor and rejected candidates remain bounded evidence", async () => {
+  const records = [];
+  const diagnostics = [];
+  const invalid = {
+    ...extracted,
+    answer_segments: [{ path: "/messages/99/missing" }],
+    api_key: "synthetic-secret",
+  };
+  const source = structuredClone(exchange);
+  source.messages[0].authorization = "synthetic-secret";
+  const result = await interpretObservation(source, {
+    onEvidence: async (record) => {
+      records.push(record);
+    },
+    onDiagnostic: (entry) => diagnostics.push(entry),
+    browserExtract: async () => {
+      assert.equal(records.length, 1, "source precedes any extraction request");
+      return extraction({ extracted: invalid, key: "synthetic-secret" });
+    },
+    apiExtract: async () =>
+      extraction({ extracted: { decision: "unverified" } }),
+  });
+  assert.equal(result, null);
+  assert.deepEqual(
+    records.map((record) => record.phase),
+    ["source", "candidate", "candidate"],
+  );
+  assert.equal(records[1].grounding_reason, "path_rejected");
+  assert.equal(records[2].grounding_reason, "model_unverified");
+  assert.equal(
+    records[0].source_sha256,
+    createHash("sha256").update(records[0].source_json).digest("hex"),
+  );
+  assert.doesNotMatch(JSON.stringify(records), /synthetic-secret/u);
+  assert.deepEqual(
+    diagnostics.map((item) => item.code),
+    ["path_rejected", "model_unverified"],
+  );
+  assert.doesNotMatch(
+    JSON.stringify(diagnostics),
+    /synthetic-secret|source-backed/u,
+  );
+});
+
+test("a rejected evidence write stops extraction without another provider request", async () => {
+  let calls = 0;
+  const diagnostics = [];
+  const result = await interpretObservation(exchange, {
+    onEvidence: async () => {
+      throw new Error("synthetic-secret");
+    },
+    browserExtract: async () => {
+      calls++;
+      return extraction();
+    },
+    apiExtract: async () => {
+      calls++;
+      return extraction();
+    },
+    onDiagnostic: (entry) => diagnostics.push(entry),
+  });
+  assert.equal(result, null);
+  assert.equal(calls, 0);
+  assert.deepEqual(
+    diagnostics.map((entry) => entry.code),
+    ["evidence_persist_failed"],
+  );
 });
 
 test("browser failure or ungrounded output falls back to API on the same source", async () => {

@@ -6,6 +6,7 @@ import {
   reportObservationDiagnostic,
 } from "./ai-observation-parser.mjs";
 import { extractWithSignedInBrowser } from "./browser-ai-extraction.mjs";
+import { reportCapturedConversation } from "./provider-conversation-ownership.mjs";
 
 const ORIGIN = "https://www.kimi.com";
 const CHAT_PATH = "/apiv2/kimi.gateway.chat.v1.ChatService/Chat";
@@ -412,6 +413,8 @@ export async function observeKimiConnectSearch(
     signal,
     interpret = interpretObservation,
     onDiagnostic,
+    onConversationCaptured,
+    onEvidence,
   } = {},
 ) {
   let stage = "input_validation";
@@ -503,25 +506,42 @@ export async function observeKimiConnectSearch(
     });
     if (!captured || !request || signal?.aborted)
       return unverified("capture_unverified");
+    const ownershipReceiptStatus = await reportCapturedConversation(
+      captured,
+      "measurement",
+      onConversationCaptured,
+    );
+    if (onConversationCaptured && ownershipReceiptStatus === "unpersisted")
+      reportObservationDiagnostic(
+        onDiagnostic,
+        "capture",
+        "ownership_receipt_unpersisted",
+      );
     stage = "rendered_answer";
     const renderedAnswer = page.locator(
       ".chat-content-item-assistant .markdown-container:not(.toolcall-content-text) > .markdown",
     );
-    const renderedText =
-      (await renderedAnswer.count()) > 0
-        ? await renderedAnswer.last().innerText()
-        : undefined;
+    let renderedText;
+    try {
+      if ((await renderedAnswer.count()) > 0)
+        renderedText = await renderedAnswer.last().innerText();
+    } catch {
+      // The completed transport remains source evidence when the optional
+      // rendered view trails or fails. Grounding never treats missing DOM text
+      // as an invented answer.
+    }
     stage = "interpretation";
     const observation = await interpret(captured, {
       renderedText,
       signal,
       onDiagnostic,
+      onEvidence,
       // Test fixtures may inject an interpreter; live execution always uses
       // grounded AI extraction, never the historical schema-specific reducer.
       question: payload.question,
       model: payload.model,
       request,
-      browserExtract: (prompt) =>
+      browserExtract: (prompt, hooks = {}) =>
         extractWithSignedInBrowser(page, prompt, {
           model: payload.model,
           trustedOrigin,
@@ -538,6 +558,8 @@ export async function observeKimiConnectSearch(
               ),
           ),
           signal,
+          onConversationCaptured,
+          onEvidence: hooks.onEvidence ?? onEvidence,
           configureModel: (parserPage, model) =>
             configureKimiSearch(parserPage, model, false, (entry) =>
               reportObservationDiagnostic(
@@ -570,6 +592,9 @@ export async function observeKimiConnectSearch(
           .update(payload.question, "utf8")
           .digest("hex"),
       },
+      ...(onConversationCaptured
+        ? { ownership_receipt_status: ownershipReceiptStatus }
+        : {}),
     };
   } catch {
     return unverified("unexpected_exception");

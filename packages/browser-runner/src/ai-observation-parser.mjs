@@ -1,12 +1,16 @@
 import { createHash } from "node:crypto";
-import { validateAiObservation } from "./ai-observation-grounding.mjs";
+import {
+  observationRejectionReason,
+  validateAiObservation,
+} from "./ai-observation-grounding.mjs";
 
 const PROMPT_VERSION = "geo.observation.extract.v1";
 const MAX_INPUT_BYTES = 750_000;
 const MAX_OUTPUT_BYTES = 150_000;
+const MAX_CANDIDATE_BYTES = 150_000;
 const privateField =
-  /^(?:authorization|cookies?|password|access_?token|refresh_?token|session_?(?:token|key)|api_?key|email|phone|user_?id|account_?id)$/iu;
-const reasoningField = /^(?:think|thinking|reasoning|reasoning_content)$/iu;
+  /^(?:authorization|cookies?|password|access[-_]?token|refresh[-_]?token|session[-_]?(?:token|key)|api[-_]?key|credentials?|proxy|encrypted[-_]?(?:proxy|session)|email|phone|user[-_]?id|account[-_]?id)$/iu;
+const reasoningField = /^(?:think|thinking|reasoning|reasoning[-_]?content)$/iu;
 
 const diagnosticStages = new Set([
   "input_validation",
@@ -29,6 +33,13 @@ const diagnosticCodes = new Set([
   "capture_unverified",
   "returned_none",
   "grounding_rejected",
+  "model_unverified",
+  "shape_rejected",
+  "path_rejected",
+  "owner_rejected",
+  "quote_rejected",
+  "citation_rejected",
+  "evidence_persist_failed",
   "grounded",
   "cancelled",
   "budget_exhausted",
@@ -80,6 +91,63 @@ export function observationDocument(exchange, renderedText) {
     ...(typeof renderedText === "string"
       ? { rendered_text: renderedText }
       : {}),
+  };
+}
+
+function captureRecord(document, receivedAt) {
+  const source_json = JSON.stringify(document);
+  if (Buffer.byteLength(source_json, "utf8") > MAX_INPUT_BYTES)
+    throw new Error("observation_input_too_large");
+  return {
+    kind: "observation_capture",
+    schema_version: "geo.observation.capture.v1",
+    phase: "source",
+    ...(typeof receivedAt === "string" &&
+    Number.isFinite(Date.parse(receivedAt))
+      ? { observed_at: receivedAt }
+      : {}),
+    source_json,
+    source_sha256: createHash("sha256").update(source_json).digest("hex"),
+  };
+}
+
+export class ObservationPersistenceError extends Error {
+  constructor() {
+    super("evidence_persist_failed");
+    this.name = "ObservationPersistenceError";
+  }
+}
+
+/** Raw extraction transport is evidence even when no JSON candidate exists. */
+export function extractionCaptureRecord(exchange) {
+  return {
+    ...captureRecord(observationDocument(exchange), exchange?.received_at),
+    phase: "extraction",
+    route: "signed_in_browser",
+  };
+}
+
+function candidateRecord(result, route, groundingReason) {
+  // Never copy extractor configuration, usage, provider headers or arbitrary
+  // result metadata into a public runner response.
+  const candidate = observationDocument({ messages: [result.extracted] })
+    .messages[0];
+  const candidate_json = JSON.stringify(candidate);
+  if (typeof candidate_json !== "string") return null;
+  const candidateBytes = Buffer.byteLength(candidate_json, "utf8");
+  return {
+    kind: "observation_capture",
+    schema_version: "geo.observation.capture.v1",
+    phase: "candidate",
+    route,
+    ...(candidateBytes <= MAX_CANDIDATE_BYTES
+      ? { candidate_json }
+      : {
+          candidate_omitted: "size_limit",
+          candidate_byte_length: candidateBytes,
+        }),
+    candidate_sha256: createHash("sha256").update(candidate_json).digest("hex"),
+    grounding_reason: groundingReason,
   };
 }
 
@@ -213,6 +281,7 @@ export async function interpretObservation(
     apiExtract = invokeExtractionApi,
     signal,
     onDiagnostic,
+    onEvidence,
   } = {},
 ) {
   if (signal?.aborted) {
@@ -225,14 +294,30 @@ export async function interpretObservation(
   }
   let document;
   let prompt;
+  let sourceEvidence;
   try {
     document = observationDocument(exchange, renderedText);
+    sourceEvidence = captureRecord(document, exchange?.received_at);
     prompt = extractionPrompt(document);
   } catch {
     reportObservationDiagnostic(
       onDiagnostic,
       "extraction_prompt",
       "unexpected_exception",
+    );
+    return null;
+  }
+  // A caller that supplies this async hook must commit before it resolves.
+  // The in-memory/final-response collector is not a durable receipt and does
+  // not authorize remote cleanup. A rejected hook fails closed, without a
+  // second provider submission.
+  try {
+    await onEvidence?.(sourceEvidence);
+  } catch {
+    reportObservationDiagnostic(
+      onDiagnostic,
+      "capture",
+      "evidence_persist_failed",
     );
     return null;
   }
@@ -244,8 +329,17 @@ export async function interpretObservation(
     if (!invoke || signal?.aborted) continue;
     let result;
     try {
-      result = await invoke(prompt, { signal });
-    } catch {
+      result = await invoke(prompt, { signal, onEvidence });
+    } catch (error) {
+      if (error instanceof ObservationPersistenceError) {
+        reportObservationDiagnostic(
+          onDiagnostic,
+          "extraction",
+          "evidence_persist_failed",
+          route,
+        );
+        return null;
+      }
       reportObservationDiagnostic(
         onDiagnostic,
         "extraction",
@@ -264,6 +358,7 @@ export async function interpretObservation(
       return null;
     }
     let grounded;
+    let groundingReason = result ? "grounding_rejected" : "returned_none";
     try {
       grounded = result
         ? validateAiObservation(document, result.extracted)
@@ -277,10 +372,29 @@ export async function interpretObservation(
       );
       grounded = null;
     }
+    if (grounded) groundingReason = "grounded";
+    else if (result)
+      groundingReason = observationRejectionReason(document, result.extracted);
+    if (result) {
+      const candidateEvidence = candidateRecord(result, route, groundingReason);
+      if (candidateEvidence) {
+        try {
+          await onEvidence?.(candidateEvidence);
+        } catch {
+          reportObservationDiagnostic(
+            onDiagnostic,
+            "extraction",
+            "evidence_persist_failed",
+            route,
+          );
+          return null;
+        }
+      }
+    }
     reportObservationDiagnostic(
       onDiagnostic,
       "extraction",
-      grounded ? "grounded" : result ? "grounding_rejected" : "returned_none",
+      groundingReason,
       route,
     );
     attempts.push({ route, status: grounded ? "grounded" : "unverified" });
@@ -295,10 +409,13 @@ export async function interpretObservation(
         model: result.model,
         surface: result.surface,
         attempts,
-        source_json: JSON.stringify(document),
-        source_sha256: createHash("sha256")
-          .update(JSON.stringify(document))
-          .digest("hex"),
+        source_json: sourceEvidence.source_json,
+        source_sha256: sourceEvidence.source_sha256,
+        ...(["persisted", "unpersisted"].includes(
+          result.ownership_receipt_status,
+        )
+          ? { ownership_receipt_status: result.ownership_receipt_status }
+          : {}),
       },
     };
   }

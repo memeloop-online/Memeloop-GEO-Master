@@ -337,8 +337,11 @@ fn map_provider_error(error: ProviderError, timeout: Duration) -> HostOpError {
             HostOp::ModelComplete,
             timeout.as_millis().min(u64::MAX as u128) as u64,
         ),
+        ProviderError::Http { status, .. } => HostOpError::failed(
+            HostOp::ModelComplete,
+            format!("model provider returned HTTP status {status}"),
+        ),
         ProviderError::TokenUnavailable(message)
-        | ProviderError::Http { message, .. }
         | ProviderError::InvalidResponse(message)
         | ProviderError::Transport(message) => HostOpError::failed(HostOp::ModelComplete, message),
     }
@@ -349,6 +352,25 @@ pub type SharedModelProvider = Arc<dyn ModelProviderBridge>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_http_failure_keeps_status_without_response_details() {
+        for status in [401, 429, 503] {
+            let error = map_provider_error(
+                ProviderError::Http {
+                    status,
+                    message: "synthetic confidential response body".into(),
+                },
+                Duration::from_secs(30),
+            );
+            assert_eq!(
+                error.message,
+                format!("model provider returned HTTP status {status}")
+            );
+            assert!(!error.message.contains("confidential"));
+        }
+    }
+
     use async_trait::async_trait;
     use geo_domain::TenantScope;
     use geo_provider::{ResolvedToken, SecretRef, TransportRequest, TransportResponse};

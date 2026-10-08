@@ -3,6 +3,64 @@ import { timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 import { createRunner, RunnerError } from "./runner.mjs";
+import { readRichMultipart } from "./rich-transport.mjs";
+
+const CALLBACK_PATH = "/internal/v1/publication-send/authorize";
+const CAPTURE_PATH = "/internal/v1/observation-captures";
+
+function serviceCallback(origin, token, path, maxResponseBytes) {
+  // Deployment configuration only, never a model/request-selected URL.
+  // Private cluster service traffic may use HTTP; external deployments use TLS.
+  if (!origin && !token) return null;
+  if (typeof origin !== "string" || typeof token !== "string")
+    throw new Error("rich_callback_config_incomplete");
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    throw new Error("invalid_rich_callback_origin");
+  }
+  if (
+    origin !== url.origin ||
+    !["https:", "http:"].includes(url.protocol) ||
+    token.length < 32 ||
+    token.length > 512 ||
+    !/^[\x21-\x7e]+$/.test(token)
+  )
+    throw new Error("invalid_rich_callback_config");
+  return async (body) => {
+    const response = await fetch(`${origin}${path}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (response.status !== 200)
+      throw new Error("service_callback_unavailable");
+    const length = Number(response.headers.get("content-length") ?? 0);
+    if (length > maxResponseBytes)
+      throw new Error("service_response_oversized");
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("send_authorization_missing");
+    const chunks = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxResponseBytes) {
+        await reader.cancel();
+        throw new Error("service_response_oversized");
+      }
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
+  };
+}
 
 function authorized(header, token) {
   if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
@@ -40,9 +98,26 @@ function send(response, status, value) {
 export function createRunnerServer({
   token = process.env.GEO_BROWSER_RUNNER_TOKEN,
   runner = createRunner(),
+  callbackOrigin = process.env.GEO_BROWSER_RUNNER_CALLBACK_ORIGIN,
+  callbackToken = process.env.GEO_BROWSER_RUNNER_CALLBACK_TOKEN,
+  captureOrigin = process.env.GEO_BROWSER_RUNNER_CAPTURE_ORIGIN ??
+    callbackOrigin,
+  captureToken = process.env.GEO_BROWSER_RUNNER_CAPTURE_TOKEN ?? callbackToken,
 } = {}) {
   if (!token || typeof token !== "string")
     throw new Error("GEO_BROWSER_RUNNER_TOKEN_required");
+  const authorizeRich = serviceCallback(
+    callbackOrigin,
+    callbackToken,
+    CALLBACK_PATH,
+    8192,
+  );
+  const persistCapture = serviceCallback(
+    captureOrigin,
+    captureToken,
+    CAPTURE_PATH,
+    8192,
+  );
   const server = createServer(async (request, response) => {
     try {
       if (!authorized(request.headers.authorization, token)) {
@@ -56,7 +131,37 @@ export function createRunnerServer({
       } else if (request.method === "POST" && path === "/v1/sessions") {
         send(response, 201, await runner.create(await readJson(request)));
       } else if (request.method === "POST" && path === "/v1/executions") {
-        send(response, 200, await runner.execute(await readJson(request)));
+        send(
+          response,
+          200,
+          await runner.execute(await readJson(request), persistCapture),
+        );
+      } else if (
+        parts.length === 4 &&
+        parts[0] === "v1" &&
+        parts[1] === "sessions" &&
+        parts[3] === "execute-rich" &&
+        request.method === "POST"
+      ) {
+        if (!authorizeRich) {
+          send(response, 503, { error: "rich_callback_unavailable" });
+          return;
+        }
+        const input = await readRichMultipart(request);
+        try {
+          send(
+            response,
+            200,
+            await runner.executeRich(
+              parts[2],
+              input.metadata,
+              input.media,
+              authorizeRich,
+            ),
+          );
+        } finally {
+          input.dispose();
+        }
       } else if (
         parts.length === 4 &&
         parts[0] === "v1" &&

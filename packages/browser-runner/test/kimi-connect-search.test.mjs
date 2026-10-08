@@ -623,6 +623,7 @@ test("browser UI submits exactly once and its captured framed request creates v2
     const page = await browser.newPage();
     const origin = `http://127.0.0.1:${server.address().port}`;
     let requestMatches = false;
+    const ownershipReceipts = [];
     page.on("request", (item) => {
       if (item.url().endsWith("/Chat"))
         requestMatches = matchesKimiChatRequest(item, QUESTION, MODEL);
@@ -630,11 +631,23 @@ test("browser UI submits exactly once and its captured framed request creates v2
     const observed = await observeKimiConnectSearch(page, frozen, {
       trustedOrigin: origin,
       timeoutMs: 5_000,
+      onConversationCaptured: async (receipt) => {
+        ownershipReceipts.push(receipt);
+        return { durable: true };
+      },
     });
     assert.equal(sends, 1);
     assert.equal(requestMatches, true);
     assert.equal(observed?.raw_answer, "An answer.");
     assert.equal(cookieSeen, true);
+    assert.equal(observed?.ownership_receipt_status, "persisted");
+    assert.deepEqual(ownershipReceipts, [
+      {
+        provider: "kimi",
+        purpose: "measurement",
+        external_conversation_id: "chat-1",
+      },
+    ]);
     assert.equal(JSON.stringify(observed).includes("fixture-only"), false);
     alreadyEnabled = true;
     const alreadyOn = await observeKimiConnectSearch(page, frozen, {
@@ -746,6 +759,25 @@ test("browser UI submits exactly once and its captured framed request creates v2
     assert.equal(aiObserved.search_event.source_sha256, "b".repeat(64));
     assert.equal("event_offset" in aiObserved.search_event, false);
     assert.equal(sends, 6);
+    const originalLocator = page.locator.bind(page);
+    page.locator = (selector, ...args) =>
+      selector.startsWith(".chat-content-item-assistant .markdown-container")
+        ? {
+            count: async () => {
+              throw new Error("private rendered page failure");
+            },
+          }
+        : originalLocator(selector, ...args);
+    const withoutRenderedText = await observeKimiConnectSearch(page, frozen, {
+      trustedOrigin: origin,
+      timeoutMs: 5_000,
+      interpret: (captured, context) => {
+        assert.equal(context.renderedText, undefined);
+        return reduceKimiConnectExchange(captured, context);
+      },
+    });
+    assert.equal(withoutRenderedText?.raw_answer, "An answer.");
+    assert.equal(sends, 7);
     // Runner stays fixture-stamped; a synthetic trace cannot verify a real account.
     assert.equal(
       (await measureKimi(null, frozen, { expectedAccountId: "fixture" }))

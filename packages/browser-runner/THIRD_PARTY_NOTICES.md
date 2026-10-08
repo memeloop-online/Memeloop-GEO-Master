@@ -22,6 +22,11 @@ The private WebSocket relay uses `ws` 8.21.3, MIT licensed, from
 in `node_modules/ws/LICENSE` in the distributed image. The runner's standalone
 npm lock and workspace pnpm lock both pin this dependency.
 
+The bounded rich-publication multipart parser uses `@fastify/busboy` 3.2.2,
+MIT licensed, from <https://github.com/fastify/busboy>. Its copyright and
+complete license remain in `node_modules/@fastify/busboy/LICENSE` in the
+distributed image.
+
 The isolated desktop smoke loads unmodified `@novnc/novnc` 1.7.0,
 MPL-2.0 licensed, from <https://github.com/novnc/noVNC>. Its ES-module source,
 `LICENSE.txt`, and `AUTHORS` remain in `node_modules/@novnc/novnc` in the

@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { extractWithSignedInBrowser } from "../src/browser-ai-extraction.mjs";
+import {
+  interpretObservation,
+  ObservationPersistenceError,
+} from "../src/ai-observation-parser.mjs";
 
 const origin = "https://example.invalid";
 const prompt =
@@ -21,6 +25,11 @@ function fixture({
   oldAnswer = false,
   markdown = false,
   codeBlock = false,
+  requestChatId = "",
+  responseChatId,
+  requestModel = "fixture-model",
+  responseMessages = [],
+  onRead = () => {},
 } = {}) {
   const child = new EventEmitter();
   let sent = 0;
@@ -41,15 +50,20 @@ function fixture({
           assert.equal(selector, "pre code");
           return {
             count: async () => Number(codeBlock),
-            innerText: async () => output,
+            innerText: async () => {
+              onRead();
+              return output;
+            },
           };
         },
         last: () => content,
       };
       const answer = {
         count: async () => Number(oldAnswer || (sent > 0 && output !== null)),
-        innerText: async () =>
-          markdown ? "reasoning and action labels" : output,
+        innerText: async () => {
+          onRead();
+          return markdown ? "reasoning and action labels" : output;
+        },
         locator: (selector) =>
           selector === "pre code" ? content.locator(selector) : content,
       };
@@ -73,13 +87,26 @@ function fixture({
             method: () => "POST",
             headers: () => ({ "content-type": "application/connect+json" }),
             postDataBuffer: () =>
-              frame(0, { arbitrary: { scalar: requestPrompt } }),
+              frame(0, {
+                chat_id: requestChatId,
+                options: { model: requestModel },
+                message: {
+                  role: "user",
+                  blocks: [{ text: { content: requestPrompt } }],
+                },
+              }),
           }),
           status: () => 200,
           headers: () => ({ "content-type": "application/connect+json" }),
           body: async () =>
             Buffer.concat([
-              frame(0, { opaque: "not interpreted by the adapter" }),
+              frame(
+                0,
+                responseChatId
+                  ? { chat: { id: responseChatId } }
+                  : { opaque: "not interpreted by the adapter" },
+              ),
+              ...responseMessages.map((message) => frame(0, message)),
               ...(complete ? [frame(2, {})] : []),
             ]),
         });
@@ -138,6 +165,8 @@ test("official final markdown excludes reasoning, action labels and code control
 test("requires matching prompt and complete stream before reading any JSON", async () => {
   for (const change of [
     { requestPrompt: "unrelated request" },
+    { requestChatId: "old-chat" },
+    { requestModel: "other-model" },
     { complete: false },
     { output: null },
     { oldAnswer: true },
@@ -154,6 +183,175 @@ test("requires matching prompt and complete stream before reading any JSON", asy
     assert.equal(f.stats().sent, change.oldAnswer ? 0 : 1);
     assert.equal(f.stats().closed, 1);
   }
+});
+
+test("extraction reports only transport-owned new conversation, even when JSON is not grounded", async () => {
+  const receipts = [];
+  const f = fixture({ responseChatId: "new-extraction-chat", output: null });
+  assert.equal(
+    await extractWithSignedInBrowser(
+      f.page,
+      prompt,
+      options({
+        deadlineAt: performance.now() + 25,
+        onConversationCaptured: async (receipt) => {
+          receipts.push(receipt);
+          return { durable: true };
+        },
+      }),
+    ),
+    null,
+  );
+  assert.deepEqual(receipts, [
+    {
+      provider: "kimi",
+      purpose: "extraction",
+      external_conversation_id: "new-extraction-chat",
+    },
+  ]);
+  const old = fixture({
+    requestChatId: "old-chat",
+    responseChatId: "old-chat",
+  });
+  await extractWithSignedInBrowser(
+    old.page,
+    prompt,
+    options({ onConversationCaptured: (receipt) => receipts.push(receipt) }),
+  );
+  assert.equal(old.stats().sent, 1);
+  assert.equal(receipts.length, 1);
+});
+
+test("ownership hook failure does not retry a completed extraction", async () => {
+  const f = fixture({ responseChatId: "new-extraction-chat" });
+  const result = await extractWithSignedInBrowser(
+    f.page,
+    prompt,
+    options({
+      onConversationCaptured: () => {
+        throw new Error("private ledger error");
+      },
+    }),
+  );
+  assert.deepEqual(result?.extracted, { decision: "unverified" });
+  assert.equal(result?.ownership_receipt_status, "unpersisted");
+  assert.equal(f.stats().sent, 1);
+});
+
+test("raw extraction is committed before DOM parsing even when JSON is malformed or absent", async () => {
+  for (const output of ["not JSON", null]) {
+    const records = [];
+    let committed = false;
+    let owned;
+    const f = fixture({
+      responseChatId: "synthetic-extraction",
+      output,
+      responseMessages: [
+        { text: "not JSON", cookie: "private", reasoning: "private" },
+      ],
+      onRead: () => assert.equal(committed, true),
+    });
+    assert.equal(
+      await extractWithSignedInBrowser(
+        f.page,
+        prompt,
+        options({
+          deadlineAt: performance.now() + 35,
+          onConversationCaptured: (receipt) => {
+            owned = receipt;
+          },
+          onEvidence: async (record) => {
+            assert.equal(
+              owned.external_conversation_id,
+              "synthetic-extraction",
+            );
+            assert.equal(record.phase, "extraction");
+            assert.equal(record.candidate_json, undefined);
+            records.push(record);
+            await new Promise((resolve) => setImmediate(resolve));
+            committed = true;
+          },
+        }),
+      ),
+      null,
+    );
+    assert.equal(records.length, 1);
+    assert.deepEqual(JSON.parse(records[0].source_json).messages[1], {
+      text: "not JSON",
+    });
+    assert.equal(f.stats().sent, 1);
+  }
+});
+
+test("raw checkpoint failure blocks DOM and API fallback, including after browser deadline", async () => {
+  for (const delayed of [false, true]) {
+    let rejectWrite;
+    let started;
+    const writing = new Promise((resolve) => {
+      started = resolve;
+    });
+    const f = fixture({
+      onRead: () => assert.fail("must not parse before commit"),
+    });
+    let apiCalls = 0;
+    const result = interpretObservation(
+      { messages: [] },
+      {
+        browserExtract: (text, hooks) =>
+          extractWithSignedInBrowser(
+            f.page,
+            prompt,
+            options({
+              ...hooks,
+              deadlineAt: performance.now() + 20,
+            }),
+          ),
+        apiExtract: () => {
+          apiCalls += 1;
+        },
+        onEvidence: (record) => {
+          if (record.phase !== "extraction") return;
+          started();
+          if (!delayed) throw new Error("private persistence failure");
+          return new Promise((resolve, reject) => {
+            rejectWrite = reject;
+          });
+        },
+      },
+    );
+    await writing;
+    if (delayed) {
+      let settled = false;
+      void result.then(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      assert.equal(settled, false);
+      rejectWrite(new Error("private persistence failure"));
+    }
+    assert.equal(await result, null);
+    assert.equal(apiCalls, 0);
+    assert.equal(f.stats().sent, 1);
+  }
+});
+
+test("oversized extraction raw evidence fails closed without DOM parsing", async () => {
+  const f = fixture({
+    responseMessages: [{ text: "x".repeat(750_000) }],
+    onRead: () => assert.fail("oversized evidence cannot be parsed"),
+  });
+  await assert.rejects(
+    extractWithSignedInBrowser(
+      f.page,
+      prompt,
+      options({
+        deadlineAt: performance.now() + 1_000,
+        onEvidence: () => assert.fail("must bound before callback"),
+      }),
+    ),
+    ObservationPersistenceError,
+  );
+  assert.equal(f.stats().sent, 1);
 });
 
 test("model unavailable, cancelled and expired calls never submit", async () => {

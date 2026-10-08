@@ -172,6 +172,14 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 40,
         description: "publication send authorization",
     },
+    MigrationMetadata {
+        version: 41,
+        description: "observation captures",
+    },
+    MigrationMetadata {
+        version: 42,
+        description: "provider conversation cleanup",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

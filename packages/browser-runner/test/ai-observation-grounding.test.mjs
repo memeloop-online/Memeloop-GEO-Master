@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { validateAiObservation } from "../src/ai-observation-grounding.mjs";
+import {
+  observationRejectionReason,
+  validateAiObservation,
+} from "../src/ai-observation-grounding.mjs";
 
 const modern = {
   messages: [
@@ -65,6 +68,43 @@ const modernExtracted = {
 
 const validate = (overrides = {}, document = modern) =>
   validateAiObservation(document, { ...modernExtracted, ...overrides });
+
+test("rejection reasons are fixed vocabulary without accepting any candidate", () => {
+  const explain = (overrides) =>
+    observationRejectionReason(modern, {
+      ...modernExtracted,
+      ...overrides,
+    });
+  assert.equal(explain({ decision: "unverified" }), "model_unverified");
+  assert.equal(explain({ answer_segments: [] }), "shape_rejected");
+  assert.equal(
+    explain({ completion: { path: "/messages/42/unknown" } }),
+    "path_rejected",
+  );
+  assert.equal(
+    explain({ answer_owner: { path: "/messages/0/chat/id" } }),
+    "owner_rejected",
+  );
+  assert.equal(
+    explain({
+      answer_segments: [
+        { path: "/messages/3/block/text/content", quote: "not present" },
+      ],
+    }),
+    "quote_rejected",
+  );
+  assert.equal(
+    explain({
+      citations: [
+        {
+          url: { path: "/messages/1/message/role" },
+          usage: modernExtracted.citations[0].usage,
+        },
+      ],
+    }),
+    "citation_rejected",
+  );
+});
 
 test("preserves all 65 streamed answer deltas while enforcing the total answer byte limit", () => {
   const document = structuredClone(modern);

@@ -45,6 +45,8 @@ mod publication_lookup;
 pub use publication_lookup::dispatch_publication_lookup;
 mod publication_send_callback;
 pub use publication_send_callback::PublicationSendCallbackService;
+mod observation_capture_callback;
+pub use observation_capture_callback::ObservationCaptureCallbackService;
 mod questions;
 mod questions_tools;
 mod reports;
@@ -148,6 +150,7 @@ pub struct AppState {
     channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
     publication_lookup_repository: Option<Arc<dyn geo_domain::PublicationLookupRepository>>,
     publication_send_callback: Option<PublicationSendCallbackService>,
+    observation_capture_callback: Option<ObservationCaptureCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
     distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
@@ -257,6 +260,7 @@ impl AppState {
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             publication_lookup_repository: None,
             publication_send_callback: None,
+            observation_capture_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
                     content_media_repository.clone(),
@@ -402,6 +406,7 @@ impl AppState {
             channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
             publication_lookup_repository: None,
             publication_send_callback: None,
+            observation_capture_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
                     content_media_repository.clone(),
@@ -838,6 +843,19 @@ impl AppState {
     ) -> Self {
         self.publication_send_callback = Some(service);
         self
+    }
+
+    /// Opt-in service-only raw evidence checkpoint.
+    pub fn with_observation_capture_callback(
+        mut self,
+        service: ObservationCaptureCallbackService,
+    ) -> Self {
+        self.observation_capture_callback = Some(service);
+        self
+    }
+
+    pub fn observation_capture_callback(&self) -> Option<&ObservationCaptureCallbackService> {
+        self.observation_capture_callback.as_ref()
     }
 
     pub fn with_channel_job_repository(
@@ -2399,6 +2417,8 @@ pub fn router(state: AppState) -> Router {
 
     let publication_callback =
         publication_send_callback::routes(state.publication_send_callback.clone());
+    let observation_callback =
+        observation_capture_callback::routes(state.observation_capture_callback.clone());
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -2424,4 +2444,5 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(context::request_context_middleware))
         .with_state(state)
         .merge(publication_callback)
+        .merge(observation_callback)
 }

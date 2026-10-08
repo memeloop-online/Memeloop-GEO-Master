@@ -3,10 +3,18 @@ import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
+import {
+  stageRichPublication,
+  executeAuthorizedRichPublication,
+  RichPublicationError,
+} from "./rich-publication.mjs";
 
 const ID = /^[a-zA-Z0-9_-]{1,128}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA256 = /^[0-9a-f]{64}$/;
 const VIEWPORT = Object.freeze({ width: 1280, height: 800 });
-const OPERATIONS = new Set(["publish", "measure", "lookup"]);
+const OPERATIONS = new Set(["publish", "measure", "lookup", "rich_publish"]);
+const JSON_OPERATIONS = new Set(["publish", "measure", "lookup"]);
 const BROWSER_CHANNELS = new Set(["chromium", "chrome", "msedge"]);
 const STATUSES = new Set([
   "unsupported",
@@ -165,7 +173,11 @@ export function createRunner(options = {}) {
           platform,
           placement_slot: "primary",
           connector_version: adapter.connectorVersion,
-          operations: [...adapter.operations],
+          operations: adapter.operations.filter(
+            (operation) =>
+              operation !== "rich_publish" ||
+              typeof adapter.executeRich === "function",
+          ),
           // Presence in a deployed runner is not live account verification.
           verified: false,
         })),
@@ -458,13 +470,23 @@ export function createRunner(options = {}) {
     }
   }
 
-  async function execute(input) {
+  async function execute(input, persistCapture) {
     if (
-      !fields(input, ["execution_id", "session_id", "operation", "payload"]) ||
+      !fields(input, [
+        "execution_id",
+        "session_id",
+        "operation",
+        "payload",
+        "source_capture_ticket",
+      ]) ||
       !validId(input.execution_id) ||
       !validId(input.session_id) ||
-      !OPERATIONS.has(input.operation) ||
-      !object(input.payload)
+      !JSON_OPERATIONS.has(input.operation) ||
+      !object(input.payload) ||
+      (input.source_capture_ticket !== undefined &&
+        (input.operation !== "measure" ||
+          typeof input.source_capture_ticket !== "string" ||
+          !/^[0-9a-f]{2,4096}$/.test(input.source_capture_ticket)))
     ) {
       throw new RunnerError(400, "invalid_execution");
     }
@@ -487,6 +509,13 @@ export function createRunner(options = {}) {
         : {}),
     };
     if (!record.completed) throw new RunnerError(409, "login_required");
+    if (input.source_capture_ticket !== undefined && !persistCapture)
+      return {
+        status: "unsupported",
+        reason: "observation_capture_unavailable",
+        evidence: [],
+        ...hostReceipt,
+      };
     if (!record.adapter.operations?.includes(input.operation)) {
       return {
         status: "unsupported",
@@ -560,12 +589,169 @@ export function createRunner(options = {}) {
         }
         // Adapters own fixed, typed platform actions; user payload is never script
         // or navigation, and adapter evidence must not be inferred from click success.
+        let sourceReceipt = null;
+        let sourceOwnership = null;
+        let extractionOwnership = null;
+        let candidateOrdinal = 0;
+        function captureReceipt(receipt) {
+          if (
+            !receipt ||
+            receipt.schema_version !== 1 ||
+            !UUID.test(receipt.capture_id) ||
+            !SHA256.test(receipt.digest_sha256) ||
+            typeof receipt.stored_at !== "string" ||
+            !Number.isFinite(Date.parse(receipt.stored_at))
+          )
+            throw new Error("capture_receipt_invalid");
+          return receipt;
+        }
+        const captureHooks =
+          input.source_capture_ticket === undefined
+            ? {}
+            : {
+                onConversationCaptured(receipt) {
+                  if (
+                    receipt?.provider === "kimi" &&
+                    ["measurement", "extraction"].includes(receipt.purpose) &&
+                    validId(receipt.external_conversation_id)
+                  ) {
+                    if (receipt.purpose === "measurement")
+                      sourceOwnership = receipt;
+                    else extractionOwnership = receipt;
+                  }
+                  // Identification is not a durable write. The evidence
+                  // callback below must commit before any capture is acknowledged.
+                  return { durable: false };
+                },
+                async onEvidence(evidence) {
+                  if (
+                    evidence?.kind !== "observation_capture" ||
+                    evidence.schema_version !== "geo.observation.capture.v1"
+                  )
+                    throw new Error("capture_evidence_invalid");
+                  if (evidence.phase === "source") {
+                    if (
+                      sourceReceipt ||
+                      typeof evidence.source_json !== "string" ||
+                      !SHA256.test(evidence.source_sha256) ||
+                      createHash("sha256")
+                        .update(evidence.source_json)
+                        .digest("hex") !== evidence.source_sha256
+                    )
+                      throw new Error("source_capture_invalid");
+                    const body = {
+                      schema_version: 1,
+                      capture_ticket: input.source_capture_ticket,
+                      ordinal: 0,
+                      observed_at:
+                        evidence.observed_at ?? new Date(clock()).toISOString(),
+                      snapshot: {
+                        phase: "source",
+                        source_json: evidence.source_json,
+                        source_sha256: evidence.source_sha256,
+                      },
+                      ...(sourceOwnership
+                        ? {
+                            owned_conversation: {
+                              provider: sourceOwnership.provider,
+                              external_conversation_id:
+                                sourceOwnership.external_conversation_id,
+                              purpose: "measurement",
+                              correlation: "create_response",
+                            },
+                          }
+                        : {}),
+                    };
+                    sourceReceipt = captureReceipt(await persistCapture(body));
+                  } else if (evidence.phase === "extraction") {
+                    if (!sourceReceipt) throw new Error("source_not_persisted");
+                    if (
+                      typeof evidence.source_json !== "string" ||
+                      Buffer.byteLength(evidence.source_json, "utf8") >
+                        750_000 ||
+                      !SHA256.test(evidence.source_sha256) ||
+                      createHash("sha256")
+                        .update(evidence.source_json)
+                        .digest("hex") !== evidence.source_sha256
+                    )
+                      throw new Error("extraction_capture_invalid");
+                    captureReceipt(
+                      await persistCapture({
+                        schema_version: 1,
+                        capture_ticket: input.source_capture_ticket,
+                        ordinal: ++candidateOrdinal,
+                        observed_at:
+                          evidence.observed_at ??
+                          new Date(clock()).toISOString(),
+                        snapshot: {
+                          phase: "extraction",
+                          source_capture_id: sourceReceipt.capture_id,
+                          source_json: evidence.source_json,
+                          source_sha256: evidence.source_sha256,
+                        },
+                        ...(extractionOwnership
+                          ? {
+                              owned_conversation: {
+                                provider: extractionOwnership.provider,
+                                external_conversation_id:
+                                  extractionOwnership.external_conversation_id,
+                                purpose: "extraction",
+                                correlation: "create_response",
+                              },
+                            }
+                          : {}),
+                      }),
+                    );
+                  } else if (evidence.phase === "candidate") {
+                    if (!sourceReceipt) throw new Error("source_not_persisted");
+                    if (typeof evidence.candidate_json !== "string") return;
+                    if (
+                      !SHA256.test(evidence.candidate_sha256) ||
+                      createHash("sha256")
+                        .update(evidence.candidate_json)
+                        .digest("hex") !== evidence.candidate_sha256
+                    )
+                      throw new Error("candidate_capture_invalid");
+                    const ordinal = ++candidateOrdinal;
+                    const body = {
+                      schema_version: 1,
+                      capture_ticket: input.source_capture_ticket,
+                      ordinal,
+                      observed_at: new Date(clock()).toISOString(),
+                      snapshot: {
+                        phase: "candidate",
+                        source_capture_id: sourceReceipt.capture_id,
+                        route: evidence.route,
+                        candidate_json: evidence.candidate_json,
+                        candidate_sha256: evidence.candidate_sha256,
+                        grounding_reason: evidence.grounding_reason ?? null,
+                      },
+                      ...(evidence.route === "signed_in_browser" &&
+                      extractionOwnership
+                        ? {
+                            owned_conversation: {
+                              provider: extractionOwnership.provider,
+                              external_conversation_id:
+                                extractionOwnership.external_conversation_id,
+                              purpose: "extraction",
+                              correlation: "create_response",
+                            },
+                          }
+                        : {}),
+                    };
+                    captureReceipt(await persistCapture(body));
+                  } else {
+                    throw new Error("capture_phase_invalid");
+                  }
+                },
+              };
         const outcome = await Promise.race([
           record.adapter.execute(record.page, input.operation, input.payload, {
             proxy: record.proxy,
             expectedAccountId: record.identity.platform_account_id,
             deadlineAt,
             signal: controller.signal,
+            ...captureHooks,
           }),
           timeout,
         ]);
@@ -577,6 +763,17 @@ export function createRunner(options = {}) {
         ) {
           throw new Error("invalid_adapter_outcome");
         }
+        if (
+          input.source_capture_ticket !== undefined &&
+          outcome.status === "completed" &&
+          !sourceReceipt
+        )
+          return {
+            status: "unknown",
+            reason: "observation_capture_missing",
+            evidence: [],
+            ...hostReceipt,
+          };
         // Adapter observations may describe a result, but cannot assert
         // whether the runner was live or which connector version was loaded.
         const {
@@ -595,6 +792,192 @@ export function createRunner(options = {}) {
           evidence: [],
           ...hostReceipt,
         };
+      } finally {
+        clearTimeout(timer);
+        record.busy = false;
+        record.lastTouched = clock();
+        entry.settledAt = clock();
+      }
+    })();
+    entry.promise = promise;
+    executions.set(input.execution_id, entry);
+    return promise;
+  }
+
+  async function executeRich(sessionId, input, media, authorize) {
+    if (
+      !UUID.test(sessionId) ||
+      !fields(input, [
+        "schema_version",
+        "execution_id",
+        "attempt_id",
+        "callback_ticket",
+        "variant",
+        "payload",
+      ]) ||
+      input.schema_version !== 1 ||
+      !validId(input.execution_id) ||
+      !UUID.test(input.attempt_id) ||
+      typeof input.callback_ticket !== "string" ||
+      !/^[0-9a-f]{2,4096}$/.test(input.callback_ticket) ||
+      !object(input.variant) ||
+      !object(input.payload) ||
+      !Array.isArray(media)
+    )
+      throw new RunnerError(400, "invalid_rich_execution");
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify(input))
+      .update(
+        JSON.stringify(
+          media.map(({ object_id, object_version, sha256 }) => [
+            object_id,
+            object_version,
+            sha256,
+          ]),
+        ),
+      )
+      .digest("hex");
+    const previous = executions.get(input.execution_id);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint)
+        throw new RunnerError(409, "execution_conflict");
+      return previous.promise;
+    }
+    const record = session(sessionId);
+    const hostReceipt = {
+      execution_id: input.execution_id,
+      provenance,
+      ...(typeof record.connectorVersion === "string"
+        ? { connector_version: record.connectorVersion }
+        : {}),
+    };
+    if (!record.completed) throw new RunnerError(409, "login_required");
+    if (
+      !record.adapter.operations?.includes("rich_publish") ||
+      typeof record.adapter.executeRich !== "function" ||
+      typeof authorize !== "function"
+    )
+      return {
+        status: "unsupported",
+        reason: "rich_publication_unavailable",
+        evidence: [],
+        ...hostReceipt,
+      };
+    if (record.busy) throw new RunnerError(409, "session_busy");
+    if (isChallenge(record.page))
+      return { status: "challenge", evidence: [], ...hostReceipt };
+    let stage;
+    try {
+      stage = stageRichPublication(input.payload, media, input.variant);
+    } catch (error) {
+      if (error instanceof RichPublicationError)
+        throw new RunnerError(
+          error.code === "rich_payload_too_large" ? 413 : 400,
+          error.code,
+        );
+      throw error;
+    }
+    record.busy = true;
+    const entry = { fingerprint, promise: null, settledAt: null };
+    const promise = (async () => {
+      const deadline = Symbol("execution_deadline");
+      const deadlineAt = performance.now() + executionTimeoutMs;
+      const controller = new AbortController();
+      let timer;
+      const timeout = new Promise((resolve) => {
+        const expire = () => {
+          const remaining = deadlineAt - performance.now();
+          if (remaining > 0) {
+            timer = setTimeout(expire, Math.ceil(remaining));
+            return;
+          }
+          controller.abort();
+          resolve(deadline);
+        };
+        timer = setTimeout(expire, executionTimeoutMs);
+      });
+      const unknown = (reason) => {
+        if (sessions.get(sessionId) === record) sessions.delete(sessionId);
+        void dispose(record).catch(() => {});
+        return { status: "unknown", reason, evidence: [], ...hostReceipt };
+      };
+      try {
+        const identity = await Promise.race([
+          record.adapter.identify(record.page).catch(() => null),
+          timeout,
+        ]);
+        if (identity === deadline) return unknown("execution_deadline");
+        if (
+          !validateIdentity(identity) ||
+          identity.platform_account_id !== record.identity.platform_account_id
+        )
+          return {
+            status: "login_required",
+            reason: "account_identity_unverified",
+            evidence: [],
+            ...hostReceipt,
+          };
+        const outcome = await Promise.race([
+          executeAuthorizedRichPublication(stage, {
+            expected: {
+              attempt_id: input.attempt_id,
+              runner_session_id: sessionId,
+              payload_hash: input.variant.payload_hash,
+            },
+            authorize: () =>
+              authorize({
+                schema_version: 1,
+                callback_ticket: input.callback_ticket,
+                attempt_id: input.attempt_id,
+                runner_session_id: sessionId,
+                payload_hash: input.variant.payload_hash,
+              }),
+            upload: (payload, bytes) =>
+              record.adapter.executeRich(record.page, payload, bytes, {
+                proxy: record.proxy,
+                expectedAccountId: record.identity.platform_account_id,
+                deadlineAt,
+                signal: controller.signal,
+              }),
+          }),
+          timeout,
+        ]);
+        if (outcome === deadline) return unknown("execution_deadline");
+        if (
+          !object(outcome) ||
+          !STATUSES.has(outcome.status) ||
+          !Array.isArray(outcome.evidence)
+        )
+          throw new Error("invalid_adapter_outcome");
+        const {
+          execution_id: _executionId,
+          connector_version: _connectorVersion,
+          provenance: _provenance,
+          fixture: _fixture,
+          ...observation
+        } = outcome;
+        // A fixture editor can exercise bytes and authorization, but no
+        // installed adapter has rich public-structure/image readback proof.
+        if (observation.status === "completed")
+          return {
+            status: "unknown",
+            reason: "rich_public_readback_unavailable",
+            evidence: [],
+            ...hostReceipt,
+          };
+        return { ...observation, ...hostReceipt };
+      } catch (error) {
+        if (error instanceof RichPublicationError) {
+          if (error.code === "send_authorization_denied")
+            return {
+              status: "unsupported",
+              reason: "send_authorization_denied",
+              evidence: [],
+              ...hostReceipt,
+            };
+          return unknown(error.code);
+        }
+        return unknown("rich_execution_unknown");
       } finally {
         clearTimeout(timer);
         record.busy = false;
@@ -638,6 +1021,7 @@ export function createRunner(options = {}) {
     complete,
     measurementOptions,
     execute,
+    executeRich,
     close,
     shutdown,
     reap,

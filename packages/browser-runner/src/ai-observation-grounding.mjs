@@ -106,6 +106,82 @@ function auditValue(value) {
 }
 
 /**
+ * Fixed-vocabulary explanation of a rejected candidate. This is diagnostic
+ * only: the validator below remains the sole authority for acceptance.
+ */
+export function observationRejectionReason(document, extracted) {
+  if (extracted?.decision === "unverified") return "model_unverified";
+  if (
+    !object(document) ||
+    !Array.isArray(document.messages) ||
+    !object(extracted) ||
+    extracted.decision !== "searched_answer" ||
+    !Array.isArray(extracted.answer_segments) ||
+    extracted.answer_segments.length < 1 ||
+    extracted.answer_segments.length > MAX_SEGMENTS ||
+    !Array.isArray(extracted.citations) ||
+    extracted.citations.length > MAX_CITATIONS
+  )
+    return "shape_rejected";
+  const required = [
+    "chat_id",
+    "message_id",
+    "answer_owner",
+    "search_owner",
+    "search_block_id",
+    "completion",
+    "search_activity",
+  ];
+  const sources = [
+    ...required.map((key) => extracted[key]),
+    ...extracted.answer_segments,
+    ...extracted.citations.flatMap((citation) =>
+      object(citation) ? [citation.url, citation.usage] : [citation],
+    ),
+  ];
+  if (sources.some((entry) => !object(entry) || !pointer(document, entry.path)))
+    return "path_rejected";
+  const selected = (entry) => pointer(document, entry.path)?.value;
+  const messageId = selected(extracted.message_id);
+  if (
+    selected(extracted.answer_owner) !== messageId ||
+    selected(extracted.search_owner) !== messageId ||
+    selected(extracted.search_block_id) === messageId
+  )
+    return "owner_rejected";
+  if (
+    extracted.answer_segments.some((entry) => {
+      if (entry.quote === undefined) return false;
+      const source = selected(entry);
+      return (
+        typeof source !== "string" ||
+        typeof entry.quote !== "string" ||
+        !entry.quote ||
+        source.indexOf(entry.quote) < 0 ||
+        source.indexOf(entry.quote) !== source.lastIndexOf(entry.quote)
+      );
+    })
+  )
+    return "quote_rejected";
+  if (
+    extracted.citations.some((entry) => {
+      const source = selected(entry.url);
+      const quote = entry.url.quote;
+      const url = quote === undefined ? source : quote;
+      return (
+        !publicUrl(url) ||
+        (quote !== undefined &&
+          (typeof source !== "string" ||
+            source.indexOf(quote) < 0 ||
+            source.indexOf(quote) !== source.lastIndexOf(quote)))
+      );
+    })
+  )
+    return "citation_rejected";
+  return "grounding_rejected";
+}
+
+/**
  * Ground a model's proposed observation in the original framed response and,
  * optionally, read-only page text. This proves source paths and exact bytes,
  * not the model's semantic judgment that those fields mean official search.

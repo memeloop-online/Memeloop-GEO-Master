@@ -7,11 +7,11 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelStatus, ChannelTarget,
-    ChannelTargetInput, ChannelTargetView, ConnectorAvailability, ConnectorKey, ErrorCode,
-    KnowledgePurpose, ProjectId, ProjectStatus, PublicationOrigin, QuestionReference,
-    RICH_DISTRIBUTION_FORMAT, RICH_MARKDOWN_FORMAT, SourceState, TenantScope, sha256_hex,
-    validate_rich_publication_payload,
+    AppError, AuthorizePublicationSend, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan,
+    ChannelStatus, ChannelTarget, ChannelTargetInput, ChannelTargetView, ConnectorAvailability,
+    ConnectorKey, ErrorCode, KnowledgePurpose, ProjectId, ProjectStatus, PublicationOrigin,
+    QuestionReference, RICH_DISTRIBUTION_FORMAT, RICH_MARKDOWN_FORMAT, SourceState, TenantScope,
+    sha256_hex, validate_rich_publication_payload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -86,13 +86,30 @@ pub enum ChannelDispatchDeferred {
     FixtureOnly,
 }
 
-/// This transport currently only sends title/body JSON. The rich runner
-/// staging code is not an authenticated, withdrawal-safe media send bridge;
-/// enabling this requires its typed authorization callback, byte delivery
-/// and structured public-readback contract to be wired into this dispatcher.
-/// Do not infer readiness from a connector's plain `publish` operation.
-fn rich_send_bridge_available(_state: &AppState) -> bool {
-    false
+/// A callback is an independently configured service capability, not a
+/// connector's plain publish proof or a claim made by the runner itself.
+fn rich_send_bridge_available(state: &AppState) -> bool {
+    state.publication_send_callback.is_some() && state.channel_service().browser.is_some()
+}
+
+fn rich_runner_operation_available(
+    connectors: &[crate::browser_bridge::RunnerConnector],
+    key: &ConnectorKey,
+    version: &str,
+) -> bool {
+    connectors
+        .iter()
+        .filter(|connector| {
+            connector.platform == key.platform_id
+                && connector.placement_slot == key.placement_slot
+                && connector.connector_version == version
+                && connector
+                    .operations
+                    .iter()
+                    .any(|operation| operation == "rich_publish")
+        })
+        .count()
+        == 1
 }
 
 fn rich_send_required(input: &ChannelTargetInput) -> bool {
@@ -152,6 +169,11 @@ async fn generated_connector_available(
             else {
                 return Ok(false);
             };
+            if rich_payload.is_some()
+                && !rich_runner_operation_available(&connectors, &key, version)
+            {
+                return Ok(false);
+            }
             let Some(settings) = state
                 .connector_capability_repository()
                 .get(scope.operator_id, &key)
@@ -227,6 +249,9 @@ async fn generated_connector_available(
     let Some(version) = crate::connector_capabilities::deployed_version(&connectors, &key) else {
         return Ok(false);
     };
+    if rich_payload.is_some() && !rich_runner_operation_available(&connectors, &key, version) {
+        return Ok(false);
+    }
     if frozen.target_id != *distribution_target_id
         || frozen.platform_id != *platform
         || placement.capability_version != version
@@ -1078,6 +1103,7 @@ async fn generated_publication_preflight(
 /// Always release the fresh browser context after a resumed account has
 /// completed identity verification and its one typed operation. The runner's
 /// idle reaper remains the fallback if this process dies mid-request.
+#[cfg(test)]
 pub(crate) async fn execute_and_close(
     bridge: &crate::browser_bridge::BrowserBridge,
     session: Uuid,
@@ -1109,13 +1135,43 @@ pub(crate) async fn execute_and_close_with_cleanup(
     Result<crate::browser_bridge::BrowserExecution, AppError>,
     bool,
 ) {
+    execute_and_close_with_cleanup_and_ticket(
+        bridge,
+        session,
+        expected_identity,
+        attempt_id,
+        operation,
+        payload,
+        None,
+    )
+    .await
+}
+
+async fn execute_and_close_with_cleanup_and_ticket(
+    bridge: &crate::browser_bridge::BrowserBridge,
+    session: Uuid,
+    expected_identity: Option<&str>,
+    attempt_id: Uuid,
+    operation: &str,
+    payload: &serde_json::Value,
+    source_capture_ticket: Option<&str>,
+) -> (
+    Result<crate::browser_bridge::BrowserExecution, AppError>,
+    bool,
+) {
     let result = async {
         let verified = bridge.complete(session).await?;
         if Some(verified.identity.platform_account_id.as_str()) != expected_identity {
             return Err(AppError::conflict("account identity changed"));
         }
         bridge
-            .execute(attempt_id, session, operation, payload)
+            .execute_with_source_capture_ticket(
+                attempt_id,
+                session,
+                operation,
+                payload,
+                source_capture_ticket,
+            )
             .await
     }
     .await;
@@ -1723,17 +1779,11 @@ async fn execute_reserved_channel_target(
             rich_payload: None,
             ..
         } => ("publish", json!({"title":title,"body":body})),
-        // There is no authorized rich upload protocol at the bridge yet.
-        // This is a defensive guard if a target bypasses the pre-claim gate.
+        // Rich content takes a distinct authenticated multipart route below.
         ChannelTargetInput::GeneratedPublish {
             rich_payload: Some(_),
             ..
-        } => {
-            if bridge.close(session).await.is_err() {
-                tracing::warn!("browser execution session cleanup failed");
-            }
-            return Err(AppError::conflict("rich publication transport unavailable"));
-        }
+        } => ("publish", json!({})),
         ChannelTargetInput::Measure {
             account_id,
             provider,
@@ -1756,10 +1806,14 @@ async fn execute_reserved_channel_target(
     let now = Utc::now();
     // Recheck mutable eligibility after the claim. Even a withdrawal at this
     // point must leave an honest attempted outcome, not release the one-shot.
+    let mut execution_started = false;
     let resolved = async {
         // Persist the encrypted network/identity selected for this exact
         // preflight before sending. A crash cannot resume on a new account or
         // silently fall back to a different network.
+        let binding_sha256 = binding
+            .as_ref()
+            .map(|binding| sha256_hex(binding.encrypted_bytes()));
         if let Some(binding) = binding {
             repo.store_publication_binding(scope, target_id, attempt.attempt_id, binding)
                 .await
@@ -1798,23 +1852,117 @@ async fn execute_reserved_channel_target(
         if !generated_connector_available(state, scope, &target.input).await? {
             return Err(AppError::conflict("connector no longer available"));
         }
-        execute_and_close(
+        if let ChannelTargetInput::GeneratedPublish {
+            account_id,
+            publication_intent_id,
+            title,
+            body,
+            payload_hash,
+            rich_payload: Some(rich_payload),
+            ..
+        } = &target.input
+        {
+            let callback = state
+                .publication_send_callback
+                .as_ref()
+                .ok_or_else(|| AppError::conflict("rich publication callback unavailable"))?;
+            let ticket = callback
+                .register_ticket(
+                    scope,
+                    &AuthorizePublicationSend {
+                        target_id,
+                        attempt_id: attempt.attempt_id,
+                        account_id: *account_id,
+                        runner_session_id: session,
+                        publication_intent_id: *publication_intent_id,
+                        payload_hash: payload_hash.clone(),
+                        encrypted_binding_sha256: binding_sha256
+                            .ok_or_else(|| AppError::conflict("publication binding unavailable"))?,
+                    },
+                    attempt.claimed_at + chrono::Duration::minutes(5),
+                )
+                .await?;
+            let keys = rich_payload
+                .media
+                .iter()
+                .map(|item| item.object.clone())
+                .collect::<Vec<_>>();
+            let snapshots = state
+                .content_media_repository()
+                .snapshot_authorized_images(scope, &keys)
+                .await?;
+            execution_started = true;
+            let result = async {
+                let identity = bridge.complete(session).await?;
+                if Some(identity.identity.platform_account_id.as_str())
+                    != account.platform_account_id.as_deref()
+                {
+                    return Err(AppError::conflict("account identity changed"));
+                }
+                bridge
+                    .execute_rich(
+                        attempt.attempt_id,
+                        session,
+                        &ticket,
+                        crate::browser_bridge::RichExecutionVariant {
+                            title,
+                            markdown: body,
+                            payload_hash,
+                        },
+                        rich_payload,
+                        snapshots,
+                    )
+                    .await
+            }
+            .await;
+            if bridge.close(session).await.is_err() {
+                tracing::warn!("browser execution session cleanup failed");
+            }
+            return result;
+        }
+        let source_capture_ticket = if operation == "measure" {
+            state
+                .observation_capture_callback()
+                .map(|service| {
+                    service.issue_ticket(
+                        scope,
+                        crate::observation_capture_callback::ObservationCaptureBinding {
+                            target_id,
+                            attempt_id: attempt.attempt_id,
+                            account_id: account.account_id,
+                            runner_session_id: session,
+                            original_identity: geo_domain::ObservationProviderIdentity {
+                                provider: account.platform.clone(),
+                                platform_account_id: account
+                                    .platform_account_id
+                                    .clone()
+                                    .ok_or_else(|| {
+                                        AppError::conflict("account identity unavailable")
+                                    })?,
+                            },
+                        },
+                        attempt.claimed_at + chrono::Duration::minutes(5),
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        execution_started = true;
+        execute_and_close_with_cleanup_and_ticket(
             bridge,
             session,
             account.platform_account_id.as_deref(),
             attempt.attempt_id,
             operation,
             &payload,
+            source_capture_ticket.as_deref(),
         )
         .await
+        .0
     }
     .await;
-    if resolved.as_ref().is_err_and(|error| {
-        error.message.starts_with("source ")
-            || error.message.starts_with("connector ")
-            || error.message.starts_with("publication binding ")
-    }) && bridge.close(session).await.is_err()
-    {
+    if !execution_started && bridge.close(session).await.is_err() {
         tracing::warn!("browser execution session cleanup failed");
     }
     let received_at = Utc::now();
@@ -2277,6 +2425,41 @@ mod tests {
             ..receipt
         };
         assert!(publication_readback(&receipt, &input));
+    }
+
+    #[test]
+    fn rich_send_needs_separate_runner_operation_and_callback_configuration() {
+        let state = AppState::development();
+        assert!(!rich_send_bridge_available(&state));
+        assert!(state.observation_capture_callback().is_none());
+        let key = ConnectorKey {
+            platform_id: "zhihu".into(),
+            placement_slot: "primary".into(),
+        };
+        let connector = crate::browser_bridge::RunnerConnector {
+            platform: "zhihu".into(),
+            placement_slot: "primary".into(),
+            connector_version: "adapter.v1".into(),
+            operations: vec!["publish".into()],
+            verified: true,
+        };
+        assert!(!rich_runner_operation_available(
+            std::slice::from_ref(&connector),
+            &key,
+            "adapter.v1"
+        ));
+        let mut rich = connector;
+        rich.operations.push("rich_publish".into());
+        assert!(rich_runner_operation_available(
+            std::slice::from_ref(&rich),
+            &key,
+            "adapter.v1"
+        ));
+        assert!(!rich_runner_operation_available(
+            &[rich],
+            &key,
+            "adapter.v2"
+        ));
     }
 
     #[test]

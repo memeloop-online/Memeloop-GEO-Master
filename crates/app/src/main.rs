@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
         let state =
             channels::configure(state.with_allowed_origins(config.allowed_origins.clone()))?;
+        let state = channels::configure_callbacks(state, &database)?;
         let runtime = if let Some(ai) = production_ai.as_ref() {
             let provider = production_runtime::build_model_provider(&database, ai)?;
             runtime::assemble_with_provider(&state, &ai.bundle_path, &ai.bundle_sha256, provider)?

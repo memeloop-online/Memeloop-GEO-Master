@@ -1,13 +1,18 @@
 import { captureConnectExchange } from "./connect-browser-capture.mjs";
-import { parseExtractionJson } from "./ai-observation-parser.mjs";
+import {
+  extractionCaptureRecord,
+  ObservationPersistenceError,
+  parseExtractionJson,
+} from "./ai-observation-parser.mjs";
+import { reportCapturedConversation } from "./provider-conversation-ownership.mjs";
 
 const CHAT_PATH = "/apiv2/kimi.gateway.chat.v1.ChatService/Chat";
 const ASSISTANT =
   '.chat-content-item-assistant, [data-message-author-role="assistant"], [data-role="assistant"]';
 
-// Only correlate the browser's own request. Never interpret provider response
-// fields here: the signed-in model performs that interpretation.
-function containsPrompt(request, prompt) {
+// Only correlate the browser's own freshly created request. Response ID
+// correlation is separately limited to the transport's chat envelopes.
+function containsPrompt(request, prompt, model) {
   try {
     const bytes = request.postDataBuffer();
     if (
@@ -24,14 +29,14 @@ function containsPrompt(request, prompt) {
     const value = JSON.parse(
       new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(5)),
     );
-    const pending = [value];
-    while (pending.length) {
-      const item = pending.pop();
-      if (typeof item === "string" && item === prompt) return true;
-      if (item && typeof item === "object")
-        pending.push(...Object.values(item));
-    }
-    return false;
+    return (
+      value?.chat_id === "" &&
+      value.options?.model === model &&
+      ["user", 2].includes(value.message?.role) &&
+      Array.isArray(value.message?.blocks) &&
+      value.message.blocks.length === 1 &&
+      value.message.blocks[0]?.text?.content === prompt
+    );
   } catch {
     return false;
   }
@@ -51,11 +56,14 @@ export async function extractWithSignedInBrowser(
     deadlineAt = performance.now() + 60_000,
     signal,
     configureModel,
+    onConversationCaptured,
+    onEvidence,
   } = {},
 ) {
   let extractionPage;
   let timer;
   let closePromise;
+  let checkpoint;
   const controller = new AbortController();
   let stop;
   const stopped = new Promise((resolve) => (stop = resolve));
@@ -130,7 +138,7 @@ export async function extractWithSignedInBrowser(
         signal: controller.signal,
         timeoutMs: Math.max(1, remaining()),
         maxMessages: 32_768,
-        matchRequest: (request) => containsPrompt(request, prompt),
+        matchRequest: (request) => containsPrompt(request, prompt, model),
         submit: async (_page, captureSignal) => {
           if (!active() || captureSignal.aborted) return;
           const send = extractionPage.locator(".send-button-container");
@@ -144,7 +152,26 @@ export async function extractWithSignedInBrowser(
           await send.click({ timeout: Math.max(1, remaining()) });
         },
       });
-      if (!exchange || !active()) return null;
+      if (!exchange) return null;
+      // Begin the checkpoint before inspecting DOM or attempting JSON parsing.
+      // Its completion also gates timeout/cancellation returns below.
+      checkpoint = (async () => {
+        const status = await reportCapturedConversation(
+          exchange,
+          "extraction",
+          onConversationCaptured,
+        );
+        if (onEvidence) {
+          try {
+            await onEvidence(extractionCaptureRecord(exchange));
+          } catch {
+            throw new ObservationPersistenceError();
+          }
+        }
+        return status;
+      })();
+      const ownershipReceiptStatus = await checkpoint;
+      if (!active()) return null;
       // DOM rendering can trail the final transport frame. Poll only the
       // assistant surface; never parse the page body or user prompt echo.
       while (active()) {
@@ -168,7 +195,14 @@ export async function extractWithSignedInBrowser(
             typeof extracted === "object" &&
             !Array.isArray(extracted)
           )
-            return { extracted, model, surface: "signed_in_browser" };
+            return {
+              extracted,
+              model,
+              surface: "signed_in_browser",
+              ...(onConversationCaptured
+                ? { ownership_receipt_status: ownershipReceiptStatus }
+                : {}),
+            };
         }
         await new Promise((resolve) =>
           setTimeout(resolve, Math.min(50, remaining())),
@@ -177,7 +211,8 @@ export async function extractWithSignedInBrowser(
       return null;
     };
     return await Promise.race([run(), stopped]);
-  } catch {
+  } catch (error) {
+    if (error instanceof ObservationPersistenceError) throw error;
     // Browser errors can contain account URLs, source material or credentials.
     return null;
   } finally {
@@ -185,5 +220,8 @@ export async function extractWithSignedInBrowser(
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
     await close();
+    // A timeout must not turn an unresolved/failed durable write into a normal
+    // null result that permits another extraction request.
+    if (checkpoint) await checkpoint;
   }
 }

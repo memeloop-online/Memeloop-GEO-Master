@@ -4,6 +4,47 @@ use std::{env, error::Error};
 
 use geo_api::{AppState, BrowserBridge, ChannelService};
 
+/// Only durable deployments expose evidence checkpoints and publication
+/// callbacks. The independently configured service credential stays server-side.
+pub fn configure_callbacks(
+    state: AppState,
+    database: &geo_persistence::Database,
+) -> Result<AppState, Box<dyn Error>> {
+    let token = env::var("GEO_BROWSER_RUNNER_CALLBACK_TOKEN").ok();
+    let key = env::var("GEO_CHANNEL_SECRET_KEY").ok();
+    callbacks_with_credentials(state, database, token.as_deref(), key.as_deref())
+}
+
+fn callbacks_with_credentials(
+    state: AppState,
+    database: &geo_persistence::Database,
+    token: Option<&str>,
+    key: Option<&str>,
+) -> Result<AppState, Box<dyn Error>> {
+    let Some(token) = token else {
+        return Ok(state);
+    };
+    let key = key.ok_or("browser callback configuration requires a persistent channel key")?;
+    let cipher = std::sync::Arc::new(geo_provider::SecretEnvelope::from_hex_key(key)?);
+    let captures = geo_api::ObservationCaptureCallbackService::new(
+        std::sync::Arc::new(
+            geo_persistence::PgObservationCaptureRepository::from_database(database),
+        ),
+        cipher.clone(),
+        token,
+    )?;
+    let publication = geo_api::PublicationSendCallbackService::new(
+        std::sync::Arc::new(
+            geo_persistence::PgPublicationSendAuthorizationRepository::from_database(database),
+        ),
+        cipher,
+        token,
+    )?;
+    Ok(state
+        .with_observation_capture_callback(captures)
+        .with_publication_send_callback(publication))
+}
+
 pub fn configure(state: AppState) -> Result<AppState, Box<dyn Error>> {
     let runner_url = env::var("GEO_BROWSER_RUNNER_URL").ok();
     let runner_token = env::var("GEO_BROWSER_RUNNER_TOKEN").ok();

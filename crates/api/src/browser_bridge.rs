@@ -1,8 +1,11 @@
 //! Internal authenticated browser runner client. The browser never receives
 //! storageState, proxy credentials, runner token, or arbitrary navigation APIs.
 
-use geo_domain::{AppError, ErrorCode};
-use reqwest::{Client, StatusCode};
+use geo_domain::{
+    AppError, AuthorizedMediaSnapshot, ErrorCode, MAX_MEDIA_SNAPSHOT_BYTES,
+    MAX_MEDIA_SNAPSHOT_IMAGES, RichPublicationPayload, sha256_hex,
+};
+use reqwest::{Client, StatusCode, multipart};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -270,17 +273,38 @@ impl BrowserBridge {
         operation: &str,
         payload: &serde_json::Value,
     ) -> Result<BrowserExecution, AppError> {
-        if !matches!(operation, "publish" | "measure" | "lookup") || !payload.is_object() {
+        self.execute_with_source_capture_ticket(execution_id, session_id, operation, payload, None)
+            .await
+    }
+
+    /// The ticket is sealed by the API after an authoritative measurement
+    /// claim. It is not part of the model/user payload and is omitted for
+    /// older runners or installations without capture callback configuration.
+    pub async fn execute_with_source_capture_ticket(
+        &self,
+        execution_id: Uuid,
+        session_id: Uuid,
+        operation: &str,
+        payload: &serde_json::Value,
+        source_capture_ticket: Option<&str>,
+    ) -> Result<BrowserExecution, AppError> {
+        if !matches!(operation, "publish" | "measure" | "lookup")
+            || !payload.is_object()
+            || source_capture_ticket.is_some_and(|ticket| {
+                operation != "measure" || ticket.is_empty() || ticket.len() > 4096
+            })
+        {
             return Err(AppError::invalid_request("unsupported browser operation"));
         }
         let response = self
             .execute_request()
-            .json(&serde_json::json!({
-                "execution_id":execution_id,
-                "session_id":session_id,
-                "operation":operation,
-                "payload":payload,
-            }))
+            .json(&BrowserExecutionRequest {
+                execution_id,
+                session_id,
+                operation,
+                payload,
+                source_capture_ticket,
+            })
             .send()
             .await
             .map_err(|_| {
@@ -291,6 +315,146 @@ impl BrowserBridge {
             })?;
         Self::response(response).await
     }
+
+    /// A separate bounded binary protocol: neither the general JSON execute
+    /// endpoint nor a model-supplied payload may carry media bytes or a ticket.
+    pub async fn execute_rich(
+        &self,
+        execution_id: Uuid,
+        session_id: Uuid,
+        callback_ticket: &str,
+        variant: RichExecutionVariant<'_>,
+        payload: &RichPublicationPayload,
+        snapshots: Vec<AuthorizedMediaSnapshot>,
+    ) -> Result<BrowserExecution, AppError> {
+        if callback_ticket.is_empty() || callback_ticket.len() > 4096 {
+            return Err(AppError::invalid_request("rich publication ticket invalid"));
+        }
+        let mut expected = std::collections::BTreeMap::new();
+        for item in &payload.media {
+            let identity = (item.object.object_id, item.object.object_version);
+            let image = (
+                &item.object.sha256,
+                &item.media_type,
+                item.byte_len,
+                item.width,
+                item.height,
+            );
+            if expected
+                .insert(identity, image)
+                .is_some_and(|old| old != image)
+            {
+                return Err(AppError::conflict(
+                    "rich publication media identity differs",
+                ));
+            }
+        }
+        if expected.len() != snapshots.len() || expected.len() > MAX_MEDIA_SNAPSHOT_IMAGES {
+            return Err(AppError::conflict(
+                "rich publication media snapshot differs",
+            ));
+        }
+        let metadata = serde_json::to_vec(&RichExecutionMetadata {
+            schema_version: 1,
+            execution_id,
+            attempt_id: execution_id,
+            callback_ticket,
+            variant,
+            payload,
+        })
+        .map_err(|_| AppError::conflict("rich publication metadata unavailable"))?;
+        // The frozen markdown alone may be 8 MiB. This limit applies only to
+        // the typed rich route; ordinary JSON operations remain unchanged.
+        if metadata.len() > 16 * 1024 * 1024 {
+            return Err(AppError::conflict(
+                "rich publication metadata exceeds limit",
+            ));
+        }
+        let mut form = multipart::Form::new().part(
+            "metadata",
+            multipart::Part::bytes(metadata)
+                .mime_str("application/json")
+                .map_err(|_| AppError::conflict("rich publication metadata invalid"))?,
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0u64;
+        for snapshot in snapshots {
+            let key = &snapshot.image.key;
+            let identity = (key.object_id, key.object_version);
+            if !seen.insert(identity) {
+                return Err(AppError::conflict("rich publication media duplicated"));
+            }
+            let Some((digest, media_type, length, width, height)) = expected.get(&identity) else {
+                return Err(AppError::conflict(
+                    "rich publication media snapshot differs",
+                ));
+            };
+            if key.sha256 != **digest
+                || snapshot.image.media_type != **media_type
+                || snapshot.image.byte_len != *length
+                || snapshot.image.width != *width
+                || snapshot.image.height != *height
+                || snapshot.bytes.len() as u64 != *length
+                || sha256_hex(&snapshot.bytes) != key.sha256
+            {
+                return Err(AppError::conflict(
+                    "rich publication media snapshot differs",
+                ));
+            }
+            total = total
+                .checked_add(*length)
+                .filter(|total| *total <= MAX_MEDIA_SNAPSHOT_BYTES)
+                .ok_or_else(|| AppError::conflict("rich publication media exceeds limit"))?;
+            form = form.part(
+                format!("media_{}_{}", key.object_id, key.object_version),
+                multipart::Part::bytes(snapshot.bytes)
+                    .mime_str(&snapshot.image.media_type)
+                    .map_err(|_| AppError::conflict("rich publication media type invalid"))?,
+            );
+        }
+        let response = self
+            .client
+            .post(self.endpoint(session_id, "/execute-rich"))
+            .timeout(Self::EXECUTE_REQUEST_TIMEOUT)
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser runner unavailable",
+                )
+            })?;
+        Self::response(response).await
+    }
+}
+
+#[derive(Serialize)]
+struct BrowserExecutionRequest<'a> {
+    execution_id: Uuid,
+    session_id: Uuid,
+    operation: &'a str,
+    payload: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_capture_ticket: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+pub struct RichExecutionVariant<'a> {
+    pub title: &'a str,
+    pub markdown: &'a str,
+    pub payload_hash: &'a str,
+}
+
+#[derive(Serialize)]
+struct RichExecutionMetadata<'a> {
+    schema_version: u8,
+    execution_id: Uuid,
+    attempt_id: Uuid,
+    callback_ticket: &'a str,
+    variant: RichExecutionVariant<'a>,
+    payload: &'a RichPublicationPayload,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,7 +505,7 @@ impl MeasurementOptions {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RunnerConnector {
     pub platform: String,
     pub placement_slot: String,
@@ -431,6 +595,139 @@ pub struct VerifiedBrowserSession {
 #[cfg(test)]
 mod measurement_options_tests {
     use super::*;
+
+    #[test]
+    fn source_capture_ticket_is_absent_from_legacy_execute_request() {
+        let payload = serde_json::json!({"question":"synthetic"});
+        let request = BrowserExecutionRequest {
+            execution_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            operation: "measure",
+            payload: &payload,
+            source_capture_ticket: None,
+        };
+        let legacy = serde_json::to_value(&request).unwrap();
+        assert!(legacy.get("source_capture_ticket").is_none());
+        let bound = serde_json::to_value(BrowserExecutionRequest {
+            source_capture_ticket: Some("sealed-ticket"),
+            ..request
+        })
+        .unwrap();
+        assert_eq!(bound["source_capture_ticket"], "sealed-ticket");
+        assert_eq!(bound["payload"], payload);
+    }
+
+    #[tokio::test]
+    async fn rich_wire_uses_separate_authenticated_multipart_endpoint() {
+        use axum::{Router, body::to_bytes, extract::Request, routing::post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let execution_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let route = format!("/v1/sessions/{session_id}/execute-rich");
+        let app = Router::new().route(
+            &route,
+            post(move |request: Request| async move {
+                assert_eq!(request.headers()["authorization"], "Bearer service-token");
+                assert!(
+                    request.headers()["content-type"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("multipart/form-data; boundary=")
+                );
+                let body = to_bytes(request.into_body(), 1024 * 1024).await.unwrap();
+                let wire = String::from_utf8(body.to_vec()).unwrap();
+                assert!(wire.contains("name=\"metadata\""));
+                assert!(wire.contains("\"schema_version\":1"));
+                assert!(wire.contains(&format!("\"execution_id\":\"{execution_id}\"")));
+                assert!(wire.contains(&format!("\"attempt_id\":\"{execution_id}\"")));
+                assert!(wire.contains("\"callback_ticket\":\"sealed-ticket\""));
+                assert!(wire.contains("\"payload_hash\":\"frozen-hash\""));
+                axum::Json(serde_json::json!({
+                    "execution_id": execution_id,
+                    "status": "unsupported",
+                    "provenance": "fixture"
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bridge = BrowserBridge::new(format!("http://{addr}"), "service-token".into()).unwrap();
+        let result = bridge
+            .execute_rich(
+                execution_id,
+                session_id,
+                "sealed-ticket",
+                RichExecutionVariant {
+                    title: "Title",
+                    markdown: "Body",
+                    payload_hash: "frozen-hash",
+                },
+                &RichPublicationPayload {
+                    schema_version: 2,
+                    format: "rich_markdown.v2".into(),
+                    content_revision_id: Uuid::new_v4(),
+                    policy_version: "test".into(),
+                    document: geo_domain::StructuredDocument {
+                        title: "Title".into(),
+                        blocks: vec![],
+                        schema_version: Some(2),
+                    },
+                    media: vec![],
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.execution_id, execution_id);
+        assert_eq!(result.status, "unsupported");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rich_transport_rejects_manifest_snapshot_mismatch_before_network() {
+        let bridge =
+            BrowserBridge::new("http://127.0.0.1:1".into(), "fixture-token".into()).unwrap();
+        let payload = RichPublicationPayload {
+            schema_version: 2,
+            format: "rich_markdown.v2".into(),
+            content_revision_id: Uuid::new_v4(),
+            policy_version: "test".into(),
+            document: geo_domain::StructuredDocument {
+                title: "Title".into(),
+                blocks: vec![],
+                schema_version: Some(2),
+            },
+            media: vec![],
+        };
+        let result = bridge
+            .execute_rich(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "sealed-ticket",
+                RichExecutionVariant {
+                    title: "Title",
+                    markdown: "Body",
+                    payload_hash: "frozen-hash",
+                },
+                &payload,
+                vec![AuthorizedMediaSnapshot {
+                    image: geo_domain::VerifiedImage {
+                        key: geo_domain::MediaObjectKey {
+                            object_id: Uuid::new_v4(),
+                            object_version: 1,
+                            sha256: sha256_hex(b"image"),
+                        },
+                        media_type: "image/png".into(),
+                        byte_len: 5,
+                        width: 1,
+                        height: 1,
+                    },
+                    bytes: b"image".to_vec(),
+                }],
+            )
+            .await;
+        assert_eq!(result.err().unwrap().code, ErrorCode::Conflict);
+    }
 
     #[test]
     fn execute_timeout_outlives_runner_without_extending_other_requests() {

@@ -1,0 +1,79 @@
+# Optional isolated Rust validation worker. No application credentials or
+# production volumes are mounted. Stream an explicit source snapshot into /build.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: geo-build-test
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rust-validation
+  namespace: geo-build-test
+  labels:
+    app.kubernetes.io/name: rust-validation
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 40Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rust-validation
+  namespace: geo-build-test
+  labels:
+    app.kubernetes.io/name: rust-validation
+spec:
+  automountServiceAccountToken: false
+  activeDeadlineSeconds: 7200
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: rust
+      image: rust:1.96-bookworm
+      command: ["sleep", "infinity"]
+      workingDir: /build
+      env:
+        - name: CARGO_HOME
+          value: /build/cargo
+        - name: CARGO_TARGET_DIR
+          value: /build/target
+        - name: CARGO_PROFILE_DEV_DEBUG
+          value: "0"
+        - name: CARGO_PROFILE_TEST_DEBUG
+          value: "0"
+        - name: CARGO_INCREMENTAL
+          value: "0"
+        - name: HOME
+          value: /tmp
+      resources:
+        requests:
+          cpu: "2"
+          memory: 4Gi
+        limits:
+          cpu: "4"
+          memory: 8Gi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: cache
+          mountPath: /build
+        - name: temporary
+          mountPath: /tmp
+  volumes:
+    - name: cache
+      persistentVolumeClaim:
+        claimName: rust-validation
+    - name: temporary
+      emptyDir: {}

@@ -409,7 +409,14 @@ function validKimiMeasurementPayload(payload) {
 export async function measureKimi(
   page,
   payload,
-  { searchFlow, expectedAccountId, deadlineAt, signal } = {},
+  {
+    searchFlow,
+    expectedAccountId,
+    deadlineAt,
+    signal,
+    onEvidence,
+    onConversationCaptured,
+  } = {},
 ) {
   if (!validKimiMeasurementPayload(payload))
     return unsupported("invalid_measurement_payload");
@@ -426,9 +433,40 @@ export async function measureKimi(
   }
   if (!page) return unsupported("official_web_search_unverified");
   const diagnostics = [];
+  const capturedEvidence = [];
+  const ownershipEvidence = [];
   const observation = await observeKimiConnectSearch(page, payload, {
     deadlineAt,
     signal,
+    ...(typeof onConversationCaptured === "function"
+      ? {
+          onConversationCaptured: async (receipt) => {
+            let ack;
+            try {
+              ack = await onConversationCaptured(receipt);
+            } catch {
+              // The ownership callback failure cannot cause a second send.
+            }
+            ownershipEvidence.push({
+              kind: "provider_conversation_ownership",
+              schema_version: "geo.provider_conversation.ownership.v1",
+              provider: receipt.provider,
+              purpose: receipt.purpose,
+              external_conversation_id: receipt.external_conversation_id,
+              ownership_receipt_status:
+                ack?.durable === true ? "persisted" : "unpersisted",
+            });
+            return ack;
+          },
+        }
+      : {}),
+    onEvidence: async (record) => {
+      capturedEvidence.push(record);
+      // Supplying this callback is a caller-owned persistence contract. A
+      // failed write prevents extraction from proceeding; the final-return
+      // evidence alone is not a durable acknowledgement for remote cleanup.
+      await onEvidence?.(record);
+    },
     onDiagnostic: (entry) => {
       if (diagnostics.length >= 12) return;
       reportObservationDiagnostic(
@@ -442,11 +480,11 @@ export async function measureKimi(
   if (observation?.reason === "requested_model_unavailable")
     return unsupported("requested_model_unavailable");
   if (!observation)
-    return unknown(
-      "official_search_observation_unverified",
-      "measure",
-      diagnostics,
-    );
+    return unknown("official_search_observation_unverified", "measure", [
+      ...capturedEvidence,
+      ...ownershipEvidence,
+      ...diagnostics,
+    ]);
   const observedAt = new Date().toISOString();
   const rawAnswer = observation.raw_answer;
   return {
@@ -483,6 +521,8 @@ export async function measureKimi(
         search_event: observation.search_event,
       },
       ...(observation.extraction_audit ? [observation.extraction_audit] : []),
+      ...capturedEvidence,
+      ...ownershipEvidence,
     ],
     connector_version: CONNECTOR_VERSION,
   };
