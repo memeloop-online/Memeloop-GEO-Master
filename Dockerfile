@@ -29,12 +29,30 @@ RUN pnpm agent:bundle \
       memeloop-content-workflow.bundle.mjs \
       > SHA256SUMS
 
-# Compile only the API binary. Runtime model configuration remains deployment
-# configuration, while the generated bundles are supplied from the prior stage.
-FROM rust:1.96-bookworm AS api-builder
+# cargo-chef (Apache-2.0 OR MIT) owns workspace dependency preparation.
+# Pin the tool and share one Rust toolchain/workdir across prepare, cook and build.
+FROM rust:1.96-bookworm AS api-chef
 
 WORKDIR /workspace
 
+RUN cargo install cargo-chef --version 0.1.78 --locked
+
+FROM api-chef AS api-planner
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Cache registry dependencies (including V8) separately from application sources.
+# Keep artifacts in normal layers so CI's exported BuildKit cache can reuse them.
+FROM api-chef AS api-builder
+
+COPY --from=api-planner /workspace/recipe.json recipe.json
+RUN cargo chef cook --locked --release -p geo-app --recipe-path recipe.json
+
+# Compile the real API and its embedded migration/prompt files after dependency
+# cooking. Runtime model configuration remains deployment configuration.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY migrations migrations
@@ -57,19 +75,17 @@ RUN apt-get update \
     && useradd --uid 10001 --gid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin geo \
     && mkdir -p /opt/geo/bundles \
       /usr/share/doc/memeloop-geo \
-    && chown -R geo:geo /opt/geo
+    && chown -R geo:geo /opt/geo /usr/share/doc/memeloop-geo
 
 WORKDIR /opt/geo
 
-COPY --from=api-builder /workspace/target/release/geo-app /usr/local/bin/geo-app
-COPY --from=bundle-builder /workspace/packages/agent-runtime/dist/memeloop-agent-loop.bundle.mjs /opt/geo/bundles/memeloop-agent-loop.bundle.mjs
-COPY --from=bundle-builder /workspace/packages/agent-runtime/dist/memeloop-content-workflow.bundle.mjs /opt/geo/bundles/memeloop-content-workflow.bundle.mjs
-COPY --from=bundle-builder /workspace/packages/agent-runtime/dist/SHA256SUMS /opt/geo/bundles/SHA256SUMS
-COPY --from=bundle-builder /workspace/packages/agent-runtime/THIRD_PARTY_NOTICES.md /usr/share/doc/memeloop-geo/agent-runtime-THIRD_PARTY_NOTICES.md
-COPY crates/api/THIRD_PARTY_NOTICES.md /usr/share/doc/memeloop-geo/api-THIRD_PARTY_NOTICES.md
-COPY LICENSE /usr/share/doc/memeloop-geo/LICENSE
-
-RUN chown -R 10001:10001 /usr/local/bin/geo-app /opt/geo/bundles /usr/share/doc/memeloop-geo
+COPY --chown=10001:10001 --from=api-builder /workspace/target/release/geo-app /usr/local/bin/geo-app
+COPY --chown=10001:10001 --from=bundle-builder /workspace/packages/agent-runtime/dist/memeloop-agent-loop.bundle.mjs /opt/geo/bundles/memeloop-agent-loop.bundle.mjs
+COPY --chown=10001:10001 --from=bundle-builder /workspace/packages/agent-runtime/dist/memeloop-content-workflow.bundle.mjs /opt/geo/bundles/memeloop-content-workflow.bundle.mjs
+COPY --chown=10001:10001 --from=bundle-builder /workspace/packages/agent-runtime/dist/SHA256SUMS /opt/geo/bundles/SHA256SUMS
+COPY --chown=10001:10001 --from=bundle-builder /workspace/packages/agent-runtime/THIRD_PARTY_NOTICES.md /usr/share/doc/memeloop-geo/agent-runtime-THIRD_PARTY_NOTICES.md
+COPY --chown=10001:10001 crates/api/THIRD_PARTY_NOTICES.md /usr/share/doc/memeloop-geo/api-THIRD_PARTY_NOTICES.md
+COPY --chown=10001:10001 LICENSE /usr/share/doc/memeloop-geo/LICENSE
 
 USER 10001:10001
 EXPOSE 8080
