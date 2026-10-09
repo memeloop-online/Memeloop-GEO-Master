@@ -93,6 +93,7 @@ export function TargetCard({
   executing,
   executeError,
   automatic = false,
+  accountDisplayName,
 }: {
   target: ChannelTarget;
   tenantId: string;
@@ -106,6 +107,7 @@ export function TargetCard({
   executing: boolean;
   executeError: unknown;
   automatic?: boolean;
+  accountDisplayName?: string | null;
 }) {
   const { t, i18n } = useTranslation("measurement");
   const [showTechnicalDetails, setShowTechnicalDetails] = useState(false);
@@ -140,8 +142,9 @@ export function TargetCard({
           <div>
             <h3>{input.question}</h3>
             <p>
-              {input.provider} ·{" "}
-              {t("resultAccount", { value: input.account_id })}
+              {input.provider}
+              {accountDisplayName?.trim() &&
+                ` · ${t("resultAccount", { value: accountDisplayName })}`}
             </p>
           </div>
           <Badge appearance="outline">
@@ -423,12 +426,14 @@ export function PlannedTarget({
   projectId,
   canWrite,
   automatic = false,
+  accountDisplayName,
 }: {
   target: ChannelTarget;
   tenantId: string;
   projectId: string;
   canWrite: boolean;
   automatic?: boolean;
+  accountDisplayName?: string | null;
 }) {
   const { session } = useAuth();
   const client = useQueryClient();
@@ -469,6 +474,7 @@ export function PlannedTarget({
       executing={execution.isPending}
       executeError={execution.error}
       automatic={automatic}
+      accountDisplayName={accountDisplayName}
     />
   );
 }

@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use geo_domain::{
-    AppError, ChannelTargetInput, ErrorCode, ObservationCapture, ObservationCaptureInput,
-    ObservationCaptureReceipt, ObservationCaptureRepository, ObservationCaptureSnapshot,
-    TenantScope,
+    AppError, ChannelTarget, ChannelTargetInput, ErrorCode, ObservationCapture,
+    ObservationCaptureInput, ObservationCaptureReceipt, ObservationCaptureRepository,
+    ObservationCaptureSnapshot, TenantScope,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -84,15 +84,18 @@ impl ObservationCaptureRepository for PgObservationCaptureRepository {
                 "observation attempt or account mismatch",
             ));
         };
-        if let Some(conversation) = &input.owned_conversation {
-            let target: ChannelTargetInput =
-                serde_json::from_value(frozen_input).map_err(|_| {
-                    AppError::new(ErrorCode::Internal, "stored measurement target invalid")
-                })?;
-            if !matches!(target, ChannelTargetInput::Measure { provider, .. } if provider == conversation.provider)
-            {
-                return Err(AppError::forbidden("observation provider mismatch"));
-            }
+        // Channel jobs persist the complete target envelope, not its input.
+        let target: ChannelTarget = serde_json::from_value(frozen_input)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "stored measurement target invalid"))?;
+        if target.target_id != input.target_id
+            || !matches!(&target.input, ChannelTargetInput::Measure { account_id, .. } if *account_id == input.account_id)
+        {
+            return Err(AppError::forbidden("observation target binding mismatch"));
+        }
+        if let Some(conversation) = &input.owned_conversation
+            && !matches!(&target.input, ChannelTargetInput::Measure { provider, .. } if provider == &conversation.provider)
+        {
+            return Err(AppError::forbidden("observation provider mismatch"));
         }
         let (phase, source_capture_id) = match &input.snapshot {
             ObservationCaptureSnapshot::Source { .. } => ("source", None),

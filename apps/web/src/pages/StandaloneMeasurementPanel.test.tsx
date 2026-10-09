@@ -158,6 +158,36 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it.each([true, false])(
+    "keeps record identifiers in collapsed details (account label available: %s)",
+    async (hasAccountLabel) => {
+      if (!hasAccountLabel) state.accounts = [];
+      const savedPlan = { ...plan, targets: [target] };
+      vi.mocked(listMeasurementPlans).mockResolvedValue({
+        items: [savedPlan],
+        next_after: null,
+      });
+      vi.mocked(getMeasurementPlan).mockResolvedValue(savedPlan);
+      const user = userEvent.setup();
+      renderPanel(false, true);
+      await user.click(
+        await screen.findByRole("button", { name: /自定义问题测量/ }),
+      );
+      expect(await screen.findByText(target.input.question)).toBeVisible();
+      expect(
+        screen.getByText(hasAccountLabel ? "kimi · 账号 测量账号" : "kimi"),
+      ).toBeVisible();
+      expect(screen.queryByText(/account-1/)).not.toBeInTheDocument();
+      expect(screen.getByText("计划 ID：measurement-1")).not.toBeVisible();
+      await user.click(screen.getByText("测量计划技术详情"));
+      expect(screen.getByText("计划 ID：measurement-1")).toBeVisible();
+      await user.click(screen.getByText("技术详情 / 原始证据"));
+      expect(
+        await screen.findByText(/"account_id": "account-1"/),
+      ).toBeVisible();
+    },
+  );
+
   it("creates one plan and displays queued, in-progress and final results without a second execute request", async () => {
     const savedPlan = { ...plan, targets: [target] };
     vi.mocked(createMeasurementPlan).mockResolvedValue(savedPlan);

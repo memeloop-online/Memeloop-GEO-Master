@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Button, Field, Select, Textarea } from "@fluentui/react-components";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
@@ -33,6 +34,7 @@ export function StandaloneMeasurementPanel({
   canWrite: boolean;
   recordsOnly?: boolean;
 }) {
+  const { t } = useTranslation("measurement");
   const [params, setParams] = useSearchParams();
   const selectedId = params.get("record") ?? params.get("planId") ?? undefined;
   const selectRecord = (id: string) =>
@@ -580,9 +582,11 @@ export function StandaloneMeasurementPanel({
           )}
           {detail.data && (
             <div className="channel-jobs-list">
-              <p>
-                计划 {detail.data.plan_id} · {detail.data.title}
-              </p>
+              <p>{detail.data.title}</p>
+              <details>
+                <summary>{t("resultPlanDetails")}</summary>
+                <p>{t("resultPlanId", { value: detail.data.plan_id })}</p>
+              </details>
               {detail.data.targets.map((target) => (
                 <PlannedTarget
                   key={target.target_id}
@@ -590,6 +594,12 @@ export function StandaloneMeasurementPanel({
                   tenantId={tenantId}
                   projectId={projectId}
                   canWrite={canWrite}
+                  accountDisplayName={
+                    channels.accounts.data?.items.find(
+                      (account) =>
+                        account.account_id === target.input.account_id,
+                    )?.display_name
+                  }
                   automatic
                 />
               ))}

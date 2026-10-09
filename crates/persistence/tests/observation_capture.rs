@@ -1,11 +1,14 @@
 use chrono::Utc;
 use geo_domain::{
-    CapturedConversation, CapturedConversationPurpose, ChannelTargetInput, ConversationCorrelation,
-    ErrorCode, ObservationCaptureCompletion, ObservationCaptureInput, ObservationCaptureRepository,
-    ObservationCaptureSnapshot, ObservationCompletionProtocol, ObservationProviderIdentity,
+    CapturedConversation, CapturedConversationPurpose, ChannelJobRepository, ChannelTarget,
+    ChannelTargetInput, ConversationCorrelation, ErrorCode, ObservationCaptureCompletion,
+    ObservationCaptureInput, ObservationCaptureRepository, ObservationCaptureSnapshot,
+    ObservationCompletionProtocol, ObservationProviderIdentity, StandaloneMeasurementPlan,
     TenantScope, sha256_hex,
 };
-use geo_persistence::{Database, DatabaseConfig, PgObservationCaptureRepository};
+use geo_persistence::{
+    Database, DatabaseConfig, PgChannelJobRepository, PgObservationCaptureRepository,
+};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -39,18 +42,42 @@ async fn capture_commit_replay_scope_and_attempt_binding() {
         sqlx::query("INSERT INTO projects (project_id,operator_id,tenant_id,slug,display_name) VALUES ($1,$2,$3,$4,'Synthetic')")
             .bind(id).bind(operator).bind(tenant).bind(format!("capture-{id}")).execute(database.pool()).await.unwrap();
     }
-    sqlx::query(
-        "INSERT INTO measurement_execution_plans \
-         (plan_id,operator_id,tenant_id,project_id,idempotency_key,request_hash,input_hash,revision,plan,created_at) \
-         VALUES ($1,$2,$3,$4,$5,'request','frozen',1,'{}',$6)"
-    ).bind(plan).bind(operator).bind(tenant).bind(project).bind(format!("capture-{plan}"))
-        .bind(Utc::now()).execute(database.pool()).await.unwrap();
-    sqlx::query(
-        "INSERT INTO channel_execution_targets \
-         (target_id,operator_id,tenant_id,project_id,kind,frozen_input,ordinal,measurement_plan_id) \
-         VALUES ($1,$2,$3,$4,'measure','{}',0,$5)"
-    ).bind(target).bind(operator).bind(tenant).bind(project).bind(plan)
-        .execute(database.pool()).await.unwrap();
+    let scope = TenantScope::new(operator.into(), tenant.into(), Some(project.into()));
+    let frozen = ChannelTarget {
+        target_id: target,
+        input: ChannelTargetInput::Measure {
+            account_id: account,
+            provider: "kimi".into(),
+            model: "synthetic".into(),
+            surface: "consumer_web".into(),
+            search_mode: "web_search".into(),
+            protocol_version: "v1".into(),
+            question_set_version: "adhoc".into(),
+            question: "Synthetic question?".into(),
+            market: "global".into(),
+            language: "en".into(),
+            scheduled_at: Utc::now(),
+            sample_ordinal: 0,
+            question_binding: None,
+        },
+    };
+    PgChannelJobRepository::from_database(&database)
+        .create_measurement_plan(
+            &scope,
+            &format!("capture-{plan}"),
+            "request",
+            StandaloneMeasurementPlan {
+                plan_id: plan,
+                project_id: scope.project_id.unwrap(),
+                title: "Synthetic capture regression".into(),
+                input_hash: "frozen".into(),
+                revision: 1,
+                created_at: Utc::now(),
+                targets: vec![frozen.clone()],
+            },
+        )
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO channel_execution_attempts \
          (attempt_id,operator_id,tenant_id,project_id,target_id,account_id,target_kind,claimed_at) \
@@ -67,7 +94,6 @@ async fn capture_commit_replay_scope_and_attempt_binding() {
     .await
     .unwrap();
 
-    let scope = TenantScope::new(operator.into(), tenant.into(), Some(project.into()));
     let other_scope = TenantScope::new(operator.into(), tenant.into(), Some(other_project.into()));
     let store = PgObservationCaptureRepository::from_database(&database);
     let source_json = r#"{"messages":[{"text":"synthetic answer"}]}"#.to_owned();
@@ -102,27 +128,6 @@ async fn capture_commit_replay_scope_and_attempt_binding() {
     };
     let raw_receipt = store.save(&scope, raw.clone()).await.unwrap();
     assert_eq!(store.save(&scope, raw.clone()).await.unwrap(), raw_receipt);
-    let frozen = ChannelTargetInput::Measure {
-        account_id: account,
-        provider: "kimi".into(),
-        model: "synthetic".into(),
-        surface: "consumer_web".into(),
-        search_mode: "web_search".into(),
-        protocol_version: "v1".into(),
-        question_set_version: "adhoc".into(),
-        question: "Synthetic question?".into(),
-        market: "global".into(),
-        language: "en".into(),
-        scheduled_at: Utc::now(),
-        sample_ordinal: 0,
-        question_binding: None,
-    };
-    sqlx::query("UPDATE channel_execution_targets SET frozen_input=$1 WHERE target_id=$2")
-        .bind(serde_json::to_value(frozen).unwrap())
-        .bind(target)
-        .execute(database.pool())
-        .await
-        .unwrap();
     let complete_json = serde_json::json!({"messages": [
         {"chat": {"id": "synthetic-chat"}},
         {"message": {"id": "synthetic-message", "chat_id": "synthetic-chat", "role": "assistant", "status": "COMPLETED"}}
@@ -152,6 +157,36 @@ async fn capture_commit_replay_scope_and_attempt_binding() {
         ..input.clone()
     };
     let completed_source_id = completed.capture_id;
+    let mut wrong_provider = completed.clone();
+    wrong_provider.completion = None;
+    wrong_provider.owned_conversation.as_mut().unwrap().provider = "other".into();
+    wrong_provider.original_identity.as_mut().unwrap().provider = "other".into();
+    assert_eq!(
+        store.save(&scope, wrong_provider).await.unwrap_err().code,
+        ErrorCode::Forbidden
+    );
+    let mut corrupted_target = frozen.clone();
+    corrupted_target.target_id = Uuid::new_v4();
+    sqlx::query("UPDATE channel_execution_targets SET frozen_input=$1 WHERE target_id=$2")
+        .bind(serde_json::to_value(corrupted_target).unwrap())
+        .bind(target)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .save(&scope, completed.clone())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Forbidden
+    );
+    sqlx::query("UPDATE channel_execution_targets SET frozen_input=$1 WHERE target_id=$2")
+        .bind(serde_json::to_value(&frozen).unwrap())
+        .bind(target)
+        .execute(database.pool())
+        .await
+        .unwrap();
     for ordinal in 0..=1 {
         if ordinal == 1 {
             completed.capture_id = Uuid::new_v4();

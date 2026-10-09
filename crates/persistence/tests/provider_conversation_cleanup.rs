@@ -1,9 +1,9 @@
 use chrono::Utc;
 use geo_domain::{
-    CapturedConversation, CapturedConversationPurpose, ChannelTargetInput, ConversationCorrelation,
-    ExtractionRoute, ObservationCaptureInput, ObservationCaptureRepository,
-    ObservationCaptureSnapshot, ProviderCleanupAction, ProviderCleanupOutcome,
-    ProviderConversationCleanupRepository, TenantScope, sha256_hex,
+    CapturedConversation, CapturedConversationPurpose, ChannelTarget, ChannelTargetInput,
+    ConversationCorrelation, ExtractionRoute, ObservationCaptureInput,
+    ObservationCaptureRepository, ObservationCaptureSnapshot, ProviderCleanupAction,
+    ProviderCleanupOutcome, ProviderConversationCleanupRepository, TenantScope, sha256_hex,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgObservationCaptureRepository,
@@ -60,7 +60,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         question_binding: None,
     };
     sqlx::query("INSERT INTO channel_execution_targets(target_id,operator_id,tenant_id,project_id,kind,frozen_input,ordinal,measurement_plan_id) VALUES($1,$2,$3,$4,'measure',$5,0,$6)")
-        .bind(target).bind(operator).bind(tenant).bind(project).bind(serde_json::to_value(frozen).unwrap()).bind(plan).execute(database.pool()).await.unwrap();
+        .bind(target).bind(operator).bind(tenant).bind(project).bind(serde_json::to_value(ChannelTarget {target_id: target, input: frozen}).unwrap()).bind(plan).execute(database.pool()).await.unwrap();
     sqlx::query("INSERT INTO channel_execution_attempts(attempt_id,operator_id,tenant_id,project_id,target_id,account_id,target_kind,claimed_at) VALUES($1,$2,$3,$4,$5,$6,'measure',now())")
         .bind(attempt).bind(operator).bind(tenant).bind(project).bind(target).bind(account).execute(database.pool()).await.unwrap();
     let scope = TenantScope::new(operator.into(), tenant.into(), Some(project.into()));
@@ -470,7 +470,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     sqlx::query("INSERT INTO measurement_execution_plans(plan_id,operator_id,tenant_id,project_id,idempotency_key,request_hash,input_hash,revision,plan,created_at) VALUES($1,$2,$3,$4,$5,'request','frozen',1,'{}',now())")
         .bind(second_plan).bind(operator).bind(tenant).bind(second_project).bind(format!("cleanup-{second_plan}"))
         .execute(database.pool()).await.unwrap();
-    sqlx::query("INSERT INTO channel_execution_targets(target_id,operator_id,tenant_id,project_id,kind,frozen_input,ordinal,measurement_plan_id) SELECT $1,operator_id,tenant_id,$2,kind,frozen_input,0,$3 FROM channel_execution_targets WHERE target_id=$4")
+    sqlx::query("INSERT INTO channel_execution_targets(target_id,operator_id,tenant_id,project_id,kind,frozen_input,ordinal,measurement_plan_id) SELECT $1,operator_id,tenant_id,$2,kind,jsonb_set(frozen_input,'{target_id}',to_jsonb($1::uuid)),0,$3 FROM channel_execution_targets WHERE target_id=$4")
         .bind(second_target).bind(second_project).bind(second_plan).bind(target)
         .execute(database.pool()).await.unwrap();
     sqlx::query("INSERT INTO channel_execution_attempts(attempt_id,operator_id,tenant_id,project_id,target_id,account_id,target_kind,claimed_at,received_at,outcome) VALUES($1,$2,$3,$4,$5,$6,'measure',now(),now(),'{\"status\":\"unknown\"}')")
