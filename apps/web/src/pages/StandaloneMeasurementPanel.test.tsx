@@ -22,6 +22,7 @@ import {
 
 const state = vi.hoisted(() => ({
   accounts: [] as unknown[],
+  platforms: [] as unknown[],
   refetch: vi.fn(),
   accountsError: false,
 }));
@@ -32,6 +33,12 @@ vi.mock("../auth/AuthProvider", () => ({
 }));
 vi.mock("../api/channels", () => ({
   useChannelData: () => ({
+    platforms: {
+      data: { items: state.platforms },
+      isPending: false,
+      isError: false,
+      refetch: vi.fn(),
+    },
     accounts: {
       data: { items: state.accounts },
       isPending: false,
@@ -130,6 +137,16 @@ function renderPanel(canWrite = true, recordsOnly = false, followTabs = false) {
 beforeEach(() => {
   vi.clearAllMocks();
   state.accountsError = false;
+  state.platforms = [
+    {
+      id: "kimi",
+      label: "Kimi",
+      purpose: "measurement",
+      login_supported: true,
+      login_entry_available: true,
+      measurement_supported: true,
+    },
+  ];
   state.accounts = [
     {
       account_id: "account-1",
@@ -161,6 +178,72 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it("submits the selected supported provider instead of a fixed provider", async () => {
+    state.platforms = [
+      {
+        id: "deepseek",
+        label: "DeepSeek",
+        purpose: "measurement",
+        login_supported: true,
+        login_entry_available: true,
+        measurement_supported: true,
+      },
+    ];
+    state.accounts = [
+      {
+        account_id: "other-account",
+        platform: "deepseek",
+        status: "ready",
+        enabled: true,
+      },
+    ];
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByRole("option", { name: "网页当前模型" });
+    await user.type(screen.getByRole("textbox"), "如何观察流星雨？");
+    await user.click(screen.getByRole("button", { name: "开始测量" }));
+    await waitFor(() =>
+      expect(createMeasurementPlan).toHaveBeenCalledWith(
+        "tenant-1",
+        "project-1",
+        expect.objectContaining({
+          measurements: [
+            expect.objectContaining({
+              provider: "deepseek",
+              account_id: "other-account",
+            }),
+          ],
+        }),
+      ),
+    );
+  });
+  it.each([
+    { login_supported: false, measurement_supported: false },
+    { login_supported: true, measurement_supported: false },
+    { login_supported: false, measurement_supported: true },
+  ])(
+    "does not measure an account without both verified capabilities: %j",
+    async (capabilities) => {
+      state.platforms = [
+        {
+          id: "kimi",
+          label: "Kimi",
+          purpose: "measurement",
+          login_entry_available: true,
+          ...capabilities,
+        },
+      ];
+      renderPanel();
+      expect(
+        await screen.findByRole("button", { name: "开始测量" }),
+      ).toBeDisabled();
+      expect(getMeasurementOptions).not.toHaveBeenCalled();
+      expect(createMeasurementPlan).not.toHaveBeenCalled();
+      expect(
+        screen.getByRole("option", { name: "还没有可用的测量账号。" }),
+      ).toBeInTheDocument();
+    },
+  );
   it.each([true, false])(
     "keeps record identifiers in collapsed details (account label available: %s)",
     async (hasAccountLabel) => {

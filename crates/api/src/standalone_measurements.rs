@@ -184,6 +184,10 @@ pub async fn create_agent_plan(
     {
         return agent_receipt(&plan, request.account_id);
     }
+    let account = state
+        .channel_service()
+        .resolve_available_account(scope, request.account_id)
+        .await?;
     let observed = crate::measurement_options::discover(state, scope, request.account_id).await?;
     let model = if let Some(model) = request.model.as_ref() {
         if !observed.models.iter().any(|item| &item.id == model) {
@@ -207,7 +211,7 @@ pub async fn create_agent_plan(
             title: "Ad-hoc question measurement".into(),
             measurements: vec![MeasurementRequest {
                 account_id: request.account_id,
-                provider: "kimi".into(),
+                provider: account.platform,
                 model,
                 surface: "consumer_web".into(),
                 search_mode: "web_search".into(),

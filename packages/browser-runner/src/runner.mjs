@@ -194,6 +194,12 @@ export function createRunner(options = {}) {
           ),
           // Presence in a deployed runner is not live account verification.
           verified: false,
+          ...(typeof adapter.loginEntryAvailable === "boolean"
+            ? { login_entry_available: adapter.loginEntryAvailable }
+            : {}),
+          ...(typeof adapter.loginSupported === "boolean"
+            ? { login_supported: adapter.loginSupported }
+            : {}),
         })),
     };
   }

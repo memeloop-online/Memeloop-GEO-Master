@@ -4,13 +4,21 @@ import { queryScopeFor } from "../auth/types";
 import { apiFetch } from "./client";
 
 export type ChannelPlatformId =
-  "zhihu" | "baidu_creator" | "xiaohongshu" | "kimi";
+  | "zhihu"
+  | "baidu_creator"
+  | "xiaohongshu"
+  | "kimi"
+  | "doubao"
+  | "deepseek"
+  | "glm";
 
 export interface ChannelPlatform {
   id: ChannelPlatformId;
   label: string;
   purpose: "publishing" | "measurement";
   login_supported: boolean;
+  login_entry_available: boolean;
+  measurement_supported: boolean;
 }
 
 export type ConnectorAvailability =

@@ -1,6 +1,14 @@
 import i18n from "../i18n";
 
 const zh = {
+  platformAccount: "{{platform}} 账号",
+  platformCatalogError: "测量平台暂时无法读取",
+  platformCatalogLoading: "正在读取测量平台",
+  measurementUnavailable: "暂不支持测量",
+  projectMeasurementAccount: "项目测量账号",
+  measurementCapabilityNote:
+    "账号已登录不代表本次测量成功；无法获取回答或确认联网搜索时，会显示相应结果。",
+  measurementModelHint: "填写账号当前可选模型的标识；不会自动切换为其他模型。",
   customMeasurementScope: "自定义问题 · 中国 · 中文 · 仅用于测量。",
   questionSetMeasurementScope: "采用所选问题的设置。",
   measurementMethod: "通过账号的联网搜索获取回答。",
@@ -83,6 +91,15 @@ const zh = {
 } as const;
 
 const en = {
+  platformAccount: "{{platform}} account",
+  platformCatalogError: "Measurement platforms could not be loaded",
+  platformCatalogLoading: "Loading measurement platforms",
+  measurementUnavailable: "Measurement unavailable",
+  projectMeasurementAccount: "Project measurement account",
+  measurementCapabilityNote:
+    "Signing in does not guarantee a successful measurement. Results indicate when an answer or web search cannot be confirmed.",
+  measurementModelHint:
+    "Enter an identifier for a model available to this account. Models are not switched automatically.",
   customMeasurementScope:
     "Custom question · China · Chinese · Measurement only.",
   questionSetMeasurementScope: "Uses the selected question's settings.",

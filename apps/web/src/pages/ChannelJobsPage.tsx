@@ -538,6 +538,7 @@ function FrozenPlan({
 
 export function ChannelJobsPage() {
   const { tenantId, projectId } = useParams();
+  const { t } = useTranslation("measurement");
   const { session } = useAuth();
   const client = useQueryClient();
   const membership = membershipForTenant(session, tenantId);
@@ -667,21 +668,18 @@ export function ChannelJobsPage() {
   const selectedAccount = accounts.find(
     (account) => account.account_id === accountId,
   );
-  // The platform registry describes login support, not verified official search.
-  const kimiPlatform = channels.platforms.data?.items.find(
-    (platform) =>
-      platform.id === "kimi" &&
-      platform.purpose === "measurement" &&
-      platform.login_supported,
+  const measurementAccounts = (channels.accounts.data?.items ?? []).filter(
+    (account) =>
+      channels.platforms.data?.items.some(
+        (platform) =>
+          platform.id === account.platform &&
+          platform.purpose === "measurement" &&
+          platform.login_supported &&
+          platform.measurement_supported,
+      ) &&
+      account.enabled &&
+      account.status === "ready",
   );
-  const measurementAccounts = kimiPlatform
-    ? (channels.accounts.data?.items ?? []).filter(
-        (account) =>
-          account.platform === "kimi" &&
-          account.enabled &&
-          account.status === "ready",
-      )
-    : [];
   const selectedMeasurementAccount = measurementAccounts.find(
     (account) => account.account_id === measurementAccountId,
   );
@@ -750,7 +748,7 @@ export function ChannelJobsPage() {
       if (!questionSetId || !boundVersionId || !selectedBoundQuestion) return;
       const item: BoundMeasurementRequest = {
         account_id: selectedMeasurementAccount.account_id,
-        provider: "kimi",
+        provider: selectedMeasurementAccount.platform,
         model: model.trim(),
         surface: "consumer_web",
         search_mode: "web_search",
@@ -774,7 +772,7 @@ export function ChannelJobsPage() {
     }
     const item: MeasurementRequest = {
       account_id: selectedMeasurementAccount.account_id,
-      provider: "kimi",
+      provider: selectedMeasurementAccount.platform,
       model: model.trim(),
       surface: "consumer_web",
       search_mode: "web_search",
@@ -1153,11 +1151,7 @@ export function ChannelJobsPage() {
                   <h3>独立 AI 测量（消费端网页）</h3>
                   <MessageBar intent="warning">
                     <MessageBarBody>
-                      Kimi
-                      网页账号登录只表示可尝试采样。官方联网搜索适配器尚未实测验证，
-                      无法确认实际搜索、完整答案或所选模型时会记录不支持或缺测；
-                      不能将登录或普通模型回答视为官方搜索成功。
-                      模型标识和协议版本须按实际观测填写，系统尚不提供已验证的模型能力列表。
+                      {t("measurementCapabilityNote")}
                     </MessageBarBody>
                   </MessageBar>
                   {!channels.accounts.isPending &&
@@ -1165,13 +1159,10 @@ export function ChannelJobsPage() {
                     !channels.accounts.isError &&
                     !channels.platforms.isError &&
                     !measurementAccounts.length && (
-                      <p role="status">
-                        没有已连接且就绪的项目 Kimi
-                        测量账号；发布账号不能用于测量。
-                      </p>
+                      <p role="status">{t("noMeasurementAccount")}</p>
                     )}
                   <div className="channel-jobs-form">
-                    <Field label="项目 Kimi 测量账号">
+                    <Field label={t("projectMeasurementAccount")}>
                       <Select
                         value={measurementAccountId}
                         onChange={(_, data) =>
@@ -1196,7 +1187,7 @@ export function ChannelJobsPage() {
                     </Field>
                     <Field
                       label="可见模型标识"
-                      hint="填写账号当前可选模型的标识，例如 k2d6-chat；不会自动切换为其他模型。"
+                      hint={t("measurementModelHint")}
                     >
                       <Input
                         value={model}
@@ -1280,8 +1271,7 @@ export function ChannelJobsPage() {
                     </Button>
                   </div>
                   <p>
-                    固定协议：Kimi · consumer_web ·
-                    web_search。绑定问题的用途由服务端确定；
+                    {t("measurementMethod")}绑定问题的用途由服务端确定；
                     冻结评估题及逐题答案不进入优化，临时未分类问题也不进入优化。
                   </p>
                   <h3>

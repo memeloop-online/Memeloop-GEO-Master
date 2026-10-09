@@ -90,18 +90,34 @@ export function StandaloneMeasurementPanel({
     enabled: Boolean(session && recordsOnly && selectedId),
     retry: false,
   });
-  const accounts = (channels.accounts.data?.items ?? []).filter(
-    (account) => account.platform === "kimi",
+  const accounts = (channels.accounts.data?.items ?? []).filter((account) =>
+    channels.platforms.data?.items.some(
+      (platform) =>
+        platform.id === account.platform && platform.purpose === "measurement",
+    ),
   );
+  const supportsMeasurement = (platformId: string) =>
+    channels.platforms.data?.items.some(
+      (platform) =>
+        platform.id === platformId &&
+        platform.login_supported &&
+        platform.measurement_supported,
+    ) === true;
   const selectedAccount = accounts.find(
     (account) =>
       account.account_id ===
       (accountId ||
-        accounts.find((item) => item.enabled && item.status === "ready")
-          ?.account_id),
+        accounts.find(
+          (item) =>
+            item.enabled &&
+            item.status === "ready" &&
+            supportsMeasurement(item.platform),
+        )?.account_id),
   );
   const accountReady = Boolean(
-    selectedAccount?.enabled && selectedAccount.status === "ready",
+    selectedAccount?.enabled &&
+    selectedAccount.status === "ready" &&
+    supportsMeasurement(selectedAccount.platform),
   );
   const options = useQuery({
     queryKey: [...key, "options", selectedAccount?.account_id],
@@ -186,10 +202,10 @@ export function StandaloneMeasurementPanel({
     },
   });
   function start() {
-    if (!selectedAccount || !selectedModel) return;
+    if (!selectedAccount || !selectedModel || !accountReady) return;
     const common = {
       account_id: selectedAccount.account_id,
-      provider: "kimi",
+      provider: selectedAccount.platform,
       model: selectedModel,
       surface: "consumer_web",
       search_mode: "web_search",
@@ -260,6 +276,16 @@ export function StandaloneMeasurementPanel({
         <>
           <h2>开始测量</h2>
           <p>输入问题，选择账号，查看联网搜索答案。</p>
+          {channels.platforms.isPending && (
+            <LoadingState label={t("platformCatalogLoading")} />
+          )}
+          {channels.platforms.isError && (
+            <ErrorState
+              title={t("platformCatalogError")}
+              detail={errorText(channels.platforms.error)}
+              onRetry={() => void channels.platforms.refetch()}
+            />
+          )}
           {channels.accounts.isPending && (
             <LoadingState label="正在读取测量账号" />
           )}
@@ -272,6 +298,8 @@ export function StandaloneMeasurementPanel({
           )}
           {!channels.accounts.isPending &&
             !channels.accounts.isError &&
+            !channels.platforms.isPending &&
+            !channels.platforms.isError &&
             !accounts.length &&
             canWrite && (
               <p role="status">
@@ -392,7 +420,13 @@ export function StandaloneMeasurementPanel({
                   >
                     {!selectedAccount && (
                       <option value="">
-                        {accounts.length ? "请重新连接账号" : "尚未连接账号"}
+                        {accounts.length
+                          ? accounts.some((account) =>
+                              supportsMeasurement(account.platform),
+                            )
+                            ? "请重新连接账号"
+                            : t("noMeasurementAccount")
+                          : "尚未连接账号"}
                       </option>
                     )}
                     {accounts.map((account) => (
@@ -400,17 +434,28 @@ export function StandaloneMeasurementPanel({
                         key={account.account_id}
                         value={account.account_id}
                         disabled={
-                          !account.enabled || account.status !== "ready"
+                          !account.enabled ||
+                          account.status !== "ready" ||
+                          !supportsMeasurement(account.platform)
                         }
                       >
-                        {account.display_name ?? "Kimi 账号"} ·{" "}
-                        {account.enabled && account.status === "ready"
-                          ? "已登录"
-                          : !account.enabled || account.status === "disabled"
-                            ? "已停用"
-                            : account.status === "unverified"
-                              ? "身份待验证"
-                              : "需要重新连接"}
+                        {account.display_name ??
+                          t("platformAccount", {
+                            platform:
+                              channels.platforms.data?.items.find(
+                                (platform) => platform.id === account.platform,
+                              )?.label ?? account.platform,
+                          })}{" "}
+                        ·{" "}
+                        {!supportsMeasurement(account.platform)
+                          ? t("measurementUnavailable")
+                          : account.enabled && account.status === "ready"
+                            ? "已登录"
+                            : !account.enabled || account.status === "disabled"
+                              ? "已停用"
+                              : account.status === "unverified"
+                                ? "身份待验证"
+                                : "需要重新连接"}
                       </option>
                     ))}
                   </Select>

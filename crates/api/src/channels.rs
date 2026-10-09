@@ -618,38 +618,95 @@ pub struct PlatformDescriptor {
     pub id: &'static str,
     pub label: &'static str,
     pub purpose: &'static str,
+    pub login_entry_available: bool,
     pub login_supported: bool,
+    /// Installed execution capability, not proof of a successful measurement.
+    pub measurement_supported: bool,
 }
 
-pub async fn platforms() -> Json<ChannelList<PlatformDescriptor>> {
+pub async fn platforms(State(state): State<AppState>) -> Json<ChannelList<PlatformDescriptor>> {
+    let connectors = crate::connector_capabilities::deployed_versions(&state).await;
     Json(ChannelList {
-        items: vec![
-            PlatformDescriptor {
-                id: "zhihu",
-                label: "知乎创作中心",
-                purpose: "publishing",
-                login_supported: true,
-            },
-            PlatformDescriptor {
-                id: "baidu_creator",
-                label: "百度创作平台",
-                purpose: "publishing",
-                login_supported: true,
-            },
-            PlatformDescriptor {
-                id: "xiaohongshu",
-                label: "小红书创作中心",
-                purpose: "publishing",
-                login_supported: true,
-            },
-            PlatformDescriptor {
-                id: "kimi",
-                label: "Kimi 网页",
-                purpose: "measurement",
-                login_supported: true,
-            },
-        ],
+        items: platform_catalog(&connectors),
     })
+}
+
+fn platform_catalog(
+    connectors: &[crate::browser_bridge::RunnerConnector],
+) -> Vec<PlatformDescriptor> {
+    [
+        ("zhihu", "知乎创作中心", "publishing", true),
+        ("baidu_creator", "百度创作平台", "publishing", true),
+        ("xiaohongshu", "小红书创作中心", "publishing", true),
+        ("kimi", "Kimi 网页", "measurement", true),
+        ("doubao", "豆包网页", "measurement", false),
+        ("deepseek", "DeepSeek 网页", "measurement", false),
+        ("glm", "GLM 网页", "measurement", false),
+    ]
+    .into_iter()
+    .map(|(id, label, purpose, legacy_login)| {
+        let matching: Vec<_> = connectors
+            .iter()
+            .filter(|entry| entry.platform == id && entry.placement_slot == "primary")
+            .collect();
+        let connector = (matching.len() == 1)
+            .then(|| matching[0])
+            .filter(|entry| !entry.connector_version.trim().is_empty());
+        PlatformDescriptor {
+            id,
+            label,
+            purpose,
+            login_entry_available: connector
+                .and_then(|entry| entry.login_entry_available)
+                .unwrap_or(legacy_login),
+            login_supported: connector
+                .and_then(|entry| entry.login_supported)
+                .unwrap_or(legacy_login),
+            measurement_supported: geo_domain::consumer_web_provider(id)
+                && crate::browser_bridge::measurement_connector_available(connectors, id),
+        }
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod platform_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn entry_login_and_measurement_are_independent_and_fail_closed() {
+        let empty = platform_catalog(&[]);
+        for provider in ["doubao", "deepseek", "glm"] {
+            assert!(geo_domain::supported_channel(provider));
+            let item = empty.iter().find(|item| item.id == provider).unwrap();
+            assert!(
+                !item.login_entry_available && !item.login_supported && !item.measurement_supported
+            );
+        }
+        assert!(
+            empty
+                .iter()
+                .find(|item| item.id == "kimi")
+                .unwrap()
+                .login_supported
+        );
+        let mut connector: crate::browser_bridge::RunnerConnector = serde_json::from_value(serde_json::json!({
+            "platform":"doubao","placement_slot":"primary","connector_version":"synthetic.v1",
+            "operations":[],"verified":false,"login_entry_available":true,"login_supported":false
+        })).unwrap();
+        let catalog = platform_catalog(std::slice::from_ref(&connector));
+        let item = catalog.iter().find(|item| item.id == "doubao").unwrap();
+        assert!(item.login_entry_available);
+        assert!(!item.login_supported && !item.measurement_supported);
+        connector.login_supported = Some(true);
+        connector.operations = vec!["measure".into()];
+        let catalog = platform_catalog(std::slice::from_ref(&connector));
+        let item = catalog.iter().find(|item| item.id == "doubao").unwrap();
+        assert!(item.login_supported && item.measurement_supported);
+        let catalog = platform_catalog(&[connector.clone(), connector]);
+        let item = catalog.iter().find(|item| item.id == "doubao").unwrap();
+        assert!(!item.login_supported && !item.measurement_supported);
+    }
 }
 
 fn default_settings(project_id: ProjectId) -> ChannelSettings {

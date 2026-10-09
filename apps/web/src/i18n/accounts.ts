@@ -30,9 +30,10 @@ const accounts = {
         unavailableDetail: "暂不支持发布。",
       },
       remote: {
+        entryOnly: "可打开登录页面，但暂不支持核验账号身份或进行测量。",
         title: "远程登录",
         cancel: "取消并关闭",
-        help: "在下方远程页面完成平台登录。识别到账号身份后会自动保存连接。",
+        help: "在下方远程页面完成平台登录。只有支持身份核验的平台才能在识别账号后保存连接；打开页面不代表账号已连接。",
         launching: "正在启动远程浏览器",
         checking: "正在确认登录状态",
         identity: "检测到账号：{{name}}",
@@ -154,7 +155,9 @@ const accounts = {
       remote: {
         title: "Remote sign-in",
         cancel: "Cancel and close",
-        help: "Sign in on the remote page below. Once your account is identified, the connection is saved automatically.",
+        entryOnly:
+          "You can open the sign-in page, but account verification and measurement are not yet supported.",
+        help: "Sign in on the remote page below. Supported platforms save the connection after verifying your account. Opening the page does not mean the account is connected.",
         launching: "Starting remote browser",
         checking: "Checking sign-in status",
         identity: "Account found: {{name}}",

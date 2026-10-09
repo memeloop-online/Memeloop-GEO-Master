@@ -177,7 +177,13 @@ pub struct LoginSession {
 }
 
 pub fn supported_channel(platform: &str) -> bool {
-    matches!(platform, "zhihu" | "baidu_creator" | "xiaohongshu" | "kimi")
+    matches!(platform, "zhihu" | "baidu_creator" | "xiaohongshu") || consumer_web_provider(platform)
+}
+
+/// Registered account namespaces, not a claim of installed login or measurement
+/// support. Those capabilities belong to the authenticated running adapter.
+pub fn consumer_web_provider(platform: &str) -> bool {
+    matches!(platform, "kimi" | "doubao" | "deepseek" | "glm")
 }
 
 fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {

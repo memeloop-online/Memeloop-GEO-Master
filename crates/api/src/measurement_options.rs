@@ -40,7 +40,7 @@ pub async fn discover(
             "channel account is not ready; reconnect the account",
         ));
     }
-    if account.platform != "kimi" {
+    if !geo_domain::consumer_web_provider(&account.platform) {
         return Err(AppError::capability_missing(
             "website model discovery is not supported for this channel",
         ));
@@ -54,6 +54,7 @@ pub async fn discover(
         .browser
         .as_ref()
         .ok_or_else(|| AppError::capability_missing("browser runner is not configured"))?;
+    require_installed_measurement(state, &account.platform).await?;
     let (session_id, mut version) = service
         .resume_available_browser_with_renewal(scope, account_id)
         .await?;
@@ -80,4 +81,24 @@ pub async fn discover(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Preserve the installed legacy Kimi protocol. Newly registered namespaces
+/// remain unavailable until the running adapter explicitly offers measurement.
+pub(crate) async fn require_installed_measurement(
+    state: &AppState,
+    provider: &str,
+) -> Result<(), AppError> {
+    if provider == "kimi" {
+        return Ok(());
+    }
+    let connectors = crate::connector_capabilities::deployed_versions(state).await;
+    if !geo_domain::consumer_web_provider(provider)
+        || !crate::browser_bridge::measurement_connector_available(&connectors, provider)
+    {
+        return Err(AppError::capability_missing(
+            "website measurement is not supported by the installed adapter",
+        ));
+    }
+    Ok(())
 }

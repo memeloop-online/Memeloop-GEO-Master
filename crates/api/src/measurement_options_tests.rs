@@ -28,10 +28,25 @@ use uuid::Uuid;
 
 #[derive(Clone, Default)]
 struct Stub {
+    measure_installed: Arc<AtomicBool>,
     mismatch: Arc<AtomicBool>,
     unavailable: Arc<AtomicBool>,
     closed: Arc<AtomicUsize>,
     starts: Arc<tokio::sync::Mutex<Vec<Value>>>,
+}
+
+async fn capabilities(State(stub): State<Stub>) -> Json<Value> {
+    let operations = if stub.measure_installed.load(Ordering::SeqCst) {
+        vec!["measure"]
+    } else {
+        vec![]
+    };
+    Json(
+        json!({"connectors": (["kimi", "doubao", "deepseek", "glm"].map(|provider| json!({
+            "platform":provider,"placement_slot":"primary","connector_version":"synthetic.v1",
+            "operations":operations,"verified":false,"login_entry_available":true,"login_supported":true
+        })))}),
+    )
 }
 
 async fn start(State(stub): State<Stub>, Json(input): Json<Value>) -> Json<Value> {
@@ -68,8 +83,20 @@ async fn close(State(stub): State<Stub>) -> Json<Value> {
 
 #[tokio::test]
 async fn discovery_restores_identity_returns_only_models_and_always_closes() {
+    discovery_for_provider("kimi").await;
+}
+
+#[tokio::test]
+async fn registered_providers_require_measure_adapter_and_keep_scoped_lifecycle() {
+    for provider in ["doubao", "deepseek", "glm"] {
+        discovery_for_provider(provider).await;
+    }
+}
+
+async fn discovery_for_provider(provider: &str) {
     let stub = Stub::default();
     let app = Router::new()
+        .route("/v1/capabilities", get(capabilities))
         .route("/v1/sessions", post(start))
         .route("/v1/sessions/{id}/complete", post(complete))
         .route("/v1/sessions/{id}/measurement-options", get(options))
@@ -144,7 +171,7 @@ async fn discovery_restores_identity_returns_only_models_and_always_closes() {
                     account_id,
                     project_id,
                     owner_kind: ChannelOwnerKind::Customer,
-                    platform: "kimi".into(),
+                    platform: provider.into(),
                     group_id: None,
                     status: ChannelStatus::Ready,
                     display_name: Some("Fixture".into()),
@@ -162,6 +189,17 @@ async fn discovery_restores_identity_returns_only_models_and_always_closes() {
         )
         .await
         .unwrap();
+    if provider != "kimi" {
+        assert_eq!(
+            discover(&state, &scope, account_id).await.unwrap_err().code,
+            ErrorCode::CapabilityMissing
+        );
+        assert!(
+            stub.starts.lock().await.is_empty(),
+            "login-only adapter must not start measurement discovery"
+        );
+    }
+    stub.measure_installed.store(true, Ordering::SeqCst);
     let result = discover(&state, &scope, account_id).await.unwrap();
     assert_eq!(
         serde_json::to_value(result).unwrap(),
@@ -202,6 +240,14 @@ async fn discovery_restores_identity_returns_only_models_and_always_closes() {
         .unwrap();
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.model, "observed-model");
+    let persisted = state
+        .channel_job_repository()
+        .get_target(&scope, accepted.target_id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&persisted.target.input, ChannelTargetInput::Measure { provider: saved, .. } if saved == provider)
+    );
     assert_eq!(
         stub.starts.lock().await[1],
         json!({"private":"not-returned"})

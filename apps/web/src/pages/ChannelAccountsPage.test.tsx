@@ -93,20 +93,38 @@ const account = {
   updated_at: "2026-10-01T00:00:00Z",
 };
 const platforms = [
-  { id: "zhihu", label: "知乎", purpose: "publishing", login_supported: true },
+  {
+    id: "zhihu",
+    label: "知乎",
+    purpose: "publishing",
+    login_supported: true,
+    login_entry_available: true,
+    measurement_supported: true,
+  },
   {
     id: "baidu_creator",
     label: "百家号",
     purpose: "publishing",
     login_supported: true,
+    login_entry_available: true,
+    measurement_supported: true,
   },
   {
     id: "xiaohongshu",
     label: "小红书",
     purpose: "publishing",
     login_supported: true,
+    login_entry_available: true,
+    measurement_supported: true,
   },
-  { id: "kimi", label: "Kimi", purpose: "measurement", login_supported: true },
+  {
+    id: "kimi",
+    label: "Kimi",
+    purpose: "measurement",
+    login_supported: true,
+    login_entry_available: true,
+    measurement_supported: true,
+  },
 ];
 const snapshot = {
   phase: "login_required",
@@ -139,6 +157,7 @@ function mockApi(
   operator = false,
   connector = unverifiedCapability,
   operatorRole = "resource_admin",
+  catalog = platforms,
 ) {
   let identityReady = false;
   const requests: { path: string; method: string; body?: unknown; url: URL }[] =
@@ -192,7 +211,7 @@ function mockApi(
     )
       return Promise.resolve(response(undefined, 204));
     if (path.endsWith("/channel-platforms"))
-      return Promise.resolve(response({ items: platforms }));
+      return Promise.resolve(response({ items: catalog }));
     if (path.endsWith("/channel-accounts") && method === "GET")
       return Promise.resolve(response({ items: initialAccounts }));
     if (path.endsWith("/channel-groups") && method === "GET")
@@ -414,6 +433,70 @@ describe("channel API scope", () => {
 });
 
 describe("account page", () => {
+  it("does not label a stored ready account connected when verification is unsupported", async () => {
+    mockApi(
+      [{ ...account, platform: "deepseek", status: "ready" }],
+      false,
+      unverifiedCapability,
+      "resource_admin",
+      [
+        {
+          id: "deepseek",
+          label: "DeepSeek",
+          purpose: "measurement",
+          login_entry_available: true,
+          login_supported: false,
+          measurement_supported: false,
+        },
+      ],
+    );
+    renderPage();
+    expect(await screen.findByText("等待身份验证")).toBeVisible();
+    expect(
+      screen.queryByText("已连接", { exact: true }),
+    ).not.toBeInTheDocument();
+  });
+  it("opens entry-only platforms without claiming a verified connection", async () => {
+    const api = mockApi([], false, unverifiedCapability, "resource_admin", [
+      {
+        id: "deepseek",
+        label: "DeepSeek",
+        purpose: "measurement",
+        login_entry_available: true,
+        login_supported: false,
+        measurement_supported: false,
+      },
+      {
+        id: "glm",
+        label: "GLM",
+        purpose: "measurement",
+        login_entry_available: false,
+        login_supported: false,
+        measurement_supported: false,
+      },
+    ]);
+    const user = userEvent.setup();
+    renderPage("connect");
+    await user.selectOptions(await screen.findByLabelText("平台"), "deepseek");
+    expect(screen.getByRole("option", { name: /GLM/ })).toBeDisabled();
+    expect(
+      screen.getByText("可打开登录页面，但暂不支持核验账号身份或进行测量。"),
+    ).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "启动远程登录" }));
+    await waitFor(() =>
+      expect(
+        api.requests.some(
+          (request) =>
+            request.path.endsWith("/channel-login-sessions") &&
+            request.method === "POST",
+        ),
+      ).toBe(true),
+    );
+    expect(screen.queryByText("账号已连接。")).not.toBeInTheDocument();
+    expect(
+      api.requests.some((request) => request.path.endsWith("/complete")),
+    ).toBe(false);
+  });
   it("shows account connection separately from read-only project publication verification", async () => {
     const { requests } = mockApi([account]);
     renderPage();

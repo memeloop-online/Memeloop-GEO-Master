@@ -280,6 +280,7 @@ function mockApi({
   currentCycleId = cycleId,
   cycleError = false,
   measurementSupported = true,
+  measurementProvider = "kimi",
   planConflict = false,
   questionSets = [],
   questionVersion = null,
@@ -293,6 +294,7 @@ function mockApi({
   currentCycleId?: string | null;
   cycleError?: boolean;
   measurementSupported?: boolean;
+  measurementProvider?: string;
   planConflict?: boolean;
   questionSets?: unknown[];
   questionVersion?: unknown;
@@ -443,14 +445,18 @@ function mockApi({
                 label: "知乎",
                 purpose: "publishing",
                 login_supported: true,
+                login_entry_available: true,
+                measurement_supported: true,
               },
               ...(measurementSupported
                 ? [
                     {
-                      id: "kimi",
+                      id: measurementProvider,
                       label: "Kimi 网页",
                       purpose: "measurement",
                       login_supported: true,
+                      login_entry_available: true,
+                      measurement_supported: true,
                     },
                   ]
                 : []),
@@ -640,7 +646,7 @@ describe("P12 channel jobs", () => {
     );
     expect(screen.getByText(/已选用途：冻结评估/)).toBeInTheDocument();
     await user.selectOptions(
-      screen.getByLabelText("项目 Kimi 测量账号"),
+      screen.getByLabelText("项目测量账号"),
       "measure-account-1",
     );
     await user.type(screen.getByLabelText("可见模型标识"), "visible-model");
@@ -788,68 +794,72 @@ describe("P12 channel jobs", () => {
     expect(requests.filter((item) => item.method === "POST")).toHaveLength(0);
   });
 
-  it("freezes a typed independent Kimi measurement without any publication", async () => {
-    const requests = mockApi({
-      sources: [],
-      accounts: [account, measurementAccount],
-    });
-    const user = userEvent.setup();
-    renderPage();
-    await user.selectOptions(
-      await screen.findByLabelText("测量问题模式"),
-      "legacy",
-    );
-    await user.selectOptions(
-      await screen.findByLabelText("项目 Kimi 测量账号"),
-      "measure-account-1",
-    );
-    await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
-    await user.type(screen.getByLabelText("采样协议版本"), "protocol-v1");
-    await user.type(screen.getByLabelText("临时问题集标签"), "evaluation-v2");
-    await user.type(screen.getByLabelText("市场"), "CN");
-    await user.type(screen.getByLabelText("语言"), "zh-CN");
-    await user.type(
-      screen.getByLabelText("临时问题（未分类）"),
-      "这是什么产品？",
-    );
-    await user.clear(screen.getByLabelText("样本序号（0–10000）"));
-    await user.type(screen.getByLabelText("样本序号（0–10000）"), "3");
-    await user.type(
-      screen.getByLabelText("计划采样时间（本地时间）"),
-      "2026-10-06T12:30",
-    );
-    expect(
-      screen.getByText(/官方联网搜索适配器尚未实测验证/),
-    ).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "加入测量目标" }));
-    await user.click(screen.getByRole("button", { name: "封存本轮计划" }));
-    const request = requests.find(
-      (item) =>
-        item.method === "POST" &&
-        item.path.endsWith("/cycles/cycle-1/channel-plan"),
-    );
-    expect(request?.body).toEqual({
-      publications: [],
-      measurements: [
-        {
-          account_id: "measure-account-1",
-          provider: "kimi",
-          model: "observed-model",
-          surface: "consumer_web",
-          search_mode: "web_search",
-          protocol_version: "protocol-v1",
-          question_set_version: "evaluation-v2",
-          question: "这是什么产品？",
-          market: "CN",
-          language: "zh-CN",
-          scheduled_at: new Date("2026-10-06T12:30").toISOString(),
-          sample_ordinal: 3,
-        },
-      ],
-      bound_measurements: [],
-    });
-    expect(screen.queryByText(/已观察/)).not.toBeInTheDocument();
-  });
+  it.each(["kimi", "doubao", "deepseek", "glm"])(
+    "freezes a typed independent %s measurement without any publication",
+    async (provider) => {
+      const requests = mockApi({
+        sources: [],
+        accounts: [account, { ...measurementAccount, platform: provider }],
+        measurementProvider: provider,
+      });
+      const user = userEvent.setup();
+      renderPage();
+      await user.selectOptions(
+        await screen.findByLabelText("测量问题模式"),
+        "legacy",
+      );
+      await user.selectOptions(
+        await screen.findByLabelText("项目测量账号"),
+        "measure-account-1",
+      );
+      await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
+      await user.type(screen.getByLabelText("采样协议版本"), "protocol-v1");
+      await user.type(screen.getByLabelText("临时问题集标签"), "evaluation-v2");
+      await user.type(screen.getByLabelText("市场"), "CN");
+      await user.type(screen.getByLabelText("语言"), "zh-CN");
+      await user.type(
+        screen.getByLabelText("临时问题（未分类）"),
+        "这是什么产品？",
+      );
+      await user.clear(screen.getByLabelText("样本序号（0–10000）"));
+      await user.type(screen.getByLabelText("样本序号（0–10000）"), "3");
+      await user.type(
+        screen.getByLabelText("计划采样时间（本地时间）"),
+        "2026-10-06T12:30",
+      );
+      expect(
+        screen.getByText(/账号已登录不代表本次测量成功/),
+      ).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "加入测量目标" }));
+      await user.click(screen.getByRole("button", { name: "封存本轮计划" }));
+      const request = requests.find(
+        (item) =>
+          item.method === "POST" &&
+          item.path.endsWith("/cycles/cycle-1/channel-plan"),
+      );
+      expect(request?.body).toEqual({
+        publications: [],
+        measurements: [
+          {
+            account_id: "measure-account-1",
+            provider,
+            model: "observed-model",
+            surface: "consumer_web",
+            search_mode: "web_search",
+            protocol_version: "protocol-v1",
+            question_set_version: "evaluation-v2",
+            question: "这是什么产品？",
+            market: "CN",
+            language: "zh-CN",
+            scheduled_at: new Date("2026-10-06T12:30").toISOString(),
+            sample_ordinal: 3,
+          },
+        ],
+        bound_measurements: [],
+      });
+      expect(screen.queryByText(/已观察/)).not.toBeInTheDocument();
+    },
+  );
 
   it("rejects empty or malformed measurement inputs, publishing accounts and unavailable Kimi accounts", async () => {
     const requests = mockApi({
@@ -858,15 +868,12 @@ describe("P12 channel jobs", () => {
     });
     const user = userEvent.setup();
     renderPage();
+    expect(await screen.findByText(/还没有可用的测量账号/)).toBeInTheDocument();
+    expect(screen.getByLabelText("项目测量账号")).toBeDisabled();
     expect(
-      await screen.findByText(/没有已连接且就绪的项目 Kimi 测量账号/),
-    ).toBeInTheDocument();
-    expect(screen.getByLabelText("项目 Kimi 测量账号")).toBeDisabled();
-    expect(
-      within(screen.getByLabelText("项目 Kimi 测量账号")).queryByRole(
-        "option",
-        { name: /项目账号/ },
-      ),
+      within(screen.getByLabelText("项目测量账号")).queryByRole("option", {
+        name: /项目账号/,
+      }),
     ).not.toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText("测量问题模式"), "legacy");
     await user.type(screen.getByLabelText("临时问题（未分类）"), "问题");
@@ -884,7 +891,7 @@ describe("P12 channel jobs", () => {
       "legacy",
     );
     await user.selectOptions(
-      await screen.findByLabelText("项目 Kimi 测量账号"),
+      await screen.findByLabelText("项目测量账号"),
       "measure-account-1",
     );
     await user.type(screen.getByLabelText("可见模型标识"), "observed-model");
@@ -909,10 +916,8 @@ describe("P12 channel jobs", () => {
       measurementSupported: false,
     });
     renderPage();
-    expect(
-      await screen.findByText(/没有已连接且就绪的项目 Kimi 测量账号/),
-    ).toBeInTheDocument();
-    expect(screen.getByLabelText("项目 Kimi 测量账号")).toBeDisabled();
+    expect(await screen.findByText(/还没有可用的测量账号/)).toBeInTheDocument();
+    expect(screen.getByLabelText("项目测量账号")).toBeDisabled();
   });
 
   it("keeps the plan editable after a 409 conflict and offers a refresh", async () => {
@@ -928,7 +933,7 @@ describe("P12 channel jobs", () => {
       "legacy",
     );
     await user.selectOptions(
-      await screen.findByLabelText("项目 Kimi 测量账号"),
+      await screen.findByLabelText("项目测量账号"),
       "measure-account-1",
     );
     await user.type(screen.getByLabelText("可见模型标识"), "observed-model");

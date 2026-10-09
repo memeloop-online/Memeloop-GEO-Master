@@ -515,6 +515,16 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
 
   async function connect(accountId?: string) {
     if (!tenantId || !projectId) return;
+    const selectedPlatform = accountId
+      ? accounts.data?.items.find((item) => item.account_id === accountId)
+          ?.platform
+      : platform;
+    if (
+      !platforms.data?.items.some(
+        (item) => item.id === selectedPlatform && item.login_entry_available,
+      )
+    )
+      return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -686,7 +696,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                           <option
                             key={item.id}
                             value={item.id}
-                            disabled={!item.login_supported}
+                            disabled={!item.login_entry_available}
                           >
                             {item.label} ·{" "}
                             {t(
@@ -747,13 +757,19 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                         busy ||
                         !platforms.data.items.some(
                           (item) =>
-                            item.id === platform && item.login_supported,
+                            item.id === platform && item.login_entry_available,
                         )
                       }
                       onClick={() => void connect()}
                     >
                       {t("account.channels.startLogin")}
                     </Button>
+                    {platforms.data.items.some(
+                      (item) =>
+                        item.id === platform &&
+                        item.login_entry_available &&
+                        !item.login_supported,
+                    ) && <p>{t("account.remote.entryOnly")}</p>}
                   </div>
                 )}
               </Card>
@@ -951,10 +967,24 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                         </Badge>
                         <Badge
                           color={
-                            account.status === "ready" ? "success" : "warning"
+                            account.status === "ready" &&
+                            platforms.data?.items.some(
+                              (item) =>
+                                item.id === account.platform &&
+                                item.login_supported,
+                            )
+                              ? "success"
+                              : "warning"
                           }
                         >
-                          {accountState(account.status)}
+                          {account.status === "ready" &&
+                          !platforms.data?.items.some(
+                            (item) =>
+                              item.id === account.platform &&
+                              item.login_supported,
+                          )
+                            ? t("account.state.unverified")
+                            : accountState(account.status)}
                         </Badge>
                       </div>
                       {account.owner_kind === "operator_pool" ? (
@@ -971,7 +1001,15 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                           </p>
                           <div className="channel-row">
                             <Button
-                              disabled={busy || Boolean(activeSession)}
+                              disabled={
+                                busy ||
+                                Boolean(activeSession) ||
+                                !platforms.data?.items.some(
+                                  (item) =>
+                                    item.id === account.platform &&
+                                    item.login_entry_available,
+                                )
+                              }
                               onClick={() => void connect(account.account_id)}
                             >
                               {account.status === "ready"
@@ -1293,6 +1331,16 @@ export function OperatorAccountsPage() {
   }
 
   async function connect(accountId?: string) {
+    const selectedPlatform = accountId
+      ? accounts.data?.items.find((item) => item.account_id === accountId)
+          ?.platform
+      : platform;
+    if (
+      !platforms.data?.items.some(
+        (item) => item.id === selectedPlatform && item.login_entry_available,
+      )
+    )
+      return;
     setBusy(true);
     setError("");
     try {
@@ -1401,7 +1449,7 @@ export function OperatorAccountsPage() {
                       <option
                         key={item.id}
                         value={item.id}
-                        disabled={!item.login_supported}
+                        disabled={!item.login_entry_available}
                       >
                         {item.label} ·{" "}
                         {item.purpose === "measurement"
@@ -1450,11 +1498,24 @@ export function OperatorAccountsPage() {
                 </details>
                 <Button
                   appearance="primary"
-                  disabled={busy || Boolean(activeSession)}
+                  disabled={
+                    busy ||
+                    Boolean(activeSession) ||
+                    !platforms.data.items.some(
+                      (item) =>
+                        item.id === platform && item.login_entry_available,
+                    )
+                  }
                   onClick={() => void connect()}
                 >
                   创建并登录总部账号
                 </Button>
+                {platforms.data.items.some(
+                  (item) =>
+                    item.id === platform &&
+                    item.login_entry_available &&
+                    !item.login_supported,
+                ) && <p>{t("account.remote.entryOnly")}</p>}
               </div>
             )}
           </Card>
@@ -1570,14 +1631,37 @@ export function OperatorAccountsPage() {
                       </p>
                     </div>
                     <Badge
-                      color={account.status === "ready" ? "success" : "warning"}
+                      color={
+                        account.status === "ready" &&
+                        platforms.data?.items.some(
+                          (item) =>
+                            item.id === account.platform &&
+                            item.login_supported,
+                        )
+                          ? "success"
+                          : "warning"
+                      }
                     >
-                      {accountState(account.status)}
+                      {account.status === "ready" &&
+                      !platforms.data?.items.some(
+                        (item) =>
+                          item.id === account.platform && item.login_supported,
+                      )
+                        ? t("account.state.unverified")
+                        : accountState(account.status)}
                     </Badge>
                   </div>
                   <div className="channel-row">
                     <Button
-                      disabled={busy || Boolean(activeSession)}
+                      disabled={
+                        busy ||
+                        Boolean(activeSession) ||
+                        !platforms.data?.items.some(
+                          (item) =>
+                            item.id === account.platform &&
+                            item.login_entry_available,
+                        )
+                      }
                       onClick={() => void connect(account.account_id)}
                     >
                       重新登录

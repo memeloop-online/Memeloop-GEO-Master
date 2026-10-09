@@ -638,10 +638,31 @@ pub struct RunnerConnector {
     pub placement_slot: String,
     pub connector_version: String,
     pub operations: Vec<String>,
+    #[serde(default)]
+    pub login_entry_available: Option<bool>,
+    #[serde(default)]
+    pub login_supported: Option<bool>,
     // Explicitly never use a self-reported verification claim to authorize
     // publishing; independent publication/readback history is the authority.
     #[allow(dead_code)]
     pub verified: bool,
+}
+
+/// Ambiguous or unversioned adapter advertisements never confer capability.
+pub(crate) fn measurement_connector_available(
+    connectors: &[RunnerConnector],
+    provider: &str,
+) -> bool {
+    let matching: Vec<_> = connectors
+        .iter()
+        .filter(|connector| connector.platform == provider && connector.placement_slot == "primary")
+        .collect();
+    matching.len() == 1
+        && !matching[0].connector_version.trim().is_empty()
+        && matching[0]
+            .operations
+            .iter()
+            .any(|operation| operation == "measure")
 }
 
 /// Private runner receipt. This is not a client-submittable success claim.

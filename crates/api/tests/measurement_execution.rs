@@ -1,5 +1,5 @@
 //! Synthetic contract tests, not real-account official-search acceptance.
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
@@ -103,10 +103,10 @@ impl Receipt {
 }
 
 #[derive(Clone)]
-struct Runner(Receipt);
+struct Runner(Receipt, Arc<Mutex<Vec<Value>>>);
 
 async fn runner(
-    State(Runner(case)): State<Runner>,
+    State(Runner(case, executions)): State<Runner>,
     method: Method,
     uri: Uri,
     payload: Option<Json<Value>>,
@@ -115,6 +115,7 @@ async fn runner(
     let response = match (method.as_str(), uri.path()) {
         ("POST", "/v1/sessions") => json!({"session_id": input["session_id"]}),
         ("POST", "/v1/executions") => {
+            executions.lock().unwrap().push(input.clone());
             let frozen = &input["payload"];
             let completed_at = Utc::now();
             let target_id = frozen["target_id"].clone();
@@ -354,12 +355,27 @@ async fn run(case: Receipt) -> geo_domain::ChannelOutcome {
 }
 
 async fn run_with_plan(case: Receipt, standalone: bool) -> geo_domain::ChannelOutcome {
+    run_with_provider(case, standalone, "kimi", "kimi")
+        .await
+        .unwrap()
+}
+
+async fn run_with_provider(
+    case: Receipt,
+    standalone: bool,
+    provider: &str,
+    account_platform: &str,
+) -> Option<geo_domain::ChannelOutcome> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let executions = Arc::new(Mutex::new(Vec::new()));
+    let captured = executions.clone();
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            Router::new().fallback(any(runner)).with_state(Runner(case)),
+            Router::new()
+                .fallback(any(runner))
+                .with_state(Runner(case, captured)),
         )
         .await
         .unwrap();
@@ -411,7 +427,7 @@ async fn run_with_plan(case: Receipt, standalone: bool) -> geo_domain::ChannelOu
                     account_id,
                     project_id: project.id,
                     owner_kind: ChannelOwnerKind::Customer,
-                    platform: "kimi".into(),
+                    platform: account_platform.into(),
                     group_id: None,
                     status: ChannelStatus::Ready,
                     display_name: None,
@@ -443,7 +459,7 @@ async fn run_with_plan(case: Receipt, standalone: bool) -> geo_domain::ChannelOu
             target_id,
             input: ChannelTargetInput::Measure {
                 account_id,
-                provider: "kimi".into(),
+                provider: provider.into(),
                 model: "frozen-model".into(),
                 surface: "consumer_web".into(),
                 search_mode: "web_search".into(),
@@ -495,10 +511,26 @@ async fn run_with_plan(case: Receipt, standalone: bool) -> geo_domain::ChannelOu
     } else {
         repo.create_plan(&scope, plan).await.unwrap();
     }
-    let ChannelDispatchResult::Executed(view) = execute_channel_target(&state, &scope, target_id)
+    let dispatched = execute_channel_target(&state, &scope, target_id)
         .await
-        .unwrap()
-    else {
+        .unwrap();
+    if provider != account_platform {
+        assert!(matches!(
+            dispatched,
+            ChannelDispatchResult::Deferred(geo_api::ChannelDispatchDeferred::AccountUnavailable)
+        ));
+        assert!(
+            repo.get_target(&scope, target_id)
+                .await
+                .unwrap()
+                .attempts
+                .is_empty()
+        );
+        assert!(executions.lock().unwrap().is_empty());
+        server.abort();
+        return None;
+    }
+    let ChannelDispatchResult::Executed(view) = dispatched else {
         panic!("unexpected deferral")
     };
     let outcome = view.attempts[0].outcome.clone().unwrap();
@@ -510,8 +542,35 @@ async fn run_with_plan(case: Receipt, standalone: bool) -> geo_domain::ChannelOu
             .len(),
         1
     );
+    assert_eq!(executions.lock().unwrap().len(), 1);
+    assert_eq!(
+        executions.lock().unwrap()[0]["payload"]["provider"],
+        provider
+    );
+    assert!(
+        execute_channel_target(&state, &scope, target_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(executions.lock().unwrap().len(), 1);
     server.abort();
-    outcome
+    Some(outcome)
+}
+
+#[tokio::test]
+async fn new_providers_dispatch_the_frozen_provider_once_and_reject_account_mismatch() {
+    for provider in ["doubao", "deepseek", "glm"] {
+        let outcome = run_with_provider(Receipt::AiBrowser, true, provider, provider)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ChannelOutcomeStatus::Observed);
+        assert_eq!(outcome.raw_answer.as_deref(), Some("Original answer"));
+        assert!(
+            run_with_provider(Receipt::Valid, true, provider, "kimi")
+                .await
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]

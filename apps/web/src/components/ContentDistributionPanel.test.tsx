@@ -124,12 +124,16 @@ const platforms: ChannelPlatform[] = [
     label: "Publisher",
     purpose: "publishing",
     login_supported: true,
+    login_entry_available: true,
+    measurement_supported: true,
   },
   {
     id: "kimi",
     label: "Search",
     purpose: "measurement",
     login_supported: true,
+    login_entry_available: true,
+    measurement_supported: true,
   },
 ];
 const capabilities: ProjectConnectorCapability[] = [

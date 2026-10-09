@@ -1349,7 +1349,7 @@ pub(crate) async fn measurement_input(
     scope: &TenantScope,
     request: MeasurementRequest,
 ) -> Result<ChannelTargetInput, AppError> {
-    if request.provider != "kimi"
+    if !geo_domain::consumer_web_provider(&request.provider)
         || request.surface != "consumer_web"
         || !matches!(request.search_mode.as_str(), "web_search" | "standard")
     {
@@ -1361,11 +1361,12 @@ pub(crate) async fn measurement_input(
         .channel_service()
         .resolve_available_account(scope, request.account_id)
         .await?;
-    if account.platform != "kimi" {
+    if account.platform != request.provider {
         return Err(AppError::invalid_request(
             "measurement account platform differs",
         ));
     }
+    crate::measurement_options::require_installed_measurement(state, &request.provider).await?;
     for (name, value, limit) in [
         ("model", &request.model, 100),
         ("protocol_version", &request.protocol_version, 100),
@@ -1747,7 +1748,7 @@ async fn execute_reserved_channel_target(
     let expected = match &planned.target.input {
         ChannelTargetInput::Publish { platform, .. }
         | ChannelTargetInput::GeneratedPublish { platform, .. } => platform.as_str(),
-        ChannelTargetInput::Measure { .. } => "kimi",
+        ChannelTargetInput::Measure { provider, .. } => provider.as_str(),
     };
     if account.platform != expected
         || !account.enabled
@@ -2648,6 +2649,8 @@ mod tests {
             placement_slot: "primary".into(),
             connector_version: "adapter.v1".into(),
             operations: vec!["publish".into()],
+            login_entry_available: None,
+            login_supported: None,
             verified: true,
         };
         assert!(!rich_runner_operation_available(
