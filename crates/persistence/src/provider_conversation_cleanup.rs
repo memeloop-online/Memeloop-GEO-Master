@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ErrorCode, ObservationCapture, ObservationCaptureInput, ObservationCaptureReceipt,
     ObservationProviderIdentity, ProviderCleanupAction, ProviderCleanupBackfillItem,
-    ProviderCleanupClaim, ProviderCleanupDueItem, ProviderCleanupOutcome,
-    ProviderConversationCleanupRepository, TenantScope,
+    ProviderCleanupClaim, ProviderCleanupDiagnostic, ProviderCleanupDueItem,
+    ProviderCleanupOutcome, ProviderConversationCleanupRepository, TenantScope,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -246,7 +246,19 @@ impl ProviderConversationCleanupRepository for PgProviderConversationCleanupRepo
         lease_id: Uuid,
         outcome: ProviderCleanupOutcome,
     ) -> Result<(), AppError> {
-        self.finish_claim(scope, cleanup_id, lease_id, outcome)
+        self.finish_claim(scope, cleanup_id, lease_id, outcome, None)
+            .await
+    }
+
+    async fn finish_with_diagnostic(
+        &self,
+        scope: &TenantScope,
+        cleanup_id: Uuid,
+        lease_id: Uuid,
+        outcome: ProviderCleanupOutcome,
+        diagnostic: Option<ProviderCleanupDiagnostic>,
+    ) -> Result<(), AppError> {
+        self.finish_claim(scope, cleanup_id, lease_id, outcome, diagnostic)
             .await
     }
 }
@@ -375,6 +387,7 @@ impl PgProviderConversationCleanupRepository {
         cleanup_id: Uuid,
         lease_id: Uuid,
         outcome: ProviderCleanupOutcome,
+        diagnostic: Option<ProviderCleanupDiagnostic>,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
@@ -391,11 +404,36 @@ impl PgProviderConversationCleanupRepository {
             _ => return Err(AppError::conflict("cleanup lease expired or replaced")),
         };
         let state = outcome.next_state(action)?;
+        let diagnostic = diagnostic
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| AppError::new(ErrorCode::Internal, "cleanup diagnostic invalid"))?;
+        // One immutable summary per fenced finish. Expired/replaced leases
+        // cannot append a receipt or overwrite the latest diagnostic.
+        sqlx::query(
+            "INSERT INTO provider_conversation_cleanup_attempts \
+             (cleanup_id,lease_id,operator_id,tenant_id,project_id,action,state,diagnostic) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        )
+        .bind(cleanup_id)
+        .bind(lease_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(match action {
+            ProviderCleanupAction::Delete => "delete",
+            ProviderCleanupAction::Reconcile => "reconcile",
+        })
+        .bind(state)
+        .bind(&diagnostic)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
         sqlx::query(
             "UPDATE provider_conversation_cleanup SET state=$1,lease_id=NULL,lease_until=NULL, \
              next_attempt_at=clock_timestamp()+make_interval(secs => LEAST(3600,30*attempt_count)), \
-             updated_at=clock_timestamp() WHERE cleanup_id=$2",
-        ).bind(state).bind(cleanup_id).execute(&mut *tx).await.map_err(db)?;
+             updated_at=clock_timestamp(),last_diagnostic=$3 WHERE cleanup_id=$2",
+        ).bind(state).bind(cleanup_id).bind(diagnostic).execute(&mut *tx).await.map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(())
     }

@@ -14,7 +14,10 @@ import {
 } from "../api/observationAnalysis";
 import { useAuth } from "../auth/AuthProvider";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
-import "../i18n/observationAnalysis";
+import {
+  analysisFailureMessageKey,
+  analysisUnverifiedMessageKey,
+} from "../i18n/observationAnalysis";
 
 export function ObservationAnalysisPanel({
   tenantId,
@@ -170,7 +173,11 @@ export function ObservationAnalysisPanel({
               {t(
                 revision.state !== "completed"
                   ? revision.state
-                  : (outcome?.status ?? "incomplete"),
+                  : outcome?.status === "failed"
+                    ? analysisFailureMessageKey(outcome.code)
+                    : outcome?.status === "unverified"
+                      ? analysisUnverifiedMessageKey(outcome.reason)
+                      : (outcome?.status ?? "incomplete"),
               )}
             </p>
             <p>{t("requested", { value: date(revision.created_at) })}</p>

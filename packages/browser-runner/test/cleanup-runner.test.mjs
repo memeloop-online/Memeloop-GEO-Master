@@ -32,31 +32,41 @@ async function fixture(run, options = {}) {
     async evaluate(_fn, args) {
       calls.push(args.selfPath ?? args.path);
       if (state.blocked) await state.blocked;
+      if (state.throwEvaluate && !args.selfPath)
+        throw new Error("private-exception-body");
       if (args.selfPath)
         return { user: { id: state.account, nickname: "Fixture" } };
       if (args.path.endsWith("GetChat"))
-        return state.missing
-          ? { kind: "http_error", status: 404 }
-          : { kind: "ok", data: { chat: { id: chat } } };
+        return (
+          state.chatResponse ??
+          (state.missing
+            ? { kind: "http_error", status: 404 }
+            : { kind: "ok", data: { chat: { id: chat } } })
+        );
       if (args.path.endsWith("ListMessages"))
-        return {
-          kind: "ok",
-          data: {
-            messages: [
-              { id: "u", role: "user" },
-              {
-                id: "a",
-                role: "assistant",
-                status: "COMPLETED",
-                text: "private-body",
-              },
-            ],
-          },
-        };
+        return (
+          state.messagesResponse ?? {
+            kind: "ok",
+            data: {
+              messages: [
+                { id: "u", role: "user" },
+                {
+                  id: "a",
+                  role: "assistant",
+                  status: "COMPLETED",
+                  text: "private-body",
+                },
+              ],
+            },
+          }
+        );
       if (args.path.endsWith("DeleteChat"))
-        return state.lost
-          ? { kind: "transport_unknown" }
-          : { kind: "ok", data: { chat_id: chat } };
+        return (
+          state.deleteResponse ??
+          (state.lost
+            ? { kind: "transport_unknown" }
+            : { kind: "ok", data: { chat_id: chat } })
+        );
       throw new Error("unexpected operation");
     },
   };
@@ -113,10 +123,15 @@ test("cleanup validates exact scope, needs authority, and never leaks recovered 
       }),
       /invalid_cleanup/,
     );
-    assert.equal(
-      (await runner.cleanupConversation("session", input("delete"))).status,
-      "retained",
+    const unauthorized = await runner.cleanupConversation(
+      "session",
+      input("delete"),
     );
+    assert.equal(unauthorized.status, "retained");
+    assert.deepEqual(unauthorized.diagnostic, {
+      stage: "authorization",
+      code: "authorization_required",
+    });
     assert.equal(calls.length, 0);
     const request = input();
     assert.deepEqual(await runner.cleanupConversation("session", request), {
@@ -129,10 +144,12 @@ test("cleanup validates exact scope, needs authority, and never leaks recovered 
       false,
     );
     state.missing = true;
-    assert.equal(
-      (await runner.cleanupConversation("session", input())).status,
-      "unknown",
-    );
+    const missing = await runner.cleanupConversation("session", input());
+    assert.equal(missing.status, "unknown");
+    assert.deepEqual(missing.diagnostic, {
+      stage: "inspection",
+      code: "http_error",
+    });
     state.account = "other-account";
     assert.equal(
       (await runner.cleanupConversation("session", input())).status,
@@ -142,6 +159,216 @@ test("cleanup validates exact scope, needs authority, and never leaks recovered 
     assert.equal(
       (await runner.cleanupConversation("session", input())).status,
       "needs_login",
+    );
+  });
+});
+
+test("cleanup returns bounded diagnostics for existing failure branches without extra deletes", async () => {
+  await fixture(async ({ runner, state, calls }) => {
+    const authority = () => ({
+      authorized: true,
+      platform_account_id: account,
+      external_conversation_id: chat,
+      delete_not_after: new Date(Date.now() + 60_000).toISOString(),
+      retained_message_inventory_sha256: inventory,
+    });
+    const cases = [
+      {
+        patch: { account: "other-account" },
+        status: "retained",
+        stage: "identity",
+        code: "account_mismatch",
+      },
+      {
+        patch: { account: null },
+        status: "needs_login",
+        stage: "identity",
+        code: "reauth_required",
+      },
+      {
+        patch: { missing: true },
+        status: "unknown",
+        stage: "inspection",
+        code: "http_error",
+      },
+      {
+        patch: {
+          chatResponse: { kind: "ok", data: { chat: { id: "other-chat" } } },
+        },
+        status: "unknown",
+        stage: "inspection",
+        code: "chat_mismatch",
+      },
+      {
+        patch: {
+          chatResponse: {
+            kind: "ok",
+            data: { chat: { id: chat, status: "generating" } },
+          },
+        },
+        status: "retained",
+        stage: "inspection",
+        code: "generating",
+      },
+      {
+        authorize: async () => {
+          throw new Error("private-callback-body");
+        },
+        status: "retained",
+        stage: "authorization",
+        code: "authorization_required",
+      },
+      {
+        authorize: async () => ({
+          ...authority(),
+          platform_account_id: "other-account",
+        }),
+        status: "retained",
+        stage: "authorization",
+        code: "authorization_required",
+      },
+      {
+        authorize: async () => ({
+          ...authority(),
+          retained_message_inventory_sha256: undefined,
+        }),
+        status: "retained",
+        stage: "authorization",
+        code: "authorization_required",
+      },
+      {
+        authorize: async () => ({
+          ...authority(),
+          delete_not_after: new Date(0).toISOString(),
+        }),
+        status: "retained",
+        stage: "authorization",
+        code: "authorization_expired",
+      },
+      {
+        authorize: async () => ({
+          ...authority(),
+          delete_not_after: new Date(Date.now() + 1_000).toISOString(),
+        }),
+        status: "retained",
+        stage: "authorization",
+        code: "authorization_expired",
+      },
+      {
+        patch: { messagesResponse: { kind: "ok", data: { messages: null } } },
+        status: "retained",
+        stage: "messages",
+        code: "unverified_messages",
+      },
+      {
+        patch: {
+          messagesResponse: {
+            kind: "ok",
+            data: { messages: [], has_more: true },
+          },
+        },
+        status: "retained",
+        stage: "messages",
+        code: "pagination_incomplete",
+      },
+      {
+        patch: { messagesResponse: { kind: "ok", data: { messages: [] } } },
+        status: "retained",
+        stage: "inventory",
+        code: "message_inventory_mismatch",
+      },
+      {
+        patch: {
+          deleteResponse: { kind: "ok", data: { chat_id: "other-chat" } },
+        },
+        status: "unknown",
+        stage: "delete",
+        code: "unverified_delete_response",
+        deletes: 1,
+      },
+      {
+        patch: { lost: true },
+        status: "unknown",
+        stage: "delete",
+        code: "transport_unknown",
+        deletes: 1,
+      },
+    ];
+    for (const kind of [
+      "wrong_origin",
+      "invalid_response",
+      "http_error",
+      "too_large",
+      "transport_unknown",
+      "reauth_required",
+    ]) {
+      for (const [field, stage, status] of [
+        ["chatResponse", "inspection", "unknown"],
+        ["messagesResponse", "messages", "retained"],
+        ["deleteResponse", "delete", "unknown"],
+      ])
+        cases.push({
+          patch: { [field]: { kind, detail: "private-response-body" } },
+          status: kind === "reauth_required" ? "needs_login" : status,
+          stage,
+          code: kind,
+          deletes: stage === "delete" ? 1 : 0,
+        });
+    }
+    for (const example of cases) {
+      Object.assign(state, {
+        account,
+        missing: false,
+        lost: false,
+        chatResponse: undefined,
+        messagesResponse: undefined,
+        deleteResponse: undefined,
+        ...example.patch,
+      });
+      calls.length = 0;
+      const result = await runner.cleanupConversation(
+        "session",
+        input("delete"),
+        example.authorize ?? (async () => authority()),
+      );
+      assert.equal(result.status, example.status, JSON.stringify(example));
+      assert.deepEqual(result.diagnostic, {
+        stage: example.stage,
+        code: example.code,
+      });
+      assert.deepEqual(Object.keys(result).sort(), [
+        "diagnostic",
+        "execution_id",
+        "external_conversation_id",
+        "status",
+      ]);
+      assert.equal(
+        calls.filter((path) => path.endsWith("DeleteChat")).length,
+        example.deletes ?? 0,
+      );
+      assert.equal(JSON.stringify(result).includes("private-"), false);
+    }
+  });
+});
+
+test("cleanup never forwards arbitrary provider reasons or exception messages", async () => {
+  await fixture(async ({ runner, state, calls }) => {
+    state.chatResponse = { kind: "private-response-body" };
+    const unknown = await runner.cleanupConversation("session", input());
+    assert.equal(unknown.status, "unknown");
+    assert.equal(unknown.diagnostic, undefined);
+    assert.equal(JSON.stringify(unknown).includes("private-"), false);
+    state.throwEvaluate = true;
+    const thrown = await runner.cleanupConversation("session", input());
+    assert.equal(thrown.status, "unknown");
+    assert.deepEqual(thrown.diagnostic, {
+      stage: "inspection",
+      code: "transport_unknown",
+    });
+    assert.equal(JSON.stringify(thrown).includes("private-"), false);
+    assert.equal(
+      calls.some((path) => path.endsWith("DeleteChat")),
+      false,
     );
   });
 });
@@ -246,7 +473,12 @@ test("deadline retains the session reservation until underlying work settles", a
           };
         },
       );
-      assert.equal((await pending).status, "unknown");
+      const expired = await pending;
+      assert.equal(expired.status, "unknown");
+      assert.deepEqual(expired.diagnostic, {
+        stage: "deadline",
+        code: "deadline_exceeded",
+      });
       await assert.rejects(runner.close("session"), /session_busy/);
       await assert.rejects(
         runner.cleanupConversation("session", input()),

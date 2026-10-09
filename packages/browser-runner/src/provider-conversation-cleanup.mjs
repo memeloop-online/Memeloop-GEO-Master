@@ -13,6 +13,60 @@ const MAX_PAGES = 10;
 const DELETE_CLOSE_MARGIN_MS = 2_000;
 const INVENTORY_SHA256 = /^[0-9a-f]{64}$/;
 
+const DIAGNOSTIC_STAGES = new Set([
+  "scope",
+  "identity",
+  "inspection",
+  "authorization",
+  "messages",
+  "inventory",
+  "delete",
+  "deadline",
+  "runner",
+]);
+const DIAGNOSTIC_CODES = new Set([
+  "invalid_scope",
+  "unsupported_platform",
+  "reauth_required",
+  "account_mismatch",
+  "wrong_origin",
+  "invalid_response",
+  "http_error",
+  "too_large",
+  "transport_unknown",
+  "chat_mismatch",
+  "generating",
+  "authorization_required",
+  "authorization_expired",
+  "unverified_messages",
+  "pagination_incomplete",
+  "message_inventory_mismatch",
+  "unverified_delete_response",
+  "deadline_exceeded",
+]);
+
+// Reconstruct only the closed diagnostic vocabulary. Never forward response
+// bodies, exception text, account identifiers, or arbitrary provider reasons.
+export function cleanupDiagnostic(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 2 ||
+    !Object.hasOwn(value, "stage") ||
+    !Object.hasOwn(value, "code") ||
+    !DIAGNOSTIC_STAGES.has(value.stage) ||
+    !DIAGNOSTIC_CODES.has(value.code)
+  )
+    return undefined;
+  return { stage: value.stage, code: value.code };
+}
+
+function failure(status, stage, reason) {
+  const diagnostic = cleanupDiagnostic({ stage, code: reason });
+  return { status, reason, ...(diagnostic ? { diagnostic } : {}) };
+}
+
 function retainedMessageInventory(pages) {
   const inventory = [];
   const seen = new Set();
@@ -184,24 +238,25 @@ async function inspect(page, options) {
   const identity = await probeKimiAccount(page, {
     trustedOrigin: options.trustedOrigin,
   });
-  if (!identity) return { status: "reauth_required" };
+  if (!identity)
+    return failure("reauth_required", "identity", "reauth_required");
   if (identity.platform_account_id !== options.expectedUserId)
-    return { status: "retained", reason: "account_mismatch" };
+    return failure("retained", "identity", "account_mismatch");
   const response = await connect(page, {
     ...options,
     path: GET_CHAT,
     body: { chat_id: options.chatId },
   });
   if (response.kind !== "ok")
-    return {
-      status:
-        response.kind === "reauth_required" ? "reauth_required" : "unknown",
-      reason: response.kind,
-    };
+    return failure(
+      response.kind === "reauth_required" ? "reauth_required" : "unknown",
+      "inspection",
+      response.kind,
+    );
   if (chatIdentity(response.data) !== options.chatId)
-    return { status: "unknown", reason: "chat_mismatch" };
+    return failure("unknown", "inspection", "chat_mismatch");
   if (generating(response.data))
-    return { status: "retained", reason: "generating" };
+    return failure("retained", "inspection", "generating");
   return { status: "matched", chat: response.data };
 }
 
@@ -228,11 +283,13 @@ export async function recoverKimiConversation(
     maxPages < 1 ||
     maxPages > MAX_PAGES
   )
-    return { status: "retained", reason: "invalid_scope" };
+    return failure("retained", "scope", "invalid_scope");
+  let stage = "inspection";
   try {
     const result = await inspect(page, options);
     if (result.status !== "matched") return result;
     const pages = [];
+    stage = "messages";
     const tokens = new Set();
     let pageToken = "";
     for (let index = 0; index < maxPages; index++) {
@@ -242,13 +299,11 @@ export async function recoverKimiConversation(
         body: { chat_id: chatId, page_size: PAGE_SIZE, page_token: pageToken },
       });
       if (response.kind !== "ok")
-        return {
-          status:
-            response.kind === "reauth_required"
-              ? "reauth_required"
-              : "retained",
-          reason: response.kind,
-        };
+        return failure(
+          response.kind === "reauth_required" ? "reauth_required" : "retained",
+          "messages",
+          response.kind,
+        );
       const data = response.data;
       if (
         !Array.isArray(data?.messages) ||
@@ -266,7 +321,7 @@ export async function recoverKimiConversation(
             generating(message),
         )
       )
-        return { status: "retained", reason: "unverified_messages" };
+        return failure("retained", "messages", "unverified_messages");
       pages.push(data);
       const next = data.next_page_token ?? "";
       if (next === "" && data.has_more !== true) {
@@ -278,20 +333,20 @@ export async function recoverKimiConversation(
         };
       }
       if (next === "")
-        return { status: "retained", reason: "pagination_incomplete" };
+        return failure("retained", "messages", "pagination_incomplete");
       if (
         typeof next !== "string" ||
         next.length > 512 ||
         tokens.has(next) ||
         index + 1 >= maxPages
       )
-        return { status: "retained", reason: "pagination_incomplete" };
+        return failure("retained", "messages", "pagination_incomplete");
       tokens.add(next);
       pageToken = next;
     }
-    return { status: "retained", reason: "pagination_incomplete" };
+    return failure("retained", "messages", "pagination_incomplete");
   } catch {
-    return { status: "unknown", reason: "transport_unknown" };
+    return failure("unknown", stage, "transport_unknown");
   }
 }
 
@@ -314,13 +369,15 @@ export async function deleteKimiConversation(
 ) {
   const options = { trustedOrigin, expectedUserId, chatId, timeoutMs };
   if (!optionsValid(options))
-    return { status: "retained", reason: "invalid_scope" };
+    return failure("retained", "scope", "invalid_scope");
   if (typeof authorizeDeletion !== "function")
-    return { status: "retained", reason: "authorization_required" };
+    return failure("retained", "authorization", "authorization_required");
+  let stage = "inspection";
   try {
     const first = await inspect(page, options);
     if (first.status !== "matched") return first;
     let authority;
+    stage = "authorization";
     try {
       authority = await authorizeDeletion({
         provider: "kimi",
@@ -328,7 +385,7 @@ export async function deleteKimiConversation(
         external_conversation_id: chatId,
       });
     } catch {
-      return { status: "retained", reason: "authorization_required" };
+      return failure("retained", "authorization", "authorization_required");
     }
     if (
       authority?.authorized !== true ||
@@ -337,18 +394,20 @@ export async function deleteKimiConversation(
       typeof authority.retained_message_inventory_sha256 !== "string" ||
       !INVENTORY_SHA256.test(authority.retained_message_inventory_sha256)
     )
-      return { status: "retained", reason: "authorization_required" };
+      return failure("retained", "authorization", "authorization_required");
     // Re-check after the awaited ledger authorization: the account or
     // conversation may have changed while the caller consulted durable state.
+    stage = "inspection";
     const second = await recoverKimiConversation(page, options);
     if (second.status !== "recovered") return second;
     // Ownership of the chat does not imply ownership/durability of every turn:
     // a user may have appended messages since the original capture. Require
     // complete bounded pagination and an exact retained-message inventory.
     // This cannot atomically exclude edits between this read and provider delete.
+    stage = "inventory";
     const inventory = retainedMessageInventory(second.message_pages);
     if (!inventory || inventory !== authority.retained_message_inventory_sha256)
-      return { status: "retained", reason: "message_inventory_mismatch" };
+      return failure("retained", "inventory", "message_inventory_mismatch");
     // Production authority carries the claim/ticket deadline. Recheck after
     // the final read, immediately before the only destructive request.
     const deleteNotAfterMs =
@@ -361,7 +420,11 @@ export async function deleteKimiConversation(
         !Number.isFinite(deleteNotAfterMs) ||
         deleteNotAfterMs - Date.now() < timeoutMs + DELETE_CLOSE_MARGIN_MS)
     )
-      return { status: "retained", reason: "authorization_required" };
+      return {
+        ...failure("retained", "authorization", "authorization_expired"),
+        reason: "authorization_required",
+      };
+    stage = "delete";
     const response = await connect(page, {
       ...options,
       path: DELETE_CHAT,
@@ -369,18 +432,21 @@ export async function deleteKimiConversation(
       deleteNotAfterMs,
     });
     if (response.kind === "authorization_expired")
-      return { status: "retained", reason: "authorization_required" };
-    if (response.kind !== "ok")
       return {
-        status:
-          response.kind === "reauth_required" ? "reauth_required" : "unknown",
-        reason: response.kind,
+        ...failure("retained", "authorization", "authorization_expired"),
+        reason: "authorization_required",
       };
+    if (response.kind !== "ok")
+      return failure(
+        response.kind === "reauth_required" ? "reauth_required" : "unknown",
+        "delete",
+        response.kind,
+      );
     if (response.data?.chat_id !== chatId)
-      return { status: "unknown", reason: "unverified_delete_response" };
+      return failure("unknown", "delete", "unverified_delete_response");
     return { status: "deleted", external_conversation_id: chatId };
   } catch {
     // The delete may have reached the provider. Never retry automatically.
-    return { status: "unknown", reason: "transport_unknown" };
+    return failure("unknown", stage, "transport_unknown");
   }
 }

@@ -3,7 +3,8 @@ use std::{sync::Arc, time::Duration};
 
 use chrono::Utc;
 use geo_domain::{
-    AppError, ProviderCleanupAction, ProviderCleanupClaim, ProviderCleanupOutcome,
+    AppError, ProviderCleanupAction, ProviderCleanupClaim, ProviderCleanupCode as Code,
+    ProviderCleanupDiagnostic, ProviderCleanupOutcome, ProviderCleanupStage as Stage,
     ProviderConversationCleanupRepository, TenantScope,
 };
 use uuid::Uuid;
@@ -27,9 +28,15 @@ pub async fn dispatch_provider_conversation_cleanup(
         return Ok(false);
     };
     tokio::spawn(async move {
-        let outcome = cleanup_once(&state, repository.as_ref(), &scope, &claim).await;
+        let (outcome, diagnostic) = cleanup_once(&state, repository.as_ref(), &scope, &claim).await;
         if let Err(error) = repository
-            .finish(&scope, claim.cleanup_id, claim.lease_id, outcome)
+            .finish_with_diagnostic(
+                &scope,
+                claim.cleanup_id,
+                claim.lease_id,
+                outcome,
+                diagnostic,
+            )
             .await
         {
             // No account, external conversation, ticket, or provider response logs.
@@ -44,23 +51,40 @@ async fn cleanup_once(
     repository: &dyn ProviderConversationCleanupRepository,
     scope: &TenantScope,
     claim: &ProviderCleanupClaim,
-) -> ProviderCleanupOutcome {
+) -> (ProviderCleanupOutcome, Option<ProviderCleanupDiagnostic>) {
     let Some(bridge) = state.channel_service().browser.as_ref() else {
-        return ProviderCleanupOutcome::Failed;
+        return diagnosed(
+            ProviderCleanupOutcome::Failed,
+            Stage::Preflight,
+            Code::DependencyUnavailable,
+        );
     };
     let Some(callback) = state.provider_cleanup_callback() else {
-        return ProviderCleanupOutcome::Failed;
+        return diagnosed(
+            ProviderCleanupOutcome::Failed,
+            Stage::Preflight,
+            Code::DependencyUnavailable,
+        );
     };
     let now = Utc::now();
     // The entire restore/identity/RPC deadline plus close must fit inside both
     // fences. No renewal, detached retry, or side effect after lease expiry.
-    if now + chrono::Duration::seconds(100) >= claim.lease_until
-        || claim.provider != claim.original_identity.provider
-    {
-        return ProviderCleanupOutcome::Failed;
+    if now + chrono::Duration::seconds(100) >= claim.lease_until {
+        return diagnosed(
+            ProviderCleanupOutcome::Failed,
+            Stage::Deadline,
+            Code::DeadlineExceeded,
+        );
+    }
+    if claim.provider != claim.original_identity.provider {
+        return diagnosed(
+            ProviderCleanupOutcome::Failed,
+            Stage::Identity,
+            Code::AccountMismatch,
+        );
     }
     let reservation_id = Uuid::new_v4();
-    if state
+    if let Err(error) = state
         .channel_job_repository()
         .reserve_account(
             scope,
@@ -70,9 +94,16 @@ async fn cleanup_once(
             claim.lease_until,
         )
         .await
-        .is_err()
     {
-        return ProviderCleanupOutcome::Failed;
+        return diagnosed(
+            ProviderCleanupOutcome::Failed,
+            Stage::Preflight,
+            if error.code == geo_domain::ErrorCode::Conflict {
+                Code::AccountBusy
+            } else {
+                Code::DependencyUnavailable
+            },
+        );
     }
     let authorized = if claim.action == ProviderCleanupAction::Delete {
         matches!(
@@ -90,10 +121,19 @@ async fn cleanup_once(
             .channel_job_repository()
             .release_account(scope, claim.account_id, reservation_id)
             .await;
-        return ProviderCleanupOutcome::Failed;
+        return diagnosed(
+            ProviderCleanupOutcome::Failed,
+            Stage::Authorization,
+            if authorized {
+                Code::DeadlineExceeded
+            } else {
+                Code::AuthorizationRequired
+            },
+        );
     }
     let session_id = Uuid::new_v4();
     let mut start_confirmed = false;
+    let mut operation_stage = Stage::Preflight;
     let operation = async {
         let restored = state
             .channel_service()
@@ -108,15 +148,25 @@ async fn cleanup_once(
         // Preserve uncertainty rather than depending on English error strings.
         restored?;
         start_confirmed = true;
+        operation_stage = Stage::Identity;
         let verified = bridge.complete(session_id).await?;
         if verified.identity.platform_account_id != claim.original_identity.platform_account_id {
-            return Ok::<_, AppError>(ProviderCleanupOutcome::NeedsLogin);
+            return Ok::<_, AppError>(diagnosed(
+                ProviderCleanupOutcome::NeedsLogin,
+                Stage::Identity,
+                Code::AccountMismatch,
+            ));
         }
         // The runner's independent 60-second deadline must also end inside
         // the leases if this client's timeout or close response is lost.
         if Utc::now() + chrono::Duration::seconds(75) >= claim.lease_until {
-            return Ok(ProviderCleanupOutcome::Failed);
+            return Ok(diagnosed(
+                ProviderCleanupOutcome::Failed,
+                Stage::Deadline,
+                Code::DeadlineExceeded,
+            ));
         }
+        operation_stage = Stage::Authorization;
         let ticket = if claim.action == ProviderCleanupAction::Delete {
             Some(callback.issue_ticket(scope, claim, reservation_id, session_id)?)
         } else {
@@ -126,6 +176,7 @@ async fn cleanup_once(
             provider: claim.original_identity.provider.clone(),
             platform_account_id: claim.original_identity.platform_account_id.clone(),
         };
+        operation_stage = Stage::Runner;
         let result = bridge
             .cleanup_conversation(
                 session_id,
@@ -142,13 +193,26 @@ async fn cleanup_once(
         if result.execution_id != claim.lease_id
             || result.external_conversation_id != claim.external_conversation_id
         {
-            return Ok(ProviderCleanupOutcome::Unknown);
+            return Ok(diagnosed(
+                ProviderCleanupOutcome::Unknown,
+                Stage::Runner,
+                Code::InvalidResponse,
+            ));
         }
-        Ok(map_outcome(claim.action, result.status))
+        Ok((map_outcome(claim.action, result.status), result.diagnostic))
     };
     let outcome = match tokio::time::timeout(Duration::from_secs(85), operation).await {
         Ok(Ok(outcome)) => outcome,
-        _ => ProviderCleanupOutcome::Unknown,
+        Ok(Err(_)) => diagnosed(
+            ProviderCleanupOutcome::Unknown,
+            operation_stage,
+            Code::TransportUnknown,
+        ),
+        Err(_) => diagnosed(
+            ProviderCleanupOutcome::Unknown,
+            operation_stage,
+            Code::DeadlineExceeded,
+        ),
     };
     let closed = matches!(
         tokio::time::timeout(Duration::from_secs(10), bridge.close(session_id)).await,
@@ -166,6 +230,14 @@ async fn cleanup_once(
         tracing::warn!(code = ?error.code, "conversation cleanup reservation release failed");
     }
     outcome
+}
+
+fn diagnosed(
+    outcome: ProviderCleanupOutcome,
+    stage: Stage,
+    code: Code,
+) -> (ProviderCleanupOutcome, Option<ProviderCleanupDiagnostic>) {
+    (outcome, Some(ProviderCleanupDiagnostic { stage, code }))
 }
 
 fn map_outcome(action: ProviderCleanupAction, status: CleanupStatus) -> ProviderCleanupOutcome {

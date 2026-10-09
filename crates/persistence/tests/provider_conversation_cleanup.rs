@@ -55,7 +55,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         question: "Synthetic question?".into(),
         market: "global".into(),
         language: "en".into(),
-        scheduled_at: Utc::now(),
+        scheduled_at: database_now(&database).await,
         sample_ordinal: 0,
         question_binding: None,
     };
@@ -78,7 +78,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
             platform_account_id: "synthetic-account".into(),
         }),
         ordinal: 0,
-        observed_at: Utc::now(),
+        observed_at: database_now(&database).await,
         snapshot: ObservationCaptureSnapshot::Source {
             source_sha256: sha256_hex(source_json.as_bytes()),
             source_json,
@@ -92,14 +92,14 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         completion: None,
     };
     assert!(cleanup.enqueue(&scope, input.capture_id).await.is_err());
-    captures.save(&scope, input.clone()).await.unwrap();
-    let discovered = backfill_ids(&cleanup, &scope, Utc::now()).await;
+    let source_receipt = captures.save(&scope, input.clone()).await.unwrap();
+    let discovered = backfill_ids(&cleanup, &scope, source_receipt.stored_at).await;
     assert_eq!(discovered, vec![input.capture_id]);
     assert!(
         backfill_ids(
             &cleanup,
             &scope,
-            input.observed_at - chrono::Duration::days(1)
+            source_receipt.stored_at - chrono::Duration::microseconds(1)
         )
         .await
         .is_empty()
@@ -107,11 +107,16 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     for limit in [0, 101, usize::MAX] {
         assert!(
             cleanup
-                .scan_unqueued(Utc::now(), None, limit)
+                .scan_unqueued(source_receipt.stored_at, None, limit)
                 .await
                 .is_err()
         );
-        assert!(cleanup.scan_due(Utc::now(), None, limit).await.is_err());
+        assert!(
+            cleanup
+                .scan_due(source_receipt.stored_at, None, limit)
+                .await
+                .is_err()
+        );
     }
     let id = cleanup.enqueue(&scope, input.capture_id).await.unwrap();
     assert_eq!(cleanup.enqueue(&scope, input.capture_id).await.unwrap(), id);
@@ -175,19 +180,116 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     assert!(cleanup.enqueue(&scope, candidate.capture_id).await.is_err());
     // Candidate, legacy identity, unowned, and already registered duplicate
     // captures must not keep returning in the backfill.
-    assert!(backfill_ids(&cleanup, &scope, Utc::now()).await.is_empty());
+    assert!(
+        backfill_ids(&cleanup, &scope, database_now(&database).await)
+            .await
+            .is_empty()
+    );
     // Unknown interpretation still preserves raw evidence and ends active use.
     sqlx::query("UPDATE channel_execution_attempts SET outcome='{\"status\":\"unknown\"}',received_at=now() WHERE attempt_id=$1")
         .bind(attempt).execute(database.pool()).await.unwrap();
-    assert_eq!(due_ids(&cleanup, &scope, Utc::now()).await, vec![id]);
+    assert_eq!(
+        due_ids(&cleanup, &scope, database_now(&database).await).await,
+        vec![id]
+    );
     let claim = cleanup.claim(&scope, id).await.unwrap().unwrap();
     assert_eq!(claim.action, ProviderCleanupAction::Delete);
+    let diagnostic = geo_domain::ProviderCleanupDiagnostic {
+        stage: geo_domain::ProviderCleanupStage::Delete,
+        code: geo_domain::ProviderCleanupCode::HttpError,
+    };
+    cleanup
+        .finish_with_diagnostic(
+            &scope,
+            id,
+            claim.lease_id,
+            ProviderCleanupOutcome::Failed,
+            Some(diagnostic),
+        )
+        .await
+        .unwrap();
+    let stored: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT last_diagnostic FROM provider_conversation_cleanup WHERE cleanup_id=$1",
+    )
+    .bind(id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, Some(serde_json::to_value(diagnostic).unwrap()));
+    assert!(cleanup.claim_due(&scope).await.unwrap().is_none());
+    assert!(
+        sqlx::query(
+            "UPDATE provider_conversation_cleanup_attempts SET state='deleted' WHERE lease_id=$1"
+        )
+        .bind(claim.lease_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    for invalid in [
+        serde_json::json!({"stage":"delete","code":"private unexpected error"}),
+        serde_json::json!({"stage":"delete","code":"http_error","raw":"secret"}),
+        serde_json::json!({"stage":"delete","code":null}),
+    ] {
+        assert!(
+            sqlx::query(
+                "UPDATE provider_conversation_cleanup SET last_diagnostic=$1 WHERE cleanup_id=$2"
+            )
+            .bind(invalid)
+            .bind(id)
+            .execute(database.pool())
+            .await
+            .is_err()
+        );
+    }
+    sqlx::query(
+        "UPDATE provider_conversation_cleanup SET next_attempt_at=now() WHERE cleanup_id=$1",
+    )
+    .bind(id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let failed_lease = claim.lease_id;
+    let claim = cleanup.claim(&scope, id).await.unwrap().unwrap();
+    assert_eq!(claim.action, ProviderCleanupAction::Delete);
+    assert!(
+        cleanup
+            .finish_with_diagnostic(
+                &scope,
+                id,
+                failed_lease,
+                ProviderCleanupOutcome::Deleted,
+                None
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(
         Some(&claim.original_identity),
         input.original_identity.as_ref()
     );
     assert!(cleanup.claim_due(&scope).await.unwrap().is_none());
-    assert!(due_ids(&cleanup, &scope, Utc::now()).await.is_empty());
+    assert!(
+        due_ids(&cleanup, &scope, database_now(&database).await)
+            .await
+            .is_empty()
+    );
+    let latest: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT last_diagnostic FROM provider_conversation_cleanup WHERE cleanup_id=$1",
+    )
+    .bind(id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(latest, Some(serde_json::to_value(diagnostic).unwrap()));
+    let retained: serde_json::Value = sqlx::query_scalar(
+        "SELECT diagnostic FROM provider_conversation_cleanup_attempts WHERE lease_id=$1",
+    )
+    .bind(failed_lease)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained, serde_json::to_value(diagnostic).unwrap());
     assert!(
         cleanup
             .finish(&scope, id, Uuid::new_v4(), ProviderCleanupOutcome::Deleted)
@@ -214,7 +316,11 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         )
         .await
         .unwrap();
-    assert!(due_ids(&cleanup, &scope, Utc::now()).await.is_empty());
+    assert!(
+        due_ids(&cleanup, &scope, database_now(&database).await)
+            .await
+            .is_empty()
+    );
     sqlx::query(
         "UPDATE provider_conversation_cleanup SET next_attempt_at=now(),attempt_count=25 WHERE cleanup_id=$1",
     )
@@ -224,6 +330,14 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     .unwrap();
     let reconcile = cleanup.claim_due(&scope).await.unwrap().unwrap();
     assert_eq!(reconcile.action, ProviderCleanupAction::Reconcile);
+    let latest: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT last_diagnostic FROM provider_conversation_cleanup WHERE cleanup_id=$1",
+    )
+    .bind(id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(latest.is_none());
     cleanup
         .finish(
             &scope,
@@ -234,7 +348,11 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         .await
         .unwrap();
     assert!(cleanup.claim_due(&scope).await.unwrap().is_none());
-    assert!(due_ids(&cleanup, &scope, Utc::now()).await.is_empty());
+    assert!(
+        due_ids(&cleanup, &scope, database_now(&database).await)
+            .await
+            .is_empty()
+    );
     assert_eq!(
         captures
             .get(&scope, input.capture_id)
@@ -262,9 +380,9 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         owned_conversation: candidate.owned_conversation.clone(),
         ..input.clone()
     };
-    captures.save(&scope, raw_extraction.clone()).await.unwrap();
+    let raw_receipt = captures.save(&scope, raw_extraction.clone()).await.unwrap();
     assert_eq!(
-        backfill_ids(&cleanup, &scope, Utc::now()).await,
+        backfill_ids(&cleanup, &scope, raw_receipt.stored_at).await,
         vec![raw_extraction.capture_id]
     );
     let raw_cleanup_id = cleanup
@@ -294,7 +412,8 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
 
     // Three separately owned resources exercise exclusive UUID keysets. The
     // snapshot cutoff must not admit captures saved after a scan began.
-    let cutoff = Utc::now() - chrono::Duration::seconds(1);
+    let cutoff = database_now(&database).await;
+    let mut latest_capture_time = cutoff;
     let mut expected_captures = Vec::new();
     let mut expected_jobs = Vec::new();
     for index in 0..3 {
@@ -305,13 +424,15 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
             .as_mut()
             .unwrap()
             .external_conversation_id = format!("synthetic-page-{index}");
-        captures.save(&scope, next.clone()).await.unwrap();
+        let receipt = captures.save(&scope, next.clone()).await.unwrap();
+        assert!(receipt.stored_at > cutoff);
+        latest_capture_time = latest_capture_time.max(receipt.stored_at);
         expected_captures.push(next.capture_id);
     }
     assert!(backfill_ids(&cleanup, &scope, cutoff).await.is_empty());
     expected_captures.sort();
     assert_eq!(
-        backfill_ids(&cleanup, &scope, Utc::now()).await,
+        backfill_ids(&cleanup, &scope, latest_capture_time).await,
         expected_captures
     );
     for capture_id in &expected_captures {
@@ -319,7 +440,10 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     }
     expected_jobs.sort();
     assert!(due_ids(&cleanup, &scope, cutoff).await.is_empty());
-    assert_eq!(due_ids(&cleanup, &scope, Utc::now()).await, expected_jobs);
+    assert_eq!(
+        due_ids(&cleanup, &scope, database_now(&database).await).await,
+        expected_jobs
+    );
     // Claiming an exact later row must not consume the first row.
     let exact_id = expected_jobs[2];
     let exact = cleanup.claim(&scope, exact_id).await.unwrap().unwrap();
@@ -327,7 +451,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     assert_eq!(exact.cleanup_id, exact_id);
     assert!(cleanup.claim(&scope, exact_id).await.unwrap().is_none());
     assert_eq!(
-        due_ids(&cleanup, &scope, Utc::now()).await,
+        due_ids(&cleanup, &scope, database_now(&database).await).await,
         expected_jobs[..2]
     );
 
@@ -445,7 +569,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
             .is_err()
     );
     assert!(
-        due_ids(&cleanup, &scope, Utc::now())
+        due_ids(&cleanup, &scope, database_now(&database).await)
             .await
             .contains(&complete_id)
     );
@@ -494,7 +618,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         .await
         .unwrap();
     assert!(
-        backfill_ids(&cleanup, &other_scope, Utc::now())
+        backfill_ids(&cleanup, &other_scope, database_now(&database).await)
             .await
             .is_empty()
     );
@@ -510,6 +634,15 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     sqlx::query("UPDATE provider_conversation_cleanup SET state='pending',lease_id=NULL,lease_until=NULL,next_attempt_at=now() WHERE cleanup_id=$1")
         .bind(ambiguous_id).execute(database.pool()).await.unwrap();
     assert!(cleanup.claim(&scope, ambiguous_id).await.unwrap().is_none());
+}
+
+// Scheduling timestamps are assigned by PostgreSQL. Tests may run against a
+// separate host, so client wall-clock cutoffs must not decide eligibility.
+async fn database_now(database: &Database) -> chrono::DateTime<Utc> {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(database.pool())
+        .await
+        .unwrap()
 }
 
 async fn backfill_ids(

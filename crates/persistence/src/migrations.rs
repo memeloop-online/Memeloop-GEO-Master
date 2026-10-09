@@ -192,6 +192,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 45,
         description: "observation analysis projection",
     },
+    MigrationMetadata {
+        version: 46,
+        description: "provider conversation cleanup diagnostics",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

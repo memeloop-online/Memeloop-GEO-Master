@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { chromium } from "playwright";
 import {
+  cleanupDiagnostic,
   deleteKimiConversation,
   recoverKimiConversation,
 } from "../src/provider-conversation-cleanup.mjs";
@@ -145,6 +146,10 @@ test("expired deletion authority is checked again after the final inspection", a
       }),
     });
     assert.equal(result.status, "retained");
+    assert.deepEqual(result.diagnostic, {
+      stage: "authorization",
+      code: "authorization_expired",
+    });
     assert.equal(
       calls.filter(({ path }) => path.endsWith("GetChat")).length,
       2,
@@ -170,6 +175,10 @@ test("still-valid grant cannot delete without request timeout and close margin",
       }),
     });
     assert.equal(result.status, "retained");
+    assert.deepEqual(result.diagnostic, {
+      stage: "authorization",
+      code: "authorization_expired",
+    });
     assert.equal(
       calls.filter(({ path }) => path.endsWith("GetChat")).length,
       2,
@@ -195,6 +204,10 @@ test("browser dispatch rechecks the absolute deletion grant budget", async () =>
       }),
     });
     assert.equal(result.status, "retained");
+    assert.deepEqual(result.diagnostic, {
+      stage: "authorization",
+      code: "authorization_expired",
+    });
     assert.equal(
       calls.some(({ path }) => path.endsWith("DeleteChat")),
       false,
@@ -401,7 +414,11 @@ test("generation and mismatched chat remain untouched", async () => {
     state.chat = { chat: { id: SCOPE.chatId, status: "generating" } };
     assert.deepEqual(
       await recoverKimiConversation(page, { ...SCOPE, trustedOrigin }),
-      { status: "retained", reason: "generating" },
+      {
+        status: "retained",
+        reason: "generating",
+        diagnostic: { stage: "inspection", code: "generating" },
+      },
     );
     assert.equal(
       (
@@ -420,7 +437,11 @@ test("generation and mismatched chat remain untouched", async () => {
         trustedOrigin,
         authorizeDeletion: async () => authority(),
       }),
-      { status: "unknown", reason: "chat_mismatch" },
+      {
+        status: "unknown",
+        reason: "chat_mismatch",
+        diagnostic: { stage: "inspection", code: "chat_mismatch" },
+      },
     );
     assert.equal(
       calls.some(({ path }) => path === `${CHAT}DeleteChat`),
@@ -442,7 +463,11 @@ test("a GetChat 404 is unknown, never proof of a prior deletion", async () => {
         trustedOrigin,
         authorizeDeletion: async () => authority(),
       }),
-      { status: "unknown", reason: "http_error" },
+      {
+        status: "unknown",
+        reason: "http_error",
+        diagnostic: { stage: "inspection", code: "http_error" },
+      },
     );
     assert.equal(
       calls.some(({ path }) => path === `${CHAT}DeleteChat`),
@@ -455,7 +480,11 @@ test("missing durable authorization or switched account cannot delete", async ()
   await fixture(async ({ page, state, calls, trustedOrigin }) => {
     assert.deepEqual(
       await deleteKimiConversation(page, { ...SCOPE, trustedOrigin }),
-      { status: "retained", reason: "authorization_required" },
+      {
+        status: "retained",
+        reason: "authorization_required",
+        diagnostic: { stage: "authorization", code: "authorization_required" },
+      },
     );
     assert.equal(
       (
@@ -512,11 +541,13 @@ test("only exact delete acknowledgement succeeds; lost or mismatched response is
     assert.deepEqual(await deleteKimiConversation(page, options), {
       status: "unknown",
       reason: "unverified_delete_response",
+      diagnostic: { stage: "delete", code: "unverified_delete_response" },
     });
     state.lostDeleteResponse = true;
     assert.deepEqual(await deleteKimiConversation(page, options), {
       status: "unknown",
       reason: "transport_unknown",
+      diagnostic: { stage: "delete", code: "transport_unknown" },
     });
     assert.equal(
       calls.filter(({ path }) => path === `${CHAT}DeleteChat`).length,
@@ -530,4 +561,22 @@ test("only exact delete acknowledgement succeeds; lost or mismatched response is
       "deleted",
     );
   });
+});
+
+test("cleanup diagnostics accept only exact fixed enum fields", () => {
+  const safe = { stage: "inventory", code: "message_inventory_mismatch" };
+  assert.deepEqual(cleanupDiagnostic(safe), safe);
+  assert.notEqual(cleanupDiagnostic(safe), safe);
+  for (const value of [
+    null,
+    [],
+    "private-body",
+    {},
+    { stage: "inventory" },
+    { ...safe, detail: "private-body" },
+    { ...safe, code: "private-body" },
+    { ...safe, stage: "private-body" },
+    Object.create(safe),
+  ])
+    assert.equal(cleanupDiagnostic(value), undefined);
 });

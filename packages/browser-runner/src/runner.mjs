@@ -5,6 +5,7 @@ import { adapters as defaultAdapters } from "./adapters.mjs";
 import { parseExtractionJson } from "./ai-observation-parser.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
 import {
+  cleanupDiagnostic,
   recoverKimiConversation,
   deleteKimiConversation,
 } from "./provider-conversation-cleanup.mjs";
@@ -1148,23 +1149,43 @@ export function createRunner(options = {}) {
       return previous.promise;
     }
     const record = session(sessionId);
-    const reply = (status) => ({
-      execution_id: input.execution_id,
-      external_conversation_id: input.external_conversation_id,
-      status,
-    });
-    if (record.platform !== "kimi") return reply("retained");
-    if (!record.completed) return reply("needs_login");
+    const reply = (status, candidate) => {
+      const diagnostic = cleanupDiagnostic(candidate);
+      return {
+        execution_id: input.execution_id,
+        external_conversation_id: input.external_conversation_id,
+        status,
+        ...(diagnostic ? { diagnostic } : {}),
+      };
+    };
+    if (record.platform !== "kimi")
+      return reply("retained", {
+        stage: "scope",
+        code: "unsupported_platform",
+      });
+    if (!record.completed)
+      return reply("needs_login", {
+        stage: "identity",
+        code: "reauth_required",
+      });
     if (record.busy) throw new RunnerError(409, "session_busy");
     if (
       input.action === "delete" &&
       (!input.authorization_ticket || typeof authorizeDeletion !== "function")
     )
-      return reply("retained");
+      return reply("retained", {
+        stage: "authorization",
+        code: "authorization_required",
+      });
     record.busy = true;
     const entry = { fingerprint, promise: null, settledAt: null };
     const deadlineAt = performance.now() + Math.min(60_000, executionTimeoutMs);
     const expired = () => performance.now() >= deadlineAt;
+    const deadlineReply = () =>
+      reply("unknown", {
+        stage: "deadline",
+        code: "deadline_exceeded",
+      });
     // No operation may start after the lifecycle deadline. Already-dispatched
     // requests remain ambiguous and keep the session reserved until settled.
     const page = {
@@ -1177,14 +1198,21 @@ export function createRunner(options = {}) {
     const work = (async () => {
       try {
         const identity = await record.adapter.identify(record.page);
-        if (expired()) return reply("unknown");
-        if (!validateIdentity(identity)) return reply("needs_login");
+        if (expired()) return deadlineReply();
+        if (!validateIdentity(identity))
+          return reply("needs_login", {
+            stage: "identity",
+            code: "reauth_required",
+          });
         if (
           identity.platform_account_id !==
             input.expected_identity.platform_account_id ||
           identity.platform_account_id !== record.identity.platform_account_id
         )
-          return reply("retained");
+          return reply("retained", {
+            stage: "identity",
+            code: "account_mismatch",
+          });
         const options = {
           expectedUserId: input.expected_identity.platform_account_id,
           chatId: input.external_conversation_id,
@@ -1193,6 +1221,7 @@ export function createRunner(options = {}) {
             Math.min(12_000, Math.floor(deadlineAt - performance.now())),
           ),
         };
+        let authorizationDiagnostic;
         const result =
           input.action === "reconcile"
             ? await recoverKimiConversation(page, options)
@@ -1212,8 +1241,13 @@ export function createRunner(options = {}) {
                     typeof authority?.delete_not_after !== "string" ||
                     !Number.isFinite(Date.parse(authority.delete_not_after)) ||
                     Date.parse(authority.delete_not_after) <= Date.now()
-                  )
+                  ) {
+                    authorizationDiagnostic = {
+                      stage: "authorization",
+                      code: "authorization_expired",
+                    };
                     throw new Error("cleanup_authorization_expired");
+                  }
                   if (
                     typeof authority.retained_message_inventory_sha256 !==
                       "string" ||
@@ -1223,7 +1257,7 @@ export function createRunner(options = {}) {
                   return authority;
                 },
               });
-        if (expired()) return reply("unknown");
+        if (expired()) return deadlineReply();
         return reply(
           {
             deleted: "deleted",
@@ -1232,9 +1266,15 @@ export function createRunner(options = {}) {
             retained: "retained",
             reauth_required: "needs_login",
           }[result.status] ?? "unknown",
+          authorizationDiagnostic ?? result.diagnostic,
         );
       } catch {
-        return reply("unknown");
+        return expired()
+          ? deadlineReply()
+          : reply("unknown", {
+              stage: "runner",
+              code: "transport_unknown",
+            });
       } finally {
         clearTimeout(timer);
         record.busy = false;
@@ -1246,7 +1286,7 @@ export function createRunner(options = {}) {
       work,
       new Promise((resolve) => {
         timer = setTimeout(
-          () => resolve(reply("unknown")),
+          () => resolve(deadlineReply()),
           Math.max(1, Math.ceil(deadlineAt - performance.now())),
         );
       }),

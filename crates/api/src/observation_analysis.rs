@@ -17,7 +17,7 @@ use geo_domain::{
     ObservationCaptureRepository, ObservationCaptureSnapshot, ProjectAiUsage, ProjectId,
     TenantScope, observation_analysis_source_json, sha256_hex,
 };
-use geo_worker::ModelCompletionRequest;
+use geo_worker::{HostOpError, HostOpErrorCode, ModelCompletionRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -318,7 +318,7 @@ impl ObservationAnalysisService {
         .await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => failed("analysis_unavailable"),
+            Ok(Err(_)) => failed("analysis_source_unavailable"),
             Err(_) => failed("analysis_timeout"),
         };
         self.repository
@@ -342,7 +342,7 @@ impl ObservationAnalysisService {
         let source = observation_analysis_source_json(scope, request, &target, capture.as_ref())?;
         let prompt = crate::observation_ai_callback::extraction_prompt(&source)
             .map_err(|_| AppError::invalid_request("invalid saved source"))?;
-        let (completion, config_revision) = self
+        let completion = self
             .model
             .complete_for_usage_with_revision(
                 scope,
@@ -356,14 +356,28 @@ impl ObservationAnalysisService {
                     tools: vec![],
                 },
             )
-            .await
-            .map_err(|_| AppError::capability_missing("analysis model unavailable"))?;
+            .await;
+        let (completion, config_revision) = match completion {
+            Ok(completion) => completion,
+            // Classify only bridge-owned vocabulary. Never persist an error
+            // message, upstream body, request, endpoint or credential.
+            Err(error) => return Ok(failed(model_failure_code(&error))),
+        };
+        let output_reason = if completion.text.len() > 150_000 {
+            "model_output_too_large"
+        } else if completion.finish_reason != "stop" {
+            "model_output_incomplete"
+        } else if !completion.tool_calls.is_empty() {
+            "model_output_tool_calls"
+        } else {
+            "model_output_invalid"
+        };
         let mut result = ObservationAnalysisResult {
             config_revision: Some(config_revision),
             actual_model: Some(completion.model),
             candidate_json: None,
             outcome: ObservationAnalysisOutcome::Unverified {
-                reason: "model_output_invalid".into(),
+                reason: output_reason.into(),
             },
             prompt_tokens: completion.prompt_tokens,
             completion_tokens: completion.completion_tokens,
@@ -394,9 +408,71 @@ impl ObservationAnalysisService {
             }
         }
         if result.validate().is_err() {
-            return Ok(failed("analysis_result_invalid"));
+            // An invalid candidate/audit must not erase a model response that
+            // was actually received. Retain its bounded model/config/usage
+            // provenance while discarding the invalid interpretation payload.
+            result.candidate_json = None;
+            result.outcome = ObservationAnalysisOutcome::Failed {
+                code: "analysis_result_invalid".into(),
+            };
+            if result.validate().is_err() {
+                result.actual_model = None;
+            }
         }
         Ok(result)
+    }
+}
+
+fn model_failure_code(error: &HostOpError) -> &'static str {
+    match error.code {
+        HostOpErrorCode::InvalidRequest => "model_request_invalid",
+        HostOpErrorCode::CapabilityMissing => "model_unconfigured",
+        HostOpErrorCode::Denied => "model_access_denied",
+        HostOpErrorCode::BudgetExceeded => "model_budget_exceeded",
+        HostOpErrorCode::DeadlineExceeded => "model_timeout",
+        HostOpErrorCode::Cancelled => "model_cancelled",
+        HostOpErrorCode::Failed => {
+            if let Some(status) = error
+                .message
+                .strip_prefix("model provider returned HTTP status ")
+                .and_then(|status| status.parse::<u16>().ok())
+            {
+                return match status {
+                    401 => "model_http_unauthorized",
+                    403 => "model_http_forbidden",
+                    408 | 504 => "model_http_timeout",
+                    429 => "model_http_rate_limited",
+                    500..=599 => "model_http_server_error",
+                    _ => "model_http_rejected",
+                };
+            }
+            match error.message.as_str() {
+                "HTTP request failed"
+                | "HTTP response failed"
+                | "HTTP client initialization failed" => "model_transport_failed",
+                "provider response exceeds the size limit" | "provider response is too large" => {
+                    "model_response_too_large"
+                }
+                "project model settings unavailable" => "model_settings_unavailable",
+                "response is missing id"
+                | "response is missing model"
+                | "response is missing choices"
+                | "response is missing message"
+                | "response contains malformed tool_calls"
+                | "response contains empty tool_calls"
+                | "response repeats a tool call id"
+                | "response is missing text content"
+                | "response has neither answer content nor tool calls"
+                | "response is missing usage"
+                | "usage is missing prompt_tokens"
+                | "usage is missing completion_tokens"
+                | "usage is missing total_tokens"
+                | "provider response is not UTF-8" => "model_response_invalid",
+                message if message.starts_with("invalid JSON:") => "model_response_invalid",
+                _ => "model_failed",
+            }
+        }
+        _ => "model_failed",
     }
 }
 
@@ -549,6 +625,207 @@ mod tests {
     }
     struct Grounder {
         unavailable: bool,
+    }
+
+    struct FailingModel(AtomicUsize);
+    struct InvalidAuditGrounder;
+    #[async_trait::async_trait]
+    impl SavedObservationGrounder for InvalidAuditGrounder {
+        async fn ground(
+            &self,
+            _: &str,
+            _: &str,
+            candidate: &str,
+            _: Value,
+        ) -> Result<GroundingResult, AppError> {
+            Ok(GroundingResult {
+                candidate_json: Some(candidate.into()),
+                outcome: ObservationAnalysisOutcome::Grounded {
+                    raw_answer: "Synthetic saved answer".into(),
+                    citations: vec![],
+                    audit: json!({"refs":[]}),
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_interpretation_preserves_received_model_config_and_usage() {
+        let mut f = fixture(false, true, false).await;
+        f.service.grounder = Arc::new(InvalidAuditGrounder);
+        let queued = f
+            .service
+            .submit(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                AnalyzeSavedSource {
+                    idempotency_key: "invalid-audit".into(),
+                    capture_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        f.service
+            .execute(&f.scope, queued.request.revision_id)
+            .await
+            .unwrap();
+        let result = f
+            .service
+            .repository
+            .get(&f.scope, queued.request.revision_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            ObservationAnalysisOutcome::Failed {
+                code: "analysis_result_invalid".into()
+            }
+        );
+        assert_eq!(
+            result.actual_model.as_deref(),
+            Some("actual-synthetic-model")
+        );
+        assert_eq!(result.config_revision, Some(0));
+        assert_eq!(result.prompt_tokens, 12);
+        assert_eq!(result.completion_tokens, 4);
+        assert!(result.candidate_json.is_none());
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProviderBridge for FailingModel {
+        async fn complete(
+            &self,
+            _: &TenantScope,
+            _: &ModelCompletionRequest,
+        ) -> Result<ModelCompletion, HostOpError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(HostOpError::failed(
+                geo_worker::HostOp::ModelComplete,
+                "model provider returned HTTP status 503",
+            ))
+        }
+    }
+
+    #[test]
+    fn model_failures_use_fixed_codes_without_serializing_error_context() {
+        use geo_worker::HostOp;
+        for (message, expected) in [
+            (
+                "model provider returned HTTP status 401",
+                "model_http_unauthorized",
+            ),
+            (
+                "model provider returned HTTP status 429",
+                "model_http_rate_limited",
+            ),
+            (
+                "model provider returned HTTP status 503",
+                "model_http_server_error",
+            ),
+            ("HTTP request failed", "model_transport_failed"),
+            ("response is missing usage", "model_response_invalid"),
+            (
+                "invalid JSON: synthetic-private-response",
+                "model_response_invalid",
+            ),
+            (
+                "provider response exceeds the size limit",
+                "model_response_too_large",
+            ),
+            (
+                "project model settings unavailable",
+                "model_settings_unavailable",
+            ),
+            ("synthetic-private-response", "model_failed"),
+            (
+                "model provider returned HTTP status 503 private-suffix",
+                "model_failed",
+            ),
+        ] {
+            let error = HostOpError::failed(HostOp::ModelComplete, message);
+            assert_eq!(model_failure_code(&error), expected);
+            let result = failed(model_failure_code(&error));
+            result.validate().unwrap();
+            let serialized = serde_json::to_string(&result).unwrap();
+            assert!(!serialized.contains("synthetic-private"));
+            assert!(!serialized.contains("private-suffix"));
+            assert!(result.actual_model.is_none());
+            assert!(result.config_revision.is_none());
+        }
+        assert_eq!(
+            model_failure_code(&HostOpError::deadline_exceeded(
+                HostOp::ModelComplete,
+                60_000
+            )),
+            "model_timeout"
+        );
+        assert_eq!(
+            model_failure_code(&HostOpError::denied(HostOp::ModelComplete, "synthetic")),
+            "model_access_denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_failure_is_terminal_without_inventing_response_provenance_or_retrying() {
+        let mut f = fixture(false, true, false).await;
+        let model = Arc::new(FailingModel(AtomicUsize::new(0)));
+        f.service.model = Arc::new(
+            ProjectConfiguredModelBridge::new(
+                ProjectAiSettingsService::development(),
+                Some(model.clone()),
+            )
+            .unwrap(),
+        );
+        let queued = f
+            .service
+            .submit(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                AnalyzeSavedSource {
+                    idempotency_key: "model-failure".into(),
+                    capture_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        f.service
+            .execute(&f.scope, queued.request.revision_id)
+            .await
+            .unwrap();
+        f.service
+            .execute(&f.scope, queued.request.revision_id)
+            .await
+            .unwrap();
+        let revision = f
+            .service
+            .repository
+            .get(&f.scope, queued.request.revision_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = revision.result.unwrap();
+        assert_eq!(
+            result.outcome,
+            ObservationAnalysisOutcome::Failed {
+                code: "model_http_server_error".into()
+            }
+        );
+        assert!(result.actual_model.is_none());
+        assert!(result.config_revision.is_none());
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            f.original
+        );
     }
     #[async_trait::async_trait]
     impl SavedObservationGrounder for Grounder {

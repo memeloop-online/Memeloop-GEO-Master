@@ -532,6 +532,17 @@ pub(crate) struct CleanupResult {
     pub execution_id: Uuid,
     pub external_conversation_id: String,
     pub status: CleanupStatus,
+    #[serde(default, deserialize_with = "cleanup_diagnostic")]
+    pub diagnostic: Option<geo_domain::ProviderCleanupDiagnostic>,
+}
+
+fn cleanup_diagnostic<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<geo_domain::ProviderCleanupDiagnostic>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    // Optional diagnostics must not turn a receipt into an error, nor admit
+    // arbitrary strings/extra fields into persistent operational history.
+    Ok(serde_json::from_value(value).ok())
 }
 
 #[derive(Serialize)]
@@ -709,6 +720,39 @@ pub struct VerifiedBrowserSession {
 #[cfg(test)]
 mod measurement_options_tests {
     use super::*;
+
+    #[test]
+    fn cleanup_diagnostics_are_optional_closed_and_non_authoritative() {
+        let base = serde_json::json!({
+            "execution_id": Uuid::new_v4(),
+            "external_conversation_id": "fixture-chat",
+            "status": "retained"
+        });
+        let old: CleanupResult = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(old.diagnostic, None);
+        for diagnostic in [
+            serde_json::Value::Null,
+            serde_json::json!({"stage":"delete","code":"unexpected secret text"}),
+            serde_json::json!({"stage":"unexpected endpoint","code":"http_error"}),
+            serde_json::json!({"stage":"delete","code":"http_error","raw":"secret"}),
+            serde_json::json!({"stage":"delete","code":null}),
+            serde_json::json!("arbitrary error"),
+        ] {
+            let mut value = base.clone();
+            value["diagnostic"] = diagnostic;
+            let result: CleanupResult = serde_json::from_value(value).unwrap();
+            assert_eq!(result.status, CleanupStatus::Retained);
+            assert_eq!(result.diagnostic, None);
+        }
+        let mut valid = base;
+        valid["diagnostic"] = serde_json::json!({"stage":"delete","code":"http_error"});
+        let result: CleanupResult = serde_json::from_value(valid).unwrap();
+        assert_eq!(result.status, CleanupStatus::Retained);
+        assert_eq!(
+            serde_json::to_value(result.diagnostic).unwrap(),
+            serde_json::json!({"stage":"delete","code":"http_error"})
+        );
+    }
 
     #[tokio::test]
     async fn cleanup_wire_is_scoped_and_rejects_mismatched_receipts() {

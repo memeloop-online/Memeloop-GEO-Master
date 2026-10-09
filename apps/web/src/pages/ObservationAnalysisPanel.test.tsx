@@ -8,6 +8,10 @@ import * as api from "../api/observationAnalysis";
 import type { ObservationAnalysisRevision } from "../api/observationAnalysis";
 import { ObservationAnalysisPanel } from "./ObservationAnalysisPanel";
 import i18n from "../i18n";
+import {
+  analysisFailureMessageKey,
+  analysisUnverifiedMessageKey,
+} from "../i18n/observationAnalysis";
 
 vi.mock("../auth/AuthProvider", () => ({
   useAuth: () => ({
@@ -84,6 +88,111 @@ afterEach(async () => {
 });
 
 describe("saved response analysis", () => {
+  it.each([
+    ["model_unconfigured", "failureConfiguration"],
+    ["model_access_denied", "failureAccess"],
+    ["model_http_unauthorized", "failureAccess"],
+    ["model_http_forbidden", "failureAccess"],
+    ["model_budget_exceeded", "failureBudget"],
+    ["model_settings_unavailable", "failureUnavailable"],
+    ["model_transport_failed", "failureUnavailable"],
+    ["model_http_server_error", "failureUnavailable"],
+    ["model_http_rate_limited", "failureRateLimit"],
+    ["model_timeout", "failureTimeout"],
+    ["model_http_timeout", "failureTimeout"],
+    ["analysis_timeout", "failureTimeout"],
+    ["model_cancelled", "failureInterrupted"],
+    ["analysis_interrupted", "failureInterrupted"],
+    ["model_request_invalid", "failureRequest"],
+    ["model_http_rejected", "failureRequest"],
+    ["model_response_invalid", "failureResponse"],
+    ["model_response_too_large", "failureResponse"],
+    ["analysis_result_invalid", "failureResponse"],
+    ["analysis_source_unavailable", "failureSource"],
+    ["grounding_unavailable", "failureGrounding"],
+    ["model_failed", "failed"],
+    ["private-upstream-message", "failed"],
+    ["constructor", "failed"],
+  ])("maps %s to a fixed translated explanation", (code, key) => {
+    expect(analysisFailureMessageKey(code)).toBe(key);
+    for (const lng of ["zh-CN", "en"]) {
+      const message = i18n.t(key, { lng, ns: "observationAnalysis" });
+      expect(message).not.toBe(key);
+      expect(message).not.toContain(code);
+    }
+  });
+
+  it.each(["zh-CN", "en"])(
+    "shows specific failure guidance in %s without submitting again or hiding model metadata",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      const codes = [
+        "model_unconfigured",
+        "model_http_unauthorized",
+        "model_http_server_error",
+        "model_http_rate_limited",
+        "model_timeout",
+        "model_response_invalid",
+        "analysis_source_unavailable",
+        "grounding_unavailable",
+        "private-upstream-message",
+      ];
+      const { create } = setup(
+        codes.map((code, index) => ({
+          ...revision,
+          request: { ...revision.request, revision_id: `revision-${index}` },
+          state: "completed",
+          result: {
+            actual_model: `received-model-${index}`,
+            config_revision: 3,
+            candidate_json: "private-candidate",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            outcome: { status: "failed", code },
+          },
+        })),
+      );
+      for (const [index, code] of codes.entries()) {
+        expect(
+          await screen.findByText(
+            i18n.t(analysisFailureMessageKey(code), {
+              ns: "observationAnalysis",
+            }),
+          ),
+        ).toBeInTheDocument();
+        expect(
+          screen.getByText(
+            i18n.t("model", {
+              ns: "observationAnalysis",
+              value: `received-model-${index}`,
+            }),
+          ),
+        ).toBeInTheDocument();
+        expect(screen.queryByText(code)).not.toBeInTheDocument();
+      }
+      expect(screen.queryByText("private-candidate")).not.toBeInTheDocument();
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    "model_output_too_large",
+    "model_output_incomplete",
+    "model_output_tool_calls",
+    "model_output_invalid",
+  ])(
+    "distinguishes unusable model output %s from source disagreement",
+    (reason) => {
+      expect(analysisUnverifiedMessageKey(reason)).toBe("failureResponse");
+      expect(analysisUnverifiedMessageKey("grounding_failed")).toBe(
+        "unverified",
+      );
+      expect(analysisUnverifiedMessageKey("private-provider-reason")).toBe(
+        "unverified",
+      );
+    },
+  );
+
   it("only offers reanalysis when a saved source exists", async () => {
     const { create } = setup([], false);
     expect(

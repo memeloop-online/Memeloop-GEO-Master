@@ -48,6 +48,55 @@ pub enum ProviderCleanupOutcome {
     NeedsLogin,
 }
 
+/// Closed, non-sensitive diagnostics only. Never stores provider error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCleanupStage {
+    Scope,
+    Identity,
+    Inspection,
+    Authorization,
+    Messages,
+    Inventory,
+    Delete,
+    Deadline,
+    Runner,
+    Preflight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCleanupCode {
+    InvalidScope,
+    UnsupportedPlatform,
+    ReauthRequired,
+    AccountMismatch,
+    WrongOrigin,
+    InvalidResponse,
+    HttpError,
+    TooLarge,
+    TransportUnknown,
+    ChatMismatch,
+    Generating,
+    AuthorizationRequired,
+    AuthorizationExpired,
+    UnverifiedMessages,
+    PaginationIncomplete,
+    MessageInventoryMismatch,
+    UnverifiedDeleteResponse,
+    DeadlineExceeded,
+    DependencyUnavailable,
+    AccountBusy,
+    RetainedEvidenceRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCleanupDiagnostic {
+    pub stage: ProviderCleanupStage,
+    pub code: ProviderCleanupCode,
+}
+
 impl ProviderCleanupOutcome {
     pub fn next_state(self, action: ProviderCleanupAction) -> Result<&'static str, AppError> {
         match (self, action) {
@@ -113,6 +162,18 @@ pub trait ProviderConversationCleanupRepository: Send + Sync {
         lease_id: Uuid,
         outcome: ProviderCleanupOutcome,
     ) -> Result<(), AppError>;
+    /// Diagnostics never influence authorization or state transitions.
+    async fn finish_with_diagnostic(
+        &self,
+        scope: &TenantScope,
+        cleanup_id: Uuid,
+        lease_id: Uuid,
+        outcome: ProviderCleanupOutcome,
+        diagnostic: Option<ProviderCleanupDiagnostic>,
+    ) -> Result<(), AppError> {
+        let _ = diagnostic;
+        self.finish(scope, cleanup_id, lease_id, outcome).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -2256,6 +2256,7 @@ mod publication_binding_tests {
         starts: Arc<Mutex<Vec<Value>>>,
         version: Arc<Mutex<String>>,
         cleanup_events: Arc<Mutex<Vec<&'static str>>>,
+        cleanup_failure: Arc<Mutex<bool>>,
     }
 
     async fn runner(
@@ -2301,12 +2302,16 @@ mod publication_binding_tests {
                     .is_some_and(|s| !s.is_empty())
             );
             stub.cleanup_events.lock().await.push("rpc");
+            let failure = *stub.cleanup_failure.lock().await;
             return (
                 StatusCode::OK,
                 Json(json!({
                     "execution_id":payload["execution_id"],
                     "external_conversation_id":payload["external_conversation_id"],
-                    "status":"deleted"
+                    "status": if failure { "retained" } else { "deleted" },
+                    "diagnostic": if failure {
+                        json!({"stage":"delete","code":"http_error"})
+                    } else { Value::Null }
                 })),
             );
         }
@@ -2493,6 +2498,7 @@ mod publication_binding_tests {
         complete_evidence: bool,
         finished: tokio::sync::Notify,
         outcome: Mutex<Option<geo_domain::ProviderCleanupOutcome>>,
+        diagnostic: Mutex<Option<geo_domain::ProviderCleanupDiagnostic>>,
     }
 
     #[async_trait::async_trait]
@@ -2594,14 +2600,26 @@ mod publication_binding_tests {
             self.finished.notify_one();
             Ok(())
         }
+        async fn finish_with_diagnostic(
+            &self,
+            scope: &TenantScope,
+            cleanup_id: Uuid,
+            lease_id: Uuid,
+            outcome: geo_domain::ProviderCleanupOutcome,
+            diagnostic: Option<geo_domain::ProviderCleanupDiagnostic>,
+        ) -> Result<(), AppError> {
+            *self.diagnostic.lock().await = diagnostic;
+            self.finish(scope, cleanup_id, lease_id, outcome).await
+        }
     }
 
-    async fn cleanup_dispatch_fixture(complete_evidence: bool) {
+    async fn cleanup_dispatch_fixture(complete_evidence: bool, failure: bool) {
         use geo_domain::{
             ObservationProviderIdentity, ProviderCleanupAction, ProviderCleanupClaim,
             ProviderCleanupOutcome,
         };
         let (service, scope, account_id, stub, server) = fixture().await;
+        *stub.cleanup_failure.lock().await = failure;
         let mut account = service
             .repository
             .get_account(&scope, account_id)
@@ -2637,6 +2655,7 @@ mod publication_binding_tests {
             complete_evidence,
             finished: tokio::sync::Notify::new(),
             outcome: Mutex::new(None),
+            diagnostic: Mutex::new(None),
         });
         let callbacks = crate::ProviderCleanupCallbackService::new(
             repository.clone(),
@@ -2679,23 +2698,44 @@ mod publication_binding_tests {
         assert_eq!(*stub.cleanup_events.lock().await, expected);
         assert_eq!(
             *repository.outcome.lock().await,
-            Some(if complete_evidence {
+            Some(if complete_evidence && !failure {
                 ProviderCleanupOutcome::Deleted
             } else {
                 ProviderCleanupOutcome::Failed
             })
+        );
+        assert_eq!(
+            *repository.diagnostic.lock().await,
+            if !complete_evidence {
+                Some(geo_domain::ProviderCleanupDiagnostic {
+                    stage: geo_domain::ProviderCleanupStage::Authorization,
+                    code: geo_domain::ProviderCleanupCode::AuthorizationRequired,
+                })
+            } else if failure {
+                Some(geo_domain::ProviderCleanupDiagnostic {
+                    stage: geo_domain::ProviderCleanupStage::Delete,
+                    code: geo_domain::ProviderCleanupCode::HttpError,
+                })
+            } else {
+                None
+            }
         );
         server.abort();
     }
 
     #[tokio::test]
     async fn cleanup_dispatch_orders_reservation_authorization_identity_rpc_close_and_finish() {
-        cleanup_dispatch_fixture(true).await;
+        cleanup_dispatch_fixture(true, false).await;
     }
 
     #[tokio::test]
     async fn cleanup_dispatch_incomplete_evidence_releases_without_start_or_model_call() {
-        cleanup_dispatch_fixture(false).await;
+        cleanup_dispatch_fixture(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_dispatch_retained_receipt_preserves_diagnostic_through_finish() {
+        cleanup_dispatch_fixture(true, true).await;
     }
 
     async fn set_default_proxy(
