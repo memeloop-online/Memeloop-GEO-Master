@@ -57,7 +57,17 @@ fn assemble_with_transport<T: Transport + 'static>(
     let provider = guarded_provider(ai, transport)?;
     // The same exact-project provider is registered for P00 host ops and
     // content generation by assemble_with_provider.
-    runtime::assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, provider)
+    let runtime =
+        runtime::assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, provider)?;
+    for usage in geo_domain::ProjectAiUsage::ALL {
+        state
+            .project_ai_settings()
+            .with_inherited_scope(usage, ai.scope.clone());
+        state
+            .project_ai_settings()
+            .with_inherited_model(usage, ai.model.clone());
+    }
+    Ok(runtime)
 }
 
 fn guarded_provider<T: Transport + 'static>(
@@ -275,6 +285,22 @@ mod tests {
         let runtime = assemble_with_transport(&state, &ai, Arc::clone(&transport)).unwrap();
         assert!(runtime.is_configured());
         assert!(state.content_model_available());
+        for usage in geo_domain::ProjectAiUsage::ALL {
+            let configured = state
+                .project_ai_settings()
+                .get(&allowed.0, usage)
+                .await
+                .unwrap();
+            assert!(configured.effective.configured);
+            assert_eq!(configured.effective.model.as_deref(), Some("test-model"));
+            let other = state
+                .project_ai_settings()
+                .get(&other_project.0, usage)
+                .await
+                .unwrap();
+            assert!(!other.effective.configured);
+            assert!(other.effective.model.is_none());
+        }
         std::fs::remove_file(path).unwrap();
 
         let service = state.content_service();

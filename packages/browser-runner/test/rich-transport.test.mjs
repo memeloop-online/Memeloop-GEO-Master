@@ -24,6 +24,7 @@ let adapterOutcome = "unsupported";
 let captureMode = "grant";
 let measurementActions = 0;
 const captures = [];
+const interpretationCalls = [];
 
 function canonical(value) {
   if (Array.isArray(value))
@@ -135,6 +136,33 @@ before(async () => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
+    if (request.url.startsWith("/internal/v1/observation-ai/")) {
+      interpretationCalls.push({ path: request.url, body });
+      assert.deepEqual(Object.keys(body).sort(), [
+        "capture_ticket",
+        "schema_version",
+        "source_capture_id",
+        "source_sha256",
+      ]);
+      assert.equal(
+        body.source_capture_id,
+        "88888888-8888-4888-8888-888888888888",
+      );
+      assert.equal(body.source_sha256, captures.at(-1).snapshot.source_sha256);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify(
+          request.url.endsWith("/policy")
+            ? { prefer_connected_account: false, config_version: 7 }
+            : {
+                text: '{"completion":"unknown"}',
+                model: "actual-project-model",
+                config_version: 8,
+              },
+        ),
+      );
+      return;
+    }
     if (request.url === "/internal/v1/observation-captures") {
       captures.push(body);
       if (captureMode !== "grant") {
@@ -249,6 +277,19 @@ before(async () => {
           });
           // The extraction/candidate phase must never run until source ack.
           assert.equal(captures.at(-1)?.snapshot.phase, "source");
+          assert.deepEqual(await network.getExtractionPolicy(), {
+            prefer_connected_account: false,
+            config_version: 7,
+          });
+          assert.deepEqual(
+            await network.apiExtract("must not cross callback boundary"),
+            {
+              extracted: { completion: "unknown" },
+              model: "actual-project-model",
+              config_version: 8,
+              surface: "model_api",
+            },
+          );
           await network.onConversationCaptured?.({
             provider: "kimi",
             purpose: "extraction",
@@ -501,6 +542,17 @@ test("source and raw extraction checkpoints precede candidate with shared ordere
   assert.equal(result.body.provenance, "fixture");
   assert.equal(measurementActions, 1);
   assert.equal(captures.length, 3);
+  assert.deepEqual(
+    interpretationCalls.map((call) => call.path),
+    [
+      "/internal/v1/observation-ai/policy",
+      "/internal/v1/observation-ai/extract",
+    ],
+  );
+  assert.equal(
+    JSON.stringify(interpretationCalls).includes("must not cross"),
+    false,
+  );
   assert.deepEqual(
     captures.map((capture) => capture.ordinal),
     [0, 1, 2],

@@ -176,6 +176,46 @@ struct DurableRoutes {
     gateway_url: String,
 }
 
+struct DurableModelMetadata {
+    grants: PgModelRouteRepository,
+}
+
+/// Metadata uses the same uncached default-grant query as inference. It does
+/// not resolve Token Center credentials or probe an upstream model.
+#[async_trait]
+impl geo_api::InheritedModelMetadata for DurableModelMetadata {
+    async fn default_model(
+        &self,
+        scope: &TenantScope,
+    ) -> Result<Option<String>, geo_domain::AppError> {
+        let grant = self
+            .grants
+            .resolve(scope, None)
+            .await
+            .map_err(|_| geo_domain::AppError::not_ready("model grant metadata unavailable"))?;
+        Ok(default_model_metadata(scope, grant.as_ref()))
+    }
+}
+
+fn default_model_metadata(scope: &TenantScope, grant: Option<&ModelRouteGrant>) -> Option<String> {
+    grant
+        .filter(|grant| {
+            grant.scope.contains(scope) && grant.enabled && grant.is_default && grant.valid()
+        })
+        .map(|grant| grant.model.clone())
+}
+
+pub fn configure_model_metadata(state: &geo_api::AppState, database: &Database) {
+    let metadata: Arc<dyn geo_api::InheritedModelMetadata> = Arc::new(DurableModelMetadata {
+        grants: PgModelRouteRepository::from_database(database),
+    });
+    for usage in geo_domain::ProjectAiUsage::ALL {
+        state
+            .project_ai_settings()
+            .with_inherited_metadata(usage, Arc::clone(&metadata));
+    }
+}
+
 #[async_trait]
 impl ProviderRouteResolver for DurableRoutes {
     async fn resolve(
@@ -266,6 +306,53 @@ pub fn build_model_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_requires_a_valid_enabled_default_grant_in_the_requested_scope() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let mut grant = ModelRouteGrant {
+            route_id: Uuid::new_v4(),
+            scope: scope.clone(),
+            model: "approved-default-model".into(),
+            is_default: true,
+            enabled: true,
+            tenant_external_id: "synthetic-tenant".into(),
+            principal_external_id: "synthetic-principal".into(),
+            key_id: Uuid::new_v4(),
+            credential_generation: 1,
+        };
+        assert_eq!(default_model_metadata(&scope, None), None);
+        assert_eq!(
+            default_model_metadata(&scope, Some(&grant)).as_deref(),
+            Some("approved-default-model")
+        );
+        grant.enabled = false;
+        assert_eq!(default_model_metadata(&scope, Some(&grant)), None);
+        grant.enabled = true;
+        grant.is_default = false;
+        assert_eq!(default_model_metadata(&scope, Some(&grant)), None);
+        grant.is_default = true;
+        for forbidden in [
+            TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, scope.project_id),
+            TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id),
+            TenantScope::new(
+                scope.operator_id,
+                scope.tenant_id,
+                Some(Uuid::new_v4().into()),
+            ),
+            TenantScope::new(scope.operator_id, scope.tenant_id, None),
+        ] {
+            assert_eq!(default_model_metadata(&forbidden, Some(&grant)), None);
+        }
+        grant.scope.project_id = None;
+        assert!(default_model_metadata(&scope, Some(&grant)).is_some());
+        grant.credential_generation = 0;
+        assert_eq!(default_model_metadata(&scope, Some(&grant)), None);
+    }
 
     #[test]
     fn config_is_all_or_nothing_and_redacted() {

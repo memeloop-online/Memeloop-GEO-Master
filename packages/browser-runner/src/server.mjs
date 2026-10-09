@@ -9,7 +9,13 @@ const CALLBACK_PATH = "/internal/v1/publication-send/authorize";
 const CAPTURE_PATH = "/internal/v1/observation-captures";
 const CLEANUP_PATH = "/internal/v1/provider-conversation-cleanup/authorize";
 
-function serviceCallback(origin, token, path, maxResponseBytes) {
+function serviceCallback(
+  origin,
+  token,
+  path,
+  maxResponseBytes,
+  timeoutMs = 10_000,
+) {
   // Deployment configuration only, never a model/request-selected URL.
   // Private cluster service traffic may use HTTP; external deployments use TLS.
   if (!origin && !token) return null;
@@ -29,7 +35,7 @@ function serviceCallback(origin, token, path, maxResponseBytes) {
     !/^[\x21-\x7e]+$/.test(token)
   )
     throw new Error("invalid_rich_callback_config");
-  return async (body) => {
+  return async (body, { signal } = {}) => {
     const response = await fetch(`${origin}${path}`, {
       method: "POST",
       headers: {
@@ -38,7 +44,9 @@ function serviceCallback(origin, token, path, maxResponseBytes) {
       },
       body: JSON.stringify(body),
       redirect: "error",
-      signal: AbortSignal.timeout(10_000),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs),
     });
     if (response.status !== 200)
       throw new Error("service_callback_unavailable");
@@ -119,6 +127,21 @@ export function createRunnerServer({
     CAPTURE_PATH,
     8192,
   );
+  const observationAi = {
+    policy: serviceCallback(
+      captureOrigin,
+      captureToken,
+      "/internal/v1/observation-ai/policy",
+      8192,
+    ),
+    extract: serviceCallback(
+      captureOrigin,
+      captureToken,
+      "/internal/v1/observation-ai/extract",
+      320_000,
+      90_000,
+    ),
+  };
   const authorizeCleanup = serviceCallback(
     callbackOrigin,
     callbackToken,
@@ -141,7 +164,11 @@ export function createRunnerServer({
         send(
           response,
           200,
-          await runner.execute(await readJson(request), persistCapture),
+          await runner.execute(
+            await readJson(request),
+            persistCapture,
+            observationAi,
+          ),
         );
       } else if (
         parts.length === 4 &&

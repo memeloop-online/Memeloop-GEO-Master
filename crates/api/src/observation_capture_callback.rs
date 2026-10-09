@@ -150,7 +150,7 @@ impl ObservationCaptureCallbackService {
             .map_err(|_| AppError::conflict("observation callback ticket unavailable"))
     }
 
-    fn authenticate(&self, headers: &axum::http::HeaderMap) -> bool {
+    pub(crate) fn authenticate(&self, headers: &axum::http::HeaderMap) -> bool {
         let mut values = headers.get_all(AUTHORIZATION).iter();
         let Some(value) = values.next().and_then(|value| value.to_str().ok()) else {
             return false;
@@ -170,6 +170,72 @@ impl ObservationCaptureCallbackService {
             self.bearer_tag.as_ref(),
         )
         .is_ok()
+    }
+
+    /// Resolve only ordinal-zero source bytes from the exact sealed execution.
+    /// Neither scope nor prompt nor model selection is accepted from a caller.
+    pub(crate) async fn load_bound_source(
+        &self,
+        capture_ticket: &str,
+        source_capture_id: Uuid,
+        source_sha256: &str,
+    ) -> Result<(TenantScope, String), StatusCode> {
+        if capture_ticket.len() > MAX_TICKET_CHARS || source_sha256.len() != 64 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let sealed = hex::decode(capture_ticket).map_err(|_| StatusCode::FORBIDDEN)?;
+        let plaintext = self
+            .cipher
+            .open(TICKET_AAD, &sealed)
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+        let ticket: Ticket =
+            serde_json::from_slice(&plaintext).map_err(|_| StatusCode::FORBIDDEN)?;
+        if ticket.version != 1
+            || ticket.scope.project_id.is_none()
+            || ticket.expires_at <= Utc::now()
+            || [
+                ticket.target_id,
+                ticket.attempt_id,
+                ticket.account_id,
+                ticket.runner_session_id,
+            ]
+            .iter()
+            .any(Uuid::is_nil)
+            || capture_id(&ticket, 0) != source_capture_id
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let capture = self
+            .repository
+            .get(&ticket.scope, source_capture_id)
+            .await
+            .map_err(status)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let expected_capture_digest = capture.input.validate(&ticket.scope).map_err(status)?;
+        let input = capture.input;
+        if input.capture_id != source_capture_id
+            || input.ordinal != 0
+            || input.target_id != ticket.target_id
+            || input.attempt_id != ticket.attempt_id
+            || input.account_id != ticket.account_id
+            || input.runner_session_id != ticket.runner_session_id
+            || input.original_identity.as_ref() != Some(&ticket.original_identity)
+            || capture.receipt.capture_id != source_capture_id
+            || capture.receipt.digest_sha256 != expected_capture_digest
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        match input.snapshot {
+            ObservationCaptureSnapshot::Source {
+                source_json,
+                source_sha256: saved_digest,
+            } if saved_digest == source_sha256
+                && geo_domain::sha256_hex(source_json.as_bytes()) == source_sha256 =>
+            {
+                Ok((ticket.scope, source_json))
+            }
+            _ => Err(StatusCode::FORBIDDEN),
+        }
     }
 
     async fn capture(
@@ -489,6 +555,75 @@ mod tests {
         )
         .unwrap();
         (status, text)
+    }
+
+    #[tokio::test]
+    async fn model_source_is_bound_to_sealed_scope_attempt_session_and_digest() {
+        let fixture = fixture();
+        let (_, text) = submit(&fixture.service, &fixture.body, Some(BEARER)).await;
+        let receipt: ObservationCaptureReceipt = serde_json::from_str(&text).unwrap();
+        let ticket = fixture.body["capture_ticket"].as_str().unwrap();
+        let source_digest = fixture.body["snapshot"]["source_sha256"].as_str().unwrap();
+        let (scope, source) = fixture
+            .service
+            .load_bound_source(ticket, receipt.capture_id, source_digest)
+            .await
+            .unwrap();
+        assert_eq!(scope, fixture.scope);
+        assert_eq!(
+            source,
+            fixture.body["snapshot"]["source_json"].as_str().unwrap()
+        );
+        assert_eq!(
+            fixture
+                .service
+                .load_bound_source(ticket, receipt.capture_id, &"0".repeat(64))
+                .await
+                .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            fixture
+                .service
+                .load_bound_source(ticket, Uuid::new_v4(), source_digest)
+                .await
+                .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        let sealed: Ticket = serde_json::from_slice(
+            &fixture
+                .service
+                .cipher
+                .open(TICKET_AAD, &hex::decode(ticket).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        for field in ["scope", "attempt", "session", "account", "expiry"] {
+            let mut changed: Ticket =
+                serde_json::from_value(serde_json::to_value(&sealed).unwrap()).unwrap();
+            match field {
+                "scope" => changed.scope.project_id = Some(ProjectId::new(Uuid::new_v4())),
+                "attempt" => changed.attempt_id = Uuid::new_v4(),
+                "session" => changed.runner_session_id = Uuid::new_v4(),
+                "account" => changed.account_id = Uuid::new_v4(),
+                _ => changed.expires_at = Utc::now() - chrono::Duration::seconds(1),
+            }
+            let ticket = hex::encode(
+                fixture
+                    .service
+                    .cipher
+                    .seal(TICKET_AAD, &serde_json::to_vec(&changed).unwrap())
+                    .unwrap(),
+            );
+            assert_eq!(
+                fixture
+                    .service
+                    .load_bound_source(&ticket, receipt.capture_id, source_digest)
+                    .await
+                    .unwrap_err(),
+                StatusCode::FORBIDDEN
+            );
+        }
     }
 
     #[tokio::test]

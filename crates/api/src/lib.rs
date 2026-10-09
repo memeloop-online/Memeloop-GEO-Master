@@ -1,6 +1,13 @@
 //! Axum HTTP boundary for the GEO modular monolith.
 
 mod agent;
+mod project_ai_settings;
+pub use project_ai_settings::{
+    InheritedModelMetadata, ProjectAiSettingsService, ProjectAiSettingsView,
+    ResolvedProjectAiConfig, UpdateProjectAiSettings,
+};
+mod project_ai_model;
+pub use project_ai_model::ProjectConfiguredModelBridge;
 mod agent_runtime;
 mod appearance;
 mod browser_bridge;
@@ -51,6 +58,8 @@ mod publication_send_callback;
 pub use publication_send_callback::PublicationSendCallbackService;
 mod observation_capture_callback;
 pub use observation_capture_callback::ObservationCaptureCallbackService;
+mod observation_ai_callback;
+pub use observation_ai_callback::ObservationAiCallbackService;
 mod questions;
 mod questions_tools;
 mod reports;
@@ -139,6 +148,7 @@ pub use storage::{EventBus, MemoryOperationStore, OperationStore, PgOperationSto
 
 #[derive(Clone)]
 pub struct AppState {
+    project_ai_settings: ProjectAiSettingsService,
     operation_store: Arc<dyn OperationStore>,
     idempotency_store: Arc<dyn IdempotencyStore>,
     agent_repository: Arc<dyn AgentRepository>,
@@ -155,6 +165,7 @@ pub struct AppState {
     publication_lookup_repository: Option<Arc<dyn geo_domain::PublicationLookupRepository>>,
     publication_send_callback: Option<PublicationSendCallbackService>,
     observation_capture_callback: Option<ObservationCaptureCallbackService>,
+    observation_ai_callback: Option<ObservationAiCallbackService>,
     provider_cleanup_callback: Option<ProviderCleanupCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
@@ -216,6 +227,13 @@ impl geo_domain::ContentDistributionIntentLookup for DistributionIntentLookupAda
 }
 
 impl AppState {
+    pub fn project_ai_settings(&self) -> ProjectAiSettingsService {
+        self.project_ai_settings.clone()
+    }
+    pub fn with_project_ai_settings(mut self, service: ProjectAiSettingsService) -> Self {
+        self.project_ai_settings = service;
+        self
+    }
     /// Construct the explicitly non-durable development state.
     pub fn development() -> Self {
         // Tests and in-process callers must opt into a password explicitly;
@@ -248,6 +266,7 @@ impl AppState {
             ),
         );
         let mut state = Self {
+            project_ai_settings: ProjectAiSettingsService::development(),
             operation_store: Arc::new(MemoryOperationStore::default()),
             idempotency_store: Arc::new(MemoryIdempotencyStore::default()),
             agent_repository: Arc::new(MemoryAgentRepository::default()),
@@ -266,6 +285,7 @@ impl AppState {
             publication_lookup_repository: None,
             publication_send_callback: None,
             observation_capture_callback: None,
+            observation_ai_callback: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -395,6 +415,13 @@ impl AppState {
             ),
         );
         let mut state = Self {
+            project_ai_settings: if durable_storage {
+                ProjectAiSettingsService::unconfigured(Arc::new(
+                    geo_domain::MemoryProjectAiSettingsRepository::default(),
+                ))
+            } else {
+                ProjectAiSettingsService::development()
+            },
             operation_store,
             idempotency_store,
             agent_repository: Arc::new(MemoryAgentRepository::default()),
@@ -413,6 +440,7 @@ impl AppState {
             publication_lookup_repository: None,
             publication_send_callback: None,
             observation_capture_callback: None,
+            observation_ai_callback: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -501,6 +529,9 @@ impl AppState {
         ))
         .with_channel_service(ChannelService::unconfigured(Arc::new(
             geo_persistence::PgChannelRepository::from_database(database),
+        )))
+        .with_project_ai_settings(ProjectAiSettingsService::unconfigured(Arc::new(
+            geo_persistence::PgProjectAiSettingsRepository::from_database(database),
         )))
     }
 
@@ -863,6 +894,11 @@ impl AppState {
 
     pub fn observation_capture_callback(&self) -> Option<&ObservationCaptureCallbackService> {
         self.observation_capture_callback.as_ref()
+    }
+
+    pub fn with_observation_ai_callback(mut self, service: ObservationAiCallbackService) -> Self {
+        self.observation_ai_callback = Some(service);
+        self
     }
 
     pub fn with_provider_cleanup_callback(
@@ -2438,6 +2474,8 @@ pub fn router(state: AppState) -> Router {
         publication_send_callback::routes(state.publication_send_callback.clone());
     let observation_callback =
         observation_capture_callback::routes(state.observation_capture_callback.clone());
+    let observation_ai_callback =
+        observation_ai_callback::routes(state.observation_ai_callback.clone());
     let cleanup_callback =
         provider_cleanup_callback::routes(state.provider_cleanup_callback.clone());
     Router::new()
@@ -2459,6 +2497,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(knowledge_routes)
                 .merge(agent_attachment_bytes)
                 .merge(agent_routes)
+                .merge(project_ai_settings::routes())
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))
@@ -2466,5 +2505,6 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
         .merge(publication_callback)
         .merge(observation_callback)
+        .merge(observation_ai_callback)
         .merge(cleanup_callback)
 }

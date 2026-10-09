@@ -416,6 +416,8 @@ export async function measureKimi(
     signal,
     onEvidence,
     onConversationCaptured,
+    apiExtract,
+    getExtractionPolicy,
   } = {},
 ) {
   if (!validKimiMeasurementPayload(payload))
@@ -438,6 +440,8 @@ export async function measureKimi(
   const observation = await observeKimiConnectSearch(page, payload, {
     deadlineAt,
     signal,
+    apiExtract,
+    getExtractionPolicy,
     ...(typeof onConversationCaptured === "function"
       ? {
           onConversationCaptured: async (receipt) => {

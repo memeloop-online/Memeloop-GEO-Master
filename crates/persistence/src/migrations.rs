@@ -180,6 +180,14 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 42,
         description: "provider conversation cleanup",
     },
+    MigrationMetadata {
+        version: 43,
+        description: "observation analyses",
+    },
+    MigrationMetadata {
+        version: 44,
+        description: "project ai settings",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

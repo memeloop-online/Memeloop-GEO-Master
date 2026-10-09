@@ -5,8 +5,8 @@ use std::{fmt, io::Read, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use geo_api::{
-    AppState, EmbeddedAgentRuntime, ModelProviderBridge, ProviderClientBridge, RepositoryHostOps,
-    SharedModelProvider,
+    AppState, EmbeddedAgentRuntime, ModelProviderBridge, ProjectConfiguredModelBridge,
+    ProviderClientBridge, RepositoryHostOps, SharedModelProvider,
 };
 use geo_domain::TenantScope;
 use geo_provider::{
@@ -91,7 +91,7 @@ pub fn assemble(
     ai: Option<&DevelopmentAiConfig>,
 ) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
     let Some(ai) = ai else {
-        return Ok(Arc::new(EmbeddedAgentRuntime::unconfigured()));
+        return assemble_project_configured(state);
     };
     assemble_with_transport(
         state,
@@ -106,7 +106,14 @@ fn assemble_with_transport<T: Transport + 'static>(
     transport: Arc<T>,
 ) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
     let bridge = provider_bridge(ai, transport)?;
-    assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, Arc::new(bridge))
+    let runtime =
+        assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, Arc::new(bridge))?;
+    for usage in geo_domain::ProjectAiUsage::ALL {
+        state
+            .project_ai_settings()
+            .with_inherited_model(usage, ai.model.clone());
+    }
+    Ok(runtime)
 }
 
 pub fn assemble_persistent(
@@ -132,7 +139,16 @@ fn assemble_persistent_with_transport<T: Transport + 'static>(
         scope: scope.clone(),
         inner: Arc::new(provider_bridge(ai, transport)?),
     });
-    assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, provider)
+    let runtime = assemble_with_provider(state, &ai.bundle_path, &ai.bundle_sha256, provider)?;
+    for usage in geo_domain::ProjectAiUsage::ALL {
+        state
+            .project_ai_settings()
+            .with_inherited_scope(usage, scope.clone());
+        state
+            .project_ai_settings()
+            .with_inherited_model(usage, ai.model.clone());
+    }
+    Ok(runtime)
 }
 
 pub(crate) fn load_verified_bundle(path: &str, sha256: &str) -> Result<String, AssemblyError> {
@@ -160,7 +176,31 @@ pub(crate) fn assemble_with_provider(
     bundle_sha256: &str,
     provider: SharedModelProvider,
 ) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
+    assemble_with_optional_provider(state, bundle_path, bundle_sha256, Some(provider))
+}
+
+fn assemble_with_optional_provider(
+    state: &AppState,
+    bundle_path: &str,
+    bundle_sha256: &str,
+    inherited: Option<SharedModelProvider>,
+) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
     let source = load_verified_bundle(bundle_path, bundle_sha256)?;
+    let settings = state.project_ai_settings();
+    settings.with_inherited_provider(
+        geo_domain::ProjectAiUsage::WorkbenchContent,
+        inherited.clone(),
+        None,
+    );
+    settings.with_inherited_provider(
+        geo_domain::ProjectAiUsage::ObservationAnalysis,
+        inherited.clone(),
+        None,
+    );
+    let provider: SharedModelProvider = Arc::new(
+        ProjectConfiguredModelBridge::new(settings, inherited)
+            .map_err(|_| AssemblyError::ProviderConfiguration)?,
+    );
     state.configure_content_model(Arc::clone(&provider));
     let capabilities = RepositoryHostOps::new(state.knowledge_repository())
         .with_model_provider(provider)
@@ -176,6 +216,46 @@ pub(crate) fn assemble_with_provider(
         EmbeddedAgentRuntime::with_bundle(bundle, BUNDLE_SPECIFIER, Arc::new(capabilities))
             .with_tool_call_repository(state.agent_repository()),
     ))
+}
+
+/// Bundle availability is independent of model credentials. A verified bundle
+/// starts the runtime now so a later project-settings save can enable calls
+/// without requiring the process to restart.
+pub(crate) fn assemble_project_configured(
+    state: &AppState,
+) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
+    let path = std::env::var("GEO_PROJECT_AGENT_BUNDLE_PATH");
+    let digest = std::env::var("GEO_PROJECT_AGENT_BUNDLE_SHA256");
+    match (path, digest) {
+        (Ok(path), Ok(digest)) => assemble_with_optional_provider(state, &path, &digest, None),
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+            assemble_packaged_project_runtime(state)
+        }
+        _ => Err(AssemblyError::ProviderConfiguration),
+    }
+}
+
+fn assemble_packaged_project_runtime(
+    state: &AppState,
+) -> Result<Arc<EmbeddedAgentRuntime>, AssemblyError> {
+    // The immutable application image supplies both bundle and build-produced
+    // digest. Local/source deployments can provide the explicit pair above.
+    let directory = std::path::Path::new("/opt/geo/bundles");
+    let manifest = directory.join("SHA256SUMS");
+    if !manifest.exists() {
+        return Ok(Arc::new(EmbeddedAgentRuntime::unconfigured()));
+    }
+    let sums = std::fs::read_to_string(manifest).map_err(|_| AssemblyError::BundleRead)?;
+    let name = "memeloop-agent-loop.bundle.mjs";
+    let digest = sums
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let digest = parts.next()?;
+            (parts.next()? == name).then_some(digest)
+        })
+        .ok_or(AssemblyError::BundleDigest)?;
+    assemble_with_optional_provider(state, &directory.join(name).to_string_lossy(), digest, None)
 }
 
 pub(crate) fn configure_content_workflow(state: &AppState) -> Result<(), AssemblyError> {
@@ -294,8 +374,70 @@ mod tests {
 
     #[test]
     fn absent_ai_configuration_keeps_runtime_unconfigured() {
-        let runtime = assemble(&AppState::development(), None).unwrap();
+        let runtime = assemble_packaged_project_runtime(&AppState::development()).unwrap();
+        if std::path::Path::new("/opt/geo/bundles/SHA256SUMS").exists() {
+            assert!(runtime.is_configured());
+            return;
+        }
         assert!(!runtime.is_configured());
+    }
+
+    #[tokio::test]
+    async fn verified_bundle_without_inherited_model_accepts_later_project_configuration() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("project-runtime-{}.mjs", uuid::Uuid::new_v4()));
+        let source = b"export async function main() {}";
+        std::fs::write(&path, source).unwrap();
+        let state = AppState::development();
+        let runtime = assemble_with_optional_provider(
+            &state,
+            &path.to_string_lossy(),
+            &hex::encode(Sha256::digest(source)),
+            None,
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(runtime.is_configured());
+        assert!(state.content_model_available());
+        let scope = TenantScope::new(
+            uuid::Uuid::new_v4().into(),
+            uuid::Uuid::new_v4().into(),
+            Some(uuid::Uuid::new_v4().into()),
+        );
+        let settings = state.project_ai_settings();
+        assert!(
+            settings
+                .resolve(&scope, geo_domain::ProjectAiUsage::WorkbenchContent)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        settings
+            .save(
+                &scope,
+                geo_domain::ProjectAiUsage::WorkbenchContent,
+                geo_api::UpdateProjectAiSettings {
+                    expected_revision: 0,
+                    mode: geo_domain::ProjectAiMode::Custom,
+                    model: Some("saved-model".into()),
+                    base_url: Some("http://127.0.0.1:1/v1".into()),
+                    api_key: Some("synthetic-project-secret".into()),
+                    clear_api_key: false,
+                    prefer_connected_account: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            settings
+                .resolve(&scope, geo_domain::ProjectAiUsage::WorkbenchContent)
+                .await
+                .unwrap()
+                .unwrap()
+                .model,
+            "saved-model"
+        );
+        assert!(runtime.is_configured());
     }
 
     #[test]

@@ -33,6 +33,8 @@ mod model_routes;
 pub use model_routes::PgModelRouteRepository;
 mod observation_capture;
 pub use observation_capture::PgObservationCaptureRepository;
+mod observation_analysis;
+pub use observation_analysis::PgObservationAnalysisRepository;
 mod provider_conversation_cleanup;
 pub use provider_conversation_cleanup::PgProviderConversationCleanupRepository;
 mod projects;
@@ -56,3 +58,5 @@ pub use migrations::{MIGRATOR, MigrationMetadata, embedded_migrations, migration
 pub use projects::{ContentBootstrapLease, PendingContentCycle, PgProjectRepository};
 pub use report::PgReportRepository;
 pub use scope::set_local_scope;
+mod project_ai_settings;
+pub use project_ai_settings::PgProjectAiSettingsRepository;

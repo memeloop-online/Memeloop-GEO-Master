@@ -33,6 +33,13 @@ fn callbacks_with_credentials(
         cipher.clone(),
         token,
     )?;
+    let settings = state.project_ai_settings();
+    let inherited = settings.inherited_provider(geo_domain::ProjectAiUsage::ObservationAnalysis);
+    let observation_ai = geo_api::ObservationAiCallbackService::new(
+        captures.clone(),
+        settings.clone(),
+        geo_api::ProjectConfiguredModelBridge::new(settings, inherited)?,
+    );
     let publication = geo_api::PublicationSendCallbackService::new(
         std::sync::Arc::new(
             geo_persistence::PgPublicationSendAuthorizationRepository::from_database(database),
@@ -48,6 +55,7 @@ fn callbacks_with_credentials(
         token,
     )?;
     Ok(state
+        .with_observation_ai_callback(observation_ai)
         .with_observation_capture_callback(captures)
         .with_publication_send_callback(publication)
         .with_provider_cleanup_callback(cleanup))

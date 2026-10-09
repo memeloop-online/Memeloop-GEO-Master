@@ -17,9 +17,8 @@ mod verification_dispatch;
 use axum::Router;
 use config::AppConfig;
 use geo_api::{
-    AppState, EmbeddedAgentRuntime, OFFICE_PARSER_PROFILE, OfficeParserClient, PDF_PARSER_PROFILE,
-    PdfParserClient, reduce_cycle_report, router, spawn_office_parse_scanner,
-    spawn_pdf_parse_scanner,
+    AppState, OFFICE_PARSER_PROFILE, OfficeParserClient, PDF_PARSER_PROFILE, PdfParserClient,
+    reduce_cycle_report, router, spawn_office_parse_scanner, spawn_pdf_parse_scanner,
 };
 use geo_persistence::{Database, PgProjectRepository, PgReportRepository};
 use std::error::Error;
@@ -85,12 +84,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .as_ref()
                 .map(|_| OFFICE_PARSER_PROFILE.to_owned()),
         );
+        let state = match std::env::var("GEO_CHANNEL_SECRET_KEY") {
+            Ok(key) => {
+                state.with_project_ai_settings(geo_api::ProjectAiSettingsService::persistent(
+                    Arc::new(
+                        geo_persistence::PgProjectAiSettingsRepository::from_database(&database),
+                    ),
+                    &key,
+                )?)
+            }
+            Err(std::env::VarError::NotPresent) => state,
+            Err(_) => return Err("invalid AI settings encryption configuration".into()),
+        };
         let state =
             channels::configure(state.with_allowed_origins(config.allowed_origins.clone()))?;
-        let state = channels::configure_callbacks(state, &database)?;
         let runtime = if let Some(ai) = production_ai.as_ref() {
             let provider = production_runtime::build_model_provider(&database, ai)?;
-            runtime::assemble_with_provider(&state, &ai.bundle_path, &ai.bundle_sha256, provider)?
+            let runtime = runtime::assemble_with_provider(
+                &state,
+                &ai.bundle_path,
+                &ai.bundle_sha256,
+                provider,
+            )?;
+            production_runtime::configure_model_metadata(&state, &database);
+            runtime
         } else if let Some(ai) = config.scoped_test_ai.as_ref() {
             scoped_test_runtime::assemble(&state, ai)?
         } else if let (Some(ai), Some(scope)) = (
@@ -99,8 +116,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ) {
             runtime::assemble_persistent(&state, ai, scope)?
         } else {
-            Arc::new(EmbeddedAgentRuntime::unconfigured())
+            runtime::assemble_project_configured(&state)?
         };
+        let state = channels::configure_callbacks(state, &database)?;
         let state = state.with_agent_runtime(runtime);
         if config.single_process_executor {
             let reconciled = state.reconcile_running_runs().await?;

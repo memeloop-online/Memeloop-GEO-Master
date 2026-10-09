@@ -68,6 +68,76 @@ const api = (fetchImpl, options = {}) =>
     ...options,
   });
 
+test("saved project preference selects API only after raw persistence", async () => {
+  const calls = [];
+  const result = await interpretObservation(exchange, {
+    onEvidence: async (record) => calls.push(record.phase),
+    getExtractionPolicy: async () => {
+      calls.push("policy");
+      return { prefer_connected_account: false, config_version: 3 };
+    },
+    browserExtract: async () => {
+      throw new Error("browser extraction must be skipped");
+    },
+    apiExtract: async () => {
+      calls.push("api");
+      return extraction({
+        surface: "model_api",
+        model: "saved-project-model",
+        config_version: 4,
+      });
+    },
+  });
+  assert.deepEqual(calls, ["source", "policy", "api", "candidate"]);
+  assert.equal(result.audit.model, "saved-project-model");
+  assert.equal(result.audit.config_version, 4);
+  assert.deepEqual(result.audit.attempts, [
+    { route: "configured_model_api", status: "grounded" },
+  ]);
+});
+
+test("connected-account preference keeps browser first and configured fallback", async () => {
+  const calls = [];
+  const result = await interpretObservation(exchange, {
+    getExtractionPolicy: async () => ({
+      prefer_connected_account: true,
+      config_version: 2,
+    }),
+    browserExtract: async () => {
+      calls.push("browser");
+      return null;
+    },
+    apiExtract: async () => {
+      calls.push("api");
+      return extraction({ config_version: 2 });
+    },
+  });
+  assert.deepEqual(calls, ["browser", "api"]);
+  assert.equal(result.audit.config_version, 2);
+});
+
+test("unavailable project policy fails closed without legacy or browser extraction", async () => {
+  let called = false;
+  assert.equal(
+    await interpretObservation(exchange, {
+      allowLegacyApi: true,
+      getExtractionPolicy: async () => {
+        throw new Error("private upstream failure");
+      },
+      browserExtract: async () => {
+        called = true;
+        return extraction();
+      },
+      apiExtract: async () => {
+        called = true;
+        return extraction();
+      },
+    }),
+    null,
+  );
+  assert.equal(called, false);
+});
+
 test("source and extraction checkpoints share lifecycle proof outside source JSON", async () => {
   const source = {
     connect_json_terminal: true,

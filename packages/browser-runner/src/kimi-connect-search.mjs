@@ -412,6 +412,8 @@ export async function observeKimiConnectSearch(
     deadlineAt,
     signal,
     interpret = interpretObservation,
+    apiExtract,
+    getExtractionPolicy,
     onDiagnostic,
     onConversationCaptured,
     onEvidence,
@@ -532,6 +534,8 @@ export async function observeKimiConnectSearch(
     }
     stage = "interpretation";
     const observation = await interpret(captured, {
+      apiExtract,
+      getExtractionPolicy,
       renderedText,
       signal,
       onDiagnostic,

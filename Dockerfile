@@ -38,6 +38,7 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY migrations migrations
+COPY packages/browser-runner/src/observation-extraction-prompt.txt packages/browser-runner/src/observation-extraction-prompt.txt
 
 RUN cargo build --locked --release -p geo-app
 

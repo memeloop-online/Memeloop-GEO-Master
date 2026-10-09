@@ -25,6 +25,9 @@ packages/agent-runtime/*
 !packages/browser-runner/
 packages/browser-runner/*
 !packages/browser-runner/package.json
+!packages/browser-runner/src/
+packages/browser-runner/src/*
+!packages/browser-runner/src/observation-extraction-prompt.txt
 !crates/
 !crates/**
 !migrations/

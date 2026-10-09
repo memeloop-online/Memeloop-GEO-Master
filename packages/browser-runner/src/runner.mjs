@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
+import { parseExtractionJson } from "./ai-observation-parser.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
 import {
   recoverKimiConversation,
@@ -523,7 +524,7 @@ export function createRunner(options = {}) {
     }
   }
 
-  async function execute(input, persistCapture) {
+  async function execute(input, persistCapture, observationAi) {
     if (
       !fields(input, [
         "execution_id",
@@ -643,6 +644,7 @@ export function createRunner(options = {}) {
         // Adapters own fixed, typed platform actions; user payload is never script
         // or navigation, and adapter evidence must not be inferred from click success.
         let sourceReceipt = null;
+        let sourceDigest = null;
         let sourceOwnership = null;
         let extractionOwnership = null;
         let candidateOrdinal = 0;
@@ -662,6 +664,56 @@ export function createRunner(options = {}) {
           input.source_capture_ticket === undefined
             ? {}
             : {
+                async getExtractionPolicy({ signal } = {}) {
+                  if (!sourceReceipt || !observationAi?.policy)
+                    throw new Error("observation_policy_unavailable");
+                  const policy = await observationAi.policy(
+                    {
+                      schema_version: 1,
+                      capture_ticket: input.source_capture_ticket,
+                      source_capture_id: sourceReceipt.capture_id,
+                      source_sha256: sourceDigest,
+                    },
+                    { signal },
+                  );
+                  if (
+                    typeof policy?.prefer_connected_account !== "boolean" ||
+                    !Number.isSafeInteger(policy.config_version) ||
+                    policy.config_version < 0
+                  )
+                    throw new Error("observation_policy_invalid");
+                  return policy;
+                },
+                async apiExtract(_prompt, { signal } = {}) {
+                  if (!sourceReceipt || !observationAi?.extract) return null;
+                  const result = await observationAi.extract(
+                    {
+                      schema_version: 1,
+                      capture_ticket: input.source_capture_ticket,
+                      source_capture_id: sourceReceipt.capture_id,
+                      source_sha256: sourceDigest,
+                    },
+                    { signal },
+                  );
+                  if (
+                    typeof result?.text !== "string" ||
+                    Buffer.byteLength(result.text) > 150_000 ||
+                    typeof result.model !== "string" ||
+                    !/^[\w./:-]{1,256}$/u.test(result.model) ||
+                    !Number.isSafeInteger(result.config_version) ||
+                    result.config_version < 0
+                  )
+                    return null;
+                  const extracted = parseExtractionJson(result.text);
+                  return extracted
+                    ? {
+                        extracted,
+                        model: result.model,
+                        config_version: result.config_version,
+                        surface: "model_api",
+                      }
+                    : null;
+                },
                 onConversationCaptured(receipt) {
                   if (
                     receipt?.provider === "kimi" &&
@@ -719,6 +771,7 @@ export function createRunner(options = {}) {
                         : {}),
                     };
                     sourceReceipt = captureReceipt(await persistCapture(body));
+                    sourceDigest = evidence.source_sha256;
                   } else if (evidence.phase === "extraction") {
                     if (!sourceReceipt) throw new Error("source_not_persisted");
                     if (

@@ -10,9 +10,16 @@ import {
   MessageBarBody,
   Select,
   Spinner,
+  Tab,
+  TabList,
 } from "@fluentui/react-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import "../i18n/accounts";
 import i18n from "../i18n";
@@ -58,6 +65,8 @@ import {
 } from "../api/channels";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { RemoteDesktop } from "../components/RemoteDesktop";
+import { ProjectAiSettingsPanel } from "./ProjectAiSettingsPanel";
+import "../i18n/projectAi";
 import "./ChannelAccountsPage.css";
 
 type View = "channels" | "connect" | "settings";
@@ -408,6 +417,8 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
   const { t } = useTranslation();
   const { tenantId, projectId } = useParams();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const aiTab = view === "settings" && searchParams.get("tab") === "ai";
   const { session } = useAuth();
   const client = useQueryClient();
   const { accounts, groups, platforms } = useChannelData(tenantId, projectId);
@@ -559,14 +570,20 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
           </p>
           <h1>
             {t(
-              view === "settings"
-                ? "account.channels.settingsTitle"
-                : "account.channels.title",
+              aiTab
+                ? "projectAi.title"
+                : view === "settings"
+                  ? "account.channels.settingsTitle"
+                  : "account.channels.title",
             )}
           </h1>
-          <p>{t("account.channels.description")}</p>
+          <p>
+            {t(
+              aiTab ? "projectAi.description" : "account.channels.description",
+            )}
+          </p>
         </div>
-        {view !== "connect" && (
+        {view !== "connect" && !aiTab && (
           <Button
             onClick={() => navigate("../channels/connect")}
             appearance="primary"
@@ -576,466 +593,436 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
         )}
       </section>
       {view === "settings" && (
-        <MessageBar intent="info">
-          <MessageBarBody>
-            {t("account.channels.settingsNote")}{" "}
-            <Link to="../setup">{t("account.channels.viewSetup")}</Link>
-          </MessageBarBody>
-        </MessageBar>
+        <TabList
+          aria-label={t("projectAi.tabs")}
+          selectedValue={aiTab ? "ai" : "accounts"}
+          onTabSelect={(_, data) =>
+            setSearchParams((previous) => {
+              const next = new URLSearchParams(previous);
+              next.set("tab", String(data.value));
+              return next;
+            })
+          }
+        >
+          <Tab value="accounts">{t("projectAi.accounts")}</Tab>
+          <Tab value="ai">{t("projectAi.tab")}</Tab>
+        </TabList>
       )}
-      {error && (
-        <ErrorState title={t("account.channels.failed")} detail={error} />
-      )}
-      {notice && (
-        <MessageBar intent="success">
-          <MessageBarBody>{notice}</MessageBarBody>
-        </MessageBar>
-      )}
-      {activeSession && tenantId && projectId && (
-        <RemoteLogin
-          key={activeSession}
+      {aiTab && tenantId && projectId ? (
+        <ProjectAiSettingsPanel
+          key={`${tenantId}:${projectId}`}
           tenantId={tenantId}
           projectId={projectId}
-          sessionId={activeSession}
-          onClose={closeLogin}
-          onDone={() => {
-            closeLogin();
-            setNotice(t("account.channels.connected"));
-          }}
         />
-      )}
-      <div className="channel-layout">
-        <section
-          className="channel-stack"
-          aria-label={t("account.channels.connectionSection")}
-        >
-          <Card className="channel-card">
-            <h2>{t("account.channels.connect")}</h2>
-            <p>{t("account.channels.connectionHelp")}</p>
-            {platforms.isPending ? (
-              <LoadingState
-                label={t("account.channels.loadingPlatforms")}
-                compact
-              />
-            ) : platforms.isError ? (
-              <ErrorState
-                detail={errorText(platforms.error)}
-                onRetry={() => void platforms.refetch()}
-              />
-            ) : (
-              <div className="channel-form">
-                <Field label={t("account.channels.platform")}>
-                  <Select
-                    value={platform}
-                    onChange={(event) =>
-                      setPlatform(event.target.value as ChannelPlatformId)
-                    }
+      ) : (
+        <>
+          {view === "settings" && (
+            <MessageBar intent="info">
+              <MessageBarBody>
+                {t("account.channels.settingsNote")}{" "}
+                <Link to="../setup">{t("account.channels.viewSetup")}</Link>
+              </MessageBarBody>
+            </MessageBar>
+          )}
+          {error && (
+            <ErrorState title={t("account.channels.failed")} detail={error} />
+          )}
+          {notice && (
+            <MessageBar intent="success">
+              <MessageBarBody>{notice}</MessageBarBody>
+            </MessageBar>
+          )}
+          {activeSession && tenantId && projectId && (
+            <RemoteLogin
+              key={activeSession}
+              tenantId={tenantId}
+              projectId={projectId}
+              sessionId={activeSession}
+              onClose={closeLogin}
+              onDone={() => {
+                closeLogin();
+                setNotice(t("account.channels.connected"));
+              }}
+            />
+          )}
+          <div className="channel-layout">
+            <section
+              className="channel-stack"
+              aria-label={t("account.channels.connectionSection")}
+            >
+              <Card className="channel-card">
+                <h2>{t("account.channels.connect")}</h2>
+                <p>{t("account.channels.connectionHelp")}</p>
+                {platforms.isPending ? (
+                  <LoadingState
+                    label={t("account.channels.loadingPlatforms")}
+                    compact
+                  />
+                ) : platforms.isError ? (
+                  <ErrorState
+                    detail={errorText(platforms.error)}
+                    onRetry={() => void platforms.refetch()}
+                  />
+                ) : (
+                  <div className="channel-form">
+                    <Field label={t("account.channels.platform")}>
+                      <Select
+                        value={platform}
+                        onChange={(event) =>
+                          setPlatform(event.target.value as ChannelPlatformId)
+                        }
+                      >
+                        {platforms.data.items.map((item) => (
+                          <option
+                            key={item.id}
+                            value={item.id}
+                            disabled={!item.login_supported}
+                          >
+                            {item.label} ·{" "}
+                            {t(
+                              item.purpose === "measurement"
+                                ? "account.channels.measurement"
+                                : "account.channels.publishing",
+                            )}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    <Field label={t("account.channels.group")}>
+                      <Select
+                        value={selectedGroup}
+                        onChange={(event) =>
+                          setSelectedGroup(event.target.value)
+                        }
+                      >
+                        <option value="">
+                          {t("account.channels.ungrouped")}
+                        </option>
+                        {groups.data?.items.map((group) => (
+                          <option key={group.group_id} value={group.group_id}>
+                            {group.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    <details className="channel-proxy">
+                      <summary>{t("account.channels.proxyOptional")}</summary>
+                      <p>{t("account.channels.proxyHelp")}</p>
+                      <Field label={t("account.channels.proxyAddressType")}>
+                        <Input
+                          value={proxyServer}
+                          onChange={(_, data) => setProxyServer(data.value)}
+                          placeholder="socks5://host:port"
+                        />
+                      </Field>
+                      <Field label={t("account.channels.usernameOptional")}>
+                        <Input
+                          value={proxyUsername}
+                          onChange={(_, data) => setProxyUsername(data.value)}
+                          autoComplete="off"
+                        />
+                      </Field>
+                      <Field label={t("account.channels.passwordOptional")}>
+                        <Input
+                          type="password"
+                          value={proxyPassword}
+                          onChange={(_, data) => setProxyPassword(data.value)}
+                          autoComplete="new-password"
+                        />
+                      </Field>
+                    </details>
+                    <Button
+                      appearance="primary"
+                      disabled={
+                        busy ||
+                        !platforms.data.items.some(
+                          (item) =>
+                            item.id === platform && item.login_supported,
+                        )
+                      }
+                      onClick={() => void connect()}
+                    >
+                      {t("account.channels.startLogin")}
+                    </Button>
+                  </div>
+                )}
+              </Card>
+              <Card className="channel-card">
+                <h2>{t("account.channels.group")}</h2>
+                <p>{t("account.channels.groupsHelp")}</p>
+                <div className="channel-row">
+                  <Field label={t("account.channels.newGroup")}>
+                    <Input
+                      value={groupName}
+                      maxLength={80}
+                      onChange={(_, data) => setGroupName(data.value)}
+                    />
+                  </Field>
+                  <Button
+                    disabled={busy || !groupName.trim()}
+                    onClick={() => {
+                      if (!tenantId || !projectId) return;
+                      void run(
+                        () =>
+                          createChannelGroup(
+                            tenantId,
+                            projectId,
+                            groupName.trim(),
+                          ),
+                        t("account.channels.groupCreated"),
+                      ).then((saved) => {
+                        if (saved) setGroupName("");
+                      });
+                    }}
                   >
-                    {platforms.data.items.map((item) => (
-                      <option
-                        key={item.id}
-                        value={item.id}
-                        disabled={!item.login_supported}
-                      >
-                        {item.label} ·{" "}
-                        {t(
-                          item.purpose === "measurement"
-                            ? "account.channels.measurement"
-                            : "account.channels.publishing",
-                        )}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label={t("account.channels.group")}>
-                  <Select
-                    value={selectedGroup}
-                    onChange={(event) => setSelectedGroup(event.target.value)}
-                  >
-                    <option value="">{t("account.channels.ungrouped")}</option>
-                    {groups.data?.items.map((group) => (
-                      <option key={group.group_id} value={group.group_id}>
-                        {group.name}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <details className="channel-proxy">
-                  <summary>{t("account.channels.proxyOptional")}</summary>
-                  <p>{t("account.channels.proxyHelp")}</p>
-                  <Field label={t("account.channels.proxyAddressType")}>
-                    <Input
-                      value={proxyServer}
-                      onChange={(_, data) => setProxyServer(data.value)}
-                      placeholder="socks5://host:port"
-                    />
-                  </Field>
-                  <Field label={t("account.channels.usernameOptional")}>
-                    <Input
-                      value={proxyUsername}
-                      onChange={(_, data) => setProxyUsername(data.value)}
-                      autoComplete="off"
-                    />
-                  </Field>
-                  <Field label={t("account.channels.passwordOptional")}>
-                    <Input
-                      type="password"
-                      value={proxyPassword}
-                      onChange={(_, data) => setProxyPassword(data.value)}
-                      autoComplete="new-password"
-                    />
-                  </Field>
-                </details>
-                <Button
-                  appearance="primary"
-                  disabled={
-                    busy ||
-                    !platforms.data.items.some(
-                      (item) => item.id === platform && item.login_supported,
-                    )
-                  }
-                  onClick={() => void connect()}
-                >
-                  {t("account.channels.startLogin")}
-                </Button>
-              </div>
-            )}
-          </Card>
-          <Card className="channel-card">
-            <h2>{t("account.channels.group")}</h2>
-            <p>{t("account.channels.groupsHelp")}</p>
-            <div className="channel-row">
-              <Field label={t("account.channels.newGroup")}>
-                <Input
-                  value={groupName}
-                  maxLength={80}
-                  onChange={(_, data) => setGroupName(data.value)}
-                />
-              </Field>
-              <Button
-                disabled={busy || !groupName.trim()}
-                onClick={() => {
-                  if (!tenantId || !projectId) return;
-                  void run(
-                    () =>
-                      createChannelGroup(tenantId, projectId, groupName.trim()),
-                    t("account.channels.groupCreated"),
-                  ).then((saved) => {
-                    if (saved) setGroupName("");
-                  });
-                }}
-              >
-                {t("account.channels.create")}
-              </Button>
-            </div>
-            {groups.isPending && (
-              <LoadingState
-                label={t("account.channels.groupsLoading")}
-                compact
-              />
-            )}
-            {groups.isError && (
-              <ErrorState
-                detail={errorText(groups.error)}
-                onRetry={() => void groups.refetch()}
-              />
-            )}
-            {groups.data?.items.length === 0 && (
-              <p>{t("account.channels.groupsEmpty")}</p>
-            )}
-            <ul className="channel-groups">
-              {groups.data?.items.map((group) => (
-                <li key={group.group_id}>
-                  {editingGroup === group.group_id ? (
-                    <>
-                      <Input
-                        aria-label={t("account.channels.groupName")}
-                        value={editingName}
-                        maxLength={80}
-                        onChange={(_, data) => setEditingName(data.value)}
-                      />
-                      <Button
-                        disabled={busy || !editingName.trim()}
-                        onClick={() => {
-                          if (!tenantId || !projectId) return;
-                          void run(
-                            () =>
-                              updateChannelGroup(
-                                tenantId,
-                                projectId,
-                                group.group_id,
-                                editingName.trim(),
-                              ),
-                            t("account.channels.groupUpdated"),
-                          ).then((saved) => {
-                            if (saved) setEditingGroup(null);
-                          });
-                        }}
-                      >
-                        {t("account.channels.save")}
-                      </Button>
-                      <Button onClick={() => setEditingGroup(null)}>
-                        {t("account.channels.cancel")}
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      <span>{group.name}</span>
-                      <Button
-                        size="small"
-                        onClick={() => {
-                          setEditingGroup(group.group_id);
-                          setEditingName(group.name);
-                        }}
-                      >
-                        {t("account.channels.rename")}
-                      </Button>
-                      {deletingGroup === group.group_id ? (
+                    {t("account.channels.create")}
+                  </Button>
+                </div>
+                {groups.isPending && (
+                  <LoadingState
+                    label={t("account.channels.groupsLoading")}
+                    compact
+                  />
+                )}
+                {groups.isError && (
+                  <ErrorState
+                    detail={errorText(groups.error)}
+                    onRetry={() => void groups.refetch()}
+                  />
+                )}
+                {groups.data?.items.length === 0 && (
+                  <p>{t("account.channels.groupsEmpty")}</p>
+                )}
+                <ul className="channel-groups">
+                  {groups.data?.items.map((group) => (
+                    <li key={group.group_id}>
+                      {editingGroup === group.group_id ? (
                         <>
-                          <span>{t("account.channels.deleteConfirm")}</span>
+                          <Input
+                            aria-label={t("account.channels.groupName")}
+                            value={editingName}
+                            maxLength={80}
+                            onChange={(_, data) => setEditingName(data.value)}
+                          />
                           <Button
-                            size="small"
-                            disabled={busy}
+                            disabled={busy || !editingName.trim()}
                             onClick={() => {
                               if (!tenantId || !projectId) return;
                               void run(
                                 () =>
-                                  deleteChannelGroup(
+                                  updateChannelGroup(
                                     tenantId,
                                     projectId,
                                     group.group_id,
+                                    editingName.trim(),
                                   ),
-                                t("account.channels.groupDeleted"),
+                                t("account.channels.groupUpdated"),
                               ).then((saved) => {
-                                if (saved) {
-                                  if (selectedGroup === group.group_id)
-                                    setSelectedGroup("");
-                                  setDeletingGroup(null);
-                                }
+                                if (saved) setEditingGroup(null);
                               });
                             }}
                           >
-                            {t("account.channels.confirmDelete")}
+                            {t("account.channels.save")}
                           </Button>
-                          <Button
-                            size="small"
-                            onClick={() => setDeletingGroup(null)}
-                          >
+                          <Button onClick={() => setEditingGroup(null)}>
                             {t("account.channels.cancel")}
                           </Button>
                         </>
                       ) : (
-                        <Button
-                          size="small"
-                          onClick={() => setDeletingGroup(group.group_id)}
-                        >
-                          {t("account.channels.deleteGroup")}
-                        </Button>
+                        <>
+                          <span>{group.name}</span>
+                          <Button
+                            size="small"
+                            onClick={() => {
+                              setEditingGroup(group.group_id);
+                              setEditingName(group.name);
+                            }}
+                          >
+                            {t("account.channels.rename")}
+                          </Button>
+                          {deletingGroup === group.group_id ? (
+                            <>
+                              <span>{t("account.channels.deleteConfirm")}</span>
+                              <Button
+                                size="small"
+                                disabled={busy}
+                                onClick={() => {
+                                  if (!tenantId || !projectId) return;
+                                  void run(
+                                    () =>
+                                      deleteChannelGroup(
+                                        tenantId,
+                                        projectId,
+                                        group.group_id,
+                                      ),
+                                    t("account.channels.groupDeleted"),
+                                  ).then((saved) => {
+                                    if (saved) {
+                                      if (selectedGroup === group.group_id)
+                                        setSelectedGroup("");
+                                      setDeletingGroup(null);
+                                    }
+                                  });
+                                }}
+                              >
+                                {t("account.channels.confirmDelete")}
+                              </Button>
+                              <Button
+                                size="small"
+                                onClick={() => setDeletingGroup(null)}
+                              >
+                                {t("account.channels.cancel")}
+                              </Button>
+                            </>
+                          ) : (
+                            <Button
+                              size="small"
+                              onClick={() => setDeletingGroup(group.group_id)}
+                            >
+                              {t("account.channels.deleteGroup")}
+                            </Button>
+                          )}
+                        </>
                       )}
-                    </>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </Card>
-        </section>
-        <section
-          className="channel-stack"
-          aria-label={t("account.channels.accountsSection")}
-        >
-          <Card className="channel-card">
-            <div className="channel-row">
-              <h2>{t("account.channels.projectAccounts")}</h2>
-              <Button
-                disabled={accounts.isFetching}
-                onClick={() => void accounts.refetch()}
-              >
-                {t("account.channels.refresh")}
-              </Button>
-            </div>
-            {accounts.isPending && (
-              <LoadingState label={t("account.channels.accountsLoading")} />
-            )}
-            {accounts.isError && (
-              <ErrorState
-                detail={errorText(accounts.error)}
-                onRetry={() => void accounts.refetch()}
-              />
-            )}
-            {accounts.data?.items.length === 0 && (
-              <EmptyState
-                title={t("account.channels.accountsEmpty")}
-                detail={t("account.channels.accountsEmptyDetail")}
-              />
-            )}
-            <ul className="channel-accounts">
-              {accounts.data?.items.map((account) => (
-                <li key={account.account_id}>
-                  <div className="channel-row">
-                    <div>
-                      <h3>
-                        {account.display_name ??
-                          t("account.channels.unidentified")}
-                      </h3>
-                      <p>
-                        {platformName(account.platform)} ·{" "}
-                        {account.owner_kind === "operator_pool"
-                          ? t("account.channels.operatorGroup")
-                          : groupNameFor(account.group_id)}
-                      </p>
-                    </div>
-                    <Badge appearance="tint">
-                      {account.owner_kind === "operator_pool"
-                        ? t("account.channels.operatorShared")
-                        : t("account.channels.ownAccount")}
-                    </Badge>
-                    <Badge
-                      color={account.status === "ready" ? "success" : "warning"}
-                    >
-                      {accountState(account.status)}
-                    </Badge>
-                  </div>
-                  {account.owner_kind === "operator_pool" ? (
-                    <p>{t("account.channels.sharedHelp")}</p>
-                  ) : (
-                    <>
-                      <p>
-                        {t("account.channels.network", {
-                          name: account.proxy_configured
-                            ? (account.proxy_server ??
-                              t("account.channels.dedicatedProxy"))
-                            : t("account.channels.defaultNetwork"),
-                        })}
-                      </p>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+            </section>
+            <section
+              className="channel-stack"
+              aria-label={t("account.channels.accountsSection")}
+            >
+              <Card className="channel-card">
+                <div className="channel-row">
+                  <h2>{t("account.channels.projectAccounts")}</h2>
+                  <Button
+                    disabled={accounts.isFetching}
+                    onClick={() => void accounts.refetch()}
+                  >
+                    {t("account.channels.refresh")}
+                  </Button>
+                </div>
+                {accounts.isPending && (
+                  <LoadingState label={t("account.channels.accountsLoading")} />
+                )}
+                {accounts.isError && (
+                  <ErrorState
+                    detail={errorText(accounts.error)}
+                    onRetry={() => void accounts.refetch()}
+                  />
+                )}
+                {accounts.data?.items.length === 0 && (
+                  <EmptyState
+                    title={t("account.channels.accountsEmpty")}
+                    detail={t("account.channels.accountsEmptyDetail")}
+                  />
+                )}
+                <ul className="channel-accounts">
+                  {accounts.data?.items.map((account) => (
+                    <li key={account.account_id}>
                       <div className="channel-row">
-                        <Button
-                          disabled={busy || Boolean(activeSession)}
-                          onClick={() => void connect(account.account_id)}
-                        >
-                          {account.status === "ready"
-                            ? t("account.channels.reconnect")
-                            : t("account.channels.loginVerify")}
-                        </Button>
-                        <Button
-                          disabled={busy}
-                          onClick={() =>
-                            setEditAccountId(
-                              editAccountId === account.account_id
-                                ? null
-                                : account.account_id,
-                            )
+                        <div>
+                          <h3>
+                            {account.display_name ??
+                              t("account.channels.unidentified")}
+                          </h3>
+                          <p>
+                            {platformName(account.platform)} ·{" "}
+                            {account.owner_kind === "operator_pool"
+                              ? t("account.channels.operatorGroup")
+                              : groupNameFor(account.group_id)}
+                          </p>
+                        </div>
+                        <Badge appearance="tint">
+                          {account.owner_kind === "operator_pool"
+                            ? t("account.channels.operatorShared")
+                            : t("account.channels.ownAccount")}
+                        </Badge>
+                        <Badge
+                          color={
+                            account.status === "ready" ? "success" : "warning"
                           }
                         >
-                          {t("account.channels.configure")}
-                        </Button>
+                          {accountState(account.status)}
+                        </Badge>
                       </div>
-                    </>
-                  )}
-                  {account.owner_kind !== "operator_pool" &&
-                    activeAccount?.account_id === account.account_id && (
-                      <div className="channel-account-editor">
-                        <Field label={t("account.channels.group")}>
-                          <Select
-                            value={account.group_id ?? ""}
-                            onChange={(event) => {
-                              if (!tenantId || !projectId) return;
-                              void run(
-                                () =>
-                                  updateChannelAccount(
-                                    tenantId,
-                                    projectId,
-                                    account.account_id,
-                                    { group_id: event.target.value || null },
-                                  ),
-                                t("account.channels.accountGroupUpdated"),
-                              );
-                            }}
-                          >
-                            <option value="">
-                              {t("account.channels.ungrouped")}
-                            </option>
-                            {groups.data?.items.map((group) => (
-                              <option
-                                key={group.group_id}
-                                value={group.group_id}
-                              >
-                                {group.name}
-                              </option>
-                            ))}
-                          </Select>
-                        </Field>
-                        <Checkbox
-                          label={t("account.channels.allowProject")}
-                          checked={account.enabled}
-                          disabled={busy}
-                          onChange={(_, data) => {
-                            if (!tenantId || !projectId) return;
-                            void run(
-                              () =>
-                                updateChannelAccount(
-                                  tenantId,
-                                  projectId,
-                                  account.account_id,
-                                  { enabled: Boolean(data.checked) },
-                                ),
-                              t("account.channels.usageUpdated"),
-                            );
-                          }}
-                        />
-                        <details className="channel-proxy">
-                          <summary>{t("account.channels.changeProxy")}</summary>
-                          <p>{t("account.channels.changeProxyHelp")}</p>
-                          <Field label={t("account.channels.proxyAddress")}>
-                            <Input
-                              value={proxyServer}
-                              onChange={(_, data) => setProxyServer(data.value)}
-                            />
-                          </Field>
-                          <Field label={t("account.channels.username")}>
-                            <Input
-                              value={proxyUsername}
-                              onChange={(_, data) =>
-                                setProxyUsername(data.value)
-                              }
-                              autoComplete="off"
-                            />
-                          </Field>
-                          <Field label={t("account.channels.password")}>
-                            <Input
-                              type="password"
-                              value={proxyPassword}
-                              onChange={(_, data) =>
-                                setProxyPassword(data.value)
-                              }
-                              autoComplete="new-password"
-                            />
-                          </Field>
-                          <Button
-                            disabled={busy || !proxyServer.trim()}
-                            onClick={() => {
-                              if (!tenantId || !projectId) return;
-                              void run(
-                                () =>
-                                  updateChannelAccount(
-                                    tenantId,
-                                    projectId,
-                                    account.account_id,
-                                    { proxy: proxyInput() },
-                                  ),
-                                t("account.channels.proxyUpdated"),
-                              ).finally(() => {
-                                setProxyPassword("");
-                                setProxyUsername("");
-                                setProxyServer("");
-                              });
-                            }}
-                          >
-                            {t("account.channels.saveProxy")}
-                          </Button>
-                          {account.proxy_configured && (
+                      {account.owner_kind === "operator_pool" ? (
+                        <p>{t("account.channels.sharedHelp")}</p>
+                      ) : (
+                        <>
+                          <p>
+                            {t("account.channels.network", {
+                              name: account.proxy_configured
+                                ? (account.proxy_server ??
+                                  t("account.channels.dedicatedProxy"))
+                                : t("account.channels.defaultNetwork"),
+                            })}
+                          </p>
+                          <div className="channel-row">
+                            <Button
+                              disabled={busy || Boolean(activeSession)}
+                              onClick={() => void connect(account.account_id)}
+                            >
+                              {account.status === "ready"
+                                ? t("account.channels.reconnect")
+                                : t("account.channels.loginVerify")}
+                            </Button>
                             <Button
                               disabled={busy}
-                              onClick={() => {
+                              onClick={() =>
+                                setEditAccountId(
+                                  editAccountId === account.account_id
+                                    ? null
+                                    : account.account_id,
+                                )
+                              }
+                            >
+                              {t("account.channels.configure")}
+                            </Button>
+                          </div>
+                        </>
+                      )}
+                      {account.owner_kind !== "operator_pool" &&
+                        activeAccount?.account_id === account.account_id && (
+                          <div className="channel-account-editor">
+                            <Field label={t("account.channels.group")}>
+                              <Select
+                                value={account.group_id ?? ""}
+                                onChange={(event) => {
+                                  if (!tenantId || !projectId) return;
+                                  void run(
+                                    () =>
+                                      updateChannelAccount(
+                                        tenantId,
+                                        projectId,
+                                        account.account_id,
+                                        {
+                                          group_id: event.target.value || null,
+                                        },
+                                      ),
+                                    t("account.channels.accountGroupUpdated"),
+                                  );
+                                }}
+                              >
+                                <option value="">
+                                  {t("account.channels.ungrouped")}
+                                </option>
+                                {groups.data?.items.map((group) => (
+                                  <option
+                                    key={group.group_id}
+                                    value={group.group_id}
+                                  >
+                                    {group.name}
+                                  </option>
+                                ))}
+                              </Select>
+                            </Field>
+                            <Checkbox
+                              label={t("account.channels.allowProject")}
+                              checked={account.enabled}
+                              disabled={busy}
+                              onChange={(_, data) => {
                                 if (!tenantId || !projectId) return;
                                 void run(
                                   () =>
@@ -1043,88 +1030,163 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                                       tenantId,
                                       projectId,
                                       account.account_id,
-                                      { proxy: null },
+                                      { enabled: Boolean(data.checked) },
                                     ),
-                                  t("account.channels.defaultRestored"),
+                                  t("account.channels.usageUpdated"),
                                 );
                               }}
-                            >
-                              {t("account.channels.removeProxy")}
-                            </Button>
-                          )}
-                        </details>
+                            />
+                            <details className="channel-proxy">
+                              <summary>
+                                {t("account.channels.changeProxy")}
+                              </summary>
+                              <p>{t("account.channels.changeProxyHelp")}</p>
+                              <Field label={t("account.channels.proxyAddress")}>
+                                <Input
+                                  value={proxyServer}
+                                  onChange={(_, data) =>
+                                    setProxyServer(data.value)
+                                  }
+                                />
+                              </Field>
+                              <Field label={t("account.channels.username")}>
+                                <Input
+                                  value={proxyUsername}
+                                  onChange={(_, data) =>
+                                    setProxyUsername(data.value)
+                                  }
+                                  autoComplete="off"
+                                />
+                              </Field>
+                              <Field label={t("account.channels.password")}>
+                                <Input
+                                  type="password"
+                                  value={proxyPassword}
+                                  onChange={(_, data) =>
+                                    setProxyPassword(data.value)
+                                  }
+                                  autoComplete="new-password"
+                                />
+                              </Field>
+                              <Button
+                                disabled={busy || !proxyServer.trim()}
+                                onClick={() => {
+                                  if (!tenantId || !projectId) return;
+                                  void run(
+                                    () =>
+                                      updateChannelAccount(
+                                        tenantId,
+                                        projectId,
+                                        account.account_id,
+                                        { proxy: proxyInput() },
+                                      ),
+                                    t("account.channels.proxyUpdated"),
+                                  ).finally(() => {
+                                    setProxyPassword("");
+                                    setProxyUsername("");
+                                    setProxyServer("");
+                                  });
+                                }}
+                              >
+                                {t("account.channels.saveProxy")}
+                              </Button>
+                              {account.proxy_configured && (
+                                <Button
+                                  disabled={busy}
+                                  onClick={() => {
+                                    if (!tenantId || !projectId) return;
+                                    void run(
+                                      () =>
+                                        updateChannelAccount(
+                                          tenantId,
+                                          projectId,
+                                          account.account_id,
+                                          { proxy: null },
+                                        ),
+                                      t("account.channels.defaultRestored"),
+                                    );
+                                  }}
+                                >
+                                  {t("account.channels.removeProxy")}
+                                </Button>
+                              )}
+                            </details>
+                          </div>
+                        )}
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+            </section>
+          </div>
+          {view === "channels" && (
+            <section aria-label={t("account.connector.section")}>
+              <Card className="channel-card">
+                <h2>{t("account.connector.section")}</h2>
+                <p>{t("account.connector.description")}</p>
+                {capabilities.isPending && (
+                  <LoadingState label={t("account.connector.loading")} />
+                )}
+                {capabilities.isError &&
+                  (capabilities.error instanceof ApiError &&
+                  capabilities.error.status === 403 ? (
+                    <ErrorState
+                      title={t("account.channels.permissionDenied")}
+                      detail={t("account.connector.forbidden")}
+                    />
+                  ) : (
+                    <ErrorState
+                      detail={errorText(capabilities.error)}
+                      onRetry={() => void capabilities.refetch()}
+                    />
+                  ))}
+                {capabilities.data?.items.length === 0 && (
+                  <EmptyState
+                    title={t("account.connector.empty")}
+                    detail={t("account.connector.emptyDetail")}
+                  />
+                )}
+                <ul className="channel-accounts">
+                  {capabilities.data?.items.map((item) => (
+                    <li key={`${item.platform_id}:${item.placement_slot}`}>
+                      <div className="channel-row">
+                        <h3>
+                          {item.platform_id} · {item.placement_slot}
+                        </h3>
+                        <Badge
+                          color={
+                            item.availability === "available"
+                              ? "success"
+                              : "warning"
+                          }
+                        >
+                          {connectorState(item.availability)}
+                        </Badge>
                       </div>
-                    )}
-                </li>
-              ))}
-            </ul>
-          </Card>
-        </section>
-      </div>
-      {view === "channels" && (
-        <section aria-label={t("account.connector.section")}>
-          <Card className="channel-card">
-            <h2>{t("account.connector.section")}</h2>
-            <p>{t("account.connector.description")}</p>
-            {capabilities.isPending && (
-              <LoadingState label={t("account.connector.loading")} />
-            )}
-            {capabilities.isError &&
-              (capabilities.error instanceof ApiError &&
-              capabilities.error.status === 403 ? (
-                <ErrorState
-                  title={t("account.channels.permissionDenied")}
-                  detail={t("account.connector.forbidden")}
-                />
-              ) : (
-                <ErrorState
-                  detail={errorText(capabilities.error)}
-                  onRetry={() => void capabilities.refetch()}
-                />
-              ))}
-            {capabilities.data?.items.length === 0 && (
-              <EmptyState
-                title={t("account.connector.empty")}
-                detail={t("account.connector.emptyDetail")}
-              />
-            )}
-            <ul className="channel-accounts">
-              {capabilities.data?.items.map((item) => (
-                <li key={`${item.platform_id}:${item.placement_slot}`}>
-                  <div className="channel-row">
-                    <h3>
-                      {item.platform_id} · {item.placement_slot}
-                    </h3>
-                    <Badge
-                      color={
-                        item.availability === "available"
-                          ? "success"
-                          : "warning"
-                      }
-                    >
-                      {connectorState(item.availability)}
-                    </Badge>
-                  </div>
-                  <p>
-                    {item.availability === "available"
-                      ? t("account.connector.formats", {
-                          formats:
-                            item.content_types
-                              .map(publicationFormatLabel)
-                              .join(t("account.connector.separator")) ||
-                            t("account.connector.none"),
-                        })
-                      : t("account.connector.unavailableDetail")}
-                  </p>
-                </li>
-              ))}
-            </ul>
-          </Card>
-        </section>
+                      <p>
+                        {item.availability === "available"
+                          ? t("account.connector.formats", {
+                              formats:
+                                item.content_types
+                                  .map(publicationFormatLabel)
+                                  .join(t("account.connector.separator")) ||
+                                t("account.connector.none"),
+                            })
+                          : t("account.connector.unavailableDetail")}
+                      </p>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+            </section>
+          )}
+          <MessageBar intent="info">
+            <MessageBarBody>
+              {t("account.channels.webLoginNote")}
+            </MessageBarBody>
+          </MessageBar>
+        </>
       )}
-      <MessageBar intent="info">
-        <MessageBarBody>{t("account.channels.webLoginNote")}</MessageBarBody>
-      </MessageBar>
     </div>
   );
 }

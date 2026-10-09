@@ -48,6 +48,8 @@ mod model_routes;
 pub use model_routes::ModelRouteGrant;
 mod observation_capture;
 pub use observation_capture::*;
+mod observation_analysis;
+pub use observation_analysis::*;
 mod provider_conversation_cleanup;
 pub use provider_conversation_cleanup::*;
 mod operation;
@@ -123,3 +125,5 @@ pub use report::{
     publication_lookup_asset_evidence, reduce_report, validate_correction,
 };
 pub use tenancy::{OperatorId, ProjectId, TenantId, TenantScope, TenantScopeId};
+mod project_ai_settings;
+pub use project_ai_settings::*;
