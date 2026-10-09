@@ -8,6 +8,10 @@ const LIST_MESSAGES = `${CHAT_SERVICE}ListMessages`;
 const DELETE_CHAT = `${CHAT_SERVICE}DeleteChat`;
 const CHAT_ID = /^[\w-]{1,128}$/u;
 const MAX_RESPONSE_BYTES = 256_000;
+// History includes full message bodies even though cleanup compares only IDs
+// and roles. Support the same byte budget as persisted observation sources
+// (MAX_OBSERVATION_SOURCE_BYTES); never truncate a page to obtain an inventory.
+const MAX_MESSAGE_RESPONSE_BYTES = 750_000;
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
 const DELETE_CLOSE_MARGIN_MS = 2_000;
@@ -216,7 +220,10 @@ async function connect(
       path,
       body,
       timeoutMs,
-      limit: MAX_RESPONSE_BYTES,
+      limit:
+        path === LIST_MESSAGES
+          ? MAX_MESSAGE_RESPONSE_BYTES
+          : MAX_RESPONSE_BYTES,
       deleteNotAfterMs,
       closeMarginMs: DELETE_CLOSE_MARGIN_MS,
     },

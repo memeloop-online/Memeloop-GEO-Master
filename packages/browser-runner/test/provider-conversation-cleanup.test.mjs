@@ -367,6 +367,93 @@ test("inventory checks every page and rejects incomplete or changed pagination",
   });
 });
 
+test("history supports the saved-source byte budget without accepting truncated inventories", async () => {
+  await fixture(async ({ page, state, calls, trustedOrigin }) => {
+    const options = {
+      ...SCOPE,
+      trustedOrigin,
+      authorizeDeletion: async () => authority(),
+    };
+    const messages = RETAINED_MESSAGES.map((message) => ({ ...message }));
+    // A complete, synthetic multibyte body exceeds the former 256 KB cap.
+    messages[1].text = "界".repeat(170_000);
+    state.messages = () => ({ messages });
+    const encoded = JSON.stringify(state.messages());
+    assert.ok(Buffer.byteLength(encoded) > 500_000);
+    assert.ok(Buffer.byteLength(encoded) < 750_000);
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "deleted",
+    );
+    assert.equal(
+      calls.filter(({ path }) => path.endsWith("DeleteChat")).length,
+      1,
+    );
+
+    // Check the exact UTF-8 boundary, including the JSON envelope. Complete
+    // decoding is required: an oversized tail must not leave a usable prefix.
+    const remaining = 750_000 - Buffer.byteLength(encoded);
+    messages[1].text += "x".repeat(remaining);
+    assert.equal(Buffer.byteLength(JSON.stringify(state.messages())), 750_000);
+    assert.equal(
+      (await deleteKimiConversation(page, options)).status,
+      "deleted",
+    );
+    calls.length = 0;
+    messages[1].text += "x";
+    assert.equal(Buffer.byteLength(JSON.stringify(state.messages())), 750_001);
+    const oversized = await deleteKimiConversation(page, options);
+    assert.equal(oversized.status, "retained");
+    assert.deepEqual(oversized.diagnostic, {
+      stage: "messages",
+      code: "too_large",
+    });
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+  });
+});
+
+test("the larger history budget does not enlarge chat inspection or delete acknowledgements", async () => {
+  await fixture(async ({ page, state, calls, trustedOrigin }) => {
+    const options = {
+      ...SCOPE,
+      trustedOrigin,
+      authorizeDeletion: async () => authority(),
+    };
+    state.chat = {
+      chat: { id: SCOPE.chatId },
+      padding: "x".repeat(256_000),
+    };
+    const oversizedChat = await deleteKimiConversation(page, options);
+    assert.equal(oversizedChat.status, "unknown");
+    assert.deepEqual(oversizedChat.diagnostic, {
+      stage: "inspection",
+      code: "too_large",
+    });
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+    state.chat = { chat: { id: SCOPE.chatId } };
+    state.deletion = {
+      chat_id: SCOPE.chatId,
+      padding: "x".repeat(256_000),
+    };
+    const oversizedDelete = await deleteKimiConversation(page, options);
+    assert.equal(oversizedDelete.status, "unknown");
+    assert.deepEqual(oversizedDelete.diagnostic, {
+      stage: "delete",
+      code: "too_large",
+    });
+    assert.equal(
+      calls.filter(({ path }) => path.endsWith("DeleteChat")).length,
+      1,
+    );
+  });
+});
+
 test("passive recovery paginates bounded message reads, without deletion or generation", async () => {
   await fixture(async ({ page, state, calls, trustedOrigin }) => {
     state.messages = ({ page_token }) =>
