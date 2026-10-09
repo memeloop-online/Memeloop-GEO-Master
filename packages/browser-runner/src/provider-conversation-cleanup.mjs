@@ -88,10 +88,21 @@ function retainedMessageInventory(pages) {
         !validId(message.id) ||
         seen.has(message.id) ||
         role === null ||
-        ((role === "assistant" || role === "system") &&
+        (role === "assistant" &&
           !["COMPLETED", "MESSAGE_STATUS_COMPLETED", 2].includes(
             message.status,
-          ))
+          )) ||
+        // System context is part of the exact ID/role inventory, not an
+        // assistant generation. History can explicitly mark that context
+        // UNSPECIFIED; do not infer completion for assistants or accept
+        // arbitrary unknown/missing system states.
+        (role === "system" &&
+          ![
+            "COMPLETED",
+            "MESSAGE_STATUS_COMPLETED",
+            2,
+            "MESSAGE_STATUS_UNSPECIFIED",
+          ].includes(message.status))
       )
         return null;
       seen.add(message.id);

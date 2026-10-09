@@ -256,7 +256,7 @@ test("only the exact durable inventory may delete, never appended or unknown mes
   });
 });
 
-test("observed completed system and assistant states join the exact canonical inventory", async () => {
+test("system context may be unspecified but assistants must complete in the exact inventory", async () => {
   await fixture(async ({ page, state, calls, trustedOrigin }) => {
     const messages = [
       { id: "system-1", role: "system", status: "MESSAGE_STATUS_COMPLETED" },
@@ -284,7 +284,17 @@ test("observed completed system and assistant states join the exact canonical in
         retained_message_inventory_sha256,
       }),
     };
-    for (const status of [undefined, "MESSAGE_STATUS_GENERATING", "unknown"]) {
+    for (const status of [
+      undefined,
+      null,
+      "MESSAGE_STATUS_GENERATING",
+      "pending",
+      "running",
+      "unknown",
+      "MESSAGE_STATUS_UNKNOWN",
+      0,
+      1,
+    ]) {
       state.messages = () => ({
         messages: messages.map((message) =>
           message.role === "system" ? { ...message, status } : message,
@@ -295,17 +305,29 @@ test("observed completed system and assistant states join the exact canonical in
         "retained",
       );
     }
-    state.messages = () => ({
-      messages: messages.map((message) =>
-        message.role === "assistant"
-          ? { ...message, status: "MESSAGE_STATUS_GENERATING" }
-          : message,
-      ),
-    });
-    assert.equal(
-      (await deleteKimiConversation(page, options)).status,
-      "retained",
-    );
+    for (const status of [
+      undefined,
+      null,
+      "MESSAGE_STATUS_GENERATING",
+      "MESSAGE_STATUS_UNSPECIFIED",
+      "MESSAGE_STATUS_UNKNOWN",
+      0,
+      1,
+    ]) {
+      state.messages = () => ({
+        messages: messages.map((message) =>
+          message.role === "assistant"
+            ? { ...message, status }
+            : message.role === "system"
+              ? { ...message, status: "MESSAGE_STATUS_UNSPECIFIED" }
+              : message,
+        ),
+      });
+      assert.equal(
+        (await deleteKimiConversation(page, options)).status,
+        "retained",
+      );
+    }
     state.messages = () => ({
       messages: messages.map((message) => ({
         ...message,
@@ -321,10 +343,59 @@ test("observed completed system and assistant states join the exact canonical in
       false,
     );
     // Exact scoped ListMessages/GetChat responses can omit per-message chat_id.
-    state.messages = () => ({ messages });
+    for (const status of [
+      "MESSAGE_STATUS_COMPLETED",
+      "MESSAGE_STATUS_UNSPECIFIED",
+    ]) {
+      state.messages = () => ({
+        messages: messages.map((message) =>
+          message.role === "system" ? { ...message, status } : message,
+        ),
+      });
+      assert.equal(
+        (await deleteKimiConversation(page, options)).status,
+        "deleted",
+      );
+    }
+    calls.length = 0;
+    for (const changed of [
+      messages.filter((message) => message.role !== "system"),
+      [
+        ...messages,
+        {
+          id: "added-system",
+          role: "system",
+          status: "MESSAGE_STATUS_UNSPECIFIED",
+        },
+      ],
+      messages.map((message) =>
+        message.role === "system"
+          ? {
+              ...message,
+              id: "changed-system",
+              status: "MESSAGE_STATUS_UNSPECIFIED",
+            }
+          : message,
+      ),
+      messages.map((message) =>
+        message.role === "system"
+          ? {
+              ...message,
+              status: "MESSAGE_STATUS_UNSPECIFIED",
+              state: "generating",
+            }
+          : message,
+      ),
+    ]) {
+      state.messages = () => ({ messages: changed });
+      assert.equal(
+        (await deleteKimiConversation(page, options)).status,
+        "retained",
+      );
+    }
     assert.equal(
-      (await deleteKimiConversation(page, options)).status,
-      "deleted",
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
     );
   });
 });
