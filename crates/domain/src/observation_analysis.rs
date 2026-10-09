@@ -397,23 +397,41 @@ pub fn observation_analysis_source_json(
                         && capture.input.account_id == target.target.input.account_id()
                 })
                 .ok_or_else(|| AppError::not_found("analysis source capture not found"))?;
-            if capture.input.validate(scope)? != capture.receipt.digest_sha256 {
+            if capture.receipt.capture_id != capture.input.capture_id
+                || capture.receipt.schema_version != 1
+                || capture.input.validate(scope)? != capture.receipt.digest_sha256
+            {
                 return Err(AppError::conflict(
                     "analysis source receipt digest mismatch",
                 ));
             }
             // An unavailable runner response is conservatively marked fixture
             // by dispatch. Only an independently persisted, identity-bound
-            // checkpoint may recover interpretation from such a receipt. A
-            // deadline response has an explicit unknown receipt, not a fixture
-            // receipt; its interpretation must remain separately attributed.
-            let receipt_allows_saved_source = outcome.runner_evidence.iter().all(|evidence| {
-                evidence["kind"] != "runner_receipt"
-                    || (evidence["schema_version"] == "geo.runner.receipt.v1"
-                        && evidence["provenance"] == "unknown"
-                        && outcome.status == ChannelOutcomeStatus::Unknown
-                        && outcome.detail.as_deref() == Some("execution_deadline"))
-            });
+            // checkpoint may recover interpretation from an explicitly unknown
+            // receipt. Failure-detail strings identify a stage, not provenance:
+            // saved-source eligibility must not depend on which stage timed out.
+            // Missing, conflicting, fixture or injected receipts are not proof.
+            let unknown_receipt = |evidence: &Value| {
+                evidence["kind"] == "runner_receipt"
+                    && evidence["schema_version"] == "geo.runner.receipt.v1"
+                    && evidence["provenance"] == "unknown"
+            };
+            let receipt_allows_saved_source = outcome.status == ChannelOutcomeStatus::Unknown
+                && outcome.runner_evidence.iter().any(unknown_receipt)
+                && outcome.runner_evidence.iter().all(|evidence| {
+                    evidence["kind"] != "runner_receipt" || unknown_receipt(evidence)
+                });
+            if outcome.runner_evidence.iter().any(|evidence| {
+                evidence["kind"] == "runner_receipt"
+                    && (matches!(
+                        evidence["provenance"].as_str(),
+                        Some("fixture" | "injected")
+                    ) || evidence["connector_version"]
+                        .as_str()
+                        .is_some_and(|version| version.starts_with("fixture")))
+            }) {
+                return Err(AppError::conflict("analysis source provenance unavailable"));
+            }
             if outcome.fixture
                 && (!receipt_allows_saved_source
                     || !capture.input.original_identity.as_ref().is_some_and(|identity| {
@@ -1396,7 +1414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deadline_unknown_receipt_allows_only_independently_bound_source_capture() {
+    async fn unknown_receipt_allows_only_independently_bound_source_capture() {
         let f = fixture().await;
         let mut request = f.request.clone();
         request.source = ObservationAnalysisSource::Capture {
@@ -1415,6 +1433,9 @@ mod tests {
             "kind":"runner_receipt",
             "schema_version":"geo.runner.receipt.v1",
             "provenance":"unknown",
+            "execution_id":Uuid::new_v4(),
+            "connector_version":"synthetic.v1",
+            "occurred_at":null,
         })];
         let mut capture = f
             .captures
@@ -1427,13 +1448,23 @@ mod tests {
             platform_account_id: "synthetic-account".into(),
         });
         capture.receipt.digest_sha256 = capture.input.validate(&f.scope).unwrap();
-        let original = target.clone();
-        assert!(
-            observation_analysis_source_json(&f.scope, &request, &target, Some(&capture)).is_ok()
-        );
-        assert_eq!(target, original);
+        for detail in [
+            Some("execution_deadline"),
+            Some("official_search_observation_unverified"),
+            Some("another_interpretation_stage_failed"),
+            None,
+        ] {
+            target.attempts[0].outcome.as_mut().unwrap().detail = detail.map(str::to_owned);
+            let original = target.clone();
+            assert!(
+                observation_analysis_source_json(&f.scope, &request, &target, Some(&capture))
+                    .is_ok(),
+                "{detail:?}",
+            );
+            assert_eq!(target, original);
+        }
         assert!(observation_analysis_source_json(&f.scope, &f.request, &target, None).is_err());
-        for provenance in ["fixture", "live", ""] {
+        for provenance in ["fixture", "injected", "live", ""] {
             let mut rejected = target.clone();
             rejected.attempts[0]
                 .outcome
@@ -1455,12 +1486,111 @@ mod tests {
             observation_analysis_source_json(&f.scope, &request, &malformed, Some(&capture))
                 .is_err()
         );
-        let mut not_deadline = target.clone();
-        not_deadline.attempts[0].outcome.as_mut().unwrap().detail = None;
+        let mut missing_receipt = target.clone();
+        missing_receipt.attempts[0]
+            .outcome
+            .as_mut()
+            .unwrap()
+            .runner_evidence
+            .clear();
         assert!(
-            observation_analysis_source_json(&f.scope, &request, &not_deadline, Some(&capture))
+            observation_analysis_source_json(&f.scope, &request, &missing_receipt, Some(&capture))
                 .is_err()
         );
+        let mut conflicting = target.clone();
+        conflicting.attempts[0].outcome.as_mut().unwrap().runner_evidence.push(json!({
+            "kind":"runner_receipt","schema_version":"geo.runner.receipt.v1","provenance":"fixture"
+        }));
+        for fixture in [true, false] {
+            conflicting.attempts[0].outcome.as_mut().unwrap().fixture = fixture;
+            assert!(
+                observation_analysis_source_json(&f.scope, &request, &conflicting, Some(&capture))
+                    .is_err()
+            );
+        }
+        let mut not_unknown = target.clone();
+        let mut fixture_connector = target.clone();
+        fixture_connector.attempts[0]
+            .outcome
+            .as_mut()
+            .unwrap()
+            .runner_evidence[0]["connector_version"] = json!("fixture-v1");
+        assert!(
+            observation_analysis_source_json(
+                &f.scope,
+                &request,
+                &fixture_connector,
+                Some(&capture)
+            )
+            .is_err()
+        );
+        not_unknown.attempts[0].outcome.as_mut().unwrap().status = ChannelOutcomeStatus::Observed;
+        assert!(
+            observation_analysis_source_json(&f.scope, &request, &not_unknown, Some(&capture))
+                .is_err()
+        );
+        for field in [
+            "capture", "account", "attempt", "target", "provider", "receipt", "schema",
+        ] {
+            let mut rebound = capture.clone();
+            match field {
+                "capture" => rebound.input.capture_id = Uuid::new_v4(),
+                "account" => rebound.input.account_id = Uuid::new_v4(),
+                "attempt" => rebound.input.attempt_id = Uuid::new_v4(),
+                "target" => rebound.input.target_id = Uuid::new_v4(),
+                "provider" => {
+                    rebound.input.original_identity.as_mut().unwrap().provider = "other".into()
+                }
+                "receipt" => rebound.receipt.capture_id = Uuid::new_v4(),
+                "schema" => rebound.receipt.schema_version = 99,
+                _ => unreachable!(),
+            }
+            rebound.receipt.digest_sha256 = rebound.input.validate(&f.scope).unwrap();
+            assert!(
+                observation_analysis_source_json(&f.scope, &request, &target, Some(&rebound))
+                    .is_err(),
+                "{field}"
+            );
+        }
+        for other in [
+            TenantScope::new(Uuid::new_v4().into(), f.scope.tenant_id, f.scope.project_id),
+            TenantScope::new(
+                f.scope.operator_id,
+                Uuid::new_v4().into(),
+                f.scope.project_id,
+            ),
+            TenantScope::new(
+                f.scope.operator_id,
+                f.scope.tenant_id,
+                Some(Uuid::new_v4().into()),
+            ),
+        ] {
+            // Scope ownership belongs to repository reads; captures do not
+            // embed tenant IDs and their content digest is not a scope token.
+            assert!(
+                f.store
+                    .create(
+                        &other,
+                        "foreign-capture",
+                        &sha256_hex(b"foreign"),
+                        request.clone(),
+                        f.now
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        for observed_at in [
+            target.attempts[0].claimed_at - Duration::seconds(1),
+            target.attempts[0].received_at.unwrap() + Duration::seconds(1),
+        ] {
+            let mut mistimed = request.clone();
+            mistimed.observed_at = observed_at;
+            assert!(
+                observation_analysis_source_json(&f.scope, &mistimed, &target, Some(&capture))
+                    .is_err()
+            );
+        }
         capture.input.original_identity = None;
         capture.receipt.digest_sha256 = capture.input.validate(&f.scope).unwrap();
         assert!(

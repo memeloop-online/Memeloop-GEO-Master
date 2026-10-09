@@ -861,6 +861,21 @@ mod tests {
         original: ChannelTargetView,
     }
     async fn fixture(fixture_receipt: bool, identity_bound: bool, unavailable: bool) -> Fixture {
+        fixture_with_detail(
+            fixture_receipt,
+            identity_bound,
+            unavailable,
+            "execution_deadline",
+        )
+        .await
+    }
+
+    async fn fixture_with_detail(
+        fixture_receipt: bool,
+        identity_bound: bool,
+        unavailable: bool,
+        detail: &str,
+    ) -> Fixture {
         let state = AppState::development_with_password("analysis-test");
         let tenant = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
         let project = state
@@ -953,7 +968,7 @@ mod tests {
                 attempt_id,
                 ChannelOutcome {
                     status: ChannelOutcomeStatus::Unknown,
-                    detail: Some("execution_deadline".into()),
+                    detail: Some(detail.into()),
                     occurred_at: now,
                     raw_answer: None,
                     citations: vec![],
@@ -965,6 +980,9 @@ mod tests {
                         "kind":"runner_receipt",
                         "schema_version":"geo.runner.receipt.v1",
                         "provenance":"unknown",
+                        "execution_id":Uuid::new_v4(),
+                        "connector_version":"synthetic.v1",
+                        "occurred_at":null,
                     })],
                 },
                 now + chrono::Duration::seconds(2),
@@ -994,6 +1012,92 @@ mod tests {
             model,
             original,
         }
+    }
+
+    #[tokio::test]
+    async fn policy_timeout_capture_is_discoverable_and_reparsed_without_upgrading_unknown() {
+        let f =
+            fixture_with_detail(true, true, false, "official_search_observation_unverified").await;
+        let sources = f
+            .service
+            .sources(&f.scope, &f.original, f.attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(matches!(
+            sources[0].source,
+            ObservationAnalysisSource::Capture { .. }
+        ));
+        let queued = f
+            .service
+            .submit(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                AnalyzeSavedSource {
+                    idempotency_key: "policy-source".into(),
+                    capture_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        f.service
+            .execute(&f.scope, queued.request.revision_id)
+            .await
+            .unwrap();
+        let revision = f
+            .service
+            .repository
+            .get(&f.scope, queued.request.revision_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            revision.result.unwrap().outcome,
+            ObservationAnalysisOutcome::Grounded { .. }
+        ));
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            f.original
+        );
+        let receipt = f.original.attempts[0].outcome.as_ref().unwrap();
+        assert_eq!(receipt.status, ChannelOutcomeStatus::Unknown);
+        assert!(receipt.fixture);
+        assert_eq!(
+            receipt.detail.as_deref(),
+            Some("official_search_observation_unverified")
+        );
+        let other = TenantScope::new(
+            f.scope.operator_id,
+            f.scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        assert!(
+            f.service
+                .sources(&other, &f.original, f.attempt_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let missing_identity =
+            fixture_with_detail(true, false, false, "official_search_observation_unverified").await;
+        assert!(
+            missing_identity
+                .service
+                .sources(
+                    &missing_identity.scope,
+                    &missing_identity.original,
+                    missing_identity.attempt_id
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
