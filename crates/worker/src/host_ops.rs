@@ -1021,12 +1021,9 @@ pub async fn op_host_report_get_v1(
     let op = HostOp::ReportGet;
     let bridge = bridge(&state.borrow())?;
     let request = parse_request::<ReportGetRequest>(op, &request)?;
-    if request.report_id.is_some_and(|id| id.is_nil()) {
-        return Err(js_error(HostOpError::invalid_request(
-            op,
-            "report ID must be non-zero",
-        )));
-    }
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
     let report = bridge
         .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
@@ -1048,12 +1045,9 @@ pub async fn op_host_report_preview_v1(
     let op = HostOp::ReportPreview;
     let bridge = bridge(&state.borrow())?;
     let request = parse_request::<ReportPreviewRequest>(op, &request)?;
-    if request.cycle_id.is_some_and(|id| id.is_nil()) {
-        return Err(js_error(HostOpError::invalid_request(
-            op,
-            "cycle ID must be non-zero",
-        )));
-    }
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
     let preview = bridge
         .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge
@@ -1075,14 +1069,9 @@ pub async fn op_host_report_reduce_v1(
     let op = HostOp::ReportReduce;
     let bridge = bridge(&state.borrow())?;
     let request = parse_request::<ReportReduceRequest>(op, &request)?;
-    if request.cycle_id.is_some_and(|id| id.is_nil())
-        || request.correction_of.is_some_and(|id| id.is_nil())
-    {
-        return Err(js_error(HostOpError::invalid_request(
-            op,
-            "report IDs must be non-zero",
-        )));
-    }
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
     let report = bridge
         .invoke_recorded(op, &request.clone(), |bridge| async move {
             bridge

@@ -196,6 +196,14 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 46,
         description: "provider conversation cleanup diagnostics",
     },
+    MigrationMetadata {
+        version: 47,
+        description: "serp measurements",
+    },
+    MigrationMetadata {
+        version: 48,
+        description: "measurement period reports",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

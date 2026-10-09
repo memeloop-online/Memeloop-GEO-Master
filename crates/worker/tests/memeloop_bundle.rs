@@ -270,32 +270,32 @@ impl HostOps for RecordingHostOps {
         &self,
         scope: &TenantScope,
         request: ReportReduceRequest,
-    ) -> Result<geo_domain::ReportSnapshot, HostOpError> {
+    ) -> Result<geo_worker::ReportResult, HostOpError> {
         self.report_calls.lock().unwrap().push((
             scope.storage_key(),
             format!("reduce:{:?}", request.cycle_id),
         ));
         assert_eq!(request.correction_of, None);
-        Ok(report_fixture())
+        Ok(geo_worker::ReportResult::Cycle(Box::new(report_fixture())))
     }
 
     async fn report_get(
         &self,
         scope: &TenantScope,
         request: ReportGetRequest,
-    ) -> Result<geo_domain::ReportSnapshot, HostOpError> {
+    ) -> Result<geo_worker::ReportResult, HostOpError> {
         self.report_calls
             .lock()
             .unwrap()
             .push((scope.storage_key(), format!("get:{:?}", request.report_id)));
-        Ok(report_fixture())
+        Ok(geo_worker::ReportResult::Cycle(Box::new(report_fixture())))
     }
 
     async fn report_preview(
         &self,
         scope: &TenantScope,
         request: ReportPreviewRequest,
-    ) -> Result<geo_domain::ReportPreview, HostOpError> {
+    ) -> Result<geo_worker::ReportPreviewResult, HostOpError> {
         self.report_calls.lock().unwrap().push((
             scope.storage_key(),
             format!("preview:{:?}", request.cycle_id),
@@ -310,12 +310,14 @@ impl HostOps for RecordingHostOps {
             "project_id".to_owned(),
             serde_json::to_value(scope.project_id.expect("project scope")).unwrap(),
         );
-        serde_json::from_value(value).map_err(|_| {
-            HostOpError::internal(
-                HostOp::ReportPreview,
-                "fixture preview could not be created",
-            )
-        })
+        serde_json::from_value(value)
+            .map(|preview| geo_worker::ReportPreviewResult::Cycle(Box::new(preview)))
+            .map_err(|_| {
+                HostOpError::internal(
+                    HostOp::ReportPreview,
+                    "fixture preview could not be created",
+                )
+            })
     }
 }
 

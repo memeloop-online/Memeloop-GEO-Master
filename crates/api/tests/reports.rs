@@ -1461,10 +1461,11 @@ async fn due_report_replays_immutable_snapshot_and_keeps_absent_sources_unavaila
         RepositoryHostOps::new(state.knowledge_repository()).with_report_state(state.clone());
     assert_eq!(
         tools
-            .report_get(&scope, ReportGetRequest { report_id: None })
+            .report_get(&scope, ReportGetRequest::default())
             .await
             .unwrap()
-            .report_id,
+            .report_id()
+            .unwrap(),
         corrected.report_id
     );
     assert_eq!(
@@ -1474,11 +1475,13 @@ async fn due_report_replays_immutable_snapshot_and_keeps_absent_sources_unavaila
                 ReportReduceRequest {
                     cycle_id: Some(cycle_id),
                     correction_of: None,
+                    ..Default::default()
                 }
             )
             .await
             .unwrap()
-            .report_id,
+            .report_id()
+            .unwrap(),
         first.report_id
     );
     // Persisting the first snapshot now advances the project to its next
@@ -1491,6 +1494,7 @@ async fn due_report_replays_immutable_snapshot_and_keeps_absent_sources_unavaila
                 ReportReduceRequest {
                     cycle_id: None,
                     correction_of: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1519,7 +1523,8 @@ async fn due_report_replays_immutable_snapshot_and_keeps_absent_sources_unavaila
             .report_get(
                 &other_scope,
                 ReportGetRequest {
-                    report_id: Some(first.report_id)
+                    report_id: Some(first.report_id),
+                    ..Default::default()
                 }
             )
             .await

@@ -59,16 +59,17 @@ pub use host::{
     KnowledgeTextReviseRequest, ManifestCoverage, ManifestItem, ManifestKind, ManifestPage,
     ManifestPlanningState, ManifestReadRequest, MeasureRequest, MeasureSample,
     MeasurementModelOption, MeasurementOptionsRequest, MeasurementOptionsResult,
-    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, MeasurementPlanReceipt,
-    MeasurementPlanStatus, MeasurementSurface, MeasurementTargetStatus, ModelCompletion,
-    ModelCompletionRequest, ModelMessage, ModelToolCall, ModelToolDefinition,
+    MeasurementPeriodListKind, MeasurementPeriodPreviewProjection,
+    MeasurementPeriodReportProjection, MeasurementPlanCreateRequest, MeasurementPlanReadRequest,
+    MeasurementPlanReceipt, MeasurementPlanStatus, MeasurementSurface, MeasurementTargetStatus,
+    ModelCompletion, ModelCompletionRequest, ModelMessage, ModelToolCall, ModelToolDefinition,
     ModelToolFunctionCall, ModelToolFunctionDefinition, ProjectCurrentRequest,
     ProjectCurrentResult, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
     PublishReceipt, PublishRequest, PublishState, QuestionDiscoverRequest, QuestionDiscoveryItem,
     QuestionDiscoveryPage, QuestionReference, QuestionReviseRequest, QuestionWriteReceipt,
-    ReportGetRequest, ReportPreviewRequest, ReportReduceRequest, ReviseQuestionSet,
-    SourceRecommendationsRequest, TenantScope, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder,
-    redact_secrets,
+    ReportGetRequest, ReportKind, ReportPreviewRequest, ReportPreviewResult, ReportReduceRequest,
+    ReportResult, ReviseQuestionSet, SourceRecommendationsRequest, TenantScope, ToolCallIdentity,
+    ToolCallOutcome, ToolCallRecorder, redact_secrets,
 };
 pub use host_runtime::HostRuntime;
 pub use loader::InMemoryModuleLoader;

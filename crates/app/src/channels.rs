@@ -10,6 +10,14 @@ pub fn configure_callbacks(
     state: AppState,
     database: &geo_persistence::Database,
 ) -> Result<AppState, Box<dyn Error>> {
+    // Durable history remains readable without any configured paid source.
+    let serp = geo_api::SerpService::new(
+        std::sync::Arc::new(geo_persistence::PgSerpRepository::from_database(database)),
+        state.project_repository(),
+        state.question_repository(),
+    );
+    let _serp_dispatcher = geo_api::spawn_serp_dispatcher(serp.clone());
+    let state = state.with_serp_service(serp);
     let state =
         state.with_observation_evidence_resolver(geo_api::ObservationEvidenceResolver::new(
             std::sync::Arc::new(

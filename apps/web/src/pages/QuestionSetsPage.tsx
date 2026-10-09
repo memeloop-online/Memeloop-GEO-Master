@@ -32,6 +32,7 @@ import {
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { CitationInsightsPanel } from "./CitationInsightsPanel";
 import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
+import { SerpMeasurementPanel } from "./SerpMeasurementPanel";
 import { TopicQuestionGenerator } from "./TopicQuestionGenerator";
 import "./measurementMessages";
 import "./QuestionSetsPage.css";
@@ -114,7 +115,7 @@ const readStoredDrafts = (value: unknown): StoredDrafts | null => {
     drafts: drafts as Record<string, RevisionDraft>,
   };
 };
-const tabs = ["measure", "records", "insights", "sets"] as const;
+const tabs = ["measure", "search", "records", "insights", "sets"] as const;
 type MeasurementTab = (typeof tabs)[number];
 const toDraft = (text: string, localId: string): EditableQuestion => ({
   localId,
@@ -392,6 +393,14 @@ export function QuestionSetsPage() {
             canWrite={canWrite}
           />
         </details>
+      </section>
+      <section
+        role="tabpanel"
+        aria-labelledby="measurement-tab-search"
+        hidden={tab !== "search"}
+        aria-label={t("search")}
+      >
+        <SerpMeasurementPanel tenantId={tenantId} projectId={projectId} />
       </section>
       <section
         role="tabpanel"

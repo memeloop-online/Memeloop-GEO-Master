@@ -181,9 +181,16 @@ impl HostOps for FakeHostOps {
         &self,
         scope: &TenantScope,
         _request: ReportPreviewRequest,
-    ) -> Result<ReportPreview, HostOpError> {
+    ) -> Result<geo_worker::ReportPreviewResult, HostOpError> {
         match self.behaviour.preview_response.clone() {
-            Some(value) => self.answer(HostOp::ReportPreview, scope, value).await,
+            Some(value) => {
+                self.answer(
+                    HostOp::ReportPreview,
+                    scope,
+                    geo_worker::ReportPreviewResult::Cycle(Box::new(value)),
+                )
+                .await
+            }
             None => Err(HostOpError::capability_missing(
                 HostOp::ReportPreview,
                 "preview unavailable",

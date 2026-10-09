@@ -35,8 +35,8 @@ use geo_domain::{
     AgentRepository, AgentRuntime, AppError, AttachmentReference, ChannelOutcomeStatus,
     DistributionManifest, DistributionTarget, DocumentManifestItemState, DocumentManifestState,
     ErrorCode, ImportItem, ImportStatus, KnowledgeImportProgress, KnowledgeRepository,
-    RUNTIME_NOT_CONFIGURED, RecordToolCall, ReportSnapshot, RuntimeCapability, SourceKind,
-    TenantScope, ToolCallDecision, TurnInput, TurnReport,
+    RUNTIME_NOT_CONFIGURED, RecordToolCall, RuntimeCapability, SourceKind, TenantScope,
+    ToolCallDecision, TurnInput, TurnReport,
 };
 use geo_worker::{
     ChannelDiscoverRequest, ChannelDiscoveryPage, ChannelExecutionResult, ChannelManifestPage,
@@ -49,12 +49,12 @@ use geo_worker::{
     HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOps,
     HostRuntime, ManifestCoverage, ManifestItem, ManifestKind, ManifestPage, ManifestPlanningState,
     ManifestReadRequest, MeasureRequest, MeasureSample, MeasurementOptionsRequest,
-    MeasurementOptionsResult, MeasurementPlanCreateRequest, MeasurementPlanReadRequest,
-    MeasurementPlanReceipt, MeasurementPlanStatus, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest, QuestionDiscoverRequest, QuestionDiscoveryPage,
-    QuestionReviseRequest, QuestionWriteReceipt, ReportGetRequest, ReportPreviewRequest,
-    ReportReduceRequest, TURN_COMPLETION_TOPIC, ToolCallIdentity, ToolCallOutcome,
-    ToolCallRecorder, WorkerError,
+    MeasurementOptionsResult, MeasurementPeriodListKind, MeasurementPlanCreateRequest,
+    MeasurementPlanReadRequest, MeasurementPlanReceipt, MeasurementPlanStatus, ModelCompletion,
+    ModelCompletionRequest, PublishReceipt, PublishRequest, QuestionDiscoverRequest,
+    QuestionDiscoveryPage, QuestionReviseRequest, QuestionWriteReceipt, ReportGetRequest,
+    ReportKind, ReportPreviewRequest, ReportPreviewResult, ReportReduceRequest, ReportResult,
+    TURN_COMPLETION_TOPIC, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder, WorkerError,
 };
 use serde_json::{Value, json};
 
@@ -668,19 +668,19 @@ trait ReportService: Send + Sync {
         &self,
         scope: &TenantScope,
         request: ReportGetRequest,
-    ) -> Result<ReportSnapshot, AppError>;
+    ) -> Result<ReportResult, AppError>;
     async fn preview(
         &self,
         scope: &TenantScope,
         request: ReportPreviewRequest,
         now: DateTime<Utc>,
-    ) -> Result<geo_domain::ReportPreview, AppError>;
+    ) -> Result<ReportPreviewResult, AppError>;
     async fn reduce(
         &self,
         scope: &TenantScope,
         request: ReportReduceRequest,
         now: DateTime<Utc>,
-    ) -> Result<ReportSnapshot, AppError>;
+    ) -> Result<ReportResult, AppError>;
 }
 
 #[async_trait]
@@ -689,9 +689,43 @@ impl ReportService for AppState {
         &self,
         scope: &TenantScope,
         request: ReportGetRequest,
-    ) -> Result<ReportSnapshot, AppError> {
+    ) -> Result<ReportResult, AppError> {
+        request.validate().map_err(AppError::invalid_request)?;
+        if request.kind == ReportKind::MeasurementPeriod {
+            if request.list {
+                let items = self
+                    .report_repository()
+                    .list_measurement_periods(scope)
+                    .await?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                return Ok(ReportResult::MeasurementPeriodList {
+                    kind: MeasurementPeriodListKind::MeasurementPeriodList,
+                    items,
+                });
+            }
+            let report = if let Some(id) = request.report_id {
+                self.report_repository()
+                    .get_measurement_period(scope, id)
+                    .await?
+            } else {
+                self.report_repository()
+                    .list_measurement_periods(scope)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        AppError::not_found("no measurement report exists for this project")
+                    })?
+            };
+            return Ok(ReportResult::MeasurementPeriod(Box::new(report.into())));
+        }
         if let Some(id) = request.report_id {
-            self.report_repository().get(scope, id).await
+            self.report_repository()
+                .get(scope, id)
+                .await
+                .map(|report| ReportResult::Cycle(Box::new(report)))
         } else {
             let project_id = scope
                 .project_id
@@ -702,6 +736,7 @@ impl ReportService for AppState {
                 .into_iter()
                 .next()
                 .ok_or_else(|| AppError::not_found("no report exists for this project"))
+                .map(|report| ReportResult::Cycle(Box::new(report)))
         }
     }
 
@@ -710,7 +745,15 @@ impl ReportService for AppState {
         scope: &TenantScope,
         request: ReportPreviewRequest,
         now: DateTime<Utc>,
-    ) -> Result<geo_domain::ReportPreview, AppError> {
+    ) -> Result<ReportPreviewResult, AppError> {
+        request.validate().map_err(AppError::invalid_request)?;
+        if request.kind == ReportKind::MeasurementPeriod {
+            let preview =
+                crate::preview_project_measurements(self, scope, request.window, now).await?;
+            return Ok(ReportPreviewResult::MeasurementPeriod(Box::new(
+                preview.into(),
+            )));
+        }
         let cycle_id = if let Some(id) = request.cycle_id {
             id
         } else {
@@ -724,7 +767,9 @@ impl ReportService for AppState {
                 .current_cycle_id
                 .ok_or_else(|| AppError::not_found("current cycle not found"))?
         };
-        preview_cycle_report(self, scope, cycle_id, now).await
+        preview_cycle_report(self, scope, cycle_id, now)
+            .await
+            .map(|preview| ReportPreviewResult::Cycle(Box::new(preview)))
     }
 
     async fn reduce(
@@ -732,7 +777,26 @@ impl ReportService for AppState {
         scope: &TenantScope,
         request: ReportReduceRequest,
         now: DateTime<Utc>,
-    ) -> Result<ReportSnapshot, AppError> {
+    ) -> Result<ReportResult, AppError> {
+        request.validate().map_err(AppError::invalid_request)?;
+        if request.kind == ReportKind::MeasurementPeriod {
+            let window = request
+                .window
+                .expect("validated explicit measurement report window");
+            let report = crate::save_project_measurement_report(
+                self,
+                scope,
+                crate::MeasurementPeriodRequest {
+                    start_at: window.start_at,
+                    end_at: window.end_at,
+                    report_timezone: window.report_timezone,
+                    correction_of: request.correction_of,
+                },
+                now,
+            )
+            .await?;
+            return Ok(ReportResult::MeasurementPeriod(Box::new(report.into())));
+        }
         let cycle_id = if let Some(id) = request.cycle_id {
             id
         } else {
@@ -746,7 +810,9 @@ impl ReportService for AppState {
                 .current_cycle_id
                 .ok_or_else(|| AppError::not_found("current cycle not found"))?
         };
-        reduce_cycle_report(self, scope, cycle_id, request.correction_of, now).await
+        reduce_cycle_report(self, scope, cycle_id, request.correction_of, now)
+            .await
+            .map(|report| ReportResult::Cycle(Box::new(report)))
     }
 }
 
@@ -1570,7 +1636,7 @@ impl HostOps for RepositoryHostOps {
         &self,
         scope: &TenantScope,
         request: ReportGetRequest,
-    ) -> Result<ReportSnapshot, HostOpError> {
+    ) -> Result<ReportResult, HostOpError> {
         let service = self.report_service.as_ref().ok_or_else(|| {
             HostOpError::capability_missing(HostOp::ReportGet, "report service is not configured")
         })?;
@@ -1584,7 +1650,7 @@ impl HostOps for RepositoryHostOps {
         &self,
         scope: &TenantScope,
         request: ReportPreviewRequest,
-    ) -> Result<geo_domain::ReportPreview, HostOpError> {
+    ) -> Result<ReportPreviewResult, HostOpError> {
         let service = self.report_service.as_ref().ok_or_else(|| {
             HostOpError::capability_missing(
                 HostOp::ReportPreview,
@@ -1601,7 +1667,7 @@ impl HostOps for RepositoryHostOps {
         &self,
         scope: &TenantScope,
         request: ReportReduceRequest,
-    ) -> Result<ReportSnapshot, HostOpError> {
+    ) -> Result<ReportResult, HostOpError> {
         let service = self.report_service.as_ref().ok_or_else(|| {
             HostOpError::capability_missing(
                 HostOp::ReportReduce,

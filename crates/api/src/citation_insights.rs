@@ -16,7 +16,7 @@ use crate::{ApiError, AppState, RequestContext, api_error};
 /// acceptance validator that originally admitted this outcome. The normalized
 /// result fields are derived from the accepted outcome; they do not reintroduce
 /// a second parser or trust a consumer-supplied search flag.
-fn accepted_live_search(view: &ChannelTargetView, attempt: &ChannelAttempt) -> bool {
+pub(crate) fn accepted_live_search(view: &ChannelTargetView, attempt: &ChannelAttempt) -> bool {
     let Some(outcome) = &attempt.outcome else {
         return false;
     };

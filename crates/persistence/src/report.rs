@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PgReportRepository {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl PgReportRepository {
@@ -91,6 +91,21 @@ fn decode(value: serde_json::Value) -> Result<ReportSnapshot, AppError> {
 
 #[async_trait]
 impl ReportRepository for PgReportRepository {
+    async fn create_measurement_period(
+        &self,
+        scope: &TenantScope,
+        snapshot: geo_domain::MeasurementPeriodReport,
+    ) -> Result<geo_domain::MeasurementPeriodReport, AppError> {
+        self.save_measurement_period(scope, snapshot).await
+    }
+
+    async fn list_measurement_periods(
+        &self,
+        scope: &TenantScope,
+    ) -> Result<Vec<geo_domain::MeasurementPeriodReport>, AppError> {
+        self.read_measurement_periods(scope).await
+    }
+
     async fn create(
         &self,
         scope: &TenantScope,

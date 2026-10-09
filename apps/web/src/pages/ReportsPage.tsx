@@ -8,6 +8,7 @@ import {
 } from "@fluentui/react-components";
 import { ArrowSyncRegular } from "@fluentui/react-icons";
 import { Link, useParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import {
   useCurrentReportCycleQuery,
   useReportEvidenceQuery,
@@ -23,6 +24,7 @@ import { ApiError } from "../api/client";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { downloadReportCsv } from "./reportsCsv";
 import { ReportSupplementaryMeasurements } from "./ReportSupplementaryMeasurements";
+import { MeasurementPeriodReportPanel } from "./MeasurementPeriodReportPanel";
 import "./ReportsPage.css";
 
 const manifestLabels = {
@@ -545,6 +547,7 @@ function ReportListPage({
   tenantId: string;
   projectId: string;
 }) {
+  const { t } = useTranslation("measurementReports");
   const query = useReportsQuery(tenantId, projectId);
   const cycle = useCurrentReportCycleQuery(tenantId, projectId);
   const preview = useReportPreviewQuery(
@@ -557,8 +560,8 @@ function ReportListPage({
       <section className="page-hero">
         <div>
           <p className="eyebrow">效果报告</p>
-          <h1>每周报告</h1>
-          <p>查看本期进展预览与历史周报，下载覆盖统计和来源证据。</p>
+          <h1>{t("pageTitle")}</h1>
+          <p>{t("pageDescription")}</p>
         </div>
         <Button
           icon={<ArrowSyncRegular />}
@@ -568,6 +571,11 @@ function ReportListPage({
           刷新列表
         </Button>
       </section>
+      <MeasurementPeriodReportPanel
+        key={`${tenantId}/${projectId}`}
+        tenantId={tenantId}
+        projectId={projectId}
+      />
       {cycle.isPending ? (
         <LoadingState label="正在读取当前周期" compact />
       ) : cycle.isError ? (

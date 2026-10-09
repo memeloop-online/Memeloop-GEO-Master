@@ -67,9 +67,22 @@ pub use observation_analysis::{
     SavedObservationGrounder,
 };
 pub use observation_evidence::ObservationEvidenceResolver;
+mod serp;
+mod serp_dataforseo;
+pub use serp::{
+    AcceptSerpMeasurement, ReparseSerpSource, SerpCapability, SerpExecutionView,
+    SerpMeasurementDetail, SerpMeasurementPage, SerpPreparedSubmission, SerpReadOutcome,
+    SerpService, SerpSource, SerpSourcePage, spawn_serp_dispatcher,
+};
+pub use serp_dataforseo::{DataForSeoSerpConfig, DataForSeoSerpSource};
+mod measurement_reports;
 mod questions;
 mod questions_tools;
 mod reports;
+pub use measurement_reports::{
+    MeasurementPeriodRequest, default_measurement_period_window, preview_project_measurements,
+    save_project_measurement_report,
+};
 mod run_executor;
 pub use run_executor::dispatch_queued;
 mod standalone_measurements;
@@ -175,6 +188,7 @@ pub struct AppState {
     observation_ai_callback: Option<ObservationAiCallbackService>,
     observation_analysis: Option<ObservationAnalysisService>,
     observation_evidence_resolver: Option<ObservationEvidenceResolver>,
+    serp_service: Option<SerpService>,
     provider_cleanup_callback: Option<ProviderCleanupCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
@@ -297,6 +311,7 @@ impl AppState {
             observation_ai_callback: None,
             observation_analysis: None,
             observation_evidence_resolver: None,
+            serp_service: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -454,6 +469,7 @@ impl AppState {
             observation_ai_callback: None,
             observation_analysis: None,
             observation_evidence_resolver: None,
+            serp_service: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -929,6 +945,15 @@ impl AppState {
 
     pub fn observation_evidence_resolver(&self) -> Option<&ObservationEvidenceResolver> {
         self.observation_evidence_resolver.as_ref()
+    }
+
+    pub fn with_serp_service(mut self, service: SerpService) -> Self {
+        self.serp_service = Some(service);
+        self
+    }
+
+    pub fn serp_service(&self) -> Option<&SerpService> {
+        self.serp_service.as_ref()
     }
 
     pub fn with_provider_cleanup_callback(
@@ -2040,6 +2065,10 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         reports::get_report_evidence,
         reports::get_report_preview,
         reports::create_reduction,
+        measurement_reports::preview,
+        measurement_reports::list,
+        measurement_reports::get,
+        measurement_reports::create,
         knowledge::capabilities,
         knowledge::create_upload_session,
         knowledge::put_upload_content,
@@ -2104,6 +2133,11 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         reports::ReduceRequest,
         reports::ReportList,
         reports::ReportEvidenceList,
+        measurement_reports::MeasurementPeriodQuery,
+        measurement_reports::MeasurementPeriodRequest,
+        measurement_reports::MeasurementPeriodList,
+        geo_domain::MeasurementPeriodReport,
+        geo_domain::MeasurementPeriodPreview,
         geo_domain::ReportSnapshot,
         geo_domain::ReportPreview,
         geo_domain::ReportPreviewKind,
@@ -2289,6 +2323,15 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}/cycles/current", get(cycles::current))
         .route("/projects/{id}/cycles", post(cycles::schedule_successor))
         .route("/projects/{id}/reports", get(reports::list_reports))
+        .route(
+            "/projects/{id}/measurement-report-preview",
+            get(measurement_reports::preview),
+        )
+        .route(
+            "/projects/{id}/measurement-reports",
+            get(measurement_reports::list).post(measurement_reports::create),
+        )
+        .route("/measurement-reports/{id}", get(measurement_reports::get))
         .route("/reports/{id}", get(reports::get_report))
         .route("/reports/{id}/evidence", get(reports::get_report_evidence))
         .route(
@@ -2529,6 +2572,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(agent_routes)
                 .merge(project_ai_settings::routes())
                 .merge(observation_analysis::routes())
+                .merge(serp::routes())
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))

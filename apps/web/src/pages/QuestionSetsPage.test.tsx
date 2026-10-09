@@ -106,6 +106,10 @@ function mockApi({
       const method = init?.method ?? "GET";
       const body = init?.body ? JSON.parse(String(init.body)) : null;
       calls.push({ path, method, body, headers: new Headers(init?.headers) });
+      if (path.endsWith("/serp-capabilities"))
+        return Promise.resolve(reply([]));
+      if (path.endsWith("/serp-measurements"))
+        return Promise.resolve(reply({ items: [], next_after: null }));
       if (path.endsWith("/auth/session"))
         return Promise.resolve(
           reply({
@@ -288,6 +292,63 @@ afterEach(async () => {
 });
 
 describe("P13 versioned question sets", () => {
+  it.each([
+    ["zh-CN", "传统搜索"],
+    ["en", "Web search"],
+  ])(
+    "opens the read-only search tab deep link in %s without creating a measurement",
+    async (language, label) => {
+      await i18n.changeLanguage(language);
+      const calls = mockApi();
+      renderPage("/app/tenant-1/project-1/measurement?tab=search");
+      expect(await screen.findByRole("tab", { name: label })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      const panel = screen.getByRole("tabpanel", { name: label });
+      expect(
+        within(panel).getByRole("heading", {
+          name: i18n.t("title", { ns: "serp" }),
+        }),
+      ).toBeInTheDocument();
+      expect(
+        await within(panel).findByText(i18n.t("unavailable", { ns: "serp" })),
+      ).toBeInTheDocument();
+      expect(
+        calls
+          .filter((call) => call.path.includes("/serp-"))
+          .every((call) => call.method === "GET"),
+      ).toBe(true);
+    },
+  );
+
+  it("keeps search input across tabs and navigates with the existing browser history", async () => {
+    mockApi();
+    renderPage();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: "传统搜索" }));
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "tab=search",
+    );
+    const panel = screen.getByRole("tabpanel", { name: "传统搜索" });
+    await user.type(
+      within(panel).getByRole("textbox", { name: /关键词/ }),
+      "generic topic",
+    );
+    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await user.click(screen.getByRole("button", { name: "浏览器返回" }));
+    expect(screen.getByRole("tab", { name: "传统搜索" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(
+      within(screen.getByRole("tabpanel", { name: "传统搜索" })).getByRole(
+        "textbox",
+        { name: /关键词/ },
+      ),
+    ).toHaveValue("generic topic");
+  });
+
   it("creates a named immutable version from pasted lines and edits into a second version", async () => {
     const calls = mockApi();
     const user = userEvent.setup();

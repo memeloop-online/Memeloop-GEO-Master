@@ -6,7 +6,7 @@ i18n.addResourceBundle(
   {
     title: "已存原文的补充分析",
     count: "独立分析 {{count}} 项",
-    note: "这些结果来自已保存的回答，单独展示；不改变原测量结果、本期计划总数或覆盖统计。",
+    note: "从已保存的回答中提取的答案与引用。",
     answer: "分析提取的回答",
     citations: "引用网页",
     noCitations: "未提取到引用网页",
@@ -38,7 +38,7 @@ i18n.addResourceBundle(
   {
     title: "Supplementary analysis of saved responses",
     count: "{{count}} independent analyses",
-    note: "These results use saved responses and are shown separately. Original measurement outcomes, planned totals and coverage counts remain unchanged.",
+    note: "Answers and citations extracted from saved responses.",
     answer: "Answer extracted by analysis",
     citations: "Cited pages",
     noCitations: "No cited pages extracted",

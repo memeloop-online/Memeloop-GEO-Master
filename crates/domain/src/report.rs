@@ -273,11 +273,40 @@ pub trait ReportRepository: Send + Sync {
         project_id: ProjectId,
     ) -> Result<Vec<ReportSnapshot>, AppError>;
     async fn get(&self, scope: &TenantScope, report_id: Uuid) -> Result<ReportSnapshot, AppError>;
+    async fn create_measurement_period(
+        &self,
+        _scope: &TenantScope,
+        _snapshot: crate::MeasurementPeriodReport,
+    ) -> Result<crate::MeasurementPeriodReport, AppError> {
+        Err(AppError::capability_missing(
+            "measurement period reports unavailable",
+        ))
+    }
+    async fn list_measurement_periods(
+        &self,
+        _scope: &TenantScope,
+    ) -> Result<Vec<crate::MeasurementPeriodReport>, AppError> {
+        Err(AppError::capability_missing(
+            "measurement period reports unavailable",
+        ))
+    }
+    async fn get_measurement_period(
+        &self,
+        scope: &TenantScope,
+        report_id: Uuid,
+    ) -> Result<crate::MeasurementPeriodReport, AppError> {
+        self.list_measurement_periods(scope)
+            .await?
+            .into_iter()
+            .find(|row| row.report_id == report_id)
+            .ok_or_else(|| AppError::not_found("measurement report not found"))
+    }
 }
 
 #[derive(Default)]
 pub struct MemoryReportRepository {
     reports: RwLock<HashMap<(Uuid, Uuid, Uuid), Vec<ReportSnapshot>>>,
+    measurement_periods: RwLock<HashMap<(Uuid, Uuid, Uuid), Vec<crate::MeasurementPeriodReport>>>,
 }
 
 impl MemoryReportRepository {
@@ -288,6 +317,63 @@ impl MemoryReportRepository {
 
 #[async_trait]
 impl ReportRepository for MemoryReportRepository {
+    async fn create_measurement_period(
+        &self,
+        scope: &TenantScope,
+        snapshot: crate::MeasurementPeriodReport,
+    ) -> Result<crate::MeasurementPeriodReport, AppError> {
+        if scope.project_id != Some(snapshot.project_id) {
+            return Err(AppError::forbidden("measurement report outside project"));
+        }
+        let mut guard = self.measurement_periods.write().await;
+        let rows = guard
+            .entry((
+                scope.operator_id.as_uuid(),
+                scope.tenant_id.as_uuid(),
+                snapshot.project_id.as_uuid(),
+            ))
+            .or_default();
+        // First writer fixes the evidence time and bytes. Concurrent callers
+        // and retries return that exact snapshot, never a refreshed reduction.
+        if let Some(row) = rows.iter().find(|row| {
+            row.window() == snapshot.window()
+                && row.revision == snapshot.revision
+                && row.correction_of == snapshot.correction_of
+        }) {
+            return Ok(row.clone());
+        }
+        crate::validate_measurement_period_correction(rows, &snapshot)?;
+        rows.push(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn list_measurement_periods(
+        &self,
+        scope: &TenantScope,
+    ) -> Result<Vec<crate::MeasurementPeriodReport>, AppError> {
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::forbidden("project scope required"))?;
+        let mut rows = self
+            .measurement_periods
+            .read()
+            .await
+            .get(&(
+                scope.operator_id.as_uuid(),
+                scope.tenant_id.as_uuid(),
+                project.as_uuid(),
+            ))
+            .cloned()
+            .unwrap_or_default();
+        rows.sort_by_key(|row| {
+            (
+                std::cmp::Reverse(row.report_window_end_at),
+                std::cmp::Reverse(row.revision),
+            )
+        });
+        Ok(rows)
+    }
+
     async fn create(
         &self,
         scope: &TenantScope,

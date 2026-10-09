@@ -250,7 +250,11 @@ const TOOL_DESCRIPTIONS = {
   project_start:
     "Submit the current project revision for atomic startup using a stable idempotency_key. Accepted means queued with durable operation/cycle references, not generated content, successful publication or completed measurement.",
   [REPORT_PREVIEW]:
-    "Read a temporary, unsaved report preview for the current project cycle (or scoped cycle_id). This is not an official report: it has no report_id, revision or correction reference. It does not reduce, schedule or save anything.",
+    "Read a temporary, unsaved report preview. For arbitrary-topic or independent measurements use kind measurement_period; no cycle, enterprise setup or new sampling is needed, and omitted window means the last seven days. To save it, pass the EXACT returned report_window_start_at, report_window_end_at and report_timezone as report_reduce.window. kind cycle (default) retains current/scoped cycle preview. This does not schedule or save anything. Omitted sample details are purpose-restricted, not missing evidence.",
+  [REPORT_GET]:
+    "Read an immutable saved report in the current project. Use kind measurement_period for independent measurement reports, report_id for an exact saved version, or list true to list that kind; omit both to read the latest. kind cycle (default) preserves cycle-report reads. Coverage is authoritative; omitted_sample_details counts details withheld from AI by immutable question purpose, not absent samples.",
+  [REPORT_REDUCE]:
+    "Save a report from already persisted evidence, never start sampling or create a cycle. For independent/arbitrary-topic reports choose kind measurement_period and provide the EXACT window returned by report_preview (start_at, end_at, report_timezone); replay the identical window after uncertainty. correction_of creates a new immutable version of that same window. kind cycle (default) reduces the current/scoped cycle after cutoff. Do not use withheld evaluation or unclassified sample details for optimization.",
   [KNOWLEDGE_IMPORT_STATUS]:
     "Read actual progress for one import_job_id returned by knowledge_import_attachments. Queued/running means source evidence is NOT usable; do not busy-poll indefinitely. Succeeded/partial returns an exact knowledge_release_id for knowledge_search (partial has coverage gaps). Failed/cancelled must not be cited or presented as evidence. This read does not automatically continue a turn.",
   [KNOWLEDGE_TEXT_READ]:
@@ -658,14 +662,38 @@ const CHANNEL_TARGET_EXECUTE_SCHEMA = {
   required: ["target_id"],
   properties: { target_id: { type: "string", format: "uuid" } },
 };
+const REPORT_KIND_SCHEMA = {
+  type: "string",
+  enum: ["cycle", "measurement_period"],
+  description:
+    "Use measurement_period for arbitrary-topic reports without an optimization cycle; omitted means cycle for compatibility.",
+};
+const REPORT_WINDOW_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["start_at", "end_at", "report_timezone"],
+  properties: {
+    start_at: { type: "string", format: "date-time" },
+    end_at: { type: "string", format: "date-time" },
+    report_timezone: { type: "string", minLength: 1, maxLength: 128 },
+  },
+  description:
+    "Measurement-period only. Copy the exact preview window when saving; never calculate a new moving window on retry.",
+};
 const REPORT_GET_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    kind: REPORT_KIND_SCHEMA,
     report_id: {
       type: "string",
       format: "uuid",
       description: "Omit to read the latest report in the current project.",
+    },
+    list: {
+      type: "boolean",
+      description:
+        "Measurement-period only; mutually exclusive with report_id.",
     },
   },
 };
@@ -673,23 +701,27 @@ const REPORT_PREVIEW_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    kind: REPORT_KIND_SCHEMA,
     cycle_id: {
       type: "string",
       format: "uuid",
       description: "Omit to preview the current project cycle.",
     },
+    window: REPORT_WINDOW_SCHEMA,
   },
 };
 const REPORT_REDUCE_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    kind: REPORT_KIND_SCHEMA,
     cycle_id: {
       type: "string",
       format: "uuid",
       description: "Omit to reduce the current project cycle after its cutoff.",
     },
     correction_of: { type: "string", format: "uuid" },
+    window: REPORT_WINDOW_SCHEMA,
   },
 };
 const KNOWLEDGE_SEARCH_SCHEMA = {

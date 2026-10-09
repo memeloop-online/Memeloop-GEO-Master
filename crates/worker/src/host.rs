@@ -245,22 +245,95 @@ fn validate_recorded_return(
         }
         HostOp::ReportPreview => {
             let requested: ReportPreviewRequest = typed(op, request)?;
-            let response: ReportPreview = typed(op, result)?;
             if result.as_object().is_none_or(|fields| {
                 ["report_id", "revision", "correction_of"]
                     .iter()
                     .any(|field| fields.contains_key(*field))
-            }) || response.kind != ReportPreviewKind::Preview
-                || scope.project_id != Some(response.project_id)
-                || requested.cycle_id.is_some_and(|id| id != response.cycle_id)
-                || response.cycle_id.is_nil()
-                || response.evidence_as_of > response.cutoff_at
-                || response.evidence_as_of > response.generated_at
-            {
+            }) {
                 return Err(HostOpError::internal(
                     op,
-                    "preview returned invalid scope or evidence",
+                    "preview returned snapshot fields",
                 ));
+            }
+            match (requested.kind, typed::<ReportPreviewResult>(op, result)?) {
+                (ReportKind::Cycle, ReportPreviewResult::Cycle(response))
+                    if response.kind == ReportPreviewKind::Preview
+                        && scope.project_id == Some(response.project_id)
+                        && requested.cycle_id.is_none_or(|id| id == response.cycle_id)
+                        && !response.cycle_id.is_nil()
+                        && response.evidence_as_of <= response.cutoff_at
+                        && response.evidence_as_of <= response.generated_at => {}
+                (
+                    ReportKind::MeasurementPeriod,
+                    ReportPreviewResult::MeasurementPeriod(response),
+                ) if scope.project_id == Some(response.preview.project_id)
+                    && response.preview.evidence_as_of <= response.preview.generated_at
+                    && report_projection_safe(
+                        &response.preview.samples,
+                        response.omitted_sample_details,
+                        response.preview.coverage.planned,
+                    )
+                    && report_window_matches(
+                        requested.window.as_ref(),
+                        response.preview.report_window_start_at,
+                        response.preview.report_window_end_at,
+                        &response.preview.report_timezone,
+                    )
+                    && result.get("cycle_id").is_none() => {}
+                _ => {
+                    return Err(HostOpError::internal(
+                        op,
+                        "preview returned invalid scope or evidence",
+                    ));
+                }
+            }
+        }
+        HostOp::ReportGet | HostOp::ReportReduce => {
+            let (kind, report_id, list, window, correction) = if op == HostOp::ReportGet {
+                let request: ReportGetRequest = typed(op, request)?;
+                (request.kind, request.report_id, request.list, None, None)
+            } else {
+                let request: ReportReduceRequest = typed(op, request)?;
+                (
+                    request.kind,
+                    None,
+                    false,
+                    request.window,
+                    Some(request.correction_of),
+                )
+            };
+            let valid_report = |projection: &MeasurementPeriodReportProjection| {
+                let report = &projection.report;
+                scope.project_id == Some(report.project_id)
+                    && !report.report_id.is_nil()
+                    && report_id.is_none_or(|id| id == report.report_id)
+                    && correction.is_none_or(|parent| parent == report.correction_of)
+                    && report_projection_safe(
+                        &report.samples,
+                        projection.omitted_sample_details,
+                        report.coverage.planned,
+                    )
+                    && report_window_matches(
+                        window.as_ref(),
+                        report.report_window_start_at,
+                        report.report_window_end_at,
+                        &report.report_timezone,
+                    )
+            };
+            match (kind, typed::<ReportResult>(op, result)?) {
+                (ReportKind::Cycle, ReportResult::Cycle(_)) => {}
+                (ReportKind::MeasurementPeriod, ReportResult::MeasurementPeriod(report))
+                    if !list && valid_report(&report) && result.get("cycle_id").is_none() => {}
+                (
+                    ReportKind::MeasurementPeriod,
+                    ReportResult::MeasurementPeriodList { items, .. },
+                ) if list && items.iter().all(valid_report) => {}
+                _ => {
+                    return Err(HostOpError::internal(
+                        op,
+                        "report returned invalid kind, scope or purpose",
+                    ));
+                }
             }
         }
         HostOp::ContentPrepare
@@ -360,7 +433,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v17";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v18";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1403,7 +1476,7 @@ pub trait HostOps: Send + Sync {
         &self,
         _scope: &TenantScope,
         _request: ReportGetRequest,
-    ) -> Result<ReportSnapshot, HostOpError> {
+    ) -> Result<ReportResult, HostOpError> {
         Err(HostOpError::capability_missing(
             HostOp::ReportGet,
             "report reads are not configured",
@@ -1414,7 +1487,7 @@ pub trait HostOps: Send + Sync {
         &self,
         _scope: &TenantScope,
         _request: ReportPreviewRequest,
-    ) -> Result<ReportPreview, HostOpError> {
+    ) -> Result<ReportPreviewResult, HostOpError> {
         Err(HostOpError::capability_missing(
             HostOp::ReportPreview,
             "report preview is not configured",
@@ -1425,7 +1498,7 @@ pub trait HostOps: Send + Sync {
         &self,
         _scope: &TenantScope,
         _request: ReportReduceRequest,
-    ) -> Result<ReportSnapshot, HostOpError> {
+    ) -> Result<ReportResult, HostOpError> {
         Err(HostOpError::capability_missing(
             HostOp::ReportReduce,
             "report reduction is not configured",
@@ -2803,28 +2876,206 @@ impl ChannelTargetExecuteRequest {
 }
 
 /// Scope is supplied by the Rust bridge, never by JavaScript.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportKind {
+    #[default]
+    Cycle,
+    MeasurementPeriod,
+}
+
+fn is_cycle_report(kind: &ReportKind) -> bool {
+    *kind == ReportKind::Cycle
+}
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The model sees a purpose-safe view of the same immutable report resource.
+/// Coverage and identity remain authoritative; omitted details stay in the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasurementPeriodReportProjection {
+    #[serde(flatten)]
+    pub report: geo_domain::MeasurementPeriodReport,
+    pub omitted_sample_details: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasurementPeriodPreviewProjection {
+    #[serde(flatten)]
+    pub preview: geo_domain::MeasurementPeriodPreview,
+    pub omitted_sample_details: usize,
+}
+
+fn report_sample_allowed(sample: &geo_domain::MeasurementPeriodSample) -> bool {
+    sample
+        .question_binding
+        .as_ref()
+        .is_some_and(|binding| binding.purpose == geo_domain::QuestionPurpose::Optimization)
+}
+
+fn report_projection_safe(
+    samples: &[geo_domain::MeasurementPeriodSample],
+    omitted: usize,
+    planned: u64,
+) -> bool {
+    samples.iter().all(report_sample_allowed)
+        && (samples.len() as u64).checked_add(omitted as u64) == Some(planned)
+}
+
+fn report_window_matches(
+    requested: Option<&geo_domain::MeasurementPeriodWindow>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    timezone: &str,
+) -> bool {
+    start < end
+        && requested.is_none_or(|window| {
+            window.start_at.timestamp_micros() == start.timestamp_micros()
+                && window.end_at.timestamp_micros() == end.timestamp_micros()
+                && window.report_timezone == timezone
+        })
+}
+
+impl From<geo_domain::MeasurementPeriodReport> for MeasurementPeriodReportProjection {
+    fn from(mut report: geo_domain::MeasurementPeriodReport) -> Self {
+        let count = report.samples.len();
+        report.samples.retain(report_sample_allowed);
+        Self {
+            omitted_sample_details: count - report.samples.len(),
+            report,
+        }
+    }
+}
+
+impl From<geo_domain::MeasurementPeriodPreview> for MeasurementPeriodPreviewProjection {
+    fn from(mut preview: geo_domain::MeasurementPeriodPreview) -> Self {
+        let count = preview.samples.len();
+        preview.samples.retain(report_sample_allowed);
+        Self {
+            omitted_sample_details: count - preview.samples.len(),
+            preview,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementPeriodListKind {
+    MeasurementPeriodList,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReportResult {
+    Cycle(Box<ReportSnapshot>),
+    MeasurementPeriod(Box<MeasurementPeriodReportProjection>),
+    MeasurementPeriodList {
+        kind: MeasurementPeriodListKind,
+        items: Vec<MeasurementPeriodReportProjection>,
+    },
+}
+
+impl ReportResult {
+    pub fn report_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Cycle(report) => Some(report.report_id),
+            Self::MeasurementPeriod(report) => Some(report.report.report_id),
+            Self::MeasurementPeriodList { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReportPreviewResult {
+    Cycle(Box<ReportPreview>),
+    MeasurementPeriod(Box<MeasurementPeriodPreviewProjection>),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportGetRequest {
+    #[serde(default, skip_serializing_if = "is_cycle_report")]
+    pub kind: ReportKind,
     #[serde(default)]
     pub report_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub list: bool,
 }
 
 /// A read-only projection for the current project cycle by default.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportPreviewRequest {
+    #[serde(default, skip_serializing_if = "is_cycle_report")]
+    pub kind: ReportKind,
     #[serde(default)]
     pub cycle_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<geo_domain::MeasurementPeriodWindow>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportReduceRequest {
+    #[serde(default, skip_serializing_if = "is_cycle_report")]
+    pub kind: ReportKind,
     #[serde(default)]
     pub cycle_id: Option<Uuid>,
     #[serde(default)]
     pub correction_of: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<geo_domain::MeasurementPeriodWindow>,
+}
+
+impl ReportGetRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.report_id.is_some_and(|id| id.is_nil())
+            || (self.list
+                && (self.kind != ReportKind::MeasurementPeriod || self.report_id.is_some()))
+        {
+            return Err("report kind, ID or list options are invalid".into());
+        }
+        Ok(())
+    }
+}
+
+impl ReportPreviewRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_report_selection(self.kind, self.cycle_id, self.window.as_ref())
+    }
+}
+
+impl ReportReduceRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_report_selection(self.kind, self.cycle_id, self.window.as_ref())?;
+        if self.correction_of.is_some_and(|id| id.is_nil())
+            || (self.kind == ReportKind::MeasurementPeriod && self.window.is_none())
+        {
+            return Err("measurement report save requires the exact preview window".into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_report_selection(
+    kind: ReportKind,
+    cycle_id: Option<Uuid>,
+    window: Option<&geo_domain::MeasurementPeriodWindow>,
+) -> Result<(), String> {
+    if cycle_id.is_some_and(|id| id.is_nil())
+        || (kind == ReportKind::Cycle && window.is_some())
+        || (kind == ReportKind::MeasurementPeriod && cycle_id.is_some())
+        || window.is_some_and(|window| {
+            window.start_at >= window.end_at
+                || window.report_timezone.trim().is_empty()
+                || window.report_timezone.len() > 128
+        })
+    {
+        return Err("report kind, cycle or time window is invalid".into());
+    }
+    Ok(())
 }
 
 /// A model completion request.
@@ -3762,6 +4013,113 @@ async fn wait_for_cancellation(cancellation: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_kind_selection_preserves_cycle_defaults_and_requires_fixed_save_window() {
+        let default: ReportPreviewRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.kind, ReportKind::Cycle);
+        assert!(default.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&default).unwrap(),
+            serde_json::json!({"cycle_id":null})
+        );
+        assert_eq!(
+            serde_json::to_value(ReportGetRequest::default()).unwrap(),
+            serde_json::json!({"report_id":null})
+        );
+        assert_eq!(
+            serde_json::to_value(ReportReduceRequest::default()).unwrap(),
+            serde_json::json!({"cycle_id":null,"correction_of":null})
+        );
+        let window = geo_domain::MeasurementPeriodWindow {
+            start_at: Utc::now() - chrono::Duration::days(7),
+            end_at: Utc::now(),
+            report_timezone: "UTC".into(),
+        };
+        let valid = ReportReduceRequest {
+            kind: ReportKind::MeasurementPeriod,
+            window: Some(window.clone()),
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+        assert!(
+            ReportReduceRequest {
+                window: None,
+                ..valid.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ReportReduceRequest {
+                cycle_id: Some(Uuid::new_v4()),
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ReportPreviewRequest {
+                window: Some(window),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ReportGetRequest {
+                kind: ReportKind::MeasurementPeriod,
+                list: true,
+                report_id: Some(Uuid::new_v4())
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(serde_json::from_str::<ReportGetRequest>(r#"{"kind":"measurement_period","project_id":"00000000-0000-4000-8000-000000000001"}"#).is_err());
+    }
+
+    #[test]
+    fn period_preview_audit_rejects_kind_scope_and_snapshot_field_forgery() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let now = Utc::now();
+        let window = geo_domain::MeasurementPeriodWindow {
+            start_at: now - chrono::Duration::days(7),
+            end_at: now,
+            report_timezone: "UTC".into(),
+        };
+        let preview = geo_domain::preview_measurement_period(&scope, &window, vec![], now).unwrap();
+        let response = serde_json::to_value(ReportPreviewResult::MeasurementPeriod(Box::new(
+            preview.into(),
+        )))
+        .unwrap();
+        let request = serde_json::json!({"kind":"measurement_period","window":window});
+        validate_recorded_return(HostOp::ReportPreview, &scope, &request, &response).unwrap();
+        for (field, value) in [
+            ("report_id", serde_json::json!(Uuid::new_v4())),
+            ("cycle_id", serde_json::json!(Uuid::new_v4())),
+            ("project_id", serde_json::json!(Uuid::new_v4())),
+            ("omitted_sample_details", serde_json::json!(1)),
+        ] {
+            let mut forged = response.clone();
+            forged[field] = value;
+            assert!(
+                validate_recorded_return(HostOp::ReportPreview, &scope, &request, &forged).is_err()
+            );
+        }
+        assert!(
+            validate_recorded_return(
+                HostOp::ReportPreview,
+                &scope,
+                &serde_json::json!({}),
+                &response
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn standalone_measurement_surface_rejects_protocol_injection_and_false_success() {

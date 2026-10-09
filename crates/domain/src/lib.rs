@@ -13,6 +13,8 @@ mod channel_jobs;
 pub use channel_jobs::*;
 mod citation_insights;
 pub use citation_insights::*;
+mod serp;
+pub use serp::*;
 mod source_channel_recommendations;
 pub use source_channel_recommendations::*;
 mod channels;
@@ -125,6 +127,8 @@ pub use report::{
     ReportSupplementaryMeasurement, preview_report, publication_lookup_asset_evidence,
     reduce_report, validate_correction,
 };
+mod measurement_report;
+pub use measurement_report::*;
 pub use tenancy::{OperatorId, ProjectId, TenantId, TenantScope, TenantScopeId};
 mod project_ai_settings;
 pub use project_ai_settings::*;

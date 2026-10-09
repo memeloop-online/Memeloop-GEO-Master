@@ -44,7 +44,10 @@ mod publication_send_authorization;
 pub use publication_send_authorization::PgPublicationSendAuthorizationRepository;
 mod questions;
 pub use questions::PgQuestionRepository;
+mod measurement_report;
 mod report;
+mod serp;
+pub use serp::{MemorySerpRepository, PgSerpRepository};
 mod scope;
 
 pub use agent::{PgAgentRepository, QueuedAgentRun};

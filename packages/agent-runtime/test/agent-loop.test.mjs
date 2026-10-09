@@ -855,11 +855,119 @@ test("report preview is independent of official read and reduce", async () => {
       (tool) => tool.function.name === "report_preview",
     );
     assert.deepEqual(Object.keys(previewTool.function.parameters.properties), [
+      "kind",
       "cycle_id",
+      "window",
     ]);
     assert.equal(previewTool.function.parameters.additionalProperties, false);
     assert.match(previewTool.function.description, /temporary|unsaved/u);
     assert.match(requests[1].messages.at(-1).content, /"kind":"preview"/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("cycle-free reports use existing tools and the exact preview window", async () => {
+  const reportId = "00000000-0000-4000-8000-000000000042";
+  const window = {
+    start_at: "2026-10-01T00:00:00Z",
+    end_at: "2026-10-08T00:00:00Z",
+    report_timezone: "UTC",
+  };
+  const steps = [
+    ["report_preview", { kind: "measurement_period" }],
+    ["report_reduce", { kind: "measurement_period", window }],
+    ["report_get", { kind: "measurement_period", report_id: reportId }],
+    ["report_get", { kind: "measurement_period", list: true }],
+  ];
+  const calls = [];
+  const requests = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Report does not need enterprise setup");
+    },
+    async reportPreview(request) {
+      calls.push(["report_preview", request]);
+      return {
+        kind: "measurement_period_preview",
+        report_window_start_at: window.start_at,
+        report_window_end_at: window.end_at,
+        report_timezone: window.report_timezone,
+        coverage: { planned: 1 },
+      };
+    },
+    async reportReduce(request) {
+      calls.push(["report_reduce", request]);
+      return {
+        kind: "measurement_period",
+        report_id: reportId,
+        coverage: { planned: 1 },
+      };
+    },
+    async reportGet(request) {
+      calls.push(["report_get", request]);
+      return request.list
+        ? { kind: "measurement_period_list", items: [{ report_id: reportId }] }
+        : { kind: "measurement_period", report_id: reportId };
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      const step = steps[requests.length - 1];
+      return step
+        ? {
+            text: "",
+            model: "stub-model",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `period-${requests.length}`,
+                type: "function",
+                function: { name: step[0], arguments: JSON.stringify(step[1]) },
+              },
+            ],
+          }
+        : {
+            text: "Saved the measurement report.",
+            model: "stub-model",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "stop",
+          };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?measurement-period=${Date.now()}`
+    );
+    const result = await main({
+      conversation_id: "conversation-period",
+      prompt: "Save my topic measurement report",
+      run_id: "run-period",
+      turn_id: "turn-period",
+    });
+    assert.equal(result.answer, "Saved the measurement report.");
+    assert.deepEqual(calls, steps);
+    for (const name of ["report_get", "report_preview", "report_reduce"]) {
+      const tool = requests[0].tools.find(
+        (entry) => entry.function.name === name,
+      ).function;
+      assert.deepEqual(tool.parameters.properties.kind.enum, [
+        "cycle",
+        "measurement_period",
+      ]);
+      assert.match(tool.description, /measurement_period/u);
+    }
+    assert.match(
+      requests[0].tools.find((entry) => entry.function.name === "report_reduce")
+        .function.description,
+      /EXACT/u,
+    );
+    assert.ok(
+      calls.every(([, request]) => !Object.hasOwn(request, "cycle_id")),
+    );
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

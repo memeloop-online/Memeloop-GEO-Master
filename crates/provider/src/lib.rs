@@ -4,8 +4,10 @@
 //! [`HttpTransport`] is an optional production adapter; injected transports
 //! keep provider-contract tests deterministic.
 
+pub mod dataforseo;
 mod http_transport;
 mod secret_envelope;
+pub mod serp;
 pub use http_transport::HttpTransport;
 pub use secret_envelope::SecretEnvelope;
 mod token_center;
