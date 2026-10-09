@@ -5,6 +5,9 @@ i18n.addResourceBundle(
   "reportAnalysis",
   {
     title: "已存原文的补充分析",
+    recordDetails: "记录详情",
+    measurementRecordTitle: "测量记录",
+    measurementTitle: "{{provider}} · {{model}}",
     count: "独立分析 {{count}} 项",
     note: "从已保存的回答中提取的答案与引用。",
     answer: "分析提取的回答",
@@ -37,6 +40,9 @@ i18n.addResourceBundle(
   "reportAnalysis",
   {
     title: "Supplementary analysis of saved responses",
+    recordDetails: "Record details",
+    measurementRecordTitle: "Measurement record",
+    measurementTitle: "{{provider}} · {{model}}",
     count: "{{count}} independent analyses",
     note: "Answers and citations extracted from saved responses.",
     answer: "Answer extracted by analysis",

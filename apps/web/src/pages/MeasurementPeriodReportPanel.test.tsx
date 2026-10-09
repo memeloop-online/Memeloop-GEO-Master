@@ -37,7 +37,8 @@ const preview: api.MeasurementPeriodPreview = {
       plan_id: "plan",
       target_id: "target",
       attempt_id: "attempt",
-      comparison_key: "provider/model/web",
+      comparison_key:
+        "provider-a|model-a|consumer_web|web_search|v1|ad_hoc.v1|US|en",
       scheduled_at: "2026-10-02T00:00:00Z",
       original_status: "unknown",
       observed_live: false,
@@ -103,6 +104,25 @@ describe("cycle-free measurement report", () => {
     expect(screen.getByText("Saved response answer")).toBeInTheDocument();
     expect(screen.getByText("analysis-model")).toBeInTheDocument();
     expect(screen.getByText("analysis-revision")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "provider-a · model-a" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("heading", {
+        name: preview.samples[0].comparison_key,
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(preview.samples[0].comparison_key),
+    ).not.toBeVisible();
+    expect(screen.getByText("analysis-revision")).not.toBeVisible();
+    expect(screen.getByText("digest")).not.toBeVisible();
+    expect(screen.getByText("Saved response answer")).toBeVisible();
+    expect(screen.getByText(/报告范围：/)).toHaveTextContent("UTC");
+    await userEvent.click(screen.getByText("记录详情"));
+    expect(screen.getByText("analysis-revision")).toBeVisible();
+    expect(screen.getByText("digest")).toBeVisible();
+    expect(screen.getByText(preview.samples[0].comparison_key)).toBeVisible();
     expect(screen.getByText(/已核验联网回答 0 项/)).toHaveTextContent(
       "已存原文分析 1 项（单独统计）",
     );

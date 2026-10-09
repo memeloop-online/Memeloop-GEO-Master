@@ -3,13 +3,16 @@ import { useTranslation } from "react-i18next";
 import { useParams } from "react-router-dom";
 import type { ReportSupplementaryMeasurement } from "../api/reports";
 import "../i18n/reportAnalysis";
+import { reportMeasurementTitle } from "./reportMeasurementTitle";
 
 export function ReportSupplementaryMeasurements({
   items,
   timezone,
+  embedded = false,
 }: {
   items: ReportSupplementaryMeasurement[];
   timezone: string;
+  embedded?: boolean;
 }) {
   const { t, i18n } = useTranslation("reportAnalysis");
   const { tenantId, projectId } = useParams();
@@ -26,61 +29,28 @@ export function ReportSupplementaryMeasurements({
   };
   return (
     <section className="report-section" aria-label={t("title")}>
-      <h2>{t("title")}</h2>
-      <p>{t("count", { count: items.length })}</p>
-      <p>{t("note")}</p>
+      {!embedded && (
+        <>
+          <h2>{t("title")}</h2>
+          <p>{t("count", { count: items.length })}</p>
+          <p>{t("note")}</p>
+        </>
+      )}
       {items.map((item) => {
         const { observation } = item;
         const analysis = observation.provenance;
+        const Container = embedded ? "div" : Card;
         return (
-          <Card
+          <Container
             key={`${item.target_id}/${item.attempt_id}/${analysis?.revision_id ?? ""}`}
             className="report-panel"
           >
-            <h3>{item.comparison_key}</h3>
+            {!embedded && (
+              <h3>{reportMeasurementTitle(item.comparison_key)}</h3>
+            )}
             <p>
-              {t(
-                item.question_binding?.purpose === "frozen_evaluation"
-                  ? "evaluation"
-                  : item.question_binding?.purpose === "optimization"
-                    ? "optimization"
-                    : "unclassified",
-              )}
+              {t("observed")}：{at(observation.observed_at)} · {timezone}
             </p>
-            <dl className="report-metadata">
-              <dt>{t("observed")}</dt>
-              <dd>{at(observation.observed_at)}</dd>
-              <dt>{t("received")}</dt>
-              <dd>{at(observation.received_at)}</dd>
-              {analysis && (
-                <>
-                  <dt>{t("analyzed")}</dt>
-                  <dd>{at(analysis.analyzed_at)}</dd>
-                  <dt>{t("model")}</dt>
-                  <dd>{analysis.actual_model}</dd>
-                  {analysis.config_revision !== null && (
-                    <>
-                      <dt>{t("config")}</dt>
-                      <dd>{analysis.config_revision}</dd>
-                    </>
-                  )}
-                  <dt>{t("revision")}</dt>
-                  <dd>{analysis.revision_id}</dd>
-                  <dt>{t("source")}</dt>
-                  <dd>
-                    {analysis.source.kind === "capture"
-                      ? analysis.source.capture_id
-                      : analysis.source.evidence_index}
-                  </dd>
-                  <dt>{t("digest")}</dt>
-                  <dd>{analysis.source_sha256}</dd>
-                  <dt>{t("parser")}</dt>
-                  <dd>{analysis.parser_version}</dd>
-                  <dt>{t("prompt")}</dt>
-                  <dd>{analysis.prompt_version}</dd>
-                </>
-              )}
-            </dl>
             <h4>{t("answer")}</h4>
             <p style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
               {observation.raw_answer}
@@ -99,7 +69,7 @@ export function ReportSupplementaryMeasurements({
                     )
                       href = parsed.href;
                   } catch {
-                    /* Preserve non-link evidence as text. */
+                    /* Retain non-link evidence as text. */
                   }
                   return (
                     <li key={`${index}/${url}`}>
@@ -121,14 +91,73 @@ export function ReportSupplementaryMeasurements({
             ) : (
               <p>{t("noCitations")}</p>
             )}
-            {item.plan_id && tenantId && projectId && (
+            <details>
+              <summary>{t("recordDetails")}</summary>
+              <p>
+                {t(
+                  item.question_binding?.purpose === "frozen_evaluation"
+                    ? "evaluation"
+                    : item.question_binding?.purpose === "optimization"
+                      ? "optimization"
+                      : "unclassified",
+                )}
+              </p>
+              <p>{timezone}</p>
+              <dl className="report-metadata">
+                <dt>{t("comparison")}</dt>
+                <dd>{item.comparison_key}</dd>
+                <dt>{t("target")}</dt>
+                <dd>{item.target_id}</dd>
+                <dt>{t("attempt")}</dt>
+                <dd>{item.attempt_id}</dd>
+                {item.plan_id && (
+                  <>
+                    <dt>{t("plan")}</dt>
+                    <dd>{item.plan_id}</dd>
+                  </>
+                )}
+                <dt>{t("observed")}</dt>
+                <dd>{at(observation.observed_at)}</dd>
+                <dt>{t("received")}</dt>
+                <dd>{at(observation.received_at)}</dd>
+                {analysis && (
+                  <>
+                    <dt>{t("analyzed")}</dt>
+                    <dd>{at(analysis.analyzed_at)}</dd>
+                    <dt>{t("model")}</dt>
+                    <dd>{analysis.actual_model}</dd>
+                    {analysis.config_revision !== null && (
+                      <>
+                        <dt>{t("config")}</dt>
+                        <dd>{analysis.config_revision}</dd>
+                      </>
+                    )}
+                    <dt>{t("revision")}</dt>
+                    <dd>{analysis.revision_id}</dd>
+                    <dt>{t("source")}</dt>
+                    <dd>
+                      {analysis.source.kind === "capture"
+                        ? analysis.source.capture_id
+                        : analysis.source.evidence_index}
+                    </dd>
+                    <dt>{t("digest")}</dt>
+                    <dd>{analysis.source_sha256}</dd>
+                    <dt>{t("parser")}</dt>
+                    <dd>{analysis.parser_version}</dd>
+                    <dt>{t("prompt")}</dt>
+                    <dd>{analysis.prompt_version}</dd>
+                  </>
+                )}
+              </dl>
+            </details>
+            {!embedded && item.plan_id && tenantId && projectId && (
               <a
                 href={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/measurement?tab=records&record=${encodeURIComponent(item.plan_id)}`}
               >
                 {t("record")}
               </a>
             )}
-          </Card>
+          </Container>
         );
       })}
     </section>

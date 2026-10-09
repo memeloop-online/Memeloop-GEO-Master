@@ -25,6 +25,8 @@ import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { downloadReportCsv } from "./reportsCsv";
 import { ReportSupplementaryMeasurements } from "./ReportSupplementaryMeasurements";
 import { MeasurementPeriodReportPanel } from "./MeasurementPeriodReportPanel";
+import { reportMeasurementTitle } from "./reportMeasurementTitle";
+import { reportAnalysisText } from "../i18n/reportAnalysis";
 import "./ReportsPage.css";
 
 const manifestLabels = {
@@ -420,7 +422,11 @@ function SnapshotDetail({
             {snapshot.measurement_groups.length ? (
               snapshot.measurement_groups.map((group) => (
                 <div key={group.comparison_key} className="report-group">
-                  <h4>{group.comparison_key}</h4>
+                  <h4>{reportMeasurementTitle(group.comparison_key)}</h4>
+                  <details>
+                    <summary>{reportAnalysisText("recordDetails")}</summary>
+                    <p>{group.comparison_key}</p>
+                  </details>
                   <p>
                     问题用途：
                     {group.purpose === "optimization"

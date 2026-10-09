@@ -13,6 +13,7 @@ import {
 import { ReportSupplementaryMeasurements } from "./ReportSupplementaryMeasurements";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import "../i18n/measurementReports";
+import { reportMeasurementTitle } from "./reportMeasurementTitle";
 
 const knownStatuses = new Set([
   "pending",
@@ -65,12 +66,12 @@ export function MeasurementPeriodReportPanel({
       member.tenant_id === tenantId &&
       ["tenant_admin", "member"].includes(member.role),
   );
-  const at = (value: string) => {
+  const at = (value: string, timezone = report?.report_timezone ?? "UTC") => {
     try {
       return new Intl.DateTimeFormat(i18n.language, {
         dateStyle: "medium",
         timeStyle: "short",
-        timeZone: report?.report_timezone ?? "UTC",
+        timeZone: timezone,
       }).format(new Date(value));
     } catch {
       return value;
@@ -177,7 +178,7 @@ export function MeasurementPeriodReportPanel({
                 className="report-panel"
                 key={`${sample.target_id}/${sample.attempt_id ?? ""}`}
               >
-                <h4>{sample.comparison_key}</h4>
+                <h4>{reportMeasurementTitle(sample.comparison_key)}</h4>
                 <p>
                   {t("original", { status: status(sample.original_status) })}
                 </p>
@@ -189,6 +190,7 @@ export function MeasurementPeriodReportPanel({
                 </a>
                 {sample.observation?.provenance && sample.attempt_id ? (
                   <ReportSupplementaryMeasurements
+                    embedded
                     timezone={report.report_timezone}
                     items={[
                       {
@@ -239,6 +241,27 @@ export function MeasurementPeriodReportPanel({
                 ) : (
                   <p>{t("noAnswer")}</p>
                 )}
+                {!sample.observation?.provenance && (
+                  <details>
+                    <summary>
+                      {t("recordDetails", { ns: "reportAnalysis" })}
+                    </summary>
+                    <dl className="report-metadata">
+                      <dt>{t("comparison", { ns: "reportAnalysis" })}</dt>
+                      <dd>{sample.comparison_key}</dd>
+                      <dt>{t("target", { ns: "reportAnalysis" })}</dt>
+                      <dd>{sample.target_id}</dd>
+                      {sample.attempt_id && (
+                        <>
+                          <dt>{t("attempt", { ns: "reportAnalysis" })}</dt>
+                          <dd>{sample.attempt_id}</dd>
+                        </>
+                      )}
+                      <dt>{t("plan", { ns: "reportAnalysis" })}</dt>
+                      <dd>{sample.plan_id}</dd>
+                    </dl>
+                  </details>
+                )}
               </Card>
             ))}
           </>
@@ -254,8 +277,9 @@ export function MeasurementPeriodReportPanel({
           {history.data.items.map((item) => (
             <li key={item.report_id}>
               <Button onClick={() => setSelected(item.report_id)}>
-                {at(item.report_window_start_at)} —{" "}
-                {at(item.report_window_end_at)} ·{" "}
+                {at(item.report_window_start_at, item.report_timezone)} —{" "}
+                {at(item.report_window_end_at, item.report_timezone)} ·{" "}
+                {item.report_timezone} ·{" "}
                 {t("view", { revision: item.revision })}
               </Button>
               {item.correction_of && (

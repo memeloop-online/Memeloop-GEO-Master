@@ -739,6 +739,17 @@ describe("P14 immutable reports", () => {
       within(supplemental).getByText("analysis-revision"),
     ).toBeInTheDocument();
     expect(
+      within(supplemental).getByText("analysis-revision"),
+    ).not.toBeVisible();
+    expect(within(supplemental).getByText("source-digest")).not.toBeVisible();
+    expect(within(supplemental).getByText("saved-protocol")).not.toBeVisible();
+    expect(
+      within(supplemental).getByText("=Saved answer, independently analyzed."),
+    ).toBeVisible();
+    await userEvent.click(within(supplemental).getByText("记录详情"));
+    expect(within(supplemental).getByText("analysis-revision")).toBeVisible();
+    expect(within(supplemental).getByText("source-digest")).toBeVisible();
+    expect(
       within(supplemental).getByText("=Saved answer, independently analyzed."),
     ).toBeInTheDocument();
     expect(
