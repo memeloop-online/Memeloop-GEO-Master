@@ -13,9 +13,10 @@ use axum::{
 use chrono::{Duration, Utc};
 use geo_domain::{
     AppError, ChannelAccount, ChannelAccountRecord, ChannelGroup, ChannelOwnerKind,
-    ChannelRepository, ChannelSecret, ChannelSettings, ChannelSettingsRecord, ChannelStatus,
-    ErrorCode, LoginSession, PoolAccount, PoolAccountRecord, PoolAssignment, PoolGroup,
-    PoolLoginSession, ProjectId, Role, TenantId, TenantScope, supported_channel,
+    ChannelRepository, ChannelSecret, ChannelSessionVersion, ChannelSettings,
+    ChannelSettingsRecord, ChannelStatus, ErrorCode, LoginSession, PoolAccount, PoolAccountRecord,
+    PoolAssignment, PoolGroup, PoolLoginSession, ProjectId, Role, TenantId, TenantScope,
+    supported_channel,
 };
 use geo_provider::SecretEnvelope;
 use serde::{Deserialize, Serialize};
@@ -226,58 +227,70 @@ impl ChannelService {
         scope: &TenantScope,
         account_id: Uuid,
     ) -> Result<Uuid, AppError> {
-        match self.repository.get_account(scope, account_id).await {
-            Ok(_) => self.resume_account_browser(scope, account_id).await,
-            Err(error) if error.code == ErrorCode::NotFound => {
-                let assigned = self
-                    .repository
-                    .list_assigned_pool_accounts(scope)
-                    .await?
-                    .iter()
-                    .any(|account| account.account_id == account_id);
-                if !assigned {
-                    return Err(AppError::not_found(
-                        "channel account not assigned to project",
-                    ));
-                }
-                let record = self
-                    .repository
-                    .get_pool_account(scope.operator_id, account_id)
-                    .await?;
-                if !record.account.enabled || record.account.status != ChannelStatus::Ready {
-                    return Err(AppError::conflict("channel account is not ready"));
-                }
-                let pool_tenant = self.operator_pool_tenant_id.ok_or_else(|| {
-                    AppError::capability_missing("operator pool is not configured")
-                })?;
-                let pool_scope = TenantScope::new(scope.operator_id, pool_tenant, None);
-                let session = record
-                    .session
-                    .as_ref()
-                    .ok_or_else(|| AppError::conflict("channel account needs login"))?;
-                let bytes = self.decrypt(&pool_scope, account_id, "pool_session", session)?;
-                let state: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-                    AppError::new(ErrorCode::Internal, "stored browser session is invalid")
-                })?;
-                let proxy = record
-                    .proxy
-                    .as_ref()
-                    .map(|secret| {
-                        let bytes = self.decrypt(&pool_scope, account_id, "pool_proxy", secret)?;
-                        let proxy: ProxyInput = serde_json::from_slice(&bytes).map_err(|_| {
-                            AppError::new(ErrorCode::Internal, "stored proxy is invalid")
-                        })?;
-                        Ok::<_, AppError>(proxy.runner())
-                    })
-                    .transpose()?;
-                let id = Uuid::new_v4();
-                self.browser()?
-                    .start(id, &record.account.platform, proxy, Some(&state))
-                    .await?;
-                Ok(id)
-            }
-            Err(error) => Err(error),
+        self.resume_available_browser_with_renewal(scope, account_id)
+            .await
+            .map(|(session, _)| session)
+    }
+
+    pub(crate) async fn resume_available_browser_with_renewal(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+    ) -> Result<(Uuid, ChannelSessionVersion), AppError> {
+        let prepared = self.prepare_available_browser(scope, account_id).await?;
+        let version = prepared.session_version(account_id);
+        let id = Uuid::new_v4();
+        self.browser()?
+            .start(
+                id,
+                &prepared.platform,
+                prepared.proxy,
+                Some(&prepared.storage_state),
+            )
+            .await?;
+        Ok((id, version))
+    }
+
+    /// Accept only website-owned storage from a freshly verified same identity.
+    /// A stale context loses the CAS instead of overwriting a reconnect.
+    pub(crate) async fn persist_browser_renewal(
+        &self,
+        scope: &TenantScope,
+        version: &mut ChannelSessionVersion,
+        verified: &crate::browser_bridge::VerifiedBrowserSession,
+    ) -> Result<bool, AppError> {
+        if verified.identity.platform_account_id != version.platform_account_id {
+            return Err(AppError::conflict("account identity changed"));
         }
+        let bytes = serde_json::to_vec(&verified.storage_state)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "browser session invalid"))?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err(AppError::invalid_request(
+                "browser session exceeds maximum size",
+            ));
+        }
+        let (secret_scope, purpose) = match version.owner_kind {
+            ChannelOwnerKind::Customer => (scope.clone(), "session"),
+            ChannelOwnerKind::OperatorPool => (
+                TenantScope::new(
+                    scope.operator_id,
+                    self.operator_pool_tenant_id.ok_or_else(|| {
+                        AppError::capability_missing("operator pool is not configured")
+                    })?,
+                    None,
+                ),
+                "pool_session",
+            ),
+        };
+        let renewed = self.encrypt(&secret_scope, version.account_id, purpose, &bytes)?;
+        let updated = self
+            .repository
+            .renew_session(scope, version, renewed.clone())
+            .await?;
+        if updated {
+            version.session = renewed;
+        }
+        Ok(updated)
     }
 
     /// Freeze the actual browser network and account used by this send attempt.
@@ -288,8 +301,9 @@ impl ChannelService {
         scope: &TenantScope,
         account_id: Uuid,
         attempt_id: Uuid,
-    ) -> Result<(Uuid, ChannelSecret), AppError> {
+    ) -> Result<(Uuid, ChannelSecret, ChannelSessionVersion), AppError> {
         let prepared = self.prepare_available_browser(scope, account_id).await?;
+        let session_version = prepared.session_version(account_id);
         let version = self
             .publication_connector_version(&prepared.platform, "publish")
             .await?;
@@ -314,7 +328,7 @@ impl ChannelService {
                 Some(&prepared.storage_state),
             )
             .await?;
-        Ok((session_id, sealed))
+        Ok((session_id, sealed, session_version))
     }
 
     /// Restore only a currently authorized, usable session under the original
@@ -476,6 +490,7 @@ impl ChannelService {
                 let effective_proxy = serde_json::to_value(&proxy)
                     .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
                 Ok(PreparedPublicationBrowser {
+                    encrypted_session: session.clone(),
                     owner_kind: ChannelOwnerKind::Customer,
                     platform: record.account.platform,
                     platform_account_id,
@@ -534,6 +549,7 @@ impl ChannelService {
                 let effective_proxy = serde_json::to_value(&proxy)
                     .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
                 Ok(PreparedPublicationBrowser {
+                    encrypted_session: session.clone(),
                     owner_kind: ChannelOwnerKind::OperatorPool,
                     platform: record.account.platform,
                     platform_account_id,
@@ -548,12 +564,25 @@ impl ChannelService {
 }
 
 struct PreparedPublicationBrowser {
+    encrypted_session: ChannelSecret,
     owner_kind: ChannelOwnerKind,
     platform: String,
     platform_account_id: String,
     storage_state: serde_json::Value,
     effective_proxy: serde_json::Value,
     proxy: Option<BrowserProxy>,
+}
+
+impl PreparedPublicationBrowser {
+    fn session_version(&self, account_id: Uuid) -> ChannelSessionVersion {
+        ChannelSessionVersion {
+            account_id,
+            owner_kind: self.owner_kind,
+            platform: self.platform.clone(),
+            platform_account_id: self.platform_account_id.clone(),
+            session: self.encrypted_session.clone(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1124,7 +1153,7 @@ pub async fn patch_account(
     record.account.updated_at = Utc::now();
     let result = service
         .repository
-        .save_account(&scope, record)
+        .save_account_metadata(&scope, record)
         .await
         .map_err(|e| err(e, context))?;
     Ok(Json(result))
@@ -1724,7 +1753,7 @@ pub async fn patch_pool_account(
     Ok(Json(
         service
             .repository
-            .save_pool_account(auth.operator.id, record)
+            .save_pool_account_metadata(auth.operator.id, record)
             .await
             .map_err(|e| err(e, context))?,
     ))
@@ -2351,6 +2380,76 @@ mod publication_binding_tests {
     }
 
     #[tokio::test]
+    async fn renewed_storage_is_encrypted_and_verified_without_metadata_changes() {
+        let (service, scope, account_id, _, server) = fixture().await;
+        let before = service
+            .repository
+            .get_account(&scope, account_id)
+            .await
+            .unwrap();
+        let (_, mut version) = service
+            .resume_available_browser_with_renewal(&scope, account_id)
+            .await
+            .unwrap();
+        let mut verified = crate::browser_bridge::VerifiedBrowserSession {
+            identity: crate::browser_bridge::BrowserIdentity {
+                platform_account_id: "different-identity".into(),
+                display_name: "Not adopted".into(),
+                avatar_url: None,
+            },
+            storage_state: json!({"cookies":[{"name":"renewed"}],"origins":[]}),
+        };
+        assert!(
+            service
+                .persist_browser_renewal(&scope, &mut version, &verified)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .repository
+                .get_account(&scope, account_id)
+                .await
+                .unwrap()
+                .session
+                .unwrap()
+                .encrypted_bytes(),
+            before.session.as_ref().unwrap().encrypted_bytes()
+        );
+        verified.identity.platform_account_id = "original-identity".into();
+        assert!(
+            service
+                .persist_browser_renewal(&scope, &mut version, &verified)
+                .await
+                .unwrap()
+        );
+        let after = service
+            .repository
+            .get_account(&scope, account_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(before.account).unwrap(),
+            serde_json::to_value(after.account).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &service
+                    .decrypt(
+                        &scope,
+                        account_id,
+                        "session",
+                        after.session.as_ref().unwrap()
+                    )
+                    .unwrap()
+            )
+            .unwrap(),
+            verified.storage_state
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn cleanup_restore_checks_original_identity_before_starting() {
         let (service, scope, account_id, stub, server) = fixture().await;
         let mut identity = geo_domain::ObservationProviderIdentity {
@@ -2643,7 +2742,7 @@ mod publication_binding_tests {
         let (service, scope, account_id, stub, server) = fixture().await;
         set_default_proxy(&service, &scope, Some("proxy-secret")).await;
         let attempt = Uuid::new_v4();
-        let (_, bound) = service
+        let (_, bound, _) = service
             .resume_available_browser_bound(&scope, account_id, attempt)
             .await
             .unwrap();
@@ -2789,15 +2888,62 @@ mod publication_binding_tests {
             .await
             .unwrap();
         let attempt = Uuid::new_v4();
-        let (_, bound) = service
+        let (_, bound, mut version) = service
             .resume_available_browser_bound(&scope, pool_id, attempt)
             .await
             .unwrap();
+        let verified = crate::browser_bridge::VerifiedBrowserSession {
+            identity: crate::browser_bridge::BrowserIdentity {
+                platform_account_id: "pool-identity".into(),
+                display_name: "Not adopted".into(),
+                avatar_url: None,
+            },
+            storage_state: json!({"cookies":[{"name":"renewed"}]}),
+        };
+        assert!(
+            service
+                .persist_browser_renewal(&scope, &mut version, &verified)
+                .await
+                .unwrap()
+        );
+        let retained = service
+            .repository
+            .get_pool_account(scope.operator_id, pool_id)
+            .await
+            .unwrap();
+        assert!(retained.account.display_name.is_none());
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &service
+                    .decrypt(
+                        &pool_scope,
+                        pool_id,
+                        "pool_session",
+                        retained.session.as_ref().unwrap()
+                    )
+                    .unwrap()
+            )
+            .unwrap(),
+            verified.storage_state
+        );
+        assert!(
+            service
+                .repository
+                .get_account(&scope, pool_id)
+                .await
+                .is_err()
+        );
         service
             .repository
             .assign_pool_account(&scope, pool_id, false)
             .await
             .unwrap();
+        assert!(
+            !service
+                .persist_browser_renewal(&scope, &mut version, &verified)
+                .await
+                .unwrap()
+        );
         assert!(
             service
                 .resume_publication_lookup_browser(&scope, pool_id, attempt, &bound)

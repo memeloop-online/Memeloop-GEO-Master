@@ -31,10 +31,14 @@ struct Stub {
     mismatch: Arc<AtomicBool>,
     unavailable: Arc<AtomicBool>,
     closed: Arc<AtomicUsize>,
+    starts: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
-async fn start(Json(input): Json<Value>) -> Json<Value> {
-    assert_eq!(input["storage_state"], json!({"cookies":[],"origins":[]}));
+async fn start(State(stub): State<Stub>, Json(input): Json<Value>) -> Json<Value> {
+    stub.starts
+        .lock()
+        .await
+        .push(input["storage_state"].clone());
     Json(json!({"session_id":input["session_id"]}))
 }
 async fn complete(State(stub): State<Stub>) -> Json<Value> {
@@ -166,6 +170,27 @@ async fn discovery_restores_identity_returns_only_models_and_always_closes() {
         })
     );
     assert_eq!(stub.closed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        stub.starts.lock().await[0],
+        json!({"cookies":[],"origins":[]})
+    );
+    let renewed = state
+        .channel_service()
+        .repository
+        .get_account(&scope, account_id)
+        .await
+        .unwrap();
+    let plaintext = SecretEnvelope::from_hex_key(&key)
+        .unwrap()
+        .open(
+            aad.as_bytes(),
+            renewed.session.as_ref().unwrap().encrypted_bytes(),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&plaintext).unwrap(),
+        json!({"private":"not-returned"})
+    );
     let command = MeasurementPlanCreateRequest {
         account_id,
         question: "How do rain gauges work?".into(),
@@ -177,6 +202,10 @@ async fn discovery_restores_identity_returns_only_models_and_always_closes() {
         .unwrap();
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.model, "observed-model");
+    assert_eq!(
+        stub.starts.lock().await[1],
+        json!({"private":"not-returned"})
+    );
     let replay = create_agent_plan(&state, &scope, command.clone())
         .await
         .unwrap();

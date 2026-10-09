@@ -1202,9 +1202,39 @@ pub(crate) async fn execute_and_close_with_cleanup(
         attempt_id,
         operation,
         payload,
-        None,
+        ExecutionSessionContext::default(),
     )
     .await
+}
+
+#[derive(Default)]
+struct ExecutionSessionContext<'a> {
+    source_capture_ticket: Option<&'a str>,
+    renewal: Option<(
+        &'a crate::channels::ChannelService,
+        &'a TenantScope,
+        &'a mut geo_domain::ChannelSessionVersion,
+    )>,
+}
+
+async fn retain_browser_renewal(
+    bridge: &crate::browser_bridge::BrowserBridge,
+    session: Uuid,
+    service: &crate::channels::ChannelService,
+    scope: &TenantScope,
+    version: &mut geo_domain::ChannelSessionVersion,
+) {
+    // A renewal failure must not erase a result after an external send.
+    let result = async {
+        let verified = bridge.complete(session).await?;
+        service
+            .persist_browser_renewal(scope, version, &verified)
+            .await
+    }
+    .await;
+    if result.is_err() {
+        tracing::warn!("browser session renewal could not be retained");
+    }
 }
 
 async fn execute_and_close_with_cleanup_and_ticket(
@@ -1214,7 +1244,7 @@ async fn execute_and_close_with_cleanup_and_ticket(
     attempt_id: Uuid,
     operation: &str,
     payload: &serde_json::Value,
-    source_capture_ticket: Option<&str>,
+    mut context: ExecutionSessionContext<'_>,
 ) -> (
     Result<crate::browser_bridge::BrowserExecution, AppError>,
     bool,
@@ -1224,17 +1254,25 @@ async fn execute_and_close_with_cleanup_and_ticket(
         if Some(verified.identity.platform_account_id.as_str()) != expected_identity {
             return Err(AppError::conflict("account identity changed"));
         }
+        if let Some((service, scope, version)) = context.renewal.as_mut() {
+            service
+                .persist_browser_renewal(scope, version, &verified)
+                .await?;
+        }
         bridge
             .execute_with_source_capture_ticket(
                 attempt_id,
                 session,
                 operation,
                 payload,
-                source_capture_ticket,
+                context.source_capture_ticket,
             )
             .await
     }
     .await;
+    if let Some((service, scope, version)) = context.renewal.as_mut() {
+        retain_browser_renewal(bridge, session, service, scope, version).await;
+    }
     let closed = bridge.close(session).await.is_ok();
     if !closed {
         // A successful external result is still evidence if cleanup fails.
@@ -1780,14 +1818,14 @@ async fn execute_reserved_channel_target(
         service
             .resume_available_browser_bound(scope, account.account_id, attempt_id)
             .await
-            .map(|(session, binding)| (session, Some(binding)))
+            .map(|(session, binding, version)| (session, Some(binding), version))
     } else {
         service
-            .resume_available_browser(scope, account.account_id)
+            .resume_available_browser_with_renewal(scope, account.account_id)
             .await
-            .map(|session| (session, None))
+            .map(|(session, version)| (session, None, version))
     };
-    let (session, binding) = match opened {
+    let (session, binding, mut session_version) = match opened {
         Ok(opened) => opened,
         Err(error)
             if matches!(
@@ -1816,6 +1854,14 @@ async fn execute_reserved_channel_target(
         return Ok(ChannelDispatchResult::Deferred(
             ChannelDispatchDeferred::AccountUnavailable,
         ));
+    }
+    if let Ok(ref identity) = identity
+        && let Err(error) = service
+            .persist_browser_renewal(scope, &mut session_version, identity)
+            .await
+    {
+        let _ = bridge.close(session).await;
+        return Err(error);
     }
     let (target, attempt) = match repo
         .claim_reserved(scope, target_id, attempt_id, reservation_id, Utc::now())
@@ -1959,6 +2005,9 @@ async fn execute_reserved_channel_target(
                 {
                     return Err(AppError::conflict("account identity changed"));
                 }
+                service
+                    .persist_browser_renewal(scope, &mut session_version, &identity)
+                    .await?;
                 bridge
                     .execute_rich(
                         attempt.attempt_id,
@@ -1975,6 +2024,7 @@ async fn execute_reserved_channel_target(
                     .await
             }
             .await;
+            retain_browser_renewal(bridge, session, service, scope, &mut session_version).await;
             if bridge.close(session).await.is_err() {
                 tracing::warn!("browser execution session cleanup failed");
             }
@@ -2016,7 +2066,10 @@ async fn execute_reserved_channel_target(
             attempt.attempt_id,
             operation,
             &payload,
-            source_capture_ticket.as_deref(),
+            ExecutionSessionContext {
+                source_capture_ticket: source_capture_ticket.as_deref(),
+                renewal: Some((service, scope, &mut session_version)),
+            },
         )
         .await
         .0
@@ -2234,6 +2287,17 @@ mod tests {
         if state.fail == Some("complete") && path.ends_with("/complete") {
             return (StatusCode::CONFLICT, Json(json!({"error":"needs_login"})));
         }
+        if state.fail == Some("post_complete")
+            && path.ends_with("/complete")
+            && state
+                .calls
+                .lock()
+                .await
+                .iter()
+                .any(|call| call == "POST /v1/executions")
+        {
+            return (StatusCode::CONFLICT, Json(json!({"error":"needs_login"})));
+        }
         if state.fail == Some("execute") && path == "/v1/executions" {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2293,6 +2357,89 @@ mod tests {
             calls,
             server,
         )
+    }
+
+    #[tokio::test]
+    async fn execution_retains_renewal_without_losing_results_when_post_send_capture_fails() {
+        for fail in [None, Some("post_complete")] {
+            let (bridge, calls, server) = stub_bridge(fail).await;
+            let service = crate::channels::ChannelService::development();
+            let scope = TenantScope::new(
+                Uuid::new_v4().into(),
+                Uuid::new_v4().into(),
+                Some(Uuid::new_v4().into()),
+            );
+            let account_id = Uuid::new_v4();
+            let mut version = geo_domain::ChannelSessionVersion {
+                account_id,
+                owner_kind: geo_domain::ChannelOwnerKind::Customer,
+                platform: "kimi".into(),
+                platform_account_id: "verified-id".into(),
+                session: geo_domain::ChannelSecret::new(vec![1]),
+            };
+            let now = Utc::now();
+            service
+                .repository
+                .save_account(
+                    &scope,
+                    geo_domain::ChannelAccountRecord {
+                        account: geo_domain::ChannelAccount {
+                            account_id,
+                            project_id: scope.project_id.unwrap(),
+                            owner_kind: version.owner_kind,
+                            platform: version.platform.clone(),
+                            group_id: None,
+                            status: geo_domain::ChannelStatus::Ready,
+                            display_name: None,
+                            platform_account_id: Some(version.platform_account_id.clone()),
+                            avatar_url: None,
+                            enabled: true,
+                            proxy_configured: false,
+                            proxy_server: None,
+                            created_at: now,
+                            updated_at: now,
+                        },
+                        session: Some(version.session.clone()),
+                        proxy: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let session = Uuid::new_v4();
+            let (result, closed) = execute_and_close_with_cleanup_and_ticket(
+                &bridge,
+                session,
+                Some("verified-id"),
+                Uuid::new_v4(),
+                "measure",
+                &json!({}),
+                ExecutionSessionContext {
+                    source_capture_ticket: None,
+                    renewal: Some((&service, &scope, &mut version)),
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap().status, "unsupported");
+            assert!(closed);
+            let retained = service
+                .repository
+                .get_account(&scope, account_id)
+                .await
+                .unwrap()
+                .session
+                .unwrap();
+            assert_ne!(retained.encrypted_bytes(), &[1]);
+            assert_eq!(
+                calls
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|call| call.ends_with("/complete"))
+                    .count(),
+                2
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]

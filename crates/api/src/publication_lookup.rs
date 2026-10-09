@@ -1119,7 +1119,7 @@ mod tests {
         jobs.claim(&scope, job.target_id, job.attempt_id, Utc::now())
             .await
             .unwrap();
-        let (session, binding) = state
+        let (session, binding, _) = state
             .channel_service()
             .resume_available_browser_bound(&scope, job.account_id, job.attempt_id)
             .await

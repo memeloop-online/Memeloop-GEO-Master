@@ -54,7 +54,9 @@ pub async fn discover(
         .browser
         .as_ref()
         .ok_or_else(|| AppError::capability_missing("browser runner is not configured"))?;
-    let session_id = service.resume_available_browser(scope, account_id).await?;
+    let (session_id, mut version) = service
+        .resume_available_browser_with_renewal(scope, account_id)
+        .await?;
     let result = async {
         let verified = browser.complete(session_id).await?;
         if &verified.identity.platform_account_id != expected {
@@ -62,11 +64,14 @@ pub async fn discover(
                 "channel account identity changed; reconnect the account",
             ));
         }
+        service
+            .persist_browser_renewal(scope, &mut version, &verified)
+            .await?;
         browser.measurement_options(session_id).await
     }
     .await;
     // Always discard the temporary inspection context, including on identity
-    // failure or unavailable menus. Never save/return its storage state.
+    // failure or unavailable menus. Verified renewal stays encrypted server-side.
     let closed = browser.close(session_id).await;
     match result {
         Ok(options) => {

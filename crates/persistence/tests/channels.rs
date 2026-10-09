@@ -16,6 +16,17 @@ use geo_persistence::{
 };
 use uuid::Uuid;
 
+#[path = "../../domain/tests/support/channel_session_renewal.rs"]
+mod session_renewal_contract;
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn renewal_is_session_only_scoped_and_compare_and_swap() {
+    let fixture = fixture().await;
+    let repository = PgChannelRepository::from_database(&fixture.database);
+    session_renewal_contract::verify(&repository, &fixture.scope).await;
+}
+
 struct Fixture {
     database: Database,
     scope: TenantScope,

@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use geo_domain::{
-    AppError, ChannelAccount, ChannelAccountRecord, ChannelGroup, ChannelRepository, ChannelSecret,
-    ChannelSettings, ChannelSettingsRecord, ErrorCode, LoginSession, OperatorId, PoolAccount,
-    PoolAccountRecord, PoolAssignment, PoolGroup, PoolLoginSession, TenantScope,
+    AppError, ChannelAccount, ChannelAccountRecord, ChannelGroup, ChannelOwnerKind,
+    ChannelRepository, ChannelSecret, ChannelSessionVersion, ChannelSettings,
+    ChannelSettingsRecord, ErrorCode, LoginSession, OperatorId, PoolAccount, PoolAccountRecord,
+    PoolAssignment, PoolGroup, PoolLoginSession, TenantScope,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -76,6 +77,123 @@ fn decode_account(
 
 #[async_trait]
 impl ChannelRepository for PgChannelRepository {
+    async fn save_account_metadata(
+        &self,
+        scope: &TenantScope,
+        record: ChannelAccountRecord,
+    ) -> Result<ChannelAccount, AppError> {
+        if Some(record.account.project_id) != scope.project_id {
+            return Err(AppError::forbidden("account outside project"));
+        }
+        let metadata = serde_json::to_value(&record.account)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "cannot encode channel account"))?;
+        let result = sqlx::query(
+            "UPDATE channel_accounts SET metadata=$5,group_id=$6,encrypted_proxy=$7 \
+            WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND account_id=$4 \
+            AND encrypted_session IS NOT DISTINCT FROM $8 AND platform=$9 \
+            AND platform_account_id IS NOT DISTINCT FROM $10 AND metadata->>'owner_kind'=$11",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(record.account.account_id)
+        .bind(metadata)
+        .bind(record.account.group_id)
+        .bind(record.proxy.as_ref().map(ChannelSecret::encrypted_bytes))
+        .bind(record.session.as_ref().map(ChannelSecret::encrypted_bytes))
+        .bind(&record.account.platform)
+        .bind(&record.account.platform_account_id)
+        .bind(match record.account.owner_kind {
+            ChannelOwnerKind::Customer => "customer",
+            ChannelOwnerKind::OperatorPool => "operator_pool",
+        })
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::conflict(
+                "channel account changed; retry the edit",
+            ));
+        }
+        Ok(record.account)
+    }
+
+    async fn save_pool_account_metadata(
+        &self,
+        operator: OperatorId,
+        record: PoolAccountRecord,
+    ) -> Result<PoolAccount, AppError> {
+        let metadata = serde_json::to_value(&record.account)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "cannot encode pool account"))?;
+        let result = sqlx::query(
+            "UPDATE operator_channel_accounts SET metadata=$3,group_id=$4,encrypted_proxy=$5 \
+            WHERE operator_id=$1 AND account_id=$2 AND encrypted_session IS NOT DISTINCT FROM $6 \
+            AND platform=$7 AND platform_account_id IS NOT DISTINCT FROM $8",
+        )
+        .bind(operator.as_uuid())
+        .bind(record.account.account_id)
+        .bind(metadata)
+        .bind(record.account.group_id)
+        .bind(record.proxy.as_ref().map(ChannelSecret::encrypted_bytes))
+        .bind(record.session.as_ref().map(ChannelSecret::encrypted_bytes))
+        .bind(&record.account.platform)
+        .bind(&record.account.platform_account_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::conflict(
+                "channel account changed; retry the edit",
+            ));
+        }
+        Ok(record.account)
+    }
+
+    async fn renew_session(
+        &self,
+        scope: &TenantScope,
+        expected: &ChannelSessionVersion,
+        renewed: ChannelSecret,
+    ) -> Result<bool, AppError> {
+        let project_id = project(scope)?;
+        if expected.platform_account_id.trim().is_empty() {
+            return Ok(false);
+        }
+        // A single conditional UPDATE serializes with reconnect/disable writes.
+        // Deliberately do not replace metadata, timestamps, groups or proxies.
+        let statement = match expected.owner_kind {
+            ChannelOwnerKind::Customer => {
+                "UPDATE channel_accounts SET encrypted_session=$8 \
+                WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND account_id=$4 \
+                AND platform=$5 AND platform_account_id=$6 AND encrypted_session=$7 \
+                AND metadata->>'enabled'='true' AND metadata->>'status'='ready' \
+                AND metadata->>'owner_kind'='customer'"
+            }
+            ChannelOwnerKind::OperatorPool => {
+                "UPDATE operator_channel_accounts AS a SET encrypted_session=$8 \
+                WHERE a.operator_id=$1 AND a.account_id=$4 \
+                AND a.platform=$5 AND a.platform_account_id=$6 AND a.encrypted_session=$7 \
+                AND a.metadata->>'enabled'='true' AND a.metadata->>'status'='ready' \
+                AND EXISTS (SELECT 1 FROM operator_channel_assignments AS assignment \
+                    WHERE assignment.operator_id=a.operator_id AND assignment.account_id=a.account_id \
+                    AND assignment.tenant_id=$2 AND assignment.project_id=$3)"
+            }
+        };
+        let result = sqlx::query(statement)
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project_id)
+            .bind(expected.account_id)
+            .bind(&expected.platform)
+            .bind(&expected.platform_account_id)
+            .bind(expected.session.encrypted_bytes())
+            .bind(renewed.encrypted_bytes())
+            .execute(&self.pool)
+            .await
+            .map_err(db_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn list_pool_groups(&self, operator: OperatorId) -> Result<Vec<PoolGroup>, AppError> {
         let rows: Vec<(Uuid, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
             "SELECT group_id,name,created_at FROM operator_channel_groups WHERE operator_id=$1 ORDER BY created_at,group_id",

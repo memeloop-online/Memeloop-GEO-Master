@@ -151,6 +151,17 @@ pub struct ChannelAccountRecord {
     pub proxy: Option<ChannelSecret>,
 }
 
+/// Server-only version of the exact encrypted state restored into a browser.
+/// Renewals change only the session, never account metadata or ownership.
+#[derive(Clone)]
+pub struct ChannelSessionVersion {
+    pub account_id: Uuid,
+    pub owner_kind: ChannelOwnerKind,
+    pub platform: String,
+    pub platform_account_id: String,
+    pub session: ChannelSecret,
+}
+
 #[derive(Clone)]
 pub struct ChannelSettingsRecord {
     pub settings: ChannelSettings,
@@ -177,6 +188,23 @@ fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {
 
 #[async_trait]
 pub trait ChannelRepository: Send + Sync {
+    /// Metadata edits must not restore a session read before a renewal.
+    async fn save_account_metadata(
+        &self,
+        scope: &TenantScope,
+        record: ChannelAccountRecord,
+    ) -> Result<ChannelAccount, AppError>;
+    async fn save_pool_account_metadata(
+        &self,
+        operator: crate::OperatorId,
+        record: PoolAccountRecord,
+    ) -> Result<PoolAccount, AppError>;
+    async fn renew_session(
+        &self,
+        scope: &TenantScope,
+        expected: &ChannelSessionVersion,
+        renewed: ChannelSecret,
+    ) -> Result<bool, AppError>;
     async fn list_pool_groups(
         &self,
         operator: crate::OperatorId,
@@ -299,6 +327,126 @@ fn key(scope: &TenantScope, id: Uuid) -> Result<(Uuid, Uuid, Uuid, Uuid), AppErr
 
 #[async_trait]
 impl ChannelRepository for MemoryChannelRepository {
+    async fn save_account_metadata(
+        &self,
+        scope: &TenantScope,
+        record: ChannelAccountRecord,
+    ) -> Result<ChannelAccount, AppError> {
+        let account_key = key(scope, record.account.account_id)?;
+        let mut data = self.0.write().await;
+        if Some(record.account.project_id) != scope.project_id {
+            return Err(AppError::forbidden("account outside project"));
+        }
+        if let Some(group) = record.account.group_id
+            && !data.groups.contains_key(&key(scope, group)?)
+        {
+            return Err(AppError::not_found("group not found"));
+        }
+        let current = data
+            .accounts
+            .get_mut(&account_key)
+            .ok_or_else(|| AppError::not_found("account not found"))?;
+        if current.session.as_ref().map(ChannelSecret::encrypted_bytes)
+            != record.session.as_ref().map(ChannelSecret::encrypted_bytes)
+            || current.account.platform != record.account.platform
+            || current.account.platform_account_id != record.account.platform_account_id
+            || current.account.owner_kind != record.account.owner_kind
+        {
+            return Err(AppError::conflict(
+                "channel account changed; retry the edit",
+            ));
+        }
+        current.account = record.account;
+        current.proxy = record.proxy;
+        Ok(current.account.clone())
+    }
+
+    async fn save_pool_account_metadata(
+        &self,
+        operator: crate::OperatorId,
+        record: PoolAccountRecord,
+    ) -> Result<PoolAccount, AppError> {
+        let mut data = self.0.write().await;
+        if let Some(group) = record.account.group_id
+            && !data.pool_groups.contains_key(&(operator.as_uuid(), group))
+        {
+            return Err(AppError::not_found("pool group not found"));
+        }
+        let current = data
+            .pool_accounts
+            .get_mut(&(operator.as_uuid(), record.account.account_id))
+            .ok_or_else(|| AppError::not_found("pool account not found"))?;
+        if current.session.as_ref().map(ChannelSecret::encrypted_bytes)
+            != record.session.as_ref().map(ChannelSecret::encrypted_bytes)
+            || current.account.platform != record.account.platform
+            || current.account.platform_account_id != record.account.platform_account_id
+        {
+            return Err(AppError::conflict(
+                "channel account changed; retry the edit",
+            ));
+        }
+        current.account = record.account;
+        current.proxy = record.proxy;
+        Ok(current.account.clone())
+    }
+
+    async fn renew_session(
+        &self,
+        scope: &TenantScope,
+        expected: &ChannelSessionVersion,
+        renewed: ChannelSecret,
+    ) -> Result<bool, AppError> {
+        let account_key = key(scope, expected.account_id)?;
+        let mut data = self.0.write().await;
+        if expected.platform_account_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let (platform, identity, enabled, status, session) = match expected.owner_kind {
+            ChannelOwnerKind::Customer => {
+                let Some(record) = data.accounts.get_mut(&account_key) else {
+                    return Ok(false);
+                };
+                if record.account.owner_kind != ChannelOwnerKind::Customer {
+                    return Ok(false);
+                }
+                (
+                    &record.account.platform,
+                    &record.account.platform_account_id,
+                    record.account.enabled,
+                    record.account.status,
+                    &mut record.session,
+                )
+            }
+            ChannelOwnerKind::OperatorPool => {
+                if !data.pool_assignments.contains(&account_key) {
+                    return Ok(false);
+                }
+                let Some(record) = data.pool_accounts.get_mut(&(account_key.0, account_key.3))
+                else {
+                    return Ok(false);
+                };
+                (
+                    &record.account.platform,
+                    &record.account.platform_account_id,
+                    record.account.enabled,
+                    record.account.status,
+                    &mut record.session,
+                )
+            }
+        };
+        if !enabled
+            || status != ChannelStatus::Ready
+            || platform != &expected.platform
+            || identity.as_deref() != Some(expected.platform_account_id.as_str())
+            || session.as_ref().map(ChannelSecret::encrypted_bytes)
+                != Some(expected.session.encrypted_bytes())
+        {
+            return Ok(false);
+        }
+        *session = Some(renewed);
+        Ok(true)
+    }
+
     async fn list_pool_groups(
         &self,
         operator: crate::OperatorId,
