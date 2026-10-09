@@ -1,7 +1,7 @@
 // Real local-memory API + real Vite + installed Chromium. No route interception,
 // external provider requests, account connections, or reusable credentials.
 // Set GEO_SMOKE_APP_BINARY and GEO_SMOKE_OUTPUT_DIR (outside the repository).
-// Optional: PLAYWRIGHT_BROWSERS_PATH, GEO_SMOKE_TMP_DIR,
+// Optional: PLAYWRIGHT_BROWSERS_PATH, GEO_TEST_CHROMIUM_PATH, GEO_SMOKE_TMP_DIR,
 // GEO_SMOKE_API_PORT, GEO_SMOKE_WEB_PORT. GEO_SMOKE_CONTENT=1 additionally
 // requires approved local bundles, an unused GEO_SMOKE_PROVIDER_PORT, and
 // Python 3 (override its executable with GEO_SMOKE_PYTHON) for ZIP inspection.
@@ -1329,6 +1329,9 @@ async function main() {
   const { chromium } = requireBrowser("playwright");
   browserServer = await chromium.launchServer({
     headless: true,
+    ...(process.env.GEO_TEST_CHROMIUM_PATH
+      ? { executablePath: process.env.GEO_TEST_CHROMIUM_PATH }
+      : {}),
     timeout: 15_000,
     env: safeEnvironment(),
   });
@@ -1631,6 +1634,22 @@ async function main() {
   });
   const measureTab = page.getByRole("tab", { name: "开始测量", exact: true });
   await measureTab.focus();
+  await page.keyboard.press("ArrowRight");
+  const searchTab = page.getByRole("tab", { name: "传统搜索", exact: true });
+  assert(
+    await searchTab.evaluate((element) => element === document.activeElement),
+    "Measurement tabs did not move keyboard focus to web search",
+  );
+  await page.keyboard.press("Enter");
+  await page.waitForURL((url) => url.searchParams.get("tab") === "search");
+  await page
+    .getByRole("tabpanel", { name: "传统搜索", exact: true })
+    .getByRole("heading", { name: "搜索排名", exact: true })
+    .waitFor();
+  assert(
+    (await searchTab.getAttribute("aria-selected")) === "true",
+    "Web search keyboard navigation did not select its tab",
+  );
   await page.keyboard.press("ArrowRight");
   assert(
     await page
