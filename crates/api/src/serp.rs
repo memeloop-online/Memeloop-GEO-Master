@@ -11,11 +11,11 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use geo_domain::{
-    AppError, ProjectId, ProjectRepository, ProjectStatus, QuestionReference, QuestionRepository,
-    SERP_TARGET_RULE_VERSION, SerpEvidenceOperation, SerpMeasurement, SerpObservation,
-    SerpProtocol, SerpProviderTask, SerpRawEvidence, SerpRawReceipt, SerpRepository,
-    SerpSendCertainty, SerpSendingIntent, SerpStoredRaw, SerpTarget, SerpTaskState, TenantScope,
-    sha256_hex,
+    AppError, ProjectId, ProjectRepository, ProjectSerpDispatchSource, ProjectSerpSettingsCursor,
+    ProjectStatus, QuestionReference, QuestionRepository, SERP_TARGET_RULE_VERSION,
+    SerpEvidenceOperation, SerpMeasurement, SerpObservation, SerpProtocol, SerpProviderTask,
+    SerpRawEvidence, SerpRawReceipt, SerpRepository, SerpSendCertainty, SerpSendingIntent,
+    SerpStoredRaw, SerpTarget, SerpTaskState, TenantScope, sha256_hex,
 };
 use geo_provider::serp::{SerpOperation, SerpRawResponse, SerpSentCertainty};
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,34 @@ pub trait SerpSource: Send + Sync {
     ) -> Result<(), AppError>;
 }
 
+pub struct ResolvedSerpSource {
+    pub source: Arc<dyn SerpSource>,
+    pub credential_revision: Option<i64>,
+}
+
+#[async_trait]
+pub trait SerpSourceResolver: Send + Sync {
+    async fn capabilities(&self, scope: &TenantScope) -> Result<Vec<SerpCapability>, AppError>;
+    async fn current(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        protocol: Option<&SerpProtocol>,
+    ) -> Result<ResolvedSerpSource, AppError>;
+    async fn bound(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        protocol: &SerpProtocol,
+        credential_revision: i64,
+    ) -> Result<Arc<dyn SerpSource>, AppError>;
+    async fn dispatch_sources(
+        &self,
+        after: Option<ProjectSerpSettingsCursor>,
+        limit: usize,
+    ) -> Result<Vec<ProjectSerpDispatchSource>, AppError>;
+}
+
 #[derive(Clone)]
 struct SourceRoute {
     scope: TenantScope,
@@ -92,6 +120,7 @@ pub struct SerpService {
     projects: Arc<dyn ProjectRepository>,
     questions: Arc<dyn QuestionRepository>,
     sources: Vec<SourceRoute>,
+    resolver: Option<Arc<dyn SerpSourceResolver>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -161,7 +190,13 @@ impl SerpService {
             projects,
             questions,
             sources: Vec::new(),
+            resolver: None,
         }
+    }
+
+    pub fn with_source_resolver(mut self, resolver: Arc<dyn SerpSourceResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     pub fn with_source(
@@ -186,18 +221,68 @@ impl SerpService {
         Ok(self)
     }
 
-    pub fn capabilities(&self, scope: &TenantScope) -> Vec<SerpCapability> {
-        self.sources
+    pub async fn capabilities(&self, scope: &TenantScope) -> Result<Vec<SerpCapability>, AppError> {
+        if let Some(resolver) = &self.resolver {
+            return resolver.capabilities(scope).await;
+        }
+        Ok(self
+            .sources
             .iter()
             .filter(|route| route.scope == *scope)
             .map(|route| SerpCapability {
                 source_key: route.key.clone(),
                 protocol_defaults: route.source.protocol(""),
             })
-            .collect()
+            .collect())
     }
 
-    fn source_for(
+    async fn current_source(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+        protocol: Option<&SerpProtocol>,
+    ) -> Result<ResolvedSerpSource, AppError> {
+        if let Some(resolver) = &self.resolver {
+            return resolver.current(scope, key, protocol).await;
+        }
+        let source = self
+            .sources
+            .iter()
+            .find(|route| route.scope == *scope && route.key == key)
+            .map(|route| route.source.clone())
+            .ok_or_else(|| AppError::capability_missing("search source unavailable"))?;
+        Ok(ResolvedSerpSource {
+            source,
+            credential_revision: None,
+        })
+    }
+
+    async fn bound_source(
+        &self,
+        scope: &TenantScope,
+        measurement: &SerpMeasurement,
+        intent: &SerpSendingIntent,
+    ) -> Result<Arc<dyn SerpSource>, AppError> {
+        if let Some(resolver) = &self.resolver {
+            let revision = intent
+                .credential_revision
+                .ok_or_else(|| AppError::not_ready("search attempt has no bound credentials"))?;
+            return resolver
+                .bound(
+                    scope,
+                    &measurement.source_key,
+                    &measurement.protocol,
+                    revision,
+                )
+                .await;
+        }
+        if intent.credential_revision.is_some() {
+            return Err(AppError::not_ready("bound search credentials unavailable"));
+        }
+        self.static_source_for(scope, measurement)
+    }
+
+    fn static_source_for(
         &self,
         scope: &TenantScope,
         measurement: &SerpMeasurement,
@@ -232,12 +317,8 @@ impl SerpService {
         ) {
             return Err(AppError::conflict("project is inactive"));
         }
-        let route = self
-            .sources
-            .iter()
-            .find(|route| route.scope == *scope && route.key == input.source_key)
-            .ok_or_else(|| AppError::capability_missing("search source unavailable"))?;
-        let protocol = route.source.protocol(&input.query);
+        let resolved_source = self.current_source(scope, &input.source_key, None).await?;
+        let protocol = resolved_source.source.protocol(&input.query);
         let binding = if let Some(reference) = input.question_reference {
             let resolved = self.questions.resolve_question(scope, reference).await?;
             if resolved.revision.text != input.query
@@ -384,7 +465,13 @@ impl SerpService {
             ));
         }
         let measurement = self.measurement(scope, id).await?;
-        let source = self.source_for(scope, &measurement)?;
+        let raw = self.raw(scope, id, input.evidence_id).await?;
+        let intent = self
+            .repository
+            .get_sending_intent(scope, id, raw.evidence.attempt_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("search sending record not found"))?;
+        let source = self.bound_source(scope, &measurement, &intent).await?;
         let bytes = serde_json::to_vec(&(scope, id, &input.idempotency_key))
             .map_err(|_| AppError::invalid_request("invalid analysis identity"))?;
         let hash = hex::decode(sha256_hex(&bytes)).expect("sha256 hex");
@@ -401,12 +488,6 @@ impl SerpService {
             }
             return Ok(prior);
         }
-        let raw = self.raw(scope, id, input.evidence_id).await?;
-        let intent = self
-            .repository
-            .get_sending_intent(scope, id, raw.evidence.attempt_id)
-            .await?
-            .ok_or_else(|| AppError::not_found("search sending record not found"))?;
         let task_id = raw
             .evidence
             .provider_task_id
@@ -467,7 +548,15 @@ impl SerpService {
         ) {
             return Err(AppError::conflict("project is inactive"));
         }
-        let source = self.source_for(scope, &measurement)?;
+        let resolved = self
+            .current_source(scope, &measurement.source_key, Some(&measurement.protocol))
+            .await?;
+        let source = resolved.source;
+        if source.protocol(&measurement.protocol.query) != measurement.protocol {
+            return Err(AppError::conflict(
+                "search source protocol differs from frozen request",
+            ));
+        }
         let now = Utc::now();
         let Some(claim) = self
             .repository
@@ -484,17 +573,26 @@ impl SerpService {
                 "search prepared request binding differs",
             ));
         }
-        let Some(intent) = self
+        // Serialize project pause/archive with the durable send authorization.
+        // PostgreSQL rechecks under the intent transaction's project row lock;
+        // the memory repository holds its project read guard until commit.
+        let project_guard = self
+            .projects
+            .hold_measurement_project(scope, project.id)
+            .await?;
+        let intent = self
             .repository
             .begin_send(
                 scope,
                 &claim,
                 &prepared.request_sha256,
                 &prepared.correlation_tag,
+                resolved.credential_revision,
                 Utc::now(),
             )
-            .await?
-        else {
+            .await?;
+        drop(project_guard);
+        let Some(intent) = intent else {
             return Ok(());
         };
         let response = source.send(&prepared).await;
@@ -540,7 +638,6 @@ impl SerpService {
     /// tasks queued longer than 45 minutes; there is no guessed completion TTL.
     pub async fn poll_once(&self, scope: &TenantScope, id: Uuid) -> Result<(), AppError> {
         let measurement = self.measurement(scope, id).await?;
-        let source = self.source_for(scope, &measurement)?;
         let now = Utc::now();
         let Some(claim) = self
             .repository
@@ -554,6 +651,7 @@ impl SerpService {
             .get_sending_intent(scope, id, claim.attempt_id)
             .await?
             .ok_or_else(|| AppError::not_found("search sending record not found"))?;
+        let source = self.bound_source(scope, &measurement, &intent).await?;
         let task = self
             .repository
             .get_provider_task(scope, id, claim.attempt_id)
@@ -616,7 +714,6 @@ impl SerpService {
         if measurement.state != SerpTaskState::Unknown {
             return Ok(());
         }
-        let source = self.source_for(scope, &measurement)?;
         let Some(execution) = self.repository.get_execution(scope, id).await? else {
             return Ok(());
         };
@@ -626,6 +723,7 @@ impl SerpService {
         let Some(intent) = execution.intent else {
             return Ok(());
         };
+        let source = self.bound_source(scope, &measurement, &intent).await?;
         let mut candidate = execution.provider_task.map(|task| task.provider_task_id);
         if candidate.is_none() {
             for receipt in self.repository.list_raw(scope, id, None, 50).await? {
@@ -779,7 +877,7 @@ pub fn spawn_serp_dispatcher(service: SerpService) -> Option<tokio::task::JoinHa
             scopes.push(route.scope.clone());
         }
     }
-    if scopes.is_empty() {
+    if scopes.is_empty() && service.resolver.is_none() {
         return None;
     }
     Some(tokio::spawn(async move {
@@ -787,7 +885,30 @@ pub fn spawn_serp_dispatcher(service: SerpService) -> Option<tokio::task::JoinHa
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
-            for scope in &scopes {
+            let mut current_scopes = scopes.clone();
+            if let Some(resolver) = &service.resolver {
+                let mut after = None;
+                loop {
+                    let page = match resolver.dispatch_sources(after, 100).await {
+                        Ok(page) => page,
+                        Err(_) => {
+                            tracing::warn!("search source inventory unavailable");
+                            break;
+                        }
+                    };
+                    let done = page.len() < 100;
+                    after = page.last().and_then(|source| source.cursor().ok());
+                    for source in page {
+                        if !current_scopes.contains(&source.scope) {
+                            current_scopes.push(source.scope);
+                        }
+                    }
+                    if done {
+                        break;
+                    }
+                }
+            }
+            for scope in &current_scopes {
                 let mut after = None;
                 for _ in 0..5 {
                     match service.dispatch_due_page(scope, after, 50).await {
@@ -836,7 +957,13 @@ async fn capabilities(
     let scope = crate::channel_jobs::scope(&state, &tenant, project)
         .await
         .map_err(map)?;
-    Ok(Json(service(&state).map_err(map)?.capabilities(&scope)))
+    Ok(Json(
+        service(&state)
+            .map_err(map)?
+            .capabilities(&scope)
+            .await
+            .map_err(map)?,
+    ))
 }
 
 async fn accept(

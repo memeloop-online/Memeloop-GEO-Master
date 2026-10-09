@@ -72,6 +72,8 @@ pub use host::{
     ToolCallOutcome, ToolCallRecorder, redact_secrets,
 };
 pub use host_runtime::HostRuntime;
+mod serp_tools;
 pub use loader::InMemoryModuleLoader;
 pub use ops::{HostEvent, HostState};
 pub use runtime::{EmbeddedIsolate, ProbeRuntime, WorkerError};
+pub use serp_tools::*;

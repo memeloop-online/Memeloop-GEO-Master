@@ -43,6 +43,27 @@ fn invalid() -> AppError {
 }
 
 impl DataForSeoSerpSource {
+    pub fn protocol_for(config: &DataForSeoSerpConfig, query: &str) -> SerpProtocol {
+        SerpProtocol {
+            query: query.into(),
+            engine: SerpEngine::Google,
+            surface: SerpSurface::ThirdPartyApi,
+            source: "dataforseo".into(),
+            source_location_code: config.location_code.to_string(),
+            country: config.country.clone(),
+            city: config.city.clone(),
+            language: config.language_code.clone(),
+            device: SerpDevice::Desktop,
+            operating_system: "windows".into(),
+            requested_depth: 10,
+            max_pages: 1,
+            priority: 1,
+            login: "unspecified".into(),
+            personalization: "unspecified".into(),
+            protocol_version: SERP_PROTOCOL_VERSION.into(),
+            connector_version: DATAFORSEO_SERP_CONNECTOR_VERSION.into(),
+        }
+    }
     pub fn new(
         client: Arc<DataForSeoClient>,
         config: DataForSeoSerpConfig,
@@ -144,25 +165,7 @@ fn provider_raw(raw: &SerpStoredRaw, operation: SerpOperation) -> SerpRawRespons
 #[async_trait]
 impl SerpSource for DataForSeoSerpSource {
     fn protocol(&self, query: &str) -> SerpProtocol {
-        SerpProtocol {
-            query: query.into(),
-            engine: SerpEngine::Google,
-            surface: SerpSurface::ThirdPartyApi,
-            source: "dataforseo".into(),
-            source_location_code: self.config.location_code.to_string(),
-            country: self.config.country.clone(),
-            city: self.config.city.clone(),
-            language: self.config.language_code.clone(),
-            device: SerpDevice::Desktop,
-            operating_system: "windows".into(),
-            requested_depth: 10,
-            max_pages: 1,
-            priority: 1,
-            login: "unspecified".into(),
-            personalization: "unspecified".into(),
-            protocol_version: SERP_PROTOCOL_VERSION.into(),
-            connector_version: DATAFORSEO_SERP_CONNECTOR_VERSION.into(),
-        }
+        Self::protocol_for(&self.config, query)
     }
 
     fn parser_version(&self) -> &str {
@@ -426,6 +429,7 @@ mod tests {
             .prepare(&measurement, "synthetic-correlation")
             .unwrap();
         let intent = SerpSendingIntent {
+            credential_revision: None,
             measurement_id: measurement.measurement_id,
             attempt_id: Uuid::new_v4(),
             send_token: Uuid::new_v4(),

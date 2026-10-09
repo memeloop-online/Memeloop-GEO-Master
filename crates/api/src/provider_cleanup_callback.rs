@@ -354,6 +354,7 @@ mod tests {
             Some(ProjectId::new(Uuid::new_v4())),
         );
         let claim = ProviderCleanupClaim {
+            has_prior_delete_attempt: false,
             cleanup_id: Uuid::new_v4(),
             capture_id: Uuid::new_v4(),
             account_id: Uuid::new_v4(),

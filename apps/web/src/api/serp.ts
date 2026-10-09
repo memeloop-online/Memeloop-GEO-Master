@@ -30,6 +30,7 @@ export interface SerpCapability {
 }
 export interface SerpMeasurement {
   measurement_id: string;
+  source_key: string;
   protocol: SerpProtocol;
   target: SerpTarget | null;
   scheduled_at: string;

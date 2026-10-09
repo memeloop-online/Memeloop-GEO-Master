@@ -168,12 +168,40 @@ async fn contract(
         .unwrap();
     let request_sha = sha256_hex(b"synthetic-paid-request");
     let (a, b) = tokio::join!(
-        store.begin_send(scope, &renewed, &request_sha, "opaque-synthetic-tag", now),
-        store.begin_send(scope, &renewed, &request_sha, "opaque-synthetic-tag", now)
+        store.begin_send(
+            scope,
+            &renewed,
+            &request_sha,
+            "opaque-synthetic-tag",
+            None,
+            now
+        ),
+        store.begin_send(
+            scope,
+            &renewed,
+            &request_sha,
+            "opaque-synthetic-tag",
+            None,
+            now
+        )
     );
     let mut authorizations: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
     assert_eq!(authorizations.len(), 1);
     let intent = authorizations.remove(0);
+    assert_eq!(intent.credential_revision, None);
+    assert!(
+        store
+            .begin_send(
+                scope,
+                &renewed,
+                &request_sha,
+                "opaque-synthetic-tag",
+                Some(2),
+                now
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(
         store
             .get_execution(scope, id)
@@ -185,7 +213,14 @@ async fn contract(
     );
     assert!(
         store
-            .begin_send(scope, &renewed, &request_sha, "opaque-synthetic-tag", now)
+            .begin_send(
+                scope,
+                &renewed,
+                &request_sha,
+                "opaque-synthetic-tag",
+                None,
+                now
+            )
             .await
             .unwrap()
             .is_none()
@@ -197,6 +232,7 @@ async fn contract(
                 &renewed,
                 &sha256_hex(b"changed"),
                 "opaque-synthetic-tag",
+                None,
                 now
             )
             .await
@@ -506,7 +542,7 @@ async fn contract(
         .unwrap()
         .unwrap();
     let recovery_intent = store
-        .begin_send(scope, &old, &request_sha, "opaque-recovery-tag", now)
+        .begin_send(scope, &old, &request_sha, "opaque-recovery-tag", None, now)
         .await
         .unwrap()
         .unwrap();
@@ -593,6 +629,7 @@ async fn contract(
                 &old,
                 &request_sha,
                 "opaque-recovery-tag",
+                None,
                 recovery_at
             )
             .await
@@ -651,6 +688,7 @@ async fn contract(
                 &reader,
                 &request_sha,
                 "opaque-recovery-tag",
+                None,
                 recovery_at
             )
             .await
@@ -809,7 +847,14 @@ async fn contract(
     assert_ne!(obsolete.attempt_id, fresh.attempt_id);
     assert!(
         store
-            .begin_send(scope, &obsolete, &request_sha, "stale-tag", recovery_at)
+            .begin_send(
+                scope,
+                &obsolete,
+                &request_sha,
+                "stale-tag",
+                None,
+                recovery_at
+            )
             .await
             .is_err()
     );

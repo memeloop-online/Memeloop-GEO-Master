@@ -230,6 +230,108 @@ fn input(at: DateTime<Utc>) -> AcceptSerpMeasurement {
     }
 }
 
+struct InactivatingResolver {
+    projects: Arc<geo_domain::MemoryProjectRepository>,
+    source: Arc<InjectedSource>,
+    status: geo_domain::ProjectStatus,
+}
+
+#[async_trait]
+impl geo_api::SerpSourceResolver for InactivatingResolver {
+    async fn capabilities(
+        &self,
+        _: &TenantScope,
+    ) -> Result<Vec<geo_api::SerpCapability>, AppError> {
+        unreachable!("this resolver is only used at send time")
+    }
+
+    async fn current(
+        &self,
+        scope: &TenantScope,
+        _: &str,
+        _: Option<&SerpProtocol>,
+    ) -> Result<geo_api::ResolvedSerpSource, AppError> {
+        use geo_domain::ProjectRepository;
+        // Deterministically let pause/archive win after submit_once's initial
+        // project check but before durable send authorization.
+        let mut project = self
+            .projects
+            .get(scope, scope.project_id.unwrap())
+            .await?
+            .unwrap();
+        project.status = self.status;
+        self.projects.insert(project).await?;
+        Ok(geo_api::ResolvedSerpSource {
+            source: self.source.clone(),
+            credential_revision: None,
+        })
+    }
+
+    async fn bound(
+        &self,
+        _: &TenantScope,
+        _: &str,
+        _: &SerpProtocol,
+        _: i64,
+    ) -> Result<Arc<dyn SerpSource>, AppError> {
+        unreachable!("no send intent may be committed")
+    }
+
+    async fn dispatch_sources(
+        &self,
+        _: Option<geo_domain::ProjectSerpSettingsCursor>,
+        _: usize,
+    ) -> Result<Vec<geo_domain::ProjectSerpDispatchSource>, AppError> {
+        unreachable!("not a dispatcher test")
+    }
+}
+
+#[tokio::test]
+async fn pause_or_archive_winning_before_send_authorization_prevents_new_intent() {
+    for status in [
+        geo_domain::ProjectStatus::Paused,
+        geo_domain::ProjectStatus::Archived,
+    ] {
+        let (state, service, repository, source, scope) = fixture().await;
+        let measurement = service.accept(&scope, input(Utc::now())).await.unwrap();
+        let project = state
+            .project_repository()
+            .get(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.status, geo_domain::ProjectStatus::Draft);
+        let projects = Arc::new(geo_domain::MemoryProjectRepository::default());
+        projects.insert(project).await.unwrap();
+        let service = SerpService::new(
+            repository.clone(),
+            projects.clone(),
+            state.question_repository(),
+        )
+        .with_source_resolver(Arc::new(InactivatingResolver {
+            projects,
+            source: source.clone(),
+            status,
+        }));
+        assert!(
+            service
+                .submit_once(&scope, measurement.measurement_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(source.posts.load(Ordering::SeqCst), 0);
+        assert!(
+            repository
+                .get_execution(&scope, measurement.measurement_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .intent
+                .is_none()
+        );
+    }
+}
+
 #[tokio::test]
 async fn identical_protocols_keep_the_selected_scoped_source_across_restart() {
     let (state, service, repository, first, scope) = fixture().await;
@@ -567,7 +669,7 @@ async fn route_capability_and_history_are_scoped_without_global_source_access() 
         .await
         .unwrap();
     let other = TenantScope::new(scope.operator_id, scope.tenant_id, Some(other.id));
-    assert!(service.capabilities(&other).is_empty());
+    assert!(service.capabilities(&other).await.unwrap().is_empty());
     assert!(service.accept(&other, input(Utc::now())).await.is_err());
     let measurement = service.accept(&scope, input(Utc::now())).await.unwrap();
     assert!(
@@ -581,7 +683,7 @@ async fn route_capability_and_history_are_scoped_without_global_source_access() 
         state.project_repository(),
         state.question_repository(),
     );
-    assert!(unconfigured.capabilities(&scope).is_empty());
+    assert!(unconfigured.capabilities(&scope).await.unwrap().is_empty());
     assert_eq!(
         unconfigured
             .detail(&scope, measurement.measurement_id, None, 20)
@@ -837,4 +939,410 @@ async fn http_uses_same_resource_and_gets_never_dispatch_or_leak_authorization()
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(source.posts.load(Ordering::SeqCst), 1);
     assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+}
+
+struct CredentialFactory {
+    first: Arc<InjectedSource>,
+    second: Arc<InjectedSource>,
+    tests: AtomicUsize,
+}
+
+#[async_trait]
+impl geo_api::ProjectSerpSourceFactory for CredentialFactory {
+    fn source(
+        &self,
+        credentials: &geo_api::ProjectSerpCredentials,
+        protocol: &SerpProtocol,
+    ) -> Result<Arc<dyn SerpSource>, AppError> {
+        let source = match (credentials.login.as_str(), credentials.password.as_str()) {
+            ("synthetic-first", "synthetic-password-a") => self.first.clone(),
+            ("synthetic-second", "synthetic-password-b") => self.second.clone(),
+            _ => return Err(AppError::not_ready("synthetic credential mismatch")),
+        };
+        if source.protocol(&protocol.query) != *protocol {
+            return Err(AppError::conflict("synthetic frozen protocol mismatch"));
+        }
+        Ok(source)
+    }
+    async fn test(
+        &self,
+        _: &geo_api::ProjectSerpCredentials,
+    ) -> geo_provider::dataforseo::DataForSeoConnectionStatus {
+        self.tests.fetch_add(1, Ordering::SeqCst);
+        geo_provider::dataforseo::DataForSeoConnectionStatus::Connected
+    }
+}
+
+#[tokio::test]
+async fn persistent_settings_rotate_credentials_without_retargeting_old_tasks_or_frozen_defaults() {
+    use geo_api::{ProjectSerpSettingsService, UpdateProjectSerpSettings};
+    use geo_domain::{MemoryProjectSerpSettingsRepository, ProjectSerpSettingsRepository};
+    let (state, _, _, _, scope) = fixture().await;
+    let settings_repository = Arc::new(MemoryProjectSerpSettingsRepository::default());
+    let repository = Arc::new(MemorySerpRepository::with_settings(
+        settings_repository.clone(),
+    ));
+    let factory = Arc::new(CredentialFactory {
+        first: Arc::new(InjectedSource::new()),
+        second: Arc::new(InjectedSource::new()),
+        tests: AtomicUsize::new(0),
+    });
+    let settings =
+        ProjectSerpSettingsService::persistent(settings_repository.clone(), &"12".repeat(32))
+            .unwrap()
+            .with_factory(factory.clone());
+    let service = SerpService::new(
+        repository.clone(),
+        state.project_repository(),
+        state.question_repository(),
+    )
+    .with_source_resolver(Arc::new(settings.clone()));
+    let defaults = factory.first.protocol("");
+    settings
+        .save(
+            &scope,
+            "primary",
+            UpdateProjectSerpSettings {
+                expected_revision: 0,
+                enabled: true,
+                protocol_defaults: defaults.clone(),
+                login: Some("synthetic-first".into()),
+                password: Some("synthetic-password-a".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let mut request = input(Utc::now());
+    request.source_key = "primary".into();
+    let measurement = service.accept(&scope, request).await.unwrap();
+    // Changing new-request defaults must not change or block an already queued
+    // request. The injected factory rejects anything except its original US protocol.
+    let mut new_defaults = defaults.clone();
+    new_defaults.country = "GB".into();
+    new_defaults.source_location_code = "2826".into();
+    settings
+        .save(
+            &scope,
+            "primary",
+            UpdateProjectSerpSettings {
+                expected_revision: 1,
+                enabled: true,
+                protocol_defaults: new_defaults,
+                login: None,
+                password: None,
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .submit_once(&scope, measurement.measurement_id)
+        .await
+        .unwrap();
+    let execution = repository
+        .get_execution(&scope, measurement.measurement_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.intent.unwrap().credential_revision, Some(1));
+    settings
+        .save(
+            &scope,
+            "primary",
+            UpdateProjectSerpSettings {
+                expected_revision: 2,
+                enabled: true,
+                protocol_defaults: defaults.clone(),
+                login: Some("synthetic-second".into()),
+                password: Some("synthetic-password-b".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let reboot_settings =
+        ProjectSerpSettingsService::persistent(settings_repository.clone(), &"12".repeat(32))
+            .unwrap()
+            .with_factory(factory.clone());
+    let reboot = SerpService::new(
+        repository.clone(),
+        state.project_repository(),
+        state.question_repository(),
+    )
+    .with_source_resolver(Arc::new(reboot_settings.clone()));
+    reboot
+        .poll_once(&scope, measurement.measurement_id)
+        .await
+        .unwrap();
+    assert_eq!(factory.first.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(factory.second.reads.load(Ordering::SeqCst), 0);
+    let mut next = input(Utc::now());
+    next.source_key = "primary".into();
+    next.idempotency_key = "rotated-task".into();
+    let next = reboot.accept(&scope, next).await.unwrap();
+    reboot
+        .submit_once(&scope, next.measurement_id)
+        .await
+        .unwrap();
+    assert_eq!(factory.second.posts.load(Ordering::SeqCst), 1);
+    let execution = repository
+        .get_execution(&scope, next.measurement_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.intent.unwrap().credential_revision, Some(3));
+    reboot_settings
+        .save(
+            &scope,
+            "primary",
+            UpdateProjectSerpSettings {
+                expected_revision: 3,
+                enabled: false,
+                protocol_defaults: defaults,
+                login: None,
+                password: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(reboot.capabilities(&scope).await.unwrap().is_empty());
+    let mut rejected = input(Utc::now());
+    rejected.source_key = "primary".into();
+    rejected.idempotency_key = "disabled-task".into();
+    assert!(reboot.accept(&scope, rejected).await.is_err());
+    reboot.poll_once(&scope, next.measurement_id).await.unwrap();
+    assert_eq!(factory.second.reads.load(Ordering::SeqCst), 1);
+    let before = (
+        factory.first.posts.load(Ordering::SeqCst),
+        factory.second.posts.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        reboot_settings
+            .test(&scope, "primary", 4)
+            .await
+            .unwrap()
+            .status,
+        geo_provider::dataforseo::DataForSeoConnectionStatus::Connected
+    );
+    assert_eq!(
+        before,
+        (
+            factory.first.posts.load(Ordering::SeqCst),
+            factory.second.posts.load(Ordering::SeqCst)
+        )
+    );
+    assert!(reboot_settings.test(&scope, "primary", 3).await.is_err());
+    assert_eq!(factory.tests.load(Ordering::SeqCst), 1);
+    let serialized = serde_json::to_string(&reboot_settings.list(&scope).await.unwrap()).unwrap();
+    assert!(!serialized.contains("synthetic-first"));
+    assert!(!serialized.contains("synthetic-second"));
+    assert!(!serialized.contains("synthetic-password"));
+    let old = settings_repository
+        .get_credential(&scope, "primary", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&old.encrypted_credentials).contains("synthetic-first"));
+    assert_eq!(
+        settings_repository
+            .list_dispatch_sources(None, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn settings_http_never_returns_credentials_and_rejects_partial_pairs_and_stale_revision() {
+    use geo_api::{ProjectSerpSettingsService, UpdateProjectSerpSettings};
+    use geo_domain::MemoryProjectSerpSettingsRepository;
+    let (state, _, _, _, scope) = fixture().await;
+    let repository = Arc::new(MemoryProjectSerpSettingsRepository::default());
+    let factory = Arc::new(CredentialFactory {
+        first: Arc::new(InjectedSource::new()),
+        second: Arc::new(InjectedSource::new()),
+        tests: AtomicUsize::new(0),
+    });
+    let settings = ProjectSerpSettingsService::persistent(repository, &"12".repeat(32))
+        .unwrap()
+        .with_factory(factory.clone());
+    let app = geo_api::router(state.with_project_serp_settings(settings.clone()));
+    let response = app
+        .clone()
+        .oneshot(http_request(
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            None,
+            json!({"login_name":"demo@localhost","password":"serp-test"}),
+        ))
+        .await
+        .unwrap();
+    let cookie = response.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let csrf = http_body(response).await["csrf_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let base = format!(
+        "/api/v1/projects/{}/serp-settings",
+        scope.project_id.unwrap()
+    );
+    let body = json!({"expected_revision":0,"enabled":true,"protocol_defaults":factory.first.protocol(""),
+        "login":"synthetic-first","password":"synthetic-password-a"});
+    let no_csrf = app
+        .clone()
+        .oneshot(http_request(
+            "PUT",
+            &format!("{base}/primary"),
+            Some(&cookie),
+            None,
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .clone()
+        .oneshot(http_request(
+            "PUT",
+            &format!("{base}/primary"),
+            Some(&cookie),
+            Some(&csrf),
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved = http_body(response).await;
+    assert_eq!(saved["revision"], 1);
+    assert_eq!(saved["credentials_present"], true);
+    assert!(saved.get("login").is_none());
+    assert!(saved.get("password").is_none());
+    let stale = app
+        .clone()
+        .oneshot(http_request(
+            "PUT",
+            &format!("{base}/primary"),
+            Some(&cookie),
+            Some(&csrf),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert!(
+        settings
+            .save(
+                &scope,
+                "primary",
+                UpdateProjectSerpSettings {
+                    expected_revision: 1,
+                    enabled: true,
+                    protocol_defaults: factory.first.protocol(""),
+                    login: Some("only-one".into()),
+                    password: None,
+                }
+            )
+            .await
+            .is_err()
+    );
+    let test = app
+        .clone()
+        .oneshot(http_request(
+            "POST",
+            &format!("{base}/primary/test"),
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_revision":1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(test.status(), StatusCode::OK);
+    assert_eq!(http_body(test).await["status"], "connected");
+    let get = app
+        .oneshot(http_request("GET", &base, Some(&cookie), None, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let value = http_body(get).await.to_string();
+    assert!(!value.contains("synthetic-first"));
+    assert!(!value.contains("synthetic-password"));
+    assert_eq!(factory.first.posts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn dynamic_sources_never_repair_missing_attempt_credential_binding_with_current_account() {
+    use geo_api::{ProjectSerpSettingsService, UpdateProjectSerpSettings};
+    use geo_domain::MemoryProjectSerpSettingsRepository;
+    let (state, static_service, repository, source, scope) = fixture().await;
+    let measurement = static_service
+        .accept(&scope, input(Utc::now()))
+        .await
+        .unwrap();
+    static_service
+        .submit_once(&scope, measurement.measurement_id)
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .get_execution(&scope, measurement.measurement_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .intent
+            .unwrap()
+            .credential_revision
+            .is_none()
+    );
+    let settings_repository = Arc::new(MemoryProjectSerpSettingsRepository::default());
+    let factory = Arc::new(CredentialFactory {
+        first: source.clone(),
+        second: Arc::new(InjectedSource::new()),
+        tests: AtomicUsize::new(0),
+    });
+    let settings = ProjectSerpSettingsService::persistent(settings_repository, &"12".repeat(32))
+        .unwrap()
+        .with_factory(factory);
+    settings
+        .save(
+            &scope,
+            "synthetic-us-en",
+            UpdateProjectSerpSettings {
+                expected_revision: 0,
+                enabled: true,
+                protocol_defaults: source.protocol(""),
+                login: Some("synthetic-first".into()),
+                password: Some("synthetic-password-a".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let dynamic = SerpService::new(
+        repository,
+        state.project_repository(),
+        state.question_repository(),
+    )
+    .with_source_resolver(Arc::new(settings));
+    assert!(
+        dynamic
+            .poll_once(&scope, measurement.measurement_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(source.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        dynamic
+            .detail(&scope, measurement.measurement_id, None, 20)
+            .await
+            .unwrap()
+            .measurement
+            .measurement_id,
+        measurement.measurement_id
+    );
 }

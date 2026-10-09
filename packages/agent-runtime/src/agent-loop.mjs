@@ -22,6 +22,87 @@ const MEASUREMENT_OPTIONS = "measurement_options";
 const MEASUREMENT_PLAN_CREATE = "measurement_plan_create";
 const MEASUREMENT_PLAN_READ = "measurement_plan_read";
 const PROJECT_TOOLS = {
+  serp_create: [
+    "serpCreate",
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["query", "idempotency_key", "scheduled_at"],
+      properties: {
+        query: { type: "string", minLength: 1, maxLength: 700 },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+        scheduled_at: { type: "string", format: "date-time" },
+        source_key: { type: "string", minLength: 1, maxLength: 128 },
+        target: {
+          oneOf: [
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["kind", "url"],
+              properties: { kind: { const: "url" }, url: { type: "string" } },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["kind", "host", "include_subdomains"],
+              properties: {
+                kind: { const: "host" },
+                host: { type: "string" },
+                include_subdomains: { type: "boolean" },
+              },
+            },
+          ],
+        },
+        question_reference: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "question_id",
+            "question_revision_id",
+            "question_set_id",
+            "question_set_version_id",
+          ],
+          properties: Object.fromEntries(
+            [
+              "question_id",
+              "question_revision_id",
+              "question_set_id",
+              "question_set_version_id",
+            ].map((key) => [key, { type: "string", format: "uuid" }]),
+          ),
+        },
+      },
+    },
+  ],
+  serp_read: [
+    "serpRead",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["capabilities", "history", "detail", "sources"],
+        },
+        measurement_id: { type: "string", format: "uuid" },
+        after: { type: "string", format: "uuid" },
+        limit: { type: "integer", minimum: 1, maximum: 10 },
+      },
+    },
+  ],
+  serp_reparse: [
+    "serpReparse",
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["measurement_id", "evidence_id", "idempotency_key"],
+      properties: {
+        measurement_id: { type: "string", format: "uuid" },
+        evidence_id: { type: "string", format: "uuid" },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+    },
+  ],
   source_channel_recommendations: [
     "sourceRecommendations",
     {
@@ -239,6 +320,12 @@ const CHANNEL_TOOLS = [
   MEASUREMENT_PLAN_READ,
 ];
 const TOOL_DESCRIPTIONS = {
+  serp_create:
+    "Schedule a traditional search measurement for the exact query without enterprise or cycle setup. First use serp_read capabilities; copy its server_time as scheduled_at and preserve both timestamp and idempotency_key on retries. Omit source_key only when exactly one configured source exists; otherwise select a returned source. Never retry paid submissions with a new key. Search ranks are not AI citations.",
+  serp_read:
+    "Read traditional search capabilities (default), bounded history, measurement detail, or retained source metadata. Detail/sources require measurement_id. No raw body or credentials are returned. Frozen evaluation detail is withheld; null target_match is not a negative finding. Do not busy-poll queued measurements.",
+  serp_reparse:
+    "Reparse one retained search evidence response locally using its measurement_id and evidence_id. Preserve the idempotency_key on retries. Does not submit a new provider task or repeat a paid search.",
   source_channel_recommendations:
     "Read one page of verified live citation-based publishing channel suggestions. This optimization-safe projection excludes frozen-evaluation and unknown-purpose evidence and never proves publishing permission, account readiness or expected results. Inspect current project settings before changing targets; preserve all unmodified distribution scope fields and use project_revise with expected revision and a stable idempotency key.",
   project_current:
@@ -1377,6 +1464,9 @@ function resolveHost(requireImport) {
     typeof denoOps.op_host_measurement_plan_read_v1 !== "function" ||
     typeof denoOps.op_host_project_current_v1 !== "function" ||
     typeof denoOps.op_host_source_recommendations_v1 !== "function" ||
+    typeof denoOps.op_host_serp_create_v1 !== "function" ||
+    typeof denoOps.op_host_serp_read_v1 !== "function" ||
+    typeof denoOps.op_host_serp_reparse_v1 !== "function" ||
     typeof denoOps.op_host_project_revise_v1 !== "function" ||
     typeof denoOps.op_host_project_estimate_v1 !== "function" ||
     typeof denoOps.op_host_project_start_v1 !== "function" ||
@@ -1476,6 +1566,21 @@ function resolveHost(requireImport) {
         await denoOps.op_host_source_recommendations_v1(
           JSON.stringify(request),
         ),
+      );
+    },
+    async serpCreate(request) {
+      return JSON.parse(
+        await denoOps.op_host_serp_create_v1(JSON.stringify(request)),
+      );
+    },
+    async serpRead(request) {
+      return JSON.parse(
+        await denoOps.op_host_serp_read_v1(JSON.stringify(request)),
+      );
+    },
+    async serpReparse(request) {
+      return JSON.parse(
+        await denoOps.op_host_serp_reparse_v1(JSON.stringify(request)),
       );
     },
     async projectRevise(request) {

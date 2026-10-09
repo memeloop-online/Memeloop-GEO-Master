@@ -675,6 +675,96 @@ test("recommendations tool reads scoped optimization-safe channel suggestions", 
   }
 });
 
+test("traditional search tools preserve scoped create, detail and local reparse selectors", async () => {
+  const id = "00000000-0000-4000-8000-000000000071";
+  const evidence = "00000000-0000-4000-8000-000000000072";
+  const at = "2026-01-01T00:00:00Z";
+  const calls = [];
+  const steps = [
+    ["serp_read", {}],
+    [
+      "serp_create",
+      {
+        query: " rain + café% ",
+        idempotency_key: "stable-search",
+        scheduled_at: at,
+      },
+    ],
+    ["serp_read", { mode: "detail", measurement_id: id }],
+    [
+      "serp_reparse",
+      {
+        measurement_id: id,
+        evidence_id: evidence,
+        idempotency_key: "stable-parse",
+      },
+    ],
+  ];
+  let iteration = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async knowledgeSearch() {
+      throw new Error("Unexpected knowledge search");
+    },
+    async serpRead(request) {
+      calls.push(["serp_read", request]);
+      return request.mode
+        ? {
+            measurements: [{ measurement_id: id }],
+            observations: [{ evidence_id: evidence }],
+          }
+        : { server_time: at, capabilities: [{ source_key: "synthetic" }] };
+    },
+    async serpCreate(request) {
+      calls.push(["serp_create", request]);
+      return { measurement: { measurement_id: id, state: "queued" } };
+    },
+    async serpReparse(request) {
+      calls.push(["serp_reparse", request]);
+      return { observation: { evidence_id: evidence } };
+    },
+    async modelComplete(request) {
+      for (const name of ["serp_create", "serp_read", "serp_reparse"]) {
+        assert.ok(request.tools.some((tool) => tool.function.name === name));
+      }
+      const step = steps[iteration++];
+      return step
+        ? {
+            text: "",
+            model: "stub-model",
+            prompt_tokens: 7,
+            completion_tokens: 4,
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `search-${iteration}`,
+                type: "function",
+                function: { name: step[0], arguments: JSON.stringify(step[1]) },
+              },
+            ],
+          }
+        : {
+            text: "Retained search response reparsed.",
+            model: "stub-model",
+            prompt_tokens: 7,
+            completion_tokens: 4,
+            finish_reason: "stop",
+          };
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?search=${Date.now()}`);
+    const result = await main({
+      ...historyTurn,
+      prompt: "Measure this search topic.",
+    });
+    assert.equal(result.answer, "Retained search response reparsed.");
+    assert.deepEqual(calls, steps);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
 test("report reduction and immutable read are exposed as separate scoped host tools", async () => {
   const cycleId = "00000000-0000-4000-8000-000000000031";
   const reportId = "00000000-0000-4000-8000-000000000032";
@@ -755,6 +845,9 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "report_get",
         "report_preview",
         "report_reduce",
+        "serp_create",
+        "serp_read",
+        "serp_reparse",
         "source_channel_recommendations",
         "project_current",
         "project_revise",
@@ -1093,6 +1186,9 @@ test("attachment-only turn imports bound items, searches its release, and answer
         "report_get",
         "report_preview",
         "report_reduce",
+        "serp_create",
+        "serp_read",
+        "serp_reparse",
         "source_channel_recommendations",
         "project_current",
         "project_revise",

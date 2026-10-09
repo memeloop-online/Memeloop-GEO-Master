@@ -515,10 +515,12 @@ export function StandaloneMeasurementPanel({
                   />
                 )}
                 <p>
-                  {mode === "custom"
-                    ? "自定义问题 · CN / zh-CN · 不进入内容优化。"
-                    : "保留所选问题的原始版本和用途。"}{" "}
-                  消费端网页联网搜索；未核验的搜索记录为缺测，不替换为普通回答。
+                  {t(
+                    mode === "custom"
+                      ? "customMeasurementScope"
+                      : "questionSetMeasurementScope",
+                  )}{" "}
+                  {t("measurementMethod")}
                 </p>
               </details>
               <Button

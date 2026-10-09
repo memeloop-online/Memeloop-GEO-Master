@@ -3,6 +3,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
+import { MemoryRouter } from "react-router-dom";
 import * as api from "../api/serp";
 import { SerpMeasurementPanel } from "./SerpMeasurementPanel";
 import i18n from "../i18n";
@@ -29,6 +30,7 @@ const protocol: api.SerpProtocol = {
 };
 const measurement: api.SerpMeasurement = {
   measurement_id: "measurement",
+  source_key: "source-key",
   protocol,
   target: null,
   scheduled_at: "2026-10-01T00:00:00Z",
@@ -139,7 +141,9 @@ function setup(available = true, items: api.SerpMeasurement[] = [measurement]) {
   render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider client={client}>
-        <SerpMeasurementPanel tenantId="tenant" projectId="project" />
+        <MemoryRouter>
+          <SerpMeasurementPanel tenantId="tenant" projectId="project" />
+        </MemoryRouter>
       </QueryClientProvider>
     </FluentProvider>,
   );
@@ -158,6 +162,9 @@ describe("independent search measurement", () => {
       await screen.findByText(/当前没有可用的搜索来源/),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
+    expect(
+      await screen.findByRole("link", { name: "设置搜索数据源" }),
+    ).toHaveAttribute("href", "/app/tenant/project/settings?tab=search");
     await userEvent.click(
       await screen.findByRole("button", { name: "rain gauge" }),
     );

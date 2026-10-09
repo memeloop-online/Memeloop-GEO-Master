@@ -198,6 +198,11 @@ impl ProviderConversationCleanupRepository for PgProviderConversationCleanupRepo
         }
         let row = sqlx::query(
             "SELECT c.*,o.input,o.input_hash,o.stored_at, \
+             EXISTS (SELECT 1 FROM provider_conversation_cleanup_attempts prior \
+               WHERE prior.cleanup_id=c.cleanup_id AND prior.operator_id=c.operator_id \
+               AND prior.tenant_id=c.tenant_id AND prior.project_id=c.project_id \
+               AND prior.action='delete' AND prior.state='unknown' \
+               AND prior.diagnostic->>'stage'='delete') AS has_prior_delete_attempt, \
              o.input->'original_identity' AS original_identity \
              FROM provider_conversation_cleanup c JOIN observation_captures o \
              ON o.capture_id=c.capture_id AND o.operator_id=c.operator_id \
@@ -309,6 +314,7 @@ fn decode_claim(
         provider: row.get("provider"),
         external_conversation_id: row.get("external_conversation_id"),
         original_identity,
+        has_prior_delete_attempt: row.get("has_prior_delete_attempt"),
         retained_message_inventory_sha256: decode_capture(row)?
             .retained_message_inventory_sha256(scope),
         lease_id: row.get("lease_id"),
@@ -362,6 +368,11 @@ impl PgProviderConversationCleanupRepository {
                state='running',lease_id=$4,lease_until=clock_timestamp()+interval '2 minutes', \
                attempt_count=LEAST(1000,c.attempt_count+1),updated_at=clock_timestamp() \
              FROM due WHERE c.cleanup_id=due.cleanup_id RETURNING c.*, \
+               EXISTS (SELECT 1 FROM provider_conversation_cleanup_attempts prior \
+                 WHERE prior.cleanup_id=c.cleanup_id AND prior.operator_id=c.operator_id \
+                 AND prior.tenant_id=c.tenant_id AND prior.project_id=c.project_id \
+                 AND prior.action='delete' AND prior.state='unknown' \
+                 AND prior.diagnostic->>'stage'='delete') AS has_prior_delete_attempt, \
                (SELECT original.input->'original_identity' FROM observation_captures original \
                 WHERE original.capture_id=c.capture_id) AS original_identity, \
                (SELECT original.input FROM observation_captures original \

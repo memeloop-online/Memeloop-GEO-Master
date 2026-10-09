@@ -194,6 +194,49 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     );
     let claim = cleanup.claim(&scope, id).await.unwrap().unwrap();
     assert_eq!(claim.action, ProviderCleanupAction::Delete);
+    assert!(!claim.has_prior_delete_attempt);
+    cleanup
+        .finish_with_diagnostic(
+            &scope,
+            id,
+            claim.lease_id,
+            ProviderCleanupOutcome::Unknown,
+            Some(geo_domain::ProviderCleanupDiagnostic {
+                stage: geo_domain::ProviderCleanupStage::Preflight,
+                code: geo_domain::ProviderCleanupCode::TransportUnknown,
+            }),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE provider_conversation_cleanup SET next_attempt_at=now() WHERE cleanup_id=$1",
+    )
+    .bind(id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let preflight_reconcile = cleanup.claim(&scope, id).await.unwrap().unwrap();
+    assert_eq!(preflight_reconcile.action, ProviderCleanupAction::Reconcile);
+    assert!(!preflight_reconcile.has_prior_delete_attempt);
+    cleanup
+        .finish(
+            &scope,
+            id,
+            preflight_reconcile.lease_id,
+            ProviderCleanupOutcome::Present,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE provider_conversation_cleanup SET next_attempt_at=now() WHERE cleanup_id=$1",
+    )
+    .bind(id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim = cleanup.claim(&scope, id).await.unwrap().unwrap();
+    assert_eq!(claim.action, ProviderCleanupAction::Delete);
+    assert!(!claim.has_prior_delete_attempt);
     let diagnostic = geo_domain::ProviderCleanupDiagnostic {
         stage: geo_domain::ProviderCleanupStage::Delete,
         code: geo_domain::ProviderCleanupCode::HttpError,
@@ -252,6 +295,8 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     let failed_lease = claim.lease_id;
     let claim = cleanup.claim(&scope, id).await.unwrap().unwrap();
     assert_eq!(claim.action, ProviderCleanupAction::Delete);
+    // A known failed delete does not prove an uncertain remote deletion.
+    assert!(!claim.has_prior_delete_attempt);
     assert!(
         cleanup
             .finish_with_diagnostic(
@@ -300,6 +345,7 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         .bind(id).execute(database.pool()).await.unwrap();
     let resumed = cleanup.claim_due(&scope).await.unwrap().unwrap();
     assert_eq!(resumed.action, ProviderCleanupAction::Reconcile);
+    assert!(!resumed.has_prior_delete_attempt);
     assert_ne!(claim.lease_id, resumed.lease_id);
     assert!(
         cleanup
@@ -400,15 +446,44 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
     let raw_claim = cleanup.claim_due(&scope).await.unwrap().unwrap();
     assert_eq!(raw_claim.action, ProviderCleanupAction::Delete);
     cleanup
-        .finish(
+        .finish_with_diagnostic(
             &scope,
             raw_cleanup_id,
             raw_claim.lease_id,
-            ProviderCleanupOutcome::Deleted,
+            ProviderCleanupOutcome::Unknown,
+            Some(geo_domain::ProviderCleanupDiagnostic {
+                stage: geo_domain::ProviderCleanupStage::Delete,
+                code: geo_domain::ProviderCleanupCode::UnverifiedDeleteResponse,
+            }),
         )
         .await
         .unwrap();
     assert!(cleanup.claim_due(&scope).await.unwrap().is_none());
+    sqlx::query(
+        "UPDATE provider_conversation_cleanup SET next_attempt_at=now() WHERE cleanup_id=$1",
+    )
+    .bind(raw_cleanup_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let reconcile = cleanup
+        .claim(&scope, raw_cleanup_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconcile.action, ProviderCleanupAction::Reconcile);
+    assert!(reconcile.has_prior_delete_attempt);
+    // The API must still require complete retained evidence independently.
+    assert!(reconcile.retained_message_inventory_sha256.is_none());
+    cleanup
+        .finish(
+            &scope,
+            raw_cleanup_id,
+            reconcile.lease_id,
+            ProviderCleanupOutcome::Deleted,
+        )
+        .await
+        .unwrap();
 
     // Three separately owned resources exercise exclusive UUID keysets. The
     // snapshot cutoff must not admit captures saved after a scan began.

@@ -2257,6 +2257,7 @@ mod publication_binding_tests {
         version: Arc<Mutex<String>>,
         cleanup_events: Arc<Mutex<Vec<&'static str>>>,
         cleanup_failure: Arc<Mutex<bool>>,
+        cleanup_absent: Arc<Mutex<bool>>,
     }
 
     async fn runner(
@@ -2296,19 +2297,25 @@ mod publication_binding_tests {
         }
         if uri.path().ends_with("/cleanup-conversation") {
             let payload: Value = serde_json::from_slice(&body).unwrap();
-            assert!(
-                payload["authorization_ticket"]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty())
-            );
+            if payload["action"] == "delete" {
+                assert!(
+                    payload["authorization_ticket"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                );
+            } else {
+                assert_eq!(payload["action"], "reconcile");
+                assert!(payload.get("authorization_ticket").is_none());
+            }
             stub.cleanup_events.lock().await.push("rpc");
             let failure = *stub.cleanup_failure.lock().await;
+            let absent = *stub.cleanup_absent.lock().await;
             return (
                 StatusCode::OK,
                 Json(json!({
                     "execution_id":payload["execution_id"],
                     "external_conversation_id":payload["external_conversation_id"],
-                    "status": if failure { "retained" } else { "deleted" },
+                    "status": if absent { "absent" } else if failure { "retained" } else { "deleted" },
                     "diagnostic": if failure {
                         json!({"stage":"delete","code":"http_error"})
                     } else { Value::Null }
@@ -2613,13 +2620,18 @@ mod publication_binding_tests {
         }
     }
 
-    async fn cleanup_dispatch_fixture(complete_evidence: bool, failure: bool) {
+    async fn cleanup_dispatch_fixture(
+        complete_evidence: bool,
+        failure: bool,
+        reconcile_proof: Option<bool>,
+    ) {
         use geo_domain::{
             ObservationProviderIdentity, ProviderCleanupAction, ProviderCleanupClaim,
             ProviderCleanupOutcome,
         };
         let (service, scope, account_id, stub, server) = fixture().await;
         *stub.cleanup_failure.lock().await = failure;
+        *stub.cleanup_absent.lock().await = reconcile_proof.is_some();
         let mut account = service
             .repository
             .get_account(&scope, account_id)
@@ -2634,21 +2646,25 @@ mod publication_binding_tests {
         let state = AppState::development().with_channel_service(service);
         let repository = Arc::new(CleanupStore {
             claim: ProviderCleanupClaim {
+                has_prior_delete_attempt: reconcile_proof.unwrap_or(false),
                 cleanup_id: Uuid::new_v4(),
                 capture_id: Uuid::new_v4(),
                 account_id,
                 provider: "kimi".into(),
                 external_conversation_id: "system-conversation".into(),
-                retained_message_inventory_sha256: Some(geo_domain::sha256_hex(
-                    br#"[["synthetic-message","assistant"]]"#,
-                )),
+                retained_message_inventory_sha256: complete_evidence
+                    .then(|| geo_domain::sha256_hex(br#"[["synthetic-message","assistant"]]"#)),
                 original_identity: ObservationProviderIdentity {
                     provider: "kimi".into(),
                     platform_account_id: "original-identity".into(),
                 },
                 lease_id: Uuid::new_v4(),
                 lease_until: Utc::now() + Duration::minutes(2),
-                action: ProviderCleanupAction::Delete,
+                action: if reconcile_proof.is_some() {
+                    ProviderCleanupAction::Reconcile
+                } else {
+                    ProviderCleanupAction::Delete
+                },
             },
             jobs: state.channel_job_repository(),
             events: stub.cleanup_events.clone(),
@@ -2680,7 +2696,11 @@ mod publication_binding_tests {
         )
         .await
         .unwrap();
-        let expected = if complete_evidence {
+        let expected = if reconcile_proof.is_some() {
+            vec![
+                "claim", "start", "complete", "rpc", "close", "release", "finish",
+            ]
+        } else if complete_evidence {
             vec![
                 "claim",
                 "reserve",
@@ -2698,15 +2718,21 @@ mod publication_binding_tests {
         assert_eq!(*stub.cleanup_events.lock().await, expected);
         assert_eq!(
             *repository.outcome.lock().await,
-            Some(if complete_evidence && !failure {
-                ProviderCleanupOutcome::Deleted
-            } else {
-                ProviderCleanupOutcome::Failed
-            })
+            Some(
+                if reconcile_proof.is_some()
+                    && !(reconcile_proof == Some(true) && complete_evidence)
+                {
+                    ProviderCleanupOutcome::Unknown
+                } else if complete_evidence && !failure {
+                    ProviderCleanupOutcome::Deleted
+                } else {
+                    ProviderCleanupOutcome::Failed
+                }
+            )
         );
         assert_eq!(
             *repository.diagnostic.lock().await,
-            if !complete_evidence {
+            if !complete_evidence && reconcile_proof.is_none() {
                 Some(geo_domain::ProviderCleanupDiagnostic {
                     stage: geo_domain::ProviderCleanupStage::Authorization,
                     code: geo_domain::ProviderCleanupCode::AuthorizationRequired,
@@ -2725,17 +2751,24 @@ mod publication_binding_tests {
 
     #[tokio::test]
     async fn cleanup_dispatch_orders_reservation_authorization_identity_rpc_close_and_finish() {
-        cleanup_dispatch_fixture(true, false).await;
+        cleanup_dispatch_fixture(true, false, None).await;
     }
 
     #[tokio::test]
     async fn cleanup_dispatch_incomplete_evidence_releases_without_start_or_model_call() {
-        cleanup_dispatch_fixture(false, false).await;
+        cleanup_dispatch_fixture(false, false, None).await;
     }
 
     #[tokio::test]
     async fn cleanup_dispatch_retained_receipt_preserves_diagnostic_through_finish() {
-        cleanup_dispatch_fixture(true, true).await;
+        cleanup_dispatch_fixture(true, true, None).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_absence_settles_only_retained_prior_delete_without_new_delete_authorization() {
+        cleanup_dispatch_fixture(true, false, Some(true)).await;
+        cleanup_dispatch_fixture(true, false, Some(false)).await;
+        cleanup_dispatch_fixture(false, false, Some(true)).await;
     }
 
     async fn set_default_proxy(

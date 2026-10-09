@@ -9,11 +9,13 @@ import {
 } from "@fluentui/react-components";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 import { createIdempotencyKey } from "../api/client";
 import * as api from "../api/serp";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import "../i18n/serp";
+import "../i18n/projectSerp";
 
 const pending = new Set<api.SerpState>([
   "queued",
@@ -225,7 +227,14 @@ function Panel({
       ) : capabilities.isPending ? (
         <p role="status">{t("loading")}</p>
       ) : !capabilities.data?.length ? (
-        <p role="status">{t("unavailable")}</p>
+        <p role="status">
+          {t("unavailable")}{" "}
+          <Link
+            to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/settings?tab=search`}
+          >
+            {t("goSettings", { ns: "projectSerp" })}
+          </Link>
+        </p>
       ) : null}
       {!canWrite && <p>{t("readOnly")}</p>}
       <form

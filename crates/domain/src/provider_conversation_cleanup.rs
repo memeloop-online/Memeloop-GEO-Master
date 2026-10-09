@@ -31,6 +31,10 @@ pub struct ProviderCleanupClaim {
     /// legacy/incomplete claims, which never authorize destructive cleanup.
     #[serde(default)]
     pub retained_message_inventory_sha256: Option<String>,
+    /// An immutable prior outcome reached the remote delete request boundary.
+    /// Legacy claims and preflight-only failures cannot certify absence.
+    #[serde(default)]
+    pub has_prior_delete_attempt: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +195,19 @@ pub struct ProviderCleanupDueItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_claim_does_not_infer_a_prior_delete_attempt() {
+        let claim: ProviderCleanupClaim = serde_json::from_value(serde_json::json!({
+            "cleanup_id": Uuid::new_v4(), "capture_id": Uuid::new_v4(),
+            "account_id": Uuid::new_v4(), "lease_id": Uuid::new_v4(),
+            "lease_until": Utc::now(), "action": "reconcile", "provider": "synthetic",
+            "external_conversation_id": "synthetic-chat",
+            "original_identity": {"provider": "synthetic", "platform_account_id": "synthetic-account"}
+        })).unwrap();
+        assert!(!claim.has_prior_delete_attempt);
+        assert!(claim.retained_message_inventory_sha256.is_none());
+    }
 
     #[test]
     fn uncertain_or_failed_lookup_never_authorizes_blind_deletion() {

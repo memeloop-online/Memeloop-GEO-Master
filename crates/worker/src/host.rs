@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+pub use crate::serp_tools::*;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,110 @@ fn validate_recorded_return(
     }
     let invalid = |_: String| HostOpError::internal(op, "typed host result does not match request");
     match op {
+        HostOp::SerpCreate => {
+            let requested: SerpCreateRequest = typed(op, request)?;
+            let response: SerpCreateReceipt = typed(op, result)?;
+            response.measurement.validate_for(scope).map_err(invalid)?;
+            if response.measurement.scheduled_at != requested.scheduled_at
+                || requested
+                    .source_key
+                    .as_ref()
+                    .is_some_and(|key| *key != response.measurement.source_key)
+                || response
+                    .measurement
+                    .query
+                    .as_ref()
+                    .is_some_and(|query| *query != requested.query)
+            {
+                return Err(invalid(String::new()));
+            }
+        }
+        HostOp::SerpRead => {
+            let requested: SerpReadRequest = typed(op, request)?;
+            let response: SerpReadResult = typed(op, result)?;
+            let limit = requested.limit.unwrap_or(5) as usize;
+            if response.mode != requested.mode
+                || response.capabilities.len() > 32
+                || response.measurements.len() > limit
+                || response.observations.len() > limit
+                || response.evidence.len() > limit
+                || response.next_after.is_some_and(|id| id.is_nil())
+            {
+                return Err(invalid(String::new()));
+            }
+            if response.capabilities.iter().any(|source| {
+                source.source_key.is_empty()
+                    || source.source_key.len() > 128
+                    || source.engine != "google"
+                    || source.country.len() > 128
+                    || source.city.as_ref().is_some_and(|city| city.len() > 256)
+                    || source.language.len() > 64
+                    || source.requested_depth != 10
+            }) {
+                return Err(invalid(String::new()));
+            }
+            for measurement in &response.measurements {
+                measurement.validate_for(scope).map_err(invalid)?;
+                if requested
+                    .measurement_id
+                    .is_some_and(|id| id != measurement.measurement_id)
+                {
+                    return Err(invalid(String::new()));
+                }
+            }
+            match requested.mode {
+                SerpReadMode::Capabilities
+                    if !response.measurements.is_empty()
+                        || !response.observations.is_empty()
+                        || !response.evidence.is_empty() =>
+                {
+                    return Err(invalid(String::new()));
+                }
+                SerpReadMode::History
+                    if !response.capabilities.is_empty()
+                        || !response.observations.is_empty()
+                        || !response.evidence.is_empty() =>
+                {
+                    return Err(invalid(String::new()));
+                }
+                SerpReadMode::Detail | SerpReadMode::Sources => {
+                    if response.measurements.len() != 1
+                        || !response.capabilities.is_empty()
+                        || (requested.mode == SerpReadMode::Detail && !response.evidence.is_empty())
+                        || (requested.mode == SerpReadMode::Sources
+                            && !response.observations.is_empty())
+                    {
+                        return Err(invalid(String::new()));
+                    }
+                    for observation in &response.observations {
+                        observation
+                            .validate_for(&response.measurements[0])
+                            .map_err(invalid)?;
+                    }
+                }
+                _ => {}
+            }
+            if response.evidence.iter().any(|evidence| {
+                evidence.evidence_id.is_nil()
+                    || evidence.body_bytes > geo_domain::MAX_SERP_RAW_BYTES
+            }) {
+                return Err(invalid(String::new()));
+            }
+        }
+        HostOp::SerpReparse => {
+            let requested: SerpReparseRequest = typed(op, request)?;
+            let response: SerpReparseReceipt = typed(op, result)?;
+            response.measurement.validate_for(scope).map_err(invalid)?;
+            response
+                .observation
+                .validate_for(&response.measurement)
+                .map_err(invalid)?;
+            if response.measurement.measurement_id != requested.measurement_id
+                || response.observation.evidence_id != requested.evidence_id
+            {
+                return Err(invalid(String::new()));
+            }
+        }
         HostOp::ProjectCurrent | HostOp::ProjectRevise => {
             let response: ProjectCurrentResult = typed(op, result)?;
             response.validate_for(scope).map_err(invalid)?;
@@ -433,7 +538,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v18";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v19";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -893,11 +998,14 @@ pub enum HostOp {
     ProjectRevise,
     ProjectEstimate,
     ProjectStart,
+    SerpCreate,
+    SerpRead,
+    SerpReparse,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 45;
+    pub const COUNT: usize = 48;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -946,6 +1054,9 @@ impl HostOp {
         Self::ProjectRevise,
         Self::ProjectEstimate,
         Self::ProjectStart,
+        Self::SerpCreate,
+        Self::SerpRead,
+        Self::SerpReparse,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -996,6 +1107,9 @@ impl HostOp {
             Self::ProjectRevise => "project.revise.v1",
             Self::ProjectEstimate => "project.estimate.v1",
             Self::ProjectStart => "project.start.v1",
+            Self::SerpCreate => "serp.create.v1",
+            Self::SerpRead => "serp.read.v1",
+            Self::SerpReparse => "serp.reparse.v1",
         }
     }
 
@@ -1047,6 +1161,9 @@ impl HostOp {
             Self::ProjectRevise => "op_host_project_revise_v1",
             Self::ProjectEstimate => "op_host_project_estimate_v1",
             Self::ProjectStart => "op_host_project_start_v1",
+            Self::SerpCreate => "op_host_serp_create_v1",
+            Self::SerpRead => "op_host_serp_read_v1",
+            Self::SerpReparse => "op_host_serp_reparse_v1",
         }
     }
 
@@ -1158,6 +1275,9 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(30_000, 8),   // project revision
                 HostOpLimits::new(15_000, 16),  // project estimate
                 HostOpLimits::new(60_000, 4),   // project start acceptance
+                HostOpLimits::new(30_000, 8),   // search scheduling, never inline provider I/O
+                HostOpLimits::new(15_000, 32),  // bounded saved search reads
+                HostOpLimits::new(30_000, 8),   // local saved-response parsing
             ],
         }
     }
@@ -1397,6 +1517,36 @@ fn is_credential_shaped(token: &str) -> bool {
 ///   UUID shape validation by the worker is not authorization.
 #[async_trait]
 pub trait HostOps: Send + Sync {
+    async fn serp_create(
+        &self,
+        _scope: &TenantScope,
+        _request: SerpCreateRequest,
+    ) -> Result<SerpCreateReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::SerpCreate,
+            "search service is not configured",
+        ))
+    }
+    async fn serp_read(
+        &self,
+        _scope: &TenantScope,
+        _request: SerpReadRequest,
+    ) -> Result<SerpReadResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::SerpRead,
+            "search service is not configured",
+        ))
+    }
+    async fn serp_reparse(
+        &self,
+        _scope: &TenantScope,
+        _request: SerpReparseRequest,
+    ) -> Result<SerpReparseReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::SerpReparse,
+            "search service is not configured",
+        ))
+    }
     async fn model_complete(
         &self,
         scope: &TenantScope,
@@ -4119,6 +4269,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn search_recorded_returns_bind_scope_schedule_and_withheld_purpose() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let now = Utc::now();
+        let measurement = SerpToolMeasurement {
+            measurement_id: Uuid::new_v4(),
+            state: geo_domain::SerpTaskState::Queued,
+            source_key: "synthetic".into(),
+            scheduled_at: now,
+            question_purpose: None,
+            details_available: true,
+            query: Some("exact query".into()),
+            href: format!(
+                "/app/{}/{}/measurement?tab=search",
+                scope.tenant_id,
+                scope.project_id.unwrap()
+            ),
+        };
+        let request = serde_json::json!({"query":"exact query","idempotency_key":"stable","scheduled_at":now});
+        let response = serde_json::to_value(SerpCreateReceipt { measurement }).unwrap();
+        validate_recorded_return(HostOp::SerpCreate, &scope, &request, &response).unwrap();
+        for (field, value) in [
+            (
+                "href",
+                serde_json::json!("/app/other/project/measurement?tab=search"),
+            ),
+            ("query", serde_json::json!("different query")),
+            ("question_purpose", serde_json::json!("frozen_evaluation")),
+            ("measurement_id", serde_json::json!(Uuid::nil())),
+            (
+                "scheduled_at",
+                serde_json::json!(now + chrono::Duration::seconds(1)),
+            ),
+        ] {
+            let mut forged = response.clone();
+            forged["measurement"][field] = value;
+            assert!(
+                validate_recorded_return(HostOp::SerpCreate, &scope, &request, &forged).is_err()
+            );
+        }
     }
 
     #[test]

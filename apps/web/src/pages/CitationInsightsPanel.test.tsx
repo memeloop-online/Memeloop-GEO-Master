@@ -338,6 +338,7 @@ describe("citation insights", () => {
           planned: 1,
           other_completed: 1,
           grounded_saved_analysis: 1,
+          fixture: 1,
         },
         observed_sources: [
           {
@@ -362,6 +363,10 @@ describe("citation insights", () => {
     expect(
       screen.getByText("已存原文分析 1 项（单独统计）"),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/模拟记录/)).not.toBeInTheDocument();
+    expect(screen.getByText("fixture")).not.toBeVisible();
+    await user.click(screen.getByText("记录详情"));
+    expect(screen.getByText("fixture")).toBeVisible();
     await user.click(screen.getByText("具体网页"));
     await user.click(screen.getByRole("button", { name: "查看原始问答" }));
     expect(
@@ -369,8 +374,9 @@ describe("citation insights", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("Answer with evidence.")).not.toBeInTheDocument();
     expect(screen.getByText(/分析模型 analysis-model/)).toHaveTextContent(
-      "原测量结果保持不变",
+      "analysis-1",
     );
+    expect(screen.queryByText(/原测量结果保持不变/)).not.toBeInTheDocument();
   });
 
   it.each(["all_eligible", "explicit"] as const)(
@@ -499,12 +505,11 @@ describe("citation insights", () => {
     renderPanel();
     expect(await screen.findByText("计划测量 9 项")).toBeInTheDocument();
     expect(screen.getByText("测量计划 2 个")).toBeInTheDocument();
-    expect(
-      screen.getByText("未核验回答 1 项（不计入引用）"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("未核验回答 1 项")).toBeInTheDocument();
     expect(screen.getByText("其中无引用 1 项")).toBeInTheDocument();
     expect(screen.getByText("缺测 1 项")).toBeInTheDocument();
-    expect(screen.getByText("模拟记录 1 项（不计入引用）")).toBeInTheDocument();
+    expect(screen.queryByText(/模拟记录/)).not.toBeInTheDocument();
+    expect(screen.getByText("fixture")).not.toBeVisible();
     expect(screen.getByText("2 条回答引用")).toBeInTheDocument();
     await user.click(screen.getByText("具体网页"));
     const link = screen.getByRole("link", {

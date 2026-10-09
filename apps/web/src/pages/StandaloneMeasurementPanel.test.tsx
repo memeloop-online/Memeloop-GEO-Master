@@ -426,6 +426,13 @@ describe("standalone arbitrary-topic measurement", () => {
     expect(
       screen.queryByRole("button", { name: "刷新账号" }),
     ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText("高级选项"));
+    expect(
+      screen.getByText(/自定义问题 · 中国 · 中文 · 仅用于测量/),
+    ).toHaveTextContent("通过账号的联网搜索获取回答");
+    expect(
+      screen.queryByText(/不替换为普通回答|未核验的搜索记录为缺测/),
+    ).not.toBeInTheDocument();
   });
   it("retains one connection entry for an empty account list", () => {
     state.accounts = [];

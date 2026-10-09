@@ -199,7 +199,14 @@ async fn cleanup_once(
                 Code::InvalidResponse,
             ));
         }
-        Ok((map_outcome(claim.action, result.status), result.diagnostic))
+        Ok((
+            map_outcome(
+                claim.action,
+                result.status,
+                claim.has_prior_delete_attempt && claim.retained_message_inventory_sha256.is_some(),
+            ),
+            result.diagnostic,
+        ))
     };
     let outcome = match tokio::time::timeout(Duration::from_secs(85), operation).await {
         Ok(Ok(outcome)) => outcome,
@@ -240,15 +247,24 @@ fn diagnosed(
     (outcome, Some(ProviderCleanupDiagnostic { stage, code }))
 }
 
-fn map_outcome(action: ProviderCleanupAction, status: CleanupStatus) -> ProviderCleanupOutcome {
+fn map_outcome(
+    action: ProviderCleanupAction,
+    status: CleanupStatus,
+    has_retained_delete_attempt: bool,
+) -> ProviderCleanupOutcome {
     match (action, status) {
         (ProviderCleanupAction::Delete, CleanupStatus::Deleted) => ProviderCleanupOutcome::Deleted,
         (ProviderCleanupAction::Reconcile, CleanupStatus::Present) => {
             ProviderCleanupOutcome::Present
         }
+        (ProviderCleanupAction::Reconcile, CleanupStatus::Absent)
+            if has_retained_delete_attempt =>
+        {
+            ProviderCleanupOutcome::Deleted
+        }
         (_, CleanupStatus::NeedsLogin) => ProviderCleanupOutcome::NeedsLogin,
         (ProviderCleanupAction::Delete, CleanupStatus::Retained) => ProviderCleanupOutcome::Failed,
-        // Absence/404 does not prove deletion, including during reconciliation.
+        // A generic deletion status or unproven absence cannot settle lookup.
         _ => ProviderCleanupOutcome::Unknown,
     }
 }
@@ -258,28 +274,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reconciliation_requires_positive_presence_and_never_certifies_deletion() {
+    fn reconciliation_requires_strict_absence_and_retained_delete_attempt() {
         for status in [
             CleanupStatus::Deleted,
             CleanupStatus::Unknown,
             CleanupStatus::Retained,
         ] {
             assert_eq!(
-                map_outcome(ProviderCleanupAction::Reconcile, status),
+                map_outcome(ProviderCleanupAction::Reconcile, status, true),
                 ProviderCleanupOutcome::Unknown
             );
         }
         assert_eq!(
-            map_outcome(ProviderCleanupAction::Reconcile, CleanupStatus::Present),
+            map_outcome(
+                ProviderCleanupAction::Reconcile,
+                CleanupStatus::Present,
+                false
+            ),
             ProviderCleanupOutcome::Present
         );
         assert_eq!(
-            map_outcome(ProviderCleanupAction::Delete, CleanupStatus::Deleted),
+            map_outcome(ProviderCleanupAction::Delete, CleanupStatus::Deleted, false),
             ProviderCleanupOutcome::Deleted
         );
         assert_eq!(
-            map_outcome(ProviderCleanupAction::Delete, CleanupStatus::Present),
+            map_outcome(ProviderCleanupAction::Delete, CleanupStatus::Present, true),
             ProviderCleanupOutcome::Unknown
         );
+        assert_eq!(
+            map_outcome(
+                ProviderCleanupAction::Reconcile,
+                CleanupStatus::Absent,
+                true
+            ),
+            ProviderCleanupOutcome::Deleted
+        );
+        for (action, proof) in [
+            (ProviderCleanupAction::Delete, false),
+            (ProviderCleanupAction::Delete, true),
+            (ProviderCleanupAction::Reconcile, false),
+        ] {
+            assert_eq!(
+                map_outcome(action, CleanupStatus::Absent, proof),
+                ProviderCleanupOutcome::Unknown
+            );
+        }
     }
 }

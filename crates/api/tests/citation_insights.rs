@@ -572,6 +572,7 @@ async fn capture_projection_requires_source_availability_and_excludes_explicit_f
         captures.clone(),
     ));
     let resolver = geo_api::ObservationEvidenceResolver::new(analyses.clone(), captures.clone());
+    let state = state.with_observation_evidence_resolver(resolver.clone());
     let observed_at = Utc::now() - Duration::seconds(30);
     let attempt_id = Uuid::new_v4();
     jobs.claim(&scope, target.target_id, attempt_id, observed_at)
@@ -637,7 +638,7 @@ async fn capture_projection_requires_source_availability_and_excludes_explicit_f
                 target_id: target.target_id,
                 attempt_id,
                 source: ObservationAnalysisSource::Capture { capture_id },
-                source_sha256,
+                source_sha256: source_sha256.clone(),
                 observed_at,
                 prompt_version: "prompt.v1".into(),
                 parser_version: "parser.v1".into(),
@@ -662,8 +663,16 @@ async fn capture_projection_requires_source_availability_and_excludes_explicit_f
                 candidate_json: Some("{}".into()),
                 outcome: ObservationAnalysisOutcome::Grounded {
                     raw_answer: "Saved answer".into(),
-                    citations: vec![],
-                    audit: json!({"refs":[{}]}),
+                    citations: vec!["https://example.org/captured-source".into()],
+                    audit: json!({
+                        "kind":"observation_extraction","method":"llm_grounded",
+                        "prompt_version":"prompt.v1","source_sha256":source_sha256,
+                        "protocol":{
+                            "provider":"provider-a","model":"model-a","surface":"consumer_web",
+                            "search_mode":"web_search","protocol_version":"v1","market":"generic","language":"en"
+                        },
+                        "refs":[{"role":"completion"},{"role":"search_activity"},{"role":"answer_segment"}]
+                    }),
                 },
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -693,6 +702,33 @@ async fn capture_projection_requires_source_availability_and_excludes_explicit_f
             .unwrap()
             .len(),
         1
+    );
+    let app = router(state);
+    let cookie = login(&app).await;
+    let project_id = scope.project_id.unwrap();
+    let response = app
+        .oneshot(request(
+            &format!("/api/v1/projects/{project_id}/citation-insights"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_body(response).await;
+    assert_eq!(page["coverage"]["planned"], 1);
+    assert_eq!(page["coverage"]["fixture"], 1);
+    assert_eq!(page["coverage"]["other_completed"], 1);
+    assert_eq!(page["coverage"]["observed_live"], 0);
+    assert_eq!(page["coverage"]["grounded_saved_analysis"], 1);
+    assert_eq!(page["observed_sources"].as_array().unwrap().len(), 1);
+    assert_eq!(page["observed_sources"][0]["citing_answers"], 1);
+    assert_eq!(
+        page["observed_sources"][0]["samples"][0]["analysis"]["revision_id"],
+        json!(revision_id)
+    );
+    assert_eq!(
+        jobs.get_target(&scope, target.target_id).await.unwrap(),
+        view
     );
     let mut fixture = view;
     fixture.attempts[0]

@@ -520,6 +520,8 @@ pub(crate) enum CleanupAction {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CleanupStatus {
     Deleted,
+    /// Strict identity-bound protocol absence, not an arbitrary HTTP 404.
+    Absent,
     Present,
     Unknown,
     Retained,

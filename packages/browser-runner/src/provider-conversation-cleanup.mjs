@@ -158,7 +158,14 @@ function generating(value) {
 // page. No token, arbitrary URL, or browser navigation is exposed to Node.
 async function connect(
   page,
-  { trustedOrigin, path, body, timeoutMs, deleteNotAfterMs },
+  {
+    trustedOrigin,
+    path,
+    body,
+    timeoutMs,
+    deleteNotAfterMs,
+    verifyAbsence = false,
+  },
 ) {
   return page.evaluate(
     async ({
@@ -169,6 +176,7 @@ async function connect(
       limit,
       deleteNotAfterMs,
       closeMarginMs,
+      verifyAbsence,
     }) => {
       if (location.origin !== origin) return { kind: "wrong_origin" };
       const token = localStorage.getItem("access_token");
@@ -203,7 +211,13 @@ async function connect(
         }
         if (response.status === 401 || response.status === 403)
           return { kind: "reauth_required" };
-        if (!response.ok)
+        const inspectNotFound =
+          verifyAbsence &&
+          response.status === 404 &&
+          /^application\/json(?:\s*;|$)/i.test(
+            response.headers.get("content-type") ?? "",
+          );
+        if (!response.ok && !inspectNotFound)
           return { kind: "http_error", status: response.status };
         const reader = response.body?.getReader();
         if (!reader) return { kind: "invalid_response" };
@@ -221,7 +235,25 @@ async function connect(
           text += decoder.decode(value, { stream: true });
         }
         text += decoder.decode();
-        return { kind: "ok", data: JSON.parse(text) };
+        const data = JSON.parse(text);
+        if (inspectNotFound) {
+          // Connect's exact public error shape is evidence of absence only
+          // for the fixed GetChat request, never a generic HTTP 404 or page.
+          const verified =
+            data !== null &&
+            typeof data === "object" &&
+            !Array.isArray(data) &&
+            data.code === "not_found" &&
+            Object.keys(data).every((key) =>
+              ["code", "message", "details"].includes(key),
+            ) &&
+            (data.message === undefined || typeof data.message === "string") &&
+            (data.details === undefined || Array.isArray(data.details));
+          return verified
+            ? { kind: "not_found" }
+            : { kind: "http_error", status: response.status };
+        }
+        return { kind: "ok", data };
       } catch {
         return { kind: "transport_unknown" };
       }
@@ -237,6 +269,7 @@ async function connect(
           : MAX_RESPONSE_BYTES,
       deleteNotAfterMs,
       closeMarginMs: DELETE_CLOSE_MARGIN_MS,
+      verifyAbsence: verifyAbsence === true && path === GET_CHAT,
     },
   );
 }
@@ -265,6 +298,8 @@ async function inspect(page, options) {
     path: GET_CHAT,
     body: { chat_id: options.chatId },
   });
+  if (options.verifyAbsence === true && response.kind === "not_found")
+    return { status: "absent", external_conversation_id: options.chatId };
   if (response.kind !== "ok")
     return failure(
       response.kind === "reauth_required" ? "reauth_required" : "unknown",
@@ -292,9 +327,16 @@ export async function recoverKimiConversation(
     chatId,
     timeoutMs = 12_000,
     maxPages = MAX_PAGES,
+    verifyAbsence = false,
   } = {},
 ) {
-  const options = { trustedOrigin, expectedUserId, chatId, timeoutMs };
+  const options = {
+    trustedOrigin,
+    expectedUserId,
+    chatId,
+    timeoutMs,
+    verifyAbsence,
+  };
   if (
     !optionsValid(options) ||
     !Number.isInteger(maxPages) ||

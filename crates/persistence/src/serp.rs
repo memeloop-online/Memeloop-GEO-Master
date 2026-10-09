@@ -510,6 +510,7 @@ impl SerpRepository for PgSerpRepository {
         claim: &SerpClaim,
         request_sha256: &str,
         correlation_tag: &str,
+        credential_revision: Option<i64>,
         now: DateTime<Utc>,
     ) -> Result<Option<SerpSendingIntent>, AppError> {
         let mut tx = self.tx(scope).await?;
@@ -519,10 +520,28 @@ impl SerpRepository for PgSerpRepository {
             if stored.measurement.state != SerpTaskState::Sending
                 || intent.request_sha256 != request_sha256
                 || intent.correlation_tag != correlation_tag
+                || intent.credential_revision != credential_revision
             {
                 return Err(AppError::conflict("search sending intent exists"));
             }
             return Ok(None);
+        }
+        let status: String = sqlx::query_scalar("SELECT status FROM projects WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 FOR SHARE")
+            .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+            .fetch_optional(&mut *tx).await.map_err(unavailable)?
+            .ok_or_else(|| AppError::not_found("project not found"))?;
+        if !matches!(status.as_str(), "draft" | "active") {
+            return Err(AppError::conflict("project is unavailable for measurement"));
+        }
+        if let Some(revision) = credential_revision {
+            let row = sqlx::query("SELECT * FROM project_serp_settings WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND source_key=$4 FOR SHARE")
+                .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+                .bind(&stored.measurement.source_key).fetch_optional(&mut *tx).await.map_err(unavailable)?;
+            let settings = row
+                .as_ref()
+                .map(crate::project_serp_settings::decode)
+                .transpose()?;
+            validate_project_serp_send(settings.as_ref(), &stored.measurement, revision)?;
         }
         validate_serp_task_transition(stored.measurement.state, SerpTaskState::Sending)?;
         let intent = SerpSendingIntent {
@@ -531,6 +550,7 @@ impl SerpRepository for PgSerpRepository {
             send_token: Uuid::new_v4(),
             request_sha256: request_sha256.into(),
             correlation_tag: correlation_tag.into(),
+            credential_revision,
             intended_at: now,
         };
         intent.validate()?;
@@ -901,6 +921,15 @@ impl SerpRepository for PgSerpRepository {
 #[derive(Default)]
 pub struct MemorySerpRepository {
     data: tokio::sync::Mutex<MemoryData>,
+    settings: Option<std::sync::Arc<MemoryProjectSerpSettingsRepository>>,
+}
+impl MemorySerpRepository {
+    pub fn with_settings(settings: std::sync::Arc<MemoryProjectSerpSettingsRepository>) -> Self {
+        Self {
+            settings: Some(settings),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1179,8 +1208,24 @@ impl SerpRepository for MemorySerpRepository {
         claim: &SerpClaim,
         request_sha256: &str,
         correlation_tag: &str,
+        credential_revision: Option<i64>,
         now: DateTime<Utc>,
     ) -> Result<Option<SerpSendingIntent>, AppError> {
+        let gate = if credential_revision.is_some() {
+            Some(
+                self.settings
+                    .as_ref()
+                    .ok_or_else(|| AppError::not_ready("search source unavailable"))?
+                    .send_consistency_gate(),
+            )
+        } else {
+            None
+        };
+        let _consistency = if let Some(gate) = &gate {
+            Some(gate.read().await)
+        } else {
+            None
+        };
         let mut data = self.data.lock().await;
         let stored = data.task_mut(scope, claim.measurement.measurement_id)?;
         stored.fence(claim, now)?;
@@ -1188,10 +1233,20 @@ impl SerpRepository for MemorySerpRepository {
             if stored.measurement.state != SerpTaskState::Sending
                 || intent.request_sha256 != request_sha256
                 || intent.correlation_tag != correlation_tag
+                || intent.credential_revision != credential_revision
             {
                 return Err(AppError::conflict("search sending intent exists"));
             }
             return Ok(None);
+        }
+        if let Some(revision) = credential_revision {
+            let settings = self
+                .settings
+                .as_ref()
+                .ok_or_else(|| AppError::not_ready("search source unavailable"))?
+                .get(scope, &stored.measurement.source_key)
+                .await?;
+            validate_project_serp_send(settings.as_ref(), &stored.measurement, revision)?;
         }
         validate_serp_task_transition(stored.measurement.state, SerpTaskState::Sending)?;
         let intent = SerpSendingIntent {
@@ -1200,6 +1255,7 @@ impl SerpRepository for MemorySerpRepository {
             send_token: Uuid::new_v4(),
             request_sha256: request_sha256.into(),
             correlation_tag: correlation_tag.into(),
+            credential_revision,
             intended_at: now,
         };
         intent.validate()?;

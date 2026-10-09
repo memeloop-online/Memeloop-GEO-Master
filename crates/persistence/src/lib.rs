@@ -63,3 +63,5 @@ pub use report::PgReportRepository;
 pub use scope::set_local_scope;
 mod project_ai_settings;
 pub use project_ai_settings::PgProjectAiSettingsRepository;
+mod project_serp_settings;
+pub use project_serp_settings::PgProjectSerpSettingsRepository;

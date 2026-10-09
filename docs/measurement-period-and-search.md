@@ -15,7 +15,7 @@
 
 `/reports` 首屏提供独立测量预览与保存历史。周期报告仍保留原路径；独立窗口报告没有伪造周期 CSV/PDF 导出。原观察时间、原文保存时间、解析完成时间分别参与截止校验。
 
-P00 沿用 `report_get`、`report_preview`、`report_reduce`，用 `kind: measurement_period` 选择新能力；默认仍为原周期行为。预览可默认最近七天，保存必须传预览返回的确切窗口。Host Ops 版本为 `geo.hostops.v18`，仍为 45 项；API 和 bundle 必须成套部署。模型返回值省略非优化用途的问题、答案、引用和出处细节，保留报告身份与权威计数；授权用户界面仍可查看完整评估报告。
+P00 沿用 `report_get`、`report_preview`、`report_reduce`，用 `kind: measurement_period` 选择新能力；默认仍为原周期行为。预览可默认最近七天，保存必须传预览返回的确切窗口。当前源码 Host Ops 为 `geo.hostops.v19`、48 项，包含下述三项搜索工具；API、bundle 与实际摘要必须成套部署。模型返回值省略非优化用途的问题、答案、引用和出处细节，保留报告身份与权威计数；授权用户界面仍可查看完整评估报告。
 
 主要入口为 `crates/domain/src/measurement_report.rs`、`crates/api/src/measurement_reports.rs`、`crates/persistence/src/measurement_report.rs`，迁移 `0048`。
 
@@ -29,7 +29,13 @@ P00 沿用 `report_get`、`report_preview`、`report_reduce`，用 `kind: measur
 
 排名区分自然排名、绝对位置与广告等其他结果。只有完整、连续的请求深度证据才能支持范围内未出现的结论；部分或截断响应不能冒充全量未命中。重新解释已存结构化搜索响应不新增供应商任务。这是供应商结构化 JSON 的协议解码，不替代 AI 网页回答的模型语义解析。
 
-测量页面 `?tab=search` 提供来源能力、关键词输入、历史、排名与原始证据。未配置来源时不允许发起任务，但保留历史查询。当前应用只装配持久服务和空来源表，尚无面向用户的搜索凭据配置、真实供应商验收、P00 搜索工具或报告搜索列项。
+测量页面 `?tab=search` 提供来源能力、关键词输入、历史、排名与原始证据。未配置来源时不允许发起任务，但保留历史查询。搜索数据源设置和 P00 工具已实现并通过本地／实库验证，随本次提交落盘、待对应 CI／部署；尚无真实供应商验收或共同报告搜索列项，不能把源码能力写成当前线上可用。
+
+项目设置 `?tab=search` 复用现有设置页。管理员保存／轮换／启停及测试来源，其他成员仅看脱敏状态；账号和密码均加密，公开响应只给凭据存在状态。凭据成对替换，留空保留，保存后清空输入；版本冲突保留本地草稿供处理。配置 API 为 `GET /projects/{project_id}/serp-settings`、`PUT /projects/{project_id}/serp-settings/{source_key}`、`POST /projects/{project_id}/serp-settings/{source_key}/test`，复用管理员授权、CSRF 与 no-store。
+
+动态路由按完整项目作用域和稳定来源键读取。新发送在持久发送意图中冻结凭据修订；既有任务查回／恢复使用其绑定版本，不以新账号兜底。轮换保留已有任务所需的加密旧版本；停用阻止新提交但不删除历史证据。项目暂停／归档与首次发送授权原子协调，已有授权不撤销，网络请求不持有项目锁。连接测试仅调用固定官方只读账号接口，不提交付费搜索任务；不把连接成功等同搜索完成。
+
+P00 的 `serp_create`、`serp_read`、`serp_reparse` 与页面共用持久资源与服务；保留原请求身份、作用域和非优化用途隔离。模型不获取凭据或原始响应。已存响应重解析不新增供应商调用，也不改变原任务的外部发送结果。
 
 主要入口：
 
@@ -37,6 +43,8 @@ P00 沿用 `report_get`、`report_preview`、`report_reduce`，用 `kind: measur
 - `crates/provider/src/dataforseo.rs`：HTTP 薄适配与原始响应。
 - `crates/api/src/serp.rs`、`serp_dataforseo.rs`：作用域服务、恢复和结果映射。
 - `crates/persistence/src/serp.rs`、迁移 `0047`：内存与 PostgreSQL。
+- `crates/{domain,persistence,api}/src/project_serp_settings.rs`、迁移 `0049`：加密来源配置、凭据修订与动态绑定。
 - `apps/web/src/pages/SerpMeasurementPanel.tsx`：搜索测量详情界面。
+- `apps/web/src/pages/ProjectSerpSettingsPanel.tsx`：项目搜索来源设置。
 
 生产接入必须显式提供来源配置与合法凭据，不把测试注入传输、合成排名或已通过契约测试写成真实搜索已完成。

@@ -447,6 +447,18 @@ fn scope_predicate<'a>(builder: &mut QueryBuilder<'a, Postgres>, scope: &'a Tena
 
 #[async_trait]
 impl ProjectRepository for PgProjectRepository {
+    async fn hold_measurement_project<'a>(
+        &'a self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        if scope.project_id != Some(project_id) {
+            return Err(AppError::forbidden("project is outside measurement scope"));
+        }
+        // PgSerpRepository verifies eligibility under a project row lock in
+        // the transaction committing the first sending intent.
+        Ok(ContentProjectGuard::transactional())
+    }
     async fn hold_content_project<'a>(
         &'a self,
         scope: &TenantScope,

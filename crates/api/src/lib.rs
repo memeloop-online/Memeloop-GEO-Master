@@ -67,12 +67,19 @@ pub use observation_analysis::{
     SavedObservationGrounder,
 };
 pub use observation_evidence::ObservationEvidenceResolver;
+mod project_serp_settings;
 mod serp;
+pub use project_serp_settings::{
+    ProjectSerpCredentials, ProjectSerpSettingsPage, ProjectSerpSettingsService,
+    ProjectSerpSettingsView, ProjectSerpSourceFactory, ProjectSerpTestResult,
+    TestProjectSerpSettings, UpdateProjectSerpSettings,
+};
 mod serp_dataforseo;
 pub use serp::{
-    AcceptSerpMeasurement, ReparseSerpSource, SerpCapability, SerpExecutionView,
-    SerpMeasurementDetail, SerpMeasurementPage, SerpPreparedSubmission, SerpReadOutcome,
-    SerpService, SerpSource, SerpSourcePage, spawn_serp_dispatcher,
+    AcceptSerpMeasurement, ReparseSerpSource, ResolvedSerpSource, SerpCapability,
+    SerpExecutionView, SerpMeasurementDetail, SerpMeasurementPage, SerpPreparedSubmission,
+    SerpReadOutcome, SerpService, SerpSource, SerpSourcePage, SerpSourceResolver,
+    spawn_serp_dispatcher,
 };
 pub use serp_dataforseo::{DataForSeoSerpConfig, DataForSeoSerpSource};
 mod measurement_reports;
@@ -189,6 +196,7 @@ pub struct AppState {
     observation_analysis: Option<ObservationAnalysisService>,
     observation_evidence_resolver: Option<ObservationEvidenceResolver>,
     serp_service: Option<SerpService>,
+    project_serp_settings: Option<ProjectSerpSettingsService>,
     provider_cleanup_callback: Option<ProviderCleanupCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
@@ -312,6 +320,7 @@ impl AppState {
             observation_analysis: None,
             observation_evidence_resolver: None,
             serp_service: None,
+            project_serp_settings: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -470,6 +479,7 @@ impl AppState {
             observation_analysis: None,
             observation_evidence_resolver: None,
             serp_service: None,
+            project_serp_settings: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -954,6 +964,15 @@ impl AppState {
 
     pub fn serp_service(&self) -> Option<&SerpService> {
         self.serp_service.as_ref()
+    }
+
+    pub fn with_project_serp_settings(mut self, settings: ProjectSerpSettingsService) -> Self {
+        self.project_serp_settings = Some(settings);
+        self
+    }
+
+    pub fn project_serp_settings(&self) -> Option<&ProjectSerpSettingsService> {
+        self.project_serp_settings.as_ref()
     }
 
     pub fn with_provider_cleanup_callback(
@@ -2573,6 +2592,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(project_ai_settings::routes())
                 .merge(observation_analysis::routes())
                 .merge(serp::routes())
+                .merge(project_serp_settings::routes())
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))

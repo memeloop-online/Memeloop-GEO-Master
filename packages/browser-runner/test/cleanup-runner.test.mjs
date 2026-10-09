@@ -373,6 +373,31 @@ test("cleanup never forwards arbitrary provider reasons or exception messages", 
   });
 });
 
+test("runner requests strict absence proof only for reconciliation", async () => {
+  await fixture(async ({ runner, state, calls }) => {
+    state.chatResponse = { kind: "not_found" };
+    const reconciled = await runner.cleanupConversation("session", input());
+    assert.equal(reconciled.status, "absent");
+    assert.equal(reconciled.diagnostic, undefined);
+    const deleted = await runner.cleanupConversation(
+      "session",
+      input("delete"),
+      async () => {
+        throw new Error("absence must not invoke delete authorization");
+      },
+    );
+    assert.equal(deleted.status, "unknown");
+    assert.equal(
+      calls.some((path) => path.endsWith("DeleteChat")),
+      false,
+    );
+    assert.equal(
+      calls.some((path) => path.endsWith("ListMessages")),
+      false,
+    );
+  });
+});
+
 test("delete authorizes exact session and does not retry ambiguous outcomes", async () => {
   await fixture(async ({ runner, state, calls }) => {
     let authorizations = 0;

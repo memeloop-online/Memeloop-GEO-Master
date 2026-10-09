@@ -969,6 +969,18 @@ impl ProjectPatch {
 
 #[async_trait]
 pub trait ProjectRepository: Send + Sync {
+    /// Keep project eligibility stable through a measurement intent commit.
+    /// Draft projects may measure arbitrary topics. Release before network I/O;
+    /// no project operation may be awaited while the held read lock is alive.
+    async fn hold_measurement_project<'a>(
+        &'a self,
+        _scope: &TenantScope,
+        _project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        Err(AppError::capability_missing(
+            "atomic measurement project eligibility guard is unavailable",
+        ))
+    }
     /// Keep the project eligibility read lock across one content-repository
     /// commit. Acquire before the knowledge guard, and never await project or
     /// knowledge operations again while either read lock is held.
@@ -1226,6 +1238,30 @@ impl MemoryProjectRepository {
 
 #[async_trait]
 impl ProjectRepository for MemoryProjectRepository {
+    async fn hold_measurement_project<'a>(
+        &'a self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        if scope.project_id != Some(project_id) {
+            return Err(AppError::forbidden("project is outside measurement scope"));
+        }
+        let guard = self.state.read().await;
+        let project = guard
+            .projects
+            .get(&project_id)
+            .filter(|project| {
+                project.operator_id == scope.operator_id && project.tenant_id == scope.tenant_id
+            })
+            .ok_or_else(|| AppError::not_found("project not found"))?;
+        if matches!(
+            project.status,
+            ProjectStatus::Paused | ProjectStatus::Archived
+        ) {
+            return Err(AppError::conflict("project is unavailable for measurement"));
+        }
+        Ok(ContentProjectGuard::held(guard))
+    }
     async fn hold_content_project<'a>(
         &'a self,
         scope: &TenantScope,
@@ -1956,6 +1992,81 @@ mod tests {
     };
     use chrono::{DateTime, Utc};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn measurement_project_guard_allows_draft_and_holds_pause_until_intent_commit() {
+        use std::sync::Arc;
+        use tokio::time::{Duration, timeout};
+        let repository = Arc::new(MemoryProjectRepository::new());
+        let id = Uuid::new_v4().into();
+        let scope = super::TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), Some(id));
+        let project = super::Project::new(
+            id,
+            &scope,
+            "measurement-guard",
+            "Measurement guard",
+            ProjectSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(project.status, ProjectStatus::Draft);
+        repository.insert(project).await.unwrap();
+        let held = repository
+            .hold_measurement_project(&scope, id)
+            .await
+            .unwrap();
+        assert_eq!(held.mode(), super::ContentGuardMode::Held);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let writer_repository = repository.clone();
+        let mut writer = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let mut state = writer_repository.state.write().await;
+            state.projects.get_mut(&id).unwrap().status = ProjectStatus::Paused;
+        });
+        started_rx.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(30), &mut writer)
+                .await
+                .is_err()
+        );
+        drop(held);
+        timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            repository
+                .hold_measurement_project(&scope, id)
+                .await
+                .is_err()
+        );
+        repository
+            .state
+            .write()
+            .await
+            .projects
+            .get_mut(&id)
+            .unwrap()
+            .status = ProjectStatus::Archived;
+        assert!(
+            repository
+                .hold_measurement_project(&scope, id)
+                .await
+                .is_err()
+        );
+        let foreign = super::TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, Some(id));
+        assert!(
+            repository
+                .hold_measurement_project(&foreign, id)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .hold_measurement_project(&scope, Uuid::new_v4().into())
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn active_project_guard_blocks_pause_until_content_commit() {

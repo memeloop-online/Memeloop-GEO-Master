@@ -702,6 +702,10 @@ pub struct SerpSendingIntent {
     pub send_token: Uuid,
     pub request_sha256: String,
     pub correlation_tag: String,
+    /// Exact project credential version used for this submission. Legacy
+    /// absence does not authorize guessing a current account for task reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_revision: Option<i64>,
     pub intended_at: DateTime<Utc>,
 }
 
@@ -843,6 +847,9 @@ impl SerpSendingIntent {
             || self.send_token.is_nil()
             || !digest(&self.request_sha256)
             || !label(&self.correlation_tag, 256)
+            || self
+                .credential_revision
+                .is_some_and(|revision| revision <= 0)
         {
             return Err(invalid());
         }
@@ -1017,6 +1024,7 @@ pub trait SerpRepository: Send + Sync {
         claim: &SerpClaim,
         request_sha256: &str,
         correlation_tag: &str,
+        credential_revision: Option<i64>,
         now: DateTime<Utc>,
     ) -> Result<Option<SerpSendingIntent>, AppError>;
     /// Audit/recovery metadata only; reading an intent never authorizes sending.
@@ -1434,6 +1442,7 @@ mod tests {
             send_token: Uuid::new_v4(),
             request_sha256: "a".repeat(64),
             correlation_tag: "opaque-synthetic-tag".into(),
+            credential_revision: Some(1),
             intended_at: now,
         };
         let mut raw = SerpRawEvidence {

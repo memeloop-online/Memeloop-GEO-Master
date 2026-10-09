@@ -68,9 +68,10 @@ async function fixture(run) {
     } else if (request.url === `${CHAT}GetChat`) {
       if (state.getChatStatus) {
         response.writeHead(state.getChatStatus, {
-          "content-type": "application/json",
+          "content-type": state.getChatContentType ?? "application/json",
+          ...(state.getChatRedirect ? { location: state.getChatRedirect } : {}),
         });
-        response.end("{}");
+        response.end(state.getChatBody ?? "{}");
         return;
       }
       data = state.chat;
@@ -629,6 +630,109 @@ test("a GetChat 404 is unknown, never proof of a prior deletion", async () => {
     );
     assert.equal(
       calls.some(({ path }) => path === `${CHAT}DeleteChat`),
+      false,
+    );
+  });
+});
+
+test("only opt-in recovery confirms bounded same-origin Connect not_found absence", async () => {
+  await fixture(async ({ page, state, calls, trustedOrigin }) => {
+    const options = { ...SCOPE, trustedOrigin, verifyAbsence: true };
+    state.getChatStatus = 404;
+    state.getChatBody = JSON.stringify({
+      code: "not_found",
+      message: "Synthetic missing resource",
+    });
+    assert.deepEqual(await recoverKimiConversation(page, options), {
+      status: "absent",
+      external_conversation_id: SCOPE.chatId,
+    });
+    assert.equal(
+      (
+        await recoverKimiConversation(page, {
+          ...options,
+          verifyAbsence: false,
+        })
+      ).status,
+      "unknown",
+    );
+    assert.equal(
+      (
+        await deleteKimiConversation(page, {
+          ...options,
+          authorizeDeletion: async () => authority(),
+        })
+      ).status,
+      "unknown",
+    );
+    for (const example of [
+      { status: 404, body: "{}" },
+      { status: 404, body: '{"code":"unknown"}' },
+      { status: 404, body: '{"code":"not_found","chat":{"id":"synthetic"}}' },
+      { status: 404, body: '{"code":"not_found","chat_id":"synthetic"}' },
+      { status: 404, body: '{"code":"not_found","message":{}}' },
+      { status: 404, body: '{"code":"not_found","details":{}}' },
+      { status: 404, body: '{"code":"not_found"' },
+      { status: 404, body: '{"code":"not_found"}', contentType: "text/html" },
+      {
+        status: 404,
+        body: '{"code":"not_found"}',
+        contentType: "application/json-unverified",
+      },
+      {
+        status: 404,
+        body: JSON.stringify({
+          code: "not_found",
+          message: "x".repeat(256_000),
+        }),
+      },
+      { status: 200, body: '{"code":"not_found"}' },
+      { status: 500, body: '{"code":"not_found"}' },
+      {
+        status: 401,
+        body: '{"code":"not_found"}',
+        expected: "reauth_required",
+      },
+      {
+        status: 403,
+        body: '{"code":"not_found"}',
+        expected: "reauth_required",
+      },
+      { status: 302, body: '{"code":"not_found"}', redirect: "/" },
+    ]) {
+      state.getChatStatus = example.status;
+      state.getChatBody = example.body;
+      state.getChatContentType = example.contentType;
+      state.getChatRedirect = example.redirect;
+      assert.equal(
+        (await recoverKimiConversation(page, options)).status,
+        example.expected ?? "unknown",
+        `status ${example.status}, type ${example.contentType ?? "json"}`,
+      );
+    }
+    state.getChatStatus = 404;
+    state.getChatBody = '{"code":"not_found"}';
+    state.getChatRedirect = undefined;
+    state.account = "different-account";
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
+      false,
+    );
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("ListMessages")),
+      false,
+    );
+    calls.length = 0;
+    assert.equal(
+      (await recoverKimiConversation(page, options)).status,
+      "retained",
+    );
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("GetChat")),
+      false,
+    );
+    assert.equal(
+      calls.some(({ path }) => path.endsWith("DeleteChat")),
       false,
     );
   });

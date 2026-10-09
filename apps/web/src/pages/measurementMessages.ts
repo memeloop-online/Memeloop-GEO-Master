@@ -1,6 +1,9 @@
 import i18n from "../i18n";
 
 const zh = {
+  customMeasurementScope: "自定义问题 · 中国 · 中文 · 仅用于测量。",
+  questionSetMeasurementScope: "采用所选问题的设置。",
+  measurementMethod: "通过账号的联网搜索获取回答。",
   addMeasurementAccount: "添加测量账号",
   noMeasurementAccount: "还没有可用的测量账号。",
   connectMeasurementAccount: "连接账号",
@@ -80,6 +83,10 @@ const zh = {
 } as const;
 
 const en = {
+  customMeasurementScope:
+    "Custom question · China · Chinese · Measurement only.",
+  questionSetMeasurementScope: "Uses the selected question's settings.",
+  measurementMethod: "Get answers using the account's web search.",
   addMeasurementAccount: "Add measurement account",
   noMeasurementAccount: "No measurement account is available yet.",
   connectMeasurementAccount: "Connect an account",

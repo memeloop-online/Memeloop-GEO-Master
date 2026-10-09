@@ -66,6 +66,8 @@ import {
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { RemoteDesktop } from "../components/RemoteDesktop";
 import { ProjectAiSettingsPanel } from "./ProjectAiSettingsPanel";
+import { ProjectSerpSettingsPanel } from "./ProjectSerpSettingsPanel";
+import "../i18n/projectSerp";
 import "../i18n/projectAi";
 import "./ChannelAccountsPage.css";
 
@@ -419,6 +421,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const aiTab = view === "settings" && searchParams.get("tab") === "ai";
+  const searchTab = view === "settings" && searchParams.get("tab") === "search";
   const { session } = useAuth();
   const client = useQueryClient();
   const { accounts, groups, platforms } = useChannelData(tenantId, projectId);
@@ -583,7 +586,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
             )}
           </p>
         </div>
-        {view !== "connect" && !aiTab && (
+        {view !== "connect" && !aiTab && !searchTab && (
           <Button
             onClick={() => navigate("../channels/connect")}
             appearance="primary"
@@ -595,7 +598,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
       {view === "settings" && (
         <TabList
           aria-label={t("projectAi.tabs")}
-          selectedValue={aiTab ? "ai" : "accounts"}
+          selectedValue={aiTab ? "ai" : searchTab ? "search" : "accounts"}
           onTabSelect={(_, data) =>
             setSearchParams((previous) => {
               const next = new URLSearchParams(previous);
@@ -606,9 +609,16 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
         >
           <Tab value="accounts">{t("projectAi.accounts")}</Tab>
           <Tab value="ai">{t("projectAi.tab")}</Tab>
+          <Tab value="search">{t("tab", { ns: "projectSerp" })}</Tab>
         </TabList>
       )}
-      {aiTab && tenantId && projectId ? (
+      {searchTab && tenantId && projectId ? (
+        <ProjectSerpSettingsPanel
+          key={`${tenantId}:${projectId}`}
+          tenantId={tenantId}
+          projectId={projectId}
+        />
+      ) : aiTab && tenantId && projectId ? (
         <ProjectAiSettingsPanel
           key={`${tenantId}:${projectId}`}
           tenantId={tenantId}

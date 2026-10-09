@@ -69,6 +69,27 @@ project_op!(
     |_: &ProjectCurrentRequest| Ok::<(), String>(())
 );
 project_op!(
+    op_host_serp_create_v1,
+    SerpCreate,
+    crate::host::SerpCreateRequest,
+    serp_create,
+    crate::host::SerpCreateRequest::validate
+);
+project_op!(
+    op_host_serp_read_v1,
+    SerpRead,
+    crate::host::SerpReadRequest,
+    serp_read,
+    crate::host::SerpReadRequest::validate
+);
+project_op!(
+    op_host_serp_reparse_v1,
+    SerpReparse,
+    crate::host::SerpReparseRequest,
+    serp_reparse,
+    crate::host::SerpReparseRequest::validate
+);
+project_op!(
     op_host_source_recommendations_v1,
     SourceRecommendations,
     crate::host::SourceRecommendationsRequest,
@@ -1132,6 +1153,9 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::DistributionTargetsRead.op_name(),
     HostOp::ContentDistributeRequest.op_name(),
     HostOp::ContentDistributeRead.op_name(),
+    HostOp::SerpCreate.op_name(),
+    HostOp::SerpRead.op_name(),
+    HostOp::SerpReparse.op_name(),
     // Rust-owned run state: the loop's emit contract and the checkpoint probe.
     "op_host_emit",
     "op_host_checkpoint",

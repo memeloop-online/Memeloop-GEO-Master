@@ -66,7 +66,7 @@ pub const MAIN_MODULE: &str = "memeloop://bundle/geo-loop.js";
 /// are parsed once, so call sites never see a raw JSON string, and every
 /// failure is the structured `GeoHostOpError` the Rust side produced.
 pub const HOST_OPS_JS: &str = r#"
-export const HOST_OPS_VERSION = "geo.hostops.v18";
+export const HOST_OPS_VERSION = "geo.hostops.v19";
 
 const OPS = {
   modelComplete: "op_host_model_complete_v1",
@@ -93,6 +93,9 @@ const OPS = {
   projectRevise: "op_host_project_revise_v1",
   projectEstimate: "op_host_project_estimate_v1",
   projectStart: "op_host_project_start_v1",
+  serpCreate: "op_host_serp_create_v1",
+  serpRead: "op_host_serp_read_v1",
+  serpReparse: "op_host_serp_reparse_v1",
   channelManifestRead: "op_host_channel_manifest_read_v1",
   channelTargetExecute: "op_host_channel_target_execute_v1",
   contentItemsRead: "op_host_content_items_read_v1",
@@ -149,6 +152,9 @@ export const hostOps = {
   projectRevise: (request) => callOp(OPS.projectRevise, request),
   projectEstimate: (request) => callOp(OPS.projectEstimate, request),
   projectStart: (request) => callOp(OPS.projectStart, request),
+  serpCreate: (request) => callOp(OPS.serpCreate, request),
+  serpRead: (request) => callOp(OPS.serpRead, request),
+  serpReparse: (request) => callOp(OPS.serpReparse, request),
   channelManifestRead: (request) => callOp(OPS.channelManifestRead, request),
   channelTargetExecute: (request) => callOp(OPS.channelTargetExecute, request),
   contentItemsRead: (request) => callOp(OPS.contentItemsRead, request),

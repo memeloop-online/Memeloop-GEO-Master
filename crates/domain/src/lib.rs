@@ -15,6 +15,8 @@ mod citation_insights;
 pub use citation_insights::*;
 mod serp;
 pub use serp::*;
+mod project_serp_settings;
+pub use project_serp_settings::*;
 mod source_channel_recommendations;
 pub use source_channel_recommendations::*;
 mod channels;

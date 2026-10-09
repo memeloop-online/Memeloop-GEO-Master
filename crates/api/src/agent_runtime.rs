@@ -660,6 +660,7 @@ pub struct RepositoryHostOps {
     channel_service: Option<Arc<dyn ChannelToolService>>,
     question_service: Option<Arc<dyn QuestionToolService>>,
     content_state: Option<AppState>,
+    serp_state: Option<AppState>,
 }
 
 #[async_trait]
@@ -827,6 +828,7 @@ impl RepositoryHostOps {
             channel_service: None,
             question_service: None,
             content_state: None,
+            serp_state: None,
         }
     }
 
@@ -847,9 +849,22 @@ impl RepositoryHostOps {
     /// Attaches project-scoped channel discovery, planning, frozen reads and
     /// one-shot target execution. The absent adapter fails explicitly.
     pub fn with_channels(mut self, state: AppState) -> Self {
+        self.serp_state = Some(state.clone());
         self.question_service = Some(Arc::new(state.clone()));
         self.channel_service = Some(Arc::new(state));
         self
+    }
+
+    pub fn with_serp_state(mut self, state: AppState) -> Self {
+        self.serp_state = Some(state);
+        self
+    }
+
+    fn serp_service(&self, op: HostOp) -> Result<&crate::SerpService, HostOpError> {
+        self.serp_state
+            .as_ref()
+            .and_then(AppState::serp_service)
+            .ok_or_else(|| HostOpError::capability_missing(op, "search service is not configured"))
     }
 
     /// Question tools share the project-scoped HTTP question services. Use
@@ -1036,8 +1051,277 @@ fn single_article_error(op: HostOp, error: AppError) -> HostOpError {
     }
 }
 
+fn serp_tool_measurement(
+    scope: &TenantScope,
+    measurement: &geo_domain::SerpMeasurement,
+) -> Result<geo_worker::SerpToolMeasurement, HostOpError> {
+    measurement
+        .validate(scope)
+        .map_err(|error| worker_error(HostOp::SerpRead, error))?;
+    let purpose = measurement
+        .question_binding
+        .as_ref()
+        .map(|binding| binding.purpose);
+    let details_available =
+        purpose.is_none_or(|purpose| purpose == geo_domain::QuestionPurpose::Optimization);
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| HostOpError::invalid_request(HostOp::SerpRead, "project scope required"))?;
+    Ok(geo_worker::SerpToolMeasurement {
+        measurement_id: measurement.measurement_id,
+        state: measurement.state,
+        source_key: measurement.source_key.clone(),
+        scheduled_at: measurement.scheduled_at,
+        question_purpose: purpose,
+        details_available,
+        query: details_available.then(|| measurement.protocol.query.clone()),
+        href: format!(
+            "/app/{}/{project_id}/measurement?tab=search",
+            scope.tenant_id
+        ),
+    })
+}
+
+fn serp_tool_observation(
+    measurement: &geo_domain::SerpMeasurement,
+    observation: &geo_domain::SerpObservation,
+) -> Result<geo_worker::SerpToolObservation, HostOpError> {
+    observation
+        .validate(measurement)
+        .map_err(|error| worker_error(HostOp::SerpRead, error))?;
+    let allowed = measurement
+        .question_binding
+        .as_ref()
+        .is_none_or(|binding| binding.purpose == geo_domain::QuestionPurpose::Optimization);
+    let results: Vec<_> = if allowed {
+        observation
+            .results
+            .iter()
+            .take(10)
+            .map(|result| geo_worker::SerpToolRank {
+                kind: result.kind,
+                url: result
+                    .normalized_url
+                    .clone()
+                    .filter(|url| url.len() <= 2048),
+                title: result
+                    .title
+                    .as_ref()
+                    .map(|title| title.chars().take(256).collect()),
+                organic_rank: result.organic_rank,
+                absolute_position: result.absolute_position,
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    Ok(geo_worker::SerpToolObservation {
+        observation_id: observation.observation_id,
+        evidence_id: observation.raw_evidence_id,
+        status: observation.status,
+        coverage: observation.coverage.clone(),
+        received_at: observation.received_at,
+        analyzed_at: observation.analyzed_at,
+        target_match: if allowed {
+            Some(
+                observation
+                    .target_match(measurement)
+                    .map_err(|error| worker_error(HostOp::SerpRead, error))?,
+            )
+        } else {
+            None
+        },
+        omitted_results: observation.results.len() - results.len(),
+        results,
+    })
+}
+
 #[async_trait]
 impl HostOps for RepositoryHostOps {
+    async fn serp_create(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::SerpCreateRequest,
+    ) -> Result<geo_worker::SerpCreateReceipt, HostOpError> {
+        let op = HostOp::SerpCreate;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.serp_service(op)?;
+        let source_key = match request.source_key {
+            Some(key) => key,
+            None => {
+                let choices = service
+                    .capabilities(scope)
+                    .await
+                    .map_err(|error| worker_error(op, error))?;
+                if choices.len() != 1 {
+                    return Err(HostOpError::capability_missing(
+                        op,
+                        "read search capabilities and select one configured source",
+                    ));
+                }
+                choices
+                    .into_iter()
+                    .next()
+                    .expect("one configured source")
+                    .source_key
+            }
+        };
+        let measurement = service
+            .accept(
+                scope,
+                crate::AcceptSerpMeasurement {
+                    idempotency_key: request.idempotency_key,
+                    source_key,
+                    query: request.query,
+                    target: request.target,
+                    question_reference: request.question_reference,
+                    scheduled_at: request.scheduled_at,
+                },
+            )
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        Ok(geo_worker::SerpCreateReceipt {
+            measurement: serp_tool_measurement(scope, &measurement)?,
+        })
+    }
+
+    async fn serp_read(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::SerpReadRequest,
+    ) -> Result<geo_worker::SerpReadResult, HostOpError> {
+        let op = HostOp::SerpRead;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.serp_service(op)?;
+        let limit = request.limit.unwrap_or(5) as usize;
+        let mut result = geo_worker::SerpReadResult {
+            mode: request.mode,
+            server_time: Utc::now(),
+            capabilities: vec![],
+            measurements: vec![],
+            observations: vec![],
+            evidence: vec![],
+            next_after: None,
+        };
+        match request.mode {
+            geo_worker::SerpReadMode::Capabilities => {
+                result.capabilities = service
+                    .capabilities(scope)
+                    .await
+                    .map_err(|error| worker_error(op, error))?
+                    .into_iter()
+                    .map(|source| geo_worker::SerpToolCapability {
+                        source_key: source.source_key,
+                        engine: "google".into(),
+                        country: source.protocol_defaults.country,
+                        city: source.protocol_defaults.city,
+                        language: source.protocol_defaults.language,
+                        requested_depth: source.protocol_defaults.requested_depth,
+                    })
+                    .collect();
+                if result.capabilities.len() > 32 {
+                    return Err(HostOpError::invalid_request(
+                        op,
+                        "search source selection exceeds tool capacity",
+                    ));
+                }
+            }
+            geo_worker::SerpReadMode::History => {
+                let page = service
+                    .list(scope, request.after, limit)
+                    .await
+                    .map_err(|error| worker_error(op, error))?;
+                result.next_after = page.next_after;
+                result.measurements = page
+                    .items
+                    .iter()
+                    .map(|measurement| serp_tool_measurement(scope, measurement))
+                    .collect::<Result<_, _>>()?;
+            }
+            geo_worker::SerpReadMode::Detail => {
+                let page = service
+                    .detail(
+                        scope,
+                        request.measurement_id.expect("validated"),
+                        request.after,
+                        limit,
+                    )
+                    .await
+                    .map_err(|error| worker_error(op, error))?;
+                result.next_after = page.next_after;
+                result
+                    .measurements
+                    .push(serp_tool_measurement(scope, &page.measurement)?);
+                result.observations = page
+                    .observations
+                    .iter()
+                    .map(|observation| serp_tool_observation(&page.measurement, observation))
+                    .collect::<Result<_, _>>()?;
+            }
+            geo_worker::SerpReadMode::Sources => {
+                let id = request.measurement_id.expect("validated");
+                let detail = service
+                    .detail(scope, id, None, 1)
+                    .await
+                    .map_err(|error| worker_error(op, error))?;
+                result
+                    .measurements
+                    .push(serp_tool_measurement(scope, &detail.measurement)?);
+                let page = service
+                    .sources(scope, id, request.after, limit)
+                    .await
+                    .map_err(|error| worker_error(op, error))?;
+                result.next_after = page.next_after;
+                result.evidence = page
+                    .items
+                    .into_iter()
+                    .map(|source| geo_worker::SerpToolEvidence {
+                        evidence_id: source.evidence_id,
+                        captured_at: source.captured_at,
+                        stored_at: source.stored_at,
+                        body_bytes: source.body_bytes,
+                        body_complete: source.body_complete,
+                    })
+                    .collect();
+            }
+        }
+        Ok(result)
+    }
+
+    async fn serp_reparse(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::SerpReparseRequest,
+    ) -> Result<geo_worker::SerpReparseReceipt, HostOpError> {
+        let op = HostOp::SerpReparse;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let service = self.serp_service(op)?;
+        let detail = service
+            .detail(scope, request.measurement_id, None, 1)
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        let observation = service
+            .reparse(
+                scope,
+                request.measurement_id,
+                crate::ReparseSerpSource {
+                    evidence_id: request.evidence_id,
+                    idempotency_key: request.idempotency_key,
+                },
+            )
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        Ok(geo_worker::SerpReparseReceipt {
+            measurement: serp_tool_measurement(scope, &detail.measurement)?,
+            observation: serp_tool_observation(&detail.measurement, &observation)?,
+        })
+    }
     async fn source_recommendations(
         &self,
         scope: &TenantScope,
@@ -2220,6 +2504,82 @@ mod tests {
         let result = ops.model_complete(&test_scope(), request).await.unwrap();
         assert_eq!(result.text, "hello");
         assert_eq!(result.model, "fake-model");
+    }
+
+    #[test]
+    fn search_projection_withholds_frozen_canaries_but_allows_ad_hoc_queries() {
+        use geo_domain::*;
+        let scope = test_scope();
+        let now = Utc::now();
+        let decoder = crate::DataForSeoSerpSource::new(
+            Arc::new(
+                geo_provider::dataforseo::DataForSeoClient::new(
+                    "synthetic".into(),
+                    "synthetic".into(),
+                )
+                .unwrap(),
+            ),
+            crate::DataForSeoSerpConfig {
+                location_code: 2840,
+                country: "US".into(),
+                city: None,
+                language_code: "en".into(),
+            },
+        )
+        .unwrap();
+        let mut measurement = SerpMeasurement {
+            measurement_id: uuid::Uuid::new_v4(),
+            source_key: "synthetic".into(),
+            protocol: crate::SerpSource::protocol(&decoder, "canary-query"),
+            target: None,
+            target_rule_version: SERP_TARGET_RULE_VERSION.into(),
+            question_binding: None,
+            scheduled_at: now,
+            created_at: now,
+            state: SerpTaskState::Queued,
+        };
+        let observation: SerpObservation = serde_json::from_value(serde_json::json!({
+            "observation_id":uuid::Uuid::new_v4(),"measurement_id":measurement.measurement_id,
+            "attempt_id":uuid::Uuid::new_v4(),"raw_evidence_id":uuid::Uuid::new_v4(),"raw_sha256":"a".repeat(64),
+            "parser_version":"synthetic.v1","provider_observed_at":null,"received_at":now,"analyzed_at":now,
+            "status":"partial","actual_conditions":SerpActualConditions::default(),
+            "coverage":{"requested_depth":10,"observed_organic_depth":1,"pages_received":1,"completion":"partial","truncated":true,"exhaustion_evidence_locator":null},
+            "results":[{"kind":"organic","raw_kind":"organic","raw_url":"https://example.org/canary-url","normalized_url":"https://example.org/canary-url","host":"example.org",
+                "normalization_version":SERP_URL_RULE_VERSION,"title":"canary-title","page":1,"position":1,"organic_rank":1,"absolute_position":1,"locator":"/items/0"}],
+            "source_limitations":["requested_conditions_unverified"]
+        })).unwrap();
+        assert!(
+            serp_tool_measurement(&scope, &measurement)
+                .unwrap()
+                .details_available
+        );
+        assert_eq!(
+            serp_tool_observation(&measurement, &observation)
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
+        measurement.question_binding = Some(FrozenQuestionBinding {
+            reference: QuestionReference {
+                question_id: uuid::Uuid::new_v4(),
+                question_revision_id: uuid::Uuid::new_v4(),
+                question_set_id: uuid::Uuid::new_v4(),
+                question_set_version_id: uuid::Uuid::new_v4(),
+            },
+            purpose: QuestionPurpose::FrozenEvaluation,
+            split_policy_version: "synthetic.v1".into(),
+        });
+        let projected = serp_tool_measurement(&scope, &measurement).unwrap();
+        let result = serp_tool_observation(&measurement, &observation).unwrap();
+        projected.validate_for(&scope).unwrap();
+        result.validate_for(&projected).unwrap();
+        assert!(result.target_match.is_none());
+        assert_eq!(result.omitted_results, 1);
+        let encoded = serde_json::to_string(&(projected, result)).unwrap();
+        for canary in ["canary-query", "canary-url", "canary-title"] {
+            assert!(!encoded.contains(canary));
+        }
     }
 
     fn test_scope() -> TenantScope {

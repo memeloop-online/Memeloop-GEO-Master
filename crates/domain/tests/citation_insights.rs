@@ -118,6 +118,34 @@ fn saved_analysis_is_one_supplementary_sample_with_unchanged_original_coverage()
 }
 
 #[test]
+fn legacy_fixture_flag_does_not_replace_independently_validated_capture_provenance() {
+    use geo_domain::{ObservationAnalysisSource, summarize_citations_with_analyses};
+    let scope = scope();
+    let now = Utc::now();
+    let target = target(now);
+    let mut view = completed(target.clone(), now, ChannelOutcomeStatus::Unknown, &[]);
+    view.attempts[0].outcome.as_mut().unwrap().fixture = true;
+    let original = view.clone();
+    // The API's source resolver independently verifies capture provenance.
+    // The old placeholder flag remains part of the original ledger.
+    let mut revision = analysis(&view, now, "https://example.org/captured-source");
+    revision.request.source = ObservationAnalysisSource::Capture {
+        capture_id: Uuid::new_v4(),
+    };
+    let input = vec![(plan(&scope, &[target]), vec![view])];
+    let page =
+        summarize_citations_with_analyses(&scope, &input, None, &[revision], now, trusted).unwrap();
+    assert_eq!(page.coverage.planned, 1);
+    assert_eq!(page.coverage.fixture, 1);
+    assert_eq!(page.coverage.other_completed, 1);
+    assert_eq!(page.coverage.observed_live, 0);
+    assert_eq!(page.coverage.grounded_saved_analysis, 1);
+    assert_eq!(page.observed_sources.len(), 1);
+    assert_eq!(page.observed_sources[0].citing_answers, 1);
+    assert_eq!(input[0].1[0], original);
+}
+
+#[test]
 fn saved_projection_replaces_live_citations_but_not_status_and_rejects_wrong_attempt_or_audit() {
     use geo_domain::{effective_observation, summarize_citations_with_analyses};
     let scope = scope();

@@ -16,6 +16,16 @@ const BASE: &str = "/v3/serp/google/organic";
 pub const DATAFORSEO_SERP_CONNECTOR_VERSION: &str = "dataforseo.google.organic.standard.v1";
 pub const DATAFORSEO_SERP_PARSER_VERSION: &str = "dataforseo.google.organic.advanced.v1";
 
+/// Fixed, redacted credential diagnostic. It is not a search-capability receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataForSeoConnectionStatus {
+    Connected,
+    AuthenticationFailed,
+    Unavailable,
+    InvalidResponse,
+}
+
 /// Construct only from a persisted, frozen attempt. Tag is correlation, not
 /// provider idempotency. Paid POST requests must never be retried blindly.
 #[derive(Clone, Serialize, Deserialize)]
@@ -147,6 +157,53 @@ pub struct DataForSeoClient {
 }
 
 impl DataForSeoClient {
+    /// Official read-only account endpoint. Never sends a task, returns account
+    /// data, follows redirects, retries, or records the response in tenant evidence.
+    pub async fn test_connection(&self) -> DataForSeoConnectionStatus {
+        let request = async {
+            let mut response = self
+                .client
+                .get(format!("{}/v3/appendix/user_data", self.origin))
+                .basic_auth(&self.login, Some(&self.password))
+                .send()
+                .await
+                .map_err(|_| DataForSeoConnectionStatus::Unavailable)?;
+            if matches!(response.status().as_u16(), 401 | 403) {
+                return Err(DataForSeoConnectionStatus::AuthenticationFailed);
+            }
+            if response.status().as_u16() != 200 {
+                return Err(DataForSeoConnectionStatus::Unavailable);
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| DataForSeoConnectionStatus::Unavailable)?
+            {
+                if bytes.len() + chunk.len() > 256 * 1024 {
+                    return Err(DataForSeoConnectionStatus::InvalidResponse);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| DataForSeoConnectionStatus::InvalidResponse)?;
+            if value["status_code"] != 20000
+                || value["tasks_count"] != 1
+                || !value["tasks"]
+                    .as_array()
+                    .is_some_and(|tasks| tasks.len() == 1)
+                || value["tasks"][0]["status_code"] != 20000
+            {
+                return Err(DataForSeoConnectionStatus::InvalidResponse);
+            }
+            Ok(DataForSeoConnectionStatus::Connected)
+        };
+        match tokio::time::timeout(Duration::from_secs(15), request).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(status)) => status,
+            Err(_) => DataForSeoConnectionStatus::Unavailable,
+        }
+    }
     pub fn new(login: String, password: String) -> Result<Self, SerpAdapterError> {
         Self::build(ORIGIN.into(), login, password, MAX_SERP_RESPONSE_BYTES)
     }
@@ -659,6 +716,43 @@ mod tests {
             }])
         );
         assert!(!format!("{response:?}").contains("synthetic-raw"));
+    }
+
+    #[tokio::test]
+    async fn connection_diagnostic_only_gets_account_endpoint_and_redacts_response() {
+        for (status, body, expected) in [
+            (
+                200,
+                r#"{"status_code":20000,"tasks_count":1,"tasks":[{"status_code":20000,"result":[{"login":"synthetic-account","balance":123}]}]}"#,
+                DataForSeoConnectionStatus::Connected,
+            ),
+            (
+                401,
+                "private diagnostic",
+                DataForSeoConnectionStatus::AuthenticationFailed,
+            ),
+            (200, "not json", DataForSeoConnectionStatus::InvalidResponse),
+            (302, "", DataForSeoConnectionStatus::Unavailable),
+        ] {
+            let (listener, origin) = listen().await;
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                socket.write_all(format!("HTTP/1.1 {status} Synthetic\r\nContent-Length: {}\r\nLocation: /paid-task\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                request
+            });
+            let client = DataForSeoClient::loopback(origin, MAX_SERP_RESPONSE_BYTES).unwrap();
+            let result = client.test_connection().await;
+            assert_eq!(result, expected);
+            let request = server.await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .starts_with("GET /v3/appendix/user_data HTTP/1.1")
+            );
+            let serialized = serde_json::to_string(&result).unwrap();
+            assert!(!serialized.contains("synthetic-account"));
+            assert!(!serialized.contains("balance"));
+        }
     }
 
     #[test]

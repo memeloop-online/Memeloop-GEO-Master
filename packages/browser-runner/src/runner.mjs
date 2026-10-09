@@ -1224,7 +1224,10 @@ export function createRunner(options = {}) {
         let authorizationDiagnostic;
         const result =
           input.action === "reconcile"
-            ? await recoverKimiConversation(page, options)
+            ? await recoverKimiConversation(page, {
+                ...options,
+                verifyAbsence: true,
+              })
             : await deleteKimiConversation(page, {
                 ...options,
                 async authorizeDeletion() {
@@ -1262,6 +1265,7 @@ export function createRunner(options = {}) {
           {
             deleted: "deleted",
             recovered: "present",
+            absent: input.action === "reconcile" ? "absent" : "unknown",
             unknown: "unknown",
             retained: "retained",
             reauth_required: "needs_login",

@@ -204,6 +204,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 48,
         description: "measurement period reports",
     },
+    MigrationMetadata {
+        version: 49,
+        description: "project serp settings",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

@@ -166,8 +166,7 @@ function SourceSample({
                 model: sample.analysis.actual_model,
                 time: date(sample.analysis.analyzed_at),
                 revision: sample.analysis.revision_id,
-              })}{" "}
-              · {t("originalUnchanged")}
+              })}
             </p>
           )}
           <a
@@ -490,10 +489,18 @@ function CitationInsightsContent({
               <span>
                 {t("other", { count: count(coverage!.other_completed) })}
               </span>
-              {coverage!.fixture > 0 && (
-                <span>{t("fixture", { count: count(coverage!.fixture) })}</span>
-              )}
             </div>
+            {coverage!.fixture > 0 && (
+              <details>
+                <summary>{t("recordDetails")}</summary>
+                <dl>
+                  <dt>
+                    <code>fixture</code>
+                  </dt>
+                  <dd>{count(coverage!.fixture)}</dd>
+                </dl>
+              </details>
+            )}
             {page.invalid_citation_urls > 0 && (
               <p role="status">
                 {t("invalid", { count: count(page.invalid_citation_urls) })}

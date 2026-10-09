@@ -10,14 +10,25 @@ pub fn configure_callbacks(
     state: AppState,
     database: &geo_persistence::Database,
 ) -> Result<AppState, Box<dyn Error>> {
-    // Durable history remains readable without any configured paid source.
+    // Sources are discovered from project-owned persistent settings. Old task
+    // reads retain their exact encrypted credential revision after rotation.
+    let serp_settings_repository = std::sync::Arc::new(
+        geo_persistence::PgProjectSerpSettingsRepository::from_database(database),
+    );
+    let serp_settings = match env::var("GEO_CHANNEL_SECRET_KEY") {
+        Ok(key) => geo_api::ProjectSerpSettingsService::persistent(serp_settings_repository, &key)?,
+        Err(_) => geo_api::ProjectSerpSettingsService::unconfigured(serp_settings_repository),
+    };
     let serp = geo_api::SerpService::new(
         std::sync::Arc::new(geo_persistence::PgSerpRepository::from_database(database)),
         state.project_repository(),
         state.question_repository(),
-    );
+    )
+    .with_source_resolver(std::sync::Arc::new(serp_settings.clone()));
     let _serp_dispatcher = geo_api::spawn_serp_dispatcher(serp.clone());
-    let state = state.with_serp_service(serp);
+    let state = state
+        .with_project_serp_settings(serp_settings)
+        .with_serp_service(serp);
     let state =
         state.with_observation_evidence_resolver(geo_api::ObservationEvidenceResolver::new(
             std::sync::Arc::new(
