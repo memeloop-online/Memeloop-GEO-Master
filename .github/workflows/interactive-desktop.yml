@@ -22,12 +22,24 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Build and exercise isolated desktop
+      - uses: docker/setup-buildx-action@v3
+      - name: Build desktop image with persistent layer cache
+        uses: docker/build-push-action@v6
+        with:
+          context: packages/browser-runner
+          file: packages/browser-runner/Dockerfile.interactive
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: geo-interactive-smoke:local
+          cache-from: type=gha,scope=interactive-desktop-linux-amd64
+          cache-to: type=gha,mode=max,scope=interactive-desktop-linux-amd64
+      - name: Exercise the built isolated desktop
         shell: bash
         run: |
           set -o pipefail
           mkdir -p logs
-          bash packages/browser-runner/smoke/verify-container.sh 2>&1 | tee logs/interactive-desktop.log
+          bash packages/browser-runner/smoke/verify-container.sh --prebuilt 2>&1 | tee logs/interactive-desktop.log
       - name: Export verified desktop image
         shell: bash
         run: |
