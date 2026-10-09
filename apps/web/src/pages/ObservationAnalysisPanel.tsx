@@ -121,11 +121,10 @@ export function ObservationAnalysisPanel({
   return (
     <section aria-label={t("title")}>
       <h4>{t("title")}</h4>
-      <p>{t("boundary")}</p>
       {history.isPending && <Spinner size="tiny" label={t("loading")} />}
       {history.isError && <p role="alert">{t("loadFailed")}</p>}
       {history.data && !hasSource && <p>{t("noSource")}</p>}
-      {history.data && !revisions.length && <p>{t("noRevisions")}</p>}
+      {hasSource && !revisions.length && <p>{t("noRevisions")}</p>}
       {hasSource && canWrite && (
         <Button
           disabled={submission.isPending || active || history.isError}

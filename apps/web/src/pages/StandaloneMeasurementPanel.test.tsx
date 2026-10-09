@@ -23,6 +23,7 @@ import {
 const state = vi.hoisted(() => ({
   accounts: [] as unknown[],
   refetch: vi.fn(),
+  accountsError: false,
 }));
 vi.mock("../auth/AuthProvider", () => ({
   useAuth: () => ({
@@ -34,7 +35,8 @@ vi.mock("../api/channels", () => ({
     accounts: {
       data: { items: state.accounts },
       isPending: false,
-      isError: false,
+      isError: state.accountsError,
+      error: state.accountsError ? new Error("Account read failed") : null,
       refetch: state.refetch,
     },
   }),
@@ -127,6 +129,7 @@ function renderPanel(canWrite = true, recordsOnly = false, followTabs = false) {
 }
 beforeEach(() => {
   vi.clearAllMocks();
+  state.accountsError = false;
   state.accounts = [
     {
       account_id: "account-1",
@@ -396,9 +399,10 @@ describe("standalone arbitrary-topic measurement", () => {
       },
     ];
     renderPanel();
-    expect(
-      screen.getByRole("link", { name: "登录或连接 Kimi 账号" }),
-    ).toHaveAttribute("href", "/app/tenant-1/project-1/channels/connect");
+    expect(screen.getByRole("link", { name: "添加测量账号" })).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/channels/connect",
+    );
     expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
     expect(
       screen.getByRole("option", { name: "Kimi 账号 · 需要重新连接" }),
@@ -407,6 +411,50 @@ describe("standalone arbitrary-topic measurement", () => {
       screen.getByRole("link", { name: "重新连接已有账号" }),
     ).toBeInTheDocument();
     expect(getMeasurementOptions).not.toHaveBeenCalled();
+  });
+  it("places one accessible add-account link beside the selector without duplicate header controls", async () => {
+    renderPanel();
+    await screen.findByText("模型：网页当前模型");
+    const selector = screen.getByLabelText("独立测量账号");
+    const add = screen.getByRole("link", { name: "添加测量账号" });
+    expect(selector.parentElement?.parentElement).toContainElement(add);
+    expect(add).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/channels/connect",
+    );
+    expect(screen.queryByText("登录或连接 Kimi 账号")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "刷新账号" }),
+    ).not.toBeInTheDocument();
+  });
+  it("retains one connection entry for an empty account list", () => {
+    state.accounts = [];
+    renderPanel();
+    expect(screen.getByRole("link", { name: "连接账号" })).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/channels/connect",
+    );
+    expect(
+      screen.queryByRole("link", { name: "添加测量账号" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
+  });
+  it("does not offer account connection controls to read-only users", () => {
+    state.accounts = [];
+    renderPanel(false);
+    expect(
+      screen.queryByRole("link", { name: "连接账号" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "添加测量账号" }),
+    ).not.toBeInTheDocument();
+  });
+  it("keeps explicit retry available when account loading fails", async () => {
+    state.accountsError = true;
+    renderPanel();
+    expect(screen.getByText("测量账号无法读取")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(state.refetch).toHaveBeenCalled();
   });
   it("pages through history and reads the selected plan independently", async () => {
     vi.mocked(listMeasurementPlans).mockImplementation(

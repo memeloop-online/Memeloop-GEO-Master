@@ -3,7 +3,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import * as api from "../api/observationAnalysis";
 import type { ObservationAnalysisRevision } from "../api/observationAnalysis";
 import { ObservationAnalysisPanel } from "./ObservationAnalysisPanel";
@@ -39,6 +39,16 @@ const revision: ObservationAnalysisRevision = {
   result: null,
 };
 
+function CurrentRoute() {
+  const location = useLocation();
+  return (
+    <output data-testid="current-route">
+      {location.pathname}
+      {location.search}
+    </output>
+  );
+}
+
 function setup(
   items: ObservationAnalysisRevision[] = [],
   eligible = true,
@@ -67,6 +77,7 @@ function setup(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider client={client}>
         <MemoryRouter>
+          <CurrentRoute />
           <ObservationAnalysisPanel
             tenantId="tenant"
             projectId="project"
@@ -88,6 +99,43 @@ afterEach(async () => {
 });
 
 describe("saved response analysis", () => {
+  it.each([
+    ["zh-CN", "配置解析模型", "重新解析"],
+    ["en", "Configure analysis model", "Reanalyze"],
+  ])(
+    "keeps direct optional AI settings navigation available after analysis failure in %s",
+    async (language, linkName, reanalyzeName) => {
+      await i18n.changeLanguage(language);
+      const { create } = setup([
+        {
+          ...revision,
+          state: "completed",
+          result: {
+            actual_model: "received-model",
+            candidate_json: null,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            outcome: { status: "failed", code: "model_http_unauthorized" },
+          },
+        },
+      ]);
+      const reanalyze = await screen.findByRole("button", {
+        name: reanalyzeName,
+      });
+      expect(reanalyze).toBeEnabled();
+      const link = screen.getByRole("link", { name: linkName });
+      expect(link).toHaveAttribute(
+        "href",
+        "/app/tenant/project/settings?tab=ai",
+      );
+      await userEvent.click(link);
+      expect(screen.getByTestId("current-route")).toHaveTextContent(
+        "/app/tenant/project/settings?tab=ai",
+      );
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     ["model_unconfigured", "failureConfiguration"],
     ["model_access_denied", "failureAccess"],
@@ -239,7 +287,7 @@ describe("saved response analysis", () => {
       "attempt",
     ]);
     expect(screen.getByRole("button", { name: "重新解析" })).toBeDisabled();
-    expect(screen.getByText(/原测量状态保持不变/)).toBeInTheDocument();
+    expect(screen.queryByText(/原测量状态保持不变/)).not.toBeInTheDocument();
   });
 
   it("renders only verified answer text and safe citations with actual model and source provenance", async () => {

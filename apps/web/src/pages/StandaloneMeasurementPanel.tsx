@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Button, Field, Select, Textarea } from "@fluentui/react-components";
+import {
+  Button,
+  Field,
+  Select,
+  Textarea,
+  Tooltip,
+} from "@fluentui/react-components";
+import { AddRegular } from "@fluentui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
@@ -19,6 +26,7 @@ import {
 } from "../api/questions";
 import { ErrorState, LoadingState } from "../components/AsyncState";
 import { PlannedTarget } from "./ChannelJobsPage";
+import "./measurementMessages";
 
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : "请稍后重试。";
@@ -252,24 +260,6 @@ export function StandaloneMeasurementPanel({
         <>
           <h2>开始测量</h2>
           <p>输入问题，选择账号，查看联网搜索答案。</p>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              flexWrap: "wrap",
-              gap: 8,
-            }}
-          >
-            <Link to={`/app/${tenantId}/${projectId}/channels/connect`}>
-              登录或连接 Kimi 账号
-            </Link>
-            <Button
-              appearance="subtle"
-              onClick={() => void channels.accounts.refetch()}
-            >
-              刷新账号
-            </Button>
-          </div>
           {channels.accounts.isPending && (
             <LoadingState label="正在读取测量账号" />
           )}
@@ -282,8 +272,14 @@ export function StandaloneMeasurementPanel({
           )}
           {!channels.accounts.isPending &&
             !channels.accounts.isError &&
-            !accounts.length && (
-              <p role="status">请先连接并登录一个 Kimi 账号。</p>
+            !accounts.length &&
+            canWrite && (
+              <p role="status">
+                {t("noMeasurementAccount")}{" "}
+                <Link to={`/app/${tenantId}/${projectId}/channels/connect`}>
+                  {t("connectMeasurementAccount")}
+                </Link>
+              </p>
             )}
           {!canWrite && <p role="status">当前权限只能查看测量历史。</p>}
           {canWrite && (
@@ -387,33 +383,58 @@ export function StandaloneMeasurementPanel({
                 </>
               )}
               <Field label="独立测量账号">
-                <Select
-                  value={selectedAccount?.account_id ?? ""}
-                  onChange={(_, data) => setAccountId(data.value)}
-                  disabled={submission.isPending || !accounts.length}
-                >
-                  {!selectedAccount && (
-                    <option value="">
-                      {accounts.length ? "请重新连接账号" : "尚未连接账号"}
-                    </option>
-                  )}
-                  {accounts.map((account) => (
-                    <option
-                      key={account.account_id}
-                      value={account.account_id}
-                      disabled={!account.enabled || account.status !== "ready"}
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <Select
+                    style={{ flex: 1, minWidth: 0 }}
+                    value={selectedAccount?.account_id ?? ""}
+                    onChange={(_, data) => setAccountId(data.value)}
+                    disabled={submission.isPending || !accounts.length}
+                  >
+                    {!selectedAccount && (
+                      <option value="">
+                        {accounts.length ? "请重新连接账号" : "尚未连接账号"}
+                      </option>
+                    )}
+                    {accounts.map((account) => (
+                      <option
+                        key={account.account_id}
+                        value={account.account_id}
+                        disabled={
+                          !account.enabled || account.status !== "ready"
+                        }
+                      >
+                        {account.display_name ?? "Kimi 账号"} ·{" "}
+                        {account.enabled && account.status === "ready"
+                          ? "已登录"
+                          : !account.enabled || account.status === "disabled"
+                            ? "已停用"
+                            : account.status === "unverified"
+                              ? "身份待验证"
+                              : "需要重新连接"}
+                      </option>
+                    ))}
+                  </Select>
+                  {accounts.length > 0 && (
+                    <Tooltip
+                      content={t("addMeasurementAccount")}
+                      relationship="label"
                     >
-                      {account.display_name ?? "Kimi 账号"} ·{" "}
-                      {account.enabled && account.status === "ready"
-                        ? "已登录"
-                        : !account.enabled || account.status === "disabled"
-                          ? "已停用"
-                          : account.status === "unverified"
-                            ? "身份待验证"
-                            : "需要重新连接"}
-                    </option>
-                  ))}
-                </Select>
+                      <Link
+                        to={`/app/${tenantId}/${projectId}/channels/connect`}
+                        aria-label={t("addMeasurementAccount")}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          minWidth: 32,
+                          minHeight: 32,
+                        }}
+                      >
+                        <AddRegular aria-hidden="true" />
+                      </Link>
+                    </Tooltip>
+                  )}
+                </div>
               </Field>
               {accounts.some(
                 (account) => !account.enabled || account.status !== "ready",

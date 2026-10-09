@@ -1,13 +1,15 @@
 name: Demo application images
 
 on:
+  # Manual dispatch deliberately rebuilds both images, regardless of path diff.
   workflow_dispatch:
   push:
     branches: [main, integration/w00-pr-stack]
     paths:
       - Dockerfile
       - .dockerignore
-      - deploy/demo/**
+      - deploy/demo/Dockerfile.web
+      - deploy/demo/nginx.conf
       - .github/workflows/demo-images.yml
       - Cargo.toml
       - Cargo.lock
@@ -18,6 +20,12 @@ on:
       - package.json
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
+      - LICENSE
+      - scripts/bundle-agent.mjs
+      - scripts/verify-web-image.mjs
+      - packages/browser-runner/package.json
+      - packages/browser-runner/package-lock.json
+      - packages/browser-runner/src/observation-extraction-prompt.txt
 
 permissions:
   contents: read
@@ -28,17 +36,62 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      components: ${{ github.event_name == 'workflow_dispatch' && '["api","web"]' || steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select images affected by this push
+        if: github.event_name != 'workflow_dispatch'
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # Compare this push with its previous tip, not the default branch.
+          base: ${{ github.ref }}
+          filters: |
+            api:
+              - '.github/workflows/demo-images.yml'
+              - '.dockerignore'
+              - 'LICENSE'
+              - 'Dockerfile'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'migrations/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'apps/web/package.json'
+              - 'packages/agent-runtime/**'
+              - 'packages/browser-runner/package.json'
+              - 'packages/browser-runner/src/observation-extraction-prompt.txt'
+              - 'scripts/bundle-agent.mjs'
+            web:
+              - '.github/workflows/demo-images.yml'
+              - '.dockerignore'
+              - 'LICENSE'
+              - 'deploy/demo/Dockerfile.web'
+              - 'deploy/demo/nginx.conf'
+              - 'apps/web/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'packages/agent-runtime/package.json'
+              - 'packages/browser-runner/package.json'
+              - 'packages/browser-runner/package-lock.json'
+              - 'scripts/verify-web-image.mjs'
   images:
+    needs: changes
+    if: needs.changes.outputs.components != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - component: api
-            dockerfile: Dockerfile
-          - component: web
-            dockerfile: deploy/demo/Dockerfile.web
+        component: ${{ fromJSON(needs.changes.outputs.components) }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -69,7 +122,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: ${{ matrix.component == 'api' && 'Dockerfile' || 'deploy/demo/Dockerfile.web' }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.image.outputs.tag }}

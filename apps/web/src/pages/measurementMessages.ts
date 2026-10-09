@@ -1,6 +1,9 @@
 import i18n from "../i18n";
 
 const zh = {
+  addMeasurementAccount: "添加测量账号",
+  noMeasurementAccount: "还没有可用的测量账号。",
+  connectMeasurementAccount: "连接账号",
   measure: "开始测量",
   records: "测量记录",
   insights: "信源洞察",
@@ -76,6 +79,9 @@ const zh = {
 } as const;
 
 const en = {
+  addMeasurementAccount: "Add measurement account",
+  noMeasurementAccount: "No measurement account is available yet.",
+  connectMeasurementAccount: "Connect an account",
   measure: "Start measurement",
   records: "Measurement records",
   insights: "Citation insights",
