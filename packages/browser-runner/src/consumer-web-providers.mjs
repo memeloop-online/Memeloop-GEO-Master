@@ -12,13 +12,13 @@ export const consumerWebProviders = Object.freeze({
     origin: "https://www.doubao.com",
     entry: "https://www.doubao.com/chat/",
     loginEntryAvailable: true,
-    loginSupported: false,
+    loginSupported: true,
   }),
   deepseek: Object.freeze({
     origin: "https://chat.deepseek.com",
     entry: "https://chat.deepseek.com/",
     loginEntryAvailable: true,
-    loginSupported: false,
+    loginSupported: true,
   }),
   glm: Object.freeze({
     origin: "https://chatglm.cn",

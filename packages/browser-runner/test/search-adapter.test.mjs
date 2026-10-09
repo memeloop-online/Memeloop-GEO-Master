@@ -265,6 +265,8 @@ test("installed measurement capability is explicitly unverified", async () => {
       placement_slot: "primary",
       connector_version: "live_unverified.source_derived.v1",
       operations: ["measure"],
+      login_entry_available: true,
+      login_supported: true,
       verified: false,
     });
   } finally {

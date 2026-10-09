@@ -769,11 +769,27 @@ async fn platform_catalogue_requires_session_but_no_tenant_selector() {
         .await
         .unwrap();
     assert_eq!(authenticated.status(), StatusCode::OK);
+    let body = json_body(authenticated).await;
+    let items = body["items"].as_array().unwrap();
+    let ids: Vec<_> = items
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        json_body(authenticated).await["items"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4
+        ids,
+        [
+            "zhihu",
+            "baidu_creator",
+            "xiaohongshu",
+            "kimi",
+            "doubao",
+            "deepseek",
+            "glm"
+        ]
     );
+    for item in items {
+        assert!(item["login_entry_available"].is_boolean());
+        assert!(item["login_supported"].is_boolean());
+        assert!(item["measurement_supported"].is_boolean());
+    }
 }

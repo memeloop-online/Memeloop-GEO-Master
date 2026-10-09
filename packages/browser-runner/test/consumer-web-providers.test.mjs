@@ -24,10 +24,7 @@ test("consumer web catalog locks HTTPS entries without conflating identity or me
     assert.equal(url.hash, "");
     assert.equal(adapters[platform].entry, provider.entry);
     assert.equal(provider.loginEntryAvailable, true);
-    assert.equal(
-      provider.loginSupported,
-      platform === "kimi" || platform === "glm",
-    );
+    assert.equal(provider.loginSupported, true);
     assert.deepEqual(
       adapters[platform].operations,
       platform === "kimi" ? ["measure"] : [],
@@ -42,7 +39,7 @@ test("capabilities expose entry availability separately from supported account c
     for (const platform of pending) {
       const connector = connectors.find((item) => item.platform === platform);
       assert.equal(connector.login_entry_available, true);
-      assert.equal(connector.login_supported, false);
+      assert.equal(connector.login_supported, true);
       assert.equal(connector.verified, false);
       assert.deepEqual(connector.operations, []);
     }
@@ -57,17 +54,12 @@ test("capabilities expose entry availability separately from supported account c
   }
 });
 
-test("pending adapters neither probe guessed APIs nor fabricate identity or measurement", async () => {
-  const page = new Proxy(
-    {},
-    {
-      get() {
-        throw new Error(
-          "unimplemented adapter must not interact with the page",
-        );
-      },
+test("installed identity probes do not fabricate identity or measurement on missing responses", async () => {
+  const page = {
+    async evaluate() {
+      return null;
     },
-  );
+  };
   for (const platform of pending) {
     assert.equal(await adapters[platform].identify(page), null);
     const result = await adapters[platform].execute(page, "measure", {});

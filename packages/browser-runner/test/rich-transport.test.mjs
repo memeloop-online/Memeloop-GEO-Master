@@ -25,6 +25,7 @@ let captureMode = "grant";
 let measurementActions = 0;
 const captures = [];
 const interpretationCalls = [];
+const policyTimings = [];
 
 function canonical(value) {
   if (Array.isArray(value))
@@ -329,6 +330,7 @@ before(async () => {
     callbackToken: serviceToken,
     captureOrigin: `http://127.0.0.1:${callbackServer.address().port}`,
     captureToken: serviceToken,
+    onPolicyTiming: (entry) => policyTimings.push(entry),
   });
   await new Promise((resolve) => runnerServer.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${runnerServer.address().port}`;
@@ -543,6 +545,22 @@ test("source and raw extraction checkpoints precede candidate with shared ordere
   assert.equal(measurementActions, 1);
   assert.equal(captures.length, 3);
   assert.deepEqual(
+    policyTimings.map((entry) => entry.stage),
+    ["started", "headers", "complete"],
+  );
+  for (const entry of policyTimings) {
+    assert.equal(entry.event, "observation_policy_callback");
+    assert.ok(Number.isSafeInteger(entry.elapsed_ms) && entry.elapsed_ms >= 0);
+    assert.deepEqual(
+      Object.keys(entry).sort(),
+      (entry.stage === "headers"
+        ? ["event", "stage", "elapsed_ms", "status"]
+        : ["event", "stage", "elapsed_ms"]
+      ).sort(),
+    );
+  }
+  assert.equal(policyTimings[1].status, 200);
+  assert.deepEqual(
     interpretationCalls.map((call) => call.path),
     [
       "/internal/v1/observation-ai/policy",
@@ -604,4 +622,72 @@ test("lost source callback stops extraction and does not retry", async () => {
   assert.equal(captures.at(-1).snapshot.phase, "source");
   assert.deepEqual(await sendMeasurement("capture-failure"), result);
   captureMode = "grant";
+});
+
+test("policy timing failures never alter callback results or expose error details", async () => {
+  let status = 200;
+  const entries = [];
+  const callback = createServer((_request, response) => {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({ prefer_connected_account: false, config_version: 1 }),
+    );
+  });
+  await new Promise((resolve) => callback.listen(0, "127.0.0.1", resolve));
+  const server = createRunnerServer({
+    token: serviceToken,
+    captureOrigin: `http://127.0.0.1:${callback.address().port}`,
+    captureToken: serviceToken,
+    runner: {
+      async execute(_input, _capture, observationAi) {
+        return observationAi.policy({ synthetic: "must-not-be-logged" });
+      },
+    },
+    onPolicyTiming: (entry) => {
+      entries.push(entry);
+      throw new Error("synthetic-private-logger-error");
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    for (const expected of [200, 503]) {
+      status = expected;
+      entries.length = 0;
+      const response = await fetch(
+        `http://127.0.0.1:${server.address().port}/v1/executions`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${serviceToken}`,
+            "content-type": "application/json",
+          },
+          body: "{}",
+        },
+      );
+      assert.equal(response.status, expected);
+      await response.json();
+      assert.deepEqual(
+        entries.map((entry) => entry.stage),
+        ["started", "headers", expected === 200 ? "complete" : "failed"],
+      );
+      for (const entry of entries) {
+        assert.deepEqual(
+          Object.keys(entry).sort(),
+          (entry.stage === "headers"
+            ? ["event", "stage", "elapsed_ms", "status"]
+            : ["event", "stage", "elapsed_ms"]
+          ).sort(),
+        );
+      }
+      assert.equal(entries[1].status, expected);
+      assert.equal(JSON.stringify(entries).includes("private"), false);
+      assert.equal(
+        JSON.stringify(entries).includes("must-not-be-logged"),
+        false,
+      );
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => callback.close(resolve));
+  }
 });

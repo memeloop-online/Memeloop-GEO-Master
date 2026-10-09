@@ -7,6 +7,19 @@ import {
 } from "./kimi-connect-search.mjs";
 import { reportObservationDiagnostic } from "./ai-observation-parser.mjs";
 import { consumerWebProviders } from "./consumer-web-providers.mjs";
+import {
+  probeGlmAccount,
+  probeDeepseekAccount,
+  probeDoubaoAccount,
+} from "./consumer-web-identity.mjs";
+export {
+  glmIdentity,
+  deepseekIdentity,
+  doubaoIdentity,
+  probeGlmAccount,
+  probeDeepseekAccount,
+  probeDoubaoAccount,
+} from "./consumer-web-identity.mjs";
 
 export const CONNECTOR_VERSION = "live_unverified.source_derived.v1";
 
@@ -134,87 +147,6 @@ export function baiduIdentity(data) {
 
 export function kimiIdentity(data) {
   return ownIdentity(data?.user?.id, data?.user?.nickname);
-}
-
-export function glmIdentity(data) {
-  if (data?.status !== 0 || data.result?.is_guest !== false) return null;
-  // Public client account state uses _id as stable identity; a guest, display
-  // name alone, or saved local state is not verified account ownership.
-  if (typeof data.result._id !== "string") return null;
-  return ownIdentity(data.result._id, data.result.username);
-}
-
-export async function probeGlmAccount(
-  page,
-  { trustedOrigin = consumerWebProviders.glm.origin } = {},
-) {
-  try {
-    // Public client account module (2026-10-10): fixed user/info GET, bearer
-    // cookie, status/result envelope. No login, refresh, or generation API.
-    const data = await page.evaluate(
-      async ({ origin }) => {
-        if (location.origin !== origin) return null;
-        const cookie = document.cookie
-          .split(";")
-          .map((part) => part.trim())
-          .find((part) => part.startsWith("chatglm_token="));
-        if (!cookie) return null;
-        const token = decodeURIComponent(cookie.slice("chatglm_token=".length));
-        if (!token) return null;
-        const path = "/chatglm/user-api/user/info";
-        const response = await fetch(path, {
-          method: "GET",
-          credentials: "same-origin",
-          redirect: "error",
-          signal: AbortSignal.timeout(10_000),
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "App-Name": "chatglm",
-          },
-        });
-        if (
-          response.status !== 200 ||
-          response.url !== `${origin}${path}` ||
-          !/^application\/json(?:\s*;|$)/i.test(
-            response.headers.get("content-type") ?? "",
-          )
-        )
-          return null;
-        const reader = response.body?.getReader();
-        if (!reader) return null;
-        const decoder = new TextDecoder();
-        let text = "";
-        let bytes = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          bytes += value.byteLength;
-          if (bytes > 128_000) {
-            await reader.cancel();
-            return null;
-          }
-          text += decoder.decode(value, { stream: true });
-        }
-        text += decoder.decode();
-        const body = JSON.parse(text);
-        // Only fields needed for identity leave the page; never return cookies,
-        // token/refresh material, response diagnostics or unrelated profile data.
-        return {
-          status: body?.status,
-          result: body?.result && {
-            _id: body.result._id,
-            username: body.result.username,
-            is_guest: body.result.is_guest,
-          },
-        };
-      },
-      { origin: trustedOrigin },
-    );
-    return glmIdentity(data);
-  } catch {
-    return null;
-  }
 }
 
 export async function probeKimiAccount(
@@ -1184,31 +1116,6 @@ export async function publishBaidu(
 }
 
 export const adapters = Object.freeze({
-  ...Object.fromEntries(
-    Object.entries(consumerWebProviders)
-      .filter(([, provider]) => !provider.loginSupported)
-      .map(([platform, provider]) => [
-        platform,
-        Object.freeze({
-          ...provider,
-          connectorVersion: "consumer_web_entry.v1",
-          operations: Object.freeze([]),
-          async identify() {
-            // A page, cookie or entered nickname cannot prove own-account
-            // identity. Install a verified provider probe before completing.
-            return null;
-          },
-          async execute() {
-            return {
-              status: "unsupported",
-              reason: "measurement_adapter_unavailable",
-              evidence: [],
-              connector_version: "consumer_web_entry.v1",
-            };
-          },
-        }),
-      ]),
-  ),
   zhihu: Object.freeze({
     loginEntryAvailable: true,
     loginSupported: true,
@@ -1287,6 +1194,24 @@ export const adapters = Object.freeze({
     identify(page) {
       return probeGlmAccount(page);
     },
+    async execute() {
+      return unsupported("measurement_adapter_unavailable");
+    },
+  }),
+  deepseek: Object.freeze({
+    ...consumerWebProviders.deepseek,
+    connectorVersion: CONNECTOR_VERSION,
+    operations: Object.freeze([]),
+    identify: probeDeepseekAccount,
+    async execute() {
+      return unsupported("measurement_adapter_unavailable");
+    },
+  }),
+  doubao: Object.freeze({
+    ...consumerWebProviders.doubao,
+    connectorVersion: CONNECTOR_VERSION,
+    operations: Object.freeze([]),
+    identify: probeDoubaoAccount,
     async execute() {
       return unsupported("measurement_adapter_unavailable");
     },

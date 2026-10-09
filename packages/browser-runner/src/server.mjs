@@ -19,6 +19,7 @@ function serviceCallback(
   path,
   maxResponseBytes,
   timeoutMs = 10_000,
+  onTiming,
 ) {
   // Deployment configuration only, never a model/request-selected URL.
   // Private cluster service traffic may use HTTP; external deployments use TLS.
@@ -40,38 +41,60 @@ function serviceCallback(
   )
     throw new Error("invalid_rich_callback_config");
   return async (body, { signal } = {}) => {
-    const response = await fetch(`${origin}${path}`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(body),
-      redirect: "error",
-      signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-        : AbortSignal.timeout(timeoutMs),
-    });
-    if (response.status !== 200)
-      throw new Error("service_callback_unavailable");
-    const length = Number(response.headers.get("content-length") ?? 0);
-    if (length > maxResponseBytes)
-      throw new Error("service_response_oversized");
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error("send_authorization_missing");
-    const chunks = [];
-    let size = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > maxResponseBytes) {
-        await reader.cancel();
-        throw new Error("service_response_oversized");
+    const started = performance.now();
+    const timing = (stage, status) => {
+      try {
+        onTiming?.({
+          event: "observation_policy_callback",
+          stage,
+          elapsed_ms: Math.max(0, Math.round(performance.now() - started)),
+          ...(status === undefined ? {} : { status }),
+        });
+      } catch {
+        // Observability cannot alter the callback or trigger a retry.
       }
-      chunks.push(value);
+    };
+    timing("started");
+    try {
+      const response = await fetch(`${origin}${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+        redirect: "error",
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+          : AbortSignal.timeout(timeoutMs),
+      });
+      timing("headers", response.status);
+      if (response.status !== 200)
+        throw new Error("service_callback_unavailable");
+      const length = Number(response.headers.get("content-length") ?? 0);
+      if (length > maxResponseBytes)
+        throw new Error("service_response_oversized");
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("send_authorization_missing");
+      const chunks = [];
+      let size = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxResponseBytes) {
+          await reader.cancel();
+          throw new Error("service_response_oversized");
+        }
+        chunks.push(value);
+      }
+      const result = JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
+      timing("complete");
+      return result;
+    } catch (error) {
+      timing("failed");
+      throw error;
     }
-    return JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
   };
 }
 
@@ -116,6 +139,7 @@ export function createRunnerServer({
   captureOrigin = process.env.GEO_BROWSER_RUNNER_CAPTURE_ORIGIN ??
     callbackOrigin,
   captureToken = process.env.GEO_BROWSER_RUNNER_CAPTURE_TOKEN ?? callbackToken,
+  onPolicyTiming = (entry) => console.info(JSON.stringify(entry)),
 } = {}) {
   if (!token || typeof token !== "string")
     throw new Error("GEO_BROWSER_RUNNER_TOKEN_required");
@@ -137,6 +161,8 @@ export function createRunnerServer({
       captureToken,
       "/internal/v1/observation-ai/policy",
       8192,
+      10_000,
+      onPolicyTiming,
     ),
     extract: serviceCallback(
       captureOrigin,

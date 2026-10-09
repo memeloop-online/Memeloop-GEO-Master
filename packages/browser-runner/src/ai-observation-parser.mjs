@@ -60,6 +60,7 @@ const diagnosticCodes = new Set([
   "budget_exhausted",
   "unexpected_exception",
   "timeout",
+  "policy_timeout",
 ]);
 const diagnosticRoutes = new Set(["signed_in_browser", "configured_model_api"]);
 
@@ -291,14 +292,20 @@ async function boundedRoute(invoke, { signal, deadlineAt, timeoutMs }) {
     deadlineAt ?? Infinity,
     performance.now() + timeoutMs,
   );
+  const timeoutCode = () =>
+    signal?.aborted
+      ? observationAbortCode(signal)
+      : deadlineAt !== undefined && deadlineAt <= performance.now()
+        ? "budget_exhausted"
+        : "timeout";
   if (signal?.aborted || routeDeadline <= performance.now())
-    return { timedOut: true };
+    return { timedOut: true, timeoutCode: timeoutCode() };
   let timer;
   let stop;
   const stopped = new Promise((resolve) => (stop = resolve));
   const abort = () => {
     controller.abort();
-    stop({ timedOut: true });
+    stop({ timedOut: true, timeoutCode: timeoutCode() });
   };
   signal?.addEventListener("abort", abort, { once: true });
   timer = setTimeout(
@@ -399,14 +406,23 @@ export async function interpretObservation(
         reportObservationDiagnostic(
           onDiagnostic,
           "configuration",
-          "budget_exhausted",
+          policyResult.timeoutCode === "timeout"
+            ? "policy_timeout"
+            : policyResult.timeoutCode,
         );
         return null;
       }
       policy = policyResult.value;
     }
-  } catch {
-    reportObservationDiagnostic(onDiagnostic, "configuration", "unverified");
+  } catch (error) {
+    const code = signal?.aborted
+      ? observationAbortCode(signal)
+      : deadlineAt !== undefined && deadlineAt <= performance.now()
+        ? "budget_exhausted"
+        : error?.name === "TimeoutError"
+          ? "policy_timeout"
+          : "unverified";
+    reportObservationDiagnostic(onDiagnostic, "configuration", code);
     return null;
   }
   const configuredExtract =

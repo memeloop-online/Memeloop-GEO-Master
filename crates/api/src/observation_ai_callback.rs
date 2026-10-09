@@ -110,16 +110,40 @@ async fn policy(
     State(service): State<ObservationAiCallbackService>,
     Json(request): Json<SourceRequest>,
 ) -> Result<Json<Policy>, StatusCode> {
-    let (scope, _) = service.source(&request).await?;
-    let view = service
-        .settings
-        .get(&scope, ProjectAiUsage::ObservationAnalysis)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(Json(Policy {
-        prefer_connected_account: view.prefer_connected_account,
-        config_version: view.revision,
-    }))
+    let total = std::time::Instant::now();
+    policy_timing("entered", total, true);
+    let result = async {
+        // This includes repository read AND validation; do not label it DB-only.
+        let started = std::time::Instant::now();
+        let source = service.source(&request).await;
+        policy_timing("source_load_validate", started, source.is_ok());
+        let (scope, _) = source?;
+        // get also resolves inherited model metadata when applicable.
+        let started = std::time::Instant::now();
+        let view = service
+            .settings
+            .get(&scope, ProjectAiUsage::ObservationAnalysis)
+            .await;
+        policy_timing("settings_get", started, view.is_ok());
+        let view = view.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        Ok(Json(Policy {
+            prefer_connected_account: view.prefer_connected_account,
+            config_version: view.revision,
+        }))
+    }
+    .await;
+    policy_timing("total", total, result.is_ok());
+    result
+}
+
+fn policy_timing(stage: &'static str, started: std::time::Instant, success: bool) {
+    tracing::info!(
+        event = "observation_policy_timing",
+        stage,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        success,
+        "observation policy timing"
+    );
 }
 
 async fn extract(

@@ -1532,16 +1532,80 @@ async function main() {
   );
   await visualEditor.locator("a").click();
   await visualEditor.locator("a").evaluate((anchor) => {
+    const editor = anchor.closest("[contenteditable='true']");
+    editor?.focus();
     const selection = document.getSelection();
     const range = document.createRange();
     range.selectNodeContents(anchor);
     selection?.removeAllRanges();
     selection?.addRange(range);
+    // Let the installed editor consume the standard DOM selection event before
+    // a toolbar interaction. A DOM Range alone is not an editor-state barrier.
+    // This guards a suspected race; the original CI failure was not reproduced.
+    document.dispatchEvent(new Event("selectionchange"));
   });
-  assert(
-    (await page.evaluate(() => getSelection()?.toString())) === "示例链接",
-    "Existing linked text was not selected before revising its URL",
-  );
+  try {
+    await page.waitForFunction(
+      () => {
+        const editor = document.querySelector(
+          "[data-testid='knowledge-visual-editor'] [contenteditable='true']",
+        );
+        const anchor = editor?.querySelector("a");
+        const selection = document.getSelection();
+        const linkButton = document.querySelector(
+          "[role='toolbar'][aria-label='资料编辑'] button[aria-label='添加链接']",
+        );
+        return (
+          editor?.contains(document.activeElement) &&
+          anchor?.contains(selection?.anchorNode) &&
+          anchor?.contains(selection?.focusNode) &&
+          selection?.toString() === "示例链接" &&
+          linkButton?.getAttribute("aria-pressed") === "true"
+        );
+      },
+      undefined,
+      { timeout: 5_000 },
+    );
+    assert(
+      (await page.evaluate(() => getSelection()?.toString())) === "示例链接",
+      "Existing linked text was not selected before revising its URL",
+    );
+  } catch (error) {
+    // Only this script's synthetic editor is inspected, never request headers,
+    // storage, page metadata, arbitrary DOM text, or application credentials.
+    const diagnostic = await visualEditor
+      .evaluate((editor) => {
+        const anchor = editor.querySelector("a");
+        const selection = document.getSelection();
+        return {
+          editorConnected: editor.isConnected,
+          editorFocused: editor.contains(document.activeElement),
+          anchorConnected: anchor?.isConnected ?? false,
+          anchorTextMatches: anchor?.textContent === "示例链接",
+          selectedTextMatches: selection?.toString() === "示例链接",
+          selectedTextLength: selection?.toString().length ?? 0,
+          selectionCollapsed: selection?.isCollapsed ?? null,
+          anchorWithinLink: anchor?.contains(selection?.anchorNode) ?? false,
+          focusWithinLink: anchor?.contains(selection?.focusNode) ?? false,
+          anchorOffset: selection?.anchorOffset ?? null,
+          focusOffset: selection?.focusOffset ?? null,
+          linkActive: document
+            .querySelector(
+              "[role='toolbar'][aria-label='资料编辑'] button[aria-label='添加链接']",
+            )
+            ?.getAttribute("aria-pressed"),
+        };
+      })
+      .catch(() => ({ diagnosticUnavailable: true }));
+    console.error("Synthetic link selection diagnostic:", diagnostic);
+    await visualEditor
+      .screenshot({
+        path: join(runDir, "p04-synthetic-link-selection-failure.png"),
+        timeout: 2_000,
+      })
+      .catch(() => undefined);
+    throw error;
+  }
   await editorToolbar.getByRole("button", { name: "添加链接" }).click();
   const linkPopover = page.locator(".source-link-popover");
   const linkInput = linkPopover.getByRole("textbox", { name: "链接地址" });
@@ -1747,8 +1811,17 @@ async function main() {
 
   await page.goto(`${base}/publications`);
   await page.getByRole("heading", { name: "发布目标与执行记录" }).waitFor();
-  await page.getByText("网页账号登录只表示可尝试采样").waitFor();
-  await page.getByText("官方联网搜索适配器尚未实测验证").waitFor();
+  // Both limitations are now expressed by measurementCapabilityNote in the
+  // shared measurement translations: login is not a successful measurement,
+  // and missing answers or unverified search must retain their actual result.
+  await page
+    .getByText("账号已登录不代表本次测量成功", { exact: false })
+    .waitFor();
+  await page
+    .getByText("无法获取回答或确认联网搜索时，会显示相应结果。", {
+      exact: false,
+    })
+    .waitFor();
   await page.getByText("还没有测量目标。").waitFor();
   assert(
     apiResponses.some(

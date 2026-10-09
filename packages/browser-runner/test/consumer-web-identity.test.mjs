@@ -2,7 +2,15 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { chromium } from "playwright";
-import { adapters, glmIdentity, probeGlmAccount } from "../src/adapters.mjs";
+import {
+  adapters,
+  glmIdentity,
+  probeGlmAccount,
+  deepseekIdentity,
+  doubaoIdentity,
+  probeDeepseekAccount,
+  probeDoubaoAccount,
+} from "../src/adapters.mjs";
 
 const own = () => ({
   status: 0,
@@ -12,6 +20,263 @@ const own = () => ({
     is_guest: false,
   },
 });
+
+const consumerCases = [
+  {
+    provider: "deepseek",
+    probe: probeDeepseekAccount,
+    identity: deepseekIdentity,
+    path: "/api/v0/users/current",
+    own: () => ({
+      code: 0,
+      data: {
+        biz_code: 0,
+        biz_data: {
+          id: "synthetic-account",
+          id_profile: { name: "Synthetic user" },
+          email: "synthetic-private-email",
+          mobile: "synthetic-private-mobile",
+          token: "synthetic-private-token",
+        },
+      },
+    }),
+    invalid: [
+      { code: 40002 },
+      { code: 0, data: { biz_code: 1, biz_data: { id: "synthetic" } } },
+      ...[true, null, "false", {}].map((is_guest) => ({
+        code: 0,
+        data: { biz_code: 0, biz_data: { id: "synthetic", is_guest } },
+      })),
+      {
+        code: 0,
+        data: { biz_code: 0, biz_data: { email: "not-an-identity" } },
+      },
+    ],
+  },
+  {
+    provider: "doubao",
+    probe: probeDoubaoAccount,
+    identity: doubaoIdentity,
+    path: "/passport/account/info/v2/?aid=497858&account_sdk_source=web&sdk_version=2.2.11-doubao.0&device_platform=web",
+    own: () => ({
+      message: "success",
+      data: {
+        user_id_str: "synthetic-account",
+        sec_user_id: "synthetic-secondary",
+        name: "Synthetic user",
+        session_key: "synthetic-private-token",
+        email: "synthetic-private-email",
+        mobile: "synthetic-private-mobile",
+      },
+    }),
+    invalid: [
+      { message: "error", data: { error_code: 13 } },
+      {
+        message: "success",
+        data: {
+          error_code: 13,
+          user_id_str: "synthetic",
+          sec_user_id: "secondary",
+        },
+      },
+      {
+        message: "success",
+        data: { user_id_str: "synthetic", name: "Name only" },
+      },
+      {
+        message: "success",
+        data: { sec_user_id: "secondary", name: "Name only" },
+      },
+      ...[true, null, "false", {}].map((is_guest) => ({
+        message: "success",
+        data: { user_id_str: "synthetic", sec_user_id: "secondary", is_guest },
+      })),
+    ],
+  },
+];
+
+for (const example of consumerCases) {
+  test(`${example.provider} identity excludes guest/error/name-only records and private contact fallback`, () => {
+    assert.deepEqual(example.identity(example.own()), {
+      platform_account_id: "synthetic-account",
+      display_name: "Synthetic user",
+    });
+    for (const body of [null, {}, ...example.invalid])
+      assert.equal(example.identity(body), null);
+    const nameless = example.own();
+    if (example.provider === "deepseek")
+      delete nameless.data.biz_data.id_profile;
+    else delete nameless.data.name;
+    assert.deepEqual(example.identity(nameless), {
+      platform_account_id: "synthetic-account",
+      display_name: "Account · ccount",
+    });
+  });
+
+  test(`${example.provider} shared probe is bounded, scoped, resumable and transfers no credentials`, async () => {
+    const requests = [];
+    const state = {
+      status: 200,
+      type: "application/json",
+      body: JSON.stringify(example.own()),
+      redirect: false,
+    };
+    const server = createServer((request, response) => {
+      if (request.url === "/" || request.url === "/favicon.ico") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end('<!doctype html><input id="draft" value="unsent">');
+        return;
+      }
+      requests.push(request.url);
+      assert.equal(
+        request.url,
+        example.path,
+        "never follow redirect or invoke another endpoint",
+      );
+      assert.equal(request.method, "GET");
+      if (example.provider === "deepseek")
+        assert.equal(request.headers.authorization, "Bearer synthetic-token");
+      else {
+        assert.equal(request.headers["agw-js-conv"], "str");
+        assert.match(
+          request.headers.cookie ?? "",
+          /synthetic_session=synthetic-cookie/,
+        );
+        assert.equal(request.headers.authorization, undefined);
+      }
+      response.writeHead(state.status, {
+        "content-type": state.type,
+        ...(state.redirect ? { location: "/must-not-follow" } : {}),
+      });
+      response.end(state.body);
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    let browser;
+    try {
+      browser = await chromium.launch(
+        process.env.GEO_TEST_CHROMIUM_PATH
+          ? { executablePath: process.env.GEO_TEST_CHROMIUM_PATH }
+          : {},
+      );
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      await page.goto(origin);
+      const options = { trustedOrigin: origin };
+      if (example.provider === "deepseek") {
+        for (const value of [
+          null,
+          "bad-json",
+          JSON.stringify({ value: "synthetic-token", __version: "unknown" }),
+          JSON.stringify({ value: 1, __version: "0" }),
+        ]) {
+          await page.evaluate(
+            (value) =>
+              value === null
+                ? localStorage.removeItem("userToken")
+                : localStorage.setItem("userToken", value),
+            value,
+          );
+          assert.equal(await example.probe(page, options), null);
+        }
+        assert.equal(requests.length, 0);
+        await page.evaluate(() =>
+          localStorage.setItem(
+            "userToken",
+            JSON.stringify({ value: "synthetic-token", __version: "0" }),
+          ),
+        );
+      } else {
+        await context.addCookies([
+          {
+            name: "synthetic_session",
+            value: "synthetic-cookie",
+            url: origin,
+            httpOnly: true,
+          },
+        ]);
+      }
+      assert.equal(await example.probe(page), null);
+      assert.equal(requests.length, 0);
+      const guardedPage = {
+        async evaluate(fn, args) {
+          const projected = await page.evaluate(fn, args);
+          assert.equal(
+            JSON.stringify(projected)?.includes("synthetic-private"),
+            false,
+          );
+          return projected;
+        },
+      };
+      assert.deepEqual(
+        await example.probe(guardedPage, options),
+        example.identity(example.own()),
+      );
+      const restored = await browser.newContext({
+        storageState: await context.storageState(),
+      });
+      const restoredPage = await restored.newPage();
+      await restoredPage.goto(origin);
+      assert.deepEqual(
+        await example.probe(restoredPage, options),
+        example.identity(example.own()),
+      );
+      await restored.close();
+      const emptyPadding = { ...example.own(), padding: "" };
+      const remaining =
+        128_000 - Buffer.byteLength(JSON.stringify(emptyPadding));
+      state.body = JSON.stringify({
+        ...emptyPadding,
+        padding: "x".repeat(remaining),
+      });
+      assert.equal(Buffer.byteLength(state.body), 128_000);
+      assert.deepEqual(
+        await example.probe(guardedPage, options),
+        example.identity(example.own()),
+      );
+      state.body = JSON.stringify({
+        ...emptyPadding,
+        padding: "x".repeat(remaining + 1),
+      });
+      assert.equal(await example.probe(guardedPage, options), null);
+      for (const invalid of [
+        ...example.invalid.map((body) => ({ body: JSON.stringify(body) })),
+        {
+          body: JSON.stringify({
+            ...example.own(),
+            padding: "界".repeat(43_000),
+          }),
+        },
+        { body: "{" },
+        { type: "text/html" },
+        { type: "application/json-invalid" },
+        { status: 401 },
+        { status: 403 },
+        { status: 500 },
+        { status: 302, redirect: true },
+      ]) {
+        Object.assign(
+          state,
+          {
+            status: 200,
+            type: "application/json",
+            body: JSON.stringify(example.own()),
+            redirect: false,
+          },
+          invalid,
+        );
+        assert.equal(await example.probe(guardedPage, options), null);
+      }
+      assert.equal(await page.locator("#draft").inputValue(), "unsent");
+      assert.equal(page.url(), `${origin}/`);
+      assert.equal(context.pages().length, 1);
+      assert.deepEqual(adapters[example.provider].operations, []);
+    } finally {
+      await browser?.close();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+}
 
 test("GLM identity requires a stable server ID and explicit non-guest success", () => {
   assert.deepEqual(glmIdentity(own()), {

@@ -730,8 +730,40 @@ test("policy and API routes have independent bounded cancellation", async () => 
     assert.equal(calls, blocked === "policy" ? 0 : 1);
     assert.equal(
       diagnostics.at(-1).code,
-      blocked === "policy" ? "budget_exhausted" : "timeout",
+      blocked === "policy" ? "policy_timeout" : "timeout",
     );
+  }
+});
+
+test("policy diagnostics distinguish overall deadline, cancellation and transport timeout", async () => {
+  for (const reason of ["deadline", "cancelled", "transport"]) {
+    const controller = new AbortController();
+    const diagnostics = [];
+    let calls = 0;
+    const result = await interpretObservation(exchange, {
+      signal: controller.signal,
+      ...(reason === "deadline" ? { deadlineAt: performance.now() - 1 } : {}),
+      getExtractionPolicy: async () => {
+        calls++;
+        if (reason === "cancelled") {
+          controller.abort();
+          return new Promise(() => {});
+        }
+        throw new DOMException("synthetic private detail", "TimeoutError");
+      },
+      onDiagnostic: (entry) => diagnostics.push(entry),
+    });
+    assert.equal(result, null);
+    assert.equal(calls, reason === "deadline" ? 0 : 1);
+    assert.equal(
+      diagnostics.at(-1).code,
+      {
+        deadline: "budget_exhausted",
+        cancelled: "cancelled",
+        transport: "policy_timeout",
+      }[reason],
+    );
+    assert.equal(JSON.stringify(diagnostics).includes("private"), false);
   }
 });
 
@@ -750,6 +782,23 @@ test("expired interpretation cannot begin either model route", async () => {
     null,
   );
   assert.equal(calls, 0);
+});
+
+test("overall deadline expiring during policy is not a policy timeout", async () => {
+  const diagnostics = [];
+  let entered = false;
+  const result = await interpretObservation(exchange, {
+    deadlineAt: performance.now() + 40,
+    policyTimeoutMs: 10_000,
+    getExtractionPolicy: async () => {
+      entered = true;
+      return new Promise(() => {});
+    },
+    onDiagnostic: (entry) => diagnostics.push(entry),
+  });
+  assert.equal(result, null);
+  assert.equal(entered, true);
+  assert.equal(diagnostics.at(-1).code, "budget_exhausted");
 });
 
 test("source is delivered before either extractor and rejected candidates remain bounded evidence", async () => {
