@@ -34,53 +34,66 @@ const automaticTarget: ChannelTarget = {
   },
 };
 
-function renderAutomaticResult(overrides: Partial<ChannelOutcome> = {}) {
-  return render(
-    <FluentProvider theme={webLightTheme}>
-      <TargetCard
-        target={automaticTarget}
-        tenantId="tenant-1"
-        projectId="project-1"
-        automatic
-        canWrite
-        loading={false}
-        loadError={null}
-        executing={false}
-        executeError={null}
-        onExecute={vi.fn()}
-        onRefresh={vi.fn()}
-        view={{
-          target: automaticTarget,
-          attempts: [
-            {
-              attempt_id: "private-attempt-id",
-              target_id: automaticTarget.target_id,
-              claimed_at: "2026-10-01T00:00:00Z",
-              received_at: "2026-10-01T00:01:00Z",
-              outcome: {
-                status: "observed",
-                detail: "internal_reason_code",
-                occurred_at: "2026-10-01T00:01:00Z",
-                raw_answer: "第一行\n第二行 <script>alert(1)</script>",
-                citations: ["https://example.com/source"],
-                public_url: null,
-                screenshot_ref: null,
-                connector_version: "internal-connector-v3",
-                runner_evidence: [{ source_json: "large-audit-payload" }],
-                fixture: false,
-                ...overrides,
-              },
-            },
-          ],
-        }}
-      />
-    </FluentProvider>,
+async function renderAutomaticResult(overrides: Partial<ChannelOutcome> = {}) {
+  mockApi();
+  const result = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <FluentProvider theme={webLightTheme}>
+        <AuthProvider>
+          <MemoryRouter>
+            <TargetCard
+              target={automaticTarget}
+              tenantId="tenant-1"
+              projectId="project-1"
+              automatic
+              canWrite
+              loading={false}
+              loadError={null}
+              executing={false}
+              executeError={null}
+              onExecute={vi.fn()}
+              onRefresh={vi.fn()}
+              view={{
+                target: automaticTarget,
+                attempts: [
+                  {
+                    attempt_id: "private-attempt-id",
+                    target_id: automaticTarget.target_id,
+                    claimed_at: "2026-10-01T00:00:00Z",
+                    received_at: "2026-10-01T00:01:00Z",
+                    outcome: {
+                      status: "observed",
+                      detail: "internal_reason_code",
+                      occurred_at: "2026-10-01T00:01:00Z",
+                      raw_answer: "第一行\n第二行 <script>alert(1)</script>",
+                      citations: ["https://example.com/source"],
+                      public_url: null,
+                      screenshot_ref: null,
+                      connector_version: "internal-connector-v3",
+                      runner_evidence: [{ source_json: "large-audit-payload" }],
+                      fixture: false,
+                      ...overrides,
+                    },
+                  },
+                ],
+              }}
+            />
+          </MemoryRouter>
+        </AuthProvider>
+      </FluentProvider>
+    </QueryClientProvider>,
   );
+  await screen.findByText(i18n.t("noSource", { ns: "observationAnalysis" }));
+  return result;
 }
 
 describe("automatic measurement results", () => {
   it("shows the answer as plain text and citations, with evidence only on demand", async () => {
-    const { container } = renderAutomaticResult();
+    const { container } = await renderAutomaticResult();
     expect(screen.getByRole("heading", { name: "回答" })).toBeVisible();
     const answer = screen.getByText(/第一行/);
     expect(answer.textContent).toBe("第一行\n第二行 <script>alert(1)</script>");
@@ -99,8 +112,8 @@ describe("automatic measurement results", () => {
     );
   });
 
-  it("only links safe http and https citations", () => {
-    renderAutomaticResult({
+  it("only links safe http and https citations", async () => {
+    await renderAutomaticResult({
       citations: [
         "https://example.com/source",
         "http://example.com/other",
@@ -111,32 +124,35 @@ describe("automatic measurement results", () => {
         "https://example.com/source",
       ],
     });
-    expect(screen.getAllByRole("link")).toHaveLength(2);
+    expect(screen.getAllByRole("link", { name: /^https?:/ })).toHaveLength(2);
+    expect(document.querySelector('a[href^="javascript:"]')).toBeNull();
     expect(
       screen.getByRole("link", { name: "http://example.com/other" }),
     ).toHaveAttribute("href", "http://example.com/other");
   });
 
-  it("does not infer a search failure from an answer without citations", () => {
-    renderAutomaticResult({ citations: [] });
+  it("does not infer a search failure from an answer without citations", async () => {
+    await renderAutomaticResult({ citations: [] });
     expect(screen.getByText("本次回答未提供引用链接。")).toBeVisible();
     expect(screen.queryByText(/未联网/)).not.toBeInTheDocument();
   });
 
   it.each(["unknown", "missing"] as const)(
     "does not present an unconfirmed %s answer as a result",
-    (status) => {
-      renderAutomaticResult({ status });
+    async (status) => {
+      await renderAutomaticResult({ status });
       expect(
         screen.queryByRole("heading", { name: "回答" }),
       ).not.toBeInTheDocument();
       expect(screen.queryByText(/第一行/)).not.toBeInTheDocument();
-      expect(screen.queryByRole("link")).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("link", { name: /^https?:/ }),
+      ).not.toBeInTheDocument();
     },
   );
 
-  it("labels fixtures and does not present them as real answers", () => {
-    renderAutomaticResult({ fixture: true });
+  it("labels fixtures and does not present them as real answers", async () => {
+    await renderAutomaticResult({ fixture: true });
     expect(screen.getAllByText("测试数据，非真实测量").length).toBeGreaterThan(
       0,
     );
@@ -149,7 +165,7 @@ describe("automatic measurement results", () => {
   it("localizes the result in English", async () => {
     await i18n.changeLanguage("en");
     try {
-      renderAutomaticResult({ citations: [] });
+      await renderAutomaticResult({ citations: [] });
       expect(screen.getByRole("heading", { name: "Answer" })).toBeVisible();
       expect(
         screen.getByText("This answer did not provide citation links."),
@@ -297,6 +313,10 @@ function mockApi({
       const method = init?.method ?? "GET";
       const body = init?.body ? JSON.parse(String(init.body)) : null;
       requests.push({ path, method, body, url });
+      if (path.endsWith("/analyses"))
+        return Promise.resolve(
+          response({ items: [], sources: [], next_after: null }),
+        );
       if (path.endsWith("/auth/session"))
         return Promise.resolve(
           response({

@@ -17,16 +17,24 @@ pub struct BrowserBridge {
 }
 
 impl BrowserBridge {
-    const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const DEFAULT_REQUEST_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(geo_domain::CHANNEL_BROWSER_REQUEST_TIMEOUT_SECONDS);
     const EXECUTE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(130);
+    const MEASUREMENT_REQUEST_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(geo_domain::CHANNEL_MEASUREMENT_REQUEST_TIMEOUT_SECONDS);
 
-    fn execute_request(&self) -> reqwest::RequestBuilder {
+    fn execute_request(&self, operation: &str) -> reqwest::RequestBuilder {
         self.client
             .post(format!("{}/v1/executions", self.base_url))
-            // The runner owns a 120s hard execution deadline. Only this
-            // one-shot request may wait longer than the client's usual 60s,
-            // so Rust can receive its completed or unknown receipt.
-            .timeout(Self::EXECUTE_REQUEST_TIMEOUT)
+            // Measurement includes source capture and independent analysis:
+            // its runner deadline is 240s; publication/lookup remain 120s.
+            // Leave 10s to receive the completed or unknown receipt without
+            // extending ordinary requests or publication execution.
+            .timeout(if operation == "measure" {
+                Self::MEASUREMENT_REQUEST_TIMEOUT
+            } else {
+                Self::EXECUTE_REQUEST_TIMEOUT
+            })
             .bearer_auth(&self.token)
     }
 
@@ -297,7 +305,7 @@ impl BrowserBridge {
             return Err(AppError::invalid_request("unsupported browser operation"));
         }
         let response = self
-            .execute_request()
+            .execute_request(operation)
             .json(&BrowserExecutionRequest {
                 execution_id,
                 session_id,
@@ -895,10 +903,25 @@ mod measurement_options_tests {
             std::time::Duration::from_secs(60)
         );
         assert!(BrowserBridge::EXECUTE_REQUEST_TIMEOUT > std::time::Duration::from_secs(120));
+        for operation in ["publish", "lookup"] {
+            assert_eq!(
+                bridge.execute_request(operation).build().unwrap().timeout(),
+                Some(&std::time::Duration::from_secs(130))
+            );
+        }
         assert_eq!(
-            bridge.execute_request().build().unwrap().timeout(),
-            Some(&BrowserBridge::EXECUTE_REQUEST_TIMEOUT)
+            bridge.execute_request("measure").build().unwrap().timeout(),
+            Some(&std::time::Duration::from_secs(250))
         );
+        assert!(BrowserBridge::MEASUREMENT_REQUEST_TIMEOUT > std::time::Duration::from_secs(240));
+        assert_eq!(
+            geo_domain::CHANNEL_MEASUREMENT_LEASE.to_std().unwrap(),
+            BrowserBridge::DEFAULT_REQUEST_TIMEOUT * 3
+                + BrowserBridge::MEASUREMENT_REQUEST_TIMEOUT
+                + std::time::Duration::from_secs(30),
+            "lease covers identity, execution, renewal, close and terminal margin"
+        );
+        assert_eq!(geo_domain::CHANNEL_EXECUTION_LEASE.num_seconds(), 300);
         assert_eq!(
             bridge
                 .client

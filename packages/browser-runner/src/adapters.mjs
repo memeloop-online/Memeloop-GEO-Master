@@ -413,6 +413,7 @@ export async function measureKimi(
     searchFlow,
     expectedAccountId,
     deadlineAt,
+    sourceDeadlineAt,
     signal,
     onEvidence,
     onConversationCaptured,
@@ -439,6 +440,7 @@ export async function measureKimi(
   const ownershipEvidence = [];
   const observation = await observeKimiConnectSearch(page, payload, {
     deadlineAt,
+    sourceDeadlineAt,
     signal,
     apiExtract,
     getExtractionPolicy,

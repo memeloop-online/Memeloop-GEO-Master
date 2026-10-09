@@ -39,6 +39,7 @@ import { useChannelData } from "../api/channels";
 import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { DistributionPanel } from "./DistributionPanel";
+import { ObservationAnalysisPanel } from "./ObservationAnalysisPanel";
 import "./measurementMessages";
 import {
   PublicationLookupPanel,
@@ -234,6 +235,15 @@ export function TargetCard({
                   )}
                 </>
               )}
+              {outcome && (
+                <ObservationAnalysisPanel
+                  tenantId={tenantId}
+                  projectId={projectId}
+                  targetId={target.target_id}
+                  attemptId={attempt.attempt_id}
+                  canWrite={canWrite}
+                />
+              )}
             </div>
           );
         })}
@@ -371,6 +381,15 @@ export function TargetCard({
                 ? t("automaticInFlightDetail")
                 : "尝试已领取但尚未收到结果；需要查回，不能重发。"}
             </p>
+          )}
+          {input.kind === "measure" && attempt.outcome && (
+            <ObservationAnalysisPanel
+              tenantId={tenantId}
+              projectId={projectId}
+              targetId={target.target_id}
+              attemptId={attempt.attempt_id}
+              canWrite={canWrite}
+            />
           )}
         </div>
       ))}

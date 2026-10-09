@@ -144,6 +144,26 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
         prompt_version: "extract.v1".into(),
         parser_version: "ground.v1".into(),
     };
+    let saved_sources = captures
+        .list_sources_for_attempt(&scope, target_id, attempt_id)
+        .await
+        .unwrap();
+    assert_eq!(saved_sources.len(), 1);
+    assert_eq!(saved_sources[0].input.capture_id, capture_id);
+    assert!(
+        captures
+            .list_sources_for_attempt(&other, target_id, attempt_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        captures
+            .list_sources_for_attempt(&scope, target_id, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let hash = sha256_hex(b"synthetic-request");
     let queued = store
         .create(&scope, "first-analysis", &hash, request.clone(), created_at)
@@ -207,6 +227,7 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
     assert_eq!(claims.len(), 1);
     let claim = &claims[0];
     let result = ObservationAnalysisResult {
+        config_revision: None,
         actual_model: Some("synthetic".into()),
         candidate_json: Some(r#"{"decision":"unverified"}"#.into()),
         outcome: ObservationAnalysisOutcome::Unverified {
@@ -332,6 +353,69 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
                 attempt_id,
                 Some(page[0].request.revision_id),
                 1
+            )
+            .await
+            .is_err()
+    );
+    let stale_running = restarted
+        .claim(&scope, legacy.revision_id, created_at)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stale_queued = request.clone();
+    stale_queued.revision_id = Uuid::new_v4();
+    restarted
+        .create(
+            &scope,
+            "stale-queued",
+            &hash,
+            stale_queued.clone(),
+            created_at,
+        )
+        .await
+        .unwrap();
+    let cutoff = created_at + chrono::Duration::seconds(180);
+    restarted
+        .interrupt_stale(&other, target_id, attempt_id, cutoff, cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .get(&scope, legacy.revision_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ObservationAnalysisState::Running
+    );
+    restarted
+        .interrupt_stale(&scope, target_id, attempt_id, cutoff, cutoff)
+        .await
+        .unwrap();
+    for id in [legacy.revision_id, stale_queued.revision_id] {
+        let interrupted = restarted.get(&scope, id).await.unwrap().unwrap();
+        assert_eq!(interrupted.state, ObservationAnalysisState::Completed);
+        assert!(matches!(interrupted.result.unwrap().outcome,
+            ObservationAnalysisOutcome::Failed { code } if code == "analysis_interrupted"));
+        assert!(restarted.claim(&scope, id, cutoff).await.unwrap().is_none());
+    }
+    assert!(
+        restarted
+            .finish(
+                &scope,
+                legacy.revision_id,
+                stale_running.claim_token,
+                ObservationAnalysisResult {
+                    config_revision: None,
+                    actual_model: None,
+                    candidate_json: None,
+                    outcome: ObservationAnalysisOutcome::Failed {
+                        code: "late".into()
+                    },
+                    prompt_tokens: 0,
+                    completion_tokens: 0
+                },
+                cutoff
             )
             .await
             .is_err()

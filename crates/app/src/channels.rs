@@ -10,6 +10,30 @@ pub fn configure_callbacks(
     state: AppState,
     database: &geo_persistence::Database,
 ) -> Result<AppState, Box<dyn Error>> {
+    let state = match (
+        env::var("GEO_BROWSER_RUNNER_URL").ok(),
+        env::var("GEO_BROWSER_RUNNER_TOKEN").ok(),
+    ) {
+        (Some(url), Some(token)) => {
+            let settings = state.project_ai_settings();
+            let inherited =
+                settings.inherited_provider(geo_domain::ProjectAiUsage::ObservationAnalysis);
+            let analysis = geo_api::ObservationAnalysisService::new(
+                std::sync::Arc::new(
+                    geo_persistence::PgObservationAnalysisRepository::from_database(database),
+                ),
+                state.channel_job_repository(),
+                std::sync::Arc::new(
+                    geo_persistence::PgObservationCaptureRepository::from_database(database),
+                ),
+                geo_api::ProjectConfiguredModelBridge::new(settings, inherited)?,
+                std::sync::Arc::new(geo_api::HttpSavedObservationGrounder::new(&url, &token)?),
+            );
+            state.with_observation_analysis(analysis)
+        }
+        (None, None) => state,
+        _ => return Err("browser runner URL and token must be configured together".into()),
+    };
     let token = env::var("GEO_BROWSER_RUNNER_CALLBACK_TOKEN").ok();
     let key = env::var("GEO_CHANNEL_SECRET_KEY").ok();
     callbacks_with_credentials(state, database, token.as_deref(), key.as_deref())

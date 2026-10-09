@@ -536,6 +536,16 @@ impl ObservationCaptureInput {
 
 #[async_trait]
 pub trait ObservationCaptureRepository: Send + Sync {
+    /// Bounded discovery of immutable source checkpoints, including attempts
+    /// whose runner response was lost after the checkpoint was saved.
+    async fn list_sources_for_attempt(
+        &self,
+        _scope: &TenantScope,
+        _target_id: Uuid,
+        _attempt_id: Uuid,
+    ) -> Result<Vec<ObservationCapture>, AppError> {
+        Ok(Vec::new())
+    }
     async fn save(
         &self,
         scope: &TenantScope,
@@ -566,6 +576,40 @@ impl MemoryObservationCaptureRepository {
 
 #[async_trait]
 impl ObservationCaptureRepository for MemoryObservationCaptureRepository {
+    async fn list_sources_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Vec<ObservationCapture>, AppError> {
+        if scope.project_id.is_none() {
+            return Err(AppError::forbidden("project scope required"));
+        }
+        let mut items: Vec<_> = self
+            .captures
+            .lock()
+            .await
+            .values()
+            .filter(|(stored_scope, capture)| {
+                stored_scope == scope
+                    && capture.input.target_id == target_id
+                    && capture.input.attempt_id == attempt_id
+                    && matches!(
+                        capture.input.snapshot,
+                        ObservationCaptureSnapshot::Source { .. }
+                    )
+            })
+            .map(|(_, capture)| capture.clone())
+            .collect();
+        items.sort_by_key(|capture| {
+            (
+                std::cmp::Reverse(capture.input.observed_at),
+                capture.input.capture_id,
+            )
+        });
+        items.truncate(100);
+        Ok(items)
+    }
     async fn save(
         &self,
         scope: &TenantScope,

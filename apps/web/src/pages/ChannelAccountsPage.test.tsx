@@ -655,9 +655,9 @@ describe("account page", () => {
     mockApi([account]);
     renderPage("settings");
     expect(
-      await screen.findByRole("heading", { name: "项目设置与渠道账号" }),
+      await screen.findByRole("heading", { name: "项目设置" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("项目设置")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "项目配置" })).toBeInTheDocument();
     expect(screen.queryByText(/P10|P11|P16/)).toBeNull();
     expect(
       screen.getByRole("button", { name: "接入账号" }),
@@ -708,10 +708,12 @@ describe("account page", () => {
     renderPage("settings");
     expect(
       await screen.findByRole("heading", {
-        name: "Project settings and channel accounts",
+        name: "Project settings",
       }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Project settings")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Project configuration" }),
+    ).toBeInTheDocument();
     await userEvent.type(
       screen.getByRole("textbox", { name: "New resource group" }),
       "Content team",

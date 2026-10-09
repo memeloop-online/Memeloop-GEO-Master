@@ -410,6 +410,7 @@ export async function observeKimiConnectSearch(
     trustedOrigin = ORIGIN,
     timeoutMs = 30_000,
     deadlineAt,
+    sourceDeadlineAt,
     signal,
     interpret = interpretObservation,
     apiExtract,
@@ -478,8 +479,9 @@ export async function observeKimiConnectSearch(
     await composer.fill(payload.question);
     // The runner's monotonic deadline includes its identity and UI setup.
     // Standalone fixture calls retain their explicit/default capture timeout.
-    if (deadlineAt !== undefined) {
-      const remaining = deadlineAt - performance.now();
+    const captureDeadlineAt = sourceDeadlineAt ?? deadlineAt;
+    if (captureDeadlineAt !== undefined) {
+      const remaining = captureDeadlineAt - performance.now();
       if (!Number.isFinite(remaining) || remaining <= 0)
         return unverified("budget_exhausted");
       timeoutMs = Math.min(120_000, Math.max(1, Math.floor(remaining)));
@@ -534,6 +536,7 @@ export async function observeKimiConnectSearch(
     }
     stage = "interpretation";
     const observation = await interpret(captured, {
+      deadlineAt: deadlineAt === undefined ? undefined : deadlineAt - 10_000,
       apiExtract,
       getExtractionPolicy,
       renderedText,
@@ -551,17 +554,10 @@ export async function observeKimiConnectSearch(
           trustedOrigin,
           // Leave part of the overall execution window for the configured
           // model fallback if the signed-in parsing conversation is slow.
-          deadlineAt: Math.min(
-            deadlineAt ?? performance.now() + 60_000,
-            performance.now() +
-              Math.max(
-                1,
-                ((deadlineAt ?? performance.now() + 90_000) -
-                  performance.now()) *
-                  0.65,
-              ),
-          ),
-          signal,
+          deadlineAt:
+            hooks.deadlineAt ??
+            Math.min(deadlineAt ?? Infinity, performance.now() + 45_000),
+          signal: hooks.signal ?? signal,
           onConversationCaptured,
           onEvidence: hooks.onEvidence ?? onEvidence,
           configureModel: (parserPage, model) =>

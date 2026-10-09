@@ -605,7 +605,8 @@ test("browser extraction succeeds first without API and records a document-bound
   const result = await interpretObservation(exchange, {
     signal: controller.signal,
     browserExtract: async (prompt, options) => {
-      assert.equal(options.signal, controller.signal);
+      assert.equal(options.signal.aborted, false);
+      assert.ok(Number.isFinite(options.deadlineAt));
       assert.equal(prompt, extractionPrompt(observationDocument(exchange)));
       return extraction();
     },
@@ -637,6 +638,118 @@ test("browser extraction succeeds first without API and records a document-bound
   assert.deepEqual(exchange, before);
   assert.equal(Object.hasOwn(result, "model"), false);
   assert.equal(Object.hasOwn(result, "surface"), false);
+});
+
+test("bounded browser route preserves API fallback on the same durable source", async () => {
+  let browserSignal;
+  let apiCalls = 0;
+  let lateEvidence;
+  const records = [];
+  const diagnostics = [];
+  const result = await interpretObservation(exchange, {
+    browserTimeoutMs: 15,
+    apiTimeoutMs: 100,
+    deadlineAt: performance.now() + 500,
+    onEvidence: async (record) => records.push(record),
+    onDiagnostic: (entry) => diagnostics.push(entry),
+    browserExtract: async (prompt, hooks) => {
+      browserSignal = hooks.signal;
+      lateEvidence = hooks.onEvidence;
+      assert.equal(prompt, extractionPrompt(observationDocument(exchange)));
+      return new Promise(() => {});
+    },
+    apiExtract: async (prompt, hooks) => {
+      apiCalls++;
+      assert.equal(browserSignal.aborted, true);
+      assert.equal(hooks.signal.aborted, false);
+      assert.equal(records[0].phase, "source");
+      assert.equal(prompt, extractionPrompt(observationDocument(exchange)));
+      return extraction({ surface: "model_api" });
+    },
+  });
+  assert.equal(apiCalls, 1);
+  assert.equal(result.raw_answer, exchange.messages[3].text);
+  assert.equal(diagnostics[0].code, "timeout");
+  await assert.rejects(
+    lateEvidence({ phase: "extraction" }),
+    /evidence_persist_failed/u,
+  );
+  assert.deepEqual(
+    records.map((record) => record.phase),
+    ["source", "candidate"],
+  );
+});
+
+test("unresolved durable browser evidence blocks fallback after route timeout", async () => {
+  let release;
+  let apiCalls = 0;
+  const result = await interpretObservation(exchange, {
+    browserTimeoutMs: 15,
+    onEvidence: async (record) => {
+      if (record.phase === "extraction")
+        await new Promise((resolve) => (release = resolve));
+    },
+    browserExtract: async (_prompt, hooks) => {
+      await hooks.onEvidence({ phase: "extraction" });
+      return null;
+    },
+    apiExtract: async () => {
+      apiCalls++;
+      return extraction();
+    },
+  });
+  assert.equal(result, null);
+  assert.equal(apiCalls, 0);
+  release();
+});
+
+test("policy and API routes have independent bounded cancellation", async () => {
+  for (const blocked of ["policy", "api"]) {
+    let childSignal;
+    let calls = 0;
+    const diagnostics = [];
+    const result = await interpretObservation(exchange, {
+      policyTimeoutMs: 15,
+      apiTimeoutMs: 15,
+      getExtractionPolicy: async ({ signal }) => {
+        if (blocked === "policy") {
+          childSignal = signal;
+          return new Promise(() => {});
+        }
+        return { prefer_connected_account: false };
+      },
+      apiExtract: async (_prompt, { signal }) => {
+        calls++;
+        childSignal = signal;
+        return new Promise(() => {});
+      },
+      onDiagnostic: (entry) => diagnostics.push(entry),
+    });
+    assert.equal(result, null);
+    assert.equal(childSignal.aborted, true);
+    assert.equal(calls, blocked === "policy" ? 0 : 1);
+    assert.equal(
+      diagnostics.at(-1).code,
+      blocked === "policy" ? "budget_exhausted" : "timeout",
+    );
+  }
+});
+
+test("expired interpretation cannot begin either model route", async () => {
+  let calls = 0;
+  const invoke = async () => {
+    calls++;
+    return extraction();
+  };
+  assert.equal(
+    await interpretObservation(exchange, {
+      deadlineAt: performance.now() - 1,
+      browserExtract: invoke,
+      apiExtract: invoke,
+    }),
+    null,
+  );
+  assert.equal(calls, 0);
 });
 
 test("source is delivered before either extractor and rejected candidates remain bounded evidence", async () => {

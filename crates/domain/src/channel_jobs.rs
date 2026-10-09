@@ -16,6 +16,19 @@ use crate::{
     ReportPublicationTarget, RichPublicationPayload, TenantScope, sha256_hex,
 };
 
+/// Reversible preflight and publication retain their existing five-minute window.
+pub const CHANNEL_EXECUTION_LEASE: chrono::Duration = chrono::Duration::minutes(5);
+pub const CHANNEL_BROWSER_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+pub const CHANNEL_MEASUREMENT_RUNNER_TIMEOUT_SECONDS: u64 = 240;
+pub const CHANNEL_MEASUREMENT_REQUEST_TIMEOUT_SECONDS: u64 =
+    CHANNEL_MEASUREMENT_RUNNER_TIMEOUT_SECONDS + 10;
+/// Identity recheck, execution, session renewal, close, and bookkeeping margin.
+/// Starts at the irreversible claim, not at the beginning of browser preflight.
+pub const CHANNEL_MEASUREMENT_LEASE: chrono::Duration = chrono::Duration::seconds(
+    (3 * CHANNEL_BROWSER_REQUEST_TIMEOUT_SECONDS + CHANNEL_MEASUREMENT_REQUEST_TIMEOUT_SECONDS + 30)
+        as i64,
+);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelTargetInput {
@@ -1279,7 +1292,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         expires_at: DateTime<Utc>,
     ) -> Result<(), AppError> {
         scope_key(scope)?;
-        if expires_at <= at || expires_at - at > chrono::Duration::minutes(5) {
+        if expires_at <= at || expires_at - at > CHANNEL_EXECUTION_LEASE {
             return Err(AppError::invalid_request(
                 "invalid account reservation duration",
             ));
@@ -1322,7 +1335,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         reservation_id: Uuid,
         at: DateTime<Utc>,
     ) -> Result<(ChannelTarget, ChannelAttempt), AppError> {
-        let reservations = self.1.lock().await;
+        let mut reservations = self.1.lock().await;
         let target = self.get_target(scope, target_id).await?.target;
         if !reservations
             .get(&(scope.operator_id.as_uuid(), target.input.account_id()))
@@ -1330,7 +1343,21 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         {
             return Err(AppError::conflict("account preflight reservation expired"));
         }
-        self.claim(scope, target_id, attempt_id, at).await
+        let claimed = self.claim(scope, target_id, attempt_id, at).await?;
+        // Preflight may have consumed most of the original reservation. Renew
+        // only its current owner, atomically with a successful one-shot claim.
+        reservations.insert(
+            (scope.operator_id.as_uuid(), target.input.account_id()),
+            (
+                reservation_id,
+                at + if matches!(target.input, ChannelTargetInput::Measure { .. }) {
+                    CHANNEL_MEASUREMENT_LEASE
+                } else {
+                    CHANNEL_EXECUTION_LEASE
+                },
+            ),
+        );
+        Ok(claimed)
     }
     async fn scan_pending(
         &self,
@@ -2488,6 +2515,11 @@ mod tests {
         repo.claim_reserved(&scope, command, attempt, reservation, now)
             .await
             .unwrap();
+        assert_eq!(
+            repo.1.lock().await[&(scope.operator_id.as_uuid(), account)],
+            (reservation, now + CHANNEL_EXECUTION_LEASE),
+            "publication retains its five-minute execution lease"
+        );
         assert!(repo.scan_pending(None, now, 10).await.unwrap().is_empty());
         assert!(
             repo.claim(&scope, command, Uuid::new_v4(), now)
@@ -2920,10 +2952,57 @@ mod tests {
         repo.release_account(&scopes[0], account_id, old)
             .await
             .unwrap();
-        assert!(
-            repo.claim_reserved(&scopes[0], target, Uuid::new_v4(), fresh, later)
-                .await
-                .is_ok()
+        let claimed_at = later + chrono::Duration::seconds(299);
+        let (first, second) = tokio::join!(
+            repo.claim_reserved(&scopes[0], target, Uuid::new_v4(), fresh, claimed_at),
+            repo.claim_reserved(&scopes[0], target, Uuid::new_v4(), fresh, claimed_at),
         );
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "one-shot claim stays exclusive"
+        );
+        let expires_at = claimed_at + CHANNEL_MEASUREMENT_LEASE;
+        assert_eq!(
+            repo.1.lock().await[&(operator.as_uuid(), account_id)],
+            (fresh, expires_at),
+            "the successful claim renews its exact owner after slow preflight"
+        );
+        // A failed duplicate claim must not prolong an existing execution.
+        assert!(
+            repo.claim_reserved(
+                &scopes[0],
+                target,
+                Uuid::new_v4(),
+                fresh,
+                claimed_at + chrono::Duration::seconds(1),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            repo.1.lock().await[&(operator.as_uuid(), account_id)].1,
+            expires_at
+        );
+        assert!(
+            repo.reserve_account(
+                &scopes[1],
+                account_id,
+                Uuid::new_v4(),
+                expires_at - chrono::Duration::milliseconds(1),
+                expires_at + chrono::Duration::seconds(1),
+            )
+            .await
+            .is_err()
+        );
+        repo.reserve_account(
+            &scopes[1],
+            account_id,
+            Uuid::new_v4(),
+            expires_at,
+            expires_at + CHANNEL_EXECUTION_LEASE,
+        )
+        .await
+        .unwrap();
     }
 }

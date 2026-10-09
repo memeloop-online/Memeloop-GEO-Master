@@ -1670,7 +1670,7 @@ pub async fn execute_channel_target(
             account_id,
             reservation_id,
             now,
-            now + chrono::Duration::minutes(5),
+            now + geo_domain::CHANNEL_EXECUTION_LEASE,
         )
         .await
     {
@@ -2051,7 +2051,7 @@ async fn execute_reserved_channel_target(
                                     })?,
                             },
                         },
-                        attempt.claimed_at + chrono::Duration::minutes(5),
+                        attempt.claimed_at + geo_domain::CHANNEL_MEASUREMENT_LEASE,
                     )
                 })
                 .transpose()?

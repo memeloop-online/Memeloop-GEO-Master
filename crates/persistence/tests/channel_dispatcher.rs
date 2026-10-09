@@ -245,6 +245,56 @@ async fn pending_scan_keyset_scope_due_and_project_state() {
         .await
         .is_err()
     );
+    let claimed_at = later + Duration::seconds(299);
+    let (first_claim, second_claim) = tokio::join!(
+        repo.claim_reserved(
+            &expected[1].1,
+            expected[1].0,
+            Uuid::new_v4(),
+            new_owner,
+            claimed_at,
+        ),
+        repo.claim_reserved(
+            &expected[1].1,
+            expected[1].0,
+            Uuid::new_v4(),
+            new_owner,
+            claimed_at,
+        ),
+    );
+    assert_ne!(first_claim.is_ok(), second_claim.is_ok());
+    let expires_at = claimed_at + geo_domain::CHANNEL_MEASUREMENT_LEASE;
+    let lease: (Uuid, chrono::DateTime<Utc>) = sqlx::query_as(
+        "SELECT reservation_id,expires_at FROM channel_account_preflight_reservations \
+         WHERE operator_id=$1 AND account_id=$2",
+    )
+    .bind(expected[1].1.operator_id.as_uuid())
+    .bind(account)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(lease.0, new_owner);
+    assert_eq!(lease.1.timestamp_micros(), expires_at.timestamp_micros());
+    assert!(
+        repo.reserve_account(
+            &another_project,
+            account,
+            Uuid::new_v4(),
+            expires_at - Duration::milliseconds(1),
+            expires_at + Duration::seconds(1),
+        )
+        .await
+        .is_err()
+    );
+    repo.reserve_account(
+        &another_project,
+        account,
+        Uuid::new_v4(),
+        expires_at,
+        expires_at + geo_domain::CHANNEL_EXECUTION_LEASE,
+    )
+    .await
+    .unwrap();
     database.pool().close().await;
     // Only this test's freshly generated schema is removed.
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

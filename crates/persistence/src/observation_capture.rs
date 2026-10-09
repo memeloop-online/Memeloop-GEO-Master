@@ -50,6 +50,38 @@ fn decode(row: sqlx::postgres::PgRow) -> Result<ObservationCapture, AppError> {
 
 #[async_trait]
 impl ObservationCaptureRepository for PgObservationCaptureRepository {
+    async fn list_sources_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Vec<ObservationCapture>, AppError> {
+        let project = scope_project(scope)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        let rows = sqlx::query(
+            "SELECT input,input_hash,stored_at FROM observation_captures \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+             AND target_id=$4 AND attempt_id=$5 AND phase='source' \
+             ORDER BY (input->>'observed_at')::timestamptz DESC,capture_id LIMIT 100",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project)
+        .bind(target_id)
+        .bind(attempt_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        let items = rows
+            .into_iter()
+            .map(decode)
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(items)
+    }
     async fn save(
         &self,
         scope: &TenantScope,

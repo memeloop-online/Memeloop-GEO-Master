@@ -14,6 +14,80 @@ const testBrowserOptions = process.env.GEO_TEST_CHROMIUM_PATH
   ? { executablePath: process.env.GEO_TEST_CHROMIUM_PATH }
   : {};
 
+test("measurement has separate bounded source and analysis windows without extending publishing", async () => {
+  const networks = [];
+  const phaseRunner = createRunner({
+    executionTimeoutMs: 20,
+    measurementExecutionTimeoutMs: 200,
+    measurementSourceTimeoutMs: 120,
+    browserType: {
+      async launch() {
+        return {
+          async newContext() {
+            return {
+              async newPage() {
+                return { url: () => "http://127.0.0.1/", async goto() {} };
+              },
+              async storageState() {
+                return { cookies: [], origins: [] };
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    },
+    platformAdapters: {
+      fixture: {
+        connectorVersion: "fixture.phase-budget.v1",
+        entry: "http://127.0.0.1/",
+        operations: ["measure", "publish"],
+        async identify() {
+          return { platform_account_id: "own-1", display_name: "Owner" };
+        },
+        async execute(_page, operation, _payload, network) {
+          networks.push(network);
+          if (operation === "publish") return new Promise(() => {});
+          await new Promise((resolve) => setTimeout(resolve, 35));
+          assert.equal(network.signal.aborted, false);
+          return { status: "completed", evidence: [] };
+        },
+      },
+    },
+  });
+  try {
+    await phaseRunner.create({
+      session_id: "phases",
+      platform: "fixture",
+      storage_state: { cookies: [], origins: [] },
+    });
+    await phaseRunner.complete("phases");
+    const measured = await phaseRunner.execute({
+      execution_id: "measure-phase",
+      session_id: "phases",
+      operation: "measure",
+      payload: {},
+    });
+    assert.equal(measured.status, "completed");
+    assert.ok(
+      Math.abs(networks[0].deadlineAt - networks[0].sourceDeadlineAt - 80) <
+        0.01,
+    );
+    const published = await phaseRunner.execute({
+      execution_id: "publish-phase",
+      session_id: "phases",
+      operation: "publish",
+      payload: {},
+    });
+    assert.equal(published.reason, "execution_deadline");
+    assert.equal(networks[1].sourceDeadlineAt, undefined);
+    assert.equal(networks[1].signal.aborted, true);
+  } finally {
+    await phaseRunner.shutdown();
+  }
+});
+
 before(async () => {
   fixture = createServer((request, response) => {
     response.writeHead(200, { "content-type": "text/html" });

@@ -60,6 +60,11 @@ mod observation_capture_callback;
 pub use observation_capture_callback::ObservationCaptureCallbackService;
 mod observation_ai_callback;
 pub use observation_ai_callback::ObservationAiCallbackService;
+mod observation_analysis;
+pub use observation_analysis::{
+    GroundingResult, HttpSavedObservationGrounder, ObservationAnalysisService,
+    SavedObservationGrounder,
+};
 mod questions;
 mod questions_tools;
 mod reports;
@@ -166,6 +171,7 @@ pub struct AppState {
     publication_send_callback: Option<PublicationSendCallbackService>,
     observation_capture_callback: Option<ObservationCaptureCallbackService>,
     observation_ai_callback: Option<ObservationAiCallbackService>,
+    observation_analysis: Option<ObservationAnalysisService>,
     provider_cleanup_callback: Option<ProviderCleanupCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
@@ -286,6 +292,7 @@ impl AppState {
             publication_send_callback: None,
             observation_capture_callback: None,
             observation_ai_callback: None,
+            observation_analysis: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -441,6 +448,7 @@ impl AppState {
             publication_send_callback: None,
             observation_capture_callback: None,
             observation_ai_callback: None,
+            observation_analysis: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -898,6 +906,11 @@ impl AppState {
 
     pub fn with_observation_ai_callback(mut self, service: ObservationAiCallbackService) -> Self {
         self.observation_ai_callback = Some(service);
+        self
+    }
+
+    pub fn with_observation_analysis(mut self, service: ObservationAnalysisService) -> Self {
+        self.observation_analysis = Some(service);
         self
     }
 
@@ -2498,6 +2511,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(agent_attachment_bytes)
                 .merge(agent_routes)
                 .merge(project_ai_settings::routes())
+                .merge(observation_analysis::routes())
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))

@@ -285,6 +285,45 @@ export async function invokeExtractionApi(
 }
 
 /** AI interprets semantics; deterministic validation only establishes grounding. */
+async function boundedRoute(invoke, { signal, deadlineAt, timeoutMs }) {
+  const controller = new AbortController();
+  const routeDeadline = Math.min(
+    deadlineAt ?? Infinity,
+    performance.now() + timeoutMs,
+  );
+  if (signal?.aborted || routeDeadline <= performance.now())
+    return { timedOut: true };
+  let timer;
+  let stop;
+  const stopped = new Promise((resolve) => (stop = resolve));
+  const abort = () => {
+    controller.abort();
+    stop({ timedOut: true });
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+  timer = setTimeout(
+    abort,
+    Math.max(1, Math.ceil(routeDeadline - performance.now())),
+  );
+  try {
+    return await Promise.race([
+      Promise.resolve()
+        .then(() =>
+          invoke({
+            signal: controller.signal,
+            deadlineAt: routeDeadline,
+          }),
+        )
+        .then((value) => ({ value, timedOut: false })),
+      stopped,
+    ]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    controller.abort();
+  }
+}
+
 export async function interpretObservation(
   exchange,
   {
@@ -295,10 +334,21 @@ export async function interpretObservation(
     // Environment credentials are a deliberately opt-in legacy route only.
     allowLegacyApi = process.env.GEO_OBSERVATION_AI_LEGACY_ENABLED === "true",
     signal,
+    deadlineAt,
+    browserTimeoutMs = 45_000,
+    apiTimeoutMs = 60_000,
+    policyTimeoutMs = 10_000,
     onDiagnostic,
     onEvidence,
   } = {},
 ) {
+  if (
+    ![browserTimeoutMs, apiTimeoutMs, policyTimeoutMs].every(
+      (value) => Number.isFinite(value) && value > 0,
+    ) ||
+    (deadlineAt !== undefined && !Number.isFinite(deadlineAt))
+  )
+    return null;
   if (signal?.aborted) {
     reportObservationDiagnostic(
       onDiagnostic,
@@ -339,7 +389,22 @@ export async function interpretObservation(
   const attempts = [];
   let policy;
   try {
-    policy = await getExtractionPolicy?.({ signal });
+    if (getExtractionPolicy) {
+      const policyResult = await boundedRoute(getExtractionPolicy, {
+        signal,
+        deadlineAt,
+        timeoutMs: policyTimeoutMs,
+      });
+      if (policyResult.timedOut) {
+        reportObservationDiagnostic(
+          onDiagnostic,
+          "configuration",
+          "budget_exhausted",
+        );
+        return null;
+      }
+      policy = policyResult.value;
+    }
   } catch {
     reportObservationDiagnostic(onDiagnostic, "configuration", "unverified");
     return null;
@@ -356,8 +421,44 @@ export async function interpretObservation(
   ]) {
     if (!invoke || signal?.aborted) continue;
     let result;
+    let timedOut = false;
+    let evidenceOpen = true;
+    const pendingEvidence = new Set();
+    const persistRouteEvidence = (record) => {
+      if (!evidenceOpen)
+        return Promise.reject(new ObservationPersistenceError());
+      const pending = Promise.resolve().then(() => onEvidence?.(record));
+      pendingEvidence.add(pending);
+      void pending.then(
+        () => pendingEvidence.delete(pending),
+        () => pendingEvidence.delete(pending),
+      );
+      return pending;
+    };
     try {
-      result = await invoke(prompt, { signal, onEvidence });
+      const attempted = await boundedRoute(
+        (hooks) =>
+          invoke(prompt, { ...hooks, onEvidence: persistRouteEvidence }),
+        {
+          signal,
+          deadlineAt,
+          timeoutMs:
+            route === "signed_in_browser" ? browserTimeoutMs : apiTimeoutMs,
+        },
+      );
+      timedOut = attempted.timedOut;
+      result = attempted.value;
+      // A timed-out page teardown must not starve the next route. An unresolved
+      // durable checkpoint is different: stop, never race into another request.
+      if (pendingEvidence.size) {
+        reportObservationDiagnostic(
+          onDiagnostic,
+          "extraction",
+          "budget_exhausted",
+          route,
+        );
+        return null;
+      }
     } catch (error) {
       if (error instanceof ObservationPersistenceError) {
         reportObservationDiagnostic(
@@ -375,6 +476,8 @@ export async function interpretObservation(
         route,
       );
       result = null;
+    } finally {
+      evidenceOpen = false;
     }
     if (signal?.aborted) {
       reportObservationDiagnostic(
@@ -386,7 +489,11 @@ export async function interpretObservation(
       return null;
     }
     let grounded;
-    let groundingReason = result ? "grounding_rejected" : "returned_none";
+    let groundingReason = timedOut
+      ? "timeout"
+      : result
+        ? "grounding_rejected"
+        : "returned_none";
     try {
       grounded = result
         ? validateAiObservation(document, result.extracted, {

@@ -570,16 +570,16 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
           </p>
           <h1>
             {t(
-              aiTab
-                ? "projectAi.title"
-                : view === "settings"
-                  ? "account.channels.settingsTitle"
-                  : "account.channels.title",
+              view === "settings"
+                ? "account.channels.settingsTitle"
+                : "account.channels.title",
             )}
           </h1>
           <p>
             {t(
-              aiTab ? "projectAi.description" : "account.channels.description",
+              view === "settings"
+                ? "account.channels.settingsDescription"
+                : "account.channels.description",
             )}
           </p>
         </div>

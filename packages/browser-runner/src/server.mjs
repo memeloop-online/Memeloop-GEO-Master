@@ -4,6 +4,10 @@ import { pathToFileURL } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 import { createRunner, RunnerError } from "./runner.mjs";
 import { readRichMultipart } from "./rich-transport.mjs";
+import {
+  groundSavedObservation,
+  SAVED_GROUNDING_BODY_BYTES,
+} from "./saved-observation-grounding.mjs";
 
 const CALLBACK_PATH = "/internal/v1/publication-send/authorize";
 const CAPTURE_PATH = "/internal/v1/observation-captures";
@@ -80,12 +84,12 @@ function authorized(header, token) {
   );
 }
 
-async function readJson(request) {
+async function readJson(request, maxBytes = 1024 * 1024) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 1024 * 1024) throw new RunnerError(413, "payload_too_large");
+    if (size > maxBytes) throw new RunnerError(413, "payload_too_large");
     chunks.push(chunk);
   }
   try {
@@ -158,6 +162,17 @@ export function createRunnerServer({
       const parts = path.split("/").filter(Boolean);
       if (request.method === "GET" && path === "/v1/capabilities") {
         send(response, 200, runner.capabilities());
+      } else if (
+        request.method === "POST" &&
+        path === "/v1/observation-analyses/ground"
+      ) {
+        send(
+          response,
+          200,
+          groundSavedObservation(
+            await readJson(request, SAVED_GROUNDING_BODY_BYTES),
+          ),
+        );
       } else if (request.method === "POST" && path === "/v1/sessions") {
         send(response, 201, await runner.create(await readJson(request)));
       } else if (request.method === "POST" && path === "/v1/executions") {

@@ -68,6 +68,8 @@ pub enum ObservationAnalysisOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationAnalysisResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<i64>,
     pub actual_model: Option<String>,
     pub candidate_json: Option<String>,
     pub outcome: ObservationAnalysisOutcome,
@@ -159,6 +161,7 @@ impl ObservationAnalysisResult {
             .actual_model
             .as_ref()
             .is_some_and(|model| !bounded_label(model, 256))
+            || self.config_revision.is_some_and(|revision| revision < 0)
             || self.candidate_json.as_ref().is_some_and(|candidate| {
                 candidate.len() > MAX_ANALYSIS_CANDIDATE_BYTES
                     || serde_json::from_str::<Value>(candidate).is_err()
@@ -238,10 +241,7 @@ pub fn observation_analysis_source_json(
     let received_at = attempt
         .received_at
         .ok_or_else(|| AppError::conflict("measurement receipt unavailable"))?;
-    if outcome.fixture
-        || attempt.claimed_at > request.observed_at
-        || request.observed_at > received_at
-    {
+    if attempt.claimed_at > request.observed_at || request.observed_at > received_at {
         return Err(AppError::conflict(
             "analysis source provenance or time mismatch",
         ));
@@ -261,6 +261,18 @@ pub fn observation_analysis_source_json(
                     "analysis source receipt digest mismatch",
                 ));
             }
+            // An unavailable runner response is conservatively marked fixture
+            // by dispatch. Only an independently persisted, identity-bound
+            // checkpoint may recover interpretation from such a receipt.
+            if outcome.fixture
+                && (outcome.runner_evidence.iter().any(|evidence| evidence["kind"] == "runner_receipt")
+                    || !capture.input.original_identity.as_ref().is_some_and(|identity| {
+                    matches!(&target.target.input, ChannelTargetInput::Measure { provider, .. }
+                        if identity.provider == *provider && !identity.platform_account_id.is_empty())
+                }))
+            {
+                return Err(AppError::conflict("analysis source provenance unavailable"));
+            }
             let ObservationCaptureSnapshot::Source {
                 source_json,
                 source_sha256,
@@ -277,6 +289,9 @@ pub fn observation_analysis_source_json(
             )
         }
         ObservationAnalysisSource::AttemptEvidence { evidence_index } => {
+            if outcome.fixture {
+                return Err(AppError::conflict("analysis source provenance unavailable"));
+            }
             let evidence = outcome
                 .runner_evidence
                 .get(evidence_index as usize)
@@ -338,6 +353,16 @@ pub fn observation_analysis_source_json(
 
 #[async_trait]
 pub trait ObservationAnalysisRepository: Send + Sync {
+    /// Terminalize abandoned work without invoking inference or reclaiming it.
+    /// The old claim is fenced out; a user may request a separate new revision.
+    async fn interrupt_stale(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError>;
     async fn create(
         &self,
         scope: &TenantScope,
@@ -413,6 +438,46 @@ fn require_project(scope: &TenantScope) -> Result<(), AppError> {
 
 #[async_trait]
 impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
+    async fn interrupt_stale(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        require_project(scope)?;
+        if cutoff > now {
+            return Err(AppError::invalid_request(
+                "invalid analysis interruption time",
+            ));
+        }
+        for stored in self.records.lock().await.values_mut() {
+            let revision = &mut stored.revision;
+            if stored.scope == *scope
+                && revision.request.target_id == target_id
+                && revision.request.attempt_id == attempt_id
+                && revision.state != ObservationAnalysisState::Completed
+                && revision.started_at.unwrap_or(revision.created_at) <= cutoff
+            {
+                stored.claim_token = Some(Uuid::new_v4());
+                revision.state = ObservationAnalysisState::Completed;
+                revision.started_at = Some(revision.started_at.unwrap_or(revision.created_at));
+                revision.analyzed_at = Some(now);
+                revision.result = Some(ObservationAnalysisResult {
+                    config_revision: None,
+                    actual_model: None,
+                    candidate_json: None,
+                    outcome: ObservationAnalysisOutcome::Failed {
+                        code: "analysis_interrupted".into(),
+                    },
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                });
+            }
+        }
+        Ok(())
+    }
     async fn create(
         &self,
         scope: &TenantScope,
@@ -584,15 +649,26 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         {
             return Err(AppError::invalid_request("invalid analysis cursor"));
         }
+        let cursor = after_revision_id.map(|id| {
+            let revision = &records[&id].revision;
+            (revision.created_at, revision.request.revision_id)
+        });
         let mut revisions: Vec<_> = records
             .values()
             .filter(matches)
             .filter(|stored| {
-                after_revision_id.is_none_or(|id| stored.revision.request.revision_id > id)
+                cursor.is_none_or(|cursor| {
+                    (
+                        stored.revision.created_at,
+                        stored.revision.request.revision_id,
+                    ) < cursor
+                })
             })
             .map(|stored| stored.revision.clone())
             .collect();
-        revisions.sort_by_key(|revision| revision.request.revision_id);
+        revisions.sort_by_key(|revision| {
+            std::cmp::Reverse((revision.created_at, revision.request.revision_id))
+        });
         revisions.truncate(limit);
         Ok(revisions)
     }
@@ -722,6 +798,7 @@ mod tests {
 
     fn result() -> ObservationAnalysisResult {
         ObservationAnalysisResult {
+            config_revision: None,
             actual_model: Some("synthetic".into()),
             candidate_json: Some(r#"{"decision":"unverified"}"#.into()),
             outcome: ObservationAnalysisOutcome::Unverified {
@@ -1056,6 +1133,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_analysis_terminalizes_without_reclaim_and_fences_late_completion() {
+        let f = fixture().await;
+        let mut queued = f.request.clone();
+        queued.revision_id = Uuid::new_v4();
+        let hash = sha256_hex(b"interruption");
+        f.store
+            .create(&f.scope, "running", &hash, f.request.clone(), f.now)
+            .await
+            .unwrap();
+        f.store
+            .create(&f.scope, "queued", &hash, queued.clone(), f.now)
+            .await
+            .unwrap();
+        let claim = f
+            .store
+            .claim(&f.scope, f.request.revision_id, f.now)
+            .await
+            .unwrap()
+            .unwrap();
+        let cutoff = f.now + Duration::seconds(180);
+        f.store
+            .interrupt_stale(
+                &f.scope,
+                f.request.target_id,
+                f.request.attempt_id,
+                cutoff,
+                cutoff,
+            )
+            .await
+            .unwrap();
+        for id in [f.request.revision_id, queued.revision_id] {
+            let revision = f.store.get(&f.scope, id).await.unwrap().unwrap();
+            assert_eq!(revision.state, ObservationAnalysisState::Completed);
+            assert!(matches!(revision.result.unwrap().outcome,
+                ObservationAnalysisOutcome::Failed { code } if code == "analysis_interrupted"));
+            assert!(f.store.claim(&f.scope, id, cutoff).await.unwrap().is_none());
+        }
+        assert!(
+            f.store
+                .finish(
+                    &f.scope,
+                    f.request.revision_id,
+                    claim.claim_token,
+                    result(),
+                    cutoff
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn analysis_time_checks_and_interruption_do_not_allow_reclaim() {
         let f = fixture().await;
         let hash = sha256_hex(b"synthetic-request");
@@ -1111,6 +1240,7 @@ mod tests {
                 .is_err()
         );
         let interrupted = ObservationAnalysisResult {
+            config_revision: None,
             actual_model: None,
             candidate_json: None,
             outcome: ObservationAnalysisOutcome::Failed {

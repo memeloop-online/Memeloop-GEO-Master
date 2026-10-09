@@ -68,6 +68,39 @@ fn decode(row: &sqlx::postgres::PgRow) -> Result<ObservationAnalysisRevision, Ap
 
 #[async_trait]
 impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
+    async fn interrupt_stale(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let project = project(scope)?;
+        if cutoff > now {
+            return Err(AppError::invalid_request(
+                "invalid analysis interruption time",
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        // Rotate rather than clear the token to satisfy the completed-row
+        // invariant while rejecting a late completion from the previous owner.
+        sqlx::query(
+            "UPDATE observation_analyses SET state='completed',claim_token=$8,\
+             started_at=COALESCE(started_at,created_at),analyzed_at=$7,\
+             result='{\"actual_model\":null,\"candidate_json\":null,\"outcome\":{\"status\":\"failed\",\"code\":\"analysis_interrupted\"},\"prompt_tokens\":0,\"completion_tokens\":0}'::jsonb \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND target_id=$4 \
+             AND attempt_id=$5 AND state IN ('queued','running') \
+             AND COALESCE(started_at,created_at)<=$6",
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
+            .bind(target_id).bind(attempt_id).bind(cutoff).bind(now).bind(Uuid::new_v4())
+            .execute(&mut *tx).await.map_err(unavailable)?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(())
+    }
     async fn create(
         &self,
         scope: &TenantScope,
@@ -312,7 +345,11 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         let rows = sqlx::query(
             "SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 \
              AND project_id=$3 AND target_id=$4 AND attempt_id=$5 \
-             AND ($6::uuid IS NULL OR revision_id>$6) ORDER BY revision_id LIMIT $7",
+             AND ($6::uuid IS NULL OR (created_at,revision_id)<(\
+                 SELECT created_at,revision_id FROM observation_analyses \
+                 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+                 AND target_id=$4 AND attempt_id=$5 AND revision_id=$6)) \
+             ORDER BY created_at DESC,revision_id DESC LIMIT $7",
         )
         .bind(scope.operator_id.as_uuid())
         .bind(scope.tenant_id.as_uuid())

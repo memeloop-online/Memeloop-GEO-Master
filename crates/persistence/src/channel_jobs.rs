@@ -567,7 +567,7 @@ impl ChannelJobRepository for PgChannelJobRepository {
         expires_at: DateTime<Utc>,
     ) -> Result<(), AppError> {
         project(scope)?;
-        if expires_at <= at || expires_at - at > chrono::Duration::minutes(5) {
+        if expires_at <= at || expires_at - at > geo_domain::CHANNEL_EXECUTION_LEASE {
             return Err(AppError::invalid_request(
                 "invalid account reservation duration",
             ));
@@ -658,6 +658,25 @@ impl ChannelJobRepository for PgChannelJobRepository {
         .await
         .map_err(db)?;
         bind_generated_claim(&mut tx, scope, &target, attempt_id, at).await?;
+        // The locked reservation still belongs to this exact preflight owner.
+        // Roll back the renewal together with the attempt if any write fails.
+        sqlx::query(
+            "UPDATE channel_account_preflight_reservations SET expires_at=$4 \
+             WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(target.input.account_id())
+        .bind(reservation_id)
+        .bind(
+            at + if kind == "measure" {
+                geo_domain::CHANNEL_MEASUREMENT_LEASE
+            } else {
+                geo_domain::CHANNEL_EXECUTION_LEASE
+            },
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok((
             target,

@@ -4,6 +4,7 @@ import test from "node:test";
 import { extractWithSignedInBrowser } from "../src/browser-ai-extraction.mjs";
 import {
   interpretObservation,
+  extractionPrompt,
   ObservationPersistenceError,
 } from "../src/ai-observation-parser.mjs";
 
@@ -432,4 +433,28 @@ test("browser failures are sanitized and never retry", async () => {
   );
   assert.equal(f.stats().closed, 1);
   assert.equal(f.stats().sent, 0);
+});
+
+test("stalled page teardown cannot consume the configured model fallback budget", async () => {
+  const source = { messages: [] };
+  const f = fixture({ requestPrompt: extractionPrompt(source) });
+  f.child.close = () => new Promise(() => {});
+  let apiCalls = 0;
+  let browserSignal;
+  const result = await interpretObservation(source, {
+    browserTimeoutMs: 25,
+    apiTimeoutMs: 100,
+    browserExtract: (text, hooks) => {
+      browserSignal = hooks.signal;
+      return extractWithSignedInBrowser(f.page, text, options(hooks));
+    },
+    apiExtract: async () => {
+      apiCalls++;
+      assert.equal(browserSignal.aborted, true);
+      return null;
+    },
+  });
+  assert.equal(result, null);
+  assert.equal(apiCalls, 1);
+  assert.equal(f.stats().sent, 1);
 });

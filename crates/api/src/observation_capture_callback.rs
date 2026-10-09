@@ -938,6 +938,33 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        let execution_expiry = Utc::now() + geo_domain::CHANNEL_MEASUREMENT_LEASE;
+        let execution_ticket = fixture
+            .service
+            .issue_ticket(
+                &fixture.scope,
+                ObservationCaptureBinding {
+                    target_id: ticket.target_id,
+                    attempt_id: ticket.attempt_id,
+                    account_id: ticket.account_id,
+                    runner_session_id: ticket.runner_session_id,
+                    original_identity: ticket.original_identity.clone(),
+                },
+                execution_expiry,
+            )
+            .unwrap();
+        let decoded: Ticket = serde_json::from_slice(
+            &fixture
+                .service
+                .cipher
+                .open(TICKET_AAD, &hex::decode(execution_ticket).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.expires_at.timestamp_micros(),
+            execution_expiry.timestamp_micros()
+        );
         assert!(
             fixture
                 .service

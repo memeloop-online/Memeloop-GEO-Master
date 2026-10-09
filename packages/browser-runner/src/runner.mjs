@@ -120,6 +120,8 @@ export function createRunner(options = {}) {
     sessionIdleMs = 15 * 60_000,
     executionRetentionMs = 5 * 60_000,
     executionTimeoutMs = 120_000,
+    measurementExecutionTimeoutMs = 240_000,
+    measurementSourceTimeoutMs = 120_000,
     maintenanceIntervalMs = 30_000,
     clock = () => Date.now(),
   } = options;
@@ -145,6 +147,8 @@ export function createRunner(options = {}) {
       sessionIdleMs,
       executionRetentionMs,
       executionTimeoutMs,
+      measurementExecutionTimeoutMs,
+      measurementSourceTimeoutMs,
       maintenanceIntervalMs,
       restoredKimiIdentityWaitMs,
     ].every((value) => Number.isFinite(value) && value > 0) ||
@@ -592,7 +596,16 @@ export function createRunner(options = {}) {
     const entry = { fingerprint, promise: null, settledAt: null };
     const promise = (async () => {
       const deadline = Symbol("execution_deadline");
-      const deadlineAt = performance.now() + executionTimeoutMs;
+      const startedAt = performance.now();
+      const timeoutMs =
+        input.operation === "measure"
+          ? measurementExecutionTimeoutMs
+          : executionTimeoutMs;
+      const deadlineAt = startedAt + timeoutMs;
+      const sourceDeadlineAt =
+        input.operation === "measure"
+          ? Math.min(deadlineAt, startedAt + measurementSourceTimeoutMs)
+          : undefined;
       const controller = new AbortController();
       let timer;
       const timeout = new Promise((resolve) => {
@@ -606,7 +619,7 @@ export function createRunner(options = {}) {
           controller.abort();
           resolve(deadline);
         };
-        timer = setTimeout(expire, executionTimeoutMs);
+        timer = setTimeout(expire, timeoutMs);
       });
       function timedOut() {
         // The external side effect may have happened. Closing this browser
@@ -862,6 +875,7 @@ export function createRunner(options = {}) {
             proxy: record.proxy,
             expectedAccountId: record.identity.platform_account_id,
             deadlineAt,
+            sourceDeadlineAt,
             signal: controller.signal,
             ...captureHooks,
           }),
