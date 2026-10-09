@@ -689,6 +689,78 @@ describe("P14 immutable reports", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows and exports saved-response analysis separately without changing missing coverage", async () => {
+    const report: ReportSnapshot = {
+      ...snapshot,
+      measurements: {
+        availability: "available",
+        expected_count: 1,
+        observed_count: 0,
+        counts: { missing: 1 },
+        reason: null,
+      },
+      supplementary_measurements: [
+        {
+          target_id: "saved-target",
+          attempt_id: "saved-attempt",
+          plan_id: "saved-plan",
+          comparison_key: "saved-protocol",
+          question_binding: { purpose: "frozen_evaluation" },
+          observation: {
+            raw_answer: "=Saved answer, independently analyzed.",
+            citations: ["https://example.org/source", "javascript:alert(1)"],
+            observed_at: "2026-09-26T08:00:00Z",
+            received_at: "2026-09-26T08:01:00Z",
+            provenance: {
+              revision_id: "analysis-revision",
+              source: { kind: "capture", capture_id: "capture-1" },
+              source_sha256: "source-digest",
+              observed_at: "2026-09-26T08:00:00Z",
+              analyzed_at: "2026-09-27T08:00:00Z",
+              actual_model: "analysis-model",
+              config_revision: 2,
+              prompt_version: "prompt-1",
+              parser_version: "parser-1",
+            },
+          },
+        },
+      ],
+    };
+    mockApi({ detail: report });
+    renderPage("/app/tenant-1/project-1/reports/report-1");
+    const supplemental = await screen.findByRole("region", {
+      name: "已存原文的补充分析",
+    });
+    expect(within(supplemental).getByText("独立分析 1 项")).toBeInTheDocument();
+    expect(
+      within(supplemental).getByText("analysis-model"),
+    ).toBeInTheDocument();
+    expect(
+      within(supplemental).getByText("analysis-revision"),
+    ).toBeInTheDocument();
+    expect(
+      within(supplemental).getByText("=Saved answer, independently analyzed."),
+    ).toBeInTheDocument();
+    expect(
+      within(supplemental).queryByRole("link", { name: "javascript:alert(1)" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(supplemental).getByRole("link", {
+        name: "查看测量记录与分析版本",
+      }),
+    ).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/measurement?tab=records&record=saved-plan",
+    );
+    const csv = reportSnapshotCsv(report);
+    expect(csv).toContain('"measurement","","missing","1"');
+    expect(csv).toContain(
+      '"supplementary_measurement","saved-target/saved-attempt","revision_id","analysis-revision"',
+    );
+    expect(csv).toContain('"\'=Saved answer, independently analyzed."');
+    expect(csv).toContain("separate_from_measurement_coverage");
+  });
+
   it("exports only persisted snapshot coverage and evidence with formula-safe CSV cells", async () => {
     const csv = reportSnapshotCsv({
       ...snapshot,

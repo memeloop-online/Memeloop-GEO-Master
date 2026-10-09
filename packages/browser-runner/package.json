@@ -15,7 +15,14 @@
   "dependencies": {
     "@fastify/busboy": "3.2.2",
     "@novnc/novnc": "1.7.0",
+    "@tiptap/core": "3.31.4",
+    "@tiptap/extension-table": "3.31.4",
+    "@tiptap/pm": "3.31.4",
+    "@tiptap/starter-kit": "3.31.4",
     "playwright": "1.63.0",
     "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
   }
 }

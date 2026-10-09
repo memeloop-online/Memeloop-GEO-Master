@@ -1,7 +1,9 @@
 import { apiFetch } from "./client";
 import type { DistributionScope } from "./projects";
+import type { SavedAnalysisProvenance } from "./observationAnalysis";
 
 export interface CitationSample {
+  analysis?: SavedAnalysisProvenance | null;
   plan_id: string;
   target_id: string;
   attempt_id: string;
@@ -45,6 +47,7 @@ export interface CitationInsightsPage {
     missing: number;
     other_completed: number;
     fixture: number;
+    grounded_saved_analysis?: number;
   };
   invalid_citation_urls: number;
   observed_sources: ObservedCitationSource[];

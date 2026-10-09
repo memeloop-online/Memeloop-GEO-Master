@@ -299,6 +299,7 @@ async fn api_freezes_source_bytes_rejects_uploaded_receipt_and_preserves_report_
         document_manifest: None,
         publication_targets: ledger.publications,
         measurement_targets: ledger.measurements,
+        supplementary_measurements: vec![],
     };
     let report = reduce_report(&scope, &input, 1, None, as_of).unwrap();
     assert_eq!(

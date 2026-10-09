@@ -8,10 +8,11 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, CycleReportView, DistributionPublicationResult, DistributionTarget,
-    DistributionTargetStatus, ErrorCode, ProjectId, ReportManifestKind, ReportManifestRef,
-    ReportPreview, ReportPublicationStatus, ReportPublicationTarget, ReportReduceInput,
-    ReportSnapshot, TenantScope, preview_report, publication_lookup_asset_evidence, reduce_report,
+    AppError, ChannelTargetInput, CycleReportView, DistributionPublicationResult,
+    DistributionTarget, DistributionTargetStatus, ErrorCode, ProjectId, ReportManifestKind,
+    ReportManifestRef, ReportPreview, ReportPublicationStatus, ReportPublicationTarget,
+    ReportReduceInput, ReportSnapshot, ReportSupplementaryMeasurement, TenantScope,
+    effective_observation, preview_report, publication_lookup_asset_evidence, reduce_report,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -302,6 +303,14 @@ async fn assemble_report_input(
         .channel_job_repository()
         .cycle_inputs(scope, cycle_id, evidence_at)
         .await?;
+    let supplementary_measurements = supplementary_measurements(
+        state,
+        scope,
+        cycle,
+        channel_inputs.measurements.as_deref().unwrap_or_default(),
+        evidence_at,
+    )
+    .await?;
     let has_distribution = formal.is_some()
         || channel_inputs
             .manifests
@@ -473,7 +482,94 @@ async fn assemble_report_input(
             })
         }),
         measurement_targets: channel_inputs.measurements,
+        supplementary_measurements,
     })
+}
+
+/// Saved interpretations of both cycle samples and independent project topics
+/// enter a separate evidence list, never the cycle manifest or its denominator.
+async fn supplementary_measurements(
+    state: &AppState,
+    scope: &TenantScope,
+    cycle: &CycleReportView,
+    targets: &[geo_domain::ReportMeasurementTarget],
+    as_of: DateTime<Utc>,
+) -> Result<Vec<ReportSupplementaryMeasurement>, AppError> {
+    let Some(resolver) = state.observation_evidence_resolver() else {
+        return Ok(vec![]);
+    };
+    let repository = state.channel_job_repository();
+    let mut identities: std::collections::BTreeMap<Uuid, Option<Uuid>> = targets
+        .iter()
+        .map(|target| (target.target_id, None))
+        .collect();
+    let mut after = None;
+    loop {
+        let plans = repository.list_measurement_plans(scope, after, 100).await?;
+        if plans.is_empty() {
+            break;
+        }
+        after = plans.last().map(|plan| plan.plan_id);
+        for plan in plans {
+            if plan.project_id != cycle.project_id || plan.created_at > as_of {
+                continue;
+            }
+            for target in plan.targets {
+                if let ChannelTargetInput::Measure { scheduled_at, .. } = &target.input
+                    && *scheduled_at >= cycle.report_window_start_at
+                    && *scheduled_at < cycle.report_window_end_at
+                {
+                    identities
+                        .entry(target.target_id)
+                        .or_insert(Some(plan.plan_id));
+                }
+            }
+        }
+    }
+    let identities: Vec<_> = identities.into_iter().collect();
+    let mut supplements = Vec::new();
+    for chunk in identities.chunks(64) {
+        let mut views = Vec::new();
+        for (target_id, _) in chunk {
+            let mut view = repository.get_target(scope, *target_id).await?;
+            view.attempts.retain(|attempt| attempt.claimed_at <= as_of);
+            views.push(view);
+        }
+        let analyses = resolver.resolve(scope, &views, as_of).await?;
+        for (view, (_, plan_id)) in views.iter().zip(chunk) {
+            // Live receipts remain in their original report adapter; this
+            // supplementary branch only accepts validated saved interpretations.
+            let Some(observation) = effective_observation(view, &analyses, as_of, |_, _| false)
+            else {
+                continue;
+            };
+            if observation.provenance.is_none()
+                || observation.observed_at < cycle.report_window_start_at
+                || observation.observed_at >= cycle.report_window_end_at
+            {
+                continue;
+            }
+            let ChannelTargetInput::Measure {
+                question_binding, ..
+            } = &view.target.input
+            else {
+                continue;
+            };
+            supplements.push(ReportSupplementaryMeasurement {
+                target_id: view.target.target_id,
+                attempt_id: view.attempts.last().expect("effective attempt").attempt_id,
+                plan_id: *plan_id,
+                comparison_key: view
+                    .target
+                    .input
+                    .comparison_key()
+                    .expect("measurement protocol"),
+                question_binding: question_binding.clone(),
+                observation,
+            });
+        }
+    }
+    Ok(supplements)
 }
 
 async fn schedule_successor_after_report(

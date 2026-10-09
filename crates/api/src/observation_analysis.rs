@@ -676,7 +676,7 @@ mod tests {
                 attempt_id,
                 ChannelOutcome {
                     status: ChannelOutcomeStatus::Unknown,
-                    detail: Some("response unavailable".into()),
+                    detail: Some("execution_deadline".into()),
                     occurred_at: now,
                     raw_answer: None,
                     citations: vec![],
@@ -684,7 +684,11 @@ mod tests {
                     screenshot_ref: None,
                     connector_version: None,
                     fixture: fixture_receipt,
-                    runner_evidence: vec![],
+                    runner_evidence: vec![json!({
+                        "kind":"runner_receipt",
+                        "schema_version":"geo.runner.receipt.v1",
+                        "provenance":"unknown",
+                    })],
                 },
                 now + chrono::Duration::seconds(2),
             )

@@ -2,10 +2,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ChannelJobRepository, ErrorCode, ObservationAnalysisClaim,
-    ObservationAnalysisRepository, ObservationAnalysisRequest, ObservationAnalysisResult,
-    ObservationAnalysisRevision, ObservationAnalysisSource, ObservationAnalysisState,
-    ObservationCaptureRepository, TenantScope, observation_analysis_source_json, sha256_hex,
+    AppError, ChannelJobRepository, ErrorCode, MAX_ANALYSIS_PROJECTION_ATTEMPTS,
+    ObservationAnalysisClaim, ObservationAnalysisRepository, ObservationAnalysisRequest,
+    ObservationAnalysisResult, ObservationAnalysisRevision, ObservationAnalysisSource,
+    ObservationAnalysisState, ObservationCaptureRepository, TenantScope,
+    observation_analysis_source_json, sha256_hex,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -68,6 +69,60 @@ fn decode(row: &sqlx::postgres::PgRow) -> Result<ObservationAnalysisRevision, Ap
 
 #[async_trait]
 impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
+    async fn latest_grounded_for_attempts(
+        &self,
+        scope: &TenantScope,
+        attempts: &[(Uuid, Uuid)],
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<ObservationAnalysisRevision>, AppError> {
+        let project = project(scope)?;
+        if attempts.len() > MAX_ANALYSIS_PROJECTION_ATTEMPTS
+            || attempts
+                .iter()
+                .any(|(target, attempt)| target.is_nil() || attempt.is_nil())
+        {
+            return Err(AppError::invalid_request(
+                "invalid analysis projection batch",
+            ));
+        }
+        if attempts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (targets, attempts): (Vec<_>, Vec<_>) = attempts.iter().copied().unzip();
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        // One indexed seek per distinct requested pair. Apply eligibility before
+        // LIMIT: newer failures and post-cutoff completions cannot hide evidence.
+        let rows = sqlx::query(
+            "SELECT revision.* FROM (\
+               SELECT DISTINCT target_id,attempt_id \
+               FROM unnest($4::uuid[],$5::uuid[]) AS pairs(target_id,attempt_id)\
+             ) requested CROSS JOIN LATERAL (\
+               SELECT a.* FROM observation_analyses a \
+               WHERE a.operator_id=$1 AND a.tenant_id=$2 AND a.project_id=$3 \
+               AND a.target_id=requested.target_id AND a.attempt_id=requested.attempt_id \
+               AND a.state='completed' AND a.result->'outcome'->>'status'='grounded' \
+               AND a.created_at<=$6 AND a.analyzed_at<=$6 \
+               AND (a.request->>'observed_at')::timestamptz<=$6 \
+               ORDER BY a.created_at DESC,a.revision_id DESC LIMIT 1\
+             ) revision ORDER BY revision.target_id,revision.attempt_id",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project)
+        .bind(targets)
+        .bind(attempts)
+        .bind(as_of)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        let revisions = rows.iter().map(decode).collect::<Result<Vec<_>, _>>()?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(revisions)
+    }
+
     async fn interrupt_stale(
         &self,
         scope: &TenantScope,

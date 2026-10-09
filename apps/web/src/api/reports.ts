@@ -3,6 +3,22 @@ import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor, type QueryScope } from "../auth/types";
 import { getCurrentCycle } from "./channelJobs";
 import { apiFetch } from "./client";
+import type { SavedAnalysisProvenance } from "./observationAnalysis";
+
+export interface ReportSupplementaryMeasurement {
+  target_id: string;
+  attempt_id: string;
+  plan_id?: string | null;
+  comparison_key: string;
+  question_binding?: { purpose: "optimization" | "frozen_evaluation" } | null;
+  observation: {
+    raw_answer: string;
+    citations: string[];
+    observed_at: string;
+    received_at: string;
+    provenance: SavedAnalysisProvenance | null;
+  };
+}
 
 export interface ReportCoverage {
   availability: "available" | "unavailable" | "unsealed";
@@ -72,6 +88,7 @@ export interface ReportSnapshot {
   publication_groups: PublicationGroup[];
   measurements: ReportCoverage;
   measurement_groups: MeasurementGroup[];
+  supplementary_measurements?: ReportSupplementaryMeasurement[];
   findings: ReportFinding[];
   evidence: ReportEvidenceReference[];
 }

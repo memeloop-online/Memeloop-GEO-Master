@@ -11,15 +11,156 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    AppError, ChannelJobRepository, ChannelTargetInput, ChannelTargetView, ObservationCapture,
-    ObservationCaptureRepository, ObservationCaptureSnapshot, TenantScope, sha256_hex,
+    AppError, ChannelAttempt, ChannelJobRepository, ChannelOutcomeStatus, ChannelTargetInput,
+    ChannelTargetView, ObservationCapture, ObservationCaptureRepository,
+    ObservationCaptureSnapshot, TenantScope, sha256_hex,
 };
 
 pub const MAX_ANALYSIS_CANDIDATE_BYTES: usize = 150_000;
 pub const MAX_ANALYSIS_ANSWER_BYTES: usize = 100_000;
 pub const MAX_ANALYSIS_AUDIT_BYTES: usize = 150_000;
+pub const MAX_ANALYSIS_PROJECTION_ATTEMPTS: usize = 1000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Interpretation provenance is supplementary evidence, never a live receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SavedAnalysisProvenance {
+    pub revision_id: Uuid,
+    pub source: ObservationAnalysisSource,
+    pub source_sha256: String,
+    pub observed_at: DateTime<Utc>,
+    pub analyzed_at: DateTime<Utc>,
+    pub actual_model: String,
+    pub config_revision: Option<i64>,
+    pub prompt_version: String,
+    pub parser_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct EffectiveObservation {
+    pub raw_answer: String,
+    pub citations: Vec<String>,
+    pub observed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub provenance: Option<SavedAnalysisProvenance>,
+}
+
+/// Repository selection checks persisted acceptance and time only. The authenticated
+/// grounder owns semantics; consumers additionally validate source binding.
+pub fn observation_analysis_projection_eligible(
+    revision: &ObservationAnalysisRevision,
+    as_of: DateTime<Utc>,
+) -> bool {
+    revision.state == ObservationAnalysisState::Completed
+        && revision.created_at <= as_of
+        && revision.request.observed_at <= as_of
+        && revision.analyzed_at.is_some_and(|at| at <= as_of)
+        && revision.result.as_ref().is_some_and(|result| {
+            matches!(result.outcome, ObservationAnalysisOutcome::Grounded { .. })
+        })
+}
+
+/// Select one interpretation for the current attempt, never union revisions.
+/// `analyses` must have passed scoped source/digest validation at the reader.
+/// The audit checks below verify the existing grounder's acceptance contract;
+/// they do not interpret any provider-specific fields.
+pub fn effective_observation(
+    view: &ChannelTargetView,
+    analyses: &[ObservationAnalysisRevision],
+    as_of: DateTime<Utc>,
+    is_trusted_search: impl Fn(&ChannelTargetView, &ChannelAttempt) -> bool,
+) -> Option<EffectiveObservation> {
+    let attempt = view.attempts.last()?;
+    let outcome = attempt.outcome.as_ref()?;
+    let received_at = attempt.received_at.filter(|at| *at <= as_of)?;
+    let ChannelTargetInput::Measure {
+        provider,
+        model,
+        surface,
+        search_mode,
+        protocol_version,
+        market,
+        language,
+        ..
+    } = &view.target.input
+    else {
+        return None;
+    };
+    let expected_protocol = serde_json::json!({
+        "provider":provider,"model":model,"surface":surface,"search_mode":search_mode,
+        "protocol_version":protocol_version,"market":market,"language":language
+    });
+    let selected = analyses
+        .iter()
+        .filter(|revision| {
+            if revision.request.target_id != view.target.target_id
+                || revision.request.attempt_id != attempt.attempt_id
+                || !observation_analysis_projection_eligible(revision, as_of)
+                || revision.request.observed_at < attempt.claimed_at
+                || revision.request.observed_at > received_at
+            {
+                return false;
+            }
+            let result = revision.result.as_ref().expect("eligible result");
+            let ObservationAnalysisOutcome::Grounded { audit, .. } = &result.outcome else {
+                return false;
+            };
+            result.validate().is_ok()
+                && audit["kind"] == "observation_extraction"
+                && audit["method"] == "llm_grounded"
+                && audit["prompt_version"] == revision.request.prompt_version
+                && audit["source_sha256"] == revision.request.source_sha256
+                && audit["protocol"] == expected_protocol
+                && ["completion", "search_activity", "answer_segment"]
+                    .iter()
+                    .all(|role| {
+                        audit["refs"]
+                            .as_array()
+                            .is_some_and(|refs| refs.iter().any(|entry| entry["role"] == *role))
+                    })
+        })
+        .max_by_key(|revision| (revision.created_at, revision.request.revision_id));
+    if let Some(revision) = selected {
+        let result = revision.result.as_ref()?;
+        let ObservationAnalysisOutcome::Grounded {
+            raw_answer,
+            citations,
+            ..
+        } = &result.outcome
+        else {
+            return None;
+        };
+        return Some(EffectiveObservation {
+            raw_answer: raw_answer.clone(),
+            citations: citations.clone(),
+            observed_at: revision.request.observed_at,
+            received_at,
+            provenance: Some(SavedAnalysisProvenance {
+                revision_id: revision.request.revision_id,
+                source: revision.request.source.clone(),
+                source_sha256: revision.request.source_sha256.clone(),
+                observed_at: revision.request.observed_at,
+                analyzed_at: revision.analyzed_at?,
+                actual_model: result.actual_model.clone()?,
+                config_revision: result.config_revision,
+                prompt_version: revision.request.prompt_version.clone(),
+                parser_version: revision.request.parser_version.clone(),
+            }),
+        });
+    }
+    (outcome.status == ChannelOutcomeStatus::Observed
+        && !outcome.fixture
+        && outcome.occurred_at <= as_of
+        && is_trusted_search(view, attempt))
+    .then(|| EffectiveObservation {
+        raw_answer: outcome.raw_answer.clone().unwrap_or_default(),
+        citations: outcome.citations.clone(),
+        observed_at: outcome.occurred_at,
+        received_at,
+        provenance: None,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObservationAnalysisSource {
     Capture { capture_id: Uuid },
@@ -263,9 +404,18 @@ pub fn observation_analysis_source_json(
             }
             // An unavailable runner response is conservatively marked fixture
             // by dispatch. Only an independently persisted, identity-bound
-            // checkpoint may recover interpretation from such a receipt.
+            // checkpoint may recover interpretation from such a receipt. A
+            // deadline response has an explicit unknown receipt, not a fixture
+            // receipt; its interpretation must remain separately attributed.
+            let receipt_allows_saved_source = outcome.runner_evidence.iter().all(|evidence| {
+                evidence["kind"] != "runner_receipt"
+                    || (evidence["schema_version"] == "geo.runner.receipt.v1"
+                        && evidence["provenance"] == "unknown"
+                        && outcome.status == ChannelOutcomeStatus::Unknown
+                        && outcome.detail.as_deref() == Some("execution_deadline"))
+            });
             if outcome.fixture
-                && (outcome.runner_evidence.iter().any(|evidence| evidence["kind"] == "runner_receipt")
+                && (!receipt_allows_saved_source
                     || !capture.input.original_identity.as_ref().is_some_and(|identity| {
                     matches!(&target.target.input, ChannelTargetInput::Measure { provider, .. }
                         if identity.provider == *provider && !identity.platform_account_id.is_empty())
@@ -353,6 +503,16 @@ pub fn observation_analysis_source_json(
 
 #[async_trait]
 pub trait ObservationAnalysisRepository: Send + Sync {
+    /// At most one latest completed grounded revision per scoped target/attempt,
+    /// selected by creation time and ID descending; returned in target/attempt
+    /// order. Later failures never erase grounded work.
+    /// Empty batches are allowed; nonempty batches contain at most 1000 pairs.
+    async fn latest_grounded_for_attempts(
+        &self,
+        scope: &TenantScope,
+        attempts: &[(Uuid, Uuid)],
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<ObservationAnalysisRevision>, AppError>;
     /// Terminalize abandoned work without invoking inference or reclaiming it.
     /// The old claim is fenced out; a user may request a separate new revision.
     async fn interrupt_stale(
@@ -438,6 +598,41 @@ fn require_project(scope: &TenantScope) -> Result<(), AppError> {
 
 #[async_trait]
 impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
+    async fn latest_grounded_for_attempts(
+        &self,
+        scope: &TenantScope,
+        attempts: &[(Uuid, Uuid)],
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<ObservationAnalysisRevision>, AppError> {
+        require_project(scope)?;
+        if attempts.len() > MAX_ANALYSIS_PROJECTION_ATTEMPTS
+            || attempts
+                .iter()
+                .any(|(target, attempt)| target.is_nil() || attempt.is_nil())
+        {
+            return Err(AppError::invalid_request(
+                "invalid analysis projection batch",
+            ));
+        }
+        let requested: std::collections::HashSet<_> = attempts.iter().copied().collect();
+        let records = self.records.lock().await;
+        let mut selected: std::collections::BTreeMap<_, &ObservationAnalysisRevision> =
+            std::collections::BTreeMap::new();
+        for stored in records.values().filter(|stored| stored.scope == *scope) {
+            let revision = &stored.revision;
+            let key = (revision.request.target_id, revision.request.attempt_id);
+            if requested.contains(&key)
+                && observation_analysis_projection_eligible(revision, as_of)
+                && selected.get(&key).is_none_or(|prior| {
+                    (revision.created_at, revision.request.revision_id)
+                        > (prior.created_at, prior.request.revision_id)
+                })
+            {
+                selected.insert(key, revision);
+            }
+        }
+        Ok(selected.into_values().cloned().collect())
+    }
     async fn interrupt_stale(
         &self,
         scope: &TenantScope,
@@ -810,6 +1005,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_batch_selects_latest_grounded_as_of_with_scope_and_bounds() {
+        let f = fixture().await;
+        let hash = sha256_hex(b"projection");
+        let mut ids = Vec::new();
+        for ordinal in 0..3 {
+            let mut request = f.request.clone();
+            request.revision_id = Uuid::new_v4();
+            ids.push(request.revision_id);
+            let at = f.now + Duration::seconds(ordinal);
+            f.store
+                .create(
+                    &f.scope,
+                    &format!("projection-{ordinal}"),
+                    &hash,
+                    request.clone(),
+                    at,
+                )
+                .await
+                .unwrap();
+            let claim = f
+                .store
+                .claim(&f.scope, request.revision_id, at)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut completion = result();
+            if ordinal < 2 {
+                completion.outcome = ObservationAnalysisOutcome::Grounded {
+                    raw_answer: "Synthetic saved answer".into(),
+                    citations: vec![],
+                    audit: json!({"refs":[{"role":"answer_source"}]}),
+                };
+            }
+            f.store
+                .finish(
+                    &f.scope,
+                    request.revision_id,
+                    claim.claim_token,
+                    completion,
+                    at,
+                )
+                .await
+                .unwrap();
+        }
+        let pairs = [(f.request.target_id, f.request.attempt_id); 2];
+        let latest = f
+            .store
+            .latest_grounded_for_attempts(&f.scope, &pairs, f.now + Duration::seconds(3))
+            .await
+            .unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].request.revision_id, ids[1]);
+        let early = f
+            .store
+            .latest_grounded_for_attempts(&f.scope, &pairs, f.now)
+            .await
+            .unwrap();
+        assert_eq!(early[0].request.revision_id, ids[0]);
+        assert!(
+            f.store
+                .latest_grounded_for_attempts(&f.scope, &pairs, f.now - Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut other = f.scope.clone();
+        other.project_id = Some(Uuid::new_v4().into());
+        assert!(
+            f.store
+                .latest_grounded_for_attempts(&other, &pairs, f.now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            f.store
+                .latest_grounded_for_attempts(&f.scope, &[], f.now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            f.store
+                .latest_grounded_for_attempts(
+                    &f.scope,
+                    &vec![pairs[0]; MAX_ANALYSIS_PROJECTION_ATTEMPTS + 1],
+                    f.now
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            f.store
+                .latest_grounded_for_attempts(&f.scope, &[(Uuid::nil(), pairs[0].1)], f.now)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn analysis_replay_atomic_claim_fencing_and_terminal_immutability() {
         let f = fixture().await;
         let request_digest = sha256_hex(b"synthetic-request");
@@ -1097,6 +1392,79 @@ mod tests {
         evidence.as_object_mut().unwrap().remove("observed_at");
         assert!(
             observation_analysis_source_json(&f.scope, &f.request, &audit_target, None).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_unknown_receipt_allows_only_independently_bound_source_capture() {
+        let f = fixture().await;
+        let mut request = f.request.clone();
+        request.source = ObservationAnalysisSource::Capture {
+            capture_id: f.source_capture_id,
+        };
+        let mut target = f
+            .jobs
+            .get_target(&f.scope, request.target_id)
+            .await
+            .unwrap();
+        let outcome = target.attempts[0].outcome.as_mut().unwrap();
+        outcome.fixture = true;
+        outcome.status = ChannelOutcomeStatus::Unknown;
+        outcome.detail = Some("execution_deadline".into());
+        outcome.runner_evidence = vec![json!({
+            "kind":"runner_receipt",
+            "schema_version":"geo.runner.receipt.v1",
+            "provenance":"unknown",
+        })];
+        let mut capture = f
+            .captures
+            .get(&f.scope, f.source_capture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        capture.input.original_identity = Some(crate::ObservationProviderIdentity {
+            provider: "synthetic".into(),
+            platform_account_id: "synthetic-account".into(),
+        });
+        capture.receipt.digest_sha256 = capture.input.validate(&f.scope).unwrap();
+        let original = target.clone();
+        assert!(
+            observation_analysis_source_json(&f.scope, &request, &target, Some(&capture)).is_ok()
+        );
+        assert_eq!(target, original);
+        assert!(observation_analysis_source_json(&f.scope, &f.request, &target, None).is_err());
+        for provenance in ["fixture", "live", ""] {
+            let mut rejected = target.clone();
+            rejected.attempts[0]
+                .outcome
+                .as_mut()
+                .unwrap()
+                .runner_evidence[0]["provenance"] = json!(provenance);
+            assert!(
+                observation_analysis_source_json(&f.scope, &request, &rejected, Some(&capture))
+                    .is_err()
+            );
+        }
+        let mut malformed = target.clone();
+        malformed.attempts[0]
+            .outcome
+            .as_mut()
+            .unwrap()
+            .runner_evidence[0]["schema_version"] = json!("unrecognized");
+        assert!(
+            observation_analysis_source_json(&f.scope, &request, &malformed, Some(&capture))
+                .is_err()
+        );
+        let mut not_deadline = target.clone();
+        not_deadline.attempts[0].outcome.as_mut().unwrap().detail = None;
+        assert!(
+            observation_analysis_source_json(&f.scope, &request, &not_deadline, Some(&capture))
+                .is_err()
+        );
+        capture.input.original_identity = None;
+        capture.receipt.digest_sha256 = capture.input.validate(&f.scope).unwrap();
+        assert!(
+            observation_analysis_source_json(&f.scope, &request, &target, Some(&capture)).is_err()
         );
     }
 

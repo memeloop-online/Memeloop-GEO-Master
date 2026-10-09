@@ -22,6 +22,7 @@ import {
 import { ApiError } from "../api/client";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { downloadReportCsv } from "./reportsCsv";
+import { ReportSupplementaryMeasurements } from "./ReportSupplementaryMeasurements";
 import "./ReportsPage.css";
 
 const manifestLabels = {
@@ -452,6 +453,12 @@ function SnapshotDetail({
           测量结果按问题集、平台、观测面、市场和采样协议分别展示。历史样本保留原测量时间。
         </p>
       </section>
+      {!!snapshot.supplementary_measurements?.length && (
+        <ReportSupplementaryMeasurements
+          items={snapshot.supplementary_measurements}
+          timezone={snapshot.report_timezone}
+        />
+      )}
       <section className="report-section" aria-label="结论">
         <h2>结论与证据</h2>
         {snapshot.findings.length ? (

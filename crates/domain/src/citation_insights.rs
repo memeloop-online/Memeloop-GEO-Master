@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::{
     AppError, ChannelAttempt, ChannelOutcomeStatus, ChannelTargetInput, ChannelTargetView,
-    QuestionPurpose, StandaloneMeasurementPlan, TenantScope,
+    ObservationAnalysisRevision, QuestionPurpose, SavedAnalysisProvenance,
+    StandaloneMeasurementPlan, TenantScope, effective_observation,
 };
 
 #[derive(Debug, Default, Serialize)]
@@ -20,6 +21,8 @@ pub struct CitationCoverage {
     pub planned: usize,
     pub pending: usize,
     pub observed_live: usize,
+    /// Supplementary interpretations; does not replace any original status counter.
+    pub grounded_saved_analysis: usize,
     pub observed_unverified: usize,
     pub observed_without_citations: usize,
     pub refused: usize,
@@ -45,6 +48,8 @@ pub struct CitationSample {
     pub scheduled_at: DateTime<Utc>,
     pub observed_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<SavedAnalysisProvenance>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +115,24 @@ pub fn summarize_citations(
     // existing official-search validator, not a second protocol parser.
     is_trusted_search: impl Fn(&ChannelTargetView, &ChannelAttempt) -> bool,
 ) -> Result<CitationInsightPage, AppError> {
+    summarize_citations_with_analyses(
+        scope,
+        plans,
+        next_after,
+        &[],
+        DateTime::<Utc>::MAX_UTC,
+        is_trusted_search,
+    )
+}
+
+pub fn summarize_citations_with_analyses(
+    scope: &TenantScope,
+    plans: &[(StandaloneMeasurementPlan, Vec<ChannelTargetView>)],
+    next_after: Option<Uuid>,
+    analyses: &[ObservationAnalysisRevision],
+    as_of: DateTime<Utc>,
+    is_trusted_search: impl Fn(&ChannelTargetView, &ChannelAttempt) -> bool,
+) -> Result<CitationInsightPage, AppError> {
     let mut coverage = CitationCoverage::default();
     let mut hosts: BTreeMap<String, SourceAccumulator> = BTreeMap::new();
     let mut invalid_citation_urls = 0;
@@ -142,68 +165,76 @@ pub fn summarize_citations(
                 ChannelOutcomeStatus::Observed => {
                     if outcome.fixture || !is_trusted_search(view, attempt) {
                         coverage.observed_unverified += 1;
-                        continue;
-                    }
-                    coverage.observed_live += 1;
-                    if outcome.citations.is_empty() {
-                        coverage.observed_without_citations += 1;
-                    }
-                    let ChannelTargetInput::Measure {
-                        provider,
-                        model,
-                        surface,
-                        search_mode,
-                        market,
-                        language,
-                        question_set_version,
-                        question_binding,
-                        scheduled_at,
-                        ..
-                    } = &target.input
-                    else {
-                        unreachable!("plan validated")
-                    };
-                    let sample = CitationSample {
-                        plan_id: plan.plan_id,
-                        target_id: target.target_id,
-                        attempt_id: attempt.attempt_id,
-                        provider: provider.clone(),
-                        model: model.clone(),
-                        surface: surface.clone(),
-                        search_mode: search_mode.clone(),
-                        market: market.clone(),
-                        language: language.clone(),
-                        question_set_version: question_set_version.clone(),
-                        question_purpose: question_binding.as_ref().map(|binding| binding.purpose),
-                        scheduled_at: *scheduled_at,
-                        observed_at: outcome.occurred_at,
-                        received_at: attempt.received_at.expect("verified search has receipt"),
-                    };
-                    let mut seen_hosts = HashSet::new();
-                    let mut seen_urls = HashSet::new();
-                    for url in &outcome.citations {
-                        if !seen_urls.insert(url.as_str()) {
-                            continue;
+                    } else {
+                        coverage.observed_live += 1;
+                        if outcome.citations.is_empty() {
+                            coverage.observed_without_citations += 1;
                         }
-                        let Some(host) = citation_host(url) else {
-                            invalid_citation_urls += 1;
-                            continue;
-                        };
-                        let source = hosts.entry(host.clone()).or_default();
-                        if seen_hosts.insert(host) {
-                            source.samples.push(sample.clone());
-                        }
-                        source
-                            .urls
-                            .entry(url.clone())
-                            .or_default()
-                            .samples
-                            .push(sample.clone());
                     }
                 }
                 ChannelOutcomeStatus::Refused => coverage.refused += 1,
                 ChannelOutcomeStatus::Missing => coverage.missing += 1,
                 _ => coverage.other_completed += 1,
+            }
+            if let Some(effective) =
+                effective_observation(view, analyses, as_of, &is_trusted_search)
+            {
+                if effective.provenance.is_some() {
+                    coverage.grounded_saved_analysis += 1;
+                }
+                let ChannelTargetInput::Measure {
+                    provider,
+                    model,
+                    surface,
+                    search_mode,
+                    market,
+                    language,
+                    question_set_version,
+                    question_binding,
+                    scheduled_at,
+                    ..
+                } = &target.input
+                else {
+                    unreachable!("plan validated")
+                };
+                let sample = CitationSample {
+                    plan_id: plan.plan_id,
+                    target_id: target.target_id,
+                    attempt_id: attempt.attempt_id,
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    surface: surface.clone(),
+                    search_mode: search_mode.clone(),
+                    market: market.clone(),
+                    language: language.clone(),
+                    question_set_version: question_set_version.clone(),
+                    question_purpose: question_binding.as_ref().map(|binding| binding.purpose),
+                    scheduled_at: *scheduled_at,
+                    observed_at: effective.observed_at,
+                    received_at: effective.received_at,
+                    analysis: effective.provenance,
+                };
+                let mut seen_hosts = HashSet::new();
+                let mut seen_urls = HashSet::new();
+                for url in &effective.citations {
+                    if !seen_urls.insert(url.as_str()) {
+                        continue;
+                    }
+                    let Some(host) = citation_host(url) else {
+                        invalid_citation_urls += 1;
+                        continue;
+                    };
+                    let source = hosts.entry(host.clone()).or_default();
+                    if seen_hosts.insert(host) {
+                        source.samples.push(sample.clone());
+                    }
+                    source
+                        .urls
+                        .entry(url.clone())
+                        .or_default()
+                        .samples
+                        .push(sample.clone());
+                }
             }
         }
     }

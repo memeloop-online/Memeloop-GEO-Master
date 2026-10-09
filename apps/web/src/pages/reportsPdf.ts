@@ -1,6 +1,7 @@
 import fontkit from "@pdf-lib/fontkit";
 import { PDFDocument, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 import type { ReportCoverage, ReportSnapshot } from "../api/reports";
+import { reportAnalysisText as analysisText } from "../i18n/reportAnalysis";
 
 const PAGE_WIDTH = 595.28; // A4 in PDF points
 const PAGE_HEIGHT = 841.89;
@@ -320,6 +321,50 @@ export async function buildReportPdf(
           : "问题用途：旧未分类（不进入优化）",
       { muted: true },
     );
+  }
+
+  if (snapshot.supplementary_measurements?.length) {
+    layout.heading(analysisText("title"));
+    layout.text(
+      analysisText("count", {
+        count: snapshot.supplementary_measurements.length,
+      }),
+    );
+    layout.text(analysisText("note"));
+    for (const [index, item] of snapshot.supplementary_measurements.entries()) {
+      await yieldToBrowser(index, signal);
+      const analysis = item.observation.provenance;
+      layout.field(analysisText("target"), item.target_id);
+      layout.field(analysisText("attempt"), item.attempt_id);
+      layout.field(analysisText("plan"), item.plan_id);
+      layout.field(analysisText("comparison"), item.comparison_key);
+      layout.text(
+        analysisText(
+          item.question_binding?.purpose === "frozen_evaluation"
+            ? "evaluation"
+            : item.question_binding?.purpose === "optimization"
+              ? "optimization"
+              : "unclassified",
+        ),
+      );
+      layout.field(analysisText("observed"), at(item.observation.observed_at));
+      layout.field(analysisText("received"), at(item.observation.received_at));
+      if (analysis) {
+        layout.field(analysisText("analyzed"), at(analysis.analyzed_at));
+        layout.field(analysisText("model"), analysis.actual_model);
+        layout.field(analysisText("config"), analysis.config_revision);
+        layout.field(analysisText("revision"), analysis.revision_id);
+        layout.field(analysisText("source"), JSON.stringify(analysis.source));
+        layout.field(analysisText("digest"), analysis.source_sha256);
+        layout.field(analysisText("parser"), analysis.parser_version);
+        layout.field(analysisText("prompt"), analysis.prompt_version);
+      }
+      layout.field(analysisText("answer"), item.observation.raw_answer);
+      for (const url of item.observation.citations)
+        layout.field(analysisText("citations"), url);
+      if (!item.observation.citations.length)
+        layout.text(analysisText("noCitations"));
+    }
   }
 
   layout.heading("结论与证据引用");

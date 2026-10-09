@@ -7,6 +7,172 @@ use geo_domain::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+fn analysis(
+    view: &ChannelTargetView,
+    at: chrono::DateTime<Utc>,
+    url: &str,
+) -> geo_domain::ObservationAnalysisRevision {
+    use geo_domain::*;
+    let ChannelTargetInput::Measure {
+        provider,
+        model,
+        surface,
+        search_mode,
+        protocol_version,
+        market,
+        language,
+        ..
+    } = &view.target.input
+    else {
+        unreachable!()
+    };
+    ObservationAnalysisRevision {
+        request: ObservationAnalysisRequest {
+            revision_id: Uuid::new_v4(),
+            target_id: view.target.target_id,
+            attempt_id: view.attempts[0].attempt_id,
+            source: ObservationAnalysisSource::AttemptEvidence { evidence_index: 0 },
+            source_sha256: "a".repeat(64),
+            observed_at: view.attempts[0].outcome.as_ref().unwrap().occurred_at,
+            prompt_version: "geo.observation.extract.v2".into(),
+            parser_version: "ground.v1".into(),
+        },
+        request_digest: "b".repeat(64),
+        state: ObservationAnalysisState::Completed,
+        created_at: at,
+        started_at: Some(at),
+        analyzed_at: Some(at),
+        result: Some(ObservationAnalysisResult {
+            config_revision: Some(2),
+            actual_model: Some("analysis-model".into()),
+            candidate_json: Some("{}".into()),
+            outcome: ObservationAnalysisOutcome::Grounded {
+                raw_answer: "Saved answer".into(),
+                citations: vec![url.into(), url.into()],
+                audit: json!({
+                    "kind":"observation_extraction", "method":"llm_grounded",
+                    "prompt_version":"geo.observation.extract.v2", "source_sha256":"a".repeat(64),
+                    "protocol":{"provider":provider,"model":model,"surface":surface,"search_mode":search_mode,
+                        "protocol_version":protocol_version,"market":market,"language":language},
+                    "refs":[{"role":"completion"},{"role":"search_activity"},{"role":"answer_segment"}]
+                }),
+            },
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        }),
+    }
+}
+
+#[test]
+fn saved_analysis_is_one_supplementary_sample_with_unchanged_original_coverage() {
+    use geo_domain::{ObservationAnalysisOutcome, summarize_citations_with_analyses};
+    let scope = scope();
+    let now = Utc::now();
+    let target = target(now);
+    let view = completed(target.clone(), now, ChannelOutcomeStatus::Unknown, &[]);
+    let original = view.clone();
+    let first = analysis(&view, now, "https://old.example.org/source");
+    let second = analysis(
+        &view,
+        now + Duration::seconds(1),
+        "https://example.org/source",
+    );
+    let mut failed = analysis(
+        &view,
+        now + Duration::seconds(2),
+        "https://unused.example.org/source",
+    );
+    failed.result.as_mut().unwrap().outcome = ObservationAnalysisOutcome::Failed {
+        code: "interrupted".into(),
+    };
+    let revisions = vec![first.clone(), second.clone(), failed];
+    let input = vec![(plan(&scope, &[target]), vec![view])];
+    let page = summarize_citations_with_analyses(
+        &scope,
+        &input,
+        None,
+        &revisions,
+        now + Duration::seconds(3),
+        trusted,
+    )
+    .unwrap();
+    assert_eq!(page.coverage.planned, 1);
+    assert_eq!(page.coverage.other_completed, 1);
+    assert_eq!(page.coverage.observed_live, 0);
+    assert_eq!(page.coverage.grounded_saved_analysis, 1);
+    assert_eq!(page.observed_sources.len(), 1);
+    assert_eq!(page.observed_sources[0].host, "example.org");
+    assert_eq!(page.observed_sources[0].citing_answers, 1);
+    assert_eq!(
+        page.observed_sources[0].samples[0]
+            .analysis
+            .as_ref()
+            .unwrap()
+            .revision_id,
+        second.request.revision_id
+    );
+    assert_eq!(input[0].1[0], original);
+    let cutoff =
+        summarize_citations_with_analyses(&scope, &input, None, &revisions, now, trusted).unwrap();
+    assert_eq!(cutoff.observed_sources[0].host, "old.example.org");
+}
+
+#[test]
+fn saved_projection_replaces_live_citations_but_not_status_and_rejects_wrong_attempt_or_audit() {
+    use geo_domain::{effective_observation, summarize_citations_with_analyses};
+    let scope = scope();
+    let now = Utc::now();
+    let target = target(now);
+    let view = completed(
+        target.clone(),
+        now,
+        ChannelOutcomeStatus::Observed,
+        &["https://old.example.org/source"],
+    );
+    let revision = analysis(&view, now, "https://example.org/source");
+    let input = vec![(plan(&scope, &[target]), vec![view.clone()])];
+    let page = summarize_citations_with_analyses(
+        &scope,
+        &input,
+        None,
+        std::slice::from_ref(&revision),
+        now,
+        trusted,
+    )
+    .unwrap();
+    assert_eq!(page.coverage.observed_live, 1);
+    assert_eq!(page.coverage.grounded_saved_analysis, 1);
+    assert_eq!(page.observed_sources.len(), 1);
+    assert_eq!(page.observed_sources[0].host, "example.org");
+    let mut wrong = revision.clone();
+    wrong.request.attempt_id = Uuid::new_v4();
+    assert!(
+        effective_observation(&view, &[wrong], now, trusted)
+            .unwrap()
+            .provenance
+            .is_none()
+    );
+    let mut malformed = revision.clone();
+    if let geo_domain::ObservationAnalysisOutcome::Grounded { audit, .. } =
+        &mut malformed.result.as_mut().unwrap().outcome
+    {
+        audit["refs"] = json!([{"role":"answer_segment"}]);
+    }
+    assert!(
+        effective_observation(&view, &[malformed], now, trusted)
+            .unwrap()
+            .provenance
+            .is_none()
+    );
+    let mut pending = view;
+    let mut next_attempt = pending.attempts[0].clone();
+    next_attempt.attempt_id = Uuid::new_v4();
+    next_attempt.received_at = None;
+    next_attempt.outcome = None;
+    pending.attempts.push(next_attempt);
+    assert!(effective_observation(&pending, &[revision], now, trusted).is_none());
+}
+
 fn scope() -> TenantScope {
     TenantScope::new(
         OperatorId::new(Uuid::new_v4()),

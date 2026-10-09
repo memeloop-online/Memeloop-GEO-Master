@@ -138,12 +138,28 @@ importers:
       '@novnc/novnc':
         specifier: 1.7.0
         version: 1.7.0
+      '@tiptap/core':
+        specifier: 3.31.4
+        version: 3.31.4(@tiptap/pm@3.31.4)
+      '@tiptap/extension-table':
+        specifier: 3.31.4
+        version: 3.31.4(@tiptap/core@3.31.4(@tiptap/pm@3.31.4))(@tiptap/pm@3.31.4)
+      '@tiptap/pm':
+        specifier: 3.31.4
+        version: 3.31.4
+      '@tiptap/starter-kit':
+        specifier: 3.31.4
+        version: 3.31.4
       playwright:
         specifier: 1.63.0
         version: 1.63.0
       ws:
         specifier: 8.21.3
         version: 8.21.3
+    devDependencies:
+      esbuild:
+        specifier: 0.25.12
+        version: 0.25.12
 
 packages:
 

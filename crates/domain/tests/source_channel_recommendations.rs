@@ -22,6 +22,7 @@ fn sample(plan_id: Uuid, purpose: Option<QuestionPurpose>) -> CitationSample {
         scheduled_at: Utc::now(),
         observed_at: Utc::now(),
         received_at: Utc::now(),
+        analysis: None,
     }
 }
 

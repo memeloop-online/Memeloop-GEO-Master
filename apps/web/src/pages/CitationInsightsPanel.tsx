@@ -12,6 +12,7 @@ import {
   type SourceChannelRecommendation,
 } from "../api/citationInsights";
 import { getChannelTarget } from "../api/channelJobs";
+import { listObservationAnalyses } from "../api/observationAnalysis";
 import { ApiError, createIdempotencyKey } from "../api/client";
 import {
   useProjectQuery,
@@ -89,6 +90,49 @@ function SourceSample({
   const attempt = detail.data?.attempts.find(
     (item) => item.attempt_id === sample.attempt_id,
   );
+  const analysis = useQuery({
+    queryKey: [
+      "citation-analysis",
+      session?.user.id,
+      session?.operator.id,
+      tenantId,
+      projectId,
+      sample.target_id,
+      sample.attempt_id,
+      sample.analysis?.revision_id,
+    ],
+    enabled: Boolean(session && open && sample.analysis),
+    retry: false,
+    queryFn: async ({ signal }) => {
+      let after: string | undefined;
+      const visited = new Set<string>();
+      do {
+        const page = await listObservationAnalyses(
+          tenantId,
+          projectId,
+          sample.target_id,
+          sample.attempt_id,
+          after,
+          signal,
+        );
+        const revision = page.items.find(
+          (item) => item.request.revision_id === sample.analysis?.revision_id,
+        );
+        if (revision) return revision;
+        after = page.next_after ?? undefined;
+        if (after && visited.has(after))
+          throw new Error("Repeated analysis cursor");
+        if (after) visited.add(after);
+      } while (after);
+      throw new Error("Analysis revision unavailable");
+    },
+  });
+  const grounded = analysis.data?.result?.outcome;
+  const answer = sample.analysis
+    ? grounded?.status === "grounded"
+      ? grounded.raw_answer
+      : undefined
+    : attempt?.outcome?.raw_answer;
   const date = (value: string) =>
     new Intl.DateTimeFormat(i18n.language, {
       dateStyle: "medium",
@@ -105,6 +149,7 @@ function SourceSample({
         {t("sample")}
       </Button>
       <span>{t("sampleTime", { time: date(sample.observed_at) })}</span>
+      {sample.analysis && <span>{t("savedAnalysis")}</span>}
       {open && (
         <div className="citation-insights-answer">
           <p>
@@ -115,6 +160,21 @@ function SourceSample({
             })}{" "}
             · {sample.market} / {sample.language}
           </p>
+          {sample.analysis && (
+            <p>
+              {t("analysisProvenance", {
+                model: sample.analysis.actual_model,
+                time: date(sample.analysis.analyzed_at),
+                revision: sample.analysis.revision_id,
+              })}{" "}
+              · {t("originalUnchanged")}
+            </p>
+          )}
+          <a
+            href={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/measurement?tab=records&record=${encodeURIComponent(sample.plan_id)}`}
+          >
+            {t("measurementRecord")}
+          </a>
           <p>
             {t("scheduledTime", { time: date(sample.scheduled_at) })} ·{" "}
             {t("receivedTime", { time: date(sample.received_at) })}
@@ -128,13 +188,19 @@ function SourceSample({
               )}
             </p>
           )}
-          {detail.isPending ? (
+          {detail.isPending || (sample.analysis && analysis.isPending) ? (
             <LoadingState label={t("evidenceLoading")} compact />
-          ) : detail.isError || !attempt ? (
+          ) : detail.isError ||
+            !attempt ||
+            (sample.analysis &&
+              (analysis.isError || grounded?.status !== "grounded")) ? (
             <ErrorState
               title={t("evidenceUnavailable")}
               detail={t("evidenceUnavailableDetail")}
-              onRetry={() => void detail.refetch()}
+              onRetry={() => {
+                void detail.refetch();
+                if (sample.analysis) void analysis.refetch();
+              }}
             />
           ) : (
             <>
@@ -147,7 +213,7 @@ function SourceSample({
               <div>
                 <strong>{t("answer")}</strong>
                 <p className="citation-insights-original-answer">
-                  {attempt.outcome?.raw_answer ?? t("answerMissing")}
+                  {answer ?? t("answerMissing")}
                 </p>
               </div>
             </>
@@ -402,6 +468,11 @@ function CitationInsightsContent({
               <span>{t("planned", { count: count(coverage!.planned) })}</span>
               <span>
                 {t("live", { count: count(coverage!.observed_live) })}
+              </span>
+              <span>
+                {t("savedAnalysisCount", {
+                  count: count(coverage!.grounded_saved_analysis ?? 0),
+                })}
               </span>
               <span>
                 {t("withoutCitations", {

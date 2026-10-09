@@ -26,6 +26,7 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 COPY src ./src
 COPY smoke ./smoke
 COPY THIRD_PARTY_NOTICES.md ./THIRD_PARTY_NOTICES.md
+COPY RICH_EDITOR_NOTICES.md ./RICH_EDITOR_NOTICES.md
 
 USER pwuser
 ENV GEO_BROWSER_RUNNER_HOST=127.0.0.1 \

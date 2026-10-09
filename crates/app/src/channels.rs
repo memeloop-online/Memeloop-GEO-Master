@@ -10,6 +10,15 @@ pub fn configure_callbacks(
     state: AppState,
     database: &geo_persistence::Database,
 ) -> Result<AppState, Box<dyn Error>> {
+    let state =
+        state.with_observation_evidence_resolver(geo_api::ObservationEvidenceResolver::new(
+            std::sync::Arc::new(
+                geo_persistence::PgObservationAnalysisRepository::from_database(database),
+            ),
+            std::sync::Arc::new(
+                geo_persistence::PgObservationCaptureRepository::from_database(database),
+            ),
+        ));
     let state = match (
         env::var("GEO_BROWSER_RUNNER_URL").ok(),
         env::var("GEO_BROWSER_RUNNER_TOKEN").ok(),

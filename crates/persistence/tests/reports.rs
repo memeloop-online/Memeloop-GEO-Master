@@ -149,6 +149,7 @@ async fn immutable_scoped_report_replay_and_correction_in_postgres() {
         document_manifest: None,
         publication_targets: None,
         measurement_targets: None,
+        supplementary_measurements: vec![],
     };
     let reports = PgReportRepository::from_database(&database);
     let scan_at = now + Duration::days(30);

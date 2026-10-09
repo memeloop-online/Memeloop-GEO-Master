@@ -91,6 +91,20 @@ pub struct ReportMeasurementTarget {
     pub evidence: Vec<ReportEvidenceReference>,
 }
 
+/// Independently interpreted saved evidence. Never part of frozen coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReportSupplementaryMeasurement {
+    pub target_id: Uuid,
+    pub attempt_id: Uuid,
+    /// Present only for a project-owned standalone measurement plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<Uuid>,
+    pub comparison_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_binding: Option<FrozenQuestionBinding>,
+    pub observation: crate::EffectiveObservation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ReportReduceInput {
     pub project_id: ProjectId,
@@ -108,6 +122,8 @@ pub struct ReportReduceInput {
     /// None means the branch has no materialized source; Some(empty) requires a sealed zero manifest.
     pub publication_targets: Option<Vec<ReportPublicationTarget>>,
     pub measurement_targets: Option<Vec<ReportMeasurementTarget>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplementary_measurements: Vec<ReportSupplementaryMeasurement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -181,6 +197,8 @@ pub struct ReportSnapshot {
     pub measurement_groups: Vec<ReportMeasurementGroup>,
     pub findings: Vec<ReportFinding>,
     pub evidence: Vec<ReportEvidenceReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplementary_measurements: Vec<ReportSupplementaryMeasurement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -213,6 +231,8 @@ pub struct ReportPreview {
     pub measurement_groups: Vec<ReportMeasurementGroup>,
     pub findings: Vec<ReportFinding>,
     pub evidence: Vec<ReportEvidenceReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplementary_measurements: Vec<ReportSupplementaryMeasurement>,
 }
 
 struct ReportProjection {
@@ -228,6 +248,7 @@ struct ReportProjection {
     measurement_groups: Vec<ReportMeasurementGroup>,
     findings: Vec<ReportFinding>,
     evidence: Vec<ReportEvidenceReference>,
+    supplementary_measurements: Vec<ReportSupplementaryMeasurement>,
 }
 
 #[derive(Clone, Copy)]
@@ -477,6 +498,7 @@ pub fn reduce_report(
         measurement_groups: projection.measurement_groups,
         findings: projection.findings,
         evidence: projection.evidence,
+        supplementary_measurements: projection.supplementary_measurements,
     })
 }
 
@@ -509,6 +531,7 @@ pub fn preview_report(
         measurement_groups: projection.measurement_groups,
         findings: projection.findings,
         evidence: projection.evidence,
+        supplementary_measurements: projection.supplementary_measurements,
     })
 }
 
@@ -608,6 +631,16 @@ fn project_report(
             target.evidence.sort_by_key(|e| e.evidence_id);
         }
     }
+    canonical.supplementary_measurements.sort_by_key(|item| {
+        (
+            item.target_id,
+            item.attempt_id,
+            item.observation
+                .provenance
+                .as_ref()
+                .map(|source| source.revision_id),
+        )
+    });
     let input_bytes = serde_json::to_vec(&canonical)
         .map_err(|_| AppError::new(ErrorCode::Internal, "report input cannot be serialized"))?;
     let input_hash = hex::encode(Sha256::digest(input_bytes));
@@ -639,6 +672,70 @@ fn project_report(
     };
     let mut findings = Vec::new();
     let mut evidence_map = BTreeMap::<Uuid, ReportEvidenceReference>::new();
+    let mut supplementary_by_target = BTreeMap::new();
+    for item in &canonical.supplementary_measurements {
+        let observation = &item.observation;
+        let Some(source) = &observation.provenance else {
+            continue;
+        };
+        if observation.observed_at < input.report_window_start_at
+            || observation.observed_at >= input.report_window_end_at
+            || observation.observed_at > observation.received_at
+            || observation.received_at > evidence_as_of
+            || source.observed_at != observation.observed_at
+            || source.analyzed_at > evidence_as_of
+            || source.analyzed_at < observation.observed_at
+            || source.actual_model.trim().is_empty()
+            || source.source_sha256.len() != 64
+            || !source
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || item.comparison_key.trim().is_empty()
+            || (item.plan_id.is_none()
+                && !canonical
+                    .measurement_targets
+                    .as_ref()
+                    .is_some_and(|targets| {
+                        targets.iter().any(|target| {
+                            target.target_id == item.target_id
+                                && target.comparison_key == item.comparison_key
+                                && target.question_binding == item.question_binding
+                        })
+                    }))
+        {
+            continue;
+        }
+        // Input adapters select exactly one revision. Reject conflicting
+        // selections rather than unioning revisions or counting them twice.
+        if let Some(previous) = supplementary_by_target.insert(item.target_id, item.clone())
+            && previous != *item
+        {
+            return Err(error(
+                "multiple supplementary interpretations for one target",
+            ));
+        }
+    }
+    for item in supplementary_by_target.values() {
+        let source = item
+            .observation
+            .provenance
+            .as_ref()
+            .expect("validated provenance");
+        record_evidence(
+            &mut evidence_map,
+            ReportEvidenceReference {
+                evidence_id: source.revision_id,
+                kind: "saved_observation_analysis".to_owned(),
+                resource_id: item.target_id,
+                resource_version: Some(source.revision_id.to_string()),
+                occurred_at: Some(item.observation.observed_at),
+                received_at: Some(source.analyzed_at),
+                summary: "Saved response interpretation; original measurement status is unchanged."
+                    .to_owned(),
+            },
+        )?;
+    }
     let documents = match (&canonical.document_manifest, doc_ref) {
         (Some(docs), Some(reference)) if docs.sealed => {
             let mut counts = BTreeMap::new();
@@ -1040,6 +1137,7 @@ fn project_report(
             .collect(),
         findings,
         evidence: evidence_map.into_values().collect(),
+        supplementary_measurements: supplementary_by_target.into_values().collect(),
     })
 }
 
@@ -1244,6 +1342,7 @@ mod tests {
             }),
             publication_targets: None,
             measurement_targets: None,
+            supplementary_measurements: vec![],
         };
         (scope, input)
     }
@@ -1258,6 +1357,158 @@ mod tests {
             received_at: Some(instant(26)),
             summary: "Recorded external observation".to_owned(),
         }
+    }
+
+    #[test]
+    fn supplementary_analysis_preserves_coverage_and_respects_cutoff_and_replay() {
+        let (scope, mut input) = setup();
+        let target_id = Uuid::new_v4();
+        input.input_manifest_versions.push(ReportManifestRef {
+            kind: ReportManifestKind::Measurement,
+            manifest_id: Uuid::new_v4(),
+            revision: 1,
+            sealed: true,
+            expected_count: Some(1),
+        });
+        input.measurement_targets = Some(vec![ReportMeasurementTarget {
+            target_id,
+            comparison_key: "protocol".into(),
+            question_binding: None,
+            scheduled_at: instant(25),
+            status: ReportMeasurementStatus::Missing,
+            missing_reason: Some("original execution unknown".into()),
+            evidence: vec![],
+        }]);
+        let original = reduce_report(&scope, &input, 1, None, instant(30)).unwrap();
+        let legacy = serde_json::to_value(&original).unwrap();
+        assert!(legacy.get("supplementary_measurements").is_none());
+        assert_eq!(
+            serde_json::from_value::<ReportSnapshot>(legacy).unwrap(),
+            original
+        );
+        let mut item = ReportSupplementaryMeasurement {
+            target_id,
+            attempt_id: Uuid::new_v4(),
+            plan_id: None,
+            comparison_key: "protocol".into(),
+            question_binding: None,
+            observation: crate::EffectiveObservation {
+                raw_answer: "Saved answer".into(),
+                citations: vec!["https://example.test/source".into()],
+                observed_at: instant(25),
+                received_at: instant(26),
+                provenance: Some(crate::SavedAnalysisProvenance {
+                    revision_id: Uuid::new_v4(),
+                    source: crate::ObservationAnalysisSource::Capture {
+                        capture_id: Uuid::new_v4(),
+                    },
+                    source_sha256: "a".repeat(64),
+                    observed_at: instant(25),
+                    analyzed_at: instant(29),
+                    actual_model: "parser-model".into(),
+                    config_revision: Some(1),
+                    prompt_version: "prompt-v1".into(),
+                    parser_version: "parser-v1".into(),
+                }),
+            },
+        };
+        input.supplementary_measurements.push(item.clone());
+        let first = reduce_report(&scope, &input, 1, None, instant(30)).unwrap();
+        assert!(first.supplementary_measurements.is_empty());
+        let preview = preview_report(&scope, &input, instant(30)).unwrap();
+        assert!(preview.supplementary_measurements.is_empty());
+        let correction =
+            reduce_report(&scope, &input, 2, Some(first.report_id), instant(30)).unwrap();
+        assert_eq!(correction.supplementary_measurements, vec![item.clone()]);
+        assert_eq!(correction.measurements, original.measurements);
+        assert_eq!(correction.measurements.expected_count, Some(1));
+        assert_eq!(correction.measurements.counts["missing"], 1);
+        assert_eq!(correction.measurement_groups, original.measurement_groups);
+        assert!(
+            correction
+                .evidence
+                .iter()
+                .any(|e| e.kind == "saved_observation_analysis")
+        );
+        input.supplementary_measurements.push(item.clone());
+        let duplicate =
+            reduce_report(&scope, &input, 2, Some(first.report_id), instant(30)).unwrap();
+        assert_eq!(duplicate.supplementary_measurements.len(), 1);
+        item.observation.provenance.as_mut().unwrap().revision_id = Uuid::new_v4();
+        input.supplementary_measurements.push(item);
+        assert!(reduce_report(&scope, &input, 2, Some(first.report_id), instant(30)).is_err());
+    }
+
+    #[test]
+    fn supplementary_analysis_rejects_unbound_outside_window_and_future_receipts() {
+        let (scope, mut input) = setup();
+        // Empty additive fields keep the canonical bytes of legacy inputs.
+        let legacy = serde_json::to_value(&input).unwrap();
+        assert!(legacy.get("supplementary_measurements").is_none());
+        assert_eq!(
+            serde_json::from_value::<ReportReduceInput>(legacy).unwrap(),
+            input
+        );
+        input
+            .supplementary_measurements
+            .push(ReportSupplementaryMeasurement {
+                target_id: Uuid::new_v4(),
+                attempt_id: Uuid::new_v4(),
+                plan_id: None,
+                comparison_key: "protocol".into(),
+                question_binding: None,
+                observation: crate::EffectiveObservation {
+                    raw_answer: "Not accepted".into(),
+                    citations: vec![],
+                    observed_at: instant(25),
+                    received_at: instant(26),
+                    provenance: Some(crate::SavedAnalysisProvenance {
+                        revision_id: Uuid::new_v4(),
+                        source: crate::ObservationAnalysisSource::AttemptEvidence {
+                            evidence_index: 0,
+                        },
+                        source_sha256: "b".repeat(64),
+                        observed_at: instant(25),
+                        analyzed_at: instant(27),
+                        actual_model: "parser".into(),
+                        config_revision: None,
+                        prompt_version: "v1".into(),
+                        parser_version: "v1".into(),
+                    }),
+                },
+            });
+        assert!(
+            reduce_report(&scope, &input, 1, None, instant(30))
+                .unwrap()
+                .supplementary_measurements
+                .is_empty()
+        );
+        input.supplementary_measurements[0].plan_id = Some(Uuid::new_v4());
+        let standalone = reduce_report(&scope, &input, 1, None, instant(30)).unwrap();
+        assert_eq!(standalone.supplementary_measurements.len(), 1);
+        assert_eq!(standalone.measurements.expected_count, None);
+        assert_eq!(standalone.measurements.observed_count, 0);
+        input.supplementary_measurements[0].observation.received_at = instant(29);
+        assert!(
+            preview_report(&scope, &input, instant(30))
+                .unwrap()
+                .supplementary_measurements
+                .is_empty()
+        );
+        input.supplementary_measurements[0].observation.received_at = instant(26);
+        input.supplementary_measurements[0].observation.observed_at = instant(19);
+        input.supplementary_measurements[0]
+            .observation
+            .provenance
+            .as_mut()
+            .unwrap()
+            .observed_at = instant(19);
+        assert!(
+            reduce_report(&scope, &input, 1, None, instant(30))
+                .unwrap()
+                .supplementary_measurements
+                .is_empty()
+        );
     }
 
     #[test]

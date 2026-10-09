@@ -87,6 +87,38 @@ export function reportSnapshotCsv(snapshot: ReportSnapshot): string {
       ),
     );
   }
+  for (const item of snapshot.supplementary_measurements ?? []) {
+    const group = `${item.target_id}/${item.attempt_id}`;
+    const observation = item.observation;
+    const values = {
+      target_id: item.target_id,
+      attempt_id: item.attempt_id,
+      plan_id: item.plan_id ?? null,
+      comparison_key: item.comparison_key,
+      purpose: item.question_binding?.purpose ?? "legacy_unclassified",
+      raw_answer: observation.raw_answer,
+      observed_at: observation.observed_at,
+      received_at: observation.received_at,
+      ...(observation.provenance
+        ? {
+            ...observation.provenance,
+            source: JSON.stringify(observation.provenance.source),
+          }
+        : {}),
+    };
+    for (const [key, value] of Object.entries(values)) {
+      rows.push([
+        "supplementary_measurement",
+        group,
+        key,
+        value,
+        "separate_from_measurement_coverage",
+      ]);
+    }
+    for (const citation of observation.citations) {
+      rows.push(["supplementary_measurement", group, "citation", citation, ""]);
+    }
+  }
   for (const finding of snapshot.findings) {
     rows.push(
       ["finding", finding.finding_id, "kind", finding.kind, ""],

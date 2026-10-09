@@ -4,6 +4,18 @@ export type AnalysisSource =
   | { kind: "capture"; capture_id: string }
   | { kind: "attempt_evidence"; evidence_index: number };
 
+export interface SavedAnalysisProvenance {
+  revision_id: string;
+  source: AnalysisSource;
+  source_sha256: string;
+  observed_at: string;
+  analyzed_at: string;
+  actual_model: string;
+  config_revision: number | null;
+  prompt_version: string;
+  parser_version: string;
+}
+
 export interface ObservationAnalysisRevision {
   request: {
     revision_id: string;

@@ -1,6 +1,12 @@
 import i18n from "../i18n";
 
 const zh = {
+  savedAnalysis: "已存原文的独立分析",
+  savedAnalysisCount: "已存原文分析 {{count}} 项（单独统计）",
+  analysisProvenance:
+    "分析模型 {{model}} · 分析于 {{time}} · 版本 {{revision}}",
+  originalUnchanged: "原测量结果保持不变",
+  measurementRecord: "查看测量记录与分析版本",
   title: "引用信源",
   description: "查看联网测量实际引用的网页，并回到原始问答核对。",
   refresh: "刷新引用",
@@ -81,6 +87,12 @@ const zh = {
 } as const;
 
 const en = {
+  savedAnalysis: "Independent analysis of saved response",
+  savedAnalysisCount: "{{count}} saved-response analyses (counted separately)",
+  analysisProvenance:
+    "Analysis model {{model}} · Analyzed {{time}} · Revision {{revision}}",
+  originalUnchanged: "Original measurement outcome is unchanged",
+  measurementRecord: "View measurement record and analysis revisions",
   title: "Cited sources",
   description:
     "Explore pages actually cited in web measurements and verify the original answers.",

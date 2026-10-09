@@ -188,6 +188,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 44,
         description: "project ai settings",
     },
+    MigrationMetadata {
+        version: 45,
+        description: "observation analysis projection",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

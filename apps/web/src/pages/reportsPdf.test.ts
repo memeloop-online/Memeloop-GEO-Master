@@ -163,11 +163,40 @@ describe("report PDF", () => {
       resource_id: `resource-${index}-${"opaque".repeat(18)}`,
       summary: `中文资料 ${index}：${"长文本、".repeat(35)}`,
     }));
+    report.supplementary_measurements = [
+      {
+        target_id: "saved-target",
+        attempt_id: "saved-attempt",
+        comparison_key: "saved-protocol",
+        observation: {
+          raw_answer: "SAVED_ANALYSIS_ANSWER",
+          citations: ["https://example.org/saved-citation"],
+          observed_at: "2026-09-26T00:00:00Z",
+          received_at: "2026-09-26T00:01:00Z",
+          provenance: {
+            revision_id: "saved-revision",
+            source: { kind: "capture", capture_id: "saved-capture" },
+            source_sha256: "saved-digest",
+            observed_at: "2026-09-26T00:00:00Z",
+            analyzed_at: "2026-09-27T00:00:00Z",
+            actual_model: "saved-model",
+            config_revision: null,
+            prompt_version: "prompt-1",
+            parser_version: "parser-1",
+          },
+        },
+      },
+    ];
     const bytes = await buildReportPdf(report, fontBytes);
     const text = drawn.mock.calls.map(([value]) => value).join("\n");
     expect(text).toContain("问题用途：优化");
     expect(text).toContain("问题用途：冻结评估（不进入优化）");
     expect(text).toContain("问题用途：旧未分类（不进入优化）");
+    expect(text).toContain("已存原文的补充分析");
+    expect(text).toContain("SAVED_ANALYSIS_ANSWER");
+    expect(text).toContain("saved-revision");
+    expect(text).toContain("saved-model");
+    expect(text).toContain("https://example.org/saved-citation");
     expect(new TextDecoder().decode(bytes.slice(0, 8))).toMatch(/^%PDF-1\./);
     const pdf = await PDFDocument.load(bytes);
     expect(pdf.getTitle()).toContain("report-1");

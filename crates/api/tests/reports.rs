@@ -252,6 +252,191 @@ async fn fixture() -> (
     )
 }
 
+#[tokio::test]
+async fn saved_standalone_analysis_fans_in_only_to_explicit_report_correction() {
+    use geo_domain::{
+        ChannelOutcome, ChannelOutcomeStatus, MemoryObservationAnalysisRepository,
+        MemoryObservationCaptureRepository, ObservationAnalysisOutcome,
+        ObservationAnalysisRepository, ObservationAnalysisRequest, ObservationAnalysisResult,
+        ObservationAnalysisSource, StandaloneMeasurementPlan,
+    };
+    let (state, _, project_id, cycle_id, cutoff) = fixture().await;
+    let scope = TenantScope::new(
+        geo_domain::DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(project_id),
+    );
+    let cycle = state
+        .project_repository()
+        .get_report_cycle(&scope, project_id, cycle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let at = cycle.report_window_start_at + Duration::minutes(1);
+    let jobs = state.channel_job_repository();
+    let captures = Arc::new(MemoryObservationCaptureRepository::new(jobs.clone()));
+    let analyses = Arc::new(MemoryObservationAnalysisRepository::new(
+        jobs.clone(),
+        captures.clone(),
+    ));
+    let state = state.with_observation_evidence_resolver(
+        geo_api::ObservationEvidenceResolver::new(analyses.clone(), captures),
+    );
+    let target = ChannelTarget {
+        target_id: Uuid::new_v4(),
+        input: ChannelTargetInput::Measure {
+            account_id: Uuid::new_v4(),
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            surface: "consumer_web".into(),
+            search_mode: "web_search".into(),
+            protocol_version: "v1".into(),
+            question_set_version: "ad_hoc.v1".into(),
+            question: "What is a rain gauge?".into(),
+            market: "generic".into(),
+            language: "en".into(),
+            scheduled_at: at,
+            sample_ordinal: 0,
+            question_binding: None,
+        },
+    };
+    let plan_id = Uuid::new_v4();
+    jobs.create_measurement_plan(
+        &scope,
+        "saved-topic",
+        "saved-topic",
+        StandaloneMeasurementPlan {
+            plan_id,
+            project_id,
+            title: "Topic".into(),
+            input_hash: "saved-topic".into(),
+            revision: 1,
+            created_at: at,
+            targets: vec![target.clone()],
+        },
+    )
+    .await
+    .unwrap();
+    let attempt_id = Uuid::new_v4();
+    jobs.claim(&scope, target.target_id, attempt_id, at)
+        .await
+        .unwrap();
+    let source = json!({"messages":[{"role":"assistant","text":"A saved answer."}]}).to_string();
+    let digest = sha256_hex(source.as_bytes());
+    jobs.finish(
+        &scope,
+        target.target_id,
+        attempt_id,
+        ChannelOutcome {
+            status: ChannelOutcomeStatus::Unknown,
+            detail: None,
+            occurred_at: at,
+            raw_answer: None,
+            citations: vec![],
+            public_url: None,
+            screenshot_ref: None,
+            connector_version: None,
+            runner_evidence: vec![json!({
+                "kind":"observation_capture","schema_version":"geo.observation.capture.v1",
+                "phase":"source","source_json":source,"source_sha256":digest,"observed_at":at
+            })],
+            fixture: false,
+        },
+        at + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    let original = jobs.get_target(&scope, target.target_id).await.unwrap();
+    let first = reduce_cycle_report(&state, &scope, cycle_id, None, cutoff)
+        .await
+        .unwrap();
+    let revision_id = Uuid::new_v4();
+    let analyzed = cutoff + Duration::seconds(1);
+    analyses
+        .create(
+            &scope,
+            "saved-analysis",
+            &sha256_hex(b"saved-analysis"),
+            ObservationAnalysisRequest {
+                revision_id,
+                target_id: target.target_id,
+                attempt_id,
+                source: ObservationAnalysisSource::AttemptEvidence { evidence_index: 0 },
+                source_sha256: digest.clone(),
+                observed_at: at,
+                prompt_version: "prompt.v1".into(),
+                parser_version: "parser.v1".into(),
+            },
+            analyzed,
+        )
+        .await
+        .unwrap();
+    let claim = analyses
+        .claim(&scope, revision_id, analyzed)
+        .await
+        .unwrap()
+        .unwrap();
+    analyses.finish(&scope, revision_id, claim.claim_token, ObservationAnalysisResult {
+        config_revision: Some(1), actual_model: Some("parser-model".into()),
+        candidate_json: Some(json!({"completion":"complete","search_used":"yes"}).to_string()),
+        outcome: ObservationAnalysisOutcome::Grounded {
+            raw_answer: "A saved answer.".into(), citations: vec!["https://example.org/source".into()],
+            audit: json!({
+                "kind":"observation_extraction","method":"llm_grounded","prompt_version":"prompt.v1",
+                "source_sha256":digest,"protocol":{
+                    "provider":"provider-a","model":"model-a","surface":"consumer_web",
+                    "search_mode":"web_search","protocol_version":"v1","market":"generic","language":"en"
+                },"refs":[{"role":"answer_segment"},{"role":"completion"},{"role":"search_activity"}]
+            }),
+        }, prompt_tokens: 1, completion_tokens: 1,
+    }, analyzed).await.unwrap();
+    let preview = preview_cycle_report(&state, &scope, cycle_id, analyzed)
+        .await
+        .unwrap();
+    assert!(preview.supplementary_measurements.is_empty());
+    let replay = reduce_cycle_report(&state, &scope, cycle_id, None, analyzed)
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+    let correction = reduce_cycle_report(&state, &scope, cycle_id, Some(first.report_id), analyzed)
+        .await
+        .unwrap();
+    assert_eq!(correction.supplementary_measurements.len(), 1);
+    let item = &correction.supplementary_measurements[0];
+    assert_eq!(item.plan_id, Some(plan_id));
+    assert_eq!(item.attempt_id, attempt_id);
+    let provenance = item.observation.provenance.as_ref().unwrap();
+    assert_eq!(provenance.revision_id, revision_id);
+    assert_eq!(provenance.actual_model, "parser-model");
+    assert_eq!(provenance.source_sha256, digest);
+    assert_eq!(correction.measurements, first.measurements);
+    assert_eq!(correction.measurements.expected_count, None);
+    assert_eq!(
+        jobs.get_target(&scope, target.target_id).await.unwrap(),
+        original
+    );
+    assert_eq!(
+        state
+            .report_repository()
+            .get(&scope, first.report_id)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        reduce_cycle_report(
+            &state,
+            &scope,
+            cycle_id,
+            Some(first.report_id),
+            analyzed + Duration::seconds(1)
+        )
+        .await
+        .unwrap(),
+        correction,
+    );
+}
+
 async fn login(app: &Router, name: &str, password: &str) -> (String, String) {
     let response = app
         .clone()

@@ -5,7 +5,7 @@ use axum::{
 };
 use geo_domain::{
     AppError, ChannelAttempt, ChannelOutcomeStatus, ChannelTargetView, CitationInsightPage,
-    ProjectId, StandaloneMeasurementPlan, TenantScope, summarize_citations,
+    ProjectId, StandaloneMeasurementPlan, TenantScope, summarize_citations_with_analyses,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -163,5 +163,22 @@ async fn read_page(
         }
         inputs.push((plan, views));
     }
-    summarize_citations(scope, &inputs, next_after, accepted_live_search)
+    let as_of = chrono::Utc::now();
+    let analyses = if let Some(resolver) = state.observation_evidence_resolver() {
+        let views = inputs
+            .iter()
+            .flat_map(|(_, views)| views.iter().cloned())
+            .collect::<Vec<_>>();
+        resolver.resolve(scope, &views, as_of).await?
+    } else {
+        Vec::new()
+    };
+    summarize_citations_with_analyses(
+        scope,
+        &inputs,
+        next_after,
+        &analyses,
+        as_of,
+        accepted_live_search,
+    )
 }

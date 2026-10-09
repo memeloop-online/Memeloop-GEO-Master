@@ -61,10 +61,12 @@ pub use observation_capture_callback::ObservationCaptureCallbackService;
 mod observation_ai_callback;
 pub use observation_ai_callback::ObservationAiCallbackService;
 mod observation_analysis;
+mod observation_evidence;
 pub use observation_analysis::{
     GroundingResult, HttpSavedObservationGrounder, ObservationAnalysisService,
     SavedObservationGrounder,
 };
+pub use observation_evidence::ObservationEvidenceResolver;
 mod questions;
 mod questions_tools;
 mod reports;
@@ -172,6 +174,7 @@ pub struct AppState {
     observation_capture_callback: Option<ObservationCaptureCallbackService>,
     observation_ai_callback: Option<ObservationAiCallbackService>,
     observation_analysis: Option<ObservationAnalysisService>,
+    observation_evidence_resolver: Option<ObservationEvidenceResolver>,
     provider_cleanup_callback: Option<ProviderCleanupCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
@@ -293,6 +296,7 @@ impl AppState {
             observation_capture_callback: None,
             observation_ai_callback: None,
             observation_analysis: None,
+            observation_evidence_resolver: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -449,6 +453,7 @@ impl AppState {
             observation_capture_callback: None,
             observation_ai_callback: None,
             observation_analysis: None,
+            observation_evidence_resolver: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -912,6 +917,18 @@ impl AppState {
     pub fn with_observation_analysis(mut self, service: ObservationAnalysisService) -> Self {
         self.observation_analysis = Some(service);
         self
+    }
+
+    pub fn with_observation_evidence_resolver(
+        mut self,
+        resolver: ObservationEvidenceResolver,
+    ) -> Self {
+        self.observation_evidence_resolver = Some(resolver);
+        self
+    }
+
+    pub fn observation_evidence_resolver(&self) -> Option<&ObservationEvidenceResolver> {
+        self.observation_evidence_resolver.as_ref()
     }
 
     pub fn with_provider_cleanup_callback(

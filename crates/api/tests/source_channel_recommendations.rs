@@ -172,7 +172,7 @@ async fn finish_accepted_search(
     citation: &str,
     answer: &str,
 ) {
-    let claimed = Utc::now();
+    let claimed = Utc::now() - Duration::seconds(1);
     let observed = claimed + Duration::milliseconds(100);
     let completed = claimed + Duration::milliseconds(200);
     let received = claimed + Duration::milliseconds(300);

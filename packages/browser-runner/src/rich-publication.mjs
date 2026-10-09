@@ -280,7 +280,7 @@ function node(value, parent, depth, limits, occurrences) {
   if (type === "table") tableShape(content);
 }
 
-function validatePayload(payload) {
+export function validateRichPublicationPayload(payload) {
   record(payload, [
     "schema_version",
     "format",
@@ -452,7 +452,7 @@ function variantHash(title, markdown, payload) {
  * This module does not parse images or implement a platform editor.
  */
 export function stageRichPublication(payload, mediaParts, variant) {
-  const distinct = validatePayload(payload);
+  const distinct = validateRichPublicationPayload(payload);
   record(variant, ["title", "markdown", "payload_hash"]);
   if (
     variant.title !== payload.document.title ||
