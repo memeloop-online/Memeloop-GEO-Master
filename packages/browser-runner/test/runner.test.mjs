@@ -366,7 +366,7 @@ test("without desktop runtime or saved state, login fails before launching a bro
   }
 });
 
-test("restored Kimi identity waits on the same page for website hydration", async () => {
+test("restored Kimi identity permits website renewal beyond four seconds on the same page", async () => {
   let ready = false;
   let newPages = 0;
   let navigations = 0;
@@ -382,7 +382,6 @@ test("restored Kimi identity waits on the same page for website hydration", asyn
     },
   };
   const restored = createRunner({
-    restoredKimiIdentityWaitMs: 800,
     browserType: {
       async launch() {
         return {
@@ -426,7 +425,7 @@ test("restored Kimi identity waits on the same page for website hydration", asyn
     );
     setTimeout(() => {
       ready = true;
-    }, 100);
+    }, 4_200);
     assert.deepEqual(await restored.complete("hydrate"), {
       identity: { platform_account_id: "own", display_name: "Own account" },
       storage_state: state,
@@ -496,7 +495,9 @@ test("restored Kimi identity stops at the deadline and never retries a different
     await assert.rejects(
       restored.complete("never-ready"),
       (error) =>
-        error instanceof RunnerError && error.code === "login_required",
+        error instanceof RunnerError &&
+        error.status === 503 &&
+        error.code === "identity_not_ready",
     );
     assert.ok(performance.now() - began < 1_000);
     assert.ok(attempts >= 3 && attempts <= 5);
@@ -525,6 +526,104 @@ test("restored Kimi identity stops at the deadline and never retries a different
     assert.equal(navigations, 2);
   } finally {
     await restored.shutdown();
+  }
+});
+
+test("restored identity failures remain bounded and shutdown cancels pending probes", async (t) => {
+  for (const mode of [
+    "throw",
+    "hang",
+    "shutdown",
+    "shutdown-wait",
+    "challenge",
+  ]) {
+    await t.test(mode, async () => {
+      let completing = false;
+      let attempts = 0;
+      let captures = 0;
+      let navigations = 0;
+      let url = "https://www.kimi.com/";
+      const failure = new Error("browser_disconnected");
+      let enteredProbe;
+      const entered = new Promise((resolve) => {
+        enteredProbe = resolve;
+      });
+      const restored = createRunner({
+        restoredKimiIdentityWaitMs: 80,
+        browserType: {
+          async launch() {
+            return {
+              async newContext() {
+                return {
+                  async newPage() {
+                    return {
+                      url: () => url,
+                      async goto() {
+                        navigations++;
+                      },
+                    };
+                  },
+                  async storageState() {
+                    captures++;
+                    return { cookies: [], origins: [] };
+                  },
+                  async close() {},
+                };
+              },
+              async close() {},
+            };
+          },
+        },
+        platformAdapters: {
+          kimi: {
+            entry: url,
+            async identify() {
+              if (!completing) return null;
+              attempts++;
+              enteredProbe();
+              if (mode === "throw") throw failure;
+              if (mode === "shutdown-wait") return null;
+              return new Promise(() => {});
+            },
+          },
+        },
+      });
+      try {
+        await restored.create({
+          session_id: "restore-failure",
+          platform: "kimi",
+          storage_state: { cookies: [], origins: [] },
+        });
+        completing = true;
+        if (mode === "challenge") url = "https://www.kimi.com/challenge/";
+        const began = performance.now();
+        const completion = restored.complete("restore-failure");
+        const rejected = assert.rejects(completion, (error) => {
+          if (mode === "throw") return error === failure;
+          return (
+            error instanceof RunnerError &&
+            error.code ===
+              {
+                hang: "identity_probe_timeout",
+                shutdown: "session_not_found",
+                "shutdown-wait": "session_not_found",
+                challenge: "challenge",
+              }[mode]
+          );
+        });
+        if (mode.startsWith("shutdown")) {
+          await entered;
+          await restored.shutdown();
+        }
+        await rejected;
+        assert.ok(performance.now() - began < 1_000);
+        assert.equal(attempts, mode === "challenge" ? 0 : 1);
+        assert.equal(captures, 0);
+        assert.equal(navigations, 1);
+      } finally {
+        await restored.shutdown();
+      }
+    });
   }
 });
 

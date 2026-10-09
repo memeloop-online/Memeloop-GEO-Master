@@ -213,7 +213,7 @@ test("restored Kimi headless session rejects missing or changed identity", async
     const begun = performance.now();
     await assert.rejects(
       runner.complete("missing-kimi-desktop"),
-      (error) => error.code === "login_required",
+      (error) => error.status === 503 && error.code === "identity_not_ready",
     );
     assert.ok(performance.now() - begun < 1_000);
     assert.equal(events.includes("closeInput"), false);

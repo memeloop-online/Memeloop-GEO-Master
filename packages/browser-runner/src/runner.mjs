@@ -27,7 +27,10 @@ const STATUSES = new Set([
   "unknown",
   "completed",
 ]);
-const RESTORED_KIMI_IDENTITY_WAIT_MS = 4_000;
+// Match the existing page-navigation budget, within the gateway's 60s request
+// timeout. Website-managed renewal can finish after initial DOM hydration.
+const BROWSER_READINESS_TIMEOUT_MS = 30_000;
+const RESTORED_KIMI_IDENTITY_WAIT_MS = BROWSER_READINESS_TIMEOUT_MS;
 
 export class RunnerError extends Error {
   constructor(status, code) {
@@ -155,6 +158,7 @@ export function createRunner(options = {}) {
   let reapingPromise;
 
   function dispose(record) {
+    record.lifetime.abort();
     for (const client of record.desktopClients) client.terminate();
     record.desktopClients.clear();
     return record.desktop ? record.desktop.close() : record.context.close();
@@ -324,7 +328,7 @@ export function createRunner(options = {}) {
       // are handled by the platform's own UI in this isolated context.
       await page.goto(adapter.entry, {
         waitUntil: "domcontentloaded",
-        timeout: 30_000,
+        timeout: BROWSER_READINESS_TIMEOUT_MS,
       });
       const record = {
         platform: input.platform,
@@ -337,6 +341,7 @@ export function createRunner(options = {}) {
         desktopClients: new Set(),
         proxy,
         restoredKimi: input.platform === "kimi" && !!storageState,
+        lifetime: new AbortController(),
         identity: null,
         completed: false,
         busy: false,
@@ -353,6 +358,32 @@ export function createRunner(options = {}) {
     }
   }
 
+  async function restoredIdentityProbe(record, deadline) {
+    const { signal } = record.lifetime;
+    if (signal.aborted) throw new RunnerError(404, "session_not_found");
+    let timer;
+    let onAbort;
+    const interrupted = new Promise((_, reject) => {
+      onAbort = () => reject(new RunnerError(404, "session_not_found"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(
+        () => reject(new RunnerError(503, "identity_probe_timeout")),
+        Math.max(1, deadline - performance.now()),
+      );
+    });
+    try {
+      // A hung/failed browser probe is infrastructure failure, not proof that
+      // credentials expired. Never retry exceptions or invoke token APIs.
+      return await Promise.race([
+        record.adapter.identify(record.page),
+        interrupted,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+
   async function identityForCompletion(record) {
     // Restored Kimi storage may need the website's hydration/refresh before
     // its saved access token verifies. Wait only for a missing identity, on
@@ -360,7 +391,9 @@ export function createRunner(options = {}) {
     const deadline = performance.now() + restoredKimiIdentityWaitMs;
     for (;;) {
       if (isChallenge(record.page)) throw new RunnerError(409, "challenge");
-      const identity = await record.adapter.identify(record.page);
+      const identity = record.restoredKimi
+        ? await restoredIdentityProbe(record, deadline)
+        : await record.adapter.identify(record.page);
       if (validateIdentity(identity)) {
         if (
           record.identity &&
@@ -369,9 +402,24 @@ export function createRunner(options = {}) {
           throw new RunnerError(409, "account_mismatch");
         return identity;
       }
-      if (!record.restoredKimi || performance.now() >= deadline)
-        throw new RunnerError(409, "login_required");
-      await delay(Math.min(250, Math.max(1, deadline - performance.now())));
+      if (!record.restoredKimi) throw new RunnerError(409, "login_required");
+      // The adapter's missing-identity result can also mean a failed request
+      // or unfinished website renewal. A deadline cannot prove login expiry.
+      if (performance.now() >= deadline)
+        throw new RunnerError(503, "identity_not_ready");
+      try {
+        await delay(
+          Math.min(250, Math.max(1, deadline - performance.now())),
+          undefined,
+          {
+            signal: record.lifetime.signal,
+          },
+        );
+      } catch (error) {
+        if (record.lifetime.signal.aborted)
+          throw new RunnerError(404, "session_not_found");
+        throw error;
+      }
     }
   }
 
