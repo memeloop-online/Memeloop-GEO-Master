@@ -60,11 +60,14 @@ describe("host-scoped public appearance", () => {
       </AppearanceProvider>,
     );
     expect(await screen.findByText("Example Operator")).toBeInTheDocument();
-    expect(document.title).toBe("Example Operator");
-    expect(document.documentElement.lang).toBe("en");
-    expect(
-      document.documentElement.style.getPropertyValue("--oem-primary-color"),
-    ).toBe("#7340A2");
+    // The brand render precedes the effect that updates document metadata.
+    await waitFor(() => {
+      expect(document.title).toBe("Example Operator");
+      expect(document.documentElement.lang).toBe("en");
+      expect(
+        document.documentElement.style.getPropertyValue("--oem-primary-color"),
+      ).toBe("#7340A2");
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/public/appearance");
     expect(screen.getByTestId("locale")).toHaveTextContent("en");

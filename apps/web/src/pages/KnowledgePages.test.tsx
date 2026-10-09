@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -497,6 +497,8 @@ describe("knowledge workbench", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", {
+      // Fluent's focus manager also uses WebCrypto, even when hashing is mocked.
+      getRandomValues: crypto.getRandomValues.bind(crypto),
       randomUUID: () => "client-id-" + Math.random(),
       subtle: {
         digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer),
@@ -504,23 +506,29 @@ describe("knowledge workbench", () => {
     });
     const user = userEvent.setup();
     renderPath("/app/tenant-a/project-a/knowledge");
-    await screen.findByRole("heading", { name: "企业知识库" });
-    await user.click(screen.getByRole("button", { name: "导入资料" }));
+    const heading = await screen.findByRole("heading", { name: "企业知识库" });
+    // Keep accessible queries local instead of recomputing the whole app shell.
+    await user.click(
+      within(heading.closest("section")!).getByRole("button", {
+        name: "导入资料",
+      }),
+    );
+    const importPanel = within(
+      screen.getByRole("complementary", { name: "导入资料" }),
+    );
 
     const file = new File(["demo"], "manual.txt", { type: "text/plain" });
     Object.defineProperty(file, "arrayBuffer", {
       value: vi.fn().mockResolvedValue(new TextEncoder().encode("demo").buffer),
     });
-    await user.upload(screen.getByLabelText("选择资料文件"), file);
+    await user.upload(importPanel.getByLabelText("选择资料文件"), file);
     // Bulk URL import is a paste interaction; avoid a render per character.
-    await user.click(
-      screen.getByRole("textbox", { name: "网页地址（每行一个）" }),
-    );
+    await user.click(importPanel.getByLabelText("网页地址（每行一个）"));
     await user.paste("https://example.com/a\nhttps://example.com/b");
-    await user.click(screen.getByRole("button", { name: "开始导入" }));
+    await user.click(importPanel.getByRole("button", { name: "开始导入" }));
 
     expect(
-      await screen.findByText(/已受理 2 项，失败 1 项/),
+      await importPanel.findByText(/已受理 2 项，失败 1 项/),
     ).toBeInTheDocument();
     const fileRequests = fetchMock.mock.calls
       .filter(([request]) =>
@@ -663,6 +671,7 @@ describe("knowledge workbench", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", {
+      getRandomValues: crypto.getRandomValues.bind(crypto),
       randomUUID: () => "pdf-request",
       subtle: {
         digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer),
@@ -1127,6 +1136,7 @@ describe("knowledge workbench", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("crypto", {
+      getRandomValues: crypto.getRandomValues.bind(crypto),
       randomUUID: () => "office-request",
       subtle: { digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer) },
     });
