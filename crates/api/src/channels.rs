@@ -1360,7 +1360,7 @@ pub async fn desktop_authorization(
         .channel_service()
         .browser()
         .map_err(|e| err(e, context))?
-        .desktop_status(id)
+        .desktop_ready(id)
         .await
         .map_err(|e| err(e, context))?;
     crate::desktop_gateway::validate_desktop_origin(&headers, state.origin_config())
@@ -2013,7 +2013,7 @@ pub async fn pool_desktop_authorization(
         .browser()
         .map_err(|e| err(e, context))?;
     browser
-        .desktop_status(id)
+        .desktop_ready(id)
         .await
         .map_err(|e| err(e, context))?;
     crate::desktop_gateway::validate_desktop_origin(&headers, state.origin_config())
