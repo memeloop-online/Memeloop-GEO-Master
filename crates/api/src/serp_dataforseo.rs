@@ -112,8 +112,9 @@ impl DataForSeoSerpSource {
         intent: &SerpSendingIntent,
     ) -> Result<(), AppError> {
         raw.evidence.validate(intent)?;
+        // Storage availability is established by the repository before decoding.
+        // Its clock need not be ordered with the application's receipt clock.
         if measurement.measurement_id != intent.measurement_id
-            || raw.stored_at < raw.evidence.captured_at
             || self
                 .prepared_for(measurement, &intent.correlation_tag)?
                 .request_sha256()
@@ -497,6 +498,82 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn persisted_receipts_accept_both_clock_skews_without_relaxing_source_bindings() {
+        let source = source();
+        let (measurement, intent) = fixture(&source);
+        for skew in [-20, 20] {
+            let mut post = stored(
+                &source,
+                &measurement,
+                &intent,
+                SerpEvidenceOperation::Submission,
+                20100,
+                json!([]),
+            );
+            post.stored_at = post.evidence.captured_at + chrono::Duration::seconds(skew);
+            assert_eq!(
+                source
+                    .decode_submission(&measurement, &post, &intent)
+                    .unwrap(),
+                TASK_ID
+            );
+            let mut raw = stored(
+                &source,
+                &measurement,
+                &intent,
+                SerpEvidenceOperation::ResultRead,
+                20000,
+                items(&[1]),
+            );
+            raw.stored_at = raw.evidence.captured_at + chrono::Duration::seconds(skew);
+            let analyzed_at = raw.evidence.captured_at + chrono::Duration::seconds(1);
+            let snapshot = raw.clone();
+            let SerpReadOutcome::Observation(observation) = source
+                .decode_result(
+                    &measurement,
+                    &raw,
+                    &intent,
+                    TASK_ID,
+                    Uuid::new_v4(),
+                    analyzed_at,
+                )
+                .unwrap()
+            else {
+                panic!("observation");
+            };
+            assert_eq!(observation.analyzed_at, analyzed_at);
+            assert_eq!(observation.received_at, raw.evidence.captured_at);
+            assert_eq!(raw, snapshot);
+            let mut recovery = raw.clone();
+            recovery.evidence.operation = SerpEvidenceOperation::RecoveryRead;
+            source
+                .verify_recovery(&measurement, &recovery, &intent, TASK_ID)
+                .unwrap();
+            for field in 0..3 {
+                let mut mismatched = raw.clone();
+                match field {
+                    0 => mismatched.evidence.measurement_id = Uuid::new_v4(),
+                    1 => mismatched.evidence.attempt_id = Uuid::new_v4(),
+                    2 => mismatched.evidence.response_sha256 = "b".repeat(64),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    source
+                        .decode_result(
+                            &measurement,
+                            &mismatched,
+                            &intent,
+                            TASK_ID,
+                            Uuid::new_v4(),
+                            analyzed_at,
+                        )
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

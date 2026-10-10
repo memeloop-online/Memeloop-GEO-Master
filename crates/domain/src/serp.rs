@@ -389,6 +389,8 @@ pub struct SerpObservation {
 }
 
 impl SerpObservation {
+    /// Validate receipt binding, not application/database clock ordering. Persistence
+    /// must load the scoped, already stored raw evidence before appending analysis.
     pub fn validate_source(
         &self,
         measurement: &SerpMeasurement,
@@ -400,7 +402,6 @@ impl SerpObservation {
             || self.measurement_id != raw.evidence.measurement_id
             || self.attempt_id != raw.evidence.attempt_id
             || self.received_at != raw.evidence.captured_at
-            || self.analyzed_at < raw.stored_at
             || (!raw.evidence.body_complete && self.status == SerpObservationStatus::Observed)
             || (raw.evidence.operation == SerpEvidenceOperation::Submission
                 && (self.status == SerpObservationStatus::Observed || !self.results.is_empty()))
@@ -1103,7 +1104,8 @@ pub trait SerpRepository: Send + Sync {
         evidence_id: Uuid,
     ) -> Result<Option<SerpStoredRaw>, AppError>;
     /// Append-only analysis version referencing scoped raw evidence with identical
-    /// attempt/digest; validate_source enforces receipt and repository availability.
+    /// attempt/digest. Load existing scoped raw evidence before append;
+    /// validate_source enforces receipt binding, not repository clock ordering.
     /// Reanalysis never calls begin_send or mutates prior versions.
     async fn append_observation(
         &self,
@@ -1515,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_deadline_and_raw_availability_are_authoritative() {
+    fn lease_deadline_and_raw_binding_are_authoritative_without_cross_host_clock_order() {
         let measurement = measurement();
         let mut value = observation(&measurement, 10);
         let claim = SerpClaim {
@@ -1545,9 +1547,26 @@ mod tests {
             },
             stored_at: value.received_at + Duration::seconds(1),
         };
+        let original = value.clone();
+        for skew in [-20, 20] {
+            raw.stored_at = value.received_at + Duration::seconds(skew);
+            value.validate_source(&measurement, &raw).unwrap();
+            assert_eq!(value, original);
+        }
+        for field in 0..4 {
+            let mut mismatched = raw.clone();
+            match field {
+                0 => mismatched.evidence.evidence_id = Uuid::new_v4(),
+                1 => mismatched.evidence.measurement_id = Uuid::new_v4(),
+                2 => mismatched.evidence.attempt_id = Uuid::new_v4(),
+                3 => mismatched.evidence.response_sha256 = "b".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(value.validate_source(&measurement, &mismatched).is_err());
+        }
+        value.analyzed_at = value.received_at - Duration::seconds(1);
         assert!(value.validate_source(&measurement, &raw).is_err());
-        value.analyzed_at = raw.stored_at;
-        value.validate_source(&measurement, &raw).unwrap();
+        value = original;
         raw.evidence.body_complete = false;
         assert!(value.validate_source(&measurement, &raw).is_err());
         raw.evidence.body_complete = true;
