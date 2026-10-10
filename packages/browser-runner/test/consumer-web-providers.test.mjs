@@ -40,14 +40,17 @@ test("capabilities expose entry availability separately from supported account c
       const connector = connectors.find((item) => item.platform === platform);
       assert.equal(connector.login_entry_available, true);
       assert.equal(connector.login_supported, true);
+      assert.equal(connector.model_discovery_supported, false);
       assert.equal(connector.verified, false);
       assert.deepEqual(connector.operations, []);
     }
     const kimi = connectors.find((item) => item.platform === "kimi");
     assert.equal(kimi.login_supported, true);
+    assert.equal(kimi.model_discovery_supported, true);
     assert.deepEqual(kimi.operations, ["measure"]);
     const glm = connectors.find((item) => item.platform === "glm");
     assert.equal(glm.login_supported, true);
+    assert.equal(glm.model_discovery_supported, false);
     assert.deepEqual(glm.operations, []);
   } finally {
     await runner.shutdown();

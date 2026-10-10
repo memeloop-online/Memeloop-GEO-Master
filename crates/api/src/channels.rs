@@ -237,9 +237,20 @@ impl ChannelService {
         scope: &TenantScope,
         account_id: Uuid,
     ) -> Result<(Uuid, ChannelSessionVersion), AppError> {
+        self.resume_available_browser_with_renewal_id(scope, account_id, Uuid::new_v4())
+            .await
+    }
+
+    /// The caller retains the context ID even if restore times out after the
+    /// runner has accepted it, so cleanup never depends on a received handle.
+    pub(crate) async fn resume_available_browser_with_renewal_id(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        id: Uuid,
+    ) -> Result<(Uuid, ChannelSessionVersion), AppError> {
         let prepared = self.prepare_available_browser(scope, account_id).await?;
         let version = prepared.session_version(account_id);
-        let id = Uuid::new_v4();
         self.browser()?
             .start(
                 id,
