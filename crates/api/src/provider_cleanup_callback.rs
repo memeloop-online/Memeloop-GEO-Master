@@ -97,7 +97,7 @@ impl ProviderCleanupCallbackService {
         let now = Utc::now();
         if scope.project_id.is_none()
             || claim.action != ProviderCleanupAction::Delete
-            || claim.provider != "kimi"
+            || !geo_domain::provider_conversation_cleanup_supported(&claim.provider)
             || claim.original_identity.provider != claim.provider
             || !valid_id(&claim.external_conversation_id)
             || claim.lease_until <= now
@@ -543,6 +543,22 @@ mod tests {
         let (status, text) = submit(&service, &body, Some(BEARER)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(!text.contains("private") && !text.contains("authorized"));
+    }
+
+    #[test]
+    fn unregistered_provider_cannot_receive_cleanup_ticket() {
+        let (service, store, _) = fixture();
+        for provider in ["deepseek", "doubao", "glm", "unknown", "Kimi"] {
+            let mut claim = store.claim.clone();
+            claim.provider = provider.into();
+            claim.original_identity.provider = provider.into();
+            assert!(
+                service
+                    .issue_ticket(&store.scope, &claim, store.reservation_id, Uuid::new_v4())
+                    .is_err()
+            );
+        }
+        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

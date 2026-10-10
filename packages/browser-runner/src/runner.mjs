@@ -1301,8 +1301,17 @@ export function createRunner(options = {}) {
     entry.promise = Promise.race([
       work,
       new Promise((resolve) => {
+        const expire = () => {
+          const remaining = deadlineAt - performance.now();
+          if (remaining > 0) {
+            // A timer wakeup does not prove the monotonic deadline has passed.
+            timer = setTimeout(expire, Math.max(1, Math.ceil(remaining)));
+            return;
+          }
+          resolve(deadlineReply());
+        };
         timer = setTimeout(
-          () => resolve(deadlineReply()),
+          expire,
           Math.max(1, Math.ceil(deadlineAt - performance.now())),
         );
       }),

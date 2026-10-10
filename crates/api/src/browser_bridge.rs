@@ -372,7 +372,7 @@ impl BrowserBridge {
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
         };
-        if expected_identity.provider != "kimi"
+        if !geo_domain::provider_conversation_cleanup_supported(&expected_identity.provider)
             || !valid_id(&expected_identity.platform_account_id)
             || !valid_id(chat_id)
             || ticket.is_some_and(|value| {
@@ -804,6 +804,54 @@ mod measurement_options_tests {
             serde_json::to_value(result.diagnostic).unwrap(),
             serde_json::json!({"stage":"delete","code":"http_error"})
         );
+    }
+
+    #[tokio::test]
+    async fn unregistered_cleanup_provider_is_rejected_before_network() {
+        use axum::{Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let session_id = Uuid::new_v4();
+        let app = Router::new().route(
+            &format!("/v1/sessions/{session_id}/cleanup-conversation"),
+            post(move || {
+                let calls = observed.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bridge = BrowserBridge::new(format!("http://{addr}"), "fixture-token".into()).unwrap();
+        for provider in ["deepseek", "doubao", "glm", "unknown", "Kimi"] {
+            for action in [CleanupAction::Delete, CleanupAction::Reconcile] {
+                let error = bridge
+                    .cleanup_conversation(
+                        session_id,
+                        Uuid::new_v4(),
+                        &CleanupExpectedIdentity {
+                            provider: provider.into(),
+                            platform_account_id: "fixture-account".into(),
+                        },
+                        "fixture-chat",
+                        action,
+                        Some("aabb"),
+                    )
+                    .await
+                    .err()
+                    .expect("unregistered provider must not reach runner");
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     #[tokio::test]
