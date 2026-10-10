@@ -412,19 +412,34 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let configuration = |base_url: &str| geo_api::UpdateProjectAiSettings {
+            expected_revision: 0,
+            mode: geo_domain::ProjectAiMode::Custom,
+            model: Some("saved-model".into()),
+            base_url: Some(base_url.into()),
+            api_key: Some("synthetic-project-secret".into()),
+            clear_api_key: false,
+            prefer_connected_account: None,
+        };
+        // A configured runtime does not authorize tenant-selected private
+        // endpoints. This failure must not consume the settings revision.
+        let rejected = settings
+            .save(
+                &scope,
+                geo_domain::ProjectAiUsage::WorkbenchContent,
+                configuration("http://127.0.0.1:1/v1"),
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(error) if error.code == geo_domain::ErrorCode::InvalidRequest)
+        );
+        // Saving a DNS hostname does not resolve it or invoke inference. The
+        // custom transport checks its resolved addresses when a call is made.
         settings
             .save(
                 &scope,
                 geo_domain::ProjectAiUsage::WorkbenchContent,
-                geo_api::UpdateProjectAiSettings {
-                    expected_revision: 0,
-                    mode: geo_domain::ProjectAiMode::Custom,
-                    model: Some("saved-model".into()),
-                    base_url: Some("http://127.0.0.1:1/v1".into()),
-                    api_key: Some("synthetic-project-secret".into()),
-                    clear_api_key: false,
-                    prefer_connected_account: None,
-                },
+                configuration("https://models.example.invalid/v1"),
             )
             .await
             .unwrap();
