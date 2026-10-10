@@ -1,5 +1,38 @@
 import { apiFetch } from "./client";
 import type { ReportSupplementaryMeasurement } from "./reports";
+import type { SerpObservation, SerpProtocol, SerpTarget } from "./serp";
+
+export interface MeasurementPeriodSearchSample {
+  cohort: {
+    measurement_id: string;
+    source_key: string;
+    query: string;
+    protocol: SerpProtocol;
+    target: SerpTarget | null;
+    target_rule_version: string;
+    question_binding: ReportSupplementaryMeasurement["question_binding"];
+    scheduled_at: string;
+    created_at: string;
+    stored_at: string;
+  };
+  evidence: {
+    observation: SerpObservation;
+    raw_stored_at: string;
+    observation_stored_at: string;
+    evidence_time: string;
+    evidence_time_basis: "provider_observed_at" | "received_at";
+    target_match:
+      | { status: "not_requested" | "undetermined" }
+      | { status: "hit"; organic_ranks: number[] }
+      | { status: "not_found_within_depth"; covered_depth: number };
+  } | null;
+}
+
+export interface MeasurementPeriodSearchSection {
+  schema_version: string;
+  coverage: { planned: number; counts: Record<string, number> };
+  samples: MeasurementPeriodSearchSample[];
+}
 
 export interface MeasurementPeriodSample {
   plan_id: string;
@@ -28,6 +61,7 @@ export interface MeasurementPeriodProjection {
     observed_live: number;
   };
   samples: MeasurementPeriodSample[];
+  search?: MeasurementPeriodSearchSection | null;
 }
 
 export interface MeasurementPeriodReport extends MeasurementPeriodProjection {

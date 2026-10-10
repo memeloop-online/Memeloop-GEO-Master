@@ -5,7 +5,6 @@ use geo_domain::{
     DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, EffectiveObservation, FrozenQuestionBinding,
     MeasurementPeriodSample, MeasurementPeriodWindow, ProjectCreate, ProjectSettings,
     QuestionPurpose, QuestionReference, TenantScope, freeze_measurement_period,
-    preview_measurement_period,
 };
 use geo_worker::{
     HostOps, ReportGetRequest, ReportKind, ReportPreviewRequest, ReportPreviewResult,
@@ -32,6 +31,101 @@ async fn fixture() -> (AppState, TenantScope, RepositoryHostOps) {
     let tools =
         RepositoryHostOps::new(state.knowledge_repository()).with_report_state(state.clone());
     (state, scope, tools)
+}
+
+fn search_sample(
+    purpose: Option<QuestionPurpose>,
+    canary: &str,
+    at: chrono::DateTime<Utc>,
+) -> geo_domain::MeasurementPeriodSearchSample {
+    use geo_domain::*;
+    let measurement = SerpMeasurement {
+        measurement_id: Uuid::new_v4(),
+        source_key: format!("{canary}-source"),
+        protocol: SerpProtocol {
+            query: format!("{canary}-query"),
+            engine: SerpEngine::Google,
+            surface: SerpSurface::ThirdPartyApi,
+            source: "synthetic".into(),
+            source_location_code: "2840".into(),
+            country: "US".into(),
+            city: None,
+            language: "en".into(),
+            device: SerpDevice::Desktop,
+            operating_system: "windows".into(),
+            requested_depth: 10,
+            max_pages: 1,
+            priority: 1,
+            login: "unspecified".into(),
+            personalization: "unspecified".into(),
+            protocol_version: SERP_PROTOCOL_VERSION.into(),
+            connector_version: "synthetic.v1".into(),
+        },
+        target: None,
+        target_rule_version: SERP_TARGET_RULE_VERSION.into(),
+        question_binding: purpose.map(|purpose| FrozenQuestionBinding {
+            reference: QuestionReference {
+                question_set_id: Uuid::new_v4(),
+                question_set_version_id: Uuid::new_v4(),
+                question_id: Uuid::new_v4(),
+                question_revision_id: Uuid::new_v4(),
+            },
+            purpose,
+            split_policy_version: "synthetic.v1".into(),
+        }),
+        scheduled_at: at,
+        created_at: at,
+        state: SerpTaskState::Queued,
+    };
+    let url = format!("https://example.org/{canary}");
+    let observation = SerpObservation {
+        observation_id: Uuid::new_v4(),
+        measurement_id: measurement.measurement_id,
+        attempt_id: Uuid::new_v4(),
+        raw_evidence_id: Uuid::new_v4(),
+        raw_sha256: sha256_hex(b"synthetic"),
+        parser_version: "synthetic.v1".into(),
+        provider_observed_at: None,
+        received_at: at,
+        analyzed_at: at,
+        status: SerpObservationStatus::Partial,
+        actual_conditions: SerpActualConditions::default(),
+        coverage: SerpCoverage {
+            requested_depth: 10,
+            observed_organic_depth: 1,
+            pages_received: 1,
+            completion: SerpCoverageCompletion::Partial,
+            truncated: true,
+            exhaustion_evidence_locator: None,
+        },
+        results: vec![SerpResult {
+            kind: SerpResultKind::Organic,
+            raw_kind: "organic".into(),
+            raw_url: Some(url.clone()),
+            normalized_url: Some(url),
+            host: Some("example.org".into()),
+            normalization_version: SERP_URL_RULE_VERSION.into(),
+            title: Some(format!("{canary}-title")),
+            page: Some(1),
+            position: 1,
+            organic_rank: Some(1),
+            absolute_position: Some(2),
+            locator: "/results/0".into(),
+        }],
+        source_limitations: vec![],
+    };
+    let target_match = observation.target_match(&measurement).unwrap();
+    MeasurementPeriodSearchSample {
+        cohort: MeasurementPeriodSearchIdentity::from_measurement(&measurement, at),
+        evidence: Some(MeasurementPeriodSearchEvidence {
+            observation,
+            raw_stored_at: at,
+            observation_stored_at: at,
+            evidence_time: at,
+            evidence_time_basis: SearchEvidenceTimeBasis::ReceivedAt,
+            target_match,
+        }),
+    }
 }
 
 #[tokio::test]
@@ -211,7 +305,27 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
         }
     })
     .collect();
-    let preview = preview_measurement_period(&scope, &window, samples, now).unwrap();
+    let search = vec![
+        search_sample(
+            Some(QuestionPurpose::Optimization),
+            "search_allowed",
+            now - Duration::hours(1),
+        ),
+        search_sample(
+            Some(QuestionPurpose::FrozenEvaluation),
+            "search_heldout_canary",
+            now - Duration::hours(1),
+        ),
+        search_sample(None, "search_adhoc_allowed", now - Duration::hours(1)),
+    ];
+    let preview = geo_domain::preview_measurement_period_with_search(
+        &scope,
+        &window,
+        samples,
+        Some(search),
+        now,
+    )
+    .unwrap();
     let stored = freeze_measurement_period(&scope, preview.clone(), 1, None).unwrap();
     state
         .report_repository()
@@ -235,6 +349,10 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
         assert!(text.contains("allowed_answer"));
         assert!(!text.contains("heldout_canary"));
         assert!(!text.contains("unclassified_canary"));
+        assert!(!text.contains("search_heldout_canary"));
+        assert!(text.contains("search_allowed-title"));
+        assert!(text.contains("search_adhoc_allowed-title"));
+        assert!(text.contains("\"omitted_search_sample_details\":1"));
         assert!(text.contains("\"omitted_sample_details\":2"));
         assert!(text.contains("\"planned\":3"));
     }
@@ -242,7 +360,13 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
     let text = serde_json::to_string(&projection).unwrap();
     assert!(!text.contains("heldout_canary"));
     assert!(!text.contains("unclassified_canary"));
+    assert!(!text.contains("search_heldout_canary"));
     assert_eq!(projection.omitted_sample_details, 2);
+    assert_eq!(projection.omitted_search_sample_details, 1);
+    assert_eq!(
+        projection.preview.search.as_ref().unwrap().coverage.planned,
+        3
+    );
     assert_eq!(
         state
             .report_repository()

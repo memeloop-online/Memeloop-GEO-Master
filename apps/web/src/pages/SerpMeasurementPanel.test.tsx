@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import * as api from "../api/serp";
 import { SerpMeasurementPanel } from "./SerpMeasurementPanel";
 import i18n from "../i18n";
@@ -99,7 +105,22 @@ const observation: api.SerpObservation = {
     },
   ],
 };
-function setup(available = true, items: api.SerpMeasurement[] = [measurement]) {
+function NavigationProbe() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="search-url">{location.search}</output>
+      <button onClick={() => navigate(-1)}>Back</button>
+    </>
+  );
+}
+function setup(
+  available = true,
+  items: api.SerpMeasurement[] = [measurement],
+  initialEntry = "/",
+  missing = false,
+) {
   vi.spyOn(api, "getSerpCapabilities").mockResolvedValue(
     available
       ? [{ source_key: "source-key", protocol_defaults: protocol }]
@@ -114,6 +135,7 @@ function setup(available = true, items: api.SerpMeasurement[] = [measurement]) {
     next_after: null,
     execution: null,
   });
+  if (missing) detail.mockRejectedValue(new Error("Record not found"));
   vi.spyOn(api, "listSerpSources").mockResolvedValue({
     items: [],
     next_after: null,
@@ -141,8 +163,9 @@ function setup(available = true, items: api.SerpMeasurement[] = [measurement]) {
   render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider client={client}>
-        <MemoryRouter>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <SerpMeasurementPanel tenantId="tenant" projectId="project" />
+          <NavigationProbe />
         </MemoryRouter>
       </QueryClientProvider>
     </FluentProvider>,
@@ -156,6 +179,59 @@ afterEach(async () => {
 });
 
 describe("independent search measurement", () => {
+  it("opens a report-linked record, preserves unrelated parameters and restores selection on back", async () => {
+    const { detail, create } = setup(
+      false,
+      [],
+      "/?tab=search&searchRecord=measurement&record=ai-record&keep=1",
+    );
+    expect(
+      await screen.findByRole("heading", { name: "rain gauge" }),
+    ).toBeVisible();
+    expect(detail).toHaveBeenCalledWith(
+      "tenant",
+      "project",
+      "measurement",
+      undefined,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "关闭详情" }));
+    expect(
+      screen.queryByRole("region", { name: "测量详情" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("search-url")).toHaveTextContent(
+      "?tab=search&record=ai-record&keep=1",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(
+      await screen.findByRole("heading", { name: "rain gauge" }),
+    ).toBeVisible();
+    expect(screen.getByTestId("search-url")).toHaveTextContent(
+      "searchRecord=measurement",
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
+  it("shows an unavailable deep-linked record without falling back to another record or creating one", async () => {
+    const { detail, create } = setup(
+      false,
+      [measurement],
+      "/?tab=search&searchRecord=missing",
+      true,
+    );
+    const section = await screen.findByRole("region", { name: "测量详情" });
+    expect(
+      await within(section).findByText("暂时无法读取记录，请刷新重试。"),
+    ).toBeVisible();
+    expect(detail).toHaveBeenCalledWith(
+      "tenant",
+      "project",
+      "missing",
+      undefined,
+    );
+    expect(
+      within(section).queryByRole("heading", { name: "rain gauge" }),
+    ).not.toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+  });
   it("keeps history readable and new paid sampling unavailable without a source", async () => {
     const { create, detail } = setup(false);
     expect(

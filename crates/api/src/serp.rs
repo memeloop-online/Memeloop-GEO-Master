@@ -178,6 +178,12 @@ pub struct ReparseSerpSource {
 }
 
 impl SerpService {
+    /// Report projection reads only persisted metadata. It never resolves
+    /// source credentials, requests capabilities, or starts provider work.
+    pub(crate) fn report_repository(&self) -> &dyn SerpRepository {
+        self.repository.as_ref()
+    }
+
     /// An empty source map preserves history access without granting any paid
     /// execution capability. Production wiring starts in this state.
     pub fn new(

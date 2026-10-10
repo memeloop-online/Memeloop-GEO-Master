@@ -963,3 +963,387 @@ async fn postgres_serp_fences_recovery_and_immutable_evidence() {
     );
     assert!(restarted.list(&other, None, 100).await.unwrap().is_empty());
 }
+
+async fn report_now(database: Option<&Database>) -> DateTime<Utc> {
+    match database {
+        Some(database) => sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        None => Utc::now(),
+    }
+}
+
+async fn report_contract(
+    store: &dyn SerpRepository,
+    scope: &TenantScope,
+    database: Option<&Database>,
+) {
+    // The database owns insertion clocks; remote test hosts need not share the
+    // client clock. Never compensate for skew with sleeps or a future cutoff.
+    let now = report_now(database).await - Duration::minutes(2);
+    let window = MeasurementPeriodWindow {
+        start_at: now - Duration::minutes(1),
+        end_at: now + Duration::minutes(1),
+        report_timezone: "UTC".into(),
+    };
+    let mut expected = Vec::new();
+    for ordinal in 1..=105u128 {
+        let mut item = measurement(now);
+        item.measurement_id = Uuid::from_u128(ordinal);
+        expected.push(item.measurement_id);
+        store
+            .accept(scope, &format!("report-{ordinal}"), item)
+            .await
+            .unwrap();
+    }
+    let cutoff = report_now(database).await;
+    let first = store
+        .list_report_measurements(scope, &window, cutoff, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 100);
+    let second = store
+        .list_report_measurements(scope, &window, cutoff, Some(first[99].measurement_id), 100)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 5);
+    assert_eq!(
+        first
+            .iter()
+            .chain(&second)
+            .map(|row| row.measurement_id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        first
+            .iter()
+            .all(|row| row.created_at < row.stored_at && row.stored_at <= cutoff)
+    );
+    assert!(
+        store
+            .list_report_measurements(scope, &window, now + Duration::minutes(1), None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let id = expected[0];
+    let frozen = first[0].clone();
+    let original = store.get(scope, id).await.unwrap().unwrap();
+    let mut replay = original.clone();
+    replay.measurement_id = Uuid::new_v4();
+    replay.created_at = report_now(database).await;
+    store.accept(scope, "report-1", replay).await.unwrap();
+    assert_eq!(
+        store
+            .get_report_measurements(scope, &[id, id, Uuid::new_v4()])
+            .await
+            .unwrap(),
+        vec![frozen.clone()]
+    );
+    for (key, scheduled_at) in [
+        ("before-window", window.start_at - Duration::microseconds(1)),
+        ("end-window", window.end_at),
+        ("late-insertion", now),
+    ] {
+        let mut item = measurement(now);
+        item.scheduled_at = scheduled_at;
+        store.accept(scope, key, item).await.unwrap();
+    }
+    // A backdated accepted task cannot enter an already fixed cohort cutoff.
+    assert_eq!(
+        store
+            .list_report_measurements(scope, &window, cutoff, None, 100)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        store
+            .list_report_measurements(scope, &window, cutoff, Some(first[99].measurement_id), 100)
+            .await
+            .unwrap(),
+        second
+    );
+    let later = store
+        .list_report_measurements(
+            scope,
+            &window,
+            report_now(database).await,
+            Some(Uuid::from_u128(105)),
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].scheduled_at, now);
+
+    let claim = store
+        .claim(scope, id, now, now + Duration::minutes(10))
+        .await
+        .unwrap()
+        .unwrap();
+    let intent = store
+        .begin_send(
+            scope,
+            &claim,
+            &sha256_hex(b"report-request"),
+            "report-tag",
+            None,
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let submission = store
+        .append_raw(
+            scope,
+            &intent,
+            raw(&intent, SerpEvidenceOperation::Submission, now),
+        )
+        .await
+        .unwrap();
+    store
+        .bind_provider_task(
+            scope,
+            &intent,
+            task(&intent, submission.evidence.evidence_id),
+        )
+        .await
+        .unwrap();
+    let saved = store
+        .append_raw(
+            scope,
+            &intent,
+            raw(&intent, SerpEvidenceOperation::ResultRead, now),
+        )
+        .await
+        .unwrap();
+    let mut obs = observation(&saved, report_now(database).await);
+    obs.observation_id = Uuid::from_u128(1000);
+    store.append_observation(scope, obs.clone()).await.unwrap();
+    let prior = store
+        .list_report_observations(scope, &[id], report_now(database).await, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(prior.len(), 1);
+    assert_eq!(prior[0].raw.stored_at, saved.stored_at);
+    assert!(prior[0].observation_stored_at >= obs.analyzed_at);
+    let observation_cutoff = prior[0].observation_stored_at;
+    store
+        .append_raw(scope, &intent, saved.evidence.clone())
+        .await
+        .unwrap();
+    store.append_observation(scope, obs.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .list_report_observations(scope, &[id], report_now(database).await, None, 100)
+            .await
+            .unwrap(),
+        prior
+    );
+    assert!(
+        store
+            .list_report_observations(
+                scope,
+                &[id],
+                saved.stored_at - Duration::microseconds(1),
+                None,
+                100
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for ordinal in 1..105u128 {
+        let mut next = obs.clone();
+        next.observation_id = Uuid::from_u128(1000 + ordinal);
+        next.analyzed_at = report_now(database).await;
+        store.append_observation(scope, next).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .list_report_observations(scope, &[id], observation_cutoff, None, 100)
+            .await
+            .unwrap(),
+        prior
+    );
+    let first_observations = store
+        .list_report_observations(scope, &[id], report_now(database).await, None, 100)
+        .await
+        .unwrap();
+    let rest = store
+        .list_report_observations(
+            scope,
+            &[id],
+            report_now(database).await,
+            Some(first_observations[99].observation.observation_id),
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_observations.len(), 100);
+    assert_eq!(rest.len(), 5);
+    assert_eq!(
+        first_observations
+            .iter()
+            .chain(&rest)
+            .map(|row| row.observation.observation_id)
+            .collect::<Vec<_>>(),
+        (1000..1105).map(Uuid::from_u128).collect::<Vec<_>>()
+    );
+    let serialized = serde_json::to_string(&first_observations).unwrap();
+    assert!(!serialized.contains("synthetic-task"));
+    assert!(!serialized.contains("\"body\":"));
+    assert_eq!(
+        store.get_report_measurements(scope, &[id]).await.unwrap(),
+        vec![frozen]
+    );
+
+    for foreign in [
+        TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, scope.project_id),
+        TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id),
+        TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        ),
+    ] {
+        assert!(
+            store
+                .list_report_measurements(&foreign, &window, report_now(database).await, None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_report_measurements(&foreign, &[id])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_report_observations(&foreign, &[id], report_now(database).await, None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    for limit in [0, 101] {
+        assert!(
+            store
+                .list_report_measurements(scope, &window, cutoff, None, limit)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .list_report_observations(scope, &[id], cutoff, None, limit)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        store
+            .get_report_measurements(scope, &expected)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .list_report_observations(scope, &expected, cutoff, None, 100)
+            .await
+            .is_err()
+    );
+    let unscoped = TenantScope::new(scope.operator_id, scope.tenant_id, None);
+    assert!(
+        store
+            .get_report_measurements(&unscoped, &[id])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn memory_serp_report_metadata_scope_cutoff_pagination_and_replay() {
+    let scope = TenantScope::new(
+        Uuid::new_v4().into(),
+        Uuid::new_v4().into(),
+        Some(Uuid::new_v4().into()),
+    );
+    report_contract(&MemorySerpRepository::default(), &scope, None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn postgres_serp_report_metadata_scope_cutoff_pagination_and_replay() {
+    let url =
+        std::env::var("GEO_TEST_DATABASE_URL").expect("disposable test database URL required");
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("serp_report_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .unwrap()
+        .options([("search_path", schema.as_str())]);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    let database = Database::from_pool(pool);
+    database.migrate().await.unwrap();
+    let (operator, tenant, project) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query("INSERT INTO operators(operator_id,slug,display_name) VALUES($1,$2,'Synthetic')")
+        .bind(operator)
+        .bind(format!("report-{operator}"))
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants(tenant_id,operator_id,slug,display_name) VALUES($1,$2,$3,'Synthetic')",
+    )
+    .bind(tenant)
+    .bind(operator)
+    .bind(format!("report-{tenant}"))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO projects(project_id,operator_id,tenant_id,slug,display_name) VALUES($1,$2,$3,$4,'Synthetic')")
+        .bind(project).bind(operator).bind(tenant).bind(format!("report-{project}")).execute(database.pool()).await.unwrap();
+    let scope = TenantScope::new(operator.into(), tenant.into(), Some(project.into()));
+    let repo = PgSerpRepository::from_database(&database);
+    report_contract(&repo, &scope, Some(&database)).await;
+    let rows = repo
+        .get_report_measurements(&scope, &[Uuid::from_u128(1)])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        PgSerpRepository::from_database(&database)
+            .get_report_measurements(&scope, &[Uuid::from_u128(1)])
+            .await
+            .unwrap()
+    );
+    // Storage errors must propagate, never become an empty report section.
+    database.pool().close().await;
+    assert_eq!(
+        repo.get_report_measurements(&scope, &[Uuid::from_u128(1)])
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::DependencyUnavailable
+    );
+    // Generated private test schema only; no shared tables are dropped.
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}

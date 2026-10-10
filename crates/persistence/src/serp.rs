@@ -36,6 +36,21 @@ fn page_limit(limit: usize) -> Result<i64, AppError> {
     }
     Ok(limit as i64)
 }
+fn report_ids(ids: &[Uuid]) -> Result<(), AppError> {
+    if ids.len() > 100 || ids.iter().any(Uuid::is_nil) {
+        return Err(AppError::invalid_request(
+            "invalid search report identities",
+        ));
+    }
+    Ok(())
+}
+fn report_identity(row: PgRow) -> Result<MeasurementPeriodSearchIdentity, AppError> {
+    let measurement = decode(row.get("measurement"))?;
+    Ok(MeasurementPeriodSearchIdentity::from_measurement(
+        &measurement,
+        row.get("stored_at"),
+    ))
+}
 fn state_name(state: SerpTaskState) -> &'static str {
     match state {
         SerpTaskState::Queued => "queued",
@@ -52,6 +67,7 @@ fn state_name(state: SerpTaskState) -> &'static str {
 #[derive(Clone)]
 struct Stored {
     measurement: SerpMeasurement,
+    stored_at: DateTime<Utc>,
     claim: Option<SerpClaim>,
     intent: Option<SerpSendingIntent>,
     task: Option<SerpProviderTask>,
@@ -146,6 +162,7 @@ impl Stored {
     fn from_row(row: PgRow) -> Result<Self, AppError> {
         Ok(Self {
             measurement: decode(row.get("measurement"))?,
+            stored_at: row.get("stored_at"),
             claim: row
                 .get::<Option<serde_json::Value>, _>("claim")
                 .map(decode)
@@ -267,6 +284,123 @@ impl PgSerpRepository {
 
 #[async_trait]
 impl SerpRepository for PgSerpRepository {
+    async fn list_report_measurements(
+        &self,
+        scope: &TenantScope,
+        window: &MeasurementPeriodWindow,
+        evidence_as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<MeasurementPeriodSearchIdentity>, AppError> {
+        window.validate(evidence_as_of)?;
+        let limit = page_limit(limit)?;
+        let mut tx = self.tx(scope).await?;
+        let rows = sqlx::query(
+            "SELECT measurement,stored_at FROM serp_measurements \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+             AND scheduled_at >= $4 AND scheduled_at < $5 \
+             AND created_at <= $6 AND stored_at <= $6 \
+             AND ($7::uuid IS NULL OR measurement_id > $7) \
+             ORDER BY measurement_id ASC LIMIT $8",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(window.start_at)
+        .bind(window.end_at)
+        .bind(evidence_as_of)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        let result = rows
+            .into_iter()
+            .map(report_identity)
+            .collect::<Result<_, _>>()?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(result)
+    }
+
+    async fn get_report_measurements(
+        &self,
+        scope: &TenantScope,
+        measurement_ids: &[Uuid],
+    ) -> Result<Vec<MeasurementPeriodSearchIdentity>, AppError> {
+        report_ids(measurement_ids)?;
+        let mut tx = self.tx(scope).await?;
+        let rows = sqlx::query(
+            "SELECT measurement,stored_at FROM serp_measurements \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
+             AND measurement_id=ANY($4) ORDER BY measurement_id ASC",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(measurement_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        let result = rows
+            .into_iter()
+            .map(report_identity)
+            .collect::<Result<_, _>>()?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(result)
+    }
+
+    async fn list_report_observations(
+        &self,
+        scope: &TenantScope,
+        measurement_ids: &[Uuid],
+        evidence_as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<SerpReportObservation>, AppError> {
+        report_ids(measurement_ids)?;
+        let limit = page_limit(limit)?;
+        let mut tx = self.tx(scope).await?;
+        // Select only safe raw metadata fields: neither body nor provider task
+        // identifiers cross the report projection boundary.
+        let rows = sqlx::query(
+            "SELECT o.observation,o.stored_at AS observation_stored_at, \
+             jsonb_build_object('evidence_id',r.evidence_id,'measurement_id',r.measurement_id, \
+             'attempt_id',r.attempt_id,'operation',r.metadata->'operation', \
+             'response_sha256',r.response_sha256,'body_complete',r.metadata->'body_complete', \
+             'captured_at',r.metadata->'captured_at','stored_at',r.stored_at) AS raw \
+             FROM serp_observations o JOIN serp_raw_evidence r \
+             ON r.operator_id=o.operator_id AND r.tenant_id=o.tenant_id \
+             AND r.project_id=o.project_id AND r.evidence_id=o.raw_evidence_id \
+             AND r.measurement_id=o.measurement_id AND r.attempt_id=o.attempt_id \
+             WHERE o.operator_id=$1 AND o.tenant_id=$2 AND o.project_id=$3 \
+             AND o.measurement_id=ANY($4) AND o.stored_at <= $5 AND r.stored_at <= $5 \
+             AND ($6::uuid IS NULL OR o.observation_id > $6) \
+             ORDER BY o.observation_id ASC LIMIT $7",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(measurement_ids)
+        .bind(evidence_as_of)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        let result = rows
+            .into_iter()
+            .map(|row| {
+                Ok(SerpReportObservation {
+                    observation: decode(row.get("observation"))?,
+                    observation_stored_at: row.get("observation_stored_at"),
+                    raw: decode(row.get("raw"))?,
+                })
+            })
+            .collect::<Result<_, AppError>>()?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(result)
+    }
+
     async fn get_execution(
         &self,
         scope: &TenantScope,
@@ -936,7 +1070,7 @@ impl MemorySerpRepository {
 struct MemoryData {
     tasks: std::collections::HashMap<Uuid, (TenantScope, String, Stored)>,
     raw: std::collections::HashMap<Uuid, (TenantScope, SerpStoredRaw)>,
-    observations: std::collections::HashMap<Uuid, (TenantScope, SerpObservation)>,
+    observations: std::collections::HashMap<Uuid, (TenantScope, SerpObservation, DateTime<Utc>)>,
     claims: std::collections::HashMap<Uuid, (TenantScope, SerpClaim)>,
 }
 impl MemoryData {
@@ -966,6 +1100,115 @@ impl MemoryData {
 
 #[async_trait]
 impl SerpRepository for MemorySerpRepository {
+    async fn list_report_measurements(
+        &self,
+        scope: &TenantScope,
+        window: &MeasurementPeriodWindow,
+        evidence_as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<MeasurementPeriodSearchIdentity>, AppError> {
+        project(scope)?;
+        window.validate(evidence_as_of)?;
+        page_limit(limit)?;
+        let data = self.data.lock().await;
+        let mut rows: Vec<_> = data
+            .tasks
+            .values()
+            .filter(|(owner, _, stored)| {
+                owner == scope
+                    && stored.measurement.scheduled_at >= window.start_at
+                    && stored.measurement.scheduled_at < window.end_at
+                    && stored.measurement.created_at <= evidence_as_of
+                    && stored.stored_at <= evidence_as_of
+                    && after.is_none_or(|id| stored.measurement.measurement_id > id)
+            })
+            .map(|(_, _, stored)| {
+                MeasurementPeriodSearchIdentity::from_measurement(
+                    &stored.measurement,
+                    stored.stored_at,
+                )
+            })
+            .collect();
+        rows.sort_by_key(|row| row.measurement_id);
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    async fn get_report_measurements(
+        &self,
+        scope: &TenantScope,
+        measurement_ids: &[Uuid],
+    ) -> Result<Vec<MeasurementPeriodSearchIdentity>, AppError> {
+        project(scope)?;
+        report_ids(measurement_ids)?;
+        let data = self.data.lock().await;
+        let mut rows: Vec<_> = data
+            .tasks
+            .values()
+            .filter(|(owner, _, stored)| {
+                owner == scope && measurement_ids.contains(&stored.measurement.measurement_id)
+            })
+            .map(|(_, _, stored)| {
+                MeasurementPeriodSearchIdentity::from_measurement(
+                    &stored.measurement,
+                    stored.stored_at,
+                )
+            })
+            .collect();
+        rows.sort_by_key(|row| row.measurement_id);
+        Ok(rows)
+    }
+
+    async fn list_report_observations(
+        &self,
+        scope: &TenantScope,
+        measurement_ids: &[Uuid],
+        evidence_as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<SerpReportObservation>, AppError> {
+        project(scope)?;
+        report_ids(measurement_ids)?;
+        page_limit(limit)?;
+        let data = self.data.lock().await;
+        let mut rows = Vec::new();
+        for (_, observation, stored_at) in
+            data.observations
+                .values()
+                .filter(|(owner, observation, stored_at)| {
+                    owner == scope
+                        && measurement_ids.contains(&observation.measurement_id)
+                        && *stored_at <= evidence_as_of
+                        && after.is_none_or(|id| observation.observation_id > id)
+                })
+        {
+            let raw = data
+                .raw(scope, observation.raw_evidence_id)
+                .ok_or_else(|| AppError::not_found("search report raw evidence missing"))?;
+            if raw.stored_at > evidence_as_of {
+                continue;
+            }
+            rows.push(SerpReportObservation {
+                observation: observation.clone(),
+                observation_stored_at: *stored_at,
+                raw: SerpReportRawMetadata {
+                    evidence_id: raw.evidence.evidence_id,
+                    measurement_id: raw.evidence.measurement_id,
+                    attempt_id: raw.evidence.attempt_id,
+                    operation: raw.evidence.operation,
+                    response_sha256: raw.evidence.response_sha256.clone(),
+                    body_complete: raw.evidence.body_complete,
+                    captured_at: raw.evidence.captured_at,
+                    stored_at: raw.stored_at,
+                },
+            });
+        }
+        rows.sort_by_key(|row| row.observation.observation_id);
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
     async fn get_execution(
         &self,
         scope: &TenantScope,
@@ -995,8 +1238,8 @@ impl SerpRepository for MemorySerpRepository {
             .await
             .observations
             .get(&observation_id)
-            .filter(|(owner, observation)| owner == scope && observation.measurement_id == id)
-            .map(|(_, observation)| observation.clone()))
+            .filter(|(owner, observation, _)| owner == scope && observation.measurement_id == id)
+            .map(|(_, observation, _)| observation.clone()))
     }
 
     async fn list_raw(
@@ -1134,6 +1377,7 @@ impl SerpRepository for MemorySerpRepository {
                 hash,
                 Stored {
                     measurement: measurement.clone(),
+                    stored_at: Utc::now(),
                     claim: None,
                     intent: None,
                     task: None,
@@ -1392,7 +1636,7 @@ impl SerpRepository for MemorySerpRepository {
             .raw(scope, observation.raw_evidence_id)
             .ok_or_else(|| AppError::not_found("search raw evidence not found"))?;
         validate_observation_evidence(stored, &observation, raw)?;
-        if let Some((owner, prior)) = data.observations.get(&observation.observation_id) {
+        if let Some((owner, prior, _)) = data.observations.get(&observation.observation_id) {
             return if owner == scope && prior == &observation {
                 Ok(prior.clone())
             } else {
@@ -1401,7 +1645,7 @@ impl SerpRepository for MemorySerpRepository {
         }
         data.observations.insert(
             observation.observation_id,
-            (scope.clone(), observation.clone()),
+            (scope.clone(), observation.clone(), Utc::now()),
         );
         Ok(observation)
     }
@@ -1430,7 +1674,7 @@ impl SerpRepository for MemorySerpRepository {
             return Err(AppError::conflict("search provider task missing"));
         }
         if state == SerpTaskState::Completed
-            && !data.observations.values().any(|(owner, observation)| {
+            && !data.observations.values().any(|(owner, observation, _)| {
                 owner == scope
                     && observation.measurement_id == stored.measurement.measurement_id
                     && observation.attempt_id == claim.attempt_id
@@ -1625,18 +1869,18 @@ impl SerpRepository for MemorySerpRepository {
             .map(|after| {
                 data.observations
                     .get(&after)
-                    .filter(|(owner, observation)| {
+                    .filter(|(owner, observation, _)| {
                         owner == scope && observation.measurement_id == id
                     })
-                    .map(|(_, observation)| (observation.analyzed_at, after))
+                    .map(|(_, observation, _)| (observation.analyzed_at, after))
                     .ok_or_else(|| AppError::invalid_request("invalid search observation cursor"))
             })
             .transpose()?;
         let mut rows: Vec<_> = data
             .observations
             .values()
-            .filter(|(owner, observation)| owner == scope && observation.measurement_id == id)
-            .map(|(_, observation)| observation)
+            .filter(|(owner, observation, _)| owner == scope && observation.measurement_id == id)
+            .map(|(_, observation, _)| observation)
             .filter(|row| {
                 cursor.is_none_or(|cursor| (row.analyzed_at, row.observation_id) < cursor)
             })

@@ -9,8 +9,9 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use geo_domain::{
     AppError, ChannelOutcomeStatus, ChannelTargetInput, MeasurementPeriodPreview,
-    MeasurementPeriodReport, MeasurementPeriodSample, MeasurementPeriodWindow, ProjectId,
-    TenantScope, effective_observation, freeze_measurement_period, preview_measurement_period,
+    MeasurementPeriodReport, MeasurementPeriodSample, MeasurementPeriodSearchSample,
+    MeasurementPeriodWindow, ProjectId, TenantScope, build_measurement_period_search_sample,
+    effective_observation, freeze_measurement_period, preview_measurement_period_with_search,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -80,7 +81,8 @@ pub async fn preview_project_measurements(
     window.validate(now)?;
     ensure_project(state, scope).await?;
     let samples = collect_samples(state, scope, &window, now, None).await?;
-    preview_measurement_period(scope, &window, samples, now)
+    let search = collect_search_samples(state, scope, &window, now, None).await?;
+    preview_measurement_period_with_search(scope, &window, samples, search, now)
 }
 
 /// Window identity is the initial-create idempotency boundary. A correction
@@ -126,7 +128,8 @@ pub async fn save_project_measurement_report(
         None
     };
     let samples = collect_samples(state, scope, &window, now, parent).await?;
-    let preview = preview_measurement_period(scope, &window, samples, now)?;
+    let search = collect_search_samples(state, scope, &window, now, parent).await?;
+    let preview = preview_measurement_period_with_search(scope, &window, samples, search, now)?;
     let report = freeze_measurement_period(
         scope,
         preview,
@@ -264,6 +267,115 @@ async fn collect_samples(
         }
     }
     Ok(samples)
+}
+
+async fn collect_search_samples(
+    state: &AppState,
+    scope: &TenantScope,
+    window: &MeasurementPeriodWindow,
+    as_of: DateTime<Utc>,
+    parent: Option<&MeasurementPeriodReport>,
+) -> Result<Option<Vec<MeasurementPeriodSearchSample>>, AppError> {
+    use std::collections::BTreeMap;
+    // An old snapshot did not freeze a search cohort. A correction must not
+    // retroactively add one or represent unavailable history as zero samples.
+    if parent.is_some_and(|report| report.search.is_none()) {
+        return Ok(None);
+    }
+    let Some(service) = state.serp_service() else {
+        return if parent.is_some() {
+            Err(AppError::capability_missing(
+                "saved search report evidence is unavailable",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let repository = service.report_repository();
+    let mut cohort = BTreeMap::new();
+    if let Some(section) = parent.and_then(|report| report.search.as_ref()) {
+        for chunk in section.samples.chunks(100) {
+            let ids: Vec<_> = chunk
+                .iter()
+                .map(|sample| sample.cohort.measurement_id)
+                .collect();
+            let current: BTreeMap<_, _> = repository
+                .get_report_measurements(scope, &ids)
+                .await?
+                .into_iter()
+                .map(|identity| (identity.measurement_id, identity))
+                .collect();
+            if current.len() != chunk.len()
+                || chunk.iter().any(|sample| {
+                    current.get(&sample.cohort.measurement_id) != Some(&sample.cohort)
+                })
+            {
+                return Err(AppError::conflict("search report cohort identity changed"));
+            }
+            cohort.extend(current);
+        }
+    } else {
+        let mut after = None;
+        loop {
+            let page = repository
+                .list_report_measurements(scope, window, as_of, after, 100)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for identity in page {
+                if after.is_some_and(|cursor| identity.measurement_id <= cursor) {
+                    return Err(AppError::conflict("search report cohort cursor invalid"));
+                }
+                after = Some(identity.measurement_id);
+                cohort.insert(identity.measurement_id, identity);
+            }
+        }
+    }
+    let identities: Vec<_> = cohort.into_values().collect();
+    let mut samples = Vec::with_capacity(identities.len());
+    for chunk in identities.chunks(100) {
+        let ids: Vec<_> = chunk
+            .iter()
+            .map(|identity| identity.measurement_id)
+            .collect();
+        let mut observations = BTreeMap::<_, Vec<_>>::new();
+        let mut after = None;
+        loop {
+            let page = repository
+                .list_report_observations(scope, &ids, as_of, after, 100)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for candidate in page {
+                let id = candidate.observation.observation_id;
+                if after.is_some_and(|cursor| id <= cursor)
+                    || !ids.contains(&candidate.observation.measurement_id)
+                {
+                    return Err(AppError::conflict(
+                        "search report observation cursor or identity invalid",
+                    ));
+                }
+                after = Some(id);
+                observations
+                    .entry(candidate.observation.measurement_id)
+                    .or_default()
+                    .push(candidate);
+            }
+        }
+        for identity in chunk {
+            samples.push(build_measurement_period_search_sample(
+                identity.clone(),
+                observations
+                    .remove(&identity.measurement_id)
+                    .unwrap_or_default(),
+                window,
+                as_of,
+            )?);
+        }
+    }
+    Ok(Some(samples))
 }
 
 #[utoipa::path(get, path="/api/v1/projects/{id}/measurement-report-preview",
