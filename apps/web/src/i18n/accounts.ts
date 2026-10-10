@@ -35,6 +35,7 @@ const accounts = {
         cancel: "取消并关闭",
         help: "在下方远程页面完成平台登录。只有支持身份核验的平台才能在识别账号后保存连接；打开页面不代表账号已连接。",
         launching: "正在启动远程浏览器",
+        startingHelp: "登录页面准备好后会显示在这里，请稍候。",
         checking: "正在确认登录状态",
         identity: "检测到账号：{{name}}",
         pendingIdentity: "待核验",
@@ -154,6 +155,8 @@ const accounts = {
           "You can open the sign-in page, but account verification and measurement are not yet supported.",
         help: "Sign in on the remote page below. Supported platforms save the connection after verifying your account. Opening the page does not mean the account is connected.",
         launching: "Starting remote browser",
+        startingHelp:
+          "Your sign-in page will appear here when it is ready. Please wait.",
         checking: "Checking sign-in status",
         identity: "Account found: {{name}}",
         pendingIdentity: "Pending verification",
