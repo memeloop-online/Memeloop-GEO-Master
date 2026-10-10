@@ -192,12 +192,16 @@ try {
     session_id: "synthetic",
     platform: "fixture",
   });
+  assert.equal(created.phase, "login_required");
+  assert.equal(identityProbeResult, undefined);
+  assert.equal(runner.desktopEndpoint("synthetic").host, "127.0.0.1");
+  const status = await runner.status("synthetic");
   assert.ifError(identityProbeError);
   assert.deepEqual(identityProbeResult, {
     text: true,
     cookie: true,
   });
-  assert.equal(created.phase, "ready_to_complete");
+  assert.equal(status.phase, "ready_to_complete");
   const endpoint = runner.desktopEndpoint("synthetic");
   assert.equal(endpoint.host, "127.0.0.1");
   assert.ok(remotePage, "synthetic remote page must exist");

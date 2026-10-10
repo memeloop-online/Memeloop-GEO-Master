@@ -2,12 +2,15 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import { createRunner } from "../src/runner.mjs";
+import { createRunnerServer } from "../src/server.mjs";
 
 function harness({
   clock = () => Date.now(),
   sessionIdleMs = 60_000,
   identify,
   failGoto = false,
+  desktopClosed = () => false,
+  endpointFails = () => false,
   platform = "fixture",
   restoredKimiIdentityWaitMs,
 } = {}) {
@@ -39,7 +42,11 @@ function harness({
       return {
         context,
         page,
+        get closed() {
+          return desktopClosed();
+        },
         endpoint() {
+          if (endpointFails()) throw new Error("synthetic_transport_failure");
           events.push("endpoint");
           return { host: "127.0.0.1", port: 65432 };
         },
@@ -256,6 +263,7 @@ test("interactive login pending retains input, then revokes input before final i
       proxy: { server: "http://127.0.0.1:9876" },
     });
     assert.equal(created.phase, "login_required");
+    assert.equal(events.includes("identify"), false);
     assert.deepEqual(runner.desktopEndpoint("desktop"), {
       host: "127.0.0.1",
       port: 65432,
@@ -353,7 +361,7 @@ test("failed navigation and changed identity after input revocation close the br
   let count = 0;
   const changed = harness({
     identify: () =>
-      ++count <= 2
+      ++count <= 1
         ? { platform_account_id: "original", display_name: "Synthetic" }
         : { platform_account_id: "different", display_name: "Synthetic" },
   });
@@ -373,6 +381,103 @@ test("failed navigation and changed identity after input revocation close the br
     );
   } finally {
     await changed.runner.shutdown();
+  }
+});
+
+test("desktop readiness stays independent of identity discovery and rejects unavailable sessions", async () => {
+  let now = 0;
+  let closed = false;
+  let endpointFailure = false;
+  let resolveIdentity;
+  const { runner, events, state } = harness({
+    clock: () => now,
+    sessionIdleMs: 100,
+    desktopClosed: () => closed,
+    endpointFails: () => endpointFailure,
+    identify: () =>
+      new Promise((resolve) => {
+        resolveIdentity = resolve;
+      }),
+  });
+  const server = createRunnerServer({ token: "fixture-token", runner });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}/v1/sessions`;
+  const readiness = (id, token = "fixture-token") =>
+    fetch(`${base}/${id}/desktop-readiness`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(2_000),
+    });
+  try {
+    assert.deepEqual(
+      await runner.create({ session_id: "desktop", platform: "fixture" }),
+      {
+        session_id: "desktop",
+        phase: "login_required",
+      },
+    );
+    assert.equal(events.includes("identify"), false);
+    assert.equal((await readiness("desktop", "wrong")).status, 401);
+    assert.equal((await readiness("unknown")).status, 404);
+    const status = runner.status("desktop");
+    assert.equal(events.filter((event) => event === "identify").length, 1);
+    const ready = await readiness("desktop");
+    assert.equal(ready.status, 200);
+    assert.equal(ready.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await ready.json(), { ready: true });
+    assert.equal(events.filter((event) => event === "identify").length, 1);
+    resolveIdentity(null);
+    await status;
+
+    const completion = runner.complete("desktop");
+    assert.equal((await readiness("desktop")).status, 409);
+    resolveIdentity(null);
+    await assert.rejects(
+      completion,
+      (error) => error.code === "login_required",
+    );
+    endpointFailure = true;
+    assert.equal((await readiness("desktop")).status, 409);
+    endpointFailure = false;
+    now = 101;
+    assert.equal((await readiness("desktop")).status, 404);
+
+    await runner.create({ session_id: "closed", platform: "fixture" });
+    closed = true;
+    assert.equal((await readiness("closed")).status, 404);
+    closed = false;
+    const restored = runner.create({
+      session_id: "restored",
+      platform: "fixture",
+      storage_state: state,
+    });
+    // Restored contexts still perform their initial identity probe.
+    await new Promise((resolve) => setImmediate(resolve));
+    resolveIdentity(null);
+    await restored;
+    assert.equal((await readiness("restored")).status, 409);
+  } finally {
+    await runner.shutdown();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("desktop readiness rejects completed login without disclosing identity", async () => {
+  const { runner, login } = harness();
+  const server = createRunnerServer({ token: "fixture-token", runner });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await runner.create({ session_id: "completed", platform: "fixture" });
+    login();
+    await runner.complete("completed");
+    const response = await fetch(
+      `http://127.0.0.1:${server.address().port}/v1/sessions/completed/desktop-readiness`,
+      { headers: { authorization: "Bearer fixture-token" } },
+    );
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { error: "desktop_unavailable" });
+  } finally {
+    await runner.shutdown();
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 

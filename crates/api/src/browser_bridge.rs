@@ -55,6 +55,35 @@ impl BrowserBridge {
         Ok((url.to_string(), self.token.clone()))
     }
 
+    /// Check transport availability without waiting for provider identity.
+    pub async fn desktop_ready(&self, id: Uuid) -> Result<(), AppError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Readiness {
+            ready: bool,
+        }
+        let response = self
+            .client
+            .get(self.endpoint(id, "/desktop-readiness"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser runner unavailable",
+                )
+            })?;
+        let readiness: Readiness = Self::response(response).await?;
+        if !readiness.ready {
+            return Err(AppError::new(
+                ErrorCode::DependencyUnavailable,
+                "browser desktop unavailable",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn desktop_status(&self, id: Uuid) -> Result<BrowserDesktopStatus, AppError> {
         let response = self
             .client
