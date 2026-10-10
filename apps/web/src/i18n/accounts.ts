@@ -53,13 +53,11 @@ const accounts = {
         settingsDescription: "管理项目账号、模型与 AI 配置。",
         description: "连接自有发布账号与网页测量账号，管理分组和可选网络出口。",
         connect: "接入账号",
-        settingsNote:
-          "连接自有发布账号与网页测量账号，管理分组和可选网络出口。",
         viewSetup: "项目配置",
         failed: "操作未完成",
         connected: "账号身份已验证，连接已保存。",
         connectionSection: "账号连接",
-        connectionHelp: "选择平台并在远程页面登录。连接凭据保存在服务端。",
+        connectionHelp: "选择平台并在远程页面登录。",
         loadingPlatforms: "正在加载支持的平台",
         platform: "平台",
         measurement: "网页测量",
@@ -72,7 +70,6 @@ const accounts = {
         usernameOptional: "用户名（可选）",
         passwordOptional: "密码（可选）",
         startLogin: "启动远程登录",
-        groupsHelp: "将多个账号归在同一组。分组不改变登录或发布方式。",
         newGroup: "新建资源组",
         create: "创建",
         groupCreated: "资源组已创建。",
@@ -118,8 +115,6 @@ const accounts = {
         defaultRestored: "已恢复默认网络出口。",
         removeProxy: "移除账号代理",
         permissionDenied: "权限不足",
-        webLoginNote:
-          "网页测量账号在此登录；编码助手授权需使用单独的连接方式。",
       },
     },
   },
@@ -179,14 +174,11 @@ const accounts = {
         description:
           "Connect your publishing and web measurement accounts. Manage groups and optional network routes.",
         connect: "Connect account",
-        settingsNote:
-          "Connect your publishing and web measurement accounts. Manage groups and optional network routes.",
         viewSetup: "Project configuration",
         failed: "Operation not completed",
         connected: "Account identity verified and connection saved.",
         connectionSection: "Account connection",
-        connectionHelp:
-          "Choose a platform and sign in on the remote page. Credentials are kept on the server.",
+        connectionHelp: "Choose a platform and sign in on the remote page.",
         loadingPlatforms: "Loading supported platforms",
         platform: "Platform",
         measurement: "Web measurement",
@@ -200,8 +192,6 @@ const accounts = {
         usernameOptional: "Username (optional)",
         passwordOptional: "Password (optional)",
         startLogin: "Start remote sign-in",
-        groupsHelp:
-          "Group multiple accounts together. Groups do not change sign-in or publishing behavior.",
         newGroup: "New resource group",
         create: "Create",
         groupCreated: "Resource group created.",
@@ -249,8 +239,6 @@ const accounts = {
         defaultRestored: "Default network route restored.",
         removeProxy: "Remove account proxy",
         permissionDenied: "Access denied",
-        webLoginNote:
-          "Sign in to a web measurement account here. Coding assistant authorization uses a separate connection.",
       },
     },
   },

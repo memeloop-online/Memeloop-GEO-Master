@@ -743,6 +743,9 @@ describe("account page", () => {
     expect(screen.getByRole("link", { name: "项目配置" })).toBeInTheDocument();
     expect(screen.queryByText(/P10|P11|P16/)).toBeNull();
     expect(
+      screen.queryByText(/分组不改变|编码助手授权|连接凭据保存在服务端/),
+    ).toBeNull();
+    expect(
       screen.getByRole("button", { name: "接入账号" }),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("已接入账号")).toBeInTheDocument();
@@ -797,6 +800,11 @@ describe("account page", () => {
     expect(
       screen.getByRole("link", { name: "Project configuration" }),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        /Groups do not change|Coding assistant authorization|Credentials are kept on the server/,
+      ),
+    ).toBeNull();
     await userEvent.type(
       screen.getByRole("textbox", { name: "New resource group" }),
       "Content team",
@@ -812,6 +820,44 @@ describe("account page", () => {
       )?.body,
     ).toMatchObject({ name: "Content team" });
   });
+  it.each([
+    ["zh-CN", "资源组", "启动远程登录"],
+    ["en", "Resource group", "Start remote sign-in"],
+  ])(
+    "connects without creating or selecting a group in %s",
+    async (language, groupLabel, loginLabel) => {
+      await i18n.changeLanguage(language);
+      const { requests } = mockApi();
+      renderPage("connect");
+      expect(
+        await screen.findByRole("combobox", { name: groupLabel }),
+      ).toHaveValue("");
+      await userEvent.click(
+        await screen.findByRole("button", { name: loginLabel }),
+      );
+      await waitFor(() =>
+        expect(
+          requests.some(
+            (entry) =>
+              entry.method === "POST" &&
+              entry.path.endsWith("/channel-login-sessions"),
+          ),
+        ).toBe(true),
+      );
+      const createAccount = requests.find(
+        (entry) =>
+          entry.method === "POST" && entry.path.endsWith("/channel-accounts"),
+      );
+      expect(createAccount?.body).toMatchObject({ platform: "zhihu" });
+      expect(createAccount?.body).toHaveProperty("group_id", null);
+      expect(
+        requests.some(
+          (entry) =>
+            entry.method === "POST" && entry.path.endsWith("/channel-groups"),
+        ),
+      ).toBe(false);
+    },
+  );
 });
 
 describe("operator pool", () => {

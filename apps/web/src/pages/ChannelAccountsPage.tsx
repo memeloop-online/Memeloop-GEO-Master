@@ -637,12 +637,9 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
       ) : (
         <>
           {view === "settings" && (
-            <MessageBar intent="info">
-              <MessageBarBody>
-                {t("account.channels.settingsNote")}{" "}
-                <Link to="../setup">{t("account.channels.viewSetup")}</Link>
-              </MessageBarBody>
-            </MessageBar>
+            <p>
+              <Link to="../setup">{t("account.channels.viewSetup")}</Link>
+            </p>
           )}
           {error && (
             <ErrorState title={t("account.channels.failed")} detail={error} />
@@ -775,7 +772,6 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
               </Card>
               <Card className="channel-card">
                 <h2>{t("account.channels.group")}</h2>
-                <p>{t("account.channels.groupsHelp")}</p>
                 <div className="channel-row">
                   <Field label={t("account.channels.newGroup")}>
                     <Input
@@ -1228,11 +1224,6 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
               </Card>
             </section>
           )}
-          <MessageBar intent="info">
-            <MessageBarBody>
-              {t("account.channels.webLoginNote")}
-            </MessageBarBody>
-          </MessageBar>
         </>
       )}
     </div>
