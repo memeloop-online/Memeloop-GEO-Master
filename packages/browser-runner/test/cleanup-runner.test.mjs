@@ -522,6 +522,75 @@ test("deadline retains the session reservation until underlying work settles", a
   );
 });
 
+test("an early cleanup timer wakeup cannot report deadline expiry", async (t) => {
+  await fixture(
+    async ({ runner, state, calls }) => {
+      let now = 1_000;
+      const timers = [];
+      const cleared = [];
+      t.mock.method(performance, "now", () => now);
+      t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+        const timer = { callback, delay };
+        timers.push(timer);
+        return timer;
+      });
+      t.mock.method(globalThis, "clearTimeout", (timer) => cleared.push(timer));
+      let release;
+      state.blocked = new Promise((resolve) => (release = resolve));
+      let authorized = false;
+      const pending = runner.cleanupConversation(
+        "session",
+        input("delete"),
+        async () => {
+          authorized = true;
+          return { authorized: true };
+        },
+      );
+      let settled = false;
+      void pending.then(() => (settled = true));
+      try {
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.ok(calls.length > 0, "inspection is blocked in page.evaluate");
+        assert.equal(timers.length, 1);
+        assert.equal(timers[0].delay, 20);
+        // Exercise an early wakeup without relying on host timer precision.
+        now = 1_019.75;
+        timers[0].callback();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(settled, false);
+        assert.equal(timers.length, 2);
+        assert.equal(timers[1].delay, 1);
+        await assert.rejects(runner.close("session"), /session_busy/);
+        now = 1_020;
+        timers[1].callback();
+        const expired = await pending;
+        assert.equal(expired.status, "unknown");
+        assert.deepEqual(expired.diagnostic, {
+          stage: "deadline",
+          code: "deadline_exceeded",
+        });
+        await assert.rejects(runner.close("session"), /session_busy/);
+        await assert.rejects(
+          runner.cleanupConversation("session", input()),
+          /session_busy/,
+        );
+        release();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(authorized, false);
+        assert.equal(
+          calls.some((path) => path.endsWith("DeleteChat")),
+          false,
+        );
+        assert.ok(cleared.includes(timers[1]));
+        await runner.close("session");
+      } finally {
+        release();
+      }
+    },
+    { executionTimeoutMs: 20 },
+  );
+});
+
 test("HTTP cleanup is service authenticated and uses only fixed authorization callback", async () => {
   await fixture(async ({ runner }) => {
     const callbackRequests = [];
