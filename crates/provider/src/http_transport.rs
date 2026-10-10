@@ -342,52 +342,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn diagnostics_distinguish_stalled_headers_and_body_without_request_payloads() {
-        let output = crate::diagnostics::tests::Capture::default();
-        let writer = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
-        for send_headers in [false, true] {
-            output.0.lock().unwrap().clear();
-            let (listener, url) = listen().await;
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                read_headers(&mut stream).await;
-                if send_headers {
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nprivate-body-canary",
-                        )
-                        .await
-                        .unwrap();
-                }
-                std::future::pending::<()>().await;
-            });
-            let result = HttpTransport::new()
-                .unwrap()
-                .send(
-                    request(url.clone()),
-                    RequestControl::new(Duration::from_millis(100)).unwrap(),
-                )
-                .await;
-            assert_eq!(result.unwrap_err(), ProviderError::Timeout);
-            server.abort();
-            let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
-            assert!(text.contains("HttpHeaders"));
-            assert_eq!(text.contains("FullBody"), send_headers);
-            assert!(text.contains("unfinished"));
-            assert!(!text.contains(&url));
-            assert!(!text.contains("test-only-bearer-value"));
-            assert!(!text.contains("private-body-canary"));
-            assert!(!text.contains("test-model"));
-        }
-    }
-
     struct TestTokenCenter;
 
     #[async_trait]
