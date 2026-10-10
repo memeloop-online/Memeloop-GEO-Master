@@ -5,6 +5,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use geo_domain::{ProjectAiUsage, TenantScope};
+use geo_provider::diagnostics::{ModelPhase, ModelPhaseTimer};
 use geo_provider::{
     HttpTransport, ProviderClient, ProviderError, ResolvedToken, SecretRef, TokenCenter, Transport,
 };
@@ -87,13 +88,16 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
     ) -> Result<(ModelCompletion, i64), HostOpError> {
         // Read the authoritative store each time; saving or clearing a route
         // affects the next call without caching a decrypted credential.
-        let (config, revision) = self
+        let phase = ModelPhaseTimer::start(ModelPhase::Settings);
+        let selection = self
             .settings
             .resolve_with_revision(scope, usage)
             .await
             .map_err(|_| {
                 HostOpError::failed(HostOp::ModelComplete, "project model settings unavailable")
-            })?;
+            });
+        phase.finish(selection.is_ok());
+        let (config, revision) = selection?;
         if expected_revision.is_some_and(|expected| expected != revision) {
             return Err(HostOpError::denied(
                 HostOp::ModelComplete,
@@ -101,7 +105,8 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
             ));
         }
         let Some(config) = config else {
-            return match &self.inherited {
+            let phase = ModelPhaseTimer::start(ModelPhase::InheritedDispatch);
+            let result = match &self.inherited {
                 Some(inherited) => inherited
                     .complete(scope, request)
                     .await
@@ -111,7 +116,10 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
                     "no inherited or project model is configured",
                 )),
             };
+            phase.finish(result.is_ok());
+            return result;
         };
+        let phase = ModelPhaseTimer::start(ModelPhase::CustomDispatch);
         let token = ResolvedToken::new(config.api_key).map_err(|_| custom_unavailable())?;
         let reference =
             SecretRef::new("project-configured-model").map_err(|_| custom_unavailable())?;
@@ -125,10 +133,12 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
         let bridge = ProviderClientBridge::new(client, config.model, Duration::from_secs(60))?;
         // ProviderClientBridge's single-model allowlist rejects a worker
         // selecting any model other than the saved project configuration.
-        bridge
+        let result = bridge
             .complete(scope, request)
             .await
-            .map(|completion| (completion, revision))
+            .map(|completion| (completion, revision));
+        phase.finish(result.is_ok());
+        result
     }
 }
 
