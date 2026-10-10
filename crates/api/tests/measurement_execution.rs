@@ -553,6 +553,23 @@ async fn run_with_provider(
             .is_err()
     );
     assert_eq!(executions.lock().unwrap().len(), 1);
+    if matches!(case, Receipt::InvalidProvenance) {
+        // A malformed top-level receipt cannot establish the execution's
+        // outcome. Even the fixture's successful close is not evidence that
+        // the external measurement stopped, so retain the account lease.
+        let now = Utc::now();
+        assert!(
+            repo.reserve_account(
+                &scope,
+                account_id,
+                Uuid::new_v4(),
+                now,
+                now + Duration::minutes(5),
+            )
+            .await
+            .is_err()
+        );
+    }
     server.abort();
     Some(outcome)
 }
@@ -826,7 +843,6 @@ async fn fixtures_and_plausible_answers_without_official_search_are_missing() {
         Receipt::FutureTimestamp,
         Receipt::RunnerFixtureProofLive,
         Receipt::MissingProvenance,
-        Receipt::InvalidProvenance,
         Receipt::ForgedMarker,
         Receipt::MismatchedExecution,
     ] {
@@ -838,7 +854,6 @@ async fn fixtures_and_plausible_answers_without_official_search_are_missing() {
             Receipt::Fixture
                 | Receipt::RunnerFixtureProofLive
                 | Receipt::MissingProvenance
-                | Receipt::InvalidProvenance
                 | Receipt::ForgedMarker
                 | Receipt::MismatchedExecution
         ) {
@@ -860,4 +875,22 @@ async fn fixtures_and_plausible_answers_without_official_search_are_missing() {
     let unknown = run(Receipt::Unknown).await;
     assert_eq!(unknown.status, ChannelOutcomeStatus::Unknown);
     assert!(unknown.raw_answer.is_none());
+}
+
+#[tokio::test]
+async fn malformed_receipt_provenance_leaves_dispatched_measurement_unknown() {
+    // Unlike missing provenance (a parseable but untrusted receipt), the
+    // unknown enum value rejects the entire BrowserExecution during decoding.
+    // No trusted terminal response exists for the already dispatched request.
+    let outcome = run(Receipt::InvalidProvenance).await;
+    assert_eq!(outcome.status, ChannelOutcomeStatus::Unknown);
+    assert_eq!(
+        outcome.detail.as_deref(),
+        Some("execution unavailable: DependencyUnavailable")
+    );
+    assert!(outcome.fixture);
+    assert!(outcome.raw_answer.is_none());
+    assert!(outcome.citations.is_empty());
+    assert!(outcome.runner_evidence.is_empty());
+    assert!(outcome.connector_version.is_none());
 }
