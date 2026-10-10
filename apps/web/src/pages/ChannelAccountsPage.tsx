@@ -233,6 +233,19 @@ function errorText(error: unknown) {
     : i18n.t("account.operationFailed");
 }
 
+function LoginStarting() {
+  const { t } = useTranslation();
+  return (
+    <Card className="channel-login" aria-label={t("account.remote.title")}>
+      <h2>{t("account.remote.title")}</h2>
+      <div role="status" aria-live="polite">
+        <Spinner label={t("account.remote.launching")} />
+      </div>
+      <p>{t("account.remote.startingHelp")}</p>
+    </Card>
+  );
+}
+
 function RemoteLogin({
   sessionId,
   mode,
@@ -360,6 +373,7 @@ function RemoteLogin({
           onRetry={() => void snapshot.refetch()}
         />
       )}
+      <RemoteDesktop authorize={authorize} active={!ended && !busy} />
       {screen && (
         <>
           <div className="channel-row">
@@ -372,7 +386,6 @@ function RemoteLogin({
               <Spinner size="tiny" label={t("account.remote.checking")} />
             )}
           </div>
-          <RemoteDesktop authorize={authorize} active={!ended && !busy} />
           {screen.identity && (
             <p>
               {t("account.remote.identity", {
@@ -436,6 +449,12 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
   const [proxyPassword, setProxyPassword] = useState("");
   const [editAccountId, setEditAccountId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<string | null>(null);
+  const [loginStarting, setLoginStarting] = useState(false);
+  const loginAttempt = useRef<object | null>(null);
+  const [failedLogin, setFailedLogin] = useState<{
+    accountId?: string;
+    platform: ChannelPlatformId;
+  } | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -483,7 +502,13 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
   useEffect(() => {
     setActiveSession(null);
     setEditAccountId(null);
-  }, [tenantId, projectId]);
+    setLoginStarting(false);
+    setFailedLogin(null);
+    setBusy(false);
+    return () => {
+      loginAttempt.current = null;
+    };
+  }, [tenantId, projectId, session?.user.id, session?.operator.id]);
 
   async function run(operation: () => Promise<unknown>, success: string) {
     setBusy(true);
@@ -514,10 +539,20 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
   }
 
   async function connect(accountId?: string) {
-    if (!tenantId || !projectId) return;
+    if (
+      !tenantId ||
+      !projectId ||
+      busy ||
+      activeSession ||
+      loginAttempt.current
+    )
+      return;
     const selectedPlatform = accountId
-      ? accounts.data?.items.find((item) => item.account_id === accountId)
-          ?.platform
+      ? (accounts.data?.items.find((item) => item.account_id === accountId)
+          ?.platform ??
+        (failedLogin?.accountId === accountId
+          ? failedLogin.platform
+          : undefined))
       : platform;
     if (
       !platforms.data?.items.some(
@@ -525,11 +560,15 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
       )
     )
       return;
+    const attempt = {};
+    loginAttempt.current = attempt;
+    setLoginStarting(true);
+    setFailedLogin(null);
     setBusy(true);
     setError("");
     setNotice("");
+    let id = accountId;
     try {
-      let id = accountId;
       if (!id) {
         const created = await createChannelAccount(
           tenantId,
@@ -539,18 +578,27 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
           proxyInput(),
         );
         id = created.account_id;
+        if (loginAttempt.current !== attempt) return;
         setProxyPassword("");
         setProxyUsername("");
-        await invalidate();
+        // List refresh has its own loading/error state and must not delay login.
+        void invalidate().catch(() => {});
       }
       const login = await startChannelLogin(tenantId, projectId, id);
+      if (loginAttempt.current !== attempt) return;
       setActiveSession(login.session_id);
       setEditAccountId(null);
     } catch (cause) {
+      if (loginAttempt.current !== attempt) return;
       setProxyPassword("");
+      setFailedLogin({ accountId: id, platform: selectedPlatform! });
       setError(errorText(cause));
     } finally {
-      setBusy(false);
+      if (loginAttempt.current === attempt) {
+        loginAttempt.current = null;
+        setLoginStarting(false);
+        setBusy(false);
+      }
     }
   }
 
@@ -642,13 +690,22 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
             </p>
           )}
           {error && (
-            <ErrorState title={t("account.channels.failed")} detail={error} />
+            <ErrorState
+              title={t("account.channels.failed")}
+              detail={error}
+              onRetry={
+                failedLogin
+                  ? () => void connect(failedLogin.accountId)
+                  : undefined
+              }
+            />
           )}
           {notice && (
             <MessageBar intent="success">
               <MessageBarBody>{notice}</MessageBarBody>
             </MessageBar>
           )}
+          {loginStarting && <LoginStarting />}
           {activeSession && tenantId && projectId && (
             <RemoteLogin
               key={activeSession}
@@ -752,6 +809,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
                       appearance="primary"
                       disabled={
                         busy ||
+                        Boolean(activeSession) ||
                         !platforms.data.items.some(
                           (item) =>
                             item.id === platform && item.login_entry_available,
@@ -1283,9 +1341,24 @@ export function OperatorAccountsPage() {
   const [targetTenant, setTargetTenant] = useState("");
   const [targetProject, setTargetProject] = useState("");
   const [activeSession, setActiveSession] = useState<string | null>(null);
+  const [loginStarting, setLoginStarting] = useState(false);
+  const loginAttempt = useRef<object | null>(null);
+  const [failedLogin, setFailedLogin] = useState<{
+    accountId?: string;
+    platform: ChannelPlatformId;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  useEffect(() => {
+    setActiveSession(null);
+    setLoginStarting(false);
+    setFailedLogin(null);
+    setBusy(false);
+    return () => {
+      loginAttempt.current = null;
+    };
+  }, [session?.user.id, session?.operator.id, allowed]);
   const assignmentsKey = [
     "operator-channel-assignments",
     ...ownerKey,
@@ -1322,9 +1395,13 @@ export function OperatorAccountsPage() {
   }
 
   async function connect(accountId?: string) {
+    if (!allowed || busy || activeSession || loginAttempt.current) return;
     const selectedPlatform = accountId
-      ? accounts.data?.items.find((item) => item.account_id === accountId)
-          ?.platform
+      ? (accounts.data?.items.find((item) => item.account_id === accountId)
+          ?.platform ??
+        (failedLogin?.accountId === accountId
+          ? failedLogin.platform
+          : undefined))
       : platform;
     if (
       !platforms.data?.items.some(
@@ -1332,10 +1409,15 @@ export function OperatorAccountsPage() {
       )
     )
       return;
+    const attempt = {};
+    loginAttempt.current = attempt;
+    setLoginStarting(true);
+    setFailedLogin(null);
     setBusy(true);
     setError("");
+    setNotice("");
+    let id = accountId;
     try {
-      let id = accountId;
       if (!id) {
         const server = proxyServer.trim();
         const proxy: ProxyInput | undefined = server
@@ -1351,16 +1433,25 @@ export function OperatorAccountsPage() {
           proxy,
         );
         id = account.account_id;
-        await refresh();
+        if (loginAttempt.current !== attempt) return;
+        // List refresh has its own loading/error state and must not delay login.
+        void refresh().catch(() => {});
       }
       const login = await startPoolLogin(id);
+      if (loginAttempt.current !== attempt) return;
       setActiveSession(login.session_id);
     } catch (cause) {
+      if (loginAttempt.current !== attempt) return;
+      setFailedLogin({ accountId: id, platform: selectedPlatform! });
       setError(errorText(cause));
     } finally {
-      setProxyPassword("");
-      setProxyUsername("");
-      setBusy(false);
+      if (loginAttempt.current === attempt) {
+        loginAttempt.current = null;
+        setLoginStarting(false);
+        setProxyPassword("");
+        setProxyUsername("");
+        setBusy(false);
+      }
     }
   }
 
@@ -1397,12 +1488,21 @@ export function OperatorAccountsPage() {
           ) && <Link to="/ops/appearance">{t("appearance.title")}</Link>}
         </div>
       </section>
-      {error && <ErrorState title="操作未完成" detail={error} />}
+      {error && (
+        <ErrorState
+          title={t("account.channels.failed")}
+          detail={error}
+          onRetry={
+            failedLogin ? () => void connect(failedLogin.accountId) : undefined
+          }
+        />
+      )}
       {notice && (
         <MessageBar intent="success">
           <MessageBarBody>{notice}</MessageBarBody>
         </MessageBar>
       )}
+      {loginStarting && <LoginStarting />}
       {activeSession && (
         <RemoteLogin
           key={activeSession}

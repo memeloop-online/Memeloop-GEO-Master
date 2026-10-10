@@ -255,6 +255,7 @@ function mockApi({
   itemList = items,
   editStatus = 201,
   executionsStatus = 200,
+  executionsDeferred,
   role = "member",
   manifestStatus = 200,
   resumeStatus = 202,
@@ -274,6 +275,7 @@ function mockApi({
   itemList?: ContentItem[];
   editStatus?: number;
   executionsStatus?: number;
+  executionsDeferred?: Promise<void>;
   role?: "member" | "viewer";
   manifestStatus?: number;
   resumeStatus?: number;
@@ -345,14 +347,16 @@ function mockApi({
                 503,
               ),
         );
-      return Promise.resolve(
+      const respond = () =>
         json(
           executionsStatus === 200
             ? persistedExecutions
             : { message: "执行账本不可用" },
           executionsStatus,
-        ),
-      );
+        );
+      return executionsDeferred
+        ? executionsDeferred.then(respond)
+        : Promise.resolve(respond());
     }
     if (path.endsWith("/document-executions/execution-1/resume"))
       return Promise.resolve(
@@ -738,12 +742,33 @@ describe("P08 content assets", () => {
   });
 
   it("cancels uncompleted branches and refreshes the persisted state", async () => {
+    let releaseExecutions!: () => void;
+    const executionsDeferred = new Promise<void>((resolve) => {
+      releaseExecutions = resolve;
+    });
     const requests = mockApi({
       executionList: [{ ...execution, status: "running" }],
+      executionsDeferred,
     });
     renderPage("/app/tenant-1/project-1/content");
+    await waitFor(() =>
+      expect(
+        requests.mock.calls.some(
+          ([url, init]) =>
+            String(url).includes("/cycles/cycle-1/document-executions") &&
+            init?.method === "GET",
+        ),
+      ).toBe(true),
+    );
+    expect(
+      screen.queryByRole("button", { name: "取消未完成分支" }),
+    ).not.toBeInTheDocument();
+    await act(async () => releaseExecutions());
+    // Wait for the persisted state, rather than repeatedly computing every
+    // button's accessible name while auth/cycle/manifest queries settle.
+    expect(await screen.findByText(/执行：running/)).toBeInTheDocument();
     await userEvent.click(
-      await screen.findByRole("button", { name: "取消未完成分支" }),
+      screen.getByRole("button", { name: "取消未完成分支" }),
     );
     expect(await screen.findByText(/取消结果已持久化/)).toBeInTheDocument();
     expect(

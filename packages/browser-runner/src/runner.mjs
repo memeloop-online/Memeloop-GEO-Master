@@ -360,7 +360,13 @@ export function createRunner(options = {}) {
         lastTouched: clock(),
       };
       sessions.set(input.session_id, record);
-      return { session_id: input.session_id, phase: await phase(record) };
+      // A new desktop is useful before account discovery finishes. Identity
+      // remains unverified until status/completion; restored sessions still
+      // perform their existing identity probe.
+      return {
+        session_id: input.session_id,
+        phase: desktopSession ? "login_required" : await phase(record),
+      };
     } catch (error) {
       if (desktopSession) await desktopSession.close();
       else if (context) await context.close();
