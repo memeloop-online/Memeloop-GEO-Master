@@ -65,6 +65,14 @@ async fn pool_fixture(
     role: Role,
     membership_matches_configured_pool: bool,
 ) -> (Router, String, String, String) {
+    pool_fixture_with_browser(role, membership_matches_configured_pool, None).await
+}
+
+async fn pool_fixture_with_browser(
+    role: Role,
+    membership_matches_configured_pool: bool,
+    browser: Option<BrowserBridge>,
+) -> (Router, String, String, String) {
     let auth = Arc::new(MemoryAuthRepository::development_with_password(
         "channel-test",
     ));
@@ -82,6 +90,13 @@ async fn pool_fixture(
     } else {
         Uuid::new_v4()
     };
+    let service =
+        ChannelService::development().with_operator_pool_tenant_id(configured_pool.into());
+    let service = if let Some(browser) = browser {
+        service.with_browser(browser)
+    } else {
+        service
+    };
     let state = AppState::with_stores_and_auth_and_projects(
         Arc::new(MemoryOperationStore::default()),
         Arc::new(MemoryIdempotencyStore::default()),
@@ -90,9 +105,7 @@ async fn pool_fixture(
         EventBus::default(),
         false,
     )
-    .with_channel_service(
-        ChannelService::development().with_operator_pool_tenant_id(configured_pool.into()),
-    );
+    .with_channel_service(service);
     let customer = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
     let project = state
         .project_repository()
@@ -179,7 +192,7 @@ async fn desktop_authorization_is_same_origin_and_cookie_session_bound() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let ready = Arc::new(AtomicBool::new(true));
-    let status_ready = ready.clone();
+    let transport_ready = ready.clone();
     let runner = Router::new()
         .route(
             "/v1/sessions",
@@ -188,12 +201,13 @@ async fn desktop_authorization_is_same_origin_and_cookie_session_bound() {
             }),
         )
         .route(
-            "/v1/sessions/{id}/status",
-            get(move || {
-                let ready = status_ready.clone();
+            "/v1/sessions/{id}/desktop-readiness",
+            get(move |headers: axum::http::HeaderMap| {
+                let ready = transport_ready.clone();
                 async move {
+                    assert_eq!(headers["authorization"], "Bearer runner-fixture-token");
                     if ready.load(Ordering::SeqCst) {
-                        (StatusCode::OK, Json(json!({"phase": "login_required"})))
+                        (StatusCode::OK, Json(json!({"ready": true})))
                     } else {
                         (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -371,6 +385,122 @@ async fn desktop_authorization_is_same_origin_and_cookie_session_bound() {
         .await
         .unwrap();
     assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    task.abort();
+}
+
+#[tokio::test]
+async fn pool_desktop_authorization_checks_transport_not_identity() {
+    use axum::{
+        Json,
+        routing::{get, post},
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let ready = Arc::new(AtomicBool::new(true));
+    let transport_ready = ready.clone();
+    let runner = Router::new()
+        .route(
+            "/v1/sessions",
+            post(|Json(input): Json<Value>| async move {
+                Json(json!({"session_id": input["session_id"]}))
+            }),
+        )
+        // No status route: authorization must never perform identity discovery.
+        .route(
+            "/v1/sessions/{id}/desktop-readiness",
+            get(move |headers: axum::http::HeaderMap| {
+                let ready = transport_ready.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer runner-fixture-token");
+                    if ready.load(Ordering::SeqCst) {
+                        (StatusCode::OK, Json(json!({"ready": true})))
+                    } else {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "unavailable"})),
+                        )
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, runner).await.unwrap() });
+    let (app, _, cookie, csrf) = pool_fixture_with_browser(
+        Role::ResourceAdmin,
+        true,
+        Some(
+            BrowserBridge::new(format!("http://{address}"), "runner-fixture-token".into()).unwrap(),
+        ),
+    )
+    .await;
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/v1/operator/channel-accounts",
+            Some(&cookie),
+            Some(&csrf),
+            json!({"platform": "zhihu"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let account = json_body(response).await;
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/v1/operator/channel-login-sessions",
+            Some(&cookie),
+            Some(&csrf),
+            json!({"account_id": account["account_id"]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let started = json_body(response).await;
+    let path = format!(
+        "/api/v1/operator/channel-login-sessions/{}/desktop-authorization",
+        started["session_id"].as_str().unwrap()
+    );
+    let authorize = |origin: &str| {
+        let mut req = request("POST", &path, Some(&cookie), Some(&csrf), String::new());
+        req.headers_mut().insert("origin", origin.parse().unwrap());
+        req
+    };
+    let response = app
+        .clone()
+        .oneshot(authorize("http://localhost:5173"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .clone()
+        .oneshot(authorize("http://localhost:8080"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt = json_body(response).await;
+    assert!(
+        receipt["protocol"]
+            .as_str()
+            .unwrap()
+            .starts_with("geo-desktop.")
+    );
+    assert_eq!(
+        receipt["websocket_path"],
+        format!(
+            "/api/v1/operator/channel-login-sessions/{}/desktop",
+            started["session_id"].as_str().unwrap()
+        )
+    );
+    ready.store(false, Ordering::SeqCst);
+    let response = app
+        .oneshot(authorize("http://localhost:8080"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     task.abort();
 }
 

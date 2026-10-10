@@ -433,6 +433,351 @@ describe("channel API scope", () => {
 });
 
 describe("account page", () => {
+  it.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])(
+    "ignores a late start response after unmount (operator=%s, rejected=%s)",
+    async (operator, rejected) => {
+      const { fetchMock, requests } = mockApi([], operator);
+      const original = fetchMock.getMockImplementation()!;
+      let resolveStart!: (value: Response) => void;
+      let rejectStart!: (reason: Error) => void;
+      const start = new Promise<Response>((resolve, reject) => {
+        resolveStart = resolve;
+        rejectStart = reject;
+      });
+      let startCount = 0;
+      fetchMock.mockImplementation((request, init) => {
+        if (
+          new URL(String(request), "http://localhost").pathname.endsWith(
+            "/channel-login-sessions",
+          ) &&
+          init?.method === "POST"
+        ) {
+          startCount++;
+          return start;
+        }
+        return original(request, init);
+      });
+      const view = operator ? renderOperator() : renderPage("connect");
+      await userEvent.click(
+        await screen.findByRole("button", {
+          name: operator ? "创建并登录总部账号" : "启动远程登录",
+        }),
+      );
+      await waitFor(() => expect(startCount).toBe(1));
+      expect(screen.getByText("正在启动远程浏览器")).toBeVisible();
+      view.unmount();
+      await act(async () => {
+        if (rejected) rejectStart(new Error("Sign-in temporarily unavailable"));
+        else
+          resolveStart(
+            response({
+              session_id: "login-1",
+              account_id: "account-1",
+              phase: "login_required",
+            }),
+          );
+      });
+      expect(desktopConnections).toHaveLength(0);
+      expect(
+        requests.filter((request) =>
+          request.path.includes("/channel-login-sessions/login-1"),
+        ),
+      ).toHaveLength(0);
+      expect(screen.queryByLabelText("远程登录")).toBeNull();
+    },
+  );
+
+  it.each([
+    [false, "close"],
+    [false, "unmount"],
+    [true, "close"],
+    [true, "unmount"],
+  ] as const)(
+    "mounts the desktop after initial status failure and cleans up on %s/%s",
+    async (operator, cleanup) => {
+      const { fetchMock, requests } = mockApi([], operator);
+      const original = fetchMock.getMockImplementation()!;
+      let resolveAuthorization!: (value: Response) => void;
+      const authorization = new Promise<Response>((resolve) => {
+        resolveAuthorization = resolve;
+      });
+      let authorizationCount = 0;
+      fetchMock.mockImplementation((request, init) => {
+        const path = new URL(String(request), "http://localhost").pathname;
+        if (path.endsWith("/channel-login-sessions/login-1/status"))
+          return Promise.resolve(
+            response(
+              {
+                code: "unavailable",
+                message: "Status temporarily unavailable",
+              },
+              503,
+            ),
+          );
+        if (
+          path.endsWith("/channel-login-sessions/login-1/desktop-authorization")
+        ) {
+          authorizationCount++;
+          return authorization;
+        }
+        return original(request, init);
+      });
+      const view = operator ? renderOperator() : renderPage("connect");
+      await userEvent.click(
+        await screen.findByRole("button", {
+          name: operator ? "创建并登录总部账号" : "启动远程登录",
+        }),
+      );
+      expect(
+        await screen.findByText("Status temporarily unavailable"),
+      ).toBeVisible();
+      await waitFor(() => expect(authorizationCount).toBe(1));
+      expect(desktopConnections).toHaveLength(0);
+      await act(async () =>
+        resolveAuthorization(
+          response({
+            websocket_path: `/api/v1/${operator ? "operator/" : ""}channel-login-sessions/login-1/desktop`,
+            protocol: "geo-desktop.test-grant",
+          }),
+        ),
+      );
+      await waitFor(() => expect(desktopConnections).toHaveLength(1));
+      const connection = desktopConnections[0];
+      act(() => connection.emit("connect"));
+      expect(screen.getByText("Status temporarily unavailable")).toBeVisible();
+      expect(screen.getByRole("button", { name: "重试" })).toBeEnabled();
+      expect(connection.disconnect).not.toHaveBeenCalled();
+      if (cleanup === "close") {
+        await userEvent.click(
+          screen.getByRole("button", { name: "取消并关闭" }),
+        );
+        await waitFor(() =>
+          expect(screen.queryByLabelText("远程登录")).toBeNull(),
+        );
+      } else view.unmount();
+      expect(connection.disconnect).toHaveBeenCalledTimes(1);
+      expect(authorizationCount).toBe(1);
+      expect(
+        requests.filter(
+          (request) =>
+            request.path.endsWith("/channel-login-sessions/login-1") &&
+            request.method === "DELETE",
+        ),
+      ).toHaveLength(cleanup === "close" ? 1 : 0);
+    },
+  );
+
+  it.each([false, true])(
+    "does not start login after leaving a pending account creation (operator=%s)",
+    async (operator) => {
+      const { fetchMock, requests } = mockApi([], operator);
+      const original = fetchMock.getMockImplementation()!;
+      let resolveCreate!: (value: Response) => void;
+      const creation = new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      });
+      fetchMock.mockImplementation((request, init) => {
+        if (
+          new URL(String(request), "http://localhost").pathname.endsWith(
+            "/channel-accounts",
+          ) &&
+          init?.method === "POST"
+        )
+          return creation;
+        return original(request, init);
+      });
+      const view = operator ? renderOperator() : renderPage("connect");
+      await userEvent.click(
+        await screen.findByRole("button", {
+          name: operator ? "创建并登录总部账号" : "启动远程登录",
+        }),
+      );
+      expect(screen.getByText("正在启动远程浏览器")).toBeVisible();
+      view.unmount();
+      await act(async () => resolveCreate(response(account)));
+      expect(
+        requests.some(
+          (request) =>
+            request.path.endsWith("/channel-login-sessions") &&
+            request.method === "POST",
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it.each([false, true])(
+    "connects the desktop while the first identity status is still pending (operator=%s)",
+    async (operator) => {
+      const { fetchMock } = mockApi([], operator);
+      const original = fetchMock.getMockImplementation()!;
+      let resolveStatus!: (value: Response) => void;
+      const status = new Promise<Response>((resolve) => {
+        resolveStatus = resolve;
+      });
+      fetchMock.mockImplementation((request, init) => {
+        if (String(request).includes("/channel-login-sessions/login-1/status"))
+          return status;
+        return original(request, init);
+      });
+      operator ? renderOperator() : renderPage("connect");
+      await userEvent.click(
+        await screen.findByRole("button", {
+          name: operator ? "创建并登录总部账号" : "启动远程登录",
+        }),
+      );
+      await waitFor(() => expect(desktopConnections).toHaveLength(1));
+      expect(screen.getByText("正在启动远程浏览器")).toBeVisible();
+      await act(async () => resolveStatus(response(snapshot)));
+    },
+  );
+
+  it.each([false, true])(
+    "shows sign-in preparation before create/start resolve without waiting for list refresh (operator=%s)",
+    async (operator) => {
+      await i18n.changeLanguage("en");
+      const { fetchMock } = mockApi([], operator);
+      const original = fetchMock.getMockImplementation()!;
+      let resolveCreate!: (value: Response) => void;
+      let resolveStart!: (value: Response) => void;
+      let resolveRefresh!: (value: Response) => void;
+      const create = new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      });
+      const start = new Promise<Response>((resolve) => {
+        resolveStart = resolve;
+      });
+      const refresh = new Promise<Response>((resolve) => {
+        resolveRefresh = resolve;
+      });
+      let creating = false;
+      let createCount = 0;
+      let startCount = 0;
+      let refreshCount = 0;
+      fetchMock.mockImplementation((request, init) => {
+        const path = new URL(String(request), "http://localhost").pathname;
+        if (path.endsWith("/channel-accounts") && init?.method === "POST") {
+          creating = true;
+          createCount++;
+          return create;
+        }
+        if (
+          path.endsWith("/channel-accounts") &&
+          creating &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          refreshCount++;
+          return refresh;
+        }
+        if (
+          path.endsWith("/channel-login-sessions") &&
+          init?.method === "POST"
+        ) {
+          startCount++;
+          return start;
+        }
+        return original(request, init);
+      });
+      operator ? renderOperator() : renderPage("connect");
+      const button = await screen.findByRole("button", {
+        name: operator ? "创建并登录总部账号" : "Start remote sign-in",
+      });
+      await userEvent.click(button);
+      const pending = screen.getByLabelText("Remote sign-in");
+      expect(
+        within(pending).getByText("Starting remote browser"),
+      ).toBeVisible();
+      expect(
+        within(pending).getByText(/Your sign-in page will appear here/),
+      ).toBeVisible();
+      expect(within(pending).queryByRole("button")).toBeNull();
+      expect(button).toBeDisabled();
+      await userEvent.click(button);
+      expect(createCount).toBe(1);
+      expect(startCount).toBe(0);
+      await act(async () =>
+        resolveCreate(response({ ...account, status: "needs_login" })),
+      );
+      await waitFor(() => expect(startCount).toBe(1));
+      expect(refreshCount).toBeGreaterThan(0);
+      expect(screen.getByText("Starting remote browser")).toBeVisible();
+      expect(desktopConnections).toHaveLength(0);
+      await act(async () =>
+        resolveStart(
+          response({
+            session_id: "login-1",
+            account_id: "account-1",
+            phase: "login_required",
+          }),
+        ),
+      );
+      expect(
+        await screen.findByRole("button", { name: "Cancel and close" }),
+      ).toBeVisible();
+      expect(button).toBeDisabled();
+      await act(async () => resolveRefresh(response({ items: [account] })));
+    },
+  );
+
+  it.each([
+    [false, "create"],
+    [false, "start"],
+    [true, "create"],
+    [true, "start"],
+  ] as const)(
+    "clears preparation and retries a failed %s/%s without recreating saved accounts",
+    async (operator, failure) => {
+      const { fetchMock } = mockApi([], operator);
+      const original = fetchMock.getMockImplementation()!;
+      let rejectPending!: (reason: Error) => void;
+      const pending = new Promise<Response>((_, reject) => {
+        rejectPending = reject;
+      });
+      let createCount = 0;
+      let startCount = 0;
+      fetchMock.mockImplementation((request, init) => {
+        const path = new URL(String(request), "http://localhost").pathname;
+        if (path.endsWith("/channel-accounts") && init?.method === "POST") {
+          createCount++;
+          if (failure === "create" && createCount === 1) return pending;
+        }
+        if (
+          path.endsWith("/channel-login-sessions") &&
+          init?.method === "POST"
+        ) {
+          startCount++;
+          if (failure === "start" && startCount === 1) return pending;
+        }
+        return original(request, init);
+      });
+      operator ? renderOperator() : renderPage("connect");
+      const button = await screen.findByRole("button", {
+        name: operator ? "创建并登录总部账号" : "启动远程登录",
+      });
+      await userEvent.click(button);
+      if (failure === "start") await waitFor(() => expect(startCount).toBe(1));
+      expect(screen.getByText("正在启动远程浏览器")).toBeVisible();
+      await act(async () =>
+        rejectPending(new Error("Sign-in temporarily unavailable")),
+      );
+      expect(
+        await screen.findByText("Sign-in temporarily unavailable"),
+      ).toBeVisible();
+      expect(screen.queryByLabelText("远程登录")).toBeNull();
+      expect(button).toBeEnabled();
+      await userEvent.click(screen.getByRole("button", { name: "重试" }));
+      expect(
+        await screen.findByRole("button", { name: "取消并关闭" }),
+      ).toBeVisible();
+      expect(createCount).toBe(failure === "create" ? 2 : 1);
+      expect(startCount).toBe(failure === "start" ? 2 : 1);
+    },
+  );
+
   it("does not label a stored ready account connected when verification is unsupported", async () => {
     mockApi(
       [{ ...account, platform: "deepseek", status: "ready" }],

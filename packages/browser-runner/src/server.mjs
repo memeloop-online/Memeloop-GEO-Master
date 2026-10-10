@@ -257,6 +257,17 @@ export function createRunnerServer({
         parts.length === 4 &&
         parts[0] === "v1" &&
         parts[1] === "sessions" &&
+        parts[3] === "desktop-readiness" &&
+        request.method === "GET"
+      ) {
+        // Reuse the relay's lifecycle checks without identity discovery or
+        // exposing the private transport endpoint.
+        runner.desktopEndpoint(parts[2]);
+        send(response, 200, { ready: true });
+      } else if (
+        parts.length === 4 &&
+        parts[0] === "v1" &&
+        parts[1] === "sessions" &&
         parts[3] === "status" &&
         request.method === "GET"
       ) {
