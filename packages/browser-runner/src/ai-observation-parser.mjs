@@ -110,11 +110,11 @@ export function observationDocument(exchange, renderedText) {
   };
 }
 
-function captureRecord(document, receivedAt, exchange) {
+function captureRecord(document, receivedAt, exchange, provider) {
   const source_json = JSON.stringify(document);
   if (Buffer.byteLength(source_json, "utf8") > MAX_INPUT_BYTES)
     throw new Error("observation_input_too_large");
-  const completion = capturedConversationCompletion(exchange);
+  const completion = capturedConversationCompletion(exchange, { provider });
   return {
     kind: "observation_capture",
     schema_version: "geo.observation.capture.v1",
@@ -137,12 +137,13 @@ export class ObservationPersistenceError extends Error {
 }
 
 /** Raw extraction transport is evidence even when no JSON candidate exists. */
-export function extractionCaptureRecord(exchange) {
+export function extractionCaptureRecord(exchange, { provider } = {}) {
   return {
     ...captureRecord(
       observationDocument(exchange),
       exchange?.received_at,
       exchange,
+      provider,
     ),
     phase: "extraction",
     route: "signed_in_browser",
@@ -334,6 +335,7 @@ async function boundedRoute(invoke, { signal, deadlineAt, timeoutMs }) {
 export async function interpretObservation(
   exchange,
   {
+    provider,
     renderedText,
     browserExtract,
     apiExtract,
@@ -369,7 +371,12 @@ export async function interpretObservation(
   let sourceEvidence;
   try {
     document = observationDocument(exchange, renderedText);
-    sourceEvidence = captureRecord(document, exchange?.received_at, exchange);
+    sourceEvidence = captureRecord(
+      document,
+      exchange?.received_at,
+      exchange,
+      provider,
+    );
     prompt = extractionPrompt(document);
   } catch {
     reportObservationDiagnostic(

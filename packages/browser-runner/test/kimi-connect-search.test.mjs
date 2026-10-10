@@ -735,6 +735,7 @@ test("browser UI submits exactly once and its captured framed request creates v2
       trustedOrigin: origin,
       timeoutMs: 5_000,
       interpret: async (captured, context) => {
+        assert.equal(context.provider, "kimi");
         const found = reduceKimiConnectExchange(captured, context);
         return {
           raw_answer: found.raw_answer,

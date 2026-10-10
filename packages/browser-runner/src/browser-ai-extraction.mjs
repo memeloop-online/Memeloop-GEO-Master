@@ -160,10 +160,13 @@ export async function extractWithSignedInBrowser(
           exchange,
           "extraction",
           onConversationCaptured,
+          { provider: "kimi" },
         );
         if (onEvidence) {
           try {
-            await onEvidence(extractionCaptureRecord(exchange));
+            await onEvidence(
+              extractionCaptureRecord(exchange, { provider: "kimi" }),
+            );
           } catch {
             throw new ObservationPersistenceError();
           }
