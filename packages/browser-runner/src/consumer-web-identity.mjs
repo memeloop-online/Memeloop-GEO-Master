@@ -22,6 +22,9 @@ const probes = Object.freeze({
     path: "/passport/account/info/v2/?aid=497858&account_sdk_source=web&sdk_version=2.2.11-doubao.0&device_platform=web",
     headers: { "Agw-Js-Conv": "str" },
     credential: "session",
+    // The website SDK may append these signatures to its own fetch. Never
+    // copy their values, construct signatures, or accept changed base params.
+    signedQueryParameters: ["msToken", "a_bogus"],
   },
 });
 
@@ -103,9 +106,40 @@ async function probeAccount(page, provider, trustedOrigin) {
           signal: AbortSignal.timeout(10_000),
           headers,
         });
+        const matchesResponseUrl = () => {
+          const expected = `${origin}${spec.path}`;
+          if (!spec.signedQueryParameters) return response.url === expected;
+          try {
+            const actual = new URL(response.url);
+            const target = new URL(expected);
+            if (
+              actual.origin !== target.origin ||
+              actual.pathname !== target.pathname ||
+              actual.username ||
+              actual.password ||
+              response.url.includes("#")
+            )
+              return false;
+            for (const [key, value] of target.searchParams) {
+              const values = actual.searchParams.getAll(key);
+              if (values.length !== 1 || values[0] !== value) return false;
+            }
+            for (const key of actual.searchParams.keys()) {
+              if (actual.searchParams.getAll(key).length !== 1) return false;
+              if (
+                !target.searchParams.has(key) &&
+                !spec.signedQueryParameters.includes(key)
+              )
+                return false;
+            }
+            return true;
+          } catch {
+            return false;
+          }
+        };
         if (
           response.status !== 200 ||
-          response.url !== `${origin}${spec.path}` ||
+          !matchesResponseUrl() ||
           !/^application\/json(?:\s*;|$)/i.test(
             response.headers.get("content-type") ?? "",
           )
