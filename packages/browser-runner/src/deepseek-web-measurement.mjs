@@ -233,6 +233,8 @@ export async function captureDeepSeekExchange(
     timeoutMs > 120_000
   )
     return null;
+  // Preserve the same frozen request identity throughout asynchronous recovery.
+  binding = { ...binding };
   let decoder;
   try {
     if (new URL(page.url()).origin !== DEEPSEEK_WEB_ORIGIN) return null;
@@ -248,9 +250,14 @@ export async function captureDeepSeekExchange(
   let timer;
   let settled = false;
   let requestId;
+  let requestAt;
+  let submitted = false;
   let responseSeen = false;
+  let responseCharset = "";
   let streamReady = false;
   let networkEnded = false;
+  let completedBeforeAttachment = false;
+  let bodyReadStarted = false;
   let queuedBytes = 0;
   let consumedBytes = 0;
   const queued = [];
@@ -291,30 +298,86 @@ export async function captureDeepSeekExchange(
       settle();
     }
   };
+  const recoverCompletedBody = () => {
+    if (
+      settled ||
+      bodyReadStarted ||
+      !completedBeforeAttachment ||
+      !networkEnded ||
+      !responseSeen
+    )
+      return;
+    // No second request and no concatenation with a partially streamed body.
+    // Chromium's resource/session buffers were bounded before submission.
+    bodyReadStarted = true;
+    queued.length = 0;
+    session.send("Network.getResponseBody", { requestId }).then((response) => {
+      if (settled) return;
+      try {
+        if (
+          !object(response) ||
+          typeof response.body !== "string" ||
+          typeof response.base64Encoded !== "boolean" ||
+          consumedBytes !== 0
+        )
+          fail();
+        if (response.base64Encoded) {
+          feed(response.body);
+        } else {
+          // CDP has already decoded textual bodies. Require explicit UTF-8;
+          // default/other charsets can silently change the source text.
+          // Reject replacement/surrogate text instead of inventing bytes.
+          if (
+            response.body.length > maxBytes ||
+            !response.body.isWellFormed() ||
+            response.body.includes("\uFFFD") ||
+            !["utf-8", "utf8"].includes(responseCharset) ||
+            Buffer.byteLength(response.body, "utf8") > maxBytes
+          )
+            fail();
+          decoder.push(Buffer.from(response.body, "utf8"));
+        }
+        streamReady = true;
+        finish();
+      } catch {
+        settle();
+      }
+    }, abort);
+  };
   const onRequest = (event) => {
     if (settled || event.request?.url !== COMPLETION) return;
     if (
       requestId ||
+      !submitted ||
       event.redirectResponse ||
+      typeof event.requestId !== "string" ||
+      !event.requestId ||
+      !Number.isFinite(event.timestamp) ||
       !matchesDeepSeekSubmission(event.request, binding)
     )
       return settle();
     requestId = event.requestId;
+    requestAt = event.timestamp;
   };
   const onResponse = (event) => {
     if (settled || event.requestId !== requestId) return;
     const response = event.response;
     if (
       responseSeen ||
+      !Number.isFinite(event.timestamp) ||
+      event.timestamp < requestAt ||
       response?.url !== COMPLETION ||
       response.status !== 200 ||
       !/^text\/event-stream(?:\s*;|$)/iu.test(response.mimeType ?? "")
     )
       return settle();
     responseSeen = true;
-    session
-      .send("Network.streamResourceContent", { requestId })
-      .then(({ bufferedData }) => {
+    responseCharset =
+      typeof response.charset === "string"
+        ? response.charset.toLowerCase()
+        : "";
+    session.send("Network.streamResourceContent", { requestId }).then(
+      ({ bufferedData }) => {
         if (settled) return;
         try {
           feed(bufferedData);
@@ -325,7 +388,20 @@ export async function captureDeepSeekExchange(
         } catch {
           settle();
         }
-      }, abort);
+      },
+      (error) => {
+        if (settled) return;
+        // Other protocol errors (unsupported command, detached session, etc.)
+        // do not authorize recovering a different or still-running resource.
+        if (
+          typeof error?.message !== "string" ||
+          !error.message.includes("already finished loading")
+        )
+          return settle();
+        completedBeforeAttachment = true;
+        recoverCompletedBody();
+      },
+    );
   };
   const onData = (event) => {
     if (settled || event.requestId !== requestId || event.data === undefined)
@@ -343,8 +419,19 @@ export async function captureDeepSeekExchange(
     }
   };
   const onFinished = (event) => {
-    if (event.requestId !== requestId) return;
+    if (settled || event.requestId !== requestId) return;
+    if (
+      !responseSeen ||
+      networkEnded ||
+      !Number.isFinite(event.timestamp) ||
+      // CDP responseReceived can be timestamped after the network's actual
+      // finish (notably an intercepted fast reply). Both must follow this
+      // request; event delivery order is checked separately by responseSeen.
+      event.timestamp < requestAt
+    )
+      return settle();
     networkEnded = true;
+    recoverCompletedBody();
     finish();
   };
   const onFailed = (event) => {
@@ -374,12 +461,21 @@ export async function captureDeepSeekExchange(
     session = await Promise.race([opening, result]);
     if (!session || settled) return null;
     for (const [name, handler] of handlers) session.on(name, handler);
-    await Promise.race([session.send("Network.enable"), result]);
+    await Promise.race([
+      session.send("Network.enable", {
+        maxTotalBufferSize: maxBytes,
+        maxResourceBufferSize: maxBytes,
+        maxPostDataSize: 64_000,
+      }),
+      result,
+    ]);
     if (settled) return null;
     // A hanging UI callback must not prevent cancellation or the deadline.
-    const submission = Promise.resolve().then(() =>
-      settled ? undefined : submit(page, controller.signal),
-    );
+    const submission = Promise.resolve().then(() => {
+      if (settled) return;
+      submitted = true;
+      return submit(page, controller.signal);
+    });
     void submission.catch(abort);
     return await result;
   } catch {

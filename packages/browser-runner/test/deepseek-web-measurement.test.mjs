@@ -180,14 +180,44 @@ test("real Chromium captures buffered and subsequent chunks from a local streami
   }
 });
 
-test("real Chromium submits once and fails closed if an immediate response outruns CDP attachment", async () => {
+test("real Chromium recovers a completed response by its original request ID without another submission", async () => {
+  await completedBrowserRecovery(true);
+  await completedBrowserRecovery(false);
+});
+
+async function completedBrowserRecovery(declaredUtf8) {
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
   });
   let posts = 0;
+  const commands = [];
   try {
     const context = await browser.newContext();
+    const openSession = context.newCDPSession.bind(context);
+    context.newCDPSession = async (page) => {
+      const session = await openSession(page);
+      const finishedRequests = new Set();
+      let requested;
+      let release;
+      const finishedRequest = new Promise((resolve) => (release = resolve));
+      session.on("Network.loadingFinished", (event) => {
+        finishedRequests.add(event.requestId);
+        if (event.requestId === requested) release();
+      });
+      const send = session.send.bind(session);
+      session.send = async (method, args) => {
+        commands.push({ method, args });
+        if (method === "Network.streamResourceContent") {
+          // Deliberately attach after actual network EOF: real CDP produces
+          // the error, and getResponseBody must recover the same real bytes.
+          requested = args.requestId;
+          if (!finishedRequests.has(requested)) await finishedRequest;
+        }
+        return send(method, args);
+      };
+      return session;
+    };
     await context.route("**/*", async (route) => {
       if (route.request().url() === `${origin}/`) {
         await route.fulfill({
@@ -202,7 +232,12 @@ test("real Chromium submits once and fails closed if an immediate response outru
         });
       } else if (route.request().url() === endpoint) {
         posts++;
-        await route.fulfill({ contentType: "text/event-stream", body: wire });
+        await route.fulfill({
+          contentType: declaredUtf8
+            ? "text/event-stream; charset=utf-8"
+            : "text/event-stream",
+          body: wire,
+        });
       } else {
         await route.abort();
       }
@@ -215,21 +250,35 @@ test("real Chromium submits once and fails closed if an immediate response outru
       timeoutMs: 5000,
     });
     assert.equal(posts, 1);
-    // route.fulfill may finish before Network.streamResourceContent can attach.
-    // Either an exact complete capture or null is valid; never partial success
-    // and never a second submission to obtain another response.
-    if (captured !== null) {
-      assert.equal(captured.sse_terminal, true);
-      assert.deepEqual(captured.messages[1].data, {
-        p: "response",
-        o: "APPEND",
-        v: "雨水",
-      });
+    if (declaredUtf8) {
+      assert.equal(captured?.sse_terminal, true);
+      assert.deepEqual(captured.messages, decode(wire).messages);
+    } else {
+      // CDP's text body without a declared encoding may contain mojibake.
+      // Do not mislabel that decoded text as the original UTF-8 source bytes.
+      assert.equal(captured, null);
     }
+    const stream = commands.filter(
+      (item) => item.method === "Network.streamResourceContent",
+    );
+    const recovery = commands.filter(
+      (item) => item.method === "Network.getResponseBody",
+    );
+    assert.equal(stream.length, 1);
+    assert.equal(recovery.length, 1);
+    assert.equal(recovery[0].args.requestId, stream[0].args.requestId);
+    assert.deepEqual(commands[0], {
+      method: "Network.enable",
+      args: {
+        maxTotalBufferSize: 750_000,
+        maxResourceBufferSize: 750_000,
+        maxPostDataSize: 64_000,
+      },
+    });
   } finally {
     await browser.close();
   }
-});
+}
 
 test("model discovery requires current trusted page configuration without guessed defaults", async () => {
   const page = { url: () => `${origin}/` };
@@ -367,10 +416,17 @@ class Session extends EventEmitter {
   detached = 0;
   commands = [];
   prefix = "";
-  async send(method) {
+  calls = [];
+  streamError = null;
+  recoveredBody = { body: wire, base64Encoded: false };
+  async send(method, args) {
     this.commands.push(method);
-    if (method === "Network.streamResourceContent")
+    this.calls.push({ method, args });
+    if (method === "Network.streamResourceContent") {
+      if (this.streamError) throw new Error(this.streamError);
       return { bufferedData: Buffer.from(this.prefix).toString("base64") };
+    }
+    if (method === "Network.getResponseBody") return await this.recoveredBody;
     if (method !== "Network.enable")
       throw new Error("unexpected browser command");
   }
@@ -384,14 +440,22 @@ function fixture() {
     url: () => `${origin}/`,
     context: () => ({ newCDPSession: async () => session }),
   };
-  const start = (patch = {}) => {
+  const start = (patch = {}, responsePatch = {}) => {
     session.emit("Network.requestWillBeSent", {
       requestId: "request-1",
+      timestamp: 1,
       request: request(patch),
     });
     session.emit("Network.responseReceived", {
       requestId: "request-1",
-      response: { url: endpoint, status: 200, mimeType: "text/event-stream" },
+      timestamp: 2,
+      response: {
+        url: endpoint,
+        status: 200,
+        mimeType: "text/event-stream",
+        charset: "utf-8",
+        ...responsePatch,
+      },
     });
   };
   const bytes = (text) =>
@@ -399,10 +463,180 @@ function fixture() {
       requestId: "request-1",
       data: Buffer.from(text).toString("base64"),
     });
-  const end = () =>
-    session.emit("Network.loadingFinished", { requestId: "request-1" });
+  const end = (patch = {}) =>
+    session.emit("Network.loadingFinished", {
+      requestId: "request-1",
+      timestamp: 3,
+      ...patch,
+    });
   return { session, page, start, bytes, end };
 }
+
+const finishedLoading =
+  "Protocol error: Request with the provided ID has already finished loading";
+
+test("completed-body recovery waits for validated EOF and reads exactly the original request once", async () => {
+  for (const base64Encoded of [false, true]) {
+    const f = fixture();
+    f.session.streamError = finishedLoading;
+    f.session.recoveredBody = {
+      body: base64Encoded ? Buffer.from(wire).toString("base64") : wire,
+      base64Encoded,
+    };
+    let submits = 0;
+    const captured = await captureDeepSeekExchange(f.page, {
+      binding,
+      submit: async () => {
+        submits++;
+        f.start({}, base64Encoded ? { charset: "" } : {});
+        await Promise.resolve();
+        assert.equal(
+          f.session.commands.includes("Network.getResponseBody"),
+          false,
+        );
+        f.end({ requestId: "unrelated" });
+        assert.equal(
+          f.session.commands.includes("Network.getResponseBody"),
+          false,
+        );
+        f.end();
+      },
+    });
+    assert.equal(submits, 1);
+    assert.deepEqual(captured.messages, decode(wire).messages);
+    assert.deepEqual(
+      f.session.calls.filter(
+        (call) => call.method === "Network.getResponseBody",
+      ),
+      [{ method: "Network.getResponseBody", args: { requestId: "request-1" } }],
+    );
+    assert.equal(f.session.detached, 1);
+  }
+});
+
+test("recovery rejects truncated, oversized, lossy or invalid bodies and non-terminal failures", async () => {
+  for (const scenario of [
+    "truncated",
+    "oversized",
+    "invalid-base64",
+    "invalid-utf8",
+    "lossy",
+    "surrogate",
+    "wrong-model",
+    "wrong-type",
+    "unknown-charset",
+    "other-charset",
+    "bad-time",
+    "failed",
+    "other-error",
+    "missing-eof",
+  ]) {
+    const f = fixture();
+    const controller = new AbortController();
+    f.session.streamError =
+      scenario === "other-error" ? "Method not found" : finishedLoading;
+    const replacements = {
+      truncated: { body: ready + delta, base64Encoded: false },
+      oversized: { body: wire + "x".repeat(1000), base64Encoded: false },
+      "invalid-base64": { body: "?!", base64Encoded: true },
+      "invalid-utf8": {
+        body: Buffer.from([255]).toString("base64"),
+        base64Encoded: true,
+      },
+      lossy: { body: wire.replace("雨水", "\uFFFD"), base64Encoded: false },
+      surrogate: { body: wire.replace("雨水", "\uD800"), base64Encoded: false },
+      "wrong-model": {
+        body: wire.replace("observed-model", "wrong-model"),
+        base64Encoded: false,
+      },
+      "wrong-type": { body: wire, base64Encoded: "false" },
+    };
+    if (replacements[scenario])
+      f.session.recoveredBody = replacements[scenario];
+    const captured = await captureDeepSeekExchange(f.page, {
+      binding,
+      signal: controller.signal,
+      maxBytes: 1000,
+      submit: async () => {
+        f.start(
+          {},
+          scenario === "unknown-charset"
+            ? { charset: "" }
+            : scenario === "other-charset"
+              ? { charset: "utf-16le" }
+              : {},
+        );
+        if (scenario === "failed") {
+          f.session.emit("Network.loadingFailed", { requestId: "request-1" });
+        } else if (scenario === "missing-eof") {
+          await Promise.resolve();
+          controller.abort();
+        } else {
+          f.end(scenario === "bad-time" ? { timestamp: 0 } : {});
+        }
+      },
+    });
+    assert.equal(captured, null, scenario);
+    if (["bad-time", "failed", "other-error", "missing-eof"].includes(scenario))
+      assert.equal(
+        f.session.commands.includes("Network.getResponseBody"),
+        false,
+        scenario,
+      );
+    assert.equal(f.session.detached, 1);
+  }
+});
+
+test("cancellation or a competing submission invalidates an in-flight body recovery", async () => {
+  for (const scenario of ["cancel", "duplicate", "timeout", "body-error"]) {
+    const f = fixture();
+    const controller = new AbortController();
+    f.session.streamError = finishedLoading;
+    let release;
+    f.session.recoveredBody = new Promise((resolve) => (release = resolve));
+    const send = f.session.send.bind(f.session);
+    f.session.send = async (method, args) => {
+      const pending = send(method, args);
+      if (method === "Network.getResponseBody") {
+        if (scenario === "cancel") controller.abort();
+        if (scenario === "duplicate")
+          f.session.emit("Network.requestWillBeSent", {
+            requestId: "second",
+            timestamp: 4,
+            request: request(),
+          });
+        if (scenario === "body-error") {
+          release({ body: wire, base64Encoded: false });
+          throw new Error("resource evicted from bounded inspector cache");
+        }
+      }
+      return pending;
+    };
+    assert.equal(
+      await captureDeepSeekExchange(f.page, {
+        binding,
+        signal: controller.signal,
+        timeoutMs: 20,
+        submit: () => {
+          f.start();
+          f.end();
+        },
+      }),
+      null,
+      scenario,
+    );
+    release({ body: wire, base64Encoded: false });
+    await Promise.resolve();
+    assert.equal(
+      f.session.commands.filter(
+        (method) => method === "Network.getResponseBody",
+      ).length,
+      1,
+    );
+    assert.equal(f.session.detached, 1);
+    assert.equal(f.session.eventNames().length, 0);
+  }
+});
 
 test("capture binds browser request, orders buffered bytes before live chunks and submits once", async () => {
   const f = fixture();
