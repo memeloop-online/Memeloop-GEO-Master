@@ -1210,6 +1210,7 @@ pub(crate) async fn execute_and_close_with_cleanup(
 #[derive(Default)]
 struct ExecutionSessionContext<'a> {
     source_capture_ticket: Option<&'a str>,
+    operation_dispatched: Option<&'a mut bool>,
     renewal: Option<(
         &'a crate::channels::ChannelService,
         &'a TenantScope,
@@ -1258,6 +1259,9 @@ async fn execute_and_close_with_cleanup_and_ticket(
             service
                 .persist_browser_renewal(scope, version, &verified)
                 .await?;
+        }
+        if let Some(dispatched) = context.operation_dispatched.as_mut() {
+            **dispatched = true;
         }
         bridge
             .execute_with_source_capture_ticket(
@@ -1914,6 +1918,7 @@ async fn execute_reserved_channel_target(
     // Recheck mutable eligibility after the claim. Even a withdrawal at this
     // point must leave an honest attempted outcome, not release the one-shot.
     let mut execution_started = false;
+    let mut operation_dispatched = false;
     let resolved = async {
         // Persist the encrypted network/identity selected for this exact
         // preflight before sending. A crash cannot resume on a new account or
@@ -2069,6 +2074,7 @@ async fn execute_reserved_channel_target(
             &payload,
             ExecutionSessionContext {
                 source_capture_ticket: source_capture_ticket.as_deref(),
+                operation_dispatched: Some(&mut operation_dispatched),
                 renewal: Some((service, scope, &mut session_version)),
             },
         )
@@ -2193,7 +2199,13 @@ async fn execute_reserved_channel_target(
             }
         }
         Err(failure) => ChannelOutcome {
-            status: if failure.message.starts_with("source ")
+            // Once dispatched, a lost or invalid receipt cannot establish
+            // whether measurement finished. Closing the browser context does
+            // not establish the external outcome either. Keep the one-shot
+            // attempt unknown and its account lease until the bounded expiry.
+            status: if operation == "measure" && operation_dispatched {
+                ChannelOutcomeStatus::Unknown
+            } else if failure.message.starts_with("source ")
                 || failure.message.starts_with("generated publication ")
                 || failure.message.starts_with("connector ")
             {
@@ -2416,6 +2428,7 @@ mod tests {
                 &json!({}),
                 ExecutionSessionContext {
                     source_capture_ticket: None,
+                    operation_dispatched: None,
                     renewal: Some((&service, &scope, &mut version)),
                 },
             )

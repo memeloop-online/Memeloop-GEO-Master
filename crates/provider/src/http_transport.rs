@@ -13,6 +13,7 @@ use crate::{
 #[derive(Clone)]
 pub struct HttpTransport {
     client: Client,
+    public_only: bool,
 }
 
 impl HttpTransport {
@@ -21,7 +22,18 @@ impl HttpTransport {
             .redirect(Policy::none())
             .build()
             .map_err(|_| ProviderError::Transport("HTTP client initialization failed".into()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            public_only: false,
+        })
+    }
+
+    /// Tenant-configured destinations, distinct from operator-owned gateways.
+    pub fn public_only() -> Result<Self, ProviderError> {
+        Ok(Self {
+            public_only: true,
+            ..Self::new()?
+        })
     }
 }
 
@@ -46,8 +58,14 @@ impl Transport for HttpTransport {
             ));
         }
         let send = async {
-            let mut response = self
-                .client
+            let public_client;
+            let client = if self.public_only {
+                public_client = crate::public_endpoint_client(&url).await?;
+                &public_client
+            } else {
+                &self.client
+            };
+            let mut response = client
                 .post(url)
                 .bearer_auth(request.bearer_token())
                 .json(&request.body)
@@ -291,6 +309,25 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, ProviderError::Timeout);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn tenant_transport_rejects_loopback_before_sending_credentials() {
+        let (listener, url) = listen().await;
+        let error = HttpTransport::public_only()
+            .unwrap()
+            .send(
+                request(url),
+                RequestControl::new(Duration::from_secs(2)).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidRequest(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     struct TestTokenCenter;

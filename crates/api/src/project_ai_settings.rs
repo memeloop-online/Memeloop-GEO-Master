@@ -365,21 +365,11 @@ impl ProjectAiSettingsService {
     }
 }
 fn validate_base_url(value: &str) -> Result<(), AppError> {
-    let url = reqwest::Url::parse(value)
-        .map_err(|_| AppError::invalid_request("API base URL is invalid"))?;
-    if value.len() > 2048
-        || !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(AppError::invalid_request(
-            "API base URL must be HTTP(S) without credentials, query or fragment",
-        ));
-    }
-    Ok(())
+    geo_provider::validate_public_endpoint(value)
+        .map(|_| ())
+        .map_err(|_| AppError::invalid_request(
+            "custom API base URL must use a public HTTP(S) endpoint without credentials, query or fragment",
+        ))
 }
 async fn scope(
     state: &AppState,
@@ -519,29 +509,38 @@ async fn models(
         let config = config.ok_or_else(|| {
             AppError::capability_missing("model discovery requires custom saved configuration")
         })?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|_| diagnostic_error())?;
-        let mut response = client
-            .get(format!("{}/models", config.base_url.trim_end_matches('/')))
-            .bearer_auth(&config.api_key)
-            .send()
-            .await
-            .map_err(|_| diagnostic_error())?;
-        if !response.status().is_success() {
-            return Err(AppError::capability_missing(
-                "model discovery unavailable; enter a model manually",
-            ));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| diagnostic_error())? {
-            if bytes.len() + chunk.len() > 1024 * 1024 {
-                return Err(diagnostic_error());
+        let url = geo_provider::validate_public_endpoint(&format!(
+            "{}/models",
+            config.base_url.trim_end_matches('/')
+        ))
+        .map_err(|_| diagnostic_error())?;
+        let discovery = async {
+            let client = geo_provider::public_endpoint_client(&url)
+                .await
+                .map_err(|_| diagnostic_error())?;
+            let mut response = client
+                .get(url)
+                .bearer_auth(&config.api_key)
+                .send()
+                .await
+                .map_err(|_| diagnostic_error())?;
+            if !response.status().is_success() {
+                return Err(AppError::capability_missing(
+                    "model discovery unavailable; enter a model manually",
+                ));
             }
-            bytes.extend_from_slice(&chunk);
-        }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| diagnostic_error())? {
+                if bytes.len() + chunk.len() > 1024 * 1024 {
+                    return Err(diagnostic_error());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok::<_, AppError>(bytes)
+        };
+        let bytes = tokio::time::timeout(Duration::from_secs(15), discovery)
+            .await
+            .map_err(|_| diagnostic_error())??;
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| diagnostic_error())?;
         let entries = body.get("data").and_then(|v| v.as_array()).ok_or_else(|| {
@@ -615,7 +614,7 @@ mod tests {
             expected_revision: revision,
             mode: ProjectAiMode::Custom,
             model: Some("synthetic-model".into()),
-            base_url: Some("http://127.0.0.1:8123/v1".into()),
+            base_url: Some("https://models.example.invalid/v1".into()),
             api_key: key.map(str::to_owned),
             clear_api_key: false,
             prefer_connected_account: None,
@@ -792,11 +791,15 @@ mod tests {
             "https://user:pass@example.invalid/v1",
             "https://example.invalid/v1?key=x",
             "https://example.invalid/v1#fragment",
+            "http://127.0.0.1:8000/v1",
+            "http://169.254.169.254/v1",
+            "http://10.0.0.1/v1",
+            "http://[::ffff:127.0.0.1]/v1",
         ] {
             let mut input = custom(0, Some("synthetic-secret"));
             input.base_url = Some(url.into());
             assert!(service.save(&scope, usage, input).await.is_err());
         }
-        assert!(validate_base_url("http://127.0.0.1:8000/v1").is_ok());
+        assert!(validate_base_url("https://models.example.invalid/v1").is_ok());
     }
 }

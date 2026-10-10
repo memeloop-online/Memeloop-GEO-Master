@@ -5,8 +5,10 @@ use std::sync::{
 
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::State,
     http::{Method, StatusCode, Uri},
+    response::{IntoResponse, Response},
     routing::any,
 };
 use chrono::{Duration, Utc};
@@ -26,14 +28,52 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[derive(Clone)]
-struct Runner(Arc<AtomicUsize>);
+struct Runner {
+    sends: Arc<AtomicUsize>,
+    completes: Arc<AtomicUsize>,
+    failure: RunnerFailure,
+}
+
+#[derive(Clone, Copy, Default)]
+enum RunnerFailure {
+    #[default]
+    None,
+    LostReceipt,
+    FinalIdentity,
+}
 
 async fn mock_runner(
     State(runner): State<Runner>,
     method: Method,
     uri: Uri,
     payload: Option<Json<Value>>,
-) -> (StatusCode, Json<Value>) {
+) -> Response {
+    if method == Method::POST
+        && uri.path() == "/v1/executions"
+        && matches!(runner.failure, RunnerFailure::LostReceipt)
+    {
+        // The runner accepted the one-shot request, then the response transport
+        // disconnected. It remains busy and refuses the subsequent close.
+        runner.sends.fetch_add(1, Ordering::SeqCst);
+        return Response::new(Body::from_stream(futures_util::stream::iter([
+            Ok(Bytes::from_static(b"{")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "synthetic post-accept disconnect",
+            )),
+        ])));
+    }
+    if method == Method::POST
+        && uri.path().ends_with("/complete")
+        && runner.completes.fetch_add(1, Ordering::SeqCst) == 1
+        && matches!(runner.failure, RunnerFailure::FinalIdentity)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"identity unavailable"})),
+        )
+            .into_response();
+    }
     match (method.as_str(), uri.path()) {
         ("GET", "/v1/capabilities") => (
             StatusCode::OK,
@@ -50,7 +90,7 @@ async fn mock_runner(
             })),
         ),
         ("POST", "/v1/executions") => {
-            runner.0.fetch_add(1, Ordering::SeqCst);
+            runner.sends.fetch_add(1, Ordering::SeqCst);
             (
                 StatusCode::OK,
                 Json(json!({
@@ -71,6 +111,7 @@ async fn mock_runner(
         ("DELETE", _) => (StatusCode::CONFLICT, Json(json!({"error":"busy"}))),
         _ => (StatusCode::OK, Json(json!({"closed":true}))),
     }
+    .into_response()
 }
 
 #[tokio::test]
@@ -175,10 +216,27 @@ async fn fixture() -> (
     tokio::task::JoinHandle<()>,
     Arc<MemoryProjectRepository>,
 ) {
+    fixture_with_failure(RunnerFailure::None).await
+}
+
+async fn fixture_with_failure(
+    failure: RunnerFailure,
+) -> (
+    AppState,
+    TenantScope,
+    Uuid,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+    Arc<MemoryProjectRepository>,
+) {
     let sends = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let runner = Runner(sends.clone());
+    let runner = Runner {
+        sends: sends.clone(),
+        completes: Arc::new(AtomicUsize::new(0)),
+        failure,
+    };
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
@@ -352,6 +410,71 @@ async fn duplicated_dispatch_sends_once_and_unknown_is_never_retried() {
             .unwrap()
             .is_empty()
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn post_accept_disconnect_and_failed_close_preserve_unknown_and_account_lease() {
+    let (state, scope, account, sends, server, _) =
+        fixture_with_failure(RunnerFailure::LostReceipt).await;
+    let repo = state.channel_job_repository();
+    let first = plan_measure(repo.clone(), &scope, account, Utc::now()).await;
+    let second = plan_measure(repo.clone(), &scope, account, Utc::now()).await;
+    let ChannelDispatchResult::Executed(view) =
+        execute_channel_target(&state, &scope, first).await.unwrap()
+    else {
+        panic!("accepted measurement must retain its attempt")
+    };
+    assert_eq!(view.attempts.len(), 1);
+    assert_eq!(
+        view.attempts[0].outcome.as_ref().unwrap().status,
+        geo_domain::ChannelOutcomeStatus::Unknown
+    );
+    assert!(execute_channel_target(&state, &scope, first).await.is_err());
+    assert!(matches!(
+        execute_channel_target(&state, &scope, second)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::AccountBusy)
+    ));
+    assert!(
+        repo.get_target(&scope, second)
+            .await
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn final_identity_preflight_failure_is_not_an_unknown_send() {
+    let (state, scope, account, sends, server, _) =
+        fixture_with_failure(RunnerFailure::FinalIdentity).await;
+    let repo = state.channel_job_repository();
+    let target = plan_measure(repo.clone(), &scope, account, Utc::now()).await;
+    let ChannelDispatchResult::Executed(view) = execute_channel_target(&state, &scope, target)
+        .await
+        .unwrap()
+    else {
+        panic!("claimed preflight failure must retain its attempt")
+    };
+    assert_eq!(
+        view.attempts[0].outcome.as_ref().unwrap().status,
+        geo_domain::ChannelOutcomeStatus::LoginRequired
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    let now = Utc::now();
+    repo.reserve_account(
+        &scope,
+        account,
+        Uuid::new_v4(),
+        now,
+        now + Duration::minutes(5),
+    )
+    .await
+    .unwrap();
     server.abort();
 }
 

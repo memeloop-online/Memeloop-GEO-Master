@@ -6,6 +6,8 @@
 
 pub mod dataforseo;
 mod http_transport;
+mod public_endpoint;
+pub use public_endpoint::{public_endpoint_client, validate_public_endpoint};
 mod secret_envelope;
 pub mod serp;
 pub use http_transport::HttpTransport;

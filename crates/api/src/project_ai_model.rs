@@ -28,7 +28,7 @@ impl ProjectConfiguredModelBridge<HttpTransport> {
         Ok(Self::with_transport(
             settings,
             inherited,
-            Arc::new(HttpTransport::new()?),
+            Arc::new(HttpTransport::public_only()?),
         ))
     }
 }
@@ -236,7 +236,7 @@ mod tests {
                         ProjectAiMode::Inherit
                     },
                     model: model.map(str::to_owned),
-                    base_url: model.map(|_| "http://127.0.0.1:1/v1".into()),
+                    base_url: model.map(|_| "https://models.example.invalid/v1".into()),
                     api_key: model.map(|_| "synthetic-project-secret".into()),
                     clear_api_key: false,
                     prefer_connected_account: None,

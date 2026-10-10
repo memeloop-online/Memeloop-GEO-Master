@@ -3,10 +3,11 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::SET_COOKIE},
 };
-use geo_api::{AppState, CSRF_HEADER, router};
+use geo_api::{AppState, CSRF_HEADER, ProjectAiSettingsService, router};
 use geo_domain::{
-    DEVELOPMENT_OPERATOR_ID, Membership, MemoryAuthRepository, ProjectCreate, ProjectSettings,
-    Role, TenantScope, UserId,
+    DEVELOPMENT_OPERATOR_ID, Membership, MemoryAuthRepository, MemoryProjectAiSettingsRepository,
+    ProjectAiSettingsRepository, ProjectAiUsage, ProjectCreate, ProjectSettings, Role, TenantScope,
+    UserId,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -19,6 +20,8 @@ struct Fixture {
     cookie: String,
     csrf: String,
     tenant: String,
+    settings: Arc<MemoryProjectAiSettingsRepository>,
+    scope: TenantScope,
 }
 impl Fixture {
     fn request(&self, method: &str, suffix: &str, body: Value, csrf: bool) -> Request<Body> {
@@ -49,8 +52,12 @@ async fn fixture(role: Role) -> Fixture {
     ))
     .await
     .unwrap();
-    let state =
-        AppState::development_with_password("synthetic-password").with_auth_repository(auth);
+    let settings = Arc::new(MemoryProjectAiSettingsRepository::default());
+    let state = AppState::development_with_password("synthetic-password")
+        .with_auth_repository(auth)
+        .with_project_ai_settings(
+            ProjectAiSettingsService::persistent(settings.clone(), &"12".repeat(32)).unwrap(),
+        );
     let project = state
         .project_repository()
         .create(
@@ -96,13 +103,15 @@ async fn fixture(role: Role) -> Fixture {
         cookie,
         csrf: body["csrf_token"].as_str().unwrap().into(),
         tenant: tenant.to_string(),
+        settings,
+        scope: TenantScope::new(DEVELOPMENT_OPERATOR_ID, tenant.into(), Some(project.id)),
     }
 }
 async fn body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
 }
 fn custom() -> Value {
-    json!({"expected_revision":0,"mode":"custom","model":"synthetic-model","base_url":"http://127.0.0.1:1/v1","api_key":"synthetic-key"})
+    json!({"expected_revision":0,"mode":"custom","model":"synthetic-model","base_url":"https://models.example.invalid/v1","api_key":"synthetic-key"})
 }
 
 #[tokio::test]
@@ -220,94 +229,60 @@ async fn read_only_and_member_can_read_but_cannot_save_or_probe() {
 }
 
 #[tokio::test]
-async fn tests_and_model_discovery_use_saved_credentials_and_provider_requests() {
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+async fn private_saved_routes_cannot_probe_or_infer_and_new_private_routes_cannot_save() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        for index in 0..2 {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0u8; 4096];
-            loop {
-                let count = stream.read(&mut buffer).await.unwrap();
-                assert!(count > 0);
-                bytes.extend_from_slice(&buffer[..count]);
-                if let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers =
-                        String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("content-length: ")
-                                .and_then(|v| v.parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-                    if bytes.len() >= header_end + 4 + length {
-                        break;
-                    }
-                }
-            }
-            let request = String::from_utf8(bytes).unwrap();
-            assert!(
-                request
-                    .to_ascii_lowercase()
-                    .contains("authorization: bearer synthetic-key")
-            );
-            let response=if index==0 {
-                assert!(request.starts_with("POST /v1/chat/completions "));
-                assert!(request.contains("synthetic-model"));
-                json!({"id":"synthetic-response","model":"synthetic-model","choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}})
-            } else {
-                assert!(request.starts_with("GET /v1/models "));
-                json!({"data":[{"id":"synthetic-model"},{"id":"synthetic-other"}]})
-            }.to_string();
-            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).as_bytes()).await.unwrap();
-        }
-    });
     let f = fixture(Role::CustomerAdmin).await;
     let mut input = custom();
-    input["base_url"] = json!(endpoint);
+    input["base_url"] = json!(&endpoint);
+    let refused = f
+        .app
+        .clone()
+        .oneshot(f.request("PUT", "/workbench_content", input, true))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         f.app
             .clone()
-            .oneshot(f.request("PUT", "/workbench_content", input, true))
+            .oneshot(f.request("PUT", "/workbench_content", custom(), true))
             .await
             .unwrap()
             .status(),
         StatusCode::OK
     );
-    let response = f
-        .app
-        .clone()
-        .oneshot(f.request(
-            "POST",
-            "/workbench_content/test",
-            json!({"expected_revision":1}),
-            true,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body(response).await, json!({"success":true}));
-    let response = f
-        .app
-        .clone()
-        .oneshot(f.request(
-            "POST",
-            "/workbench_content/models",
-            json!({"expected_revision":1}),
-            true,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body(response).await["items"].as_array().unwrap().len(), 2);
-    tokio::time::timeout(std::time::Duration::from_secs(5), server)
-        .await
-        .unwrap()
-        .unwrap();
+    // Simulate a configuration stored before the public-only policy existed.
+    // Runtime protection must not depend on the save route having validated it.
+    for endpoint in [endpoint, "http://localhost:1/v1".into()] {
+        let mut row = f
+            .settings
+            .get(&f.scope, ProjectAiUsage::WorkbenchContent)
+            .await
+            .unwrap();
+        let expected = row.revision;
+        row.base_url = Some(endpoint);
+        let row = f.settings.save(&f.scope, expected, row).await.unwrap();
+        for suffix in ["/workbench_content/test", "/workbench_content/models"] {
+            let response = f
+                .app
+                .clone()
+                .oneshot(f.request(
+                    "POST",
+                    suffix,
+                    json!({"expected_revision":row.revision}),
+                    true,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let text = body(response).await.to_string();
+            assert!(!text.contains("synthetic-key"));
+            assert!(!text.contains("127.0.0.1"));
+        }
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
 }
