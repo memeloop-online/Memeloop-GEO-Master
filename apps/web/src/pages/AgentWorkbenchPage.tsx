@@ -2,7 +2,11 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
   type ReactNode,
 } from "react";
 import {
@@ -22,30 +26,42 @@ import type { WebMemeLoopChatAdapter } from "@memeloop/react-ui/chat";
 import { createTheme, ThemeProvider } from "@mui/material/styles";
 import type { ConversationMessageListProjection } from "memeloop";
 import { useNavigate, useParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import {
   agentEventStreamUrl,
   cancelAgentTurn,
+  createAgentConversation,
   openAgentEventStream,
   postAgentMessage,
+  uploadAgentAttachment,
+  type AgentAttachmentReference,
+  type AgentAttachmentUploadState,
   type AgentConversationDetail,
   type AgentConversationSummary,
   type AgentMessage,
   type AgentRun,
   useAgentConversationQuery,
   useAgentConversationsQuery,
-  useCreateAgentConversationMutation,
 } from "../api/agent";
-import { ErrorState, EmptyState, LoadingState } from "../components/AsyncState";
+import { createIdempotencyKey } from "../api/client";
+import { ErrorState, LoadingState } from "../components/AsyncState";
+import { useAppearance } from "../appearance/AppearanceProvider";
+import { formatUiDate } from "../i18n";
 
-const agentTheme = createTheme({
-  palette: {
-    primary: { main: "#0f6cbd" },
-    background: { default: "#ffffff", paper: "#ffffff" },
+// A composer projection only, never saved or presented as a server conversation.
+const emptyConversation: AgentConversationDetail = {
+  conversation: {
+    id: "local-unsent-composer",
+    title: "",
+    status: "active",
+    revision: 0,
+    created_at: "",
+    updated_at: "",
   },
-  typography: {
-    fontFamily: '"Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif',
-  },
-});
+  messages: [],
+  turns: [],
+  runs: [],
+};
 
 function projectMessage(
   message: AgentMessage,
@@ -75,11 +91,14 @@ function projectMessage(
 
 function conversationName(
   conversation: Pick<AgentConversationSummary, "title" | "created_at">,
+  unnamed: string,
+  newConversation: string,
 ) {
   if (conversation.title?.trim()) return conversation.title;
+  if (!conversation.created_at) return newConversation;
   const date = new Date(conversation.created_at);
-  if (Number.isNaN(date.getTime())) return "未命名对话";
-  return `新对话 · ${date.toLocaleDateString("zh-CN")}`;
+  if (Number.isNaN(date.getTime())) return unnamed;
+  return `${newConversation} · ${formatUiDate(date)}`;
 }
 
 function orderedRuns(runs: readonly AgentRun[]) {
@@ -88,20 +107,29 @@ function orderedRuns(runs: readonly AgentRun[]) {
   );
 }
 
-function unavailableRuntimeNotice(runs: readonly AgentRun[]) {
-  const failedRun = orderedRuns(runs).find(
-    (run) =>
-      run.status === "failed" &&
-      ["missing", "unavailable"].includes(run.capability.status),
-  );
-  if (!failedRun) return undefined;
-  const runtime =
-    failedRun.capability.runtime === "deno_core"
-      ? "Rust JS Agent Runtime"
-      : failedRun.capability.runtime;
-  return failedRun.capability.status === "missing"
-    ? `${runtime} 尚未配置，本次未生成 AI 回复。`
-    : `${runtime} 当前不可用，本次未生成 AI 回复。`;
+function terminalRunNotice(
+  run: AgentRun | undefined,
+  missing: string,
+  unavailable: string,
+  failed: string,
+  cancelled: string,
+) {
+  if (run?.status === "cancelled") return cancelled;
+  if (run?.status !== "failed") return undefined;
+  if (run.capability.status === "missing") return missing;
+  if (run.capability.status === "unavailable") return unavailable;
+  return failed;
+}
+
+interface PendingAttachment {
+  id: string;
+  file: File;
+  status: "waiting" | AgentAttachmentUploadState | "failed";
+  createKey: string;
+  completeKey: string;
+  sessionId?: string;
+  contentUploaded?: boolean;
+  reference?: AgentAttachmentReference;
 }
 
 function ConversationList({
@@ -123,39 +151,46 @@ function ConversationList({
   onSelect: (conversationId: string) => void;
   onRetry: () => void;
 }) {
+  const { t } = useTranslation();
   return (
-    <aside className="agent-conversation-list" aria-label="AI 对话列表">
+    <aside
+      className="agent-conversation-list"
+      aria-label={t("chatWorkbench.conversationList")}
+    >
       <div className="agent-conversation-list-heading">
         <div>
-          <p className="eyebrow">P00</p>
-          <h2>AI 工作台</h2>
+          <h2>{t("chatWorkbench.title")}</h2>
         </div>
-        <Button
-          appearance="primary"
-          size="small"
-          icon={<AddRegular />}
-          disabled={creating}
-          onClick={onCreate}
-        >
-          {creating ? "正在创建…" : "新建"}
-        </Button>
+        {(activeConversationId || items.length > 0) && (
+          <Button
+            appearance="primary"
+            size="small"
+            icon={<AddRegular />}
+            disabled={creating}
+            onClick={onCreate}
+          >
+            {creating ? t("chatWorkbench.creating") : t("chatWorkbench.create")}
+          </Button>
+        )}
       </div>
       <p className="agent-conversation-list-description">
-        对话和运行记录按当前项目隔离。
+        {t("chatWorkbench.description")}
       </p>
       <div className="agent-conversation-items">
-        {pending && <LoadingState compact label="正在加载对话" />}
+        {pending && <LoadingState compact label={t("chatWorkbench.loading")} />}
         {error && (
           <Button
             appearance="subtle"
             icon={<ArrowSyncRegular />}
             onClick={onRetry}
           >
-            重新加载对话
+            {t("chatWorkbench.reload")}
           </Button>
         )}
         {!pending && !error && items.length === 0 && (
-          <p className="agent-conversation-list-empty">还没有对话。</p>
+          <p className="agent-conversation-list-empty">
+            {t("chatWorkbench.noConversations")}
+          </p>
         )}
         {items.map((conversation) => (
           <Button
@@ -166,7 +201,11 @@ function ConversationList({
             className="agent-conversation-item"
             onClick={() => onSelect(conversation.id)}
           >
-            {conversationName(conversation)}
+            {conversationName(
+              conversation,
+              t("chatWorkbench.unnamedConversation"),
+              t("chatWorkbench.newConversation"),
+            )}
           </Button>
         ))}
       </div>
@@ -179,21 +218,159 @@ function AgentChat({
   tenantId,
   projectId,
   onRefresh,
+  onFirstMessage,
 }: {
   conversation: AgentConversationDetail;
   tenantId: string;
   projectId: string;
   onRefresh: () => Promise<void>;
+  onFirstMessage?: (conversationId: string) => void;
 }) {
-  const [selectedFile, setSelectedFile] = useState<File>();
+  const { t } = useTranslation();
+  const { appearance } = useAppearance();
+  const agentTheme = useMemo(
+    () =>
+      createTheme({
+        palette: {
+          primary: { main: appearance.primary_color },
+          background: { default: "#ffffff", paper: "#ffffff" },
+        },
+        typography: {
+          fontFamily: '"Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif',
+        },
+      }),
+    [appearance.primary_color],
+  );
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [attachmentNotice, setAttachmentNotice] = useState<string>();
   const [localTurnId, setLocalTurnId] = useState<string>();
   const [runtimeNotice, setRuntimeNotice] = useState<string>();
-  const activeRun = orderedRuns(conversation.runs).find((run) =>
-    ["queued", "running"].includes(run.status),
+  const picker = useRef<HTMLInputElement>(null);
+  const submissionInFlight = useRef(false);
+  const pendingConversation = useRef<{ key: string; id?: string } | undefined>(
+    undefined,
   );
-  const activeTurnId = activeRun?.turn_id ?? localTurnId;
-  const capabilityNotice = unavailableRuntimeNotice(conversation.runs);
-  const displayedRuntimeNotice = capabilityNotice ?? runtimeNotice;
+  const [submitting, setSubmitting] = useState(false);
+  const pendingSubmission = useRef<
+    { signature: string; key: string } | undefined
+  >(undefined);
+  const selectedFile = attachments[0]?.file;
+  const latestRun = orderedRuns(conversation.runs)[0];
+  const activeRun =
+    latestRun && ["queued", "running"].includes(latestRun.status)
+      ? latestRun
+      : undefined;
+  const localTurnIsTerminal = conversation.runs.some(
+    (run) =>
+      run.turn_id === localTurnId &&
+      ["succeeded", "failed", "cancelled"].includes(run.status),
+  );
+  const activeTurnId =
+    activeRun?.turn_id ?? (localTurnIsTerminal ? undefined : localTurnId);
+  const persistedNotice = terminalRunNotice(
+    latestRun,
+    t("chatWorkbench.runtimeMissing"),
+    t("chatWorkbench.runtimeUnavailable"),
+    t("chatWorkbench.runFailed"),
+    t("chatWorkbench.runCancelled"),
+  );
+  const displayedRuntimeNotice =
+    persistedNotice ?? (runtimeNotice ? t(runtimeNotice) : undefined);
+  useEffect(() => {
+    if (localTurnId && localTurnIsTerminal) setLocalTurnId(undefined);
+  }, [localTurnId, localTurnIsTerminal]);
+  const latestAnswer = [...conversation.messages]
+    .filter((message) => message.role === "assistant")
+    .sort((a, b) => b.sequence - a.sequence)[0];
+  const omittedHistory =
+    latestAnswer?.metadata &&
+    typeof latestAnswer.metadata === "object" &&
+    !Array.isArray(latestAnswer.metadata)
+      ? (latestAnswer.metadata as Record<string, unknown>).history_omitted_turns
+      : undefined;
+
+  function addFiles(files: readonly File[]) {
+    if (!files.length) return;
+    setAttachments((current) => {
+      const available = Math.max(0, 100 - current.length);
+      const accepted = files.slice(0, available).filter((file) => {
+        if (file.size > 100 * 1024 * 1024) {
+          setAttachmentNotice("chatWorkbench.fileTooLarge");
+          return false;
+        }
+        return true;
+      });
+      if (files.length > available) {
+        setAttachmentNotice("chatWorkbench.tooManyFiles");
+      }
+      return [
+        ...current,
+        ...accepted.map((file) => ({
+          id: createIdempotencyKey(),
+          file,
+          status: "waiting" as const,
+          createKey: createIdempotencyKey(),
+          completeKey: createIdempotencyKey(),
+        })),
+      ];
+    });
+  }
+
+  function updateAttachment(id: string, update: Partial<PendingAttachment>) {
+    setAttachments((current) =>
+      current.map((item) => (item.id === id ? { ...item, ...update } : item)),
+    );
+  }
+
+  async function upload(item: PendingAttachment) {
+    if (item.reference) return item.reference;
+    try {
+      const reference = await uploadAgentAttachment(
+        tenantId,
+        projectId,
+        item.file,
+        {
+          createKey: item.createKey,
+          completeKey: item.completeKey,
+          sessionId: item.sessionId,
+          contentUploaded: item.contentUploaded,
+          onProgress: (status, sessionId) =>
+            updateAttachment(item.id, {
+              status,
+              sessionId,
+              contentUploaded:
+                item.contentUploaded ||
+                status === "completing" ||
+                status === "uploaded",
+            }),
+        },
+      );
+      updateAttachment(item.id, { status: "uploaded", reference });
+      return reference;
+    } catch (error) {
+      updateAttachment(item.id, { status: "failed" });
+      throw error;
+    }
+  }
+
+  function onPickerChange(event: ChangeEvent<HTMLInputElement>) {
+    addFiles(Array.from(event.target.files ?? []));
+    event.target.value = "";
+  }
+
+  function onDropCapture(event: DragEvent<HTMLElement>) {
+    if (!event.dataTransfer.files.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    addFiles(Array.from(event.dataTransfer.files));
+  }
+
+  function onPasteCapture(event: ClipboardEvent<HTMLElement>) {
+    if (!event.clipboardData.files.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    addFiles(Array.from(event.clipboardData.files));
+  }
 
   const adapter = useMemo<WebMemeLoopChatAdapter>(
     () => ({
@@ -201,31 +378,95 @@ function AgentChat({
       messages: conversation.messages.map(projectMessage),
       isRunning: Boolean(activeTurnId),
       isLoading: false,
-      error: null,
+      error:
+        latestRun?.status === "failed" &&
+        latestRun.capability.status === "available"
+          ? new Error(t("chatWorkbench.runFailed"))
+          : null,
       sendMessage: async ({ text, file }) => {
+        if (submissionInFlight.current) return;
         const content = text.trim();
-        if (!content) return;
-        if (file || selectedFile) {
-          throw new Error("agent-upload-reference-required");
-        }
-        setRuntimeNotice(undefined);
-        const acceptance = await postAgentMessage(
-          tenantId,
-          projectId,
-          conversation.conversation.id,
-          { content, attachments: [] },
-        );
-        setLocalTurnId(
-          ["queued", "running"].includes(acceptance.run_status)
-            ? acceptance.turn_id
-            : undefined,
-        );
-        if (acceptance.error?.code === "capability_missing") {
-          setRuntimeNotice(
-            "Rust JS Agent Runtime 尚未配置，本次未生成 AI 回复。",
+        const batch = attachments.length
+          ? attachments
+          : file
+            ? [
+                {
+                  id: createIdempotencyKey(),
+                  file,
+                  status: "waiting" as const,
+                  createKey: createIdempotencyKey(),
+                  completeKey: createIdempotencyKey(),
+                },
+              ]
+            : [];
+        if (!content && !batch.length) return;
+        submissionInFlight.current = true;
+        setSubmitting(true);
+        try {
+          setAttachmentNotice(undefined);
+          const results = await Promise.allSettled(batch.map(upload));
+          if (results.some((result) => result.status === "rejected")) {
+            setAttachmentNotice("chatWorkbench.partialUploadFailed");
+            throw new Error("agent-attachment-upload-incomplete");
+          }
+          const references = results.map(
+            (result) =>
+              (result as PromiseFulfilledResult<AgentAttachmentReference>)
+                .value,
           );
+          const signature = JSON.stringify({
+            content,
+            attachmentIds: references.map(
+              (reference) => reference.attachment_id,
+            ),
+          });
+          if (pendingSubmission.current?.signature !== signature) {
+            pendingSubmission.current = {
+              signature,
+              key: createIdempotencyKey(),
+            };
+          }
+          setRuntimeNotice(undefined);
+          let targetConversationId = conversation.conversation.id;
+          if (onFirstMessage) {
+            pendingConversation.current ??= { key: createIdempotencyKey() };
+            if (!pendingConversation.current.id) {
+              const created = await createAgentConversation(
+                tenantId,
+                projectId,
+                {},
+                pendingConversation.current.key,
+              );
+              pendingConversation.current.id = created.id;
+            }
+            targetConversationId = pendingConversation.current.id;
+          }
+          const acceptance = await postAgentMessage(
+            tenantId,
+            projectId,
+            targetConversationId,
+            { content, attachments: references },
+            pendingSubmission.current.key,
+          );
+          setLocalTurnId(
+            ["queued", "running"].includes(acceptance.run_status)
+              ? acceptance.turn_id
+              : undefined,
+          );
+          if (references.length) {
+            setRuntimeNotice("chatWorkbench.uploadedHint");
+          }
+          if (acceptance.error?.code === "capability_missing") {
+            setRuntimeNotice("chatWorkbench.runtimeMissing");
+          }
+          if (!onFirstMessage) await onRefresh();
+          pendingSubmission.current = undefined;
+          setAttachments([]);
+          onFirstMessage?.(targetConversationId);
+        } finally {
+          submissionInFlight.current = false;
+          setSubmitting(false);
         }
-        await onRefresh();
       },
       cancel: async () => {
         if (!activeTurnId) return;
@@ -241,61 +482,152 @@ function AgentChat({
         throw new Error("agent-turn-retry-unavailable");
       },
       onError: () => {
-        setRuntimeNotice(
-          "操作未完成。请确认 Agent 运行时已配置且当前项目有权限后重试。",
-        );
+        if (attachmentNotice) return;
+        setRuntimeNotice("chatWorkbench.operationFailed");
       },
     }),
     [
       activeTurnId,
       conversation.conversation.id,
       conversation.messages,
+      latestRun?.status,
+      latestRun?.capability.status,
       onRefresh,
+      onFirstMessage,
       projectId,
-      selectedFile,
+      attachments,
+      attachmentNotice,
       tenantId,
+      t,
     ],
   );
 
   const empty: ReactNode = (
     <div className="agent-chat-empty">
       <FolderOpenRegular fontSize={28} aria-hidden="true" />
-      <h2>此对话还没有消息</h2>
-      <p>输入任务后，服务端会受理并创建可追踪的 Agent 运行。</p>
+      <h2>{t("chatWorkbench.emptyTitle")}</h2>
+      <p>{t("chatWorkbench.emptyHint")}</p>
+      <p>{t("chatWorkbench.emptyDetail")}</p>
     </div>
   );
 
   return (
-    <section className="agent-chat-column" aria-label="AI 对话">
+    <section
+      className="agent-chat-column"
+      aria-label={t("chatWorkbench.conversation")}
+      onDragOverCapture={(event) => {
+        if (event.dataTransfer.types.includes("Files")) event.preventDefault();
+      }}
+      onDropCapture={onDropCapture}
+      onPasteCapture={onPasteCapture}
+    >
       <div className="agent-chat-titlebar">
         <div>
-          <p className="eyebrow">P00 · AI 工作台</p>
-          <h1>{conversationName(conversation.conversation)}</h1>
+          <p className="eyebrow">{t("chatWorkbench.title")}</p>
+          <h1>
+            {conversationName(
+              conversation.conversation,
+              t("chatWorkbench.unnamedConversation"),
+              t("chatWorkbench.newConversation"),
+            )}
+          </h1>
         </div>
         {activeTurnId && (
           <span className="agent-run-state" aria-live="polite">
-            正在运行
+            {t(
+              activeRun?.status === "queued"
+                ? "chatWorkbench.queued"
+                : "chatWorkbench.running",
+            )}
           </span>
         )}
       </div>
-      {selectedFile && (
+      {attachmentNotice && (
         <MessageBar intent="warning" className="agent-file-reference-notice">
-          <MessageBarBody>
-            已选择“{selectedFile.name}
-            ”。当前聊天接口只接受已上传对象的附件引用，
-            文件不会作为浏览器原始内容发送。
-          </MessageBarBody>
+          <MessageBarBody>{t(attachmentNotice)}</MessageBarBody>
+        </MessageBar>
+      )}
+      {typeof omittedHistory === "number" &&
+        Number.isSafeInteger(omittedHistory) &&
+        omittedHistory > 0 && (
+          <MessageBar
+            intent="info"
+            aria-label={t("chatWorkbench.historyScope")}
+          >
+            <MessageBarBody>
+              {t("chatWorkbench.historyOmitted", { count: omittedHistory })}
+            </MessageBarBody>
+          </MessageBar>
+        )}
+      {attachments.length > 0 && (
+        <div
+          className="agent-file-reference-notice"
+          aria-label={t("chatWorkbench.pendingAttachments")}
+        >
+          <p>{t("chatWorkbench.attachmentHint")}</p>
+          {attachments.map((item) => (
+            <div key={item.id}>
+              <span>
+                {item.file.name} · {t(`chatWorkbench.upload.${item.status}`)}
+              </span>
+              {item.status === "failed" && (
+                <Button
+                  appearance="subtle"
+                  onClick={() =>
+                    void upload(item).catch(() =>
+                      setAttachmentNotice("chatWorkbench.retryUploadFailed"),
+                    )
+                  }
+                >
+                  {t("chatWorkbench.retryFile", { name: item.file.name })}
+                </Button>
+              )}
+              <Button
+                appearance="subtle"
+                icon={<DismissRegular />}
+                aria-label={t("chatWorkbench.removeFile", {
+                  name: item.file.name,
+                })}
+                onClick={() =>
+                  setAttachments((current) =>
+                    current.filter((candidate) => candidate.id !== item.id),
+                  )
+                }
+              />
+            </div>
+          ))}
           <Button
             appearance="subtle"
-            icon={<DismissRegular />}
-            aria-label={`移除文件 ${selectedFile.name}`}
-            onClick={() => setSelectedFile(undefined)}
-          />
-        </MessageBar>
+            disabled={Boolean(activeTurnId) || submitting}
+            onClick={() =>
+              void adapter
+                .sendMessage({ text: "", file: selectedFile })
+                .catch(() =>
+                  setAttachmentNotice(
+                    (previous) => previous ?? "chatWorkbench.submissionFailed",
+                  ),
+                )
+            }
+          >
+            {t("chatWorkbench.sendAttachments")}
+          </Button>
+        </div>
       )}
       {displayedRuntimeNotice && (
         <MessageBar intent="warning" className="agent-runtime-notice">
-          <MessageBarBody>{displayedRuntimeNotice}</MessageBarBody>
+          <MessageBarBody>
+            {displayedRuntimeNotice}
+            {persistedNotice && (
+              <Button
+                appearance="subtle"
+                size="small"
+                icon={<ArrowSyncRegular />}
+                onClick={() => void onRefresh()}
+              >
+                {t("chatWorkbench.reload")}
+              </Button>
+            )}
+          </MessageBarBody>
         </MessageBar>
       )}
       <div className="agent-chat-surface">
@@ -304,20 +636,48 @@ function AgentChat({
             adapter={adapter}
             empty={empty}
             selectedFile={selectedFile}
-            onFileSelect={setSelectedFile}
-            onClearFile={() => setSelectedFile(undefined)}
-            placeholder="描述你希望 AI 协助完成的项目任务"
+            onFileSelect={(file) => addFiles([file])}
+            onClearFile={() => setAttachments((current) => current.slice(1))}
+            onClearAttachments={() => setAttachments([])}
+            renderAttachmentPicker={({ disabled }) => (
+              <>
+                <input
+                  ref={picker}
+                  type="file"
+                  multiple
+                  aria-label={t("chatWorkbench.selectFiles")}
+                  data-testid="agent-multi-file-input"
+                  style={{ display: "none" }}
+                  disabled={disabled}
+                  onChange={onPickerChange}
+                />
+                <Button
+                  size="small"
+                  appearance="subtle"
+                  disabled={disabled}
+                  onClick={() => picker.current?.click()}
+                >
+                  {t("chatWorkbench.addFile")}
+                </Button>
+              </>
+            )}
+            placeholder={t("chatWorkbench.placeholder")}
             composerLabels={{
-              input: "输入任务",
-              send: "发送",
-              cancel: "取消运行",
-              addFile: "添加文件",
-              removeFile: (filename) => `移除文件 ${filename}`,
+              input: t("chatWorkbench.input"),
+              send: t("chatWorkbench.send"),
+              cancel: t("chatWorkbench.cancel"),
+              addFile: t("chatWorkbench.addFile"),
+              removeFile: (filename) =>
+                t("chatWorkbench.removeFile", { name: filename }),
             }}
-            emptyMessage="此对话还没有消息"
-            loadingMessage="正在读取对话…"
-            genericErrorMessage="Agent 运行时暂不可用，暂时无法读取消息。"
-            operationErrorMessage="操作未完成；未生成任何模拟回复。"
+            emptyMessage={t("chatWorkbench.noMessages")}
+            loadingMessage={t("chatWorkbench.reading")}
+            genericErrorMessage={
+              latestRun?.status === "failed"
+                ? t("chatWorkbench.runFailed")
+                : t("chatWorkbench.readFailed")
+            }
+            operationErrorMessage={t("chatWorkbench.noReply")}
             showTurnActions={false}
             showTimeline={false}
           />
@@ -328,6 +688,7 @@ function AgentChat({
 }
 
 export function AgentWorkbenchPage() {
+  const { t } = useTranslation();
   const { tenantId, projectId, conversationId } = useParams();
   const navigate = useNavigate();
   const conversations = useAgentConversationsQuery(tenantId, projectId);
@@ -335,10 +696,6 @@ export function AgentWorkbenchPage() {
     tenantId,
     projectId,
     conversationId,
-  );
-  const createConversation = useCreateAgentConversationMutation(
-    tenantId,
-    projectId,
   );
   const refetchConversations = conversations.refetch;
   const refetchConversation = conversation.refetch;
@@ -349,8 +706,11 @@ export function AgentWorkbenchPage() {
       : "/workspaces";
 
   const refresh = useCallback(async () => {
-    await Promise.all([refetchConversations(), refetchConversation()]);
-  }, [refetchConversation, refetchConversations]);
+    await Promise.all([
+      refetchConversations(),
+      ...(conversationId ? [refetchConversation()] : []),
+    ]);
+  }, [conversationId, refetchConversation, refetchConversations]);
 
   useEffect(() => {
     if (
@@ -368,10 +728,8 @@ export function AgentWorkbenchPage() {
     return () => stream.close();
   }, [conversationId, projectId, refresh, tenantId]);
 
-  async function handleCreate() {
-    if (!tenantId || !projectId) return;
-    const created = await createConversation.mutateAsync({});
-    navigate(`${base}/${encodeURIComponent(created.id)}`);
+  function handleCreate() {
+    navigate(base);
   }
 
   function selectConversation(nextConversationId: string) {
@@ -386,38 +744,37 @@ export function AgentWorkbenchPage() {
           items={conversations.data?.items ?? []}
           pending={conversations.isPending}
           error={conversations.isError}
-          creating={createConversation.isPending}
-          onCreate={() => void handleCreate()}
+          creating={false}
+          onCreate={handleCreate}
           onSelect={selectConversation}
           onRetry={() => void conversations.refetch()}
         />
         <div className="agent-workbench-content">
           {conversationId && conversation.isPending && (
             <div className="agent-workbench-loading">
-              <Spinner label="正在加载对话" />
+              <Spinner label={t("chatWorkbench.loading")} />
             </div>
           )}
           {conversationId && conversation.isError && (
             <ErrorState
-              title="AI 运行时暂不可用"
-              detail="无法读取当前对话。请检查服务连接或稍后重试。"
+              title={t("chatWorkbench.conversationUnavailable")}
+              detail={t("chatWorkbench.conversationUnavailableDetail")}
               onRetry={() => void conversation.refetch()}
             />
           )}
-          {!conversationId && (
-            <EmptyState
-              title="从一个项目任务开始"
-              detail="新建对话后，才会向当前项目的 Agent 运行时提交任务。这里不会生成演示回复。"
-              action={
-                <Button
-                  appearance="primary"
-                  icon={<AddRegular />}
-                  disabled={createConversation.isPending}
-                  onClick={() => void handleCreate()}
-                >
-                  新建对话
-                </Button>
-              }
+          {!conversationId && tenantId && projectId && (
+            <AgentChat
+              key={`${tenantId}:${projectId}:unsent`}
+              conversation={emptyConversation}
+              tenantId={tenantId}
+              projectId={projectId}
+              onRefresh={refresh}
+              onFirstMessage={(id) => {
+                void refetchConversations();
+                navigate(`${base}/${encodeURIComponent(id)}`, {
+                  replace: true,
+                });
+              }}
             />
           )}
           {conversation.data && tenantId && projectId && (

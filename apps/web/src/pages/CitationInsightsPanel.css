@@ -1,0 +1,74 @@
+.citation-insights {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.citation-insights-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.citation-insights-heading h2,
+.citation-insights-heading p,
+.citation-insights-source h3,
+.citation-insights-source p {
+  margin-block: 0 8px;
+}
+
+.citation-insights-coverage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  border: 1px solid var(--colorNeutralStroke2);
+  border-radius: var(--borderRadiusMedium);
+  padding: 12px;
+}
+
+.citation-insights-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+}
+
+.citation-insights-source,
+.citation-insights-urls,
+.citation-insights-urls li,
+.citation-insights-answer {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.citation-insights-urls {
+  padding-left: 20px;
+}
+
+.citation-insights-urls > li {
+  padding-block: 8px;
+}
+
+.citation-insights-sample {
+  padding-block: 6px;
+}
+
+.citation-insights-sample > span {
+  margin-inline-start: 8px;
+}
+
+.citation-insights-original-answer {
+  white-space: pre-wrap;
+}
+
+.citation-insights-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+@media (max-width: 600px) {
+  .citation-insights-heading {
+    flex-wrap: wrap;
+  }
+}

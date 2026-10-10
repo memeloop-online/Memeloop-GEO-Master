@@ -3,11 +3,12 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import type { AuthSession } from "../auth/types";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
+import { SetupPage } from "./SetupPage";
 
 const session: AuthSession = {
   user: {
@@ -99,9 +100,12 @@ const acceptance = {
   operation_url: "/operations/operation-a",
 };
 
+// Mirrors the real payload from `estimate_project` in crates/api/src/lib.rs:
+// English prose in `reason`, and blockers carrying a structured `code`/`scope`.
+// The UI must not parse the prose, so the fixture must not pre-translate it.
 const estimate = {
   settings_hash: "settings-hash-a",
-  estimator_version: "v2",
+  estimator_version: "w02-prerequisites-unknown-v1",
   pricing_snapshot_id: null,
   capability_snapshot_id: null,
   coverage: {
@@ -111,7 +115,8 @@ const estimate = {
       min: null,
       max: null,
       basis_refs: [],
-      reason: "待知识规划",
+      reason:
+        "KnowledgeRelease is not available; document manifest is not frozen.",
     },
     document_platform_targets: {
       state: "unknown" as const,
@@ -119,7 +124,8 @@ const estimate = {
       min: null,
       max: null,
       basis_refs: [],
-      reason: "待能力快照",
+      reason:
+        "CapabilitySnapshot is not available; distribution targets are not expanded.",
     },
     measurement_samples: {
       state: "unknown" as const,
@@ -127,7 +133,8 @@ const estimate = {
       min: null,
       max: null,
       basis_refs: [],
-      reason: "待测量协议",
+      reason:
+        "MeasurementProtocol is not available; measurement samples are not planned.",
     },
   },
   costs: {
@@ -137,7 +144,8 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "待知识规划",
+      reason:
+        "PricingSnapshot and frozen document denominator are unavailable.",
     },
     phase_two_distribution: {
       state: "unknown" as const,
@@ -145,7 +153,8 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "待能力快照",
+      reason:
+        "PricingSnapshot, CapabilitySnapshot, and distribution denominator are unavailable.",
     },
     measurement: {
       state: "unknown" as const,
@@ -153,7 +162,7 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "待测量协议",
+      reason: "PricingSnapshot and MeasurementProtocol are unavailable.",
     },
     total: {
       state: "unknown" as const,
@@ -161,7 +170,7 @@ const estimate = {
       min_minor: null,
       max_minor: null,
       basis_refs: [],
-      reason: "待能力快照",
+      reason: "Component costs are not known.",
     },
   },
   budget: {
@@ -169,8 +178,32 @@ const estimate = {
     measurement_reserve_minor: 1200000,
     currency: "CNY",
   },
-  blockers: [],
-  assumptions: ["能力与知识处理完成后会冻结覆盖。"],
+  blockers: [
+    {
+      code: "knowledge_release_unavailable",
+      scope: "documents",
+      reason: "W02 has not resolved immutable knowledge inputs.",
+    },
+    {
+      code: "capability_snapshot_unavailable",
+      scope: "document_platform_targets",
+      reason: "No eligible platform/account capability snapshot is frozen.",
+    },
+    {
+      code: "measurement_protocol_unavailable",
+      scope: "measurement_samples",
+      reason: "No measurement protocol or sample plan is frozen.",
+    },
+    {
+      code: "pricing_snapshot_unavailable",
+      scope: "costs",
+      reason: "No applicable price list snapshot is frozen.",
+    },
+  ],
+  assumptions: [
+    "Estimate is side-effect free: it creates no project, reservation, or task.",
+    "Zero budget permits later free knowledge work but must block paid actions.",
+  ],
 };
 
 const overview = {
@@ -196,7 +229,7 @@ function response(body: unknown, status = 200) {
   });
 }
 
-function renderSetup() {
+function renderSetup(path = "/setup?tenant_id=tenant-a") {
   return render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider
@@ -207,8 +240,14 @@ function renderSetup() {
         }
       >
         <AuthProvider>
-          <MemoryRouter initialEntries={["/setup?tenant_id=tenant-a"]}>
-            <AppRoutes />
+          <MemoryRouter initialEntries={[path]}>
+            <Routes>
+              <Route
+                path="/setup"
+                element={<SetupPage tenantId="tenant-a" />}
+              />
+              <Route path="*" element={<AppRoutes />} />
+            </Routes>
           </MemoryRouter>
         </AuthProvider>
       </QueryClientProvider>
@@ -266,6 +305,20 @@ function patchCalls(fetchMock: ReturnType<typeof vi.fn>) {
   return fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
 }
 
+/** The rendered value of the estimate row whose label (or coverage term) is
+ * `name`. Reading it per row is what makes the scope-to-label mapping testable;
+ * a page-wide `getAllByText` cannot tell one row's label from another's. */
+function estimateRowValue(name: string) {
+  const row = screen.getByText(name).closest("div");
+  return row?.querySelector("strong")?.textContent ?? null;
+}
+
+/** The explanation line rendered under the same estimate row. */
+function estimateRowExplanation(name: string) {
+  const row = screen.getByText(name).closest("div");
+  return row?.querySelector("small")?.textContent ?? null;
+}
+
 async function advanceToLaunch(
   user: ReturnType<typeof userEvent.setup>,
   { saveFirst = false }: { saveFirst?: boolean } = {},
@@ -297,6 +350,61 @@ afterEach(() => {
 });
 
 describe("project setup workflow", () => {
+  it("loads the scoped draft and edits it without creating a replacement project", async () => {
+    const base = requestHandler();
+    const existing = projectForRevision(7);
+    existing.settings.document_scope.content_types = ["custom_faq"];
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          pathFor(request).endsWith("/projects/project-a") &&
+          (!init?.method || init.method === "GET")
+        ) {
+          return Promise.resolve(response(existing));
+        }
+        return base(request, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderSetup("/app/tenant-a/project-a/setup");
+    const brand = await screen.findByRole("textbox", { name: "品牌名称" });
+    expect(brand).toHaveValue("Northstar AI");
+    expect(patchCalls(fetchMock)).toHaveLength(0);
+    await user.clear(brand);
+    await user.type(brand, "Updated Brand");
+    await user.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() =>
+      expect(patchCalls(fetchMock).length).toBeGreaterThan(0),
+    );
+    const patch = patchCalls(fetchMock)[0];
+    expect(pathFor(patch[0])).toBe("/api/v1/projects/project-a");
+    const body = JSON.parse(String(patch[1]?.body));
+    expect(body.revision).toBe(7);
+    expect(body.settings.document_scope.content_types).toEqual(["custom_faq"]);
+    expect(
+      postCalls(fetchMock).filter(
+        ([request]) => pathFor(request) === "/api/v1/projects",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("fails closed when the scoped project cannot be loaded", async () => {
+    const base = requestHandler();
+    const fetchMock = vi.fn((request: RequestInfo | URL, init?: RequestInit) =>
+      pathFor(request).endsWith("/projects/project-a")
+        ? Promise.resolve(response({ error: { code: "unavailable" } }, 503))
+        : base(request, init),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderSetup("/app/tenant-a/project-a/setup");
+    expect(await screen.findByText("无法读取项目配置")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: "品牌名称" }),
+    ).not.toBeInTheDocument();
+    expect(postCalls(fetchMock)).toHaveLength(0);
+  });
+
   it("uses three steps and permits optional product and target audience", async () => {
     const fetchMock = requestHandler();
     vi.stubGlobal("fetch", fetchMock);
@@ -317,7 +425,7 @@ describe("project setup workflow", () => {
     expect(createBody.settings.target_audience).toBeNull();
   });
 
-  it("shows unknown estimates honestly while retaining known budget values", async () => {
+  it("labels each unknown estimate from the blocker that owns its scope", async () => {
     const fetchMock = requestHandler();
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
@@ -325,12 +433,30 @@ describe("project setup workflow", () => {
 
     await advanceToLaunch(user);
 
-    expect(screen.getAllByText("待知识规划").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("待能力快照").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("待测量协议").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("月度预算").length).toBeGreaterThan(0);
+    // Every cost row is blocked by the `costs`-scoped pricing blocker. A row
+    // whose prose also mentions a capability or measurement snapshot must not
+    // be relabelled by that incidental mention.
+    expect(estimateRowValue("第一阶段文档成本")).toBe("待分项估算");
+    expect(estimateRowValue("第二阶段分发成本")).toBe("待分项估算");
+    expect(estimateRowValue("测量成本")).toBe("待分项估算");
+    expect(estimateRowValue("预计总成本")).toBe("待分项估算");
+    // Each coverage row keeps its own scope's label.
+    expect(estimateRowValue("文档")).toBe("待知识规划");
+    expect(estimateRowValue("文档 × 平台目标")).toBe("待能力快照");
+    expect(estimateRowValue("测量样本")).toBe("待测量协议");
+
+    // The reason behind an unknown row is shown, not discarded, and it is the
+    // translated blocker text rather than the raw English payload string.
+    expect(estimateRowExplanation("预计总成本")).toBe(
+      "适用价格表尚未形成快照，因此当前不展示总价。",
+    );
+    expect(screen.queryByText(/PricingSnapshot/)).not.toBeInTheDocument();
+
+    // Known values are still shown, and the total still spans the grid.
     expect(screen.getByText("¥60,000.00")).toBeInTheDocument();
-    expect(screen.queryByText(/预计总资源成本区间/)).not.toBeInTheDocument();
+    expect(screen.getByText("预计总成本").closest("div")).toHaveClass(
+      "estimate-total",
+    );
   });
 
   it("creates one draft, serializes revision patches, and starts that revision", async () => {
@@ -345,7 +471,7 @@ describe("project setup workflow", () => {
     await user.click(screen.getByRole("button", { name: "启动项目" }));
 
     expect(
-      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
+      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
     ).toBeInTheDocument();
     expect(
       postCalls(fetchMock).filter(
@@ -386,7 +512,7 @@ describe("project setup workflow", () => {
     ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "重试启动" }));
     expect(
-      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
+      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
     ).toBeInTheDocument();
 
     const starts = postCalls(fetchMock).filter(
@@ -417,9 +543,9 @@ describe("project setup workflow", () => {
 
     await advanceToLaunch(user);
     await user.click(screen.getByRole("button", { name: "启动项目" }));
-    await screen.findByRole("heading", { name: "从一个项目任务开始" });
-    await user.click(screen.getByRole("link", { name: "P02 · 项目总览" }));
-    await screen.findByText(/项目已启动（受理操作 operation-a）/);
+    await screen.findByRole("heading", { name: "从你的资料或想法开始" });
+    await user.click(screen.getByRole("link", { name: "项目总览" }));
+    await screen.findByText(/项目启动请求已受理/);
     const startReadsBeforeRefresh = fetchMock.mock.calls.filter(
       ([request, init]) =>
         pathFor(request) === "/api/v1/projects/project-a/start" &&
@@ -624,10 +750,8 @@ describe("project setup workflow", () => {
     const user = userEvent.setup();
     renderSetup();
 
-    await user.type(
-      await screen.findByRole("textbox", { name: "品牌名称" }),
-      "Northstar AI",
-    );
+    await user.click(await screen.findByRole("textbox", { name: "品牌名称" }));
+    await user.paste("Northstar AI");
     await user.selectOptions(
       screen.getByRole("combobox", { name: "文件用途" }),
       "internal",
@@ -646,7 +770,7 @@ describe("project setup workflow", () => {
     await screen.findByRole("heading", { name: "发布资源与预算" });
     await screen.findByRole("heading", { name: "资源与预算估算" });
     await user.click(screen.getByRole("button", { name: "启动项目" }));
-    await screen.findByRole("heading", { name: "从一个项目任务开始" });
+    await screen.findByRole("heading", { name: "从你的资料或想法开始" });
 
     const sourcePatch = fetchMock.mock.calls.find(([request, init]) => {
       if (
@@ -779,7 +903,7 @@ describe("project setup workflow", () => {
     await user.click(screen.getByRole("button", { name: "启动项目" }));
 
     expect(
-      await screen.findByRole("heading", { name: "从一个项目任务开始" }),
+      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
     ).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(

@@ -1,0 +1,79 @@
+//! Isolated Rust-hosted JavaScript worker.
+//!
+//! The crate answers two questions.  First, can the chosen embedded engine load
+//! a MemeLoop-shaped bundle and satisfy the loop's runtime requirements (ESM,
+//! Promise, host ops, timeout, cancellation, memory limits and checkpoint
+//! serialisation)?  That is the W00 compatibility probe, [`ProbeRuntime`], with
+//! one test per concern.  Second, how does a tenant script reach the product's
+//! real capabilities?  That is the production host-op surface in [`host`],
+//! registered by [`HostRuntime`].
+//!
+//! Boundary rules encoded here, per the product spec:
+//!
+//! - JavaScript reaches Rust only through the versioned ops declared in
+//!   [`host::HostOp`] and registered by [`HostRuntime`].  There is no op that
+//!   grants SQL, arbitrary network, filesystem, process or environment-variable
+//!   access, and no op that synthesises a result when a capability is missing.
+//! - The op bodies delegate to the [`host::HostOps`] trait, which the API
+//!   process implements over its own repositories and provider bridge.  The
+//!   dependency therefore runs `geo-api -> geo-worker`, never the reverse.
+//! - Modules are only those seeded into [`InMemoryModuleLoader`]; there is no
+//!   filesystem, network or package-registry resolution.
+//! - Rust owns the state that survives a restart, so checkpoints are
+//!   serialised host state rather than opaque engine snapshots.
+//! - The probe's deterministic model stub is registered only on
+//!   [`ProbeRuntime`].  A production run has no path to a fabricated answer.
+
+pub mod bundle;
+pub mod host;
+mod host_ops;
+mod host_runtime;
+pub mod loader;
+pub mod ops;
+pub mod runtime;
+
+pub use bundle::{
+    GEO_LOOP_JS, HOST_BUNDLE, HOST_LOOP_JS, HOST_MAIN_MODULE, HOST_OPS_JS, LOOP_CORE_JS,
+    MAIN_MODULE, PROBE_BUNDLE, TURN_COMPLETION_TOPIC,
+};
+pub use host::{
+    ChannelBoundMeasurementPlanItem, ChannelDiscoverRequest, ChannelDiscoveryItem,
+    ChannelDiscoveryKind, ChannelDiscoveryPage, ChannelExecutionResult, ChannelExecutionState,
+    ChannelManifestPage, ChannelManifestReadRequest, ChannelMeasurementPlanItem,
+    ChannelPlanReceipt, ChannelPlanRequest, ChannelPublicationLookupObservation,
+    ChannelPublicationLookupSummary, ChannelPublicationPlanItem, ChannelTargetExecuteRequest,
+    ChannelTargetKind, ChannelTargetSummary, ContentCloseRequest, ContentDistributeReadRequest,
+    ContentDistributeRef, ContentDistributeRequest, ContentDocumentReadRequest,
+    ContentDocumentSnapshot, ContentExecutionReadRequest, ContentExecutionRef, ContentHandoffRef,
+    ContentItemRef, ContentItemsPage, ContentItemsReadRequest, ContentMediaBindRequest,
+    ContentMediaInsertReceipt, ContentMediaInsertRequest, ContentMediaListRequest,
+    ContentMediaPage, ContentMediaRef, ContentRequestDeferral, ContentStartRequest,
+    ContentStepRequest, CreateQuestionSet, DistributionManifestRef, DistributionReadRequest,
+    DistributionResumeRequest, DistributionStartRequest, DistributionTargetRef,
+    DistributionTargetsPage, DistributionTargetsReadRequest, HOST_OP_ERROR_BOOTSTRAP,
+    HOST_OP_ERROR_NAME, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets, HostOpError,
+    HostOpErrorCode, HostOpLimits, HostOpMeter, HostOps, KnowledgeImportAttachmentItem,
+    KnowledgeImportAttachmentResultItem, KnowledgeImportAttachmentsRequest,
+    KnowledgeImportAttachmentsResult, KnowledgeImportStatusRequest, KnowledgeSearchRequest,
+    KnowledgeSearchResult, KnowledgeTextReadRequest, KnowledgeTextReadResult,
+    KnowledgeTextReviseRequest, ManifestCoverage, ManifestItem, ManifestKind, ManifestPage,
+    ManifestPlanningState, ManifestReadRequest, MeasureRequest, MeasureSample,
+    MeasurementModelOption, MeasurementOptionsRequest, MeasurementOptionsResult,
+    MeasurementPeriodListKind, MeasurementPeriodPreviewProjection,
+    MeasurementPeriodReportProjection, MeasurementPlanCreateRequest, MeasurementPlanReadRequest,
+    MeasurementPlanReceipt, MeasurementPlanStatus, MeasurementSurface, MeasurementTargetStatus,
+    ModelCompletion, ModelCompletionRequest, ModelMessage, ModelToolCall, ModelToolDefinition,
+    ModelToolFunctionCall, ModelToolFunctionDefinition, ProjectCurrentRequest,
+    ProjectCurrentResult, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
+    PublishReceipt, PublishRequest, PublishState, QuestionDiscoverRequest, QuestionDiscoveryItem,
+    QuestionDiscoveryPage, QuestionReference, QuestionReviseRequest, QuestionWriteReceipt,
+    ReportGetRequest, ReportKind, ReportPreviewRequest, ReportPreviewResult, ReportReduceRequest,
+    ReportResult, ReviseQuestionSet, SourceRecommendationsRequest, TenantScope, ToolCallIdentity,
+    ToolCallOutcome, ToolCallRecorder, redact_secrets,
+};
+pub use host_runtime::HostRuntime;
+mod serp_tools;
+pub use loader::InMemoryModuleLoader;
+pub use ops::{HostEvent, HostState};
+pub use runtime::{EmbeddedIsolate, ProbeRuntime, WorkerError};
+pub use serp_tools::*;

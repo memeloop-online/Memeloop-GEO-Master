@@ -88,6 +88,13 @@ export interface CreateProjectInput {
   settings: ProjectSettings;
 }
 
+/** Drafts may omit unknown settings; only starting requires complete input. */
+export interface CreateProjectDraftInput {
+  slug?: string;
+  display_name: string;
+  settings: Partial<ProjectSettings>;
+}
+
 export interface CountEstimate {
   state: "unknown" | "estimated" | "frozen";
   value: number | null;
@@ -162,6 +169,7 @@ export interface UpdateProjectInput {
   revision: number;
   display_name?: string;
   settings?: Partial<ProjectSettings>;
+  idempotencyKey?: string;
 }
 
 export interface ProjectOverview {
@@ -242,7 +250,7 @@ export function getProject(
 
 export function createProject(
   tenantId: string,
-  input: CreateProjectInput,
+  input: CreateProjectDraftInput,
   idempotencyKey?: ApiRequestOptions["idempotencyKey"],
 ): Promise<Project> {
   return apiFetch<Project>("/projects", {
@@ -305,11 +313,13 @@ export function updateProject(
   projectId: string,
   input: UpdateProjectInput,
 ): Promise<Project> {
+  const { idempotencyKey, ...body } = input;
   return apiFetch<Project>(`/projects/${encodeURIComponent(projectId)}`, {
     method: "PATCH",
-    body: input,
+    body,
     headers: { "If-Match": String(input.revision) },
     tenantId,
+    idempotencyKey,
   });
 }
 

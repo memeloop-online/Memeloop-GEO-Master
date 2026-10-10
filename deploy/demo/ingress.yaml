@@ -1,0 +1,28 @@
+# Replace the reserved example hostname, ingress class and TLS Secret reference
+# in private deployment configuration before applying this optional template.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: geo-demo
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [geo.example.invalid]
+      secretName: geo-demo-tls
+  rules:
+    - host: geo.example.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 8080

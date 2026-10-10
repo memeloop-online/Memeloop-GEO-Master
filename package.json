@@ -10,10 +10,11 @@
     "pnpm": ">=10.17.1"
   },
   "scripts": {
+    "agent:bundle": "node scripts/bundle-agent.mjs",
     "dev": "pnpm -r --parallel --if-present run dev",
     "build": "pnpm -r --if-present run build",
-    "format": "prettier --write .github package.json pnpm-workspace.yaml compose.yaml README.md CONTRIBUTING.md && pnpm -r --if-present run format",
-    "format:check": "prettier --check .github package.json pnpm-workspace.yaml compose.yaml README.md CONTRIBUTING.md && pnpm -r --if-present run format:check",
+    "format": "prettier --write .github package.json pnpm-workspace.yaml compose.yaml README.md CONTRIBUTING.md \"scripts/**/*.mjs\" && pnpm -r --if-present run format",
+    "format:check": "prettier --check .github package.json pnpm-workspace.yaml compose.yaml README.md CONTRIBUTING.md \"scripts/**/*.mjs\" && pnpm -r --if-present run format:check",
     "lint": "pnpm -r --if-present run lint",
     "typecheck": "pnpm --filter @memeloop-geo/web exec tsc --build --pretty false",
     "test": "pnpm -r --if-present run test"

@@ -16,7 +16,9 @@ use tokio::sync::RwLock;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{AppError, Operator, OperatorId, TenantId};
+use crate::{
+    AppError, Operator, OperatorAppearance, OperatorId, TenantId, UpdateOperatorAppearance,
+};
 
 pub const DEVELOPMENT_USER_EMAIL: &str = "demo@localhost";
 pub const DEFAULT_SESSION_TTL_SECS: i64 = 60 * 60 * 12;
@@ -303,6 +305,28 @@ pub struct LoginIdentity {
 #[async_trait]
 pub trait AuthRepository: Send + Sync {
     async fn operator_for_host(&self, host: &str) -> Result<Option<Operator>, AppError>;
+    async fn operator_appearance(
+        &self,
+        operator_id: OperatorId,
+    ) -> Result<Option<OperatorAppearance>, AppError> {
+        let _ = operator_id;
+        Err(AppError::new(
+            crate::ErrorCode::DependencyUnavailable,
+            "operator appearance storage is not configured",
+        ))
+    }
+    async fn update_operator_appearance(
+        &self,
+        operator_id: OperatorId,
+        expected_revision: i64,
+        update: UpdateOperatorAppearance,
+    ) -> Result<OperatorAppearance, AppError> {
+        let _ = (operator_id, expected_revision, update);
+        Err(AppError::new(
+            crate::ErrorCode::DependencyUnavailable,
+            "operator appearance storage is not configured",
+        ))
+    }
     async fn authenticate(
         &self,
         operator_id: OperatorId,
@@ -340,6 +364,7 @@ pub trait AuthRepository: Send + Sync {
 #[derive(Debug, Default)]
 struct MemoryAuthData {
     operators: HashMap<OperatorId, Operator>,
+    appearances: HashMap<OperatorId, OperatorAppearance>,
     host_operators: HashMap<String, OperatorId>,
     users: HashMap<UserId, User>,
     memberships: Vec<Membership>,
@@ -457,6 +482,55 @@ impl AuthRepository for MemoryAuthRepository {
             return Ok(None);
         };
         Ok(data.operators.get(operator_id).cloned())
+    }
+
+    async fn operator_appearance(
+        &self,
+        operator_id: OperatorId,
+    ) -> Result<Option<OperatorAppearance>, AppError> {
+        let data = self.data.read().await;
+        Ok(data.operators.get(&operator_id).map(|operator| {
+            data.appearances
+                .get(&operator_id)
+                .cloned()
+                .unwrap_or_else(|| OperatorAppearance::for_operator(operator))
+        }))
+    }
+
+    async fn update_operator_appearance(
+        &self,
+        operator_id: OperatorId,
+        expected_revision: i64,
+        update: UpdateOperatorAppearance,
+    ) -> Result<OperatorAppearance, AppError> {
+        let update = update.validate()?;
+        if expected_revision < 1 || expected_revision == i64::MAX {
+            return Err(AppError::invalid_request("invalid appearance revision"));
+        }
+        let mut data = self.data.write().await;
+        let operator = data
+            .operators
+            .get(&operator_id)
+            .ok_or_else(|| AppError::not_found("operator is not configured"))?;
+        let current = data
+            .appearances
+            .get(&operator_id)
+            .cloned()
+            .unwrap_or_else(|| OperatorAppearance::for_operator(operator));
+        if current.revision != expected_revision {
+            return Err(AppError::conflict("operator appearance revision changed"));
+        }
+        let appearance = OperatorAppearance {
+            display_name: update.display_name,
+            logo_url: None,
+            primary_color: update.primary_color,
+            default_locale: update.default_locale,
+            revision: current.revision + 1,
+        };
+        data.operators.get_mut(&operator_id).unwrap().display_name =
+            appearance.display_name.clone();
+        data.appearances.insert(operator_id, appearance.clone());
+        Ok(appearance)
     }
 
     async fn authenticate(

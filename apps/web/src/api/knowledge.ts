@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { uploadMediaType as declaredMediaType } from "./upload-media";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor, type QueryScope } from "../auth/types";
 import {
@@ -24,9 +25,19 @@ export interface Capability {
   configured_at?: string | null;
 }
 
-export type CapabilityName = "ocr" | "vector" | "llm" | "url_fetch";
+export type CapabilityName =
+  | "pdf_parser"
+  | "docx_parser"
+  | "xlsx_parser"
+  | "ocr"
+  | "vector"
+  | "llm"
+  | "url_fetch";
 
 export interface KnowledgeCapabilities {
+  pdf_parser: Capability;
+  docx_parser: Capability;
+  xlsx_parser: Capability;
   ocr: Capability;
   vector: Capability;
   llm: Capability;
@@ -48,10 +59,24 @@ export interface SourceLocator {
   ocr?: boolean | null;
   heading_path?: string[] | null;
   paragraph_index?: number | null;
+  body_element_index?: number | null;
+  table_index?: number | null;
+  table_row?: number | null;
+  table_column?: number | null;
+  table_row_span?: number | null;
+  table_col_span?: number | null;
+  table_merged?: boolean | null;
   table?: { row?: number; column?: number } | null;
   sheet?: string | null;
   range?: string | null;
   header_range?: string | null;
+  merged_range?: string | null;
+  cell_kind?: string | null;
+  display_value?: string | null;
+  formula?: string | null;
+  cached_kind?: string | null;
+  cached_value?: string | null;
+  header_row?: number | null;
   snapshot_object_id?: string | null;
   original_url?: string | null;
   selector?: string | null;
@@ -93,12 +118,36 @@ export interface SourceVersion {
   source_version_id: string;
   source_id: string;
   version: number;
+  representation?: "original" | "authored_text";
   content_sha256?: string | null;
   captured_at?: string | null;
   original_url?: string | null;
   parser_version?: string | null;
   extraction_version?: string | null;
   created_at?: string | null;
+}
+
+export interface SourceVersionContent {
+  source_version_id: string;
+  representation: "original" | "authored_text";
+  media_type: string;
+  text: string;
+  text_basis: "exact" | "extracted";
+}
+
+export interface SaveSourceTextInput {
+  sourceId: string;
+  revision: number;
+  baseVersionId: string;
+  mediaType: "text/plain" | "text/markdown";
+  text: string;
+  idempotencyKey: string;
+}
+
+export interface SaveSourceTextReceipt {
+  source: SourceSummary;
+  source_version: SourceVersion;
+  knowledge_release: KnowledgeRelease;
 }
 
 export interface SourceChunk {
@@ -167,7 +216,15 @@ export interface ImportJob {
   attempt?: number | null;
   completed_units?: number | null;
   failed_units?: number | null;
-  errors?: Array<{ code?: string; message?: string; unit?: string }> | null;
+  errors?: Array<{
+    code?: string;
+    page?: number;
+    message?: string;
+    unit?: string;
+    unit_id?: number;
+    format?: "docx" | "xlsx";
+  }> | null;
+  resumed_from?: string | null;
   updated_at?: string | null;
 }
 
@@ -379,6 +436,14 @@ export const knowledgeQueryKeys = {
       ...scopeKey(scope),
       sourceId,
     ] as const,
+  versionContent: (scope: QueryScope, sourceId: string, versionId: string) =>
+    [
+      ...knowledgeQueryKeys.all,
+      "source-version-content",
+      ...scopeKey(scope),
+      sourceId,
+      versionId,
+    ] as const,
   products: (scope: QueryScope) =>
     [...knowledgeQueryKeys.all, "products", ...scopeKey(scope)] as const,
   facts: (scope: QueryScope, productId: string | null, query: string) =>
@@ -428,6 +493,9 @@ function normalizeCapabilities(value: unknown): KnowledgeCapabilities {
   const root = asRecord(value);
   const values = asRecord(root.capabilities ?? root);
   return {
+    pdf_parser: capability(values.pdf_parser),
+    docx_parser: capability(values.docx_parser),
+    xlsx_parser: capability(values.xlsx_parser),
     ocr: capability(values.ocr),
     vector: capability(values.vector ?? values.vector_search),
     llm: capability(values.llm ?? values.llm_answering),
@@ -676,6 +744,55 @@ export async function getSource(
   );
 }
 
+export function getSourceVersionContent(
+  tenantId: string,
+  projectId: string,
+  sourceId: string,
+  versionId: string,
+): Promise<SourceVersionContent> {
+  return apiFetch<SourceVersionContent>(
+    `/knowledge/sources/${encodeURIComponent(sourceId)}/versions/${encodeURIComponent(versionId)}/content`,
+    scopedOptions(tenantId, projectId),
+  );
+}
+
+export function saveSourceText(
+  tenantId: string,
+  projectId: string,
+  input: SaveSourceTextInput,
+): Promise<SaveSourceTextReceipt> {
+  return apiFetch<SaveSourceTextReceipt>(
+    `/knowledge/sources/${encodeURIComponent(input.sourceId)}/versions`,
+    {
+      ...scopedOptions(tenantId, projectId),
+      method: "POST",
+      headers: { "If-Match": String(input.revision) },
+      idempotencyKey: input.idempotencyKey,
+      body: {
+        base_version_id: input.baseVersionId,
+        media_type: input.mediaType,
+        text: input.text,
+      },
+    },
+  );
+}
+
+export function retryImportJob(
+  tenantId: string,
+  projectId: string,
+  importJobId: string,
+  idempotencyKey = createIdempotencyKey(),
+): Promise<ImportJob> {
+  return apiFetch<ImportJob>(
+    `/knowledge/import-jobs/${encodeURIComponent(importJobId)}/retry`,
+    {
+      ...scopedOptions(tenantId, projectId),
+      method: "POST",
+      idempotencyKey,
+    },
+  );
+}
+
 export async function listProducts(
   tenantId: string,
   projectId: string,
@@ -792,17 +909,6 @@ async function sha256(file: File) {
   return Array.from(new Uint8Array(digest), (value) =>
     value.toString(16).padStart(2, "0"),
   ).join("");
-}
-
-function declaredMediaType(file: File) {
-  if (file.type) return file.type;
-  const filename = file.name.toLocaleLowerCase();
-  if (filename.endsWith(".txt")) return "text/plain";
-  if (filename.endsWith(".md") || filename.endsWith(".markdown")) {
-    return "text/markdown";
-  }
-  if (filename.endsWith(".csv")) return "text/csv";
-  return "application/octet-stream";
 }
 
 export async function uploadFile(
@@ -957,6 +1063,13 @@ export function useSourcesQuery(
         ],
     queryFn: () => listSources(tenantId!, projectId!, query),
     enabled: Boolean(scope),
+    refetchInterval: (queryState) =>
+      queryState.state.data?.items.some(
+        (item) =>
+          item.import_status === "queued" || item.import_status === "running",
+      )
+        ? 2500
+        : false,
   });
 }
 
@@ -981,6 +1094,46 @@ export function useSourceQuery(
           ],
     queryFn: () => getSource(tenantId!, projectId!, sourceId!),
     enabled: Boolean(scope && sourceId),
+    refetchInterval: (queryState) =>
+      ["queued", "running"].includes(
+        queryState.state.data?.import_jobs.at(-1)?.status ?? "",
+      )
+        ? 2500
+        : false,
+  });
+}
+
+export function useSourceVersionContentQuery(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+  sourceId: string | undefined,
+  versionId: string | undefined,
+) {
+  const scope = useScope(tenantId, projectId);
+  return useQuery({
+    queryKey:
+      scope && sourceId && versionId
+        ? knowledgeQueryKeys.versionContent(scope, sourceId, versionId)
+        : [...knowledgeQueryKeys.all, "source-version-content", "anonymous"],
+    queryFn: () =>
+      getSourceVersionContent(tenantId!, projectId!, sourceId!, versionId!),
+    enabled: Boolean(scope && sourceId && versionId),
+    retry: false,
+  });
+}
+
+export function useSaveSourceTextMutation(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+) {
+  const queryClient = useQueryClient();
+  const scope = useScope(tenantId, projectId);
+  return useMutation({
+    mutationFn: (input: SaveSourceTextInput) => {
+      if (!tenantId || !projectId) throw new Error("请先选择项目。");
+      return saveSourceText(tenantId, projectId, input);
+    },
+    onSuccess: () => invalidateKnowledge(queryClient, scope),
   });
 }
 
@@ -1097,6 +1250,21 @@ export function useUploadFilesMutation(
         ),
       );
       return results;
+    },
+    onSuccess: () => invalidateKnowledge(queryClient, scope),
+  });
+}
+
+export function useRetryImportJobMutation(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+) {
+  const queryClient = useQueryClient();
+  const scope = useScope(tenantId, projectId);
+  return useMutation({
+    mutationFn: (importJobId: string) => {
+      if (!tenantId || !projectId) throw new Error("请先选择项目。");
+      return retryImportJob(tenantId, projectId, importJobId);
     },
     onSuccess: () => invalidateKnowledge(queryClient, scope),
   });

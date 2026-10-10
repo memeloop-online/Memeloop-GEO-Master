@@ -38,6 +38,9 @@ input {
   border-right: 1px solid #e2e4e8;
   background: #fff;
 }
+.sidebar-dismiss {
+  display: none;
+}
 .brand {
   height: 56px;
   display: flex;
@@ -50,7 +53,7 @@ input {
   font-weight: 600;
 }
 .brand b {
-  color: #0f6cbd;
+  color: var(--oem-primary-color, #2563eb);
   font-weight: 700;
 }
 .brand-mark {
@@ -59,7 +62,7 @@ input {
   width: 30px;
   height: 30px;
   border-radius: 8px;
-  background: linear-gradient(145deg, #0f6cbd, #185abd);
+  background: var(--oem-primary-color, #2563eb);
   color: #fff;
   font-size: 15px;
   font-weight: 800;
@@ -71,6 +74,10 @@ input {
   padding: 10px 8px;
   gap: 2px;
   overflow-y: auto;
+}
+.nav-group {
+  display: flex;
+  flex-direction: column;
 }
 .nav-link {
   display: grid;
@@ -85,13 +92,34 @@ input {
   font-size: 14px;
   white-space: nowrap;
 }
+.nav-children {
+  display: flex;
+  flex-direction: column;
+  padding: 2px 0 6px 41px;
+  gap: 2px;
+}
+.nav-child-link {
+  padding: 7px 8px;
+  border-radius: 6px;
+  color: #4a4a4a;
+  font-size: 13px;
+  text-decoration: none;
+}
+.nav-child-link:hover,
+.nav-child-link.active {
+  background: #e8f2fc;
+  color: var(--oem-primary-color, #2563eb);
+}
+.nav-child-link.active {
+  font-weight: 600;
+}
 .nav-link:hover {
   background: #f3f5f7;
-  color: #0f6cbd;
+  color: var(--oem-primary-color, #2563eb);
 }
 .nav-link.active {
   background: #e8f2fc;
-  color: #0f6cbd;
+  color: var(--oem-primary-color, #2563eb);
   font-weight: 600;
 }
 .nav-link small {
@@ -112,7 +140,7 @@ input {
   place-items: center;
   padding: 8px 4px;
 }
-.collapse-button {
+.sidebar > .collapse-button {
   margin: auto 10px 12px;
   min-height: 36px;
 }
@@ -811,7 +839,7 @@ input {
 }
 .estimate-coverage {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin: 0;
 }
@@ -853,6 +881,38 @@ input {
   display: grid;
   grid-template-columns: minmax(0, 1.6fr) minmax(280px, 0.75fr);
   gap: 16px;
+}
+.document-manifest-page {
+  display: grid;
+  gap: 16px;
+}
+.manifest-items ul {
+  display: grid;
+  gap: 12px;
+  padding: 0;
+  list-style: none;
+}
+.manifest-items h2 {
+  margin: 0 0 12px;
+}
+.manifest-item-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.manifest-item-heading h3 {
+  margin: 0;
+}
+.manifest-items dl {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) minmax(0, 1fr);
+  gap: 6px 12px;
+  overflow-wrap: anywhere;
+}
+.manifest-items dd {
+  margin: 0;
 }
 .primary-workbench {
   min-height: 370px;
@@ -966,6 +1026,24 @@ input {
   .app-shell.sidebar-collapsed {
     --sidebar-width: 64px;
   }
+  .app-shell:not(.sidebar-collapsed) .sidebar-dismiss {
+    position: fixed;
+    inset: 0;
+    z-index: 19;
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: rgb(0 0 0 / 18%);
+  }
+  .app-shell:not(.sidebar-collapsed) .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 20;
+    width: min(224px, calc(100vw - 64px));
+    height: 100vh;
+    box-shadow: 4px 0 16px rgb(0 0 0 / 15%);
+  }
   .topbar {
     padding: 0 12px;
   }
@@ -1047,9 +1125,6 @@ input {
   }
   .sidebar .brand {
     padding-left: 17px;
-  }
-  .collapse-button {
-    display: none;
   }
 }
 
@@ -1239,6 +1314,10 @@ input {
   font-size: 12px;
   white-space: nowrap;
 }
+.knowledge-panel-heading > .fui-Badge {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 .knowledge-table-scroll {
   overflow-x: auto;
 }
@@ -1274,6 +1353,8 @@ input {
 .knowledge-table td b,
 .knowledge-table td small {
   display: block;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .knowledge-table td small {
   margin-top: 3px;
@@ -1319,6 +1400,18 @@ input {
   background: #fff;
   box-shadow: -8px 0 24px rgba(0, 0, 0, 0.14);
 }
+.knowledge-import-sidebar,
+.knowledge-import-sidebar .fui-MessageBar,
+.knowledge-import-sidebar .fui-Field {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.knowledge-import-sidebar .fui-Input,
+.knowledge-import-sidebar .fui-Select,
+.knowledge-import-sidebar .fui-Textarea {
+  min-width: 0;
+  max-width: 100%;
+}
 .knowledge-sidebar-heading {
   padding-bottom: 16px;
   border-bottom: 1px solid #e1e4e8;
@@ -1329,17 +1422,20 @@ input {
 }
 .knowledge-import-form {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   padding: 18px 0;
 }
 .knowledge-import-section {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
 .knowledge-inline-heading {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 12px;
   border: 1px dashed #9ba8b5;
@@ -1348,7 +1444,14 @@ input {
 }
 .knowledge-inline-heading div {
   display: grid;
+  min-width: 0;
   gap: 3px;
+}
+.knowledge-import-queue li span,
+.knowledge-import-results li span,
+.knowledge-import-results li small {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .knowledge-inline-heading small {
   color: #616161;
@@ -1416,6 +1519,9 @@ input {
   gap: 12px;
   align-items: start;
 }
+.source-detail-workbench--text-first > .source-text-panel {
+  grid-column: 1 / -1;
+}
 .source-original-panel,
 .source-extraction-panel,
 .source-impact-panel {
@@ -1433,6 +1539,29 @@ input {
     "Cascadia Code",
     monospace;
   white-space: pre-wrap;
+}
+
+.csv-evidence-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.csv-evidence-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.csv-evidence-table th,
+.csv-evidence-table td {
+  padding: 8px;
+  border: 1px solid #d1d1d1;
+  text-align: left;
+  vertical-align: top;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 100px;
+}
+.csv-evidence-table th span,
+.csv-evidence-table th small {
+  display: block;
 }
 .source-chunk-list {
   display: grid;
@@ -1692,6 +1821,9 @@ input {
   .source-detail-workbench,
   .knowledge-ask-layout {
     grid-template-columns: 1fr;
+  }
+  .knowledge-table {
+    min-width: 640px;
   }
   .knowledge-context,
   .source-impact-panel {

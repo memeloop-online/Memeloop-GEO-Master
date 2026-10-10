@@ -1,11 +1,101 @@
 //! Axum HTTP boundary for the GEO modular monolith.
 
 mod agent;
+mod project_ai_settings;
+pub use project_ai_settings::{
+    InheritedModelMetadata, ProjectAiSettingsService, ProjectAiSettingsView,
+    ResolvedProjectAiConfig, UpdateProjectAiSettings,
+};
+mod project_ai_model;
+pub use project_ai_model::ProjectConfiguredModelBridge;
+mod agent_runtime;
+mod appearance;
+mod browser_bridge;
+mod channel_jobs;
+mod channel_tools;
+mod channels;
+mod citation_insights;
+mod connector_capabilities;
+mod content;
+mod content_distribution_requests;
+mod content_export;
+mod content_media;
+mod content_media_tools;
+pub mod content_runtime;
+mod content_tools;
+mod desktop_gateway;
+pub mod distribution;
+mod source_channel_recommendations;
+pub use content::ContentService;
+pub use content_distribution_requests::{
+    SingleArticleDistributionRequest, SingleArticlePublication,
+    accept_content_distribution_request, read_content_distribution_publication,
+    read_content_distribution_request,
+};
 mod context;
+mod cycles;
 mod error;
 mod idempotency;
 mod knowledge;
+mod office_parse;
+pub use office_parse::{
+    OFFICE_PARSER_PROFILE, OfficeParserClient, dispatch_office_parse_job,
+    spawn_office_parse_scanner,
+};
+mod pdf_parse;
+pub use pdf_parse::{
+    PDF_PARSER_PROFILE, PdfParserClient, dispatch_pdf_parse_job, spawn_pdf_parse_scanner,
+};
+mod project_tools;
+mod provider_bridge;
+mod publication_lookup;
+pub use publication_lookup::dispatch_publication_lookup;
+mod provider_conversation_cleanup;
+pub use provider_conversation_cleanup::dispatch_provider_conversation_cleanup;
+mod provider_cleanup_callback;
+pub use provider_cleanup_callback::ProviderCleanupCallbackService;
+mod publication_send_callback;
+pub use publication_send_callback::PublicationSendCallbackService;
+mod observation_capture_callback;
+pub use observation_capture_callback::ObservationCaptureCallbackService;
+mod observation_ai_callback;
+pub use observation_ai_callback::ObservationAiCallbackService;
+mod observation_analysis;
+mod observation_evidence;
+pub use observation_analysis::{
+    GroundingResult, HttpSavedObservationGrounder, ObservationAnalysisService,
+    SavedObservationGrounder,
+};
+pub use observation_evidence::ObservationEvidenceResolver;
+mod project_serp_settings;
+mod serp;
+pub use project_serp_settings::{
+    ProjectSerpCredentials, ProjectSerpSettingsPage, ProjectSerpSettingsService,
+    ProjectSerpSettingsView, ProjectSerpSourceFactory, ProjectSerpTestResult,
+    TestProjectSerpSettings, UpdateProjectSerpSettings,
+};
+mod serp_dataforseo;
+pub use serp::{
+    AcceptSerpMeasurement, ReparseSerpSource, ResolvedSerpSource, SerpCapability,
+    SerpExecutionView, SerpMeasurementDetail, SerpMeasurementPage, SerpPreparedSubmission,
+    SerpReadOutcome, SerpService, SerpSource, SerpSourcePage, SerpSourceResolver,
+    spawn_serp_dispatcher,
+};
+pub use serp_dataforseo::{DataForSeoSerpConfig, DataForSeoSerpSource};
+mod measurement_reports;
+mod questions;
+mod questions_tools;
+mod reports;
+pub use measurement_reports::{
+    MeasurementPeriodRequest, default_measurement_period_window, preview_project_measurements,
+    save_project_measurement_report,
+};
+mod run_executor;
+pub use run_executor::dispatch_queued;
+mod standalone_measurements;
 mod storage;
+pub use standalone_measurements::{MeasurementPlanRequest, create_measurement_plan};
+mod measurement_options;
 
 use axum::{
     Json, Router,
@@ -21,16 +111,17 @@ use axum::{
 };
 use futures_util::StreamExt;
 use geo_domain::{
-    AgentRepository, AgentRuntime, AppError, DEFAULT_SESSION_TTL_SECS, DistributionScope,
-    DocumentScope, EventEnvelope, InitialSource, KnowledgeRepository, Membership,
-    MemoryAgentRepository, MemoryAuthRepository, MemoryKnowledgeRepository, MissingAgentRuntime,
-    Operation, Operator, Project, ProjectCreate, ProjectId, ProjectOverview, ProjectPage,
-    ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
-    ReportSchedule, ResourceMode, Role, TenantId, TenantScope, User, hash_idempotency_key,
-    settings_hash, start_request_hash,
+    AgentRepository, AgentRuntime, AppError, ConnectorCapabilityRepository,
+    DEFAULT_SESSION_TTL_SECS, DistributionScope, DocumentScope, EventEnvelope, InitialSource,
+    KnowledgeRepository, Membership, MemoryAgentRepository, MemoryAuthRepository,
+    MemoryConnectorCapabilityRepository, MemoryKnowledgeRepository, MissingAgentRuntime, Operation,
+    Operator, Project, ProjectCreate, ProjectId, ProjectOverview, ProjectPage, ProjectPatch,
+    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ReportRepository, ReportSchedule,
+    ResourceMode, Role, TenantId, TenantScope, User, settings_hash,
 };
 use geo_persistence::{
     Database, PgAuthRepository, PgIdempotencyStore, PgKnowledgeRepository, PgProjectRepository,
+    PgReportRepository,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,6 +137,13 @@ use tokio_stream::wrappers::BroadcastStream;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+pub use agent_runtime::{EmbeddedAgentRuntime, RepositoryHostOps};
+pub use browser_bridge::BrowserBridge;
+pub use channel_jobs::{
+    ChannelDispatchDeferred, ChannelDispatchResult, MeasurementRequest, PlanRequest,
+    PublicationRequest, create_channel_plan, execute_channel_target,
+};
+pub use channels::ChannelService;
 pub use context::{
     AuthContext, AuthMiddlewareState, CORRELATION_ID_HEADER, CSRF_HEADER, DEV_SESSION_COOKIE_NAME,
     OPERATOR_ID_HEADER, OriginConfig, PROJECT_ID_HEADER, REQUEST_ID_HEADER, RequestContext,
@@ -68,10 +166,16 @@ pub use idempotency::{
     MAX_IDEMPOTENCY_REQUEST_BYTES, MAX_IDEMPOTENCY_RESPONSE_BYTES, MemoryIdempotencyStore,
     SharedIdempotencyStore, StoredResponse, body_hash, json_command_idempotency_middleware,
 };
+pub use provider_bridge::{
+    ModelProviderBridge, ProviderClientBridge, ProviderRoute, ProviderRouteResolver,
+    RoutedProviderClientBridge, SharedModelProvider,
+};
+pub use reports::{preview_cycle_report, reduce_cycle_report};
 pub use storage::{EventBus, MemoryOperationStore, OperationStore, PgOperationStore};
 
 #[derive(Clone)]
 pub struct AppState {
+    project_ai_settings: ProjectAiSettingsService,
     operation_store: Arc<dyn OperationStore>,
     idempotency_store: Arc<dyn IdempotencyStore>,
     agent_repository: Arc<dyn AgentRepository>,
@@ -79,6 +183,32 @@ pub struct AppState {
     auth_repository: SharedAuthRepository,
     project_repository: Arc<dyn ProjectRepository>,
     knowledge_repository: Arc<dyn KnowledgeRepository>,
+    question_repository: Arc<dyn geo_domain::QuestionRepository>,
+    report_repository: Arc<dyn ReportRepository>,
+    connector_capability_repository: Arc<dyn ConnectorCapabilityRepository>,
+    channel_service: ChannelService,
+    desktop_grants: desktop_gateway::DesktopGrants,
+    channel_job_repository: Arc<dyn geo_domain::ChannelJobRepository>,
+    publication_lookup_repository: Option<Arc<dyn geo_domain::PublicationLookupRepository>>,
+    publication_send_callback: Option<PublicationSendCallbackService>,
+    observation_capture_callback: Option<ObservationCaptureCallbackService>,
+    observation_ai_callback: Option<ObservationAiCallbackService>,
+    observation_analysis: Option<ObservationAnalysisService>,
+    observation_evidence_resolver: Option<ObservationEvidenceResolver>,
+    serp_service: Option<SerpService>,
+    project_serp_settings: Option<ProjectSerpSettingsService>,
+    provider_cleanup_callback: Option<ProviderCleanupCallbackService>,
+    content_repository: Arc<dyn geo_domain::ContentRepository>,
+    content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
+    distribution_repository: Arc<dyn geo_domain::DistributionRepository>,
+    content_distribution_request_repository:
+        Arc<dyn geo_domain::ContentDistributionRequestRepository>,
+    memory_request_repository: Option<geo_domain::MemoryContentDistributionRequestRepository>,
+    distribution_intent_lookup: Arc<DistributionIntentLookupAdapter>,
+    content_dispatch_repository: Option<geo_persistence::PgContentRepository>,
+    content_model: Arc<std::sync::RwLock<Option<SharedModelProvider>>>,
+    content_executor:
+        Arc<std::sync::RwLock<Option<Arc<dyn content_runtime::ContentWorkflowExecutor>>>>,
     events: EventBus,
     ready: Arc<AtomicBool>,
     durable_storage: bool,
@@ -86,7 +216,55 @@ pub struct AppState {
     origin_config: OriginConfig,
 }
 
+struct DistributionIntentLookupAdapter(
+    std::sync::RwLock<Arc<dyn geo_domain::DistributionRepository>>,
+);
+
+#[async_trait::async_trait]
+impl geo_domain::ContentDistributionIntentLookup for DistributionIntentLookupAdapter {
+    async fn get_existing_publication(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+    ) -> Result<geo_domain::PublicationBundle, AppError> {
+        let repository = self.0.read().expect("distribution lookup lock").clone();
+        repository.get_publication_bundle(scope, intent_id).await
+    }
+
+    async fn materialize_accepted_request(
+        &self,
+        scope: &TenantScope,
+        request: &geo_domain::ContentDistributionRequest,
+        revision: &geo_domain::ContentRevision,
+    ) -> Result<geo_domain::PublicationIntent, AppError> {
+        let repository = self.0.read().expect("distribution lookup lock").clone();
+        repository
+            .materialize_request_origin(scope, request, revision)
+            .await
+    }
+
+    async fn materialize_accepted_rich_request(
+        &self,
+        scope: &TenantScope,
+        request: &geo_domain::ContentDistributionRequest,
+        revision: &geo_domain::ContentRevision,
+        bindings: Vec<geo_domain::ContentMediaBinding>,
+    ) -> Result<geo_domain::PublicationIntent, AppError> {
+        let repository = self.0.read().expect("distribution lookup lock").clone();
+        repository
+            .materialize_rich_request_origin(scope, request, revision, bindings)
+            .await
+    }
+}
+
 impl AppState {
+    pub fn project_ai_settings(&self) -> ProjectAiSettingsService {
+        self.project_ai_settings.clone()
+    }
+    pub fn with_project_ai_settings(mut self, service: ProjectAiSettingsService) -> Self {
+        self.project_ai_settings = service;
+        self
+    }
     /// Construct the explicitly non-durable development state.
     pub fn development() -> Self {
         // Tests and in-process callers must opt into a password explicitly;
@@ -95,20 +273,105 @@ impl AppState {
     }
 
     pub fn development_with_password(password: &str) -> Self {
-        Self {
+        Self::development_with_knowledge_repository(
+            password,
+            Arc::new(MemoryKnowledgeRepository::default()),
+        )
+    }
+
+    fn development_with_knowledge_repository(
+        password: &str,
+        knowledge_repository: Arc<dyn KnowledgeRepository>,
+    ) -> Self {
+        let distribution_repository: Arc<dyn geo_domain::DistributionRepository> =
+            Arc::new(geo_domain::MemoryDistributionRepository::default());
+        let distribution_intent_lookup = Arc::new(DistributionIntentLookupAdapter(
+            std::sync::RwLock::new(distribution_repository.clone()),
+        ));
+        let memory_request_repository = geo_domain::MemoryContentDistributionRequestRepository::new(
+            distribution_intent_lookup.clone(),
+        );
+        let content_media_repository = Arc::new(
+            geo_domain::MemoryContentMediaRepository::with_knowledge_repository(
+                knowledge_repository.clone(),
+            ),
+        );
+        let mut state = Self {
+            project_ai_settings: ProjectAiSettingsService::development(),
             operation_store: Arc::new(MemoryOperationStore::default()),
             idempotency_store: Arc::new(MemoryIdempotencyStore::default()),
             agent_repository: Arc::new(MemoryAgentRepository::default()),
             agent_runtime: Arc::new(MissingAgentRuntime),
             auth_repository: Arc::new(MemoryAuthRepository::development_with_password(password)),
             project_repository: Arc::new(geo_domain::MemoryProjectRepository::default()),
-            knowledge_repository: Arc::new(MemoryKnowledgeRepository::default()),
+            knowledge_repository,
+            question_repository: Arc::new(geo_domain::MemoryQuestionRepository::default()),
+            report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
+            connector_capability_repository: Arc::new(
+                MemoryConnectorCapabilityRepository::default(),
+            ),
+            channel_service: ChannelService::development(),
+            desktop_grants: desktop_gateway::DesktopGrants::default(),
+            channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+            publication_lookup_repository: None,
+            publication_send_callback: None,
+            observation_capture_callback: None,
+            observation_ai_callback: None,
+            observation_analysis: None,
+            observation_evidence_resolver: None,
+            serp_service: None,
+            project_serp_settings: None,
+            provider_cleanup_callback: None,
+            content_repository: Arc::new(
+                geo_domain::MemoryContentRepository::with_media_repository(
+                    content_media_repository.clone(),
+                ),
+            ),
+            content_media_repository,
+            distribution_repository,
+            content_distribution_request_repository: Arc::new(memory_request_repository.clone()),
+            memory_request_repository: Some(memory_request_repository),
+            distribution_intent_lookup,
+            content_dispatch_repository: None,
+            content_model: Arc::new(std::sync::RwLock::new(None)),
+            content_executor: Arc::new(std::sync::RwLock::new(None)),
             events: EventBus::default(),
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage: false,
             origin_scheme: Arc::from("http"),
             origin_config: OriginConfig::local_http(),
-        }
+        };
+        state.refresh_memory_request_authorities();
+        state
+    }
+
+    /// Replace the identity store during explicit local application assembly.
+    pub fn with_auth_repository(mut self, repository: SharedAuthRepository) -> Self {
+        self.auth_repository = repository;
+        self
+    }
+
+    pub fn development_with_pdf_parser_profile(password: &str, profile: String) -> Self {
+        Self::development_with_parser_profiles(password, Some(profile), None)
+    }
+
+    pub fn development_with_office_parser_profile(password: &str, profile: String) -> Self {
+        Self::development_with_parser_profiles(password, None, Some(profile))
+    }
+
+    pub fn development_with_parser_profiles(
+        password: &str,
+        pdf_profile: Option<String>,
+        office_profile: Option<String>,
+    ) -> Self {
+        Self::development_with_knowledge_repository(
+            password,
+            Arc::new(MemoryKnowledgeRepository::with_parser_profiles(
+                pdf_profile,
+                office_profile.clone(),
+                office_profile,
+            )),
+        )
     }
 
     pub fn with_stores(
@@ -173,7 +436,27 @@ impl AppState {
         events: EventBus,
         durable_storage: bool,
     ) -> Self {
-        Self {
+        let distribution_repository: Arc<dyn geo_domain::DistributionRepository> =
+            Arc::new(geo_domain::MemoryDistributionRepository::default());
+        let distribution_intent_lookup = Arc::new(DistributionIntentLookupAdapter(
+            std::sync::RwLock::new(distribution_repository.clone()),
+        ));
+        let memory_request_repository = geo_domain::MemoryContentDistributionRequestRepository::new(
+            distribution_intent_lookup.clone(),
+        );
+        let content_media_repository = Arc::new(
+            geo_domain::MemoryContentMediaRepository::with_knowledge_repository(
+                knowledge_repository.clone(),
+            ),
+        );
+        let mut state = Self {
+            project_ai_settings: if durable_storage {
+                ProjectAiSettingsService::unconfigured(Arc::new(
+                    geo_domain::MemoryProjectAiSettingsRepository::default(),
+                ))
+            } else {
+                ProjectAiSettingsService::development()
+            },
             operation_store,
             idempotency_store,
             agent_repository: Arc::new(MemoryAgentRepository::default()),
@@ -181,12 +464,44 @@ impl AppState {
             auth_repository,
             project_repository,
             knowledge_repository,
+            question_repository: Arc::new(geo_domain::MemoryQuestionRepository::default()),
+            report_repository: Arc::new(geo_domain::MemoryReportRepository::default()),
+            connector_capability_repository: Arc::new(
+                MemoryConnectorCapabilityRepository::default(),
+            ),
+            channel_service: ChannelService::development(),
+            desktop_grants: desktop_gateway::DesktopGrants::default(),
+            channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+            publication_lookup_repository: None,
+            publication_send_callback: None,
+            observation_capture_callback: None,
+            observation_ai_callback: None,
+            observation_analysis: None,
+            observation_evidence_resolver: None,
+            serp_service: None,
+            project_serp_settings: None,
+            provider_cleanup_callback: None,
+            content_repository: Arc::new(
+                geo_domain::MemoryContentRepository::with_media_repository(
+                    content_media_repository.clone(),
+                ),
+            ),
+            content_media_repository,
+            distribution_repository,
+            content_distribution_request_repository: Arc::new(memory_request_repository.clone()),
+            memory_request_repository: Some(memory_request_repository),
+            distribution_intent_lookup,
+            content_dispatch_repository: None,
+            content_model: Arc::new(std::sync::RwLock::new(None)),
+            content_executor: Arc::new(std::sync::RwLock::new(None)),
             events,
             ready: Arc::new(AtomicBool::new(false)),
             durable_storage,
             origin_scheme: Arc::from("http"),
             origin_config: OriginConfig::local_http(),
-        }
+        };
+        state.refresh_memory_request_authorities();
+        state
     }
 
     pub fn with_origin_scheme(mut self, scheme: impl Into<Arc<str>>) -> Self {
@@ -220,9 +535,64 @@ impl AppState {
             EventBus::default(),
             true,
         )
-        .with_agent_repository(Arc::new(
-            geo_persistence::PgAgentRepository::from_database(database),
+        .with_agent_repository(Arc::new(geo_persistence::PgAgentRepository::from_database(
+            database,
+        )))
+        .with_report_repository(Arc::new(PgReportRepository::from_database(database)))
+        .with_question_repository(Arc::new(
+            geo_persistence::PgQuestionRepository::from_database(database),
         ))
+        .with_connector_capability_repository(Arc::new(
+            geo_persistence::PgConnectorCapabilityRepository::from_database(database),
+        ))
+        .with_content_repository(Arc::new(
+            geo_persistence::PgContentRepository::from_database(database),
+        ))
+        .with_content_media_repository(Arc::new(
+            geo_persistence::PgContentMediaRepository::from_database(database),
+        ))
+        .with_distribution_repository(Arc::new(
+            geo_persistence::PgDistributionRepository::from_database(database),
+        ))
+        .with_content_distribution_request_repository(Arc::new(
+            geo_persistence::PgContentDistributionRequestRepository::from_database(database),
+        ))
+        .with_content_dispatch_repository(geo_persistence::PgContentRepository::from_database(
+            database,
+        ))
+        .with_channel_job_repository(Arc::new(
+            geo_persistence::PgChannelJobRepository::from_database(database),
+        ))
+        .with_publication_lookup_repository(Arc::new(
+            geo_persistence::PgPublicationLookupRepository::from_database(database),
+        ))
+        .with_channel_service(ChannelService::unconfigured(Arc::new(
+            geo_persistence::PgChannelRepository::from_database(database),
+        )))
+        .with_project_ai_settings(ProjectAiSettingsService::unconfigured(Arc::new(
+            geo_persistence::PgProjectAiSettingsRepository::from_database(database),
+        )))
+    }
+
+    pub fn from_database_with_pdf_parser_profile(database: &Database, profile: String) -> Self {
+        Self::from_database_with_parser_profiles(database, Some(profile), None)
+    }
+
+    pub fn from_database_with_parser_profiles(
+        database: &Database,
+        pdf_profile: Option<String>,
+        office_profile: Option<String>,
+    ) -> Self {
+        let mut state = Self::from_database(database);
+        let mut repository = PgKnowledgeRepository::from_database(database);
+        if let Some(profile) = pdf_profile {
+            repository = repository.with_pdf_parser_profile(profile);
+        }
+        if let Some(profile) = office_profile {
+            repository = repository.with_office_parser_profile(profile);
+        }
+        state.knowledge_repository = Arc::new(repository);
+        state
     }
 
     pub fn operation_store(&self) -> Arc<dyn OperationStore> {
@@ -263,8 +633,372 @@ impl AppState {
         Arc::clone(&self.knowledge_repository)
     }
 
+    pub fn content_media_repository(&self) -> Arc<dyn geo_domain::ContentMediaRepository> {
+        Arc::clone(&self.content_media_repository)
+    }
+
+    pub fn content_repository(&self) -> Arc<dyn geo_domain::ContentRepository> {
+        Arc::clone(&self.content_repository)
+    }
+
+    pub fn with_content_media_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ContentMediaRepository>,
+    ) -> Self {
+        self.content_media_repository = repository;
+        self.refresh_memory_request_authorities();
+        self
+    }
+
+    pub fn question_repository(&self) -> Arc<dyn geo_domain::QuestionRepository> {
+        Arc::clone(&self.question_repository)
+    }
+
+    pub fn with_question_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::QuestionRepository>,
+    ) -> Self {
+        self.question_repository = repository;
+        self
+    }
+
+    pub fn report_repository(&self) -> Arc<dyn ReportRepository> {
+        Arc::clone(&self.report_repository)
+    }
+
+    pub fn connector_capability_repository(&self) -> Arc<dyn ConnectorCapabilityRepository> {
+        Arc::clone(&self.connector_capability_repository)
+    }
+
+    pub fn with_connector_capability_repository(
+        mut self,
+        repository: Arc<dyn ConnectorCapabilityRepository>,
+    ) -> Self {
+        self.connector_capability_repository = repository;
+        self.refresh_memory_request_authorities();
+        self
+    }
+
+    pub fn with_report_repository(mut self, repository: Arc<dyn ReportRepository>) -> Self {
+        self.report_repository = repository;
+        self
+    }
+
     pub fn durable_storage(&self) -> bool {
         self.durable_storage
+    }
+
+    pub fn channel_service(&self) -> &ChannelService {
+        &self.channel_service
+    }
+
+    pub fn content_service(&self) -> ContentService {
+        let service = ContentService::new(
+            Arc::clone(&self.content_repository),
+            self.knowledge_repository(),
+            self.project_repository(),
+        );
+        match self
+            .content_model
+            .read()
+            .expect("content model lock")
+            .clone()
+        {
+            Some(provider) => service.with_model_provider(provider),
+            None => service,
+        }
+    }
+
+    pub fn distribution_repository(&self) -> Arc<dyn geo_domain::DistributionRepository> {
+        Arc::clone(&self.distribution_repository)
+    }
+
+    pub fn content_distribution_request_repository(
+        &self,
+    ) -> Arc<dyn geo_domain::ContentDistributionRequestRepository> {
+        Arc::clone(&self.content_distribution_request_repository)
+    }
+
+    pub fn with_content_distribution_request_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ContentDistributionRequestRepository>,
+    ) -> Self {
+        self.content_distribution_request_repository = repository;
+        self.memory_request_repository = None;
+        self
+    }
+
+    /// Each builder publishes a new immutable validation snapshot while
+    /// sharing only accepted request rows. A cloned AppState cannot silently
+    /// replace another clone's content/account/source/capability authority.
+    fn refresh_memory_request_authorities(&mut self) {
+        if let Some(repository) = self.memory_request_repository.clone() {
+            let repository = repository
+                .with_authorities(
+                    Arc::clone(&self.content_repository),
+                    Arc::clone(&self.knowledge_repository),
+                    Arc::clone(&self.project_repository),
+                    Arc::clone(&self.channel_service.repository),
+                    Arc::clone(&self.connector_capability_repository),
+                )
+                .with_media_repository(Arc::clone(&self.content_media_repository));
+            self.content_distribution_request_repository = Arc::new(repository.clone());
+            self.memory_request_repository = Some(repository);
+        }
+    }
+
+    pub fn distribution_service(&self) -> distribution::DistributionService {
+        distribution::DistributionService::new(
+            Arc::clone(&self.distribution_repository),
+            Arc::clone(&self.content_repository),
+            self.knowledge_repository(),
+            self.project_repository(),
+            Arc::clone(&self.channel_service.repository),
+        )
+        .with_connector_registry(
+            self.connector_capability_repository(),
+            self.channel_service.browser.clone(),
+        )
+        .with_media_repository(self.content_media_repository())
+    }
+
+    pub fn with_distribution_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::DistributionRepository>,
+    ) -> Self {
+        // Fork the adapter too. In-place mutation of an Arc shared by a
+        // previously cloned AppState would silently change its origin ledger.
+        self.distribution_intent_lookup = Arc::new(DistributionIntentLookupAdapter(
+            std::sync::RwLock::new(repository.clone()),
+        ));
+        self.distribution_repository = repository;
+        if let Some(memory) = self.memory_request_repository.take() {
+            self.memory_request_repository =
+                Some(memory.with_distribution_lookup(self.distribution_intent_lookup.clone()));
+        }
+        self.refresh_memory_request_authorities();
+        self
+    }
+
+    pub fn with_content_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ContentRepository>,
+    ) -> Self {
+        self.content_repository = repository;
+        self.refresh_memory_request_authorities();
+        self
+    }
+
+    fn with_content_dispatch_repository(
+        mut self,
+        repository: geo_persistence::PgContentRepository,
+    ) -> Self {
+        self.content_dispatch_repository = Some(repository);
+        self
+    }
+
+    /// Startup-only assembly; shared with the already constructed host bridge.
+    pub fn configure_content_model(&self, provider: SharedModelProvider) {
+        *self.content_model.write().expect("content model lock") = Some(provider);
+    }
+
+    pub fn content_model_available(&self) -> bool {
+        self.content_model
+            .read()
+            .expect("content model lock")
+            .is_some()
+    }
+
+    pub fn configure_content_executor(
+        &self,
+        executor: Arc<dyn content_runtime::ContentWorkflowExecutor>,
+    ) {
+        *self
+            .content_executor
+            .write()
+            .expect("content executor lock") = Some(executor);
+    }
+
+    pub fn content_executor_available(&self) -> bool {
+        self.content_executor
+            .read()
+            .expect("content executor lock")
+            .is_some()
+    }
+
+    pub fn dispatch_content_execution(
+        &self,
+        scope: TenantScope,
+        execution_id: Uuid,
+    ) -> Result<(), AppError> {
+        let executor = self
+            .content_executor
+            .read()
+            .expect("content executor lock")
+            .clone()
+            .ok_or_else(|| {
+                AppError::capability_missing("content workflow engine is not configured")
+            })?;
+        let Some(repository) = self.content_dispatch_repository.clone() else {
+            return executor.dispatch(scope, execution_id);
+        };
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| AppError::capability_missing("content workflow requires an application runtime"))?
+            .spawn(async move {
+                let now = chrono::Utc::now();
+                let lease = match repository
+                    .try_claim_dispatch(&scope, execution_id, now, chrono::Duration::seconds(90))
+                    .await
+                {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(code = ?error.code, "content dispatch claim failed");
+                        return;
+                    }
+                };
+                let cancellation = Arc::new(AtomicBool::new(false));
+                let mut run = Box::pin(executor.run_supervised(scope, execution_id, Arc::clone(&cancellation)));
+                let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // The engine may be in a non-cancellable provider operation if
+                // renewal fails. Never claim exactly-once external calls:
+                // persisted step tokens fence late result writes instead.
+                let outcome = loop {
+                    tokio::select! {
+                        result = &mut run => break Some(result),
+                        _ = heartbeat.tick() => {
+                            match repository.renew_dispatch(&lease, chrono::Utc::now(), chrono::Duration::seconds(90)).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    cancellation.store(true, Ordering::SeqCst);
+                                    tracing::warn!("content dispatch lease lost; waiting for engine to finish");
+                                    break None;
+                                }
+                                Err(error) => {
+                                    cancellation.store(true, Ordering::SeqCst);
+                                    tracing::warn!(code = ?error.code, "content dispatch heartbeat failed");
+                                    break None;
+                                }
+                            }
+                        }
+                    }
+                };
+                if outcome.is_none() {
+                    let _ = run.await;
+                }
+                if let Some(Err(error)) = &outcome {
+                    tracing::warn!(code = ?error.code, "content workflow interrupted; durable item state remains resumable");
+                }
+                // A completed preparation pass may still have deferred account
+                // or source dependencies. Retry those with backoff; a fully
+                // prepared execution is excluded by the durable scanner.
+                let backoff = if matches!(outcome, Some(Ok(()))) { 300 } else { 30 };
+                if let Err(error) = repository.release_dispatch(&lease, chrono::Utc::now(), chrono::Duration::seconds(backoff)).await {
+                    tracing::warn!(code = ?error.code, "content dispatch release failed");
+                }
+            });
+        Ok(())
+    }
+
+    pub fn channel_job_repository(&self) -> Arc<dyn geo_domain::ChannelJobRepository> {
+        Arc::clone(&self.channel_job_repository)
+    }
+
+    pub fn with_publication_lookup_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::PublicationLookupRepository>,
+    ) -> Self {
+        self.publication_lookup_repository = Some(repository);
+        self
+    }
+
+    /// Opt-in service-only callback; ordinary browser routes never issue tickets.
+    pub fn with_publication_send_callback(
+        mut self,
+        service: PublicationSendCallbackService,
+    ) -> Self {
+        self.publication_send_callback = Some(service);
+        self
+    }
+
+    /// Opt-in service-only raw evidence checkpoint.
+    pub fn with_observation_capture_callback(
+        mut self,
+        service: ObservationCaptureCallbackService,
+    ) -> Self {
+        self.observation_capture_callback = Some(service);
+        self
+    }
+
+    pub fn observation_capture_callback(&self) -> Option<&ObservationCaptureCallbackService> {
+        self.observation_capture_callback.as_ref()
+    }
+
+    pub fn with_observation_ai_callback(mut self, service: ObservationAiCallbackService) -> Self {
+        self.observation_ai_callback = Some(service);
+        self
+    }
+
+    pub fn with_observation_analysis(mut self, service: ObservationAnalysisService) -> Self {
+        self.observation_analysis = Some(service);
+        self
+    }
+
+    pub fn with_observation_evidence_resolver(
+        mut self,
+        resolver: ObservationEvidenceResolver,
+    ) -> Self {
+        self.observation_evidence_resolver = Some(resolver);
+        self
+    }
+
+    pub fn observation_evidence_resolver(&self) -> Option<&ObservationEvidenceResolver> {
+        self.observation_evidence_resolver.as_ref()
+    }
+
+    pub fn with_serp_service(mut self, service: SerpService) -> Self {
+        self.serp_service = Some(service);
+        self
+    }
+
+    pub fn serp_service(&self) -> Option<&SerpService> {
+        self.serp_service.as_ref()
+    }
+
+    pub fn with_project_serp_settings(mut self, settings: ProjectSerpSettingsService) -> Self {
+        self.project_serp_settings = Some(settings);
+        self
+    }
+
+    pub fn project_serp_settings(&self) -> Option<&ProjectSerpSettingsService> {
+        self.project_serp_settings.as_ref()
+    }
+
+    pub fn with_provider_cleanup_callback(
+        mut self,
+        service: ProviderCleanupCallbackService,
+    ) -> Self {
+        self.provider_cleanup_callback = Some(service);
+        self
+    }
+
+    pub fn provider_cleanup_callback(&self) -> Option<&ProviderCleanupCallbackService> {
+        self.provider_cleanup_callback.as_ref()
+    }
+
+    pub fn with_channel_job_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ChannelJobRepository>,
+    ) -> Self {
+        self.channel_job_repository = repository;
+        self
+    }
+
+    pub fn with_channel_service(mut self, service: ChannelService) -> Self {
+        self.channel_service = service;
+        self.refresh_memory_request_authorities();
+        self
     }
 
     pub fn origin_scheme(&self) -> &str {
@@ -285,6 +1019,15 @@ impl AppState {
 
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    /// Reconcile abandoned in-flight runs before this process accepts work.
+    ///
+    /// The repository operation is deliberately not started by `router` or a
+    /// request handler. It is a startup-only hook and must be enabled only
+    /// when this process is the sole executor for the database.
+    pub async fn reconcile_running_runs(&self) -> Result<u64, AppError> {
+        self.agent_repository.reconcile_running_runs().await
     }
 
     pub fn publish_event(&self, event: EventEnvelope) -> usize {
@@ -1200,61 +1943,14 @@ async fn start_project(
         ));
     }
     let operation_scope = TenantScope::new(auth.scope.operator_id, auth.scope.tenant_id, Some(id));
-    let operation_id = project_start_operation_id(&operation_scope, &idempotency_key);
-    let project = state
-        .project_repository
-        .get(&auth.scope, id)
-        .await
-        .map_err(|error| api_error(error, context.request_id))?
-        .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
-
-    let normalized_settings = project
-        .settings
-        .clone()
-        .validate_draft()
-        .map_err(|error| api_error(error, context.request_id))?;
-    let frozen_settings_hash = settings_hash(&normalized_settings)
-        .map_err(|error| api_error(error, context.request_id))?;
-    let command = ProjectStartCommand {
-        expected_revision: input.expected_revision,
-        idempotency_key_hash: hash_idempotency_key(&idempotency_key),
-        request_hash: start_request_hash(id, input.expected_revision, &frozen_settings_hash),
-        settings_hash: frozen_settings_hash,
-        operation_id,
-    };
-    let acceptance = state
-        .project_repository
-        .start(&auth.scope, id, command)
-        .await
-        .map_err(|error| api_error(error, context.request_id))?;
-    // PostgreSQL writes this operation in the same start transaction. The
-    // in-memory adapter mirrors it in the existing operation store so normal
-    // operation lookup remains available in development and tests.
-    if !state.durable_storage() {
-        let mut operation = Operation::queued("project.start", operation_scope.clone());
-        operation.id = acceptance.operation_id;
-        operation.result = Some(serde_json::to_value(&acceptance).map_err(|error| {
-            api_error(
-                AppError::new(
-                    geo_domain::ErrorCode::Internal,
-                    format!("start acceptance cannot be serialized: {error}"),
-                ),
-                context.request_id,
-            )
-        })?);
-        state
-            .operation_store
-            .save(operation)
-            .await
-            .map_err(|error| api_error(error, context.request_id))?;
-        state.publish_event(EventEnvelope::new(
-            "cycle.created",
-            operation_scope,
-            acceptance.cycle_id,
-            1,
-            acceptance.operation_id,
-        ));
-    }
+    let acceptance = project_tools::start(
+        &state,
+        &operation_scope,
+        input.expected_revision,
+        &idempotency_key,
+    )
+    .await
+    .map_err(|error| api_error(error, context.request_id))?;
     Ok((StatusCode::ACCEPTED, Json(acceptance)).into_response())
 }
 
@@ -1372,6 +2068,9 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         auth_login,
         auth_session,
         auth_logout,
+        appearance::public,
+        appearance::current,
+        appearance::update,
         list_projects,
         create_project,
         get_project,
@@ -1380,6 +2079,15 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         estimate_project_handler,
         start_project,
         get_project_start,
+        reports::list_reports,
+        reports::get_report,
+        reports::get_report_evidence,
+        reports::get_report_preview,
+        reports::create_reduction,
+        measurement_reports::preview,
+        measurement_reports::list,
+        measurement_reports::get,
+        measurement_reports::create,
         knowledge::capabilities,
         knowledge::create_upload_session,
         knowledge::put_upload_content,
@@ -1388,10 +2096,16 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         knowledge::materialize_initial_sources,
         knowledge::list_sources,
         knowledge::get_source,
+        knowledge::get_import_job,
+        knowledge::retry_import_job,
         knowledge::get_source_version,
+        knowledge::revise_source_text,
+        knowledge::get_source_version_content,
         knowledge::list_products,
         knowledge::list_facts,
         knowledge::current_release,
+        knowledge::get_document_manifest,
+        knowledge::plan_document_manifest,
         knowledge::search,
         knowledge::ask,
         get_operation,
@@ -1400,6 +2114,10 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         agent::list_conversations,
         agent::get_conversation,
         agent::append_message,
+        agent::create_attachment_upload,
+        agent::put_attachment_content,
+        agent::complete_attachment_upload,
+        agent::get_attachment,
         agent::cancel_turn,
         agent::conversation_events
     ),
@@ -1408,6 +2126,8 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         LoginRequest,
         AuthConfigResponse,
         AuthSessionResponse,
+        geo_domain::OperatorAppearance,
+        geo_domain::UpdateOperatorAppearance,
         UserView,
         OperatorView,
         MembershipView,
@@ -1428,6 +2148,27 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         ProjectEstimateResponse,
         ProjectStartRequest,
         ProjectStartAcceptance,
+        reports::ReportProjectQuery,
+        reports::ReduceRequest,
+        reports::ReportList,
+        reports::ReportEvidenceList,
+        measurement_reports::MeasurementPeriodQuery,
+        measurement_reports::MeasurementPeriodRequest,
+        measurement_reports::MeasurementPeriodList,
+        geo_domain::MeasurementPeriodReport,
+        geo_domain::MeasurementPeriodPreview,
+        geo_domain::ReportSnapshot,
+        geo_domain::ReportPreview,
+        geo_domain::ReportPreviewKind,
+        geo_domain::ReportStatus,
+        geo_domain::ReportAvailability,
+        geo_domain::ReportCoverage,
+        geo_domain::ReportManifestKind,
+        geo_domain::ReportManifestRef,
+        geo_domain::ReportEvidenceReference,
+        geo_domain::ReportFinding,
+        geo_domain::ReportPublicationGroup,
+        geo_domain::ReportMeasurementGroup,
         knowledge::KnowledgeProjectQuery,
         knowledge::ImportBatchRequest,
         geo_domain::KnowledgeCapability,
@@ -1439,6 +2180,11 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::Source,
         geo_domain::SourceDetail,
         geo_domain::SourceVersion,
+        geo_domain::SourceVersionRepresentation,
+        geo_domain::SourceVersionContent,
+        geo_domain::SourceTextBasis,
+        geo_domain::ReviseSourceTextCommand,
+        geo_domain::SourceTextRevisionReceipt,
         geo_domain::Chunk,
         geo_domain::ChunkLocator,
         geo_domain::ImportJob,
@@ -1446,6 +2192,12 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::Fact,
         geo_domain::KnowledgeRelease,
         geo_domain::CurrentKnowledgeRelease,
+        geo_domain::DocumentManifest,
+        geo_domain::DocumentManifestCoverage,
+        geo_domain::DocumentManifestItem,
+        geo_domain::DocumentManifestItemState,
+        geo_domain::DocumentManifestPlanRequest,
+        geo_domain::DocumentManifestState,
         geo_domain::KnowledgeSearchRequest,
         geo_domain::KnowledgeEvidence,
         geo_domain::KnowledgeSearchResult,
@@ -1483,7 +2235,8 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::RuntimeCapability,
         geo_domain::RuntimeCapabilityStatus,
         agent::ConversationPage,
-        agent::AgentSubmitResponse
+        agent::AgentSubmitResponse,
+        agent::AttachmentUploadCommand
     )),
     modifiers(&SecurityModifier)
 )]
@@ -1544,10 +2297,30 @@ pub fn router(state: AppState) -> Router {
             get(agent::conversation_events),
         )
         .route("/agent/turns/{turn_id}/cancel", post(agent::cancel_turn))
+        .route(
+            "/agent/attachments/upload-sessions",
+            post(agent::create_attachment_upload),
+        )
+        .route(
+            "/agent/attachments/upload-sessions/{id}/complete",
+            post(agent::complete_attachment_upload),
+        )
+        .route("/agent/attachments/{id}", get(agent::get_attachment))
         .layer(middleware::from_fn_with_state(
             idempotency_store.clone(),
             json_command_idempotency_middleware,
         ))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(agent::project_scope_middleware))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // Raw upload bytes exceed the JSON command cache's 1 MiB buffer. The
+    // knowledge repository verifies bytes and scopes the session itself.
+    let agent_attachment_bytes: Router<AppState> = Router::new()
+        .route(
+            "/agent/attachments/upload-sessions/{id}/content",
+            axum::routing::put(agent::put_attachment_content),
+        )
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(agent::project_scope_middleware))
         .layer(middleware::from_fn(auth_scope_from_request));
@@ -1560,6 +2333,206 @@ pub fn router(state: AppState) -> Router {
             "/projects/{id}/start",
             get(get_project_start).post(start_project),
         )
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // The repository enforces immutable revision/replay semantics. The
+    // generic JSON idempotency cache is deliberately not the report authority.
+    let report_routes: Router<AppState> = Router::new()
+        .route("/projects/{id}/cycles/current", get(cycles::current))
+        .route("/projects/{id}/cycles", post(cycles::schedule_successor))
+        .route("/projects/{id}/reports", get(reports::list_reports))
+        .route(
+            "/projects/{id}/measurement-report-preview",
+            get(measurement_reports::preview),
+        )
+        .route(
+            "/projects/{id}/measurement-reports",
+            get(measurement_reports::list).post(measurement_reports::create),
+        )
+        .route("/measurement-reports/{id}", get(measurement_reports::get))
+        .route("/reports/{id}", get(reports::get_report))
+        .route("/reports/{id}/evidence", get(reports::get_report_evidence))
+        .route(
+            "/cycles/{id}/report-preview",
+            get(reports::get_report_preview),
+        )
+        .route("/cycles/{id}/reductions", post(reports::create_reduction))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // Question versions and idempotency are committed together by the scoped
+    // repository, rather than the generic HTTP response cache.
+    let question_routes: Router<AppState> = Router::new()
+        .route(
+            "/projects/{project_id}/question-sets",
+            get(questions::list_question_sets).post(questions::create_question_set),
+        )
+        .route(
+            "/projects/{project_id}/question-sets/{set_id}/versions",
+            get(questions::list_question_set_versions).post(questions::revise_question_set),
+        )
+        .route(
+            "/projects/{project_id}/question-sets/{set_id}/versions/{version_id}",
+            get(questions::get_question_set_version),
+        )
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // Login actions can contain transient credentials. Never put these
+    // requests through the generic idempotency cache.
+    let channel_routes = channels::customer_routes()
+        .route(
+            "/projects/{project_id}/channel-accounts/{account_id}/measurement-options",
+            get(measurement_options::get_options),
+        )
+        .route(
+            "/projects/{project_id}/measurement-plans",
+            get(standalone_measurements::list_plans).post(standalone_measurements::submit_plan),
+        )
+        .route(
+            "/projects/{project_id}/measurement-plans/{plan_id}",
+            get(standalone_measurements::get_plan),
+        )
+        .route(
+            "/projects/{project_id}/citation-insights",
+            get(citation_insights::get_citation_insights),
+        )
+        .route(
+            "/projects/{project_id}/source-channel-recommendations",
+            get(source_channel_recommendations::get),
+        )
+        .route(
+            "/projects/{project_id}/cycles/{cycle_id}/channel-plan",
+            get(channel_jobs::get_plan).post(channel_jobs::submit_plan),
+        )
+        .route(
+            "/projects/{project_id}/channel-targets/{target_id}",
+            get(channel_jobs::get_target),
+        )
+        .route(
+            "/projects/{project_id}/channel-targets/{target_id}/publication-lookup",
+            get(publication_lookup::get_publication_lookup),
+        )
+        .route(
+            "/projects/{project_id}/channel-targets/{target_id}/execute",
+            post(channel_jobs::execute_target),
+        )
+        .layer(middleware::from_fn(no_store_middleware))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(auth_scope_from_request));
+
+    // Operator pool scope comes from deployment configuration plus trusted
+    // membership, not a customer tenant selector. The catalogue is session-only.
+    let operator_channel_routes = channels::operator_routes()
+        .route(
+            "/operator/connector-capabilities",
+            get(connector_capabilities::list_operator),
+        )
+        .route(
+            "/operator/connector-capabilities/{platform_id}/{placement_slot}",
+            axum::routing::patch(connector_capabilities::configure_operator),
+        )
+        .layer(middleware::from_fn(no_store_middleware))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(session_auth_from_request));
+
+    let content_routes: Router<AppState> = Router::new()
+        .route(
+            "/projects/{id}/connector-capabilities",
+            get(connector_capabilities::list_project),
+        )
+        .route(
+            "/projects/{id}/cycles/{cycle_id}/distribution-manifest",
+            get(distribution::cycle_manifest).post(distribution::freeze),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}",
+            get(distribution::manifest),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}/targets",
+            get(distribution::targets),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}/targets/{target_id}",
+            get(distribution::target),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}/targets/{target_id}/publication-target",
+            get(distribution::publication_target),
+        )
+        .route(
+            "/projects/{id}/distribution-manifests/{manifest_id}/resume",
+            post(distribution::resume),
+        )
+        .route(
+            "/projects/{id}/cycles/{cycle_id}/document-executions",
+            get(content::executions).post(content::start),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}",
+            get(content::execution),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}/items",
+            get(content::items),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}/items/{item_id}/fork",
+            post(content::fork_reused_item),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}/resume",
+            post(content::resume),
+        )
+        .route(
+            "/projects/{id}/document-executions/{execution_id}/cancel",
+            post(content::cancel),
+        )
+        .route("/projects/{id}/contents", get(content::contents))
+        .route(
+            "/projects/{id}/content-distribution-requests",
+            post(content_distribution_requests::accept),
+        )
+        .route(
+            "/projects/{id}/content-distribution-requests/{request_id}",
+            get(content_distribution_requests::get_request),
+        )
+        .route(
+            "/projects/{id}/content-distribution-requests/{request_id}/publication",
+            get(content_distribution_requests::get_publication),
+        )
+        .route(
+            "/projects/{id}/content-media/bindings",
+            get(content_media::list_bindings).post(content_media::create_binding),
+        )
+        .route(
+            "/projects/{id}/content-media/bindings/{binding_id}",
+            axum::routing::delete(content_media::withdraw_binding),
+        )
+        .route(
+            "/projects/{id}/content-media/bindings/{binding_id}/bytes",
+            get(content_media::get_binding_bytes),
+        )
+        .route(
+            "/projects/{id}/content-media/bindings/{binding_id}/thumbnail",
+            get(content_media::get_binding_thumbnail),
+        )
+        .route("/projects/{id}/contents/{asset_id}", get(content::asset))
+        .route(
+            "/projects/{id}/contents/{asset_id}/revisions",
+            get(content::revisions).post(content::edit),
+        )
+        .route(
+            "/projects/{id}/contents/{asset_id}/revisions/{revision_id}/export",
+            get(content::export),
+        )
+        .route(
+            "/projects/{id}/contents/{asset_id}/revisions/{revision_id}/export-bundle",
+            get(content_export::export_bundle),
+        )
+        .layer(middleware::from_fn(no_store_middleware))
         .layer(middleware::from_fn(csrf_origin_from_request))
         .layer(middleware::from_fn(auth_scope_from_request));
 
@@ -1589,6 +2562,14 @@ pub fn router(state: AppState) -> Router {
         .merge(auth_session_routes)
         .layer(middleware::from_fn(no_store_middleware));
 
+    let publication_callback =
+        publication_send_callback::routes(state.publication_send_callback.clone());
+    let observation_callback =
+        observation_capture_callback::routes(state.observation_capture_callback.clone());
+    let observation_ai_callback =
+        observation_ai_callback::routes(state.observation_ai_callback.clone());
+    let cleanup_callback =
+        provider_cleanup_callback::routes(state.provider_cleanup_callback.clone());
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -1596,14 +2577,29 @@ pub fn router(state: AppState) -> Router {
             "/api/v1",
             Router::new()
                 .route("/openapi.json", get(openapi_json))
+                .merge(appearance::routes())
                 .merge(auth_routes)
                 .merge(estimate_routes)
                 .merge(start_routes)
+                .merge(report_routes)
+                .merge(question_routes)
+                .merge(channel_routes)
+                .merge(content_routes)
+                .merge(operator_channel_routes)
                 .merge(knowledge_routes)
+                .merge(agent_attachment_bytes)
                 .merge(agent_routes)
+                .merge(project_ai_settings::routes())
+                .merge(observation_analysis::routes())
+                .merge(serp::routes())
+                .merge(project_serp_settings::routes())
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))
         .layer(middleware::from_fn(context::request_context_middleware))
         .with_state(state)
+        .merge(publication_callback)
+        .merge(observation_callback)
+        .merge(observation_ai_callback)
+        .merge(cleanup_callback)
 }

@@ -714,9 +714,32 @@ pub struct ProjectStartView {
     pub acceptance: ProjectStartAcceptance,
     pub requested_revision: i64,
     pub settings_hash: String,
+    pub report_timezone: String,
     pub report_window_start_at: DateTime<Utc>,
     pub report_window_end_at: DateTime<Utc>,
     pub cutoff_at: DateTime<Utc>,
+}
+
+/// Frozen cycle metadata and versioned manifest selectors for report fan-in.
+/// Unlike the start acceptance, this also describes subsequent cycles that
+/// were not created by a project-start operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CycleReportView {
+    pub project_id: ProjectId,
+    pub cycle_id: Uuid,
+    pub report_timezone: String,
+    pub report_window_start_at: DateTime<Utc>,
+    pub report_window_end_at: DateTime<Utc>,
+    pub cutoff_at: DateTime<Utc>,
+    pub document_manifest: Option<DocumentManifestAcceptance>,
+    pub distribution_manifest: Option<DistributionManifestAcceptance>,
+}
+
+/// A scoped candidate for recovering a completed report's missing successor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSuccessorCycle {
+    pub scope: TenantScope,
+    pub predecessor_cycle_id: Uuid,
 }
 
 pub fn settings_hash(settings: &ProjectSettings) -> Result<String, AppError> {
@@ -771,25 +794,21 @@ pub fn previous_calendar_week_window(
         - now_local.weekday().num_days_from_monday() as i64)
         % 7;
     report_date += Duration::days(report_delta);
-    let mut report_at = resolve_local_datetime(timezone, report_date.and_time(report_time));
+    let report_at = resolve_local_datetime(timezone, report_date.and_time(report_time));
     if report_at <= now {
         report_date += Duration::days(7);
-        report_at = resolve_local_datetime(timezone, report_date.and_time(report_time));
     }
     let report_week_monday =
         report_date - Duration::days(report_date.weekday().num_days_from_monday() as i64);
     let period_start_date = report_week_monday - Duration::days(7);
     let period_end_date = report_week_monday;
-    let mut cutoff_date = report_date;
-    let cutoff_delta = (7 + report_date.weekday().num_days_from_monday() as i64
-        - schedule.cutoff_weekday.num_days_from_monday() as i64)
-        % 7;
-    cutoff_date -= Duration::days(cutoff_delta);
-    let mut cutoff = resolve_local_datetime(timezone, cutoff_date.and_time(cutoff_time));
-    if cutoff > report_at {
-        cutoff_date -= Duration::days(7);
-        cutoff = resolve_local_datetime(timezone, cutoff_date.and_time(cutoff_time));
-    }
+    let period_end = resolve_local_datetime(
+        timezone,
+        period_end_date
+            .and_hms_opt(0, 0, 0)
+            .expect("valid midnight"),
+    );
+    let cutoff = cutoff_after(timezone, schedule.cutoff_weekday, cutoff_time, period_end)?;
     Ok((
         resolve_local_datetime(
             timezone,
@@ -797,14 +816,63 @@ pub fn previous_calendar_week_window(
                 .and_hms_opt(0, 0, 0)
                 .expect("valid midnight"),
         ),
-        resolve_local_datetime(
-            timezone,
-            period_end_date
-                .and_hms_opt(0, 0, 0)
-                .expect("valid midnight"),
-        ),
+        period_end,
         cutoff,
     ))
+}
+
+/// The immediately adjacent natural week, using the predecessor's frozen
+/// timezone and schedule. Recovery time must not extend the observation
+/// window or shift an overdue report's original cutoff.
+pub fn next_calendar_week_window(
+    timezone: &str,
+    schedule: &ReportSchedule,
+    predecessor_end_at: DateTime<Utc>,
+) -> Result<ReportWindowUtc, AppError> {
+    let timezone = timezone
+        .parse::<Tz>()
+        .map_err(|_| AppError::invalid_request("report_timezone must be a valid IANA timezone"))?;
+    let local_end = predecessor_end_at.with_timezone(&timezone).date_naive();
+    let start = resolve_local_datetime(
+        timezone,
+        local_end.and_hms_opt(0, 0, 0).expect("valid midnight"),
+    );
+    if start != predecessor_end_at || local_end.weekday().num_days_from_monday() != 0 {
+        return Err(AppError::invalid_request(
+            "predecessor report window must end at local Monday midnight",
+        ));
+    }
+    let end = resolve_local_datetime(
+        timezone,
+        (local_end + Duration::days(7))
+            .and_hms_opt(0, 0, 0)
+            .expect("valid midnight"),
+    );
+    let cutoff_time =
+        NaiveTime::parse_from_str(&schedule.cutoff_local_time, "%H:%M").map_err(|_| {
+            AppError::invalid_request("report_schedule.cutoff_local_time must be HH:MM")
+        })?;
+    let cutoff = cutoff_after(timezone, schedule.cutoff_weekday, cutoff_time, end)?;
+    Ok((start, end, cutoff))
+}
+
+fn cutoff_after(
+    timezone: Tz,
+    weekday: ReportWeekday,
+    time: NaiveTime,
+    floor: DateTime<Utc>,
+) -> Result<DateTime<Utc>, AppError> {
+    let mut date = floor.with_timezone(&timezone).date_naive();
+    date += Duration::days(
+        (7 + weekday.num_days_from_monday() as i64 - date.weekday().num_days_from_monday() as i64)
+            % 7,
+    );
+    let mut cutoff = resolve_local_datetime(timezone, date.and_time(time));
+    if cutoff < floor {
+        date += Duration::days(7);
+        cutoff = resolve_local_datetime(timezone, date.and_time(time));
+    }
+    Ok(cutoff)
 }
 
 fn resolve_local_datetime(timezone: Tz, value: NaiveDateTime) -> DateTime<Utc> {
@@ -901,6 +969,30 @@ impl ProjectPatch {
 
 #[async_trait]
 pub trait ProjectRepository: Send + Sync {
+    /// Keep project eligibility stable through a measurement intent commit.
+    /// Draft projects may measure arbitrary topics. Release before network I/O;
+    /// no project operation may be awaited while the held read lock is alive.
+    async fn hold_measurement_project<'a>(
+        &'a self,
+        _scope: &TenantScope,
+        _project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        Err(AppError::capability_missing(
+            "atomic measurement project eligibility guard is unavailable",
+        ))
+    }
+    /// Keep the project eligibility read lock across one content-repository
+    /// commit. Acquire before the knowledge guard, and never await project or
+    /// knowledge operations again while either read lock is held.
+    async fn hold_content_project<'a>(
+        &'a self,
+        _scope: &TenantScope,
+        _project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        Err(AppError::capability_missing(
+            "atomic content project eligibility guard is unavailable",
+        ))
+    }
     async fn list(&self, scope: &TenantScope) -> Result<Vec<Project>, AppError>;
     async fn list_page(
         &self,
@@ -971,6 +1063,102 @@ pub trait ProjectRepository: Send + Sync {
     ) -> Result<Option<ProjectStartView>, AppError> {
         Ok(None)
     }
+
+    async fn schedule_next_cycle(
+        &self,
+        _scope: &TenantScope,
+        _project_id: ProjectId,
+        _predecessor_cycle_id: Uuid,
+        _now: DateTime<Utc>,
+    ) -> Result<CycleReportView, AppError> {
+        Err(AppError::new(
+            crate::ErrorCode::DependencyUnavailable,
+            "project repository does not support successor cycles",
+        ))
+    }
+
+    async fn get_current_cycle(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+    ) -> Result<Option<CycleReportView>, AppError> {
+        let Some(project) = self.get(scope, project_id).await? else {
+            return Ok(None);
+        };
+        match project.current_cycle_id {
+            Some(cycle_id) => self.get_report_cycle(scope, project_id, cycle_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The configuration revision bound to this cycle, not the mutable
+    /// project draft. Planning must not drift after a project edit.
+    async fn get_cycle_settings(
+        &self,
+        _scope: &TenantScope,
+        _project_id: ProjectId,
+        _cycle_id: Uuid,
+    ) -> Result<Option<ProjectSettings>, AppError> {
+        Err(AppError::new(
+            crate::ErrorCode::DependencyUnavailable,
+            "project repository does not support frozen cycle settings",
+        ))
+    }
+
+    async fn get_report_cycle(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        cycle_id: Uuid,
+    ) -> Result<Option<CycleReportView>, AppError> {
+        Ok(self.get_start(scope, project_id).await?.and_then(|start| {
+            (start.acceptance.cycle_id == cycle_id).then_some(CycleReportView {
+                project_id,
+                cycle_id,
+                report_timezone: start.report_timezone,
+                report_window_start_at: start.report_window_start_at,
+                report_window_end_at: start.report_window_end_at,
+                cutoff_at: start.cutoff_at,
+                document_manifest: Some(start.acceptance.document_manifest),
+                distribution_manifest: Some(start.acceptance.distribution_manifest),
+            })
+        }))
+    }
+}
+
+/// Transactional indicates that the content repository performs the same
+/// eligibility validation inside its own write transaction. Unconfigured
+/// repository wrappers cannot silently claim this marker: the trait default
+/// fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentGuardMode {
+    Held,
+    Transactional,
+}
+
+pub struct ContentProjectGuard<'a> {
+    mode: ContentGuardMode,
+    _hold: Option<Box<dyn Send + 'a>>,
+}
+
+impl<'a> ContentProjectGuard<'a> {
+    pub fn transactional() -> Self {
+        Self {
+            mode: ContentGuardMode::Transactional,
+            _hold: None,
+        }
+    }
+
+    fn held(guard: tokio::sync::RwLockReadGuard<'a, MemoryProjectState>) -> Self {
+        Self {
+            mode: ContentGuardMode::Held,
+            _hold: Some(Box::new(guard)),
+        }
+    }
+
+    pub fn mode(&self) -> ContentGuardMode {
+        self.mode
+    }
 }
 
 fn format_cursor(project: &Project) -> String {
@@ -994,6 +1182,7 @@ fn parse_cursor(value: &str) -> Result<(i64, Uuid), AppError> {
 struct MemoryProjectState {
     projects: HashMap<ProjectId, Project>,
     starts: HashMap<ProjectId, MemoryStartRecord>,
+    cycles: HashMap<Uuid, MemoryCycleRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -1001,6 +1190,15 @@ struct MemoryStartRecord {
     idempotency_key_hash: String,
     request_hash: String,
     view: ProjectStartView,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryCycleRecord {
+    project_id: ProjectId,
+    previous_cycle_id: Option<Uuid>,
+    config_revision_id: Uuid,
+    settings: ProjectSettings,
+    view: CycleReportView,
 }
 
 #[derive(Debug, Default)]
@@ -1040,6 +1238,53 @@ impl MemoryProjectRepository {
 
 #[async_trait]
 impl ProjectRepository for MemoryProjectRepository {
+    async fn hold_measurement_project<'a>(
+        &'a self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        if scope.project_id != Some(project_id) {
+            return Err(AppError::forbidden("project is outside measurement scope"));
+        }
+        let guard = self.state.read().await;
+        let project = guard
+            .projects
+            .get(&project_id)
+            .filter(|project| {
+                project.operator_id == scope.operator_id && project.tenant_id == scope.tenant_id
+            })
+            .ok_or_else(|| AppError::not_found("project not found"))?;
+        if matches!(
+            project.status,
+            ProjectStatus::Paused | ProjectStatus::Archived
+        ) {
+            return Err(AppError::conflict("project is unavailable for measurement"));
+        }
+        Ok(ContentProjectGuard::held(guard))
+    }
+    async fn hold_content_project<'a>(
+        &'a self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+    ) -> Result<ContentProjectGuard<'a>, AppError> {
+        if scope.project_id != Some(project_id) {
+            return Err(AppError::forbidden("project is outside content scope"));
+        }
+        let guard = self.state.read().await;
+        let project = guard
+            .projects
+            .get(&project_id)
+            .filter(|project| {
+                project.operator_id == scope.operator_id && project.tenant_id == scope.tenant_id
+            })
+            .ok_or_else(|| AppError::not_found("project not found"))?;
+        if project.status != ProjectStatus::Active {
+            return Err(AppError::conflict(
+                "project is not active for public content",
+            ));
+        }
+        Ok(ContentProjectGuard::held(guard))
+    }
     async fn list(&self, scope: &TenantScope) -> Result<Vec<Project>, AppError> {
         let mut result = self
             .state
@@ -1225,6 +1470,7 @@ impl ProjectRepository for MemoryProjectRepository {
             acceptance: acceptance.clone(),
             requested_revision: command.expected_revision,
             settings_hash: computed_settings_hash,
+            report_timezone: settings.report_timezone.clone(),
             report_window_start_at,
             report_window_end_at,
             cutoff_at,
@@ -1242,7 +1488,26 @@ impl ProjectRepository for MemoryProjectRepository {
             MemoryStartRecord {
                 idempotency_key_hash: command.idempotency_key_hash,
                 request_hash: command.request_hash,
-                view,
+                view: view.clone(),
+            },
+        );
+        state.cycles.insert(
+            cycle_id,
+            MemoryCycleRecord {
+                project_id: id,
+                previous_cycle_id: None,
+                config_revision_id,
+                settings,
+                view: CycleReportView {
+                    project_id: id,
+                    cycle_id,
+                    report_timezone: view.report_timezone,
+                    report_window_start_at,
+                    report_window_end_at,
+                    cutoff_at,
+                    document_manifest: Some(acceptance.document_manifest.clone()),
+                    distribution_manifest: Some(acceptance.distribution_manifest.clone()),
+                },
             },
         );
         Ok(acceptance)
@@ -1264,6 +1529,148 @@ impl ProjectRepository for MemoryProjectRepository {
             return Ok(None);
         }
         Ok(state.starts.get(&id).map(|record| record.view.clone()))
+    }
+
+    async fn schedule_next_cycle(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        predecessor_cycle_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<CycleReportView, AppError> {
+        let mut state = self.state.write().await;
+        let project = state
+            .projects
+            .get(&project_id)
+            .filter(|project| {
+                project.operator_id == scope.operator_id
+                    && project.tenant_id == scope.tenant_id
+                    && scope.project_id.is_none_or(|id| id == project_id)
+            })
+            .cloned()
+            .ok_or_else(|| AppError::not_found("project not found"))?;
+        let predecessor = state
+            .cycles
+            .get(&predecessor_cycle_id)
+            .filter(|cycle| cycle.project_id == project_id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("predecessor cycle not found"))?;
+        if let Some(existing) = state.cycles.values().find(|cycle| {
+            cycle.project_id == project_id && cycle.previous_cycle_id == Some(predecessor_cycle_id)
+        }) {
+            return Ok(existing.view.clone());
+        }
+        if project.status != ProjectStatus::Active {
+            return Err(AppError::conflict(
+                "only active projects can advance cycles",
+            ));
+        }
+        if project.current_cycle_id != Some(predecessor_cycle_id) {
+            return Err(AppError::conflict("predecessor is not the current cycle"));
+        }
+        if now < predecessor.view.cutoff_at {
+            return Err(AppError::conflict(
+                "predecessor report cutoff has not passed",
+            ));
+        }
+        let (start, end, cutoff) = next_calendar_week_window(
+            &predecessor.view.report_timezone,
+            &predecessor.settings.report_schedule,
+            predecessor.view.report_window_end_at,
+        )?;
+        let mut successor_settings = predecessor.settings.clone();
+        successor_settings.distribution_scope = project.settings.distribution_scope.clone();
+        let config_revision_id = if successor_settings != predecessor.settings {
+            successor_settings = successor_settings.validate_start()?;
+            Uuid::new_v4()
+        } else {
+            predecessor.config_revision_id
+        };
+        let cycle_id = Uuid::new_v4();
+        let view = CycleReportView {
+            project_id,
+            cycle_id,
+            report_timezone: predecessor.view.report_timezone.clone(),
+            report_window_start_at: start,
+            report_window_end_at: end,
+            cutoff_at: cutoff,
+            document_manifest: Some(DocumentManifestAcceptance {
+                manifest_id: Uuid::new_v4(),
+                revision: 1,
+                state: "awaiting_knowledge".to_owned(),
+                sealed: false,
+                expected_count: None,
+            }),
+            distribution_manifest: Some(DistributionManifestAcceptance {
+                manifest_id: Uuid::new_v4(),
+                revision: 1,
+                state: "awaiting_documents".to_owned(),
+                sealed: false,
+                expected_count: None,
+            }),
+        };
+        state.cycles.insert(
+            cycle_id,
+            MemoryCycleRecord {
+                project_id,
+                previous_cycle_id: Some(predecessor_cycle_id),
+                config_revision_id,
+                settings: successor_settings,
+                view: view.clone(),
+            },
+        );
+        let project = state.projects.get_mut(&project_id).expect("project locked");
+        project.current_cycle_id = Some(cycle_id);
+        project.current_config_revision_id = Some(config_revision_id);
+        project.revision += 1;
+        project.updated_at = now;
+        Ok(view)
+    }
+
+    async fn get_report_cycle(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        cycle_id: Uuid,
+    ) -> Result<Option<CycleReportView>, AppError> {
+        let state = self.state.read().await;
+        let authorized = state.projects.get(&project_id).is_some_and(|project| {
+            project.operator_id == scope.operator_id
+                && project.tenant_id == scope.tenant_id
+                && scope.project_id.is_none_or(|id| id == project_id)
+        });
+        Ok(authorized
+            .then(|| {
+                state
+                    .cycles
+                    .get(&cycle_id)
+                    .filter(|cycle| cycle.project_id == project_id)
+                    .map(|cycle| cycle.view.clone())
+            })
+            .flatten())
+    }
+
+    async fn get_cycle_settings(
+        &self,
+        scope: &TenantScope,
+        project_id: ProjectId,
+        cycle_id: Uuid,
+    ) -> Result<Option<ProjectSettings>, AppError> {
+        let state = self.state.read().await;
+        let authorized = state.projects.get(&project_id).is_some_and(|project| {
+            project.operator_id == scope.operator_id
+                && project.tenant_id == scope.tenant_id
+                && scope.project_id.is_none_or(|id| id == project_id)
+        });
+        Ok(authorized
+            .then(|| {
+                state
+                    .cycles
+                    .get(&cycle_id)
+                    .filter(|cycle| cycle.project_id == project_id)
+                    .map(|cycle| cycle.settings.clone())
+            })
+            .flatten())
     }
 }
 
@@ -1580,11 +1987,124 @@ mod tests {
     use super::{
         InitialSource, InitialSourceKind, InitialSourceVisibility, MemoryProjectRepository,
         ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand, ProjectStatus,
-        ReportSchedule, ReportWeekday, hash_idempotency_key, previous_calendar_week_window,
-        settings_hash, start_request_hash,
+        ReportSchedule, ReportWeekday, hash_idempotency_key, next_calendar_week_window,
+        previous_calendar_week_window, settings_hash, start_request_hash,
     };
     use chrono::{DateTime, Utc};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn measurement_project_guard_allows_draft_and_holds_pause_until_intent_commit() {
+        use std::sync::Arc;
+        use tokio::time::{Duration, timeout};
+        let repository = Arc::new(MemoryProjectRepository::new());
+        let id = Uuid::new_v4().into();
+        let scope = super::TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), Some(id));
+        let project = super::Project::new(
+            id,
+            &scope,
+            "measurement-guard",
+            "Measurement guard",
+            ProjectSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(project.status, ProjectStatus::Draft);
+        repository.insert(project).await.unwrap();
+        let held = repository
+            .hold_measurement_project(&scope, id)
+            .await
+            .unwrap();
+        assert_eq!(held.mode(), super::ContentGuardMode::Held);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let writer_repository = repository.clone();
+        let mut writer = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let mut state = writer_repository.state.write().await;
+            state.projects.get_mut(&id).unwrap().status = ProjectStatus::Paused;
+        });
+        started_rx.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(30), &mut writer)
+                .await
+                .is_err()
+        );
+        drop(held);
+        timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            repository
+                .hold_measurement_project(&scope, id)
+                .await
+                .is_err()
+        );
+        repository
+            .state
+            .write()
+            .await
+            .projects
+            .get_mut(&id)
+            .unwrap()
+            .status = ProjectStatus::Archived;
+        assert!(
+            repository
+                .hold_measurement_project(&scope, id)
+                .await
+                .is_err()
+        );
+        let foreign = super::TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, Some(id));
+        assert!(
+            repository
+                .hold_measurement_project(&foreign, id)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .hold_measurement_project(&scope, Uuid::new_v4().into())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_project_guard_blocks_pause_until_content_commit() {
+        use std::sync::Arc;
+        use tokio::time::{Duration, sleep, timeout};
+
+        let repository = Arc::new(MemoryProjectRepository::new());
+        let id = Uuid::new_v4().into();
+        let scope = super::TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), Some(id));
+        let mut project = super::Project::new(
+            id,
+            &scope,
+            "guard-project",
+            "Guard project",
+            ProjectSettings::default(),
+        )
+        .unwrap();
+        project.status = ProjectStatus::Active;
+        repository.insert(project).await.unwrap();
+        let held = repository.hold_content_project(&scope, id).await.unwrap();
+        assert_eq!(held.mode(), super::ContentGuardMode::Held);
+        let writer_repo = repository.clone();
+        let writer = tokio::spawn(async move {
+            let mut state = writer_repo.state.write().await;
+            state.projects.get_mut(&id).unwrap().status = ProjectStatus::Paused;
+        });
+        sleep(Duration::from_millis(30)).await;
+        assert!(
+            !writer.is_finished(),
+            "project pause must wait for content commit"
+        );
+        drop(held);
+        timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repository.hold_content_project(&scope, id).await.is_err());
+    }
 
     fn utc(value: &str) -> DateTime<Utc> {
         value.parse::<DateTime<Utc>>().expect("valid UTC fixture")
@@ -1604,7 +2124,7 @@ mod tests {
                 .expect("window");
         assert_eq!(start, utc("2025-12-28T16:00:00Z"));
         assert_eq!(end, utc("2026-01-04T16:00:00Z"));
-        assert_eq!(cutoff, utc("2026-01-04T15:59:00Z"));
+        assert_eq!(cutoff, utc("2026-01-11T15:59:00Z"));
     }
 
     #[test]
@@ -1624,7 +2144,286 @@ mod tests {
         .expect("window");
         assert_eq!(start, utc("2026-03-02T05:00:00Z"));
         assert_eq!(end, utc("2026-03-09T04:00:00Z"));
-        assert_eq!(cutoff, utc("2026-03-08T07:00:00Z"));
+        assert_eq!(cutoff, utc("2026-03-15T06:30:00Z"));
+    }
+
+    #[test]
+    fn successor_uses_frozen_local_week_even_if_recovery_is_late() {
+        let schedule = ReportSchedule::default();
+        let (start, end, cutoff) =
+            next_calendar_week_window("America/New_York", &schedule, utc("2026-03-02T05:00:00Z"))
+                .expect("next week");
+        assert_eq!(start, utc("2026-03-02T05:00:00Z"));
+        assert_eq!(end, utc("2026-03-09T04:00:00Z"));
+        assert_eq!(cutoff, end);
+        let recovered =
+            next_calendar_week_window("America/New_York", &schedule, utc("2026-03-02T05:00:00Z"))
+                .expect("late scheduling");
+        assert_eq!(recovered, (start, end, cutoff));
+        assert!(cutoff < utc("2026-10-01T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn memory_successor_is_scoped_idempotent_and_preserves_original_start() {
+        let repository = MemoryProjectRepository::new();
+        let scope = super::TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), None);
+        let project = repository
+            .create(
+                &scope,
+                ProjectCreate {
+                    slug: None,
+                    display_name: "Cycle test".to_owned(),
+                    settings: ProjectSettings {
+                        brand_name: "Example".to_owned(),
+                        market: "US".to_owned(),
+                        language: "en".to_owned(),
+                        initial_sources: vec![InitialSource {
+                            kind: InitialSourceKind::Text,
+                            value: "Generic public source".to_owned(),
+                            visibility: InitialSourceVisibility::Public,
+                            version_ref: None,
+                            content_hash: None,
+                        }],
+                        ..ProjectSettings::default()
+                    },
+                },
+            )
+            .await
+            .expect("project");
+        let frozen_hash =
+            settings_hash(&project.settings.clone().validate_start().unwrap()).unwrap();
+        let acceptance = repository
+            .start(
+                &scope,
+                project.id,
+                ProjectStartCommand {
+                    expected_revision: project.revision,
+                    idempotency_key_hash: hash_idempotency_key("memory-cycle-start"),
+                    request_hash: start_request_hash(project.id, project.revision, &frozen_hash),
+                    settings_hash: frozen_hash,
+                    operation_id: Uuid::new_v4(),
+                },
+            )
+            .await
+            .expect("start");
+        let start = repository
+            .get_start(&scope, project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_cycle = repository
+            .state
+            .read()
+            .await
+            .cycles
+            .get(&acceptance.cycle_id)
+            .unwrap()
+            .clone();
+        let first_scope = super::DistributionScope {
+            mode: super::DistributionScopeMode::Explicit,
+            included_platform_ids: vec!["channel-one".to_owned()],
+            ..Default::default()
+        };
+        let patch = super::ProjectPatch {
+            report_timezone: Some("America/New_York".to_owned()),
+            distribution_scope: Some(first_scope.clone()),
+            ..Default::default()
+        };
+        let revision = repository
+            .get(&scope, project.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+        repository
+            .update(&scope, project.id, revision, patch)
+            .await
+            .expect("edit");
+        let now = start.cutoff_at + chrono::Duration::days(120);
+        let successor = repository
+            .schedule_next_cycle(&scope, project.id, acceptance.cycle_id, now)
+            .await
+            .expect("successor");
+        assert_eq!(successor.report_window_start_at, start.report_window_end_at);
+        assert_eq!(successor.report_timezone, "Asia/Shanghai");
+        assert_eq!(
+            successor.cutoff_at,
+            start.cutoff_at + chrono::Duration::days(7)
+        );
+        assert!(successor.cutoff_at < now);
+        let first_successor_record = repository
+            .state
+            .read()
+            .await
+            .cycles
+            .get(&successor.cycle_id)
+            .unwrap()
+            .clone();
+        assert_ne!(
+            first_successor_record.config_revision_id,
+            original_cycle.config_revision_id
+        );
+        assert_eq!(
+            first_successor_record.settings.distribution_scope,
+            first_scope
+        );
+        assert_eq!(
+            first_successor_record.settings.report_timezone,
+            original_cycle.settings.report_timezone
+        );
+        assert_eq!(
+            first_successor_record.settings.report_schedule,
+            original_cycle.settings.report_schedule
+        );
+        assert_eq!(
+            repository
+                .state
+                .read()
+                .await
+                .cycles
+                .get(&acceptance.cycle_id)
+                .unwrap()
+                .settings,
+            original_cycle.settings
+        );
+        let second_scope = super::DistributionScope {
+            mode: super::DistributionScopeMode::Explicit,
+            included_platform_ids: vec!["channel-two".to_owned()],
+            ..Default::default()
+        };
+        let revision = repository
+            .get(&scope, project.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+        repository
+            .update(
+                &scope,
+                project.id,
+                revision,
+                super::ProjectPatch {
+                    distribution_scope: Some(second_scope.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("later edit");
+        assert_eq!(
+            repository
+                .schedule_next_cycle(
+                    &scope,
+                    project.id,
+                    acceptance.cycle_id,
+                    start.cutoff_at + chrono::Duration::seconds(1),
+                )
+                .await
+                .unwrap(),
+            successor
+        );
+        let third = repository
+            .schedule_next_cycle(&scope, project.id, successor.cycle_id, now)
+            .await
+            .expect("third cycle");
+        assert_eq!(third.report_timezone, original_cycle.view.report_timezone);
+        let state = repository.state.read().await;
+        assert_eq!(
+            state
+                .cycles
+                .get(&third.cycle_id)
+                .unwrap()
+                .settings
+                .distribution_scope,
+            second_scope
+        );
+        assert_eq!(
+            state
+                .cycles
+                .get(&successor.cycle_id)
+                .unwrap()
+                .settings
+                .distribution_scope,
+            first_scope
+        );
+        assert_eq!(
+            state
+                .cycles
+                .get(&successor.cycle_id)
+                .unwrap()
+                .config_revision_id,
+            first_successor_record.config_revision_id
+        );
+        drop(state);
+        assert_eq!(
+            repository
+                .get_current_cycle(&scope, project.id)
+                .await
+                .unwrap(),
+            Some(third.clone())
+        );
+        assert_eq!(
+            repository
+                .get_report_cycle(&scope, project.id, successor.cycle_id)
+                .await
+                .unwrap(),
+            Some(successor.clone())
+        );
+        assert_eq!(
+            repository.get_start(&scope, project.id).await.unwrap(),
+            Some(start)
+        );
+        for status in [ProjectStatus::Paused, ProjectStatus::Archived] {
+            repository
+                .state
+                .write()
+                .await
+                .projects
+                .get_mut(&project.id)
+                .unwrap()
+                .status = status;
+            assert!(
+                repository
+                    .schedule_next_cycle(
+                        &scope,
+                        project.id,
+                        third.cycle_id,
+                        third.cutoff_at + chrono::Duration::seconds(1),
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let foreign = super::TenantScope::new(scope.operator_id, Uuid::new_v4().into(), None);
+        assert!(
+            repository
+                .get_current_cycle(&foreign, project.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .schedule_next_cycle(&foreign, project.id, acceptance.cycle_id, now,)
+                .await
+                .is_err()
+        );
+        let other_project = repository
+            .create(
+                &scope,
+                ProjectCreate {
+                    slug: None,
+                    display_name: "Other project".to_owned(),
+                    settings: ProjectSettings::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .schedule_next_cycle(&scope, other_project.id, acceptance.cycle_id, now)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

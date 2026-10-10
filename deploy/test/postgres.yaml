@@ -1,0 +1,62 @@
+# Disposable test database, co-located with the validation worker.
+# Create geo-validation-db with a generated "password" key before applying.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-validation
+  namespace: geo-build-test
+  labels:
+    app.kubernetes.io/name: postgres-validation
+spec:
+  automountServiceAccountToken: false
+  activeDeadlineSeconds: 7200
+  restartPolicy: Never
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: rust-validation
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: postgres
+      image: postgres:17-alpine
+      env:
+        - name: POSTGRES_USER
+          value: geo_test
+        - name: POSTGRES_DB
+          value: geo_validation
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: geo-validation-db
+              key: password
+      resources:
+        requests:
+          cpu: "100m"
+          memory: 128Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      readinessProbe:
+        exec:
+          command: ["pg_isready", "-U", "geo_test", "-d", "geo_validation"]
+        periodSeconds: 2
+      volumeMounts:
+        - name: database
+          mountPath: /var/lib/postgresql/data
+  volumes:
+    - name: database
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-validation
+  namespace: geo-build-test
+spec:
+  selector:
+    app.kubernetes.io/name: postgres-validation
+  ports:
+    - port: 5432
+      targetPort: 5432

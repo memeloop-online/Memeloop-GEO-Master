@@ -4,6 +4,7 @@ export type MembershipRole =
   | "viewer"
   | "operator_agent"
   | "operator_admin"
+  | "oem_admin"
   | "resource_admin";
 
 export interface SessionUser {

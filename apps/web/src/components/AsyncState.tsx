@@ -9,36 +9,40 @@ import {
 } from "@fluentui/react-components";
 import { ArrowSyncRegular, LockClosedRegular } from "@fluentui/react-icons";
 import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import "../i18n";
 
 export function LoadingState({
-  label = "正在加载",
+  label,
   compact = false,
 }: {
   label?: string;
   compact?: boolean;
 }) {
+  const { t } = useTranslation();
+  const displayLabel = label ?? t("asyncState.loading");
   if (compact) {
     return (
-      <Skeleton aria-label={label}>
+      <Skeleton aria-label={displayLabel}>
         <SkeletonItem size={16} />
       </Skeleton>
     );
   }
   return (
     <section className="async-state async-state-loading" aria-live="polite">
-      <Skeleton aria-label={label}>
+      <Skeleton aria-label={displayLabel}>
         <SkeletonItem size={32} />
         <SkeletonItem size={16} />
         <SkeletonItem size={16} />
       </Skeleton>
-      <span>{label}</span>
+      <span>{displayLabel}</span>
     </section>
   );
 }
 
 export function ErrorState({
-  title = "暂时无法加载",
-  detail = "请检查连接后重试。",
+  title,
+  detail,
   onRetry,
   intent = "error",
 }: {
@@ -47,11 +51,12 @@ export function ErrorState({
   onRetry?: () => void;
   intent?: MessageBarIntent;
 }) {
+  const { t } = useTranslation();
   return (
     <MessageBar intent={intent} className="async-error" aria-live="assertive">
       <MessageBarBody>
-        <b>{title}</b>
-        <span>{detail}</span>
+        <b>{title ?? t("asyncState.loadError")}</b>
+        <span>{detail ?? t("asyncState.checkConnection")}</span>
       </MessageBarBody>
       {onRetry && (
         <Button
@@ -59,7 +64,7 @@ export function ErrorState({
           icon={<ArrowSyncRegular />}
           onClick={onRetry}
         >
-          重试
+          {t("asyncState.retry")}
         </Button>
       )}
     </MessageBar>
@@ -86,18 +91,22 @@ export function EmptyState({
 
 export function UnauthorizedState({
   tenantName,
-  detail = "你已登录，但没有访问此工作区的权限。",
+  detail,
   action,
 }: {
   tenantName?: string;
   detail?: ReactNode;
   action?: ReactNode;
 }) {
+  const { t } = useTranslation();
   return (
     <Card className="async-state async-unauthorized" role="alert">
       <LockClosedRegular aria-hidden="true" fontSize={28} />
-      <h1>权限不足</h1>
-      <p>{tenantName ? `无法访问“${tenantName}”。${detail}` : detail}</p>
+      <h1>{t("asyncState.accessDenied")}</h1>
+      <p>
+        {tenantName && t("asyncState.cannotAccessTenant", { name: tenantName })}
+        {detail ?? t("asyncState.workspaceForbidden")}
+      </p>
       {action}
     </Card>
   );

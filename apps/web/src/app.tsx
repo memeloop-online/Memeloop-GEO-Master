@@ -11,7 +11,17 @@ import { SetupEntry } from "./pages/SetupEntry";
 import { SetupPage } from "./pages/SetupPage";
 import { SourceDetailPage } from "./pages/SourceDetailPage";
 import { WorkbenchPage } from "./pages/WorkbenchPage";
+import { DocumentManifestPage } from "./pages/DocumentManifestPage";
+import {
+  ChannelAccountsPage,
+  OperatorAccountsPage,
+} from "./pages/ChannelAccountsPage";
 import { WorkspacePage } from "./pages/WorkspacePage";
+import { ReportsPage } from "./pages/ReportsPage";
+import { ChannelJobsPage } from "./pages/ChannelJobsPage";
+import { QuestionSetsPage } from "./pages/QuestionSetsPage";
+import { ContentAssetPage, ContentAssetsPage } from "./pages/ContentPages";
+import { OperatorAppearancePage } from "./pages/OperatorAppearancePage";
 
 export function AppRoutes() {
   return (
@@ -20,6 +30,8 @@ export function AppRoutes() {
       <Route element={<RequireSession />}>
         <Route path="/" element={<Navigate replace to="/workspaces" />} />
         <Route path="/workspaces" element={<WorkspacePage />} />
+        <Route path="/ops/channels" element={<OperatorAccountsPage />} />
+        <Route path="/ops/appearance" element={<OperatorAppearancePage />} />
         <Route path="/setup" element={<SetupEntry />} />
         <Route element={<RequireMembership />}>
           <Route path="/app/:tenantId/:projectId" element={<AppShell />}>
@@ -45,36 +57,25 @@ export function AppRoutes() {
               path="campaigns"
               element={<WorkbenchPage page="campaigns" />}
             />
-            <Route
-              path="campaigns/:id"
-              element={<WorkbenchPage page="campaign" />}
-            />
-            <Route path="content" element={<WorkbenchPage page="content" />} />
-            <Route
-              path="content/:id"
-              element={<WorkbenchPage page="contentDetail" />}
-            />
+            <Route path="campaigns/:id" element={<DocumentManifestPage />} />
+            <Route path="content" element={<ContentAssetsPage />} />
+            <Route path="content/:id" element={<ContentAssetPage />} />
             <Route
               path="channels"
-              element={<WorkbenchPage page="channels" />}
+              element={<ChannelAccountsPage view="channels" />}
             />
             <Route
               path="channels/connect"
-              element={<WorkbenchPage page="connect" />}
+              element={<ChannelAccountsPage view="connect" />}
             />
-            <Route
-              path="publications"
-              element={<WorkbenchPage page="publications" />}
-            />
-            <Route
-              path="measurement"
-              element={<WorkbenchPage page="measurement" />}
-            />
-            <Route path="reports" element={<WorkbenchPage page="reports" />} />
+            <Route path="publications" element={<ChannelJobsPage />} />
+            <Route path="measurement" element={<QuestionSetsPage />} />
+            <Route path="reports" element={<ReportsPage />} />
+            <Route path="reports/:id" element={<ReportsPage />} />
             <Route path="billing" element={<WorkbenchPage page="billing" />} />
             <Route
               path="settings"
-              element={<WorkbenchPage page="settings" />}
+              element={<ChannelAccountsPage view="settings" />}
             />
           </Route>
         </Route>

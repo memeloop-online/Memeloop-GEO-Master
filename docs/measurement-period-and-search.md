@@ -1,0 +1,56 @@
+# 独立测量报告与传统搜索实施说明
+
+产品基线不变。本文件记录新增接口与接手边界；当前验证和未完成范围分别查 WORKLOG、TODO。
+
+## 独立时间窗口报告
+
+独立话题测量不要求企业资料或优化周期。`MeasurementPeriodReport` 独立保存窗口、时区、冻结样本及证据截止，不创建伪周期，也不改写原测量状态。后续解析作为有来源的补充结果；失败解析不覆盖既有有效结果。
+
+接口以 `/api/v1` 为前缀，作用域来自当前登录主体与项目：
+
+- `GET /projects/{project_id}/measurement-report-preview`：默认最近七天，或明确窗口预览。
+- `GET /projects/{project_id}/measurement-reports`：已保存快照。
+- `POST /projects/{project_id}/measurement-reports`：保存明确窗口，重放复用不可变结果；更正创建新版本。
+- `GET /measurement-reports/{report_id}`：读取已保存报告。
+
+`/reports` 首屏提供独立测量预览与保存历史。周期报告仍保留原路径；独立窗口报告没有伪造周期 CSV/PDF 导出。原观察时间、原文保存时间、解析完成时间分别参与截止校验。
+
+P00 沿用 `report_get`、`report_preview`、`report_reduce`，用 `kind: measurement_period` 选择新能力；默认仍为原周期行为。预览可默认最近七天，保存必须传预览返回的确切窗口。当前源码 Host Ops 为 `geo.hostops.v19`、48 项，包含下述三项搜索工具；API、bundle 与实际摘要必须成套部署。模型返回值省略非优化用途的问题、答案、引用和出处细节，保留报告身份与权威计数；授权用户界面仍可查看完整评估报告。
+
+主要入口为 `crates/domain/src/measurement_report.rs`、`crates/api/src/measurement_reports.rs`、`crates/persistence/src/measurement_report.rs`，迁移 `0048`。
+
+## 传统搜索观察
+
+`SerpMeasurement` 与 AI 渠道账号、AI 引用和站长数据分开。当前首个适配采用 DataForSEO Google Organic Standard 的异步任务 API；普通 LLM 回答不替代搜索结果。
+
+接受任意查询词、可选 URL/域名及受信问题引用。持久保存精确查询、来源键、协议、计划时间与幂等请求；来源键和协议共同匹配运行配置，相同协议的不同来源不会在重启后混用。地区、语言、设备等请求条件与实际返回条件分别保存；实际条件缺失保持未知。
+
+后台流程为受理排队、持久发送意图、一次提交、原始响应入库、只读轮询、解析观察。发送结果未知不自动再次付费提交；原始部分响应和失败证据先保存，不能先解析后丢弃。待处理任务持久保存下次读取时间，进程重启不丢失轮询进度；取消后的迟到证据可归档，但不复活任务。
+
+排名区分自然排名、绝对位置与广告等其他结果。只有完整、连续的请求深度证据才能支持范围内未出现的结论；部分或截断响应不能冒充全量未命中。重新解释已存结构化搜索响应不新增供应商任务。这是供应商结构化 JSON 的协议解码，不替代 AI 网页回答的模型语义解析。
+
+测量页面 `?tab=search` 提供来源能力、关键词输入、历史、排名与原始证据。未配置来源时不允许发起任务，但保留历史查询。搜索数据源设置和 P00 工具已实现、通过本地／实库验证并部署，v19 bundle 已核对；真实搜索来源结果及 P00 同资源调用仍待验收，不能以部署代替真实供应商验收。
+
+项目设置 `?tab=search` 复用现有设置页。管理员保存／轮换／启停及测试来源，其他成员仅看脱敏状态；账号和密码均加密，公开响应只给凭据存在状态。凭据成对替换，留空保留，保存后清空输入；版本冲突保留本地草稿供处理。配置 API 为 `GET /projects/{project_id}/serp-settings`、`PUT /projects/{project_id}/serp-settings/{source_key}`、`POST /projects/{project_id}/serp-settings/{source_key}/test`，复用管理员授权、CSRF 与 no-store。
+
+动态路由按完整项目作用域和稳定来源键读取。新发送在持久发送意图中冻结凭据修订；既有任务查回／恢复使用其绑定版本，不以新账号兜底。轮换保留已有任务所需的加密旧版本；停用阻止新提交但不删除历史证据。项目暂停／归档与首次发送授权原子协调，已有授权不撤销，网络请求不持有项目锁。连接测试仅调用固定官方只读账号接口，不提交付费搜索任务；不把连接成功等同搜索完成。
+
+P00 的 `serp_create`、`serp_read`、`serp_reparse` 与页面共用持久资源与服务；保留原请求身份、作用域和非优化用途隔离。模型不获取凭据或原始响应。已存响应重解析不新增供应商调用，也不改变原任务的外部发送结果。
+
+主要入口：
+
+- `crates/domain/src/serp.rs`：协议、任务、证据与仓储契约。
+- `crates/provider/src/dataforseo.rs`：HTTP 薄适配与原始响应。
+- `crates/api/src/serp.rs`、`serp_dataforseo.rs`：作用域服务、恢复和结果映射。
+- `crates/persistence/src/serp.rs`、迁移 `0047`：内存与 PostgreSQL。
+- `crates/{domain,persistence,api}/src/project_serp_settings.rs`、迁移 `0049`：加密来源配置、凭据修订与动态绑定。
+- `apps/web/src/pages/SerpMeasurementPanel.tsx`：搜索测量详情界面。
+- `apps/web/src/pages/ProjectSerpSettingsPanel.tsx`：项目搜索来源设置。
+
+生产接入必须显式提供来源配置与合法凭据，不把测试注入传输、合成排名或已通过契约测试写成真实搜索已完成。
+
+## 共同报告当前实施边界（2026-10-10）
+
+共同报告搜索列项尚未提交／上线。领域全量、六项定向及审查、PostgreSQL 实库 1/1、UI 457/457 与类型／格式及单轮审查、API 7 项、worker 2 项及 Clippy 均通过。实库首轮暴露数据库／应用时钟差，测试修正后的通过不消除生产跨时钟检查风险，须修复后交付。搜索排名与 AI 引用分开统计；窗口及存储截止固定，更正复用冻结样本集合，旧报告未纳入搜索不能显示为零。无 AI 样本、无来源配置、迟到证据与评估题隔离须分别验证，不通过新增供应商请求补测试。
+
+现有独立报告的预览、保存、刷新同版本读回及结果前置展示已实测；UI 时间语义已上线并读回 `received_at`。最新已存原文可发现，但单次重解析为 `failed/model_timeout`、60.0349 秒、无 `actual_model`；超时预算包含凭据解析及完整 HTTP。本轮诊断因缺少 requestId、无法关联网关而收束，不能证明出站阶段或根因。原文发现不代表解析或共同报告验收成功，不重问；后续需可关联证据再定位。当前组件版本、CI 和获批 Astra 首轮阻断状态统一见 HANDOFF。

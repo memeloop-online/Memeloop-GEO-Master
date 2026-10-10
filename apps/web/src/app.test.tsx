@@ -228,13 +228,11 @@ describe("authentication and workspace guards", () => {
     renderApp("/app/tenant-a/project-a/overview");
 
     expect(
-      await screen.findAllByText("知识版本已形成，等待文档覆盖规划/清单封存"),
+      await screen.findAllByText("资料已就绪，等待规划内容"),
     ).not.toHaveLength(0);
     expect(screen.queryByText("等待知识处理")).not.toBeInTheDocument();
     expect(
-      screen.getByText(
-        /文档与分发清单骨架已创建，知识版本已形成，仍等待文档覆盖规划与文档清单封存/,
-      ),
+      screen.getByText("项目启动请求已受理。资料已就绪，内容计划待生成。"),
     ).toBeInTheDocument();
     expect(screen.getByText("查看企业知识")).toBeInTheDocument();
     expect(screen.queryByText("导入资料")).not.toBeInTheDocument();

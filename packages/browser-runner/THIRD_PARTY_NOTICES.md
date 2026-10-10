@@ -1,0 +1,34 @@
+# Interactive container dependencies
+
+`Dockerfile.interactive` adds Ubuntu Noble packages at fixed distribution
+versions: TigerVNC `1.13.1+dfsg-2build2` (`Xtigervnc` and
+`tigervncpasswd`), websockify `0.10.0+dfsg1-5build2`, Openbox
+`3.6.1-12build5`, xauth `1:1.1.2-1build1`, Noto CJK
+`1:20230817+repack1-3`. Noto Color Emoji is retained at the version already
+installed in the digest-pinned base image, rather than downgraded to an older
+distribution build. Chromium and Playwright come from the pinned Playwright
+`1.63.0` image/package.
+
+These are independent upstream components, not repository-owned code.
+The distributed image keeps Ubuntu's required copyright/license records in
+`/usr/share/doc/*/copyright`; do not strip these records from a published
+image. TigerVNC and Openbox include GPL-family code; publishing the image
+requires meeting their corresponding source distribution obligations.
+Playwright's npm lock records its Apache-2.0 license. Validate the final
+image's actual package records and licenses before external distribution.
+
+The private WebSocket relay uses `ws` 8.21.3, MIT licensed, from
+<https://github.com/websockets/ws>. Its copyright and complete license remain
+in `node_modules/ws/LICENSE` in the distributed image. The runner's standalone
+npm lock and workspace pnpm lock both pin this dependency.
+
+The bounded rich-publication multipart parser uses `@fastify/busboy` 3.2.2,
+MIT licensed, from <https://github.com/fastify/busboy>. Its copyright and
+complete license remain in `node_modules/@fastify/busboy/LICENSE` in the
+distributed image.
+
+The isolated desktop smoke loads unmodified `@novnc/novnc` 1.7.0,
+MPL-2.0 licensed, from <https://github.com/novnc/noVNC>. Its ES-module source,
+`LICENSE.txt`, and `AUTHORS` remain in `node_modules/@novnc/novnc` in the
+test image. It supplies the RFB client, keyboard, and clipboard protocol;
+the fixture does not implement a replacement remote-input stack.

@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: browser-runner
+  labels:
+    app.kubernetes.io/name: memeloop-geo-browser-runner
+    app.kubernetes.io/component: browser-runner
+    app.kubernetes.io/part-of: memeloop-geo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: memeloop-geo-browser-runner
+      app.kubernetes.io/component: browser-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: memeloop-geo-browser-runner
+        app.kubernetes.io/component: browser-runner
+        app.kubernetes.io/part-of: memeloop-geo
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: browser-runner
+          # Replace this example reference with the immutable digest emitted by
+          # a successful interactive-desktop CI run before applying.
+          image: ghcr.io/example-org/geo-browser-runner-desktop:ci-placeholder@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 38080
+              protocol: TCP
+          envFrom:
+            # Optional low-cost extraction fallback. This does not configure
+            # or replace the measured consumer-web account.
+            - secretRef:
+                name: geo-observation-parser
+                optional: true
+          env:
+            - name: GEO_BROWSER_RUNNER_HOST
+              value: 0.0.0.0
+            - name: GEO_BROWSER_RUNNER_PORT
+              value: "38080"
+            - name: GEO_BROWSER_INTERACTIVE_RUNTIME
+              value: linux-vnc
+            - name: HOME
+              value: /tmp
+            - name: GEO_BROWSER_RUNNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: geo-browser-runner
+                  key: GEO_BROWSER_RUNNER_TOKEN
+                  optional: false
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: dshm
+              mountPath: /dev/shm
+          readinessProbe:
+            tcpSocket:
+              port: 38080
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            # Baseline capacity for a headed Chromium/VNC process; tune for
+            # the target cluster rather than using this as a business limit.
+            requests:
+              cpu: 500m
+              memory: 1Gi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 2Gi
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: browser-runner
+  labels:
+    app.kubernetes.io/name: memeloop-geo-browser-runner
+    app.kubernetes.io/component: browser-runner
+    app.kubernetes.io/part-of: memeloop-geo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: memeloop-geo-browser-runner
+    app.kubernetes.io/component: browser-runner
+  ports:
+    - name: http
+      port: 38080
+      targetPort: http
+      protocol: TCP

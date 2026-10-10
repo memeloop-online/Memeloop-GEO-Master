@@ -1,26 +1,31 @@
 use axum::{
     Json,
+    body::to_bytes,
     extract::{Extension, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     middleware::Next,
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
 use geo_domain::{
-    AppError, AppendMessage, Conversation, ConversationDetail, ConversationEvent, ConversationId,
-    CreateConversation, ProjectId, Run, SubmitAcceptance, TenantScope, TurnId,
+    AppError, AppendMessage, AttachmentId, AttachmentReference, Conversation, ConversationDetail,
+    ConversationEvent, ConversationId, CreateConversation, KnowledgePurpose, MAX_UPLOAD_BYTES,
+    ProjectId, Run, StoredObject, SubmitAcceptance, TenantScope, TurnId, UploadSession,
+    UploadSessionCommand,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{convert::Infallible, time::Duration};
-use tokio_stream::wrappers::BroadcastStream;
+use std::{collections::VecDeque, convert::Infallible, sync::Arc, time::Duration};
+use tokio::{sync::broadcast, time::Interval};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, IDEMPOTENCY_KEY_HEADER, PROJECT_ID_HEADER, RequestContext, api_error,
-    context, error_response, require_project_writer,
+    context, error_response, require_project_writer, run_executor,
 };
+
+const SSE_AUTH_REVALIDATION_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub(crate) struct AgentScopeQuery {
@@ -154,6 +159,190 @@ fn request_hash(input: &AppendMessage) -> Result<String, AppError> {
     Ok(hex::encode(Sha256::digest(body)))
 }
 
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentUploadCommand {
+    pub filename: String,
+    pub declared_media_type: String,
+    pub expected_size: u64,
+    pub expected_sha256: String,
+}
+
+fn attachment_reference(object: StoredObject, filename: String) -> AttachmentReference {
+    AttachmentReference {
+        attachment_id: AttachmentId::new(object.object_id),
+        object_id: object.object_id.to_string(),
+        filename,
+        media_type: Some(object.detected_media_type),
+        size_bytes: Some(object.actual_size),
+        sha256: Some(object.sha256),
+        object_version: Some(object.object_version.to_string()),
+    }
+}
+
+fn required_upload_key(headers: &HeaderMap) -> Result<&str, AppError> {
+    let key = headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .ok_or_else(|| AppError::invalid_request("missing Idempotency-Key header"))?
+        .to_str()
+        .map_err(|_| AppError::invalid_request("invalid Idempotency-Key header"))?
+        .trim();
+    if key.is_empty() {
+        return Err(AppError::invalid_request(
+            "Idempotency-Key must not be empty",
+        ));
+    }
+    Ok(key)
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/agent/attachments/upload-sessions",
+    security(("sessionCookie" = [])), request_body = AttachmentUploadCommand,
+    responses((status = 201, body = UploadSession))
+)]
+pub(crate) async fn create_attachment_upload(
+    State(state): State<AppState>,
+    Extension(auth): Extension<context::AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<AgentScopeQuery>,
+    Json(input): Json<AttachmentUploadCommand>,
+) -> Result<(StatusCode, Json<UploadSession>), ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, request_id(context)))?;
+    let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    let session = state
+        .knowledge_repository()
+        .create_upload_session(
+            &scope,
+            UploadSessionCommand {
+                filename: input.filename,
+                declared_media_type: input.declared_media_type,
+                expected_size: input.expected_size,
+                expected_sha256: input.expected_sha256,
+                // Raw chat uploads are private staging objects, not classified
+                // knowledge sources. The explicit import tool assigns the
+                // source purpose; uploading alone must never publish knowledge.
+                purpose: KnowledgePurpose::Internal,
+            },
+        )
+        .await
+        .map_err(|error| api_error(error, request_id(context)))?;
+    Ok((StatusCode::CREATED, Json(session)))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/agent/attachments/upload-sessions/{id}/content",
+    security(("sessionCookie" = [])),
+    params(("id" = Uuid, Path)),
+    request_body(content = String, content_type = "application/octet-stream"),
+    responses((status = 200, body = UploadSession))
+)]
+pub(crate) async fn put_attachment_content(
+    State(state): State<AppState>,
+    Extension(auth): Extension<context::AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<AgentScopeQuery>,
+    Path(id): Path<Uuid>,
+    request: Request,
+) -> Result<Json<UploadSession>, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, request_id(context)))?;
+    let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    let bytes = to_bytes(request.into_body(), MAX_UPLOAD_BYTES as usize + 1)
+        .await
+        .map_err(|_| {
+            api_error(
+                AppError::invalid_request("uploaded content exceeds maximum upload size"),
+                request_id(context),
+            )
+        })?;
+    state
+        .knowledge_repository()
+        .put_upload_content(&scope, id, bytes.to_vec())
+        .await
+        .map(Json)
+        .map_err(|error| api_error(error, request_id(context)))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/agent/attachments/upload-sessions/{id}/complete",
+    security(("sessionCookie" = [])),
+    params(("id" = Uuid, Path)),
+    responses((status = 200, body = AttachmentReference))
+)]
+pub(crate) async fn complete_attachment_upload(
+    State(state): State<AppState>,
+    Extension(auth): Extension<context::AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<AgentScopeQuery>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AttachmentReference>, ApiError> {
+    require_project_writer(&auth).map_err(|error| api_error(error, request_id(context)))?;
+    let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    let key =
+        required_upload_key(&headers).map_err(|error| api_error(error, request_id(context)))?;
+    let (object, filename) = state
+        .knowledge_repository()
+        .complete_attachment_upload(&scope, id, key)
+        .await
+        .map_err(|error| api_error(error, request_id(context)))?;
+    Ok(Json(attachment_reference(object, filename)))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/agent/attachments/{id}",
+    security(("sessionCookie" = [])),
+    params(("id" = AttachmentId, Path)),
+    responses((status = 200, body = AttachmentReference))
+)]
+pub(crate) async fn get_attachment(
+    State(state): State<AppState>,
+    Extension(auth): Extension<context::AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<AgentScopeQuery>,
+    Path(id): Path<AttachmentId>,
+) -> Result<Json<AttachmentReference>, ApiError> {
+    let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
+        .map_err(|error| api_error(error, request_id(context)))?;
+    let (object, filename) = state
+        .knowledge_repository()
+        .get_attachment_object(&scope, id.as_uuid())
+        .await
+        .map_err(|error| api_error(error, request_id(context)))?
+        .ok_or_else(|| {
+            api_error(
+                AppError::not_found("attachment not found"),
+                request_id(context),
+            )
+        })?;
+    Ok(Json(attachment_reference(object, filename)))
+}
+
+async fn verify_attachments(
+    state: &AppState,
+    scope: &TenantScope,
+    attachments: &[AttachmentReference],
+) -> Result<(), AppError> {
+    for supplied in attachments {
+        let (object, filename) = state
+            .knowledge_repository()
+            .get_attachment_object(scope, supplied.attachment_id.as_uuid())
+            .await?
+            .ok_or_else(|| AppError::not_found("attachment not found"))?;
+        if *supplied != attachment_reference(object, filename) {
+            return Err(AppError::invalid_request(
+                "attachment metadata does not match committed object",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/agent/conversations",
@@ -258,6 +447,9 @@ pub(crate) async fn append_message(
     require_project_writer(&auth).map_err(|error| api_error(error, request_id(context)))?;
     let scope = scoped_project(&auth.scope, &headers, query.project_id, true)
         .map_err(|error| api_error(error, request_id(context)))?;
+    verify_attachments(&state, &scope, &input.attachments)
+        .await
+        .map_err(|error| api_error(error, request_id(context)))?;
     let request_hash =
         request_hash(&input).map_err(|error| api_error(error, request_id(context)))?;
     let acceptance = state
@@ -273,6 +465,16 @@ pub(crate) async fn append_message(
         )
         .await
         .map_err(|error| api_error(error, request_id(context)))?;
+    // Scheduled only after the acceptance has committed: the response below
+    // states that the turn was accepted, never that it has started, and the run
+    // can take minutes.  The executor claims the run atomically, so a replayed
+    // Idempotency-Key cannot start a second turn.
+    run_executor::dispatch(
+        state.agent_runtime(),
+        state.agent_repository(),
+        scope,
+        &acceptance,
+    );
     Ok((
         StatusCode::ACCEPTED,
         Json(AgentSubmitResponse::from(acceptance)),
@@ -303,6 +505,9 @@ pub(crate) async fn cancel_turn(
         .cancel_turn(&scope, turn_id)
         .await
         .map_err(|error| api_error(error, request_id(context)))?;
+    if run.status == geo_domain::RunStatus::Cancelled {
+        run_executor::signal_cancelled(run.id);
+    }
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
@@ -313,6 +518,162 @@ fn sse_event(event: ConversationEvent) -> Result<Event, Infallible> {
         .data(payload))
 }
 
+fn sse_auth_revoked() -> Result<Event, Infallible> {
+    Ok(Event::default()
+        .event("auth.revoked")
+        .data(r#"{"code":"unauthorized","message":"session is no longer valid"}"#))
+}
+
+fn event_cursor(headers: &HeaderMap, query_after: Option<u64>) -> Result<u64, AppError> {
+    if let Some(after) = query_after {
+        return Ok(after);
+    }
+    let Some(value) = headers.get("last-event-id") else {
+        return Ok(0);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| AppError::invalid_request("invalid Last-Event-ID header"))?
+        .trim();
+    if value.is_empty() {
+        return Ok(0);
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| AppError::invalid_request("invalid Last-Event-ID header"))
+}
+
+async fn revalidate_stream_auth(
+    repository: &dyn geo_domain::AuthRepository,
+    headers: &HeaderMap,
+    uri: &Uri,
+    durable_storage: bool,
+    expected_session: &geo_domain::Session,
+    expected_scope: &geo_domain::TenantScope,
+) -> bool {
+    let cookie_name = if durable_storage {
+        context::SESSION_COOKIE_NAME
+    } else {
+        context::DEV_SESSION_COOKIE_NAME
+    };
+    let Ok(auth) =
+        context::resolve_auth_context_from_parts(repository, headers, uri, true, Some(cookie_name))
+            .await
+    else {
+        return false;
+    };
+    auth.session.id == expected_session.id
+        && auth.user.id == expected_session.user_id
+        && auth.scope.operator_id == expected_scope.operator_id
+        && auth.scope.tenant_id == expected_scope.tenant_id
+}
+
+struct EventTail {
+    receiver: broadcast::Receiver<ConversationEvent>,
+    interval: Interval,
+    last_sequence: u64,
+    pending: VecDeque<ConversationEvent>,
+    terminated: bool,
+    scope: TenantScope,
+    conversation_id: ConversationId,
+    repository: Arc<dyn geo_domain::AgentRepository>,
+    auth_repository: context::SharedAuthRepository,
+    headers: HeaderMap,
+    uri: Uri,
+    durable_storage: bool,
+    session: geo_domain::Session,
+}
+
+impl EventTail {
+    async fn authorized(&self) -> bool {
+        revalidate_stream_auth(
+            &*self.auth_repository,
+            &self.headers,
+            &self.uri,
+            self.durable_storage,
+            &self.session,
+            &self.scope,
+        )
+        .await
+    }
+
+    fn revoke(&mut self) -> Option<Result<Event, Infallible>> {
+        self.terminated = true;
+        self.pending.clear();
+        Some(sse_auth_revoked())
+    }
+
+    async fn catch_up(&mut self) -> bool {
+        match self
+            .repository
+            .replay_events(&self.scope, self.conversation_id, Some(self.last_sequence))
+            .await
+        {
+            Ok(events) => {
+                self.pending.extend(events);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<Result<Event, Infallible>> {
+        if self.terminated {
+            return None;
+        }
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                if !self.authorized().await {
+                    return self.revoke();
+                }
+                self.last_sequence = event.sequence;
+                return Some(sse_event(event));
+            }
+            tokio::select! {
+                item = self.receiver.recv() => {
+                    let event = match item {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if !self.catch_up().await {
+                                return None;
+                            }
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    };
+                    if event.conversation_id != self.conversation_id
+                        || !self.scope.contains(&event.scope())
+                        || event.sequence <= self.last_sequence
+                    {
+                        continue;
+                    }
+                    if !self.authorized().await {
+                        return self.revoke();
+                    }
+                    if event.sequence > self.last_sequence.saturating_add(1) {
+                        if !self.catch_up().await {
+                            return None;
+                        }
+                        continue;
+                    }
+                    self.last_sequence = event.sequence;
+                    return Some(sse_event(event));
+                }
+                _ = self.interval.tick() => {
+                    if !self.authorized().await {
+                        return self.revoke();
+                    }
+                    // Broadcast is only a local wake-up; another API replica
+                    // may have committed events without publishing here.
+                    if !self.catch_up().await {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/agent/conversations/{conversation_id}/events",
@@ -320,25 +681,21 @@ fn sse_event(event: ConversationEvent) -> Result<Event, Infallible> {
     params(("conversation_id" = ConversationId, Path)),
     responses((status = 200, description = "Conversation event stream", content_type = "text/event-stream"))
 )]
+#[allow(clippy::too_many_arguments)] // Route extractors keep the authorized scope and raw reconnect request distinct.
 pub(crate) async fn conversation_events(
     State(state): State<AppState>,
     Extension(tenant_scope): Extension<TenantScope>,
+    Extension(auth): Extension<context::AuthContext>,
     Extension(context): Extension<RequestContext>,
     headers: HeaderMap,
     Query(query): Query<AgentEventsQuery>,
     Path(conversation_id): Path<ConversationId>,
+    uri: Uri,
 ) -> Result<Response, ApiError> {
     let scope = scoped_project(&tenant_scope, &headers, query.project_id, true)
         .map_err(|error| api_error(error, request_id(context)))?;
-    let after = query
-        .after
-        .or_else(|| {
-            headers
-                .get("last-event-id")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-        })
-        .unwrap_or(0);
+    let after = event_cursor(&headers, query.after)
+        .map_err(|error| api_error(error, request_id(context)))?;
     let repository = state.agent_repository();
     // Subscribe before reading the durable replay so events published between
     // the snapshot and stream construction are still available to the tail.
@@ -347,24 +704,29 @@ pub(crate) async fn conversation_events(
         .replay_events(&scope, conversation_id, Some(after))
         .await
         .map_err(|error| api_error(error, request_id(context)))?;
-    let replay_last = replay.last().map(|event| event.sequence).unwrap_or(after);
-    let scope_for_stream = scope.clone();
-    let live = BroadcastStream::new(receiver).filter_map(move |item| {
-        let scope = scope_for_stream.clone();
-        async move {
-            let event = item.ok()?;
-            if event.conversation_id != conversation_id
-                || !scope.contains(&event.scope())
-                || event.sequence <= replay_last
-            {
-                return None;
-            }
-            Some(sse_event(event))
-        }
+    let mut interval = tokio::time::interval(SSE_AUTH_REVALIDATION_INTERVAL);
+    // `interval` ticks immediately once; consume that tick so the first
+    // revalidation happens after the advertised grace period.
+    interval.tick().await;
+    let tail = EventTail {
+        receiver,
+        interval,
+        last_sequence: after,
+        pending: replay.into(),
+        terminated: false,
+        scope,
+        conversation_id,
+        repository,
+        auth_repository: state.auth_repository(),
+        headers,
+        uri,
+        durable_storage: state.durable_storage(),
+        session: auth.session,
+    };
+    let live = futures_util::stream::unfold(tail, |mut tail| async move {
+        tail.next_event().await.map(|event| (event, tail))
     });
-    let replay_stream = futures_util::stream::iter(replay.into_iter().map(sse_event));
-    let stream = Box::pin(replay_stream.chain(live));
-    Ok(Sse::new(stream)
+    Ok(Sse::new(live)
         .keep_alive(
             KeepAlive::new()
                 .interval(Duration::from_secs(15))

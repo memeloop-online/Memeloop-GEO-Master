@@ -1,0 +1,143 @@
+.reports-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.reports-page .report-panel {
+  min-width: 0;
+  padding: 18px;
+}
+
+.reports-page .report-preview {
+  padding: 18px;
+  border: 2px solid #b8cee7;
+  border-radius: 10px;
+  background: #f4f8fd;
+}
+
+.reports-page .report-preview > .report-metadata {
+  margin: 12px 0 0;
+}
+
+.reports-page .report-preview .report-list-heading h2 {
+  margin: 0;
+}
+
+.reports-page > section[aria-label="已保存的正式周报"] {
+  display: grid;
+  gap: 12px;
+}
+
+.reports-page h2,
+.reports-page h3,
+.reports-page h4 {
+  margin: 0 0 10px;
+}
+
+.reports-page p {
+  overflow-wrap: anywhere;
+}
+
+.report-list,
+.report-findings,
+.report-evidence-list {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.report-list-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.report-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.report-coverage {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 12px;
+}
+
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.report-table th,
+.report-table td {
+  padding: 8px 0;
+  border-bottom: 1px solid #e3e7ed;
+}
+
+.report-table td {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.report-metadata,
+.report-evidence dl {
+  display: grid;
+  grid-template-columns: minmax(95px, 140px) minmax(0, 1fr);
+  gap: 7px 12px;
+  margin: 8px 0 16px;
+}
+
+.report-metadata dt,
+.report-evidence dt,
+.report-muted {
+  color: #616161;
+}
+
+.report-metadata dd,
+.report-evidence dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.report-group {
+  padding: 12px 0;
+  border-top: 1px solid #e3e7ed;
+}
+
+.report-group h4 {
+  overflow-wrap: anywhere;
+}
+
+.report-section > h2 {
+  margin-bottom: 12px;
+}
+
+.report-evidence {
+  padding: 16px;
+  border: 1px solid #dfe3e8;
+  border-radius: 8px;
+  background: #fff;
+  scroll-margin-top: 24px;
+}
+
+@media (max-width: 600px) {
+  .report-metadata,
+  .report-evidence dl {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .report-metadata dd,
+  .report-evidence dd {
+    margin-bottom: 8px;
+  }
+}

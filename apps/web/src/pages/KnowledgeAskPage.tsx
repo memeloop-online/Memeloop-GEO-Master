@@ -7,11 +7,7 @@ import {
   MessageBarBody,
   Textarea,
 } from "@fluentui/react-components";
-import {
-  ArrowRightRegular,
-  DocumentAddRegular,
-  SearchRegular,
-} from "@fluentui/react-icons";
+import { ArrowRightRegular, SearchRegular } from "@fluentui/react-icons";
 import { Link, useParams } from "react-router-dom";
 import {
   useAskKnowledgeMutation,
@@ -57,7 +53,7 @@ export function KnowledgeAskPage() {
       <div className="knowledge-ask-page">
         <ErrorState
           title="无法读取当前知识版本"
-          detail="问答必须绑定到一个明确的知识版本，因此当前不会发送无版本请求。"
+          detail="暂时无法读取项目资料，请重试。"
           onRetry={() => void release.refetch()}
         />
       </div>
@@ -68,7 +64,7 @@ export function KnowledgeAskPage() {
       <div className="knowledge-ask-page">
         <EmptyState
           title="还没有可问答的知识版本"
-          detail="请先导入并完成至少一份资料的处理。系统不会用上传中的文件或空索引伪造答案。"
+          detail="请先导入资料，处理完成后即可提问。"
           action={
             <Link to="../knowledge">
               <Button appearance="primary">前往资料中心</Button>
@@ -83,26 +79,18 @@ export function KnowledgeAskPage() {
     <div className="knowledge-ask-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">P05 · 知识问答</p>
+          <p className="eyebrow">知识问答</p>
           <h1>向项目知识提问</h1>
           <p>
-            当前绑定知识版本 #{release.data.sequence}。每个回答最多使用 12
-            条可定位证据。
+            基于知识版本 #{release.data.sequence}{" "}
+            查找答案，可查看引用的来源原文。
           </p>
         </div>
-        <Button
-          appearance="secondary"
-          icon={<DocumentAddRegular />}
-          disabled
-          title="W05/W06 内容简报和编辑器尚未接入；系统不会假装已生成文章。"
-        >
-          生成文章
-        </Button>
       </section>
       {capabilities.isError ? (
         <MessageBar intent="warning">
           <MessageBarBody>
-            无法确认 LLM 能力。提交后服务端会如实返回可用模式或能力缺失。
+            暂时无法确认问答服务状态。你仍可尝试提交问题。
           </MessageBarBody>
         </MessageBar>
       ) : (
@@ -113,8 +101,7 @@ export function KnowledgeAskPage() {
           <MessageBarBody>
             <b>证据摘录模式</b>
             <span>
-              LLM
-              问答未配置。系统仅返回检索到的证据与资料缺口，不会生成看似确定的回答。
+              当前提供资料检索，显示相关原文与资料缺口；暂不生成综合回答。
             </span>
           </MessageBarBody>
         </MessageBar>
@@ -206,8 +193,7 @@ export function KnowledgeAskPage() {
               {result.capability_missing?.length ? (
                 <MessageBar intent="warning">
                   <MessageBarBody>
-                    本次问答缺少以下能力：{result.capability_missing.join("；")}
-                    。结果不会被补成完整回答。
+                    部分问答功能不可用：{result.capability_missing.join("；")}。
                   </MessageBarBody>
                 </MessageBar>
               ) : null}
@@ -240,7 +226,7 @@ export function KnowledgeAskPage() {
             </p>
           ) : result.evidence.length === 0 ? (
             <p className="source-empty-inline">
-              当前没有足以支持这个问题的证据，系统不会补造引用。
+              暂未找到相关来源。请尝试更具体的问题，或补充资料。
             </p>
           ) : (
             <ol className="ask-evidence-list">
@@ -262,10 +248,6 @@ export function KnowledgeAskPage() {
           )}
         </Card>
       </section>
-      <p className="knowledge-disabled-note">
-        “生成文章”将在 W05/W06
-        接入版本化内容简报与编辑器后可用；当前保持禁用，避免创建不存在的内容任务。
-      </p>
     </div>
   );
 }

@@ -1,0 +1,2209 @@
+//! The production host-op surface.
+//!
+//! Each test pins one guarantee the boundary claims: the declared surface is
+//! closed, JavaScript cannot reach an undeclared capability, every op has a
+//! success *and* a typed failure path, budgets and deadlines are enforced, and a
+//! missing capability is never reported as a plausible result.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use chrono::Utc;
+use geo_domain::{
+    AttachmentId, AttachmentReference, ChunkLocator, ImportStatus, KnowledgeEvidence,
+    KnowledgeImportProgress, KnowledgeSearchRequest, KnowledgeSearchResult, ReportPreview,
+    TenantScope,
+};
+use geo_worker::{
+    HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
+    HostOpError, HostOpErrorCode, HostOpLimits, HostOps, HostRuntime, HostState,
+    KnowledgeImportAttachmentResultItem, KnowledgeImportAttachmentsRequest,
+    KnowledgeImportAttachmentsResult, KnowledgeImportStatusRequest, ManifestItem, ManifestPage,
+    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
+    PublishReceipt, PublishRequest, PublishState, ReportPreviewRequest, ToolCallIdentity,
+    ToolCallOutcome, ToolCallRecorder,
+};
+use serde_json::Value;
+
+const GENEROUS_DEADLINE: Duration = Duration::from_secs(30);
+const SCENARIO_MODULE: &str = "memeloop://bundle/scenario.js";
+const CHECKPOINT_MODULE: &str = "memeloop://bundle/checkpoint.js";
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+/// How the fake bridge should answer, so one recorder covers the success and
+/// failure paths of every op.
+#[derive(Debug, Clone, Default)]
+struct Behaviour {
+    /// Ops that answer with a typed failure instead of a result.
+    failing: BTreeMap<HostOp, HostOpErrorCode>,
+    /// Ops that stall before answering, for the deadline and cancellation
+    /// tests.
+    stalling: BTreeMap<HostOp, Duration>,
+    /// The message carried by every failure, so a test can show that the
+    /// isolate boundary redacts what a bridge hands it.
+    failure_message: Option<String>,
+    import_status: Option<KnowledgeImportProgress>,
+    preview_response: Option<ReportPreview>,
+}
+
+/// Records what the bridge was asked for and answers from `behaviour`.
+#[derive(Debug, Clone, Default)]
+struct FakeHostOps {
+    behaviour: Behaviour,
+    seen: Arc<Mutex<Vec<HostOp>>>,
+    scopes: Arc<Mutex<Vec<String>>>,
+    imported_bindings: Arc<Mutex<Vec<Vec<uuid::Uuid>>>>,
+}
+
+impl FakeHostOps {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with(behaviour: Behaviour) -> Self {
+        Self {
+            behaviour,
+            ..Self::default()
+        }
+    }
+
+    fn seen(&self) -> Vec<HostOp> {
+        self.seen.lock().expect("seen lock").clone()
+    }
+
+    fn scopes(&self) -> Vec<String> {
+        self.scopes.lock().expect("scope lock").clone()
+    }
+
+    fn imported_bindings(&self) -> Vec<Vec<uuid::Uuid>> {
+        self.imported_bindings.lock().expect("binding lock").clone()
+    }
+
+    async fn answer<T>(&self, op: HostOp, scope: &TenantScope, value: T) -> Result<T, HostOpError> {
+        self.seen.lock().expect("seen lock").push(op);
+        self.scopes
+            .lock()
+            .expect("scope lock")
+            .push(scope.storage_key());
+        if let Some(delay) = self.behaviour.stalling.get(&op) {
+            tokio::time::sleep(*delay).await;
+        }
+        if let Some(code) = self.behaviour.failing.get(&op) {
+            let message = self
+                .behaviour
+                .failure_message
+                .clone()
+                .unwrap_or_else(|| format!("{} is unavailable", op.name()));
+            return Err(HostOpError::new(op, *code, message));
+        }
+        Ok(value)
+    }
+}
+
+#[async_trait]
+impl HostOps for FakeHostOps {
+    async fn question_discover(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::QuestionDiscoverRequest,
+    ) -> Result<geo_worker::QuestionDiscoveryPage, HostOpError> {
+        let page = geo_worker::QuestionDiscoveryPage {
+            sets: vec![],
+            versions: vec![],
+            questions: vec![geo_worker::QuestionDiscoveryItem {
+                reference: geo_worker::QuestionReference {
+                    question_set_id: request.question_set_id.unwrap(),
+                    question_set_version_id: request.question_set_version_id.unwrap(),
+                    question_id: uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000131")
+                        .unwrap(),
+                    question_revision_id: uuid::Uuid::parse_str(
+                        "00000000-0000-4000-8000-000000000132",
+                    )
+                    .unwrap(),
+                },
+                purpose: geo_domain::QuestionPurpose::FrozenEvaluation,
+                optimization_text: None,
+            }],
+            next_cursor: None,
+        };
+        self.answer(HostOp::QuestionDiscover, scope, page).await
+    }
+
+    async fn question_create(
+        &self,
+        scope: &TenantScope,
+        _request: geo_worker::CreateQuestionSet,
+    ) -> Result<geo_worker::QuestionWriteReceipt, HostOpError> {
+        self.answer(
+            HostOp::QuestionCreate,
+            scope,
+            geo_worker::QuestionWriteReceipt {
+                question_set_id: uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000133")
+                    .unwrap(),
+                question_set_version_id: uuid::Uuid::parse_str(
+                    "00000000-0000-4000-8000-000000000134",
+                )
+                .unwrap(),
+                revision: 1,
+                optimization_count: 0,
+                evaluation_count: 1,
+            },
+        )
+        .await
+    }
+
+    async fn question_revise(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::QuestionReviseRequest,
+    ) -> Result<geo_worker::QuestionWriteReceipt, HostOpError> {
+        self.answer(
+            HostOp::QuestionRevise,
+            scope,
+            geo_worker::QuestionWriteReceipt {
+                question_set_id: request.question_set_id,
+                question_set_version_id: uuid::Uuid::new_v4(),
+                revision: 2,
+                optimization_count: 0,
+                evaluation_count: 1,
+            },
+        )
+        .await
+    }
+
+    async fn report_preview(
+        &self,
+        scope: &TenantScope,
+        _request: ReportPreviewRequest,
+    ) -> Result<geo_worker::ReportPreviewResult, HostOpError> {
+        match self.behaviour.preview_response.clone() {
+            Some(value) => {
+                self.answer(
+                    HostOp::ReportPreview,
+                    scope,
+                    geo_worker::ReportPreviewResult::Cycle(Box::new(value)),
+                )
+                .await
+            }
+            None => Err(HostOpError::capability_missing(
+                HostOp::ReportPreview,
+                "preview unavailable",
+            )),
+        }
+    }
+    async fn knowledge_import_status(
+        &self,
+        scope: &TenantScope,
+        request: KnowledgeImportStatusRequest,
+    ) -> Result<KnowledgeImportProgress, HostOpError> {
+        let progress = self
+            .behaviour
+            .import_status
+            .clone()
+            .unwrap_or(KnowledgeImportProgress {
+                import_job_id: Some(request.import_job_id),
+                status: ImportStatus::Queued,
+                stage: None,
+                source_id: None,
+                source_version_id: None,
+                knowledge_release_id: None,
+                completed_units: 0,
+                failed_units: 0,
+                error_count: 0,
+                errors: vec![],
+            });
+        self.answer(HostOp::KnowledgeImportStatus, scope, progress)
+            .await
+    }
+    async fn model_complete(
+        &self,
+        scope: &TenantScope,
+        request: ModelCompletionRequest,
+    ) -> Result<ModelCompletion, HostOpError> {
+        self.answer(
+            HostOp::ModelComplete,
+            scope,
+            ModelCompletion {
+                text: format!("bridge:{}", request.prompt.trim()),
+                model: request
+                    .model
+                    .unwrap_or_else(|| "test-routing-id".to_owned()),
+                prompt_tokens: 11,
+                completion_tokens: 7,
+                finish_reason: "stop".to_owned(),
+                tool_calls: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    async fn knowledge_search(
+        &self,
+        scope: &TenantScope,
+        request: KnowledgeSearchRequest,
+    ) -> Result<KnowledgeSearchResult, HostOpError> {
+        let evidence = KnowledgeEvidence {
+            source_id: uuid::Uuid::new_v4(),
+            source_version_id: uuid::Uuid::new_v4(),
+            chunk_id: uuid::Uuid::new_v4(),
+            source_name: "warranty-policy.md".to_owned(),
+            purpose: request.purpose,
+            locator: ChunkLocator::Text {
+                start_line: 1,
+                end_line: 3,
+                start_char: 0,
+                end_char: 64,
+            },
+            text: "the warranty runs for twenty-four months".to_owned(),
+            quote: "twenty-four months".to_owned(),
+        };
+        self.answer(
+            HostOp::KnowledgeSearch,
+            scope,
+            KnowledgeSearchResult {
+                knowledge_release_id: Some(uuid::Uuid::new_v4()),
+                evidence: vec![evidence],
+                capability_missing: None,
+            },
+        )
+        .await
+    }
+
+    async fn knowledge_import_attachments(
+        &self,
+        scope: &TenantScope,
+        request: KnowledgeImportAttachmentsRequest,
+        attachments: &[AttachmentReference],
+    ) -> Result<KnowledgeImportAttachmentsResult, HostOpError> {
+        self.imported_bindings.lock().expect("binding lock").push(
+            attachments
+                .iter()
+                .map(|attachment| attachment.attachment_id.as_uuid())
+                .collect(),
+        );
+        self.answer(
+            HostOp::KnowledgeImportAttachments,
+            scope,
+            KnowledgeImportAttachmentsResult {
+                items: request
+                    .items
+                    .into_iter()
+                    .map(|item| KnowledgeImportAttachmentResultItem {
+                        attachment_id: item.attachment_id,
+                        import_job_id: None,
+                        status: ImportStatus::Succeeded,
+                        source_id: Some(uuid::Uuid::new_v4()),
+                        source_version_id: Some(uuid::Uuid::new_v4()),
+                        knowledge_release_id: Some(uuid::Uuid::new_v4()),
+                        error: None,
+                    })
+                    .collect(),
+            },
+        )
+        .await
+    }
+
+    async fn manifest_read(
+        &self,
+        scope: &TenantScope,
+        request: ManifestReadRequest,
+    ) -> Result<ManifestPage, HostOpError> {
+        self.answer(
+            HostOp::ManifestRead,
+            scope,
+            ManifestPage {
+                kind: request.kind,
+                manifest_id: uuid::Uuid::new_v4(),
+                revision: 1,
+                state: "frozen".to_owned(),
+                sealed: false,
+                expected_count: None,
+                coverage: None,
+                items: vec![ManifestItem {
+                    branch_id: "document-key-1".to_owned(),
+                    document_manifest_item_id: Some(uuid::Uuid::new_v4()),
+                    planning_state: Some(geo_worker::ManifestPlanningState::Planned),
+                    block_reason: None,
+                    document_revision_id: None,
+                    platform_target_id: None,
+                }],
+                next_cursor: None,
+            },
+        )
+        .await
+    }
+
+    async fn publish_submit(
+        &self,
+        scope: &TenantScope,
+        request: PublishRequest,
+    ) -> Result<PublishReceipt, HostOpError> {
+        assert!(!request.body.is_empty(), "the body must reach the bridge");
+        self.answer(
+            HostOp::Publish,
+            scope,
+            PublishReceipt {
+                publish_attempt_id: uuid::Uuid::new_v4(),
+                state: PublishState::UnknownResult,
+                external_url: None,
+                evidence_ref: None,
+            },
+        )
+        .await
+    }
+
+    async fn measure_sample(
+        &self,
+        scope: &TenantScope,
+        request: MeasureRequest,
+    ) -> Result<MeasureSample, HostOpError> {
+        self.answer(
+            HostOp::Measure,
+            scope,
+            MeasureSample {
+                sample_id: request.scheduled_sample_id,
+                channel: request.channel,
+                surface: request.surface,
+                answer: "the warranty is twenty-four months".to_owned(),
+                observation_ref: uuid::Uuid::new_v4(),
+                evidence_refs: vec![request.measurement_protocol_id],
+                observed_at: Utc::now(),
+            },
+        )
+        .await
+    }
+}
+
+fn scope() -> TenantScope {
+    TenantScope::new(
+        uuid::Uuid::new_v4().into(),
+        uuid::Uuid::new_v4().into(),
+        Some(uuid::Uuid::new_v4().into()),
+    )
+}
+
+fn bridge(ops: Arc<FakeHostOps>) -> HostBridge {
+    // These tests drive the isolate on the test's own runtime, so the
+    // capability work belongs there too.
+    HostBridge::new(ops, scope(), tokio::runtime::Handle::current())
+}
+
+/// Builds a production runtime whose entry module is `script`.
+///
+/// The scenario imports the crate's own host façade, so the tests exercise the
+/// same transport an embedding host would ship.
+fn runtime(script: &'static str, bridge: HostBridge) -> HostRuntime {
+    struct TestRecorder;
+    #[async_trait]
+    impl ToolCallRecorder for TestRecorder {
+        async fn begin(&self, _: &ToolCallIdentity) -> Result<bool, HostOpError> {
+            Ok(true)
+        }
+        async fn attempt(&self, _: &ToolCallIdentity) -> Result<bool, HostOpError> {
+            Ok(true)
+        }
+        async fn finish(
+            &self,
+            _: &ToolCallIdentity,
+            _: ToolCallOutcome,
+        ) -> Result<(), HostOpError> {
+            Ok(())
+        }
+    }
+    let bridge = bridge.with_recorder(
+        geo_domain::RunId::from(uuid::Uuid::new_v4()),
+        Arc::new(TestRecorder),
+    );
+    let bundle = [
+        ("memeloop://bundle/host-ops.js", geo_worker::HOST_OPS_JS),
+        (SCENARIO_MODULE, script),
+    ];
+    HostRuntime::new(&bundle, bridge, None).expect("the production runtime must be constructible")
+}
+
+/// Reads one reported op outcome out of the Rust-owned event log.
+fn outcome(state: &HostState, topic: &str) -> Value {
+    let event = state
+        .events
+        .iter()
+        .find(|event| event.topic == topic)
+        .unwrap_or_else(|| panic!("no `{topic}` outcome in {:?}", state.events));
+    serde_json::from_str(&event.payload).expect("an outcome payload must be JSON")
+}
+
+fn assert_typed_error(record: &Value, code: &str, op: &str) {
+    assert_eq!(record["ok"], false, "expected a failure: {record}");
+    assert_eq!(
+        record["name"], "GeoHostOpError",
+        "failures must carry the stable class: {record}"
+    );
+    assert_eq!(record["error"]["code"], code, "unexpected code: {record}");
+    assert_eq!(record["error"]["op"], op, "unexpected op: {record}");
+}
+
+fn assert_success(record: &Value) -> Value {
+    assert_eq!(record["ok"], true, "expected a result: {record}");
+    record["value"].clone()
+}
+
+// ---------------------------------------------------------------------------
+// The closed surface
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn project_onboarding_rejects_scope_overrides_and_missing_capabilities() {
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("current", () => hostOps.projectCurrent({}));
+        await attempt("foreign", () => hostOps.projectCurrent({project_id:"00000000-0000-4000-8000-000000000001"}));
+        await attempt("revise", () => hostOps.projectRevise({expected_revision:1,idempotency_key:"draft",patch:{brand_name:"Example"}}));
+        await attempt("invalid", () => hostOps.projectStart({expected_revision:0,idempotency_key:"start"}));
+        await attempt("estimate", () => hostOps.projectEstimate({}));
+        await attempt("start", () => hostOps.projectStart({expected_revision:1,idempotency_key:"start"}));
+        "#,
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for (topic, op) in [
+        ("current", "project_current"),
+        ("revise", "project_revise"),
+        ("estimate", "project_estimate"),
+        ("start", "project_start"),
+    ] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "capability_missing",
+            op,
+        );
+    }
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "foreign"),
+        "invalid_request",
+        "project_current",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "invalid"),
+        "invalid_request",
+        "project_start",
+    );
+}
+
+/// The registered surface is exactly the declared set: a capability added
+/// without being declared, or declared without a registered body, fails here.
+#[tokio::test]
+async fn production_runtime_exposes_only_the_declared_host_ops() {
+    let mut runtime = runtime(
+        "export const ready = true;",
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+    runtime
+        .execute_script_with_deadline(
+            "op-names.js",
+            r#"
+            for (const name of Deno.core.opNames()) {
+              Deno.core.ops.op_host_emit("everything", name);
+              if (name.startsWith("op_host_")) {
+                Deno.core.ops.op_host_emit("host-op", name);
+              }
+            }
+            "#,
+            Duration::from_secs(20),
+        )
+        .expect("enumerating op names must succeed");
+
+    let mut presented = runtime
+        .host_state()
+        .events
+        .iter()
+        .filter(|event| event.topic == "host-op")
+        .map(|event| event.payload.clone())
+        .collect::<Vec<_>>();
+    presented.sort();
+    assert_eq!(
+        presented,
+        HostRuntime::op_surface(),
+        "the registered surface must be the declared surface, no more and no less"
+    );
+    assert_eq!(presented.len(), HostOp::COUNT + 2);
+    assert_eq!(runtime.host_ops_version(), HOST_OPS_VERSION);
+
+    // Built-in engine ops remain (the loop needs the microtask queue and
+    // timers), but none of them opens a file, a socket, a process or the
+    // environment.  The needles are deliberately narrow: `op_read`/`op_write`
+    // are the engine's own console paths, not file access.
+    let dangerous = [
+        "op_fs_",
+        "op_read_file",
+        "op_write_file",
+        "op_net_",
+        "op_http_",
+        "op_tcp",
+        "op_udp",
+        "op_dns",
+        "op_env_",
+        "op_process_",
+        "op_spawn",
+        "op_child",
+        "op_sql",
+        "op_connect",
+        "op_listen",
+        "op_socket",
+        "op_exec_",
+    ];
+    let everything = runtime
+        .host_state()
+        .events
+        .iter()
+        .filter(|event| event.topic == "everything")
+        .map(|event| event.payload.clone())
+        .collect::<Vec<_>>();
+    assert!(!everything.is_empty(), "the op table must be visible");
+    for name in everything {
+        for needle in dangerous {
+            assert!(
+                !name.contains(needle),
+                "`{name}` must not be registered: it would grant `{needle}`"
+            );
+        }
+    }
+}
+
+/// JavaScript reaches the outside world only through the declared ops: no
+/// filesystem, network, process or environment capability exists as a global,
+/// and the probe's model stub is not registered here either.
+#[tokio::test]
+async fn javascript_cannot_reach_filesystem_network_process_or_environment() {
+    let mut runtime = runtime(
+        "export const ready = true;",
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+    runtime
+        .execute_script_with_deadline(
+            "globals.js",
+            r#"
+            const probes = [
+              "fetch", "process", "require", "module", "Buffer", "XMLHttpRequest",
+              "WebSocket", "EventSource", "Worker", "SharedWorker", "importScripts",
+              "Deno.readTextFile", "Deno.writeTextFile", "Deno.remove", "Deno.mkdir",
+              "Deno.readDir", "Deno.stat", "Deno.env", "Deno.exit", "Deno.run",
+              "Deno.spawn", "Deno.connect", "Deno.listen", "Deno.serve", "Deno.chdir",
+              "Deno.execPath", "Deno.makeTempDir", "Deno.open", "Deno.create",
+              "Deno.core.ops.op_host_model_complete",
+              "Deno.core.ops.op_host_model_call_count",
+            ];
+            for (const probe of probes) {
+              let kind;
+              try {
+                kind = typeof eval(probe);
+              } catch (error) {
+                kind = "unresolvable:" + error.name;
+              }
+              Deno.core.ops.op_host_emit("probe", probe + "=" + kind);
+            }
+            "#,
+            Duration::from_secs(20),
+        )
+        .expect("probing globals must succeed");
+
+    let presented = runtime
+        .host_state()
+        .events
+        .iter()
+        .filter(|event| event.topic == "probe")
+        .map(|event| event.payload.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        presented.len(),
+        31,
+        "every probe must report: {presented:?}"
+    );
+    for probe in presented {
+        assert!(
+            probe.ends_with("=undefined") || probe.ends_with("=unresolvable:ReferenceError"),
+            "`{probe}` names a capability JavaScript can reach"
+        );
+    }
+}
+
+/// The reference bundle loads against the production op set and declares the
+/// capabilities it expects, so an embedding host can tell "loaded" from
+/// "loaded and able to reach its capabilities".
+#[tokio::test]
+async fn the_reference_bundle_declares_the_surface_it_expects() {
+    let mut runtime = HostRuntime::new(HOST_BUNDLE, bridge(Arc::new(FakeHostOps::new())), None)
+        .expect("the production runtime must be constructible");
+    runtime
+        .evaluate_module(HOST_MAIN_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the reference bundle must evaluate");
+
+    let ready = outcome(&runtime.host_state(), "loop.ready");
+    assert_eq!(ready["version"], HOST_OPS_VERSION);
+    let declared = ready["capabilities"]
+        .as_array()
+        .expect("capabilities must be a list");
+    for capability in [
+        "modelComplete",
+        "knowledgeSearch",
+        "manifestRead",
+        "publishSubmit",
+        "measureSample",
+        "distributionStart",
+        "contentRepair",
+        "distributionRead",
+        "distributionResume",
+        "distributionTargetsRead",
+        "contentDistributeRequest",
+        "contentDistributeRead",
+    ] {
+        assert!(
+            declared.iter().any(|entry| entry == capability),
+            "`{capability}` must be declared by the bundle: {declared:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn single_article_ops_reject_scope_injection_and_unknown_format_before_capability() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        const base = {
+          content_asset_id: "00000000-0000-4000-8000-000000000001",
+          content_revision_id: "00000000-0000-4000-8000-000000000002",
+          account_id: "00000000-0000-4000-8000-000000000003",
+          placement_slot: "article",
+          format: "markdown.v1",
+          idempotency_key: "one-article"
+        };
+        await attempt("scope-injection", () => Deno.core.ops.op_host_content_distribute_request_v1(
+          JSON.stringify({...base, tenant_id: "00000000-0000-4000-8000-000000000004"})
+        ));
+        await attempt("unknown-format", () => Deno.core.ops.op_host_content_distribute_request_v1(
+          JSON.stringify({...base, format:"unknown"})
+        ));
+        await attempt("valid-unconfigured", () => Deno.core.ops.op_host_content_distribute_request_v1(
+          JSON.stringify(base)
+        ));
+        await attempt("read-injection", () => Deno.core.ops.op_host_content_distribute_read_v1(
+          JSON.stringify({request_id: base.content_revision_id, project_id:base.account_id})
+        ));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for label in ["scope-injection", "unknown-format", "read-injection"] {
+        let result = outcome(&runtime.host_state(), label);
+        assert_eq!(result["error"]["code"], "invalid_request", "{result}");
+    }
+    let result = outcome(&runtime.host_state(), "valid-unconfigured");
+    assert_eq!(result["error"]["code"], "capability_missing", "{result}");
+    assert!(
+        ops.scopes().is_empty(),
+        "unconfigured ops must not fabricate a request"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Success and failure paths, one op at a time
+// ---------------------------------------------------------------------------
+
+const BOUND_ATTACHMENT: &str = "9e95e603-544c-4778-9f59-0b2b54b7db31";
+const OTHER_ATTACHMENT: &str = "dbbd6700-c410-4264-84a6-01806cc9a207";
+
+fn attachment(id: &str) -> AttachmentReference {
+    AttachmentReference {
+        attachment_id: AttachmentId::new(id.parse().expect("test UUID")),
+        object_id: "opaque-object".to_owned(),
+        filename: "notes.txt".to_owned(),
+        media_type: Some("text/plain".to_owned()),
+        size_bytes: Some(12),
+        sha256: None,
+        object_version: Some("1".to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn attachment_import_receives_only_the_current_runs_rust_bindings() {
+    let ops = Arc::new(FakeHostOps::new());
+    let scope = scope();
+    let bridge = HostBridge::new(
+        Arc::clone(&ops) as Arc<dyn HostOps>,
+        scope.clone(),
+        tokio::runtime::Handle::current(),
+    )
+    .with_attachments(vec![attachment(BOUND_ATTACHMENT)]);
+    let mut runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        await attempt("import", async () => JSON.parse(await Deno.core.ops.op_host_knowledge_import_attachments_v1(
+          JSON.stringify({items:[{attachment_id:"9e95e603-544c-4778-9f59-0b2b54b7db31",purpose:"internal"}]})
+        )));
+        "#,
+        bridge,
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+
+    let result = assert_success(&outcome(&runtime.host_state(), "import"));
+    assert_eq!(result["items"][0]["attachment_id"], BOUND_ATTACHMENT);
+    assert_eq!(result["items"][0]["status"], "succeeded");
+    assert!(result["items"][0]["source_version_id"].is_string());
+    assert!(result["items"][0]["knowledge_release_id"].is_string());
+    assert_eq!(ops.scopes(), vec![scope.storage_key()]);
+    assert_eq!(
+        ops.imported_bindings(),
+        vec![vec![BOUND_ATTACHMENT.parse::<uuid::Uuid>().unwrap()]]
+    );
+}
+
+#[tokio::test]
+async fn attachment_import_rejects_unbound_and_cross_run_ids_before_capability() {
+    let ops = Arc::new(FakeHostOps::new());
+    let run_scope = scope();
+    let mut first_runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        await attempt("unbound", async () => JSON.parse(await Deno.core.ops.op_host_knowledge_import_attachments_v1(
+          JSON.stringify({items:[{attachment_id:"dbbd6700-c410-4264-84a6-01806cc9a207",purpose:"internal"}]})
+        )));
+        "#,
+        HostBridge::new(
+            Arc::clone(&ops) as Arc<dyn HostOps>,
+            run_scope.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_attachments(vec![attachment(BOUND_ATTACHMENT)]),
+    );
+    first_runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_typed_error(
+        &outcome(&first_runtime.host_state(), "unbound"),
+        "denied",
+        "knowledge_import_attachments",
+    );
+
+    // The same ID is valid in another run's bridge, but that does not widen
+    // this run's immutable binding, even under the same tenant scope.
+    assert!(ops.seen().is_empty());
+    let mut other_runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        await attempt("bound-here", async () => JSON.parse(await Deno.core.ops.op_host_knowledge_import_attachments_v1(
+          JSON.stringify({items:[{attachment_id:"dbbd6700-c410-4264-84a6-01806cc9a207",purpose:"internal"}]})
+        )));
+        "#,
+        HostBridge::new(
+            Arc::clone(&ops) as Arc<dyn HostOps>,
+            run_scope,
+            tokio::runtime::Handle::current(),
+        )
+        .with_attachments(vec![attachment(OTHER_ATTACHMENT)]),
+    );
+    other_runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_success(&outcome(&other_runtime.host_state(), "bound-here"));
+    assert_eq!(ops.seen(), vec![HostOp::KnowledgeImportAttachments]);
+    assert_eq!(
+        ops.imported_bindings(),
+        vec![vec![OTHER_ATTACHMENT.parse::<uuid::Uuid>().unwrap()]]
+    );
+}
+
+#[tokio::test]
+async fn import_status_rejects_invalid_input_and_unrelated_or_unready_results_before_success() {
+    let job = uuid::Uuid::new_v4();
+    let other_job = uuid::Uuid::new_v4();
+    let ops = Arc::new(FakeHostOps::with(Behaviour {
+        import_status: Some(KnowledgeImportProgress {
+            import_job_id: Some(other_job),
+            status: ImportStatus::Succeeded,
+            stage: Some(geo_domain::ImportStage::Release),
+            source_id: Some(uuid::Uuid::new_v4()),
+            source_version_id: Some(uuid::Uuid::new_v4()),
+            knowledge_release_id: Some(uuid::Uuid::new_v4()),
+            completed_units: 1,
+            failed_units: 0,
+            error_count: 0,
+            errors: vec![],
+        }),
+        ..Behaviour::default()
+    }));
+    let script = format!(
+        r#"
+        import {{ attempt }} from "./host-ops.js";
+        const call = (payload) => Deno.core.ops.op_host_knowledge_import_status_v1(JSON.stringify(payload));
+        await attempt("missing", () => call({{import_job_id:"{job}",purpose:"internal",tenant_id:"forged"}}));
+        await attempt("nil", () => call({{import_job_id:"00000000-0000-0000-0000-000000000000",purpose:"internal"}}));
+        await attempt("mismatch", () => call({{import_job_id:"{job}",purpose:"internal"}}));
+        "#
+    );
+    let mut runtime = runtime(Box::leak(script.into_boxed_str()), bridge(Arc::clone(&ops)));
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for topic in ["missing", "nil"] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "invalid_request",
+            "knowledge_import_status",
+        );
+    }
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "mismatch"),
+        "internal",
+        "knowledge_import_status",
+    );
+    assert_eq!(ops.seen(), vec![HostOp::KnowledgeImportStatus]);
+    assert_eq!(runtime.op_calls(HostOp::KnowledgeImportStatus), 1);
+}
+
+#[tokio::test]
+async fn import_status_returns_scoped_queued_state_but_missing_adapter_fails_closed() {
+    let ops = Arc::new(FakeHostOps::new());
+    let job = uuid::Uuid::new_v4();
+    let script = format!(
+        r#"
+        import {{ hostOps, attempt }} from "./host-ops.js";
+        await attempt("queued", () => hostOps.knowledgeImportStatus({{import_job_id:"{job}",purpose:"internal"}}));
+        "#
+    );
+    let mut queued_runtime = runtime(Box::leak(script.into_boxed_str()), bridge(Arc::clone(&ops)));
+    queued_runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    let progress = assert_success(&outcome(&queued_runtime.host_state(), "queued"));
+    assert_eq!(progress["status"], "queued");
+    assert_eq!(progress["import_job_id"], job.to_string());
+    assert!(progress["knowledge_release_id"].is_null());
+    assert_eq!(ops.seen(), vec![HostOp::KnowledgeImportStatus]);
+
+    struct Missing;
+    #[async_trait]
+    impl HostOps for Missing {
+        async fn model_complete(
+            &self,
+            _: &TenantScope,
+            _: ModelCompletionRequest,
+        ) -> Result<ModelCompletion, HostOpError> {
+            unreachable!()
+        }
+        async fn knowledge_search(
+            &self,
+            _: &TenantScope,
+            _: KnowledgeSearchRequest,
+        ) -> Result<KnowledgeSearchResult, HostOpError> {
+            unreachable!()
+        }
+        async fn manifest_read(
+            &self,
+            _: &TenantScope,
+            _: ManifestReadRequest,
+        ) -> Result<ManifestPage, HostOpError> {
+            unreachable!()
+        }
+        async fn publish_submit(
+            &self,
+            _: &TenantScope,
+            _: PublishRequest,
+        ) -> Result<PublishReceipt, HostOpError> {
+            unreachable!()
+        }
+        async fn measure_sample(
+            &self,
+            _: &TenantScope,
+            _: MeasureRequest,
+        ) -> Result<MeasureSample, HostOpError> {
+            unreachable!()
+        }
+    }
+    let missing_bridge = HostBridge::new(
+        Arc::new(Missing),
+        scope(),
+        tokio::runtime::Handle::current(),
+    );
+    let missing_script = format!(
+        r#"
+        import {{ hostOps, attempt }} from "./host-ops.js";
+        await attempt("missing", () => hostOps.knowledgeImportStatus({{import_job_id:"{job}",purpose:"internal"}}));
+        "#
+    );
+    let mut missing = runtime(Box::leak(missing_script.into_boxed_str()), missing_bridge);
+    missing
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_typed_error(
+        &outcome(&missing.host_state(), "missing"),
+        "capability_missing",
+        "knowledge_import_status",
+    );
+}
+
+#[tokio::test]
+async fn attachment_import_refuses_malformed_batches_and_model_supplied_metadata() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { attempt } from "./host-ops.js";
+        const id = "9e95e603-544c-4778-9f59-0b2b54b7db31";
+        const call = async (payload) => JSON.parse(await Deno.core.ops.op_host_knowledge_import_attachments_v1(JSON.stringify(payload)));
+        await attempt("empty", () => call({items:[]}));
+        await attempt("nil", () => call({items:[{attachment_id:"00000000-0000-0000-0000-000000000000",purpose:"internal"}]}));
+        await attempt("duplicate", () => call({items:[{attachment_id:id,purpose:"internal"},{attachment_id:id,purpose:"public"}]}));
+        await attempt("too-many", () => call({items:Array.from({length:101}, () => ({attachment_id:id,purpose:"internal"}))}));
+        await attempt("metadata", () => call({items:[{attachment_id:id,purpose:"internal",object_id:"forged"}]}));
+        await attempt("scope", () => call({items:[{attachment_id:id,purpose:"internal"}],tenant_id:"forged"}));
+        "#,
+        bridge(Arc::clone(&ops)).with_attachments(vec![attachment(BOUND_ATTACHMENT)]),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for topic in ["empty", "nil", "duplicate", "too-many", "metadata", "scope"] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "invalid_request",
+            "knowledge_import_attachments",
+        );
+    }
+    assert!(ops.seen().is_empty());
+}
+
+#[tokio::test]
+async fn model_completion_delegates_to_the_rust_bridge() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("model", () => hostOps.modelComplete({ prompt: "  how long is the warranty?  " }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    let value = assert_success(&outcome(&runtime.host_state(), "model"));
+    assert_eq!(value["text"], "bridge:how long is the warranty?");
+    assert_eq!(value["model"], "test-routing-id");
+    assert_eq!(value["prompt_tokens"], 11);
+    assert_eq!(value["finish_reason"], "stop");
+    assert_eq!(ops.seen(), vec![HostOp::ModelComplete]);
+    assert_eq!(runtime.op_calls(HostOp::ModelComplete), 1);
+}
+
+#[tokio::test]
+async fn knowledge_search_returns_evidence() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty", limit: 3 }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    let value = assert_success(&outcome(&runtime.host_state(), "search"));
+    assert_eq!(value["evidence"][0]["source_name"], "warranty-policy.md");
+    assert_eq!(value["evidence"][0]["quote"], "twenty-four months");
+    assert!(
+        value["capability_missing"].is_null(),
+        "a successful retrieval must not carry a capability gap: {value}"
+    );
+    assert_eq!(ops.seen(), vec![HostOp::KnowledgeSearch]);
+}
+
+/// An empty evidence list and a missing retrieval capability mean opposite
+/// things, so a missing capability must be an error, not an empty result.
+#[tokio::test]
+async fn knowledge_search_reports_a_missing_capability_as_a_typed_error() {
+    let ops = Arc::new(FakeHostOps::with(Behaviour {
+        failing: BTreeMap::from([(HostOp::KnowledgeSearch, HostOpErrorCode::CapabilityMissing)]),
+        failure_message: Some("vector retrieval is not configured".to_owned()),
+        ..Behaviour::default()
+    }));
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        "#,
+        bridge(ops),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    let record = outcome(&runtime.host_state(), "search");
+    assert_typed_error(&record, "capability_missing", "knowledge_search");
+    assert_eq!(record["error"]["retryable"], false);
+    assert_eq!(
+        record["error"]["message"], "vector retrieval is not configured",
+        "the reason must survive: {record}"
+    );
+}
+
+#[tokio::test]
+async fn knowledge_text_ops_are_scoped_strict_and_fail_closed_without_an_adapter() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        const source_id = "00000000-0000-4000-8000-000000000041";
+        const source_version_id = "00000000-0000-4000-8000-000000000042";
+        await attempt("read-foreign", () => hostOps.knowledgeTextRead({
+          source_id, source_version_id,
+          project_id: "00000000-0000-4000-8000-000000000099"
+        }));
+        await attempt("read", () => hostOps.knowledgeTextRead({ source_id, source_version_id }));
+        await attempt("revise-missing-base", () => hostOps.knowledgeTextRevise({
+          source_id, expected_revision: 1, idempotency_key: "same-operation",
+          media_type: "text/plain", text: "Updated"
+        }));
+        await attempt("revise", () => hostOps.knowledgeTextRevise({
+          source_id, expected_revision: 1, idempotency_key: "same-operation",
+          base_version_id: source_version_id, media_type: "text/plain", text: "Updated"
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the knowledge op scenario evaluates");
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "read-foreign"),
+        "invalid_request",
+        "knowledge_text_read",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "read"),
+        "capability_missing",
+        "knowledge_text_read",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "revise-missing-base"),
+        "invalid_request",
+        "knowledge_text_revise",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "revise"),
+        "capability_missing",
+        "knowledge_text_revise",
+    );
+    assert!(
+        ops.seen().is_empty(),
+        "unconfigured writes must never hit another op"
+    );
+}
+
+#[tokio::test]
+async fn manifest_read_returns_the_frozen_manifest_state() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("manifest", () => hostOps.manifestRead({ kind: "document" }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    let value = assert_success(&outcome(&runtime.host_state(), "manifest"));
+    assert_eq!(value["kind"], "document");
+    assert_eq!(value["sealed"], false);
+    assert_eq!(value["items"][0]["branch_id"], "document-key-1");
+    assert!(value["items"][0].get("document_revision_id").is_none());
+    assert_eq!(ops.seen(), vec![HostOp::ManifestRead]);
+}
+
+#[test]
+fn planning_items_do_not_require_generated_revisions_but_distribution_items_do() {
+    let id = uuid::Uuid::new_v4();
+    let request = ManifestReadRequest {
+        manifest_id: Some(id),
+        kind: geo_worker::ManifestKind::Document,
+        revision: Some(1),
+        cursor: None,
+        limit: Some(1),
+    };
+    let item = ManifestItem {
+        branch_id: "document-branch".into(),
+        document_manifest_item_id: Some(uuid::Uuid::new_v4()),
+        planning_state: Some(geo_worker::ManifestPlanningState::Blocked),
+        block_reason: Some("missing_evidence".into()),
+        document_revision_id: None,
+        platform_target_id: None,
+    };
+    let page = ManifestPage {
+        kind: request.kind,
+        manifest_id: id,
+        revision: 1,
+        state: "ready".into(),
+        sealed: true,
+        expected_count: Some(1),
+        coverage: Some(geo_worker::ManifestCoverage {
+            total: 1,
+            planned: 0,
+            blocked: 1,
+            deferred: 0,
+            not_applicable: 0,
+        }),
+        items: vec![item],
+        next_cursor: None,
+    };
+    page.validate_for(&request)
+        .expect("a planning item has no generated revision");
+    let distribution_request = ManifestReadRequest {
+        kind: geo_worker::ManifestKind::Distribution,
+        ..request
+    };
+    let mut distribution_page = ManifestPage {
+        kind: geo_worker::ManifestKind::Distribution,
+        ..page
+    };
+    assert!(
+        distribution_page
+            .validate_for(&distribution_request)
+            .is_err()
+    );
+    distribution_page.items[0].document_revision_id = Some(uuid::Uuid::new_v4());
+    distribution_page.items[0].platform_target_id = Some(uuid::Uuid::new_v4());
+    distribution_page
+        .validate_for(&distribution_request)
+        .expect("distribution needs a generated revision and target");
+}
+
+#[tokio::test]
+async fn manifest_read_reports_a_missing_manifest_as_not_found() {
+    let ops = Arc::new(FakeHostOps::with(Behaviour {
+        failing: BTreeMap::from([(HostOp::ManifestRead, HostOpErrorCode::NotFound)]),
+        failure_message: Some("the project has not been started".to_owned()),
+        ..Behaviour::default()
+    }));
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("manifest", () => hostOps.manifestRead({ kind: "distribution" }));
+        "#,
+        bridge(ops),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "manifest"),
+        "not_found",
+        "manifest_read",
+    );
+}
+
+#[tokio::test]
+async fn publish_submit_returns_a_typed_receipt() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("publish", () => hostOps.publishSubmit({
+          publication_intent_id: "00000000-0000-4000-8000-000000000004",
+          document_revision_id: "00000000-0000-4000-8000-000000000001",
+          platform_target_id: "00000000-0000-4000-8000-000000000002",
+          payload_sha256: "28c190665631daa107fd8f9436571508d3c3177cc8c4b3f3545fc06b345dc6b0",
+          body: "final copy",
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    // An unknown result is a first-class outcome: a loop must query rather than
+    // blindly resend.
+    let value = assert_success(&outcome(&runtime.host_state(), "publish"));
+    assert_eq!(value["state"], "unknown_result");
+    assert!(value["publish_attempt_id"].as_str().is_some());
+    assert_eq!(ops.seen(), vec![HostOp::Publish]);
+}
+
+#[tokio::test]
+async fn measure_sample_returns_an_observed_sample() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("measure", () => hostOps.measureSample({
+          measurement_protocol_id: "00000000-0000-4000-8000-000000000003",
+          scheduled_sample_id: "00000000-0000-4000-8000-000000000005",
+          question: "how long is the warranty?",
+          channel: "independent-search",
+          surface: "consumer_web",
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    let value = assert_success(&outcome(&runtime.host_state(), "measure"));
+    assert_eq!(value["channel"], "independent-search");
+    assert_eq!(value["surface"], "consumer_web");
+    assert_eq!(value["sample_id"], "00000000-0000-4000-8000-000000000005");
+    assert!(value["observation_ref"].as_str().is_some());
+    assert_eq!(value["answer"], "the warranty is twenty-four months");
+    assert_eq!(
+        value["evidence_refs"][0],
+        "00000000-0000-4000-8000-000000000003"
+    );
+    assert_eq!(ops.seen(), vec![HostOp::Measure]);
+}
+
+// ---------------------------------------------------------------------------
+// The boundary itself
+// ---------------------------------------------------------------------------
+
+/// A request cannot smuggle a destination, a credential or a foreign scope: the
+/// declared shape is the whole shape.
+#[tokio::test]
+async fn undeclared_request_fields_are_refused() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("endpoint", () => hostOps.modelComplete({
+          prompt: "hello",
+          base_url: "https://attacker.example/v1",
+          api_key: "sk-live-abcdefghijklmnopqrstuvwxyz0123456789",
+        }));
+        await attempt("foreign-scope", () => hostOps.knowledgeSearch({
+          query: "warranty",
+          tenant_id: "00000000-0000-4000-8000-00000000000f",
+        }));
+        await attempt("report-foreign-scope", () => hostOps.reportReduce({
+          cycle_id: "00000000-0000-4000-8000-000000000001",
+          project_id: "00000000-0000-4000-8000-000000000002",
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "endpoint"),
+        "invalid_request",
+        "model_complete",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "foreign-scope"),
+        "invalid_request",
+        "knowledge_search",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "report-foreign-scope"),
+        "invalid_request",
+        "report_reduce",
+    );
+    // Neither request reached the bridge, so no destination was ever dialled
+    // and no foreign scope was ever addressed.
+    assert!(
+        ops.seen().is_empty(),
+        "the bridge must not be called: {:?}",
+        ops.seen()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn report_ops_without_an_adapter_fail_closed_after_scope_validation() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("read", () => hostOps.reportGet({
+          report_id: "00000000-0000-4000-8000-000000000001",
+        }));
+        await attempt("preview", () => hostOps.reportPreview({}));
+        await attempt("preview-invalid", () => hostOps.reportPreview({
+          cycle_id: "00000000-0000-0000-0000-000000000000",
+        }));
+        await attempt("preview-foreign", () => hostOps.reportPreview({
+          project_id: "00000000-0000-4000-8000-000000000002",
+        }));
+        await attempt("reduce", () => hostOps.reportReduce({
+          cycle_id: "00000000-0000-4000-8000-000000000002",
+        }));
+        await attempt("nil", () => hostOps.reportReduce({
+          cycle_id: "00000000-0000-0000-0000-000000000000",
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "read"),
+        "capability_missing",
+        "report_get",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "preview"),
+        "capability_missing",
+        "report_preview",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "preview-invalid"),
+        "invalid_request",
+        "report_preview",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "preview-foreign"),
+        "invalid_request",
+        "report_preview",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "reduce"),
+        "capability_missing",
+        "report_reduce",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "nil"),
+        "invalid_request",
+        "report_reduce",
+    );
+    assert!(ops.seen().is_empty());
+}
+
+fn preview_fixture(project_id: geo_domain::ProjectId, cycle_id: uuid::Uuid) -> ReportPreview {
+    let unavailable = serde_json::json!({
+        "availability": "unavailable", "expected_count": null,
+        "observed_count": 0, "counts": {}, "reason": "no frozen source"
+    });
+    serde_json::from_value(serde_json::json!({
+        "kind": "preview",
+        "project_id": project_id,
+        "cycle_id": cycle_id,
+        "report_window_start_at": "2026-09-01T00:00:00Z",
+        "report_window_end_at": "2026-09-08T00:00:00Z",
+        "report_timezone": "UTC",
+        "cutoff_at": "2026-09-08T00:00:00Z",
+        "evidence_as_of": "2026-09-07T00:00:00Z",
+        "generated_at": "2026-09-07T00:00:00Z",
+        "reducer_version": "test",
+        "input_hash": "test-hash",
+        "status": "partial",
+        "input_manifest_versions": [],
+        "documents": unavailable,
+        "publications": unavailable,
+        "measurements": unavailable,
+        "publication_groups": [],
+        "measurement_groups": [],
+        "findings": [],
+        "evidence": []
+    }))
+    .expect("preview fixture must match domain DTO")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preview_rejects_foreign_project_and_cycle_before_recording_success() {
+    struct Outcomes(Arc<Mutex<Vec<ToolCallOutcome>>>);
+    #[async_trait]
+    impl ToolCallRecorder for Outcomes {
+        async fn begin(&self, _: &ToolCallIdentity) -> Result<bool, HostOpError> {
+            Ok(true)
+        }
+        async fn attempt(&self, _: &ToolCallIdentity) -> Result<bool, HostOpError> {
+            Ok(true)
+        }
+        async fn finish(
+            &self,
+            _: &ToolCallIdentity,
+            outcome: ToolCallOutcome,
+        ) -> Result<(), HostOpError> {
+            self.0.lock().unwrap().push(outcome);
+            Ok(())
+        }
+    }
+    let scoped = scope();
+    let other_cycle = uuid::Uuid::new_v4();
+    let foreign_project = uuid::Uuid::new_v4().into();
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let script = r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("preview", () => hostOps.reportPreview({
+          cycle_id: "00000000-0000-4000-8000-000000000031",
+        }));
+    "#;
+    // Use the same explicit request on each run, so mismatched project and
+    // cycle responses are independently rejected by the recorded-return path.
+    let requested_cycle = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000031").unwrap();
+    for (project, response_cycle) in [
+        (foreign_project, requested_cycle),
+        (scoped.project_id.unwrap(), other_cycle),
+        (scoped.project_id.unwrap(), requested_cycle),
+    ] {
+        let ops = Arc::new(FakeHostOps::with(Behaviour {
+            preview_response: Some(preview_fixture(project, response_cycle)),
+            ..Behaviour::default()
+        }));
+        let bridge = HostBridge::new(ops, scoped.clone(), tokio::runtime::Handle::current())
+            .with_recorder(
+                geo_domain::RunId::from(uuid::Uuid::new_v4()),
+                Arc::new(Outcomes(Arc::clone(&results))),
+            );
+        let mut runtime = HostRuntime::new(
+            &[
+                ("memeloop://bundle/host-ops.js", geo_worker::HOST_OPS_JS),
+                (SCENARIO_MODULE, script),
+            ],
+            bridge,
+            None,
+        )
+        .unwrap();
+        runtime
+            .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+            .await
+            .unwrap();
+        let event = outcome(&runtime.host_state(), "preview");
+        if project != scoped.project_id.unwrap() || response_cycle != requested_cycle {
+            assert_typed_error(&event, "internal", "report_preview");
+        } else {
+            let preview = assert_success(&event);
+            assert_eq!(preview["kind"], "preview");
+            assert!(preview.get("report_id").is_none());
+        }
+    }
+    assert_eq!(
+        *results.lock().unwrap(),
+        vec![
+            ToolCallOutcome::Failed,
+            ToolCallOutcome::Failed,
+            ToolCallOutcome::Succeeded
+        ],
+    );
+}
+
+/// A request that is well-shaped but out of the declared range is refused the
+/// same way, before any capability is consulted.
+#[tokio::test]
+async fn out_of_range_requests_are_refused() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("too-many", () => hostOps.knowledgeSearch({ query: "warranty", limit: 500 }));
+        await attempt("zero", () => hostOps.knowledgeSearch({ query: "warranty", limit: 0 }));
+        await attempt("page", () => hostOps.manifestRead({ kind: "document", limit: 1000 }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    for topic in ["too-many", "zero", "page"] {
+        let record = outcome(&runtime.host_state(), topic);
+        assert_eq!(
+            record["ok"], false,
+            "expected a failure for `{topic}`: {record}"
+        );
+        assert_eq!(record["error"]["code"], "invalid_request", "for `{topic}`");
+    }
+    assert!(
+        ops.seen().is_empty(),
+        "no capability may be consulted: {:?}",
+        ops.seen()
+    );
+}
+
+#[tokio::test]
+async fn native_question_ops_preserve_scope_and_reject_forged_bound_purpose() {
+    let ops = Arc::new(FakeHostOps::new());
+    let run_scope = scope();
+    let expected_scope = run_scope.storage_key();
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        const draft = {
+          text: "Can this be shipped?", intent: "purchase", product_refs: [],
+          market: "global", language: "en", source: {kind:"user_provided"}, weight: 1
+        };
+        const created = await attempt("question-create", () => hostOps.questionCreate({
+          idempotency_key: "native-create", name: "Questions", questions: [draft]
+        }));
+        const revised = await attempt("question-revise", () => hostOps.questionRevise({
+          question_set_id: created.value.question_set_id,
+          command: {
+            idempotency_key: "native-revise",
+            base_version_id: created.value.question_set_version_id,
+            name: "Questions", questions: [draft]
+          }
+        }));
+        await attempt("question-discover", () => hostOps.questionDiscover({
+          question_set_id: created.value.question_set_id,
+          question_set_version_id: created.value.question_set_version_id
+        }));
+        await attempt("forged-bound-purpose", () => hostOps.channelPlan({
+          publications: [], measurements: [], bound_measurements: [{
+            account_id:"00000000-0000-4000-8000-000000000111",
+            provider:"kimi",model:"model",surface:"consumer_web",
+            search_mode:"web_search",protocol_version:"v1",
+            question: {
+              question_set_id:created.value.question_set_id,
+              question_set_version_id:revised.value.question_set_version_id,
+              question_id:"00000000-0000-4000-8000-000000000131",
+              question_revision_id:"00000000-0000-4000-8000-000000000132",
+              purpose:"optimization"
+            },
+            scheduled_at:"2026-10-06T00:00:00Z",sample_ordinal:0
+          }]
+        }));
+        "#,
+        HostBridge::new(ops.clone(), run_scope, tokio::runtime::Handle::current()),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for topic in ["question-create", "question-revise", "question-discover"] {
+        assert_eq!(outcome(&runtime.host_state(), topic)["ok"], true);
+    }
+    let discover = outcome(&runtime.host_state(), "question-discover");
+    assert_eq!(
+        discover["value"]["questions"][0]["purpose"],
+        "frozen_evaluation"
+    );
+    assert!(
+        discover["value"]["questions"][0]
+            .get("optimization_text")
+            .is_none()
+    );
+    assert!(!discover.to_string().contains("HELDOUT_CANARY"));
+    assert_eq!(
+        outcome(&runtime.host_state(), "forged-bound-purpose")["error"]["code"],
+        "invalid_request"
+    );
+    assert_eq!(
+        ops.seen(),
+        vec![
+            HostOp::QuestionCreate,
+            HostOp::QuestionRevise,
+            HostOp::QuestionDiscover
+        ]
+    );
+    assert!(ops.scopes().iter().all(|actual| *actual == expected_scope));
+}
+
+#[tokio::test]
+async fn side_effect_requests_fail_before_the_bridge_when_their_identity_is_invalid() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("changed-body", () => hostOps.publishSubmit({
+          publication_intent_id: "00000000-0000-4000-8000-000000000004",
+          document_revision_id: "00000000-0000-4000-8000-000000000001",
+          platform_target_id: "00000000-0000-4000-8000-000000000002",
+          payload_sha256: "28c190665631daa107fd8f9436571508d3c3177cc8c4b3f3545fc06b345dc6b0",
+          body: "changed copy",
+        }));
+        await attempt("foreign-publish", () => hostOps.publishSubmit({
+          publication_intent_id: "00000000-0000-4000-8000-000000000004",
+          document_revision_id: "00000000-0000-4000-8000-000000000001",
+          platform_target_id: "00000000-0000-4000-8000-000000000002",
+          payload_sha256: "28c190665631daa107fd8f9436571508d3c3177cc8c4b3f3545fc06b345dc6b0",
+          body: "final copy",
+          tenant_id: "00000000-0000-4000-8000-00000000000f",
+        }));
+        await attempt("missing-sample-id", () => hostOps.measureSample({
+          measurement_protocol_id: "00000000-0000-4000-8000-000000000003",
+          question: "how long is the warranty?",
+          channel: "independent-search",
+          surface: "consumer_web",
+        }));
+        await attempt("wrong-surface", () => hostOps.measureSample({
+          measurement_protocol_id: "00000000-0000-4000-8000-000000000003",
+          scheduled_sample_id: "00000000-0000-4000-8000-000000000005",
+          question: "how long is the warranty?",
+          channel: "independent-search",
+          surface: "unverified",
+        }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+    for topic in [
+        "changed-body",
+        "foreign-publish",
+        "missing-sample-id",
+        "wrong-surface",
+    ] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "invalid_request",
+            if topic.contains("publish") || topic == "changed-body" {
+                "publish"
+            } else {
+                "measure"
+            },
+        );
+    }
+    assert!(ops.seen().is_empty(), "invalid effects reached the bridge");
+}
+
+/// The scope a capability runs under is the one the worker was assembled with,
+/// never one a script supplies.
+#[tokio::test]
+async fn the_tenant_scope_comes_from_the_bridge_not_from_the_script() {
+    let ops = Arc::new(FakeHostOps::new());
+    let scope = scope();
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("model", () => hostOps.modelComplete({ prompt: "hello" }));
+        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        "#,
+        HostBridge::new(
+            Arc::clone(&ops) as Arc<dyn HostOps>,
+            scope.clone(),
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    assert_eq!(
+        ops.scopes(),
+        vec![scope.storage_key(), scope.storage_key()],
+        "every capability must have run under the assembled scope"
+    );
+    assert_eq!(runtime.bridge().scope(), &scope);
+}
+
+/// A run that exhausts an op's budget is refused, the refused attempt is still
+/// counted, and the spent budget does not spill into another op.
+#[tokio::test]
+async fn the_call_budget_is_enforced_per_op() {
+    let ops = Arc::new(FakeHostOps::new());
+    let budgets = HostOpBudgets::default()
+        .with_limits(HostOp::ModelComplete, HostOpLimits::new(5_000, 1))
+        .with_limits(HostOp::KnowledgeSearch, HostOpLimits::new(5_000, 3));
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("first", () => hostOps.modelComplete({ prompt: "hello" }));
+        await attempt("second", () => hostOps.modelComplete({ prompt: "hello" }));
+        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        "#,
+        bridge(Arc::clone(&ops)).with_budgets(budgets),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    assert_success(&outcome(&runtime.host_state(), "first"));
+    let refused = outcome(&runtime.host_state(), "second");
+    assert_typed_error(&refused, "budget_exceeded", "model_complete");
+    assert_eq!(refused["error"]["retryable"], true);
+    assert_eq!(runtime.op_calls(HostOp::ModelComplete), 2);
+    assert_eq!(runtime.op_calls(HostOp::KnowledgeSearch), 1);
+    assert_success(&outcome(&runtime.host_state(), "search"));
+    assert_eq!(
+        ops.seen(),
+        vec![HostOp::ModelComplete, HostOp::KnowledgeSearch],
+        "the refused attempt must not reach the capability"
+    );
+}
+
+/// An op that outlives its wall-clock budget fails with a typed error instead
+/// of stalling the run, and the budget bounds the op rather than the run.
+#[tokio::test]
+async fn the_op_deadline_is_enforced() {
+    let ops = Arc::new(FakeHostOps::with(Behaviour {
+        stalling: BTreeMap::from([(HostOp::ModelComplete, Duration::from_secs(30))]),
+        ..Behaviour::default()
+    }));
+    let budgets =
+        HostOpBudgets::default().with_limits(HostOp::ModelComplete, HostOpLimits::new(50, 4));
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("model", () => hostOps.modelComplete({ prompt: "hello" }));
+        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        "#,
+        bridge(ops).with_budgets(budgets),
+    );
+
+    let started = Instant::now();
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must observe the deadline rather than hang");
+    let elapsed = started.elapsed();
+
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "model"),
+        "deadline_exceeded",
+        "model_complete",
+    );
+    assert_success(&outcome(&runtime.host_state(), "search"));
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the op budget must stop the call, took {elapsed:?}"
+    );
+}
+
+/// Cancelling a run fails its in-flight op and every later one with a typed
+/// error, so a cancelled run cannot go on to publish or measure.
+#[tokio::test]
+async fn cancelling_the_run_fails_ops_with_a_typed_error() {
+    let ops = Arc::new(FakeHostOps::with(Behaviour {
+        stalling: BTreeMap::from([(HostOp::ModelComplete, Duration::from_secs(30))]),
+        ..Behaviour::default()
+    }));
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("model", () => hostOps.modelComplete({ prompt: "hello" }));
+        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+
+    let cancellation = runtime.bridge().cancellation();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        cancellation.store(true, Ordering::SeqCst);
+    });
+
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must observe the cancellation rather than hang");
+    canceller.join().expect("the canceller must not panic");
+
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "model"),
+        "cancelled",
+        "model_complete",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "search"),
+        "cancelled",
+        "knowledge_search",
+    );
+    // The stalling capability was entered once and never re-entered.
+    assert_eq!(ops.seen(), vec![HostOp::ModelComplete]);
+}
+
+/// A provider message that quotes a credential reaches the script redacted, and
+/// the part of the diagnosis that is not a credential survives.
+#[tokio::test]
+async fn provider_failures_reach_the_script_redacted() {
+    const KEY: &str = "sk-live-abcdefghijklmnopqrstuvwxyz0123456789";
+    let ops = Arc::new(FakeHostOps::with(Behaviour {
+        failing: BTreeMap::from([(HostOp::ModelComplete, HostOpErrorCode::Failed)]),
+        failure_message: Some(format!("provider rejected key {KEY} with status 401")),
+        ..Behaviour::default()
+    }));
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("model", () => hostOps.modelComplete({ prompt: "hello" }));
+        "#,
+        bridge(ops),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the scenario must evaluate");
+
+    let record = outcome(&runtime.host_state(), "model");
+    assert_typed_error(&record, "failed", "model_complete");
+    let message = record["error"]["message"]
+        .as_str()
+        .expect("the error must carry a message");
+    assert!(
+        !message.contains(KEY),
+        "the key leaked into the isolate: {message}"
+    );
+    assert!(message.contains("***"), "unexpected redaction: {message}");
+    assert!(
+        message.contains("401"),
+        "the diagnosis must survive: {message}"
+    );
+}
+
+/// The run-level wall clock still terminates the production isolate, which is
+/// what makes an unbounded script recoverable.
+#[tokio::test]
+async fn the_wall_clock_deadline_terminates_the_production_isolate() {
+    let mut runtime = runtime(
+        "export const ready = true;",
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+    let started = Instant::now();
+    let error = runtime
+        .execute_script_with_deadline("spin.js", "for(;;) {}", Duration::from_millis(300))
+        .expect_err("an unbounded script must be terminated");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the deadline must actually stop execution, took {elapsed:?}"
+    );
+    assert!(
+        error.message.contains("terminated"),
+        "unexpected error: {error:?}"
+    );
+}
+
+/// The Rust-owned state a resumed run continues from round-trips through the
+/// production runtime exactly as it does through the probe.
+#[tokio::test]
+async fn checkpoint_round_trips_through_the_production_runtime() {
+    let bundle = [(CHECKPOINT_MODULE, CHECKPOINT_SCENARIO_JS)];
+    let mut origin = HostRuntime::new(&bundle, bridge(Arc::new(FakeHostOps::new())), None)
+        .expect("the production runtime must be constructible");
+    origin
+        .evaluate_module(CHECKPOINT_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the checkpoint scenario must evaluate");
+    let checkpoint = origin.checkpoint().expect("checkpoint must serialise");
+    assert_eq!(origin.host_state().events.len(), 1);
+
+    let mut resumed = HostRuntime::new(&bundle, bridge(Arc::new(FakeHostOps::new())), None)
+        .expect("the production runtime must be constructible");
+    assert!(resumed.host_state().events.is_empty());
+    resumed
+        .restore_checkpoint(&checkpoint)
+        .expect("checkpoint must deserialise");
+    assert_eq!(resumed.host_state(), origin.host_state());
+}
+
+/// Reports a step through the emit contract, which is exactly what a checkpoint
+/// carries: Rust-owned state, not an opaque engine snapshot.
+const CHECKPOINT_SCENARIO_JS: &str = r#"
+await Deno.core.ops.op_host_emit("loop.step", JSON.stringify({ step: 1 }));
+export const ready = true;
+"#;
+
+// ---------------------------------------------------------------------------
+// Turns: the host calls `main` once per run
+// ---------------------------------------------------------------------------
+
+/// Short enough that a turn relying on it cannot be confused with one that
+/// finished, long enough that loading and evaluating the bundle is not racing
+/// it.
+const SHORT_DEADLINE: Duration = Duration::from_millis(400);
+
+fn count_events(state: &HostState, topic: &str) -> usize {
+    state
+        .events
+        .iter()
+        .filter(|event| event.topic == topic)
+        .count()
+}
+
+/// A turn is a *call*, not an evaluation: the host evaluates the entry module
+/// and then calls `main` with that turn's inputs.  Every capability the turn
+/// reaches carries the run's own scope, and the turn reports its result exactly
+/// once.
+#[tokio::test]
+async fn calling_main_runs_one_turn_under_the_run_scope() {
+    let ops = Arc::new(FakeHostOps::new());
+    let bridge = bridge(Arc::clone(&ops));
+    let run_scope = bridge.scope().storage_key();
+    let mut runtime =
+        HostRuntime::new(HOST_BUNDLE, bridge, None).expect("the runtime must be constructible");
+
+    runtime
+        .call_main(
+            HOST_MAIN_MODULE,
+            &serde_json::json!({ "prompt": "how long is the warranty?" }).to_string(),
+            GENEROUS_DEADLINE,
+        )
+        .await
+        .expect("the reference bundle must complete a turn");
+
+    assert_eq!(
+        ops.seen(),
+        vec![HostOp::KnowledgeSearch, HostOp::ModelComplete],
+        "a turn retrieves evidence before it asks the model"
+    );
+    assert!(
+        ops.scopes().iter().all(|seen| *seen == run_scope),
+        "every capability call must carry the run's scope: {:?}",
+        ops.scopes()
+    );
+
+    let state = runtime.host_state();
+    assert_eq!(
+        count_events(&state, "loop.completed"),
+        1,
+        "a turn reports its result exactly once: {:?}",
+        state.events
+    );
+    let completed = outcome(&state, "loop.completed");
+    assert_eq!(completed["answer"], "bridge:how long is the warranty?");
+}
+
+/// Evaluating the entry module is not a turn.  It announces the surface it
+/// expects and stops; nothing is retrieved and no model is asked.  Without this
+/// a host that evaluated a bundle and read the event log would see a plausible
+/// turn that never ran.
+#[tokio::test]
+async fn evaluating_the_entry_module_does_not_run_a_turn() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime =
+        HostRuntime::new(HOST_BUNDLE, bridge(Arc::clone(&ops)), None).expect("constructible");
+
+    runtime
+        .evaluate_module(HOST_MAIN_MODULE, GENEROUS_DEADLINE)
+        .await
+        .expect("the reference bundle must evaluate");
+
+    let state = runtime.host_state();
+    assert_eq!(count_events(&state, "loop.ready"), 1);
+    assert_eq!(
+        count_events(&state, "loop.completed"),
+        0,
+        "evaluating a module must not be mistaken for running a turn: {:?}",
+        state.events
+    );
+    assert!(
+        ops.seen().is_empty(),
+        "an evaluation must not exercise a capability: {:?}",
+        ops.seen()
+    );
+}
+
+/// A bundle that never exported `main` is refused by name, rather than appearing
+/// to run a turn that produced nothing.
+#[tokio::test]
+async fn a_bundle_without_main_is_refused() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime("export const ready = true;", bridge(Arc::clone(&ops)));
+
+    let error = runtime
+        .call_main(SCENARIO_MODULE, "{}", GENEROUS_DEADLINE)
+        .await
+        .expect_err("a bundle that exports no `main` cannot run a turn");
+
+    assert_eq!(error.stage, "namespace", "unexpected error: {error:?}");
+    assert!(
+        error.message.contains("main"),
+        "unexpected error: {error:?}"
+    );
+    assert!(ops.seen().is_empty(), "no capability may be exercised");
+}
+
+/// `main` that is not callable is refused just as explicitly as `main` that is
+/// absent.
+#[tokio::test]
+async fn a_main_that_is_not_a_function_is_refused() {
+    let mut runtime = runtime(
+        "export const main = 42;",
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+
+    let error = runtime
+        .call_main(SCENARIO_MODULE, "{}", GENEROUS_DEADLINE)
+        .await
+        .expect_err("a `main` that is not a function cannot run a turn");
+
+    assert_eq!(error.stage, "namespace", "unexpected error: {error:?}");
+}
+
+/// A turn that throws surfaces the script's own message, so a failing turn can
+/// be diagnosed from the run record alone.
+#[tokio::test]
+async fn a_main_that_throws_fails_the_call() {
+    let mut runtime = runtime(
+        "export async function main() { throw new Error('turn exploded'); }",
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+
+    let error = runtime
+        .call_main(SCENARIO_MODULE, "{}", GENEROUS_DEADLINE)
+        .await
+        .expect_err("a throwing turn must fail");
+
+    assert_eq!(error.stage, "call", "unexpected error: {error:?}");
+    assert!(
+        error.message.contains("turn exploded"),
+        "unexpected error: {error:?}"
+    );
+}
+
+/// A turn whose promise can never settle fails as soon as the event loop has
+/// nothing left to do, rather than burning the whole deadline before saying so.
+#[tokio::test]
+async fn a_main_awaiting_an_unresolvable_promise_fails_promptly() {
+    let mut runtime = runtime(
+        "export async function main() { await new Promise(() => {}); }",
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+
+    let started = Instant::now();
+    let error = runtime
+        .call_main(SCENARIO_MODULE, "{}", GENEROUS_DEADLINE)
+        .await
+        .expect_err("a turn that can never settle must fail");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.stage, "call", "unexpected error: {error:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "it must not wait out the deadline, took {elapsed:?}"
+    );
+}
+
+/// An external guard bounds this regression test even if a watchdog regression
+/// leaves the child process spinning forever.  The child builds the same
+/// current-thread runtime used by the production executor.
+const CURRENT_THREAD_WATCHDOG_CHILD: &str = "GEO_WORKER_CURRENT_THREAD_WATCHDOG_CHILD";
+const CURRENT_THREAD_WATCHDOG_GUARD: Duration = Duration::from_secs(10);
+
+fn run_current_thread_watchdog_case(script: &'static str, call_main: bool) {
+    let current_thread = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the current-thread executor must be constructible");
+
+    current_thread.block_on(async {
+        let mut runtime = runtime(script, bridge(Arc::new(FakeHostOps::new())));
+        let started = Instant::now();
+        let error = if call_main {
+            runtime
+                .call_main(SCENARIO_MODULE, "{}", SHORT_DEADLINE)
+                .await
+                .expect_err("an unbounded turn must be terminated")
+        } else {
+            runtime
+                .evaluate_module(SCENARIO_MODULE, SHORT_DEADLINE)
+                .await
+                .expect_err("an unbounded module evaluation must be terminated")
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < CURRENT_THREAD_WATCHDOG_GUARD,
+            "the deadline must actually stop execution, took {elapsed:?}"
+        );
+        assert!(
+            error.message.contains("terminated"),
+            "unexpected error: {error:?}"
+        );
+        if call_main {
+            assert_eq!(error.stage, "call", "unexpected error: {error:?}");
+        }
+    });
+}
+
+fn run_current_thread_watchdog_child(test_name: &str) {
+    let test_binary = std::env::current_exe().expect("the test binary path must be available");
+    let mut child = std::process::Command::new(test_binary)
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CURRENT_THREAD_WATCHDOG_CHILD, "1")
+        .spawn()
+        .expect("the watchdog regression child must start");
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("the watchdog regression child must remain observable")
+        {
+            assert!(
+                status.success(),
+                "the watchdog regression child failed: {status}"
+            );
+            return;
+        }
+        if started.elapsed() >= CURRENT_THREAD_WATCHDOG_GUARD {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the current-thread watchdog regression child exceeded its guard");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Exercises a synchronously spinning `main` on an explicit current-thread
+/// runtime.  It is only run by the parent guard below so a broken watchdog
+/// cannot hang the whole test suite.
+#[test]
+fn current_thread_main_spin_watchdog_child() {
+    if std::env::var_os(CURRENT_THREAD_WATCHDOG_CHILD).is_some() {
+        run_current_thread_watchdog_case("export function main() { for (;;) {} }", true);
+    }
+}
+
+/// Exercises top-level synchronous JavaScript as well: module evaluation can
+/// block the current-thread runtime before it ever reaches a future yield.
+#[test]
+fn current_thread_module_spin_watchdog_child() {
+    if std::env::var_os(CURRENT_THREAD_WATCHDOG_CHILD).is_some() {
+        run_current_thread_watchdog_case("for (;;) {} export function main() {}", false);
+    }
+}
+
+/// Both `call_main` and module evaluation must be interrupted even when V8
+/// monopolises the thread that owns the Tokio current-thread runtime.
+#[test]
+fn current_thread_watchdog_terminates_synchronous_javascript() {
+    for test_name in [
+        "current_thread_main_spin_watchdog_child",
+        "current_thread_module_spin_watchdog_child",
+    ] {
+        run_current_thread_watchdog_child(test_name);
+    }
+}

@@ -8,9 +8,12 @@ import {
   MessageBarBody,
 } from "@fluentui/react-components";
 import { ArrowRightRegular, LockClosedRegular } from "@fluentui/react-icons";
+import { useTranslation } from "react-i18next";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { ErrorState, LoadingState } from "../components/AsyncState";
+import { Brand } from "../components/Brand";
+import { LanguageSelect } from "../components/LanguageSelect";
 import { useAuth } from "../auth/AuthProvider";
 
 function returnToFrom(search: string) {
@@ -21,6 +24,7 @@ function returnToFrom(search: string) {
 }
 
 export function LoginPage() {
+  const { t } = useTranslation();
   const { status, error, refresh, login } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
@@ -30,14 +34,15 @@ export function LoginPage() {
   const [submitting, setSubmitting] = useState(false);
   const returnTo = returnToFrom(location.search);
 
-  if (status === "checking") return <LoadingState label="正在确认登录状态" />;
+  if (status === "checking")
+    return <LoadingState label={t("login.checking")} />;
   if (status === "authenticated") return <Navigate replace to={returnTo} />;
   if (status === "unavailable") {
     return (
       <main className="login-page">
         <ErrorState
-          title="身份服务暂时不可用"
-          detail={error?.message ?? "无法连接到身份服务。"}
+          title={t("login.unavailableTitle")}
+          detail={error?.message ?? t("login.unavailableDetail")}
           onRetry={() => void refresh()}
         />
       </main>
@@ -56,10 +61,10 @@ export function LoginPage() {
         requestError instanceof ApiError ? requestError : undefined;
       setSubmitError(
         apiError?.status === 401
-          ? "用户名或密码不正确。"
+          ? t("login.invalidCredentials")
           : apiError?.isRetryable
-            ? "登录服务暂时不可用，请重试。"
-            : (apiError?.message ?? "无法登录，请稍后重试。"),
+            ? t("login.retry")
+            : (apiError?.message ?? t("login.failed")),
       );
     } finally {
       setSubmitting(false);
@@ -69,16 +74,12 @@ export function LoginPage() {
   return (
     <main className="login-page">
       <Card className="login-card">
-        <div className="brand login-brand" aria-label="Memeloop GEO">
-          <div className="brand-mark">M</div>
-          <span>
-            Memeloop <b>GEO</b>
-          </span>
-        </div>
+        <Brand />
+        <LanguageSelect />
         <div>
-          <p className="eyebrow">欢迎回来</p>
-          <h1>登录工作区</h1>
-          <p>使用分配给你的 GEO 软件账号登录。</p>
+          <p className="eyebrow">{t("login.welcome")}</p>
+          <h1>{t("login.title")}</h1>
+          <p>{t("login.description")}</p>
         </div>
         {submitError && (
           <MessageBar intent="error" aria-live="assertive">
@@ -86,7 +87,7 @@ export function LoginPage() {
           </MessageBar>
         )}
         <form className="login-form" onSubmit={submit}>
-          <Field label="用户名" required>
+          <Field label={t("login.username")} required>
             <Input
               autoComplete="username"
               value={loginName}
@@ -95,7 +96,7 @@ export function LoginPage() {
               autoFocus
             />
           </Field>
-          <Field label="密码" required>
+          <Field label={t("login.password")} required>
             <Input
               type="password"
               autoComplete="current-password"
@@ -110,12 +111,11 @@ export function LoginPage() {
             disabled={submitting || !loginName.trim() || !password}
             icon={submitting ? undefined : <ArrowRightRegular />}
           >
-            {submitting ? "正在登录…" : "登录"}
+            {submitting ? t("login.submitting") : t("login.submit")}
           </Button>
         </form>
         <p className="login-note">
-          <LockClosedRegular aria-hidden="true" /> 会话由安全 Cookie
-          保存；此浏览器不会保存密码或 CSRF 令牌。
+          <LockClosedRegular aria-hidden="true" /> {t("login.help")}
         </p>
       </Card>
     </main>

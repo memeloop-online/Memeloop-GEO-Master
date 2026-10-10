@@ -1,4 +1,4 @@
-name: CI
+name: CI (5-minute milestone)
 
 on:
   push:
@@ -12,78 +12,418 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  frontend:
-    name: Frontend checks
+  linux:
+    name: Linux Rust/V8 + frontend (5-minute milestone)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: geo_ci
+          POSTGRES_PASSWORD: disposable-ci-only
+          POSTGRES_DB: geo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U geo_ci -d geo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Detect frontend workspace
-        id: workspace
-        shell: bash
-        run: |
-          present=false
-          for directory in apps packages; do
-            if [[ -d "$directory" ]] && find "$directory" -name package.json -print -quit | grep -q .; then
-              present=true
-              break
-            fi
-          done
-          echo "present=$present" >> "$GITHUB_OUTPUT"
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+          run_install: false
 
       - name: Set up Node
-        if: steps.workspace.outputs.present == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install frontend dependencies
-        if: steps.workspace.outputs.present == 'true'
-        shell: bash
-        run: |
-          corepack enable
-          if [[ -f pnpm-lock.yaml ]]; then
-            pnpm install --frozen-lockfile
-          else
-            pnpm install --no-frozen-lockfile
-          fi
-
-      - name: Check frontend format, types, and tests
-        if: steps.workspace.outputs.present == 'true'
-        run: |
-          pnpm run format:check
-          pnpm run typecheck
-          pnpm run test
-          pnpm run build
-
-      - name: Report deferred frontend setup
-        if: steps.workspace.outputs.present != 'true'
-        run: echo "No frontend workspace yet; checks will run when apps/ or packages/ contains package.json."
-
-  backend:
-    name: Backend checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Detect Rust workspace
-        id: workspace
-        shell: bash
-        run: echo "present=$([[ -f Cargo.toml ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Set up Rust
-        if: steps.workspace.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Check backend format, lint, and tests
-        if: steps.workspace.outputs.present == 'true'
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace --all-targets
+      - name: Set up isolated document parser build
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: services/document-parser/pom.xml
 
-      - name: Report deferred backend setup
-        if: steps.workspace.outputs.present != 'true'
-        run: echo "No Cargo.toml yet; checks will run when the Rust workspace is added."
+      - name: Test and package real PDF parser
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          mvn -B -ntp -f services/document-parser/pom.xml clean verify 2>&1 | tee logs/pdf-parser-build.log
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install pinned browser for isolated connector tests
+        timeout-minutes: 8
+        run: |
+          # The hosted runner's preferred Azure HTTP mirror can stall APT even
+          # after the official HTTPS archive has answered successfully.
+          # Keep signed Ubuntu packages; change only that mirror preference.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          pnpm --filter @memeloop-geo/browser-runner exec playwright install --with-deps chromium
+
+      - name: Build generated MemeLoop bundle
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          pnpm agent:bundle 2>&1 | tee logs/pnpm-agent-bundle.log
+
+      - name: Check frontend format, types, tests, and build
+        shell: bash
+        run: |
+          set -o pipefail
+          pnpm format:check 2>&1 | tee logs/pnpm-format.log
+          node --test scripts/local-workspace.test.mjs 2>&1 | tee logs/local-workspace-unit.log
+          pnpm typecheck 2>&1 | tee logs/pnpm-typecheck.log
+          pnpm test 2>&1 | tee logs/pnpm-test.log
+          pnpm build 2>&1 | tee logs/pnpm-build.log
+
+      - name: Check Rust format, lint, and tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          cargo fmt --all -- --check 2>&1 | tee logs/cargo-fmt.log
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee logs/cargo-clippy.log
+          cargo test --workspace --all-targets 2>&1 | tee logs/cargo-test.log
+
+      - name: Verify report PDF text, glyphs, and pagination
+        env:
+          GEO_REPORT_PDF_OUTPUT_DIR: ${{ runner.temp }}/geo-report-pdf-smoke
+          GEO_REPORT_PDF_PARSER_JAR: ${{ github.workspace }}/services/document-parser/target/document-parser-1.0.0.jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-report-pdf.mjs 2>&1 | tee logs/report-pdf-smoke.log
+
+      - name: Run generated bundle Rust/V8 compatibility test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p geo-worker --test memeloop_bundle -- --ignored 2>&1 | tee logs/cargo-memeloop-bundle.log
+          cargo test -p geo-app generated_bundle_runs_one_turn_through_assembled_provider -- --ignored 2>&1 | tee logs/cargo-app-bundle.log
+          cargo test -p geo-app scoped_test_generated_bundle_runs_one_turn -- --ignored 2>&1 | tee logs/cargo-app-scoped-test-bundle.log
+          cargo test -p geo-api --test attachment_import_runtime -- --ignored 2>&1 | tee logs/cargo-attachment-import-runtime.log
+          cargo test -p geo-api --test channel_tools_runtime -- --ignored 2>&1 | tee logs/cargo-channel-tools-runtime.log
+          cargo test -p geo-worker --test content_media_runtime -- --ignored 2>&1 | tee logs/cargo-content-media-runtime.log
+          cargo test -p geo-worker --test content_workflow -- --ignored 2>&1 | tee logs/cargo-content-workflow.log
+          cargo test -p geo-app content_runtime_tests -- --ignored 2>&1 | tee logs/cargo-content-app-runtime.log
+
+      - name: Test repositories against disposable PostgreSQL
+        # Preserve independent migration evidence if a V8 probe aborts earlier.
+        # Earlier failures still fail the job; this is not continue-on-error.
+        if: ${{ !cancelled() }}
+        env:
+          GEO_TEST_DATABASE_URL: postgres://geo_ci:disposable-ci-only@127.0.0.1:5432/geo_test
+        shell: bash
+        run: |
+          set -o pipefail
+          failed=0
+          for suite in postgres reports channels standalone_measurements channel_identity successor_cycles channel_dispatcher bootstrap model_routes operator_appearance content content_revision_lookup content_distribution_request rich_content content_reuse content_media content_media_authority media_export_snapshots questions distribution connector_capabilities publication_lookup publication_bindings publication_send_authorization observation_capture provider_conversation_cleanup pdf_parse office_parse import_progress knowledge_text_revisions attachment_bytes; do
+            if ! cargo test -p geo-persistence --test "$suite" -- --ignored 2>&1 | tee "logs/cargo-${suite}-postgres.log"; then
+              failed=1
+            fi
+          done
+          if ! cargo test -p geo-persistence --lib content_validation_holds_object_and_binding_until_caller_commits -- --ignored 2>&1 | tee "logs/cargo-media-lock-postgres.log"; then
+            failed=1
+          fi
+          if ! cargo test -p geo-api --test content_media_tools -- --ignored 2>&1 | tee "logs/cargo-media-tools-postgres.log"; then
+            failed=1
+          fi
+          exit "$failed"
+
+      - name: Diagnose V8 heap pressure with isolated and concurrent probes
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          failed=0
+          for round in $(seq 1 5); do
+            if ! cargo test -p geo-worker --test probe enforces_heap_limit -- --exact --nocapture 2>&1 | tee "logs/v8-heap-alone-${round}.log"; then
+              failed=1
+            fi
+            if ! cargo test -p geo-worker --test probe -- --test-threads=1 --nocapture 2>&1 | tee "logs/v8-probe-serial-${round}.log"; then
+              failed=1
+            fi
+            if ! cargo test -p geo-worker --test probe -- --nocapture 2>&1 | tee "logs/v8-probe-parallel-${round}.log"; then
+              failed=1
+            fi
+          done
+          # Every invocation counts. Later success cannot erase an earlier crash.
+          exit "$failed"
+
+      - name: Test Rust import pipeline against real PDF parser
+        env:
+          GEO_PDF_BIND: 127.0.0.1
+          GEO_PDF_PORT: 18081
+          GEO_TEST_PDF_PARSER_URL: http://127.0.0.1:18081
+          GEO_TEST_OFFICE_PARSER_URL: http://127.0.0.1:18081
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -jar services/document-parser/target/document-parser-1.0.0.jar > logs/pdf-parser-service.log 2>&1 &
+          parser_pid=$!
+          trap 'kill "$parser_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent "$GEO_TEST_PDF_PARSER_URL/health" > /dev/null; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$parser_pid" 2>/dev/null; then
+              echo "PDF parser exited before readiness"
+              exit 1
+            fi
+            sleep 1
+          done
+          test "$ready" -eq 1
+          cargo test -p geo-api --test pdf_parse -- --ignored 2>&1 | tee logs/cargo-pdf-parser-live.log
+          cargo test -p geo-api --test office_parse -- --ignored 2>&1 | tee logs/cargo-office-parser-live.log
+
+      - name: Test real local UI with synthetic knowledge and report preview
+        env:
+          GEO_SMOKE_CONTENT: "1"
+          GEO_SMOKE_APP_BINARY: ${{ github.workspace }}/target/debug/geo-app
+          GEO_SMOKE_OUTPUT_DIR: ${{ runner.temp }}/geo-web-smoke
+          GEO_SMOKE_TMP_DIR: ${{ runner.temp }}/geo-web-smoke-tmp
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p geo-app 2>&1 | tee logs/cargo-web-smoke-build.log
+          node scripts/verify-web-smoke.mjs 2>&1 | tee logs/web-smoke.log
+          node scripts/verify-chat-copy-smoke.mjs 2>&1 | tee logs/chat-copy-smoke.log
+
+      - name: Verify persistent local login across service restart
+        env:
+          GEO_LOCAL_APP_BINARY: ${{ github.workspace }}/target/debug/geo-app
+          GEO_LOCAL_STATE_DIR: ${{ runner.temp }}/geo-private-restart-state
+          GEO_LOCAL_TMP_DIR: ${{ runner.temp }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"
+          node scripts/verify-local-workspace.mjs 2>&1 | tee logs/local-workspace-restart.log
+
+      - name: Write 5-minute milestone summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## 5-minute milestone"
+            echo
+            echo "- Linux frontend checks, Rust/V8 checks, and generated bundle verification are configured in this job."
+            echo "- The Linux-generated JavaScript bundle is uploaded with third-party notices; it is not a Windows/MSVC rusty_v8 cache."
+            echo "- Test logs are uploaded separately for failed-run diagnosis."
+            echo "- PostgreSQL repository tests use an isolated service container; this does not prove non-bypass FORCE RLS."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload generated MemeLoop bundle and notices
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memeloop-bundle-linux-${{ github.sha }}
+          if-no-files-found: warn
+          path: |
+            packages/agent-runtime/dist/memeloop-agent-loop.bundle.mjs
+            packages/agent-runtime/dist/memeloop-content-workflow.bundle.mjs
+            packages/agent-runtime/THIRD_PARTY_NOTICES.md
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-logs-${{ github.sha }}
+          if-no-files-found: warn
+          path: logs/
+
+      - name: Upload document parser artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: document-parser-java21-${{ github.sha }}
+          if-no-files-found: error
+          path: services/document-parser/target/document-parser-1.0.0.jar
+
+      - name: Upload synthetic UI acceptance screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-smoke-synthetic-${{ github.sha }}
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/geo-web-smoke/
+
+      - name: Upload synthetic report PDF acceptance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-pdf-synthetic-${{ github.sha }}
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/geo-report-pdf-smoke/
+
+  windows-msvc:
+    name: Windows MSVC Rust/V8 (5-minute milestone)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node for private local workspace checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test private local workspace configuration
+        shell: pwsh
+        run: node --test scripts/local-workspace.test.mjs
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache Cargo and rusty_v8
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/.rusty_v8
+            target
+          key: ${{ runner.os }}-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msvc-cargo-
+
+      - name: Download pinned rusty_v8 archive and metadata
+        id: collect-v8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          $artifactDirectory = Join-Path $env:GITHUB_WORKSPACE "artifacts\rusty-v8-msvc"
+          $lockfile = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.lock") -Raw
+          $versions = [regex]::Matches($lockfile, '(?m)^\[\[package\]\]\r?\nname = "v8"\r?\nversion = "(\d+\.\d+\.\d+)"\r?$')
+          if ($versions.Count -ne 1) {
+            throw "Expected exactly one pinned v8 package in Cargo.lock; found $($versions.Count)."
+          }
+          $v8Version = $versions[0].Groups[1].Value
+          $target = "x86_64-pc-windows-msvc"
+          $archiveName = "rusty_v8_simdutf_release_$target.lib.gz"
+          $releaseUrl = "https://github.com/denoland/rusty_v8/releases/download/v$v8Version/$archiveName"
+          New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
+          $archivePath = Join-Path $artifactDirectory $archiveName
+          $temporaryPath = "$archivePath.download"
+          try {
+            Invoke-WebRequest -Uri $releaseUrl -OutFile $temporaryPath -MaximumRedirection 5
+            if ((Get-Item -LiteralPath $temporaryPath).Length -le 0) {
+              throw "The rusty_v8 release archive is empty: $releaseUrl"
+            }
+            $inputStream = [System.IO.File]::OpenRead($temporaryPath)
+            try {
+              $gzip = [System.IO.Compression.GzipStream]::new($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+              try {
+                $buffer = [byte[]]::new(65536)
+                $expandedBytes = 0L
+                while (($bytesRead = $gzip.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                  $expandedBytes += $bytesRead
+                }
+                if ($expandedBytes -eq 0) {
+                  throw "The rusty_v8 release archive has no decompressed content: $releaseUrl"
+                }
+              } finally {
+                $gzip.Dispose()
+              }
+            } finally {
+              $inputStream.Dispose()
+            }
+            Move-Item -LiteralPath $temporaryPath -Destination $archivePath
+          } finally {
+            if (Test-Path -LiteralPath $temporaryPath) {
+              Remove-Item -LiteralPath $temporaryPath
+            }
+          }
+          $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archiveName" | Set-Content (Join-Path $artifactDirectory "rusty_v8.sha256")
+          rustc -vV | Set-Content (Join-Path $artifactDirectory "rustc.txt")
+          $target | Set-Content (Join-Path $artifactDirectory "target.txt")
+          $v8Version | Set-Content (Join-Path $artifactDirectory "v8-version.txt")
+          $releaseUrl | Set-Content (Join-Path $artifactDirectory "source-url.txt")
+
+      - name: Verify collected artifact restores into a clean Cargo cache
+        id: verify-v8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cleanCargoHome = Join-Path $env:RUNNER_TEMP "geo-v8-restore-cargo"
+          if (Test-Path -LiteralPath $cleanCargoHome) {
+            Remove-Item -LiteralPath $cleanCargoHome -Recurse -Force
+          }
+          & ./scripts/fetch-v8-artifact.ps1 `
+            -ArtifactDirectory "$env:GITHUB_WORKSPACE\artifacts\rusty-v8-msvc" `
+            -CargoHome $cleanCargoHome
+          $restored = @(Get-ChildItem -LiteralPath (Join-Path $cleanCargoHome ".rusty_v8") -File)
+          if ($restored.Count -eq 0) {
+            throw "The collected artifact did not restore any Cargo V8 archive."
+          }
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          & ./scripts/fetch-v8-artifact.ps1 `
+            -ArtifactDirectory "$env:GITHUB_WORKSPACE\artifacts\rusty-v8-msvc" `
+            -CargoHome $cargoHome
+
+      - name: Build Rust workspace
+        shell: pwsh
+        run: cargo build --workspace --target x86_64-pc-windows-msvc
+
+      - name: Test Rust workspace
+        shell: pwsh
+        run: cargo test --workspace --all-targets --target x86_64-pc-windows-msvc
+
+      - name: Write 5-minute milestone summary
+        if: always()
+        shell: pwsh
+        run: |
+          @"
+          ## 5-minute milestone
+
+          - Windows MSVC Rust/V8 build and tests run against the native target.
+          - The exact `rusty_v8` archive, SHA-256, rustc, target, and V8 metadata are uploaded below.
+          - This artifact is Windows/MSVC-only and is not a Linux or local cross-platform bundle.
+          "@ | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows rusty_v8 artifact
+        if: ${{ always() && steps.collect-v8.outcome == 'success' && steps.verify-v8.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusty-v8-msvc-${{ github.sha }}
+          if-no-files-found: error
+          path: artifacts/rusty-v8-msvc/

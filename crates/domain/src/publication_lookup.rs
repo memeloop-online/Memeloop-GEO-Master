@@ -1,0 +1,139 @@
+//! Read-only reconciliation of an ambiguous publication attempt.
+//! A lookup can observe an asset, but cannot prove that this send created it.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{AppError, ChannelTargetInput, TenantScope};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationLookupJob {
+    pub attempt_id: Uuid,
+    pub target_id: Uuid,
+    pub account_id: Uuid,
+    pub frozen_input: ChannelTargetInput,
+    pub connector_version: Option<String>,
+    /// Unverified hint from the original attempt, never a publication receipt.
+    pub candidate_public_url: Option<String>,
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub lease_execution_id: Option<Uuid>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub query_count: i32,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationLookupCandidate {
+    pub scope: TenantScope,
+    pub attempt_id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationLookupFinding {
+    Unknown,
+    AssetObserved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationLookupObservation {
+    pub execution_id: Uuid,
+    pub attempt_id: Uuid,
+    pub finding: PublicationLookupFinding,
+    /// Data retained for later, independent validation of send causality.
+    pub evidence: serde_json::Value,
+    pub observed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub error_code: Option<String>,
+}
+
+/// Internal report input only. Never serialize the job or raw observation:
+/// both can contain account and unverified external evidence.
+#[derive(Debug, Clone)]
+pub struct PublicationLookupReportObservation {
+    pub original_target_id: Uuid,
+    pub job: PublicationLookupJob,
+    pub observation: PublicationLookupObservation,
+}
+
+#[async_trait]
+pub trait PublicationLookupRepository: Send + Sync {
+    /// Create one job per original attempt. Read its bound target, outcome,
+    /// and candidate from the database; callers cannot supply asset hints.
+    async fn enqueue(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<PublicationLookupJob, AppError>;
+
+    /// Trusted cross-scope keyset page, including recoverable expired leases.
+    async fn scan_due(
+        &self,
+        after_attempt_id: Option<Uuid>,
+        as_of: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<PublicationLookupCandidate>, AppError>;
+
+    /// The fresh execution ID is also the lease fence. Expiry permits only
+    /// another read-only lookup, never another publication.
+    async fn claim(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        execution_id: Uuid,
+        at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<PublicationLookupJob, AppError>;
+
+    /// Append one observation for the currently held execution and schedule
+    /// another lookup (or stop scheduling with None). Never project a receipt.
+    async fn finish(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        observation: PublicationLookupObservation,
+        next_due_at: Option<DateTime<Utc>>,
+    ) -> Result<PublicationLookupJob, AppError>;
+
+    async fn get(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<PublicationLookupJob, AppError>;
+
+    async fn observations(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<Vec<PublicationLookupObservation>, AppError>;
+
+    /// Newest-first, bounded page. A cursor must belong to this exact
+    /// scope and original attempt; unknown/foreign IDs are invalid requests.
+    /// Returns at most `limit + 1` rows to detect another page.
+    async fn observation_page(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        before: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<PublicationLookupObservation>, AppError>;
+
+    /// A scoped, bounded fan-in: at most 32 newest timely asset candidates
+    /// and their original job per requested original send. The reducer takes
+    /// the first candidate passing independent validation, then projects one
+    /// representative reference per frozen target. Older than 32 fails closed.
+    async fn report_asset_observations(
+        &self,
+        scope: &TenantScope,
+        original_channel_target_ids: &[Uuid],
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<PublicationLookupReportObservation>, AppError> {
+        let _ = (scope, original_channel_target_ids, as_of);
+        // In-memory/read-only fixtures cannot assert durable send provenance.
+        Ok(Vec::new())
+    }
+}

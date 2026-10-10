@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { uploadMediaType as attachmentMediaType } from "./upload-media";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor, type QueryScope } from "../auth/types";
 import {
@@ -28,6 +29,22 @@ export interface AgentAttachmentReference {
   size_bytes?: number;
   sha256?: string;
   object_version?: string;
+}
+
+export type AgentAttachmentUploadState =
+  "creating_session" | "uploading" | "completing" | "uploaded";
+
+export interface AgentAttachmentUploadOptions {
+  /** Retain these keys and the session after a failed request for safe retries. */
+  createKey: string;
+  completeKey: string;
+  sessionId?: string;
+  contentUploaded?: boolean;
+  onProgress?: (state: AgentAttachmentUploadState, sessionId?: string) => void;
+}
+
+interface AgentAttachmentUploadSession {
+  upload_session_id: string;
 }
 
 export interface AgentConversationSummary {
@@ -151,6 +168,75 @@ export const agentQueryKeys = {
 
 function scopedOptions(tenantId: string, projectId: string): ApiRequestOptions {
   return { tenantId, projectId };
+}
+
+async function fileSha256(file: File): Promise<string> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("浏览器不支持 SHA-256 核验，无法安全上传附件。");
+  }
+  const digest = await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    await file.arrayBuffer(),
+  );
+  return Array.from(new Uint8Array(digest), (value) =>
+    value.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+/**
+ * Stages and verifies an attachment without importing it into the knowledge
+ * base. Only the completion response may be sent in a conversation message.
+ */
+export async function uploadAgentAttachment(
+  tenantId: string,
+  projectId: string,
+  file: File,
+  options: AgentAttachmentUploadOptions,
+): Promise<AgentAttachmentReference> {
+  let sessionId = options.sessionId;
+  if (!sessionId) {
+    options.onProgress?.("creating_session");
+    const session = await apiFetch<AgentAttachmentUploadSession>(
+      "/agent/attachments/upload-sessions",
+      {
+        ...scopedOptions(tenantId, projectId),
+        method: "POST",
+        body: {
+          filename: file.name,
+          declared_media_type: attachmentMediaType(file),
+          expected_size: file.size,
+          expected_sha256: await fileSha256(file),
+        },
+        idempotencyKey: options.createKey,
+      },
+    );
+    sessionId = session.upload_session_id;
+  }
+  if (!options.contentUploaded) {
+    options.onProgress?.("uploading", sessionId);
+    await apiFetch<AgentAttachmentUploadSession>(
+      `/agent/attachments/upload-sessions/${encodeURIComponent(sessionId)}/content`,
+      {
+        ...scopedOptions(tenantId, projectId),
+        method: "PUT",
+        rawBody: file,
+        idempotency: "omit",
+        headers: { "Content-Type": "application/octet-stream" },
+      },
+    );
+  }
+  options.onProgress?.("completing", sessionId);
+  const reference = await apiFetch<AgentAttachmentReference>(
+    `/agent/attachments/upload-sessions/${encodeURIComponent(sessionId)}/complete`,
+    {
+      ...scopedOptions(tenantId, projectId),
+      method: "POST",
+      body: {},
+      idempotencyKey: options.completeKey,
+    },
+  );
+  options.onProgress?.("uploaded", sessionId);
+  return reference;
 }
 
 export function listAgentConversations(
