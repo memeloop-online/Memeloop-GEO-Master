@@ -131,6 +131,8 @@ pub use report::{
 };
 mod measurement_report;
 pub use measurement_report::*;
+mod measurement_report_search;
+pub use measurement_report_search::*;
 pub use tenancy::{OperatorId, ProjectId, TenantId, TenantScope, TenantScopeId};
 mod project_ai_settings;
 pub use project_ai_settings::*;

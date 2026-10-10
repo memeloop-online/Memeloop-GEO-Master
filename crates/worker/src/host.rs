@@ -378,6 +378,10 @@ fn validate_recorded_return(
                         response.omitted_sample_details,
                         response.preview.coverage.planned,
                     )
+                    && search_report_projection_safe(
+                        response.preview.search.as_ref(),
+                        response.omitted_search_sample_details,
+                    )
                     && report_window_matches(
                         requested.window.as_ref(),
                         response.preview.report_window_start_at,
@@ -417,6 +421,10 @@ fn validate_recorded_return(
                         &report.samples,
                         projection.omitted_sample_details,
                         report.coverage.planned,
+                    )
+                    && search_report_projection_safe(
+                        report.search.as_ref(),
+                        projection.omitted_search_sample_details,
                     )
                     && report_window_matches(
                         window.as_ref(),
@@ -3048,6 +3056,8 @@ pub struct MeasurementPeriodReportProjection {
     #[serde(flatten)]
     pub report: geo_domain::MeasurementPeriodReport,
     pub omitted_sample_details: usize,
+    #[serde(default)]
+    pub omitted_search_sample_details: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3055,6 +3065,8 @@ pub struct MeasurementPeriodPreviewProjection {
     #[serde(flatten)]
     pub preview: geo_domain::MeasurementPeriodPreview,
     pub omitted_sample_details: usize,
+    #[serde(default)]
+    pub omitted_search_sample_details: usize,
 }
 
 fn report_sample_allowed(sample: &geo_domain::MeasurementPeriodSample) -> bool {
@@ -3071,6 +3083,35 @@ fn report_projection_safe(
 ) -> bool {
     samples.iter().all(report_sample_allowed)
         && (samples.len() as u64).checked_add(omitted as u64) == Some(planned)
+}
+
+fn search_report_sample_allowed(sample: &geo_domain::MeasurementPeriodSearchSample) -> bool {
+    sample
+        .cohort
+        .question_binding
+        .as_ref()
+        .is_none_or(|binding| binding.purpose == geo_domain::QuestionPurpose::Optimization)
+}
+
+fn search_report_projection_safe(
+    search: Option<&geo_domain::MeasurementPeriodSearchSection>,
+    omitted: usize,
+) -> bool {
+    search.map_or(omitted == 0, |section| {
+        section.samples.iter().all(search_report_sample_allowed)
+            && (section.samples.len() as u64).checked_add(omitted as u64)
+                == Some(section.coverage.planned)
+    })
+}
+
+fn project_search_samples(
+    search: &mut Option<geo_domain::MeasurementPeriodSearchSection>,
+) -> usize {
+    search.as_mut().map_or(0, |section| {
+        let count = section.samples.len();
+        section.samples.retain(search_report_sample_allowed);
+        count - section.samples.len()
+    })
 }
 
 fn report_window_matches(
@@ -3093,6 +3134,7 @@ impl From<geo_domain::MeasurementPeriodReport> for MeasurementPeriodReportProjec
         report.samples.retain(report_sample_allowed);
         Self {
             omitted_sample_details: count - report.samples.len(),
+            omitted_search_sample_details: project_search_samples(&mut report.search),
             report,
         }
     }
@@ -3104,6 +3146,7 @@ impl From<geo_domain::MeasurementPeriodPreview> for MeasurementPeriodPreviewProj
         preview.samples.retain(report_sample_allowed);
         Self {
             omitted_sample_details: count - preview.samples.len(),
+            omitted_search_sample_details: project_search_samples(&mut preview.search),
             preview,
         }
     }
@@ -4253,6 +4296,7 @@ mod tests {
             ("cycle_id", serde_json::json!(Uuid::new_v4())),
             ("project_id", serde_json::json!(Uuid::new_v4())),
             ("omitted_sample_details", serde_json::json!(1)),
+            ("omitted_search_sample_details", serde_json::json!(1)),
         ] {
             let mut forged = response.clone();
             forged[field] = value;
@@ -4268,6 +4312,69 @@ mod tests {
                 &response
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn period_search_projection_rejects_heldout_rows_and_forged_omission_counts() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let now = Utc::now();
+        let at = now - chrono::Duration::hours(1);
+        let window = geo_domain::MeasurementPeriodWindow {
+            start_at: now - chrono::Duration::days(1),
+            end_at: now,
+            report_timezone: "UTC".into(),
+        };
+        let sample: geo_domain::MeasurementPeriodSearchSample = serde_json::from_value(serde_json::json!({
+            "cohort": {
+                "measurement_id": Uuid::new_v4(), "source_key": "synthetic",
+                "query": "heldout-search-canary",
+                "protocol": {
+                    "query":"heldout-search-canary", "engine":"google", "surface":"third_party_api",
+                    "source":"synthetic", "source_location_code":"2840", "country":"US", "city":null,
+                    "language":"en", "device":"desktop", "operating_system":"windows", "requested_depth":10,
+                    "max_pages":1, "priority":1, "login":"unspecified", "personalization":"unspecified",
+                    "protocol_version":geo_domain::SERP_PROTOCOL_VERSION, "connector_version":"synthetic.v1"
+                },
+                "target":null, "target_rule_version":geo_domain::SERP_TARGET_RULE_VERSION,
+                "question_binding":{
+                    "reference":{"question_set_id":Uuid::new_v4(),"question_set_version_id":Uuid::new_v4(),
+                        "question_id":Uuid::new_v4(),"question_revision_id":Uuid::new_v4()},
+                    "purpose":"frozen_evaluation","split_policy_version":"synthetic.v1"
+                },
+                "scheduled_at":at,"created_at":at,"stored_at":at
+            },
+            "evidence":null
+        })).unwrap();
+        let preview = geo_domain::preview_measurement_period_with_search(
+            &scope,
+            &window,
+            vec![],
+            Some(vec![sample.clone()]),
+            now,
+        )
+        .unwrap();
+        let response = serde_json::to_value(ReportPreviewResult::MeasurementPeriod(Box::new(
+            preview.into(),
+        )))
+        .unwrap();
+        assert!(!response.to_string().contains("heldout-search-canary"));
+        assert_eq!(response["search"]["coverage"]["planned"], 1);
+        assert_eq!(response["omitted_search_sample_details"], 1);
+        let request = serde_json::json!({"kind":"measurement_period","window":window});
+        validate_recorded_return(HostOp::ReportPreview, &scope, &request, &response).unwrap();
+        let mut forged = response.clone();
+        forged["omitted_search_sample_details"] = serde_json::json!(0);
+        assert!(
+            validate_recorded_return(HostOp::ReportPreview, &scope, &request, &forged).is_err()
+        );
+        forged["search"]["samples"] = serde_json::json!([sample]);
+        assert!(
+            validate_recorded_return(HostOp::ReportPreview, &scope, &request, &forged).is_err()
         );
     }
 

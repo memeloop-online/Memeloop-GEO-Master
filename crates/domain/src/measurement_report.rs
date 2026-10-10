@@ -9,7 +9,10 @@ use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{AppError, EffectiveObservation, FrozenQuestionBinding, ProjectId, TenantScope};
+use crate::{
+    AppError, EffectiveObservation, FrozenQuestionBinding, MeasurementPeriodSearchSample,
+    MeasurementPeriodSearchSection, ProjectId, TenantScope,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct MeasurementPeriodWindow {
@@ -81,6 +84,8 @@ pub struct MeasurementPeriodPreview {
     pub input_hash: String,
     pub coverage: MeasurementPeriodCoverage,
     pub samples: Vec<MeasurementPeriodSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<MeasurementPeriodSearchSection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -98,6 +103,8 @@ pub struct MeasurementPeriodReport {
     pub input_hash: String,
     pub coverage: MeasurementPeriodCoverage,
     pub samples: Vec<MeasurementPeriodSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<MeasurementPeriodSearchSection>,
 }
 
 impl MeasurementPeriodReport {
@@ -113,7 +120,17 @@ impl MeasurementPeriodReport {
 pub fn preview_measurement_period(
     scope: &TenantScope,
     window: &MeasurementPeriodWindow,
+    samples: Vec<MeasurementPeriodSample>,
+    now: DateTime<Utc>,
+) -> Result<MeasurementPeriodPreview, AppError> {
+    preview_measurement_period_with_search(scope, window, samples, None, now)
+}
+
+pub fn preview_measurement_period_with_search(
+    scope: &TenantScope,
+    window: &MeasurementPeriodWindow,
     mut samples: Vec<MeasurementPeriodSample>,
+    search_samples: Option<Vec<MeasurementPeriodSearchSample>>,
     now: DateTime<Utc>,
 ) -> Result<MeasurementPeriodPreview, AppError> {
     let project_id = scope
@@ -182,8 +199,19 @@ pub fn preview_measurement_period(
                 .is_some_and(|observation| observation.provenance.is_some()),
         );
     }
-    let bytes = serde_json::to_vec(&(window, &samples))
-        .map_err(|_| AppError::invalid_request("measurement report cannot be serialized"))?;
+    let search = search_samples
+        .map(|samples| {
+            crate::measurement_report_search::measurement_period_search_section(
+                samples, window, now,
+            )
+        })
+        .transpose()?;
+    // Preserve legacy AI-only hashes. An included empty search section is distinct.
+    let bytes = match &search {
+        Some(search) => serde_json::to_vec(&(window, &samples, search)),
+        None => serde_json::to_vec(&(window, &samples)),
+    }
+    .map_err(|_| AppError::invalid_request("measurement report cannot be serialized"))?;
     Ok(MeasurementPeriodPreview {
         kind: MeasurementPeriodPreviewKind::MeasurementPeriodPreview,
         project_id,
@@ -195,6 +223,7 @@ pub fn preview_measurement_period(
         input_hash: hex::encode(Sha256::digest(bytes)),
         coverage,
         samples,
+        search,
     })
 }
 
@@ -242,6 +271,7 @@ pub fn freeze_measurement_period(
         input_hash: preview.input_hash,
         coverage: preview.coverage,
         samples: preview.samples,
+        search: preview.search,
     })
 }
 
@@ -267,6 +297,19 @@ pub fn validate_measurement_period_correction(
         || parent.revision + 1 != proposed.revision
         || parent.evidence_as_of > proposed.evidence_as_of
         || parent.samples.len() != proposed.samples.len()
+        || match (&parent.search, &proposed.search) {
+            (None, None) => false,
+            (Some(before), Some(after)) => {
+                before.schema_version != after.schema_version
+                    || before.samples.len() != after.samples.len()
+                    || before
+                        .samples
+                        .iter()
+                        .zip(&after.samples)
+                        .any(|(before, after)| before.cohort != after.cohort)
+            }
+            _ => true,
+        }
         || parent
             .samples
             .iter()

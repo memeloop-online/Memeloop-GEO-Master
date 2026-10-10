@@ -4,7 +4,7 @@
 
 ## 当前状态（2026-10-10）
 
-- 当前 API `46b8cbc`、Web `70dcc0e`、执行器 `99dd02f` 均 Ready、零重启，v19 bundle 已核对，账号会话与持久卷保留。PR #6 HEAD 为 `06d7388`，Linux／Windows CI 均失败于同一 InvalidProvenance 陈旧断言。单文件回归修正已完成：派发后顶层畸形枚举使完整回执被拒绝，应为 Unknown、保留租约、无证据且不重发；Windows 本地测量执行 9/9、调度 6/6 及格式／差异检查通过，不回退生产逻辑。修正提交的精确 HEAD CI 仍待确认。
+- 当前 API `46b8cbc`、Web `70dcc0e`、执行器 `99dd02f` 均 Ready、零重启，v19 bundle 已核对，账号会话与持久卷保留。PR #6 修正 HEAD `049d06f` 已推送，interactive 通过，其余精确 HEAD 检查待确认。双平台 InvalidProvenance 旧断言已修，Windows 本地执行 9/9、调度 6/6 通过；保留派发后 Unknown、租约及不重发语义，不回退生产逻辑。
 - 实际项目设置 `/settings?tab=ai` 已可见，工作台和解析默认模型均读回 `gpt-6.1-sol`，此前实际已保存配置的连接测试成功。超时 unknown 回执的来源筛选修复已在真实页面确认，已存原文现可发现；自定义密钥保存/轮换、新实时解析回调和最新预算仍须真实验收。入口见 [`project-ai-settings.md`](project-ai-settings.md)。
 - 已核对部署启用 `GEO_SCOPED_TEST_AI=true`，注入默认 `gpt-6.1-sol`，不能以生产路由数量为零解释此次超时。使用对应凭据的只读模型列表仅确认匹配 `gpt-6.1-sol`，未返回 luna；不外推其他凭据或模型的普遍可用性。60 秒重解析超时仍未解决，未追加请求。
 - 已存原文重分析及信源真实页面、答案／引用与刷新持久读回已通过，原测量 unknown 和旧失败版本保持不变。随后在 `350bc23` 实际页面完成无周期独立报告预览、保存、整页刷新与同版本再次读取，未新增外部问题或创建周期。这不证明旧失败根因，也不代表新实时采样、P00 同报告调用或共同搜索报告已验收。入口见 [`saved-observation-analysis.md`](saved-observation-analysis.md)。
@@ -13,7 +13,7 @@
 - 多供应商身份入口已上线，但三家新增渠道尚无真实账号验收或完整联网适配。独立 SSE 采集模块已通过真实 Chromium／本地回环 CDP 一次流式采集，未据此开放或宣称测量能力。全部已跟踪执行器测试 246/246 通过、零跳过；合成测试不替代真实供应商验收。每次真实采样前仍须完整验证账号、供应商身份、模型、会话与权限／租约。
 - 快速完成原始流的有界读回 `e1ba43d` 已包含在 PR #6；11/11、相关 58/58、真实 Chrome 两种路径及审查通过，不等于真实供应商支持。账号文案 `70dcc0e` 的 50/50 及审查通过，已部署。
 - 桌面 registry 缓存后继构建已验证 apt 层实际命中，未出现缺失 blob 或 apt 回退；npm 步骤仍执行，不能宣称全部层缓存命中。API/Web 已按输入分别构建。富文本编辑桥 CI 成功，但未启用外部发布能力，也无实际发布证明。
-- 搜索数据源设置、P00 v19/48 项及来源纠偏已部署；报告展示和 `received_at` 已实际读回。共同报告尚未提交／上线：既有 PostgreSQL 实库 1/1、UI 457/457、API 7 项、worker 2 项等验证保留；领域时钟修复已完成，新增定向 8/8 通过，领域全量通过发生在该增量之前，不当作增量后复验。旧 `SerpObservation::validate_source` 跨时钟风险另列待办，不与已完成的领域修复混同。
+- 搜索数据源设置、P00 v19/48 项及来源纠偏已部署；报告展示和 `received_at` 已实际读回。共同报告已具备提交条件，尚未提交／部署：领域时钟增量后全量 130 项单元及全部集成（含八项定向）通过；PostgreSQL 实库 1/1、UI 457/457、API 7 项、worker 2 项等证据保留。最终 Astra 第二轮源码审查及 PostgreSQL 窄范围时钟互审无阻断，不代表运行或部署验收。旧 `SerpObservation::validate_source` 入口跨时钟风险独立跟进；解析诊断实现亦属另一增量。
 
 历史部署、失败修复和逐批验证只查 [`WORKLOG.md`](WORKLOG.md)，不将旧批次“待提交/待部署”视为当前状态。完整未完成范围和验收门槛见 [`TODO.md`](TODO.md)；产品基线保持不变。
 
@@ -21,7 +21,7 @@
 
 未验证的输入法实验继续保留在工作区，不得误提交或视为已完成。实际域名、凭据及运维配置只从受控部署配置读取，不写入公开交接文档。
 
-- [PR #6](https://github.com/memeloop-online/Memeloop-GEO-Master/pull/6) HEAD `06d7388` 已完成获批 Astra 两轮审查，第二轮无阻断，不再开启第三轮；待当前 CI 回归修正及检查通过后合并。工作分支现为 `feat/search-period-reports`，保留未提交共同报告及受保护输入法实验。旧 #1–#5 和分支须核实已全量合并再收敛，不提前关闭／删除。
+- [PR #6](https://github.com/memeloop-online/Memeloop-GEO-Master/pull/6) 当前 HEAD `049d06f`；获批 Astra 两轮审查已完成，第二轮无阻断，不开启第三轮，待精确 HEAD 检查通过后合并。工作分支为 `feat/search-period-reports`，保留待提交共同报告及受保护输入法实验；旧 #1–#5 和分支须核实已全量合并再收敛。
 - Windows 开发复用 CI 的预编译 V8 静态库，恢复和校验方法见 [README](../README.md)，不需要重新编译 V8 源码。
 - P00 当前源码及已部署 API 均为 `geo.hostops.v19`，48 项工具；包含独立窗口报告及搜索创建／读取／已存响应重解析，bundle 与实际摘要已核对匹配。独立报告和搜索接口边界见 [`measurement-period-and-search.md`](measurement-period-and-search.md)。媒体工具、正文版本定点查询与缩略图增量已有前批验证，详细证据见 [`WORKLOG.md`](WORKLOG.md)，媒体接口边界见 [`p00-content-media-tools.md`](p00-content-media-tools.md)。完整历史列表和写事务仍保留原聚合路径，不能据此宣称整体容量验收通过。
 

@@ -2,6 +2,24 @@ import i18n from "./index";
 
 const translations = {
   "zh-CN": {
+    aiTitle: "AI 回答测量",
+    searchTitle: "传统搜索",
+    searchNotIncluded: "此报告未纳入传统搜索数据。",
+    searchPlanned: "计划搜索 {{count}} 项",
+    searchEmpty: "这个时间范围暂无搜索样本。",
+    searchNoEvidence: "截至报告时间暂无可用搜索证据",
+    searchSource: "搜索来源：{{source}}",
+    searchTarget: "关注目标：{{target}}",
+    searchRecord: "查看搜索记录",
+    searchProviderTime: "供应方观测时间：{{time}}",
+    searchReceiptTime: "结果接收时间：{{time}}（供应方观测时间不可用）",
+    searchTargetHit: "目标自然排名：{{ranks}}",
+    searchTargetNotFound: "在已覆盖的前 {{depth}} 项自然结果中未找到目标。",
+    searchTargetUndetermined: "尚不能确认目标是否出现。",
+    searchRank: "自然排名 {{rank}}",
+    searchResult: "搜索结果",
+    searchLimitation: "部分搜索条件尚未确认，详见搜索记录。",
+    searchDetails: "搜索条件与证据详情",
     pageTitle: "测量与效果报告",
     pageDescription: "查看话题测量、已存回答分析与周期报告。",
     title: "话题测量报告",
@@ -47,6 +65,29 @@ const translations = {
     scopeError: "此报告不属于当前项目，请重新打开。",
   },
   en: {
+    aiTitle: "AI answer measurements",
+    searchTitle: "Traditional search",
+    searchNotIncluded:
+      "Traditional search data is not included in this report.",
+    searchPlanned: "{{count}} planned searches",
+    searchEmpty: "No search samples in this period.",
+    searchNoEvidence: "No eligible search evidence as of this report",
+    searchSource: "Search source: {{source}}",
+    searchTarget: "Target: {{target}}",
+    searchRecord: "View search record",
+    searchProviderTime: "Provider observation time: {{time}}",
+    searchReceiptTime:
+      "Result received: {{time}} (provider observation time unavailable)",
+    searchTargetHit: "Target organic ranks: {{ranks}}",
+    searchTargetNotFound:
+      "Target not found within the first {{depth}} covered organic results.",
+    searchTargetUndetermined:
+      "Whether the target appears is not yet confirmed.",
+    searchRank: "Organic rank {{rank}}",
+    searchResult: "Search result",
+    searchLimitation:
+      "Some search conditions remain unconfirmed. See the search record.",
+    searchDetails: "Search conditions and evidence details",
     pageTitle: "Measurement and performance reports",
     pageDescription:
       "Review topic measurements, saved-response analyses and cycle reports.",

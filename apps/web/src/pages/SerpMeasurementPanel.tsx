@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Button,
   Card,
@@ -9,7 +9,7 @@ import {
 } from "@fluentui/react-components";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 import { createIdempotencyKey } from "../api/client";
 import * as api from "../api/serp";
@@ -62,8 +62,17 @@ function Panel({
   const [mode, setMode] = useState<"none" | "host" | "url">("none");
   const [targetText, setTargetText] = useState("");
   const [subdomains, setSubdomains] = useState(true);
-  const [selected, setSelected] = useState<string>();
+  const [params, setParams] = useSearchParams();
+  const selected = params.get("searchRecord") || undefined;
+  const setSelected = (id?: string) =>
+    setParams((previous) => {
+      const next = new URLSearchParams(previous);
+      if (id) next.set("searchRecord", id);
+      else next.delete("searchRecord");
+      return next;
+    });
   const [rawId, setRawId] = useState<string>();
+  useEffect(() => setRawId(undefined), [selected]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<
     "createError" | "invalidTarget" | "cancelError"

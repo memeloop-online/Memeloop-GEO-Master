@@ -924,6 +924,33 @@ impl SerpRawEvidence {
 /// and the documented transactional fences. No method authorizes a blind retry.
 #[async_trait]
 pub trait SerpRepository: Send + Sync {
+    /// Metadata-only report cohort, UUID ASC, limit 1..=100. Enforce full scope,
+    /// scheduled [start,end), and created/stored <= evidence_as_of.
+    async fn list_report_measurements(
+        &self,
+        scope: &TenantScope,
+        window: &crate::MeasurementPeriodWindow,
+        evidence_as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::MeasurementPeriodSearchIdentity>, AppError>;
+    /// Fixed correction cohort, UUID ASC, at most 100 IDs. Missing IDs are omitted.
+    async fn get_report_measurements(
+        &self,
+        scope: &TenantScope,
+        measurement_ids: &[Uuid],
+    ) -> Result<Vec<crate::MeasurementPeriodSearchIdentity>, AppError>;
+    /// Metadata-only joined observations, observation UUID ASC, limit 1..=100,
+    /// at most 100 measurement IDs. Both raw and observation repository storage
+    /// clocks must be <= evidence_as_of. Never load raw response bodies.
+    async fn list_report_observations(
+        &self,
+        scope: &TenantScope,
+        measurement_ids: &[Uuid],
+        evidence_as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::SerpReportObservation>, AppError>;
     /// Current durable identity for restart recovery. Never reconstruct an
     /// attempt/token from client input or mint a new submission authorization.
     async fn get_execution(

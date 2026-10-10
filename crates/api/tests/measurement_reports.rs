@@ -22,6 +22,316 @@ use serde_json::json;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+fn search_measurement(at: DateTime<Utc>, ordinal: usize) -> geo_domain::SerpMeasurement {
+    use geo_domain::*;
+    SerpMeasurement {
+        measurement_id: Uuid::new_v4(),
+        source_key: "synthetic-unconfigured".into(),
+        protocol: SerpProtocol {
+            query: format!("exact synthetic search {ordinal}"),
+            engine: SerpEngine::Google,
+            surface: SerpSurface::ThirdPartyApi,
+            source: "synthetic".into(),
+            source_location_code: "2840".into(),
+            country: "US".into(),
+            city: None,
+            language: "en".into(),
+            device: SerpDevice::Desktop,
+            operating_system: "windows".into(),
+            requested_depth: 10,
+            max_pages: 1,
+            priority: 1,
+            login: "unspecified".into(),
+            personalization: "unspecified".into(),
+            protocol_version: SERP_PROTOCOL_VERSION.into(),
+            connector_version: "synthetic.v1".into(),
+        },
+        target: None,
+        target_rule_version: SERP_TARGET_RULE_VERSION.into(),
+        question_binding: None,
+        scheduled_at: at,
+        created_at: at,
+        state: SerpTaskState::Queued,
+    }
+}
+
+async fn search_versions(
+    repository: &dyn geo_domain::SerpRepository,
+    scope: &TenantScope,
+    id: Uuid,
+) -> Uuid {
+    use geo_domain::*;
+    let now = Utc::now();
+    let claim = repository
+        .claim(scope, id, now, now + Duration::minutes(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let intent = repository
+        .begin_send(
+            scope,
+            &claim,
+            &sha256_hex(b"synthetic-request"),
+            "synthetic-report-tag",
+            None,
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let body = b"synthetic persisted search response".to_vec();
+    let submission = SerpRawEvidence {
+        evidence_id: Uuid::new_v4(),
+        measurement_id: id,
+        attempt_id: intent.attempt_id,
+        operation: SerpEvidenceOperation::Submission,
+        provider_task_id: None,
+        request_sha256: intent.request_sha256.clone(),
+        intent_request_sha256: intent.request_sha256.clone(),
+        response_sha256: sha256_hex(&body),
+        body,
+        body_complete: true,
+        http_status: Some(200),
+        send_certainty: SerpSendCertainty::ResponseReceived,
+        captured_at: Utc::now(),
+    };
+    repository
+        .append_raw(scope, &intent, submission.clone())
+        .await
+        .unwrap();
+    repository
+        .bind_provider_task(
+            scope,
+            &intent,
+            SerpProviderTask {
+                measurement_id: id,
+                attempt_id: intent.attempt_id,
+                binding_evidence_id: submission.evidence_id,
+                provider_task_id: "synthetic-task".into(),
+                correlation_tag: intent.correlation_tag.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let raw = repository
+        .append_raw(
+            scope,
+            &intent,
+            SerpRawEvidence {
+                evidence_id: Uuid::new_v4(),
+                operation: SerpEvidenceOperation::ResultRead,
+                provider_task_id: Some("synthetic-task".into()),
+                captured_at: Utc::now(),
+                request_sha256: sha256_hex(b"synthetic-read"),
+                ..submission
+            },
+        )
+        .await
+        .unwrap();
+    let mut useful = Uuid::nil();
+    // More than one observation page; later failed interpretations must not
+    // erase the persisted useful partial response.
+    for index in 0..101 {
+        let observation_id = Uuid::new_v4();
+        if index == 0 {
+            useful = observation_id;
+        }
+        repository
+            .append_observation(
+                scope,
+                SerpObservation {
+                    observation_id,
+                    measurement_id: id,
+                    attempt_id: intent.attempt_id,
+                    raw_evidence_id: raw.evidence.evidence_id,
+                    raw_sha256: raw.evidence.response_sha256.clone(),
+                    parser_version: format!("synthetic.v{index}"),
+                    provider_observed_at: None,
+                    received_at: raw.evidence.captured_at,
+                    analyzed_at: Utc::now().max(raw.stored_at),
+                    status: if index == 0 {
+                        SerpObservationStatus::Partial
+                    } else {
+                        SerpObservationStatus::Failed
+                    },
+                    actual_conditions: SerpActualConditions::default(),
+                    coverage: SerpCoverage {
+                        requested_depth: 10,
+                        observed_organic_depth: 0,
+                        pages_received: 1,
+                        completion: SerpCoverageCompletion::Partial,
+                        truncated: true,
+                        exhaustion_evidence_locator: None,
+                    },
+                    results: vec![],
+                    source_limitations: vec![SerpLimitationCode::ResultUnavailable],
+                },
+            )
+            .await
+            .unwrap();
+    }
+    useful
+}
+
+#[tokio::test]
+async fn search_report_reads_unconfigured_persisted_pages_and_freezes_correction_cohort() {
+    use geo_domain::{MeasurementPeriodSearchStatus, SearchEvidenceTimeBasis, SerpRepository};
+    let without_search = AppState::development_with_password("synthetic-report-search");
+    let scope = project(&without_search).await;
+    let repository = Arc::new(geo_persistence::MemorySerpRepository::default());
+    let state = without_search
+        .clone()
+        .with_serp_service(geo_api::SerpService::new(
+            repository.clone(),
+            without_search.project_repository(),
+            without_search.question_repository(),
+        ));
+    let at = Utc::now() - Duration::hours(1);
+    plan(&state, &scope, at).await;
+    let mut ids = Vec::new();
+    for ordinal in 0..101 {
+        let measurement = search_measurement(at, ordinal);
+        ids.push(measurement.measurement_id);
+        repository
+            .accept(&scope, &format!("search-{ordinal}"), measurement)
+            .await
+            .unwrap();
+    }
+    let now = Utc::now() + Duration::seconds(1);
+    let request = MeasurementPeriodRequest {
+        start_at: at - Duration::hours(1),
+        end_at: now + Duration::minutes(1),
+        report_timezone: "UTC".into(),
+        correction_of: None,
+    };
+    // Explicit window ends after the evidence insertion below, but never after
+    // the caller's current time used by report validation.
+    let report_now = request.end_at;
+    let first = save_project_measurement_report(&state, &scope, request.clone(), report_now)
+        .await
+        .unwrap();
+    assert_eq!(first.coverage.planned, 1);
+    let search = first.search.as_ref().unwrap();
+    assert_eq!(search.coverage.planned, 101);
+    assert_eq!(
+        search.coverage.counts[&MeasurementPeriodSearchStatus::NoEligibleObservation],
+        101
+    );
+    let useful = search_versions(repository.as_ref(), &scope, ids[0]).await;
+    repository
+        .accept(&scope, "new-after-freeze", search_measurement(at, 102))
+        .await
+        .unwrap();
+    // Stored replay remains available even when the search service is absent.
+    assert_eq!(
+        save_project_measurement_report(&without_search, &scope, request.clone(), report_now)
+            .await
+            .unwrap(),
+        first
+    );
+    let correction_request = MeasurementPeriodRequest {
+        correction_of: Some(first.report_id),
+        ..request.clone()
+    };
+    assert!(
+        save_project_measurement_report(
+            &without_search,
+            &scope,
+            correction_request.clone(),
+            report_now
+        )
+        .await
+        .is_err()
+    );
+    let correction =
+        save_project_measurement_report(&state, &scope, correction_request.clone(), report_now)
+            .await
+            .unwrap();
+    assert_eq!(correction.coverage.planned, 1);
+    let search = correction.search.as_ref().unwrap();
+    assert_eq!(search.coverage.planned, 101);
+    assert_eq!(
+        search.coverage.counts[&MeasurementPeriodSearchStatus::Partial],
+        1
+    );
+    let evidence = search
+        .samples
+        .iter()
+        .find(|sample| sample.cohort.measurement_id == ids[0])
+        .unwrap()
+        .evidence
+        .as_ref()
+        .unwrap();
+    assert_eq!(evidence.observation.observation_id, useful);
+    assert_eq!(
+        evidence.evidence_time_basis,
+        SearchEvidenceTimeBasis::ReceivedAt
+    );
+    assert_eq!(
+        save_project_measurement_report(&without_search, &scope, correction_request, report_now)
+            .await
+            .unwrap(),
+        correction
+    );
+    let fresh = preview_project_measurements(&state, &scope, Some(first.window()), report_now)
+        .await
+        .unwrap();
+    assert_eq!(fresh.search.unwrap().coverage.planned, 102);
+    assert_eq!(
+        state
+            .report_repository()
+            .get_measurement_period(&scope, first.report_id)
+            .await
+            .unwrap(),
+        first
+    );
+}
+
+#[tokio::test]
+async fn legacy_report_correction_keeps_search_unavailable_after_service_is_added() {
+    use geo_domain::SerpRepository;
+    let state = AppState::development_with_password("synthetic-legacy-report");
+    let scope = project(&state).await;
+    let now = Utc::now();
+    let request = MeasurementPeriodRequest {
+        start_at: now - Duration::days(1),
+        end_at: now,
+        report_timezone: "UTC".into(),
+        correction_of: None,
+    };
+    let first = save_project_measurement_report(&state, &scope, request.clone(), now)
+        .await
+        .unwrap();
+    assert!(first.search.is_none());
+    let repository = Arc::new(geo_persistence::MemorySerpRepository::default());
+    repository
+        .accept(
+            &scope,
+            "new",
+            search_measurement(now - Duration::hours(1), 0),
+        )
+        .await
+        .unwrap();
+    let service = geo_api::SerpService::new(
+        repository,
+        state.project_repository(),
+        state.question_repository(),
+    );
+    let state = state.with_serp_service(service);
+    let correction = save_project_measurement_report(
+        &state,
+        &scope,
+        MeasurementPeriodRequest {
+            correction_of: Some(first.report_id),
+            ..request
+        },
+        now + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert!(correction.search.is_none());
+}
+
 async fn project(state: &AppState) -> TenantScope {
     let tenant = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
     let project = state

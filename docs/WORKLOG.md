@@ -1,5 +1,11 @@
 # 工作日志
 
+## 2026-10-10：共同报告最终源码复核与时钟增量全量验证
+
+- 共同报告领域时钟增量后，130 项单元及全部集成测试（含八项定向）通过；既有 API、worker、UI 与实库验证范围不变。最终独立 Astra 第二轮源码审查无阻断，PostgreSQL 窄范围时钟互审无阻断；审查仅覆盖源码，不代表实际运行或部署验收。
+- 功能已具备提交条件，尚未提交／部署，当前分支 `feat/search-period-reports`；旧 `SerpObservation::validate_source` 入口时钟风险和解析诊断实现分别跟进，不混入本次完成声明。
+- PR #6 修正 HEAD `049d06f` 已推送，interactive 通过，其余精确 HEAD 检查待确认；既有两轮审查完成，不增加第三轮。
+
 ## 2026-10-10：两轮审查完成与当前回归边界
 
 - PR #6 HEAD `06d7388` 已完成获批 Astra 两轮审查，第二轮无阻断，不开启第三轮。Linux／Windows CI 均确认失败于同一 `measurement_execution` InvalidProvenance 旧断言。单文件回归修正已完成：顶层畸形枚举拒绝完整回执，派发后应为 Unknown，保留租约、无证据且不重发；Windows 本地执行 9/9、调度 6/6、格式及差异检查通过，生产逻辑未回退。修正提交的精确 HEAD CI 待确认。工作分支为 `feat/search-period-reports`，未提交共同报告及受保护输入法实验保留。

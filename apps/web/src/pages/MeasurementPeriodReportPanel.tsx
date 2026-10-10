@@ -14,6 +14,7 @@ import { ReportSupplementaryMeasurements } from "./ReportSupplementaryMeasuremen
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import "../i18n/measurementReports";
 import { reportMeasurementTitle } from "./reportMeasurementTitle";
+import { MeasurementReportSearchSection } from "./MeasurementReportSearchSection";
 
 const knownStatuses = new Set([
   "pending",
@@ -153,6 +154,7 @@ export function MeasurementPeriodReportPanel({
               · {report.report_timezone}
             </p>
             <p>{t("asOf", { time: at(report.evidence_as_of) })}</p>
+            <h3>{t("aiTitle")}</h3>
             <p>
               {t("planned", { count: report.coverage.planned })} ·{" "}
               {t("live", { count: report.coverage.observed_live })} ·{" "}
@@ -264,6 +266,12 @@ export function MeasurementPeriodReportPanel({
                 )}
               </Card>
             ))}
+            <MeasurementReportSearchSection
+              search={report.search}
+              tenantId={tenantId}
+              projectId={projectId}
+              at={at}
+            />
           </>
         )
       )}
