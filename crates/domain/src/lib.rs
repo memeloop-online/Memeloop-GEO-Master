@@ -56,6 +56,8 @@ mod observation_analysis;
 pub use observation_analysis::*;
 mod provider_conversation_cleanup;
 pub use provider_conversation_cleanup::*;
+mod provider_conversation_lifecycle;
+pub use provider_conversation_lifecycle::provider_conversation_cleanup_supported;
 mod operation;
 mod project;
 mod publication_lookup;
