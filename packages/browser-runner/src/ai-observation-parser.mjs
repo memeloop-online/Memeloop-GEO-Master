@@ -309,8 +309,18 @@ async function boundedRoute(invoke, { signal, deadlineAt, timeoutMs }) {
     stop({ timedOut: true, timeoutCode: timeoutCode() });
   };
   signal?.addEventListener("abort", abort, { once: true });
+  const onTimeout = () => {
+    // Timers can wake before the high-resolution deadline. Keep the original
+    // budget and wait out the remainder rather than aborting/misclassifying it.
+    const remaining = routeDeadline - performance.now();
+    if (remaining > 0) {
+      timer = setTimeout(onTimeout, Math.max(1, Math.ceil(remaining)));
+      return;
+    }
+    abort();
+  };
   timer = setTimeout(
-    abort,
+    onTimeout,
     Math.max(1, Math.ceil(routeDeadline - performance.now())),
   );
   try {
