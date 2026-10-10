@@ -222,6 +222,7 @@ test("authenticated capabilities describe the running adapters without verificat
           platform: "fixture",
           placement_slot: "primary",
           connector_version: "fixture.v1",
+          model_discovery_supported: true,
           operations: ["publish", "measure", "lookup"],
           verified: false,
         },

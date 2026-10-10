@@ -671,6 +671,8 @@ pub struct RunnerConnector {
     pub login_entry_available: Option<bool>,
     #[serde(default)]
     pub login_supported: Option<bool>,
+    #[serde(default)]
+    pub model_discovery_supported: bool,
     // Explicitly never use a self-reported verification claim to authorize
     // publishing; independent publication/readback history is the authority.
     #[allow(dead_code)]

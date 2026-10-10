@@ -2664,6 +2664,7 @@ mod tests {
             operations: vec!["publish".into()],
             login_entry_available: None,
             login_supported: None,
+            model_discovery_supported: false,
             verified: true,
         };
         assert!(!rich_runner_operation_available(
