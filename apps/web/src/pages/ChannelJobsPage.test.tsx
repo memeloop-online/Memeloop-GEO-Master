@@ -34,7 +34,10 @@ const automaticTarget: ChannelTarget = {
   },
 };
 
-async function renderAutomaticResult(overrides: Partial<ChannelOutcome> = {}) {
+async function renderAutomaticResult(
+  overrides: Partial<ChannelOutcome> = {},
+  automatic = true,
+) {
   mockApi();
   const result = render(
     <QueryClientProvider
@@ -49,7 +52,7 @@ async function renderAutomaticResult(overrides: Partial<ChannelOutcome> = {}) {
               target={automaticTarget}
               tenantId="tenant-1"
               projectId="project-1"
-              automatic
+              automatic={automatic}
               canWrite
               loading={false}
               loadError={null}
@@ -92,6 +95,19 @@ async function renderAutomaticResult(overrides: Partial<ChannelOutcome> = {}) {
 }
 
 describe("automatic measurement results", () => {
+  it("uses receipt time for a legacy measurement without changing its unknown outcome", async () => {
+    await renderAutomaticResult(
+      { status: "unknown", occurred_at: "2026-10-01T00:00:00Z" },
+      false,
+    );
+    expect(screen.getByText(/结果接收时间/)).toHaveTextContent(
+      new Date("2026-10-01T00:01:00Z").toLocaleString("zh-CN"),
+    );
+    expect(screen.getByText(/结果接收时间/)).not.toHaveTextContent(
+      new Date("2026-10-01T00:00:00Z").toLocaleString("zh-CN"),
+    );
+    expect(screen.getAllByText(/结果未知/).length).toBeGreaterThan(0);
+  });
   it("shows the answer as plain text and citations, with evidence only on demand", async () => {
     const { container } = await renderAutomaticResult();
     expect(screen.getByRole("heading", { name: "回答" })).toBeVisible();
@@ -165,7 +181,14 @@ describe("automatic measurement results", () => {
   it("localizes the result in English", async () => {
     await i18n.changeLanguage("en");
     try {
-      await renderAutomaticResult({ citations: [] });
+      await renderAutomaticResult({
+        citations: [],
+        occurred_at: "2026-10-01T00:00:00Z",
+      });
+      expect(screen.getByText(/Result received/)).toHaveTextContent(
+        new Date("2026-10-01T00:01:00Z").toLocaleString("en"),
+      );
+      expect(screen.queryByText(/Result time/)).not.toBeInTheDocument();
       expect(screen.getByRole("heading", { name: "Answer" })).toBeVisible();
       expect(
         screen.getByText("This answer did not provide citation links."),

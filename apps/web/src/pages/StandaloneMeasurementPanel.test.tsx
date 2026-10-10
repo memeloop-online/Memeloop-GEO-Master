@@ -329,8 +329,16 @@ describe("standalone arbitrary-topic measurement", () => {
     await user.click(screen.getByRole("button", { name: "刷新记录" }));
     expect(await screen.findByText("执行中或等待结果")).toBeInTheDocument();
     expect(screen.getByText("正在等待测量结果。")).toBeInTheDocument();
+    expect(screen.getByText(/开始时间/)).toHaveTextContent(
+      new Date(attempt.claimed_at).toLocaleString("zh-CN"),
+    );
+    expect(screen.queryByText(/结果接收时间|结果时间/)).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "刷新记录" }));
     expect(await screen.findByText("已取得测量结果")).toBeInTheDocument();
+    expect(screen.getByText(/结果接收时间/)).toHaveTextContent(
+      new Date("2026-10-01T00:00:04Z").toLocaleString("zh-CN"),
+    );
+    expect(screen.queryByText(/开始时间/)).not.toBeInTheDocument();
     expect(screen.getByText("可在晴朗夜晚观测")).toBeVisible();
     expect(screen.getByText("本次回答未提供引用链接。")).toBeVisible();
     expect(screen.queryByText(/已收到搜索答案/)).not.toBeInTheDocument();
@@ -374,11 +382,11 @@ describe("standalone arbitrary-topic measurement", () => {
           attempt_id: "attempt-unknown",
           target_id: target.target_id,
           claimed_at: "2026-10-01T00:00:01Z",
-          received_at: "2026-10-01T00:00:04Z",
+          received_at: "2026-10-01T00:01:34Z",
           outcome: {
             status: "unknown",
             detail: "响应采集超时",
-            occurred_at: "2026-10-01T00:00:04Z",
+            occurred_at: "2026-10-01T00:00:01Z",
             raw_answer: null,
             citations: [],
             public_url: null,
@@ -396,6 +404,12 @@ describe("standalone arbitrary-topic measurement", () => {
       await screen.findByRole("button", { name: /自定义问题测量/ }),
     );
     expect(await screen.findByText("测量结果未知")).toBeInTheDocument();
+    expect(screen.getByText(/结果接收时间/)).toHaveTextContent(
+      new Date("2026-10-01T00:01:34Z").toLocaleString("zh-CN"),
+    );
+    expect(screen.getByText(/结果接收时间/)).not.toHaveTextContent(
+      new Date("2026-10-01T00:00:01Z").toLocaleString("zh-CN"),
+    );
     expect(screen.getByText("未能确认本次测量结果。")).toBeInTheDocument();
     expect(screen.queryByText(/响应采集超时/)).not.toBeInTheDocument();
     expect(screen.queryByText("测试数据，非真实测量")).not.toBeInTheDocument();

@@ -193,9 +193,9 @@ export function TargetCard({
                   <span>{t("automaticInFlightDetail")}</span>
                 )}
                 {" · "}
-                {t("resultTime", {
+                {t(outcome ? "resultReceivedAt" : "resultStartedAt", {
                   value: measurementDate(
-                    outcome?.occurred_at ?? attempt.claimed_at,
+                    outcome ? attempt.received_at : attempt.claimed_at,
                   ),
                 })}
               </p>
@@ -337,7 +337,11 @@ export function TargetCard({
                 {attempt.outcome.detail ?? "无详细说明"}
               </p>
               <p>
-                结果时间 {dateTime(attempt.outcome.occurred_at)}
+                {input.kind === "measure"
+                  ? t("resultReceivedAt", {
+                      value: dateTime(attempt.received_at),
+                    })
+                  : `结果时间 ${dateTime(attempt.outcome.occurred_at)}`}
                 {" · "}连接器 {attempt.outcome.connector_version ?? "未记录"}
                 {attempt.outcome.fixture &&
                   (automatic

@@ -591,7 +591,16 @@ async fn capture_projection_requires_source_availability_and_excludes_explicit_f
             public_url: None,
             screenshot_ref: None,
             connector_version: None,
-            runner_evidence: vec![],
+            // Conservative fixture flag, but an explicit normalized unknown
+            // receipt; absence of a receipt is not saved-source provenance.
+            runner_evidence: vec![json!({
+                "kind":"runner_receipt",
+                "schema_version":"geo.runner.receipt.v1",
+                "provenance":"unknown",
+                "execution_id":Uuid::new_v4(),
+                "connector_version":"synthetic.v1",
+                "occurred_at":null,
+            })],
             fixture: true,
         },
         observed_at + Duration::seconds(1),
@@ -729,6 +738,20 @@ async fn capture_projection_requires_source_availability_and_excludes_explicit_f
     assert_eq!(
         jobs.get_target(&scope, target.target_id).await.unwrap(),
         view
+    );
+    let mut missing_receipt = view.clone();
+    missing_receipt.attempts[0]
+        .outcome
+        .as_mut()
+        .unwrap()
+        .runner_evidence
+        .clear();
+    assert!(
+        resolver
+            .resolve(&scope, &[missing_receipt], Utc::now())
+            .await
+            .unwrap()
+            .is_empty()
     );
     let mut fixture = view;
     fixture.attempts[0]
