@@ -6,6 +6,8 @@ import {
   reportCapturedConversation,
 } from "../src/provider-conversation-ownership.mjs";
 
+const kimi = Object.freeze({ provider: "kimi" });
+
 const completedExchange = () => ({
   connect_json_terminal: true,
   messages: [
@@ -27,13 +29,13 @@ test("completion uses final observed statuses for every owned assistant message"
   exchange.messages.push({
     message: { id: "answer-2", chat_id: "new-chat", role: 3, status: 2 },
   });
-  assert.deepEqual(capturedConversationCompletion(exchange), {
+  assert.deepEqual(capturedConversationCompletion(exchange, kimi), {
     protocol: "connect_json",
     terminal: true,
     assistant_message_ids: ["answer-1", "answer-2"],
   });
   exchange.messages.push({ message: { id: "answer-1", text: "tail" } });
-  assert.equal(capturedConversationCompletion(exchange)?.terminal, true);
+  assert.equal(capturedConversationCompletion(exchange, kimi)?.terminal, true);
 });
 
 test("legacy, ambiguous, incomplete and unknown statuses never prove completion", () => {
@@ -80,7 +82,7 @@ test("legacy, ambiguous, incomplete and unknown statuses never prove completion"
   ]) {
     const exchange = completedExchange();
     change(exchange);
-    assert.equal(capturedConversationCompletion(exchange), null);
+    assert.equal(capturedConversationCompletion(exchange, kimi), null);
   }
 });
 
@@ -119,7 +121,7 @@ test("preceding chat scopes system, user and incremental assistant lifecycle env
       },
     ],
   };
-  assert.deepEqual(capturedConversationCompletion(exchange), {
+  assert.deepEqual(capturedConversationCompletion(exchange, kimi), {
     protocol: "connect_json",
     terminal: true,
     assistant_message_ids: ["synthetic-assistant"],
@@ -135,7 +137,7 @@ test("preceding chat scopes system, user and incremental assistant lifecycle env
   ]) {
     const invalid = structuredClone(exchange);
     change(invalid);
-    assert.equal(capturedConversationCompletion(invalid), null);
+    assert.equal(capturedConversationCompletion(invalid, kimi), null);
   }
 });
 
@@ -149,7 +151,7 @@ test("completion metadata stays bounded even with oversized structural fixtures"
         status: "COMPLETED",
       },
     });
-  assert.equal(capturedConversationCompletion(exchange), null);
+  assert.equal(capturedConversationCompletion(exchange, kimi), null);
 });
 
 test("only a consistent transport chat envelope identifies the new conversation", () => {
@@ -159,7 +161,7 @@ test("only a consistent transport chat envelope identifies the new conversation"
       { chat: { id: "new-chat" } },
     ],
   };
-  assert.equal(capturedNewConversationId(exchange), "new-chat");
+  assert.equal(capturedNewConversationId(exchange, kimi), "new-chat");
   for (const messages of [
     [{ message: { chat_id: "new-chat" } }],
     [{ chat: { id: "new-chat" } }, { message: { chat_id: "other-chat" } }],
@@ -169,7 +171,7 @@ test("only a consistent transport chat envelope identifies the new conversation"
     [{ chat: { id: "new-chat" }, message: { chat_id: "new-chat" } }],
     [{ chat: {} }],
   ])
-    assert.equal(capturedNewConversationId({ messages }), null);
+    assert.equal(capturedNewConversationId({ messages }, kimi), null);
 });
 
 test("unknown capture never invokes the optional ownership hook", async () => {
@@ -178,6 +180,7 @@ test("unknown capture never invokes the optional ownership hook", async () => {
     { messages: [{ message: { chat_id: "unverified" } }] },
     "measurement",
     (receipt) => receipts.push(receipt),
+    kimi,
   );
   assert.deepEqual(receipts, []);
 });
@@ -185,17 +188,109 @@ test("unknown capture never invokes the optional ownership hook", async () => {
 test("only an explicit durable ledger acknowledgement marks ownership receipt persisted", async () => {
   const exchange = { messages: [{ chat: { id: "new-chat" } }] };
   assert.equal(
-    await reportCapturedConversation(exchange, "measurement", async () => {}),
+    await reportCapturedConversation(
+      exchange,
+      "measurement",
+      async () => {},
+      kimi,
+    ),
     "unpersisted",
   );
   assert.equal(
-    await reportCapturedConversation(exchange, "measurement", async () => ({
-      durable: true,
-    })),
+    await reportCapturedConversation(
+      exchange,
+      "measurement",
+      async () => ({ durable: true }),
+      kimi,
+    ),
     "persisted",
   );
   assert.equal(
+    await reportCapturedConversation(exchange, "measurement", undefined, kimi),
+    "untracked",
+  );
+});
+
+test("only explicit registered providers can identify or prove captured conversations", async () => {
+  const exchange = {
+    ...completedExchange(),
+    provider: "kimi",
+    completion: {
+      protocol: "connect_json",
+      terminal: true,
+      assistant_message_ids: ["invented"],
+    },
+  };
+  for (const provider of [
+    undefined,
+    null,
+    "",
+    "Kimi",
+    "deepseek",
+    "doubao",
+    "glm",
+    "__proto__",
+    "constructor",
+    "toString",
+    {},
+    ["kimi"],
+  ]) {
+    const context = { provider };
+    assert.equal(capturedNewConversationId(exchange, context), null);
+    assert.equal(capturedConversationCompletion(exchange, context), null);
+    assert.equal(
+      await reportCapturedConversation(
+        exchange,
+        "measurement",
+        () => {
+          assert.fail("unregistered provider must not invoke ownership hook");
+        },
+        context,
+      ),
+      "unidentified",
+    );
+  }
+  assert.equal(capturedNewConversationId(exchange), null);
+  assert.equal(capturedConversationCompletion(exchange), null);
+  assert.equal(
     await reportCapturedConversation(exchange, "measurement", undefined),
     "untracked",
+  );
+  exchange.provider = "deepseek";
+  const receipts = [];
+  assert.equal(
+    await reportCapturedConversation(
+      exchange,
+      "measurement",
+      async (receipt) => {
+        receipts.push(receipt);
+        return { durable: true };
+      },
+      kimi,
+    ),
+    "persisted",
+  );
+  assert.deepEqual(receipts, [
+    {
+      provider: "kimi",
+      purpose: "measurement",
+      external_conversation_id: "new-chat",
+    },
+  ]);
+  assert.deepEqual(capturedConversationCompletion(exchange, kimi), {
+    protocol: "connect_json",
+    terminal: true,
+    assistant_message_ids: ["answer-1"],
+  });
+  assert.equal(
+    await reportCapturedConversation(
+      exchange,
+      "extraction",
+      async () => {
+        throw new Error("synthetic private callback failure");
+      },
+      kimi,
+    ),
+    "unpersisted",
   );
 });

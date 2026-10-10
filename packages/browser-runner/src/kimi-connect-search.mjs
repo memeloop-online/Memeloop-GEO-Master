@@ -514,6 +514,7 @@ export async function observeKimiConnectSearch(
       captured,
       "measurement",
       onConversationCaptured,
+      { provider: "kimi" },
     );
     if (onConversationCaptured && ownershipReceiptStatus === "unpersisted")
       reportObservationDiagnostic(
@@ -536,6 +537,7 @@ export async function observeKimiConnectSearch(
     }
     stage = "interpretation";
     const observation = await interpret(captured, {
+      provider: "kimi",
       deadlineAt: deadlineAt === undefined ? undefined : deadlineAt - 10_000,
       apiExtract,
       getExtractionPolicy,
