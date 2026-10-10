@@ -801,6 +801,47 @@ test("overall deadline expiring during policy is not a policy timeout", async ()
   assert.equal(diagnostics.at(-1).code, "budget_exhausted");
 });
 
+test("an early policy timer wakeup waits for the overall deadline", async (t) => {
+  let now = 1_000;
+  const timers = [];
+  t.mock.method(performance, "now", () => now);
+  t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    const timer = { callback, delay };
+    timers.push(timer);
+    return timer;
+  });
+  t.mock.method(globalThis, "clearTimeout", () => {});
+  const diagnostics = [];
+  let childSignal;
+  let entered;
+  const policyEntered = new Promise((resolve) => (entered = resolve));
+  const pending = interpretObservation(exchange, {
+    deadlineAt: 1_040,
+    policyTimeoutMs: 10_000,
+    getExtractionPolicy: async ({ signal }) => {
+      childSignal = signal;
+      entered();
+      return new Promise(() => {});
+    },
+    onDiagnostic: (entry) => diagnostics.push(entry),
+  });
+  await policyEntered;
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 40);
+  // Timer scheduling and performance.now() need not share sub-ms precision.
+  now = 1_039.75;
+  timers[0].callback();
+  assert.equal(childSignal.aborted, false);
+  assert.equal(diagnostics.length, 0);
+  assert.equal(timers.length, 2);
+  assert.equal(timers[1].delay, 1);
+  now = 1_040;
+  timers[1].callback();
+  assert.equal(await pending, null);
+  assert.equal(childSignal.aborted, true);
+  assert.equal(diagnostics.at(-1).code, "budget_exhausted");
+});
+
 test("source is delivered before either extractor and rejected candidates remain bounded evidence", async () => {
   const records = [];
   const diagnostics = [];
