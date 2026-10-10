@@ -146,6 +146,7 @@ fn policy_timing(stage: &'static str, started: std::time::Instant, success: bool
     );
 }
 
+#[tracing::instrument(name = "observation_extract_callback", skip_all, fields(call_id = %Uuid::new_v4()))]
 async fn extract(
     State(service): State<ObservationAiCallbackService>,
     Json(request): Json<SourceRequest>,
@@ -163,7 +164,13 @@ async fn extract(
         .model
         .complete_for_usage_with_revision(&scope, ProjectAiUsage::ObservationAnalysis, &request)
         .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|error| {
+            tracing::info!(
+                failure = crate::observation_analysis::model_failure_code(&error),
+                "observation model failed"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
     if completion.text.len() > 150_000
         || completion.finish_reason != "stop"
         || !completion.tool_calls.is_empty()
