@@ -183,6 +183,160 @@ async fn json_body(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
+async fn proxy_inventory_http_versions_redaction_pagination_and_validation() {
+    let (app, _, cookie, csrf) = pool_fixture(Role::ResourceAdmin, true).await;
+    let base = "/api/v1/operator/channel-proxy-pools";
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            base,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"name":"Synthetic pool"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let pool = json_body(response).await;
+    assert_eq!(pool["version"], 1);
+    assert_eq!(pool["enabled"], true);
+    let members = format!("{base}/{}/members", pool["pool_id"].as_str().unwrap());
+    let mut req = request("POST",&members,Some(&cookie),Some(&csrf),json!({"name":"Synthetic member","proxy":{"server":"http://fixture.invalid:3128","username":"synthetic-user","password":"synthetic-secret"}}).to_string());
+    req.headers_mut()
+        .insert("idempotency-key", "synthetic-key".parse().unwrap());
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let member = json_body(response).await;
+    assert!(!member.to_string().contains("synthetic-secret"));
+    assert!(!member.to_string().contains("synthetic-user"));
+    assert_eq!(member["proxy_server"], "http://fixture.invalid:3128");
+    let path = format!("{members}/{}", member["member_id"].as_str().unwrap());
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &path,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_version":1,"enabled":false}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let changed = json_body(response).await;
+    assert_eq!(changed["version"], 2);
+    assert_eq!(changed["revision_id"], member["revision_id"]);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &path,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_version":1,"enabled":true}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app.clone().oneshot(request("PATCH",&path,Some(&cookie),Some(&csrf),json!({"expected_version":2,"proxy":{"server":"socks5://fixture.invalid:1080","password":"new-synthetic-secret"}}).to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let rotated = json_body(response).await;
+    assert_eq!(rotated["version"], 3);
+    assert_ne!(rotated["revision_id"], member["revision_id"]);
+    for server in [
+        "http://user:secret@fixture.invalid:3128",
+        "http://fixture.invalid:3128/private",
+        "http://fixture.invalid:3128?secret=x",
+        "http://fixture.invalid:3128#secret",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &members,
+                Some(&cookie),
+                Some(&csrf),
+                json!({"name":"Synthetic member","proxy":{"server":server}}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!json_body(response).await.to_string().contains(server));
+    }
+    for query in ["?limit=0", "?limit=101", "?cursor=invalid", "?unknown=1"] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("{base}{query}"),
+                Some(&cookie),
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let response = app
+        .clone()
+        .oneshot(request("GET", &members, Some(&cookie), None, String::new()))
+        .await
+        .unwrap();
+    let list = json_body(response).await;
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert_eq!(list["items"][0]["version"], 3);
+    assert_eq!(list["next_cursor"], Value::Null);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &path,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_version":3,"password":"synthetic-secret"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn proxy_inventory_requires_trusted_resource_scope_and_csrf() {
+    let base = "/api/v1/operator/channel-proxy-pools";
+    for (role, matching) in [(Role::CustomerAdmin, true), (Role::ResourceAdmin, false)] {
+        let (app, _, cookie, csrf) = pool_fixture(role, matching).await;
+        for method in ["GET", "POST"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    method,
+                    base,
+                    Some(&cookie),
+                    Some(&csrf),
+                    json!({"name":"Synthetic pool"}).to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+    let (app, _, cookie, _) = pool_fixture(Role::ResourceAdmin, true).await;
+    let response = app
+        .oneshot(request(
+            "POST",
+            base,
+            Some(&cookie),
+            None,
+            json!({"name":"Synthetic pool"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn operator_import_http_is_scoped_durable_secretless_and_not_cached() {
     let (app, _, cookie, csrf) = pool_fixture(Role::ResourceAdmin, true).await;
     let path = "/api/v1/operator/channel-account-imports";
