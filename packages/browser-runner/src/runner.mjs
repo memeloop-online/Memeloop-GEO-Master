@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
@@ -158,6 +158,11 @@ export function createRunner(options = {}) {
     throw new Error("invalid_runner_retention");
   }
   const sessions = new Map();
+  const generation = randomUUID();
+  // Retain fences for this runner generation, including never-started IDs.
+  // This grows with closed IDs and is intentionally not TTL-reaped: eviction
+  // could resurrect delayed starts. Restart/other replicas are not covered.
+  const disposedIds = new Set();
   const executions = new Map();
   let browserPromise;
   let reapingPromise;
@@ -171,6 +176,7 @@ export function createRunner(options = {}) {
   }
 
   function closeRecord(id, record) {
+    disposedIds.add(id);
     if (record.disposed) return Promise.resolve();
     record.closing = true;
     record.lifetime.abort();
@@ -318,18 +324,28 @@ export function createRunner(options = {}) {
 
   async function create(input) {
     if (
-      !fields(input, ["session_id", "platform", "storage_state", "proxy"]) ||
+      !fields(input, [
+        "session_id",
+        "platform",
+        "storage_state",
+        "proxy",
+        "expected_generation",
+      ]) ||
       !validId(input.session_id) ||
       typeof input.platform !== "string"
     ) {
       throw new RunnerError(400, "invalid_session");
     }
+    if (Object.hasOwn(input, "expected_generation"))
+      requireGeneration(input.expected_generation);
     const adapter = platformAdapters[input.platform];
     if (!adapter) throw new RunnerError(400, "unsupported_platform");
     if (shuttingDown) throw new RunnerError(503, "runner_unavailable");
     if (sessions.has(input.session_id)) {
       throw new RunnerError(409, "session_exists");
     }
+    if (disposedIds.has(input.session_id))
+      throw new RunnerError(409, "session_disposed");
     const proxy = parseProxy(input.proxy);
     const storageState = parseState(input.storage_state);
     if (!desktop && !storageState) {
@@ -400,6 +416,7 @@ export function createRunner(options = {}) {
       // perform their existing identity probe.
       const result = {
         session_id: input.session_id,
+        ...(Object.hasOwn(input, "expected_generation") ? { generation } : {}),
         phase: desktopSession ? "login_required" : await phase(record),
       };
       if (record.closing) throw new RunnerError(409, "session_closing");
@@ -1363,6 +1380,27 @@ export function createRunner(options = {}) {
     await closeRecord(id, record);
   }
 
+  function requireGeneration(expected) {
+    if (typeof expected !== "string" || !UUID.test(expected))
+      throw new RunnerError(400, "invalid_generation");
+    if (expected !== generation)
+      throw new RunnerError(409, "runner_generation_mismatch");
+  }
+
+  async function disposeSession(id, input) {
+    if (!validId(id) || !fields(input, ["expected_generation"]))
+      throw new RunnerError(400, "invalid_disposal");
+    requireGeneration(input.expected_generation);
+    const record = sessions.get(id);
+    if (record?.busy && !record.closing)
+      throw new RunnerError(409, "session_busy");
+    // Synchronous fence insertion precedes resource disposal and every await.
+    // A failed close leaves its resource record for a real retry, not a receipt.
+    disposedIds.add(id);
+    if (record) await closeRecord(id, record);
+    return { session_id: id, generation, state: "disposed" };
+  }
+
   async function shutdown() {
     clearInterval(maintenance);
     shuttingDown = true;
@@ -1385,6 +1423,8 @@ export function createRunner(options = {}) {
     executeRich,
     cleanupConversation,
     close,
+    lifecycle: () => ({ generation }),
+    disposeSession,
     shutdown,
     reap,
     capabilities,
