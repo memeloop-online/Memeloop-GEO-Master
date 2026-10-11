@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test } from "node:test";
+import { runInNewContext } from "node:vm";
 import { chromium } from "playwright";
 import {
   adapters,
@@ -94,6 +95,126 @@ const consumerCases = [
     ],
   },
 ];
+
+test("Doubao accepts only website signature additions without weakening response URL binding", async () => {
+  const example = consumerCases.find((item) => item.provider === "doubao");
+  const origin = "https://www.doubao.com";
+  const expected = `${origin}${example.path}`;
+  const withQuery = (change) => {
+    const url = new URL(expected);
+    change(url.searchParams);
+    return url.href;
+  };
+  const probeUrl = async (url) =>
+    probeDoubaoAccount({
+      evaluate: async (fn, args) => {
+        const response = new Response(JSON.stringify(example.own()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+        Object.defineProperty(response, "url", { value: url });
+        return runInNewContext(`(${fn.toString()})`, {
+          location: { origin },
+          URL,
+          AbortSignal,
+          TextDecoder,
+          // Synthetic credentials stay confined to this isolated fixture.
+          localStorage: {
+            getItem: () =>
+              JSON.stringify({ __version: "0", value: "synthetic" }),
+          },
+          document: { cookie: "chatglm_token=synthetic" },
+          fetch: async (requested, options) => {
+            assert.equal(requested, example.path);
+            assert.equal(options.method, "GET");
+            assert.equal(options.credentials, "same-origin");
+            assert.equal(options.redirect, "error");
+            return response;
+          },
+        })(args);
+      },
+    });
+  for (const url of [
+    expected,
+    `${expected}&msToken=synthetic-token`,
+    `${expected}&a_bogus=synthetic-signature`,
+    `${expected}&msToken=synthetic-token&a_bogus=synthetic-signature`,
+    withQuery((params) => {
+      params.append("a_bogus", "synthetic-signature");
+      params.sort();
+    }),
+  ])
+    assert.deepEqual(await probeUrl(url), example.identity(example.own()));
+
+  const invalid = [
+    `${expected}&unrecognized=synthetic`,
+    `${expected}&msToken=one&msToken=two`,
+    `${expected}&a_bogus=one&a_bogus=two`,
+    `${expected}&msToken=one&%6DsToken=two`,
+    `${expected}&MS_TOKEN=synthetic`,
+    `${expected}#fragment`,
+    `${expected}#`,
+    expected.replace("https://www.doubao.com", "https://other.example"),
+    expected.replace("https://", "http://"),
+    expected.replace("https://", "https://synthetic@"),
+    expected.replace("https://", "https://synthetic:synthetic@"),
+    expected.replace("/info/v2/", "/info/v3/"),
+    expected.replace("/info/v2/", "/info/v2"),
+    "not a URL",
+  ];
+  for (const [key] of new URL(expected).searchParams) {
+    invalid.push(
+      withQuery((params) => params.delete(key)),
+      withQuery((params) => params.set(key, "tampered")),
+      withQuery((params) => params.append(key, params.get(key))),
+    );
+  }
+  for (const url of invalid)
+    assert.equal(
+      await probeUrl(url),
+      null,
+      "unverified response URL must fail closed",
+    );
+
+  // Other providers retain exact full-URL matching. A Doubao-shaped response
+  // would fail their identity parser anyway; assert URL rejection occurs
+  // before the body is consumed in the separate fixture below.
+  for (const [probe, providerOrigin, path] of [
+    [
+      probeDeepseekAccount,
+      "https://chat.deepseek.com",
+      "/api/v0/users/current",
+    ],
+    [probeGlmAccount, "https://chatglm.cn", "/chatglm/user-api/user/info"],
+  ]) {
+    let bodyReads = 0;
+    const page = {
+      evaluate: async (fn, args) =>
+        runInNewContext(`(${fn.toString()})`, {
+          location: { origin: providerOrigin },
+          URL,
+          AbortSignal,
+          TextDecoder,
+          localStorage: {
+            getItem: () =>
+              JSON.stringify({ __version: "0", value: "synthetic" }),
+          },
+          document: { cookie: "chatglm_token=synthetic" },
+          fetch: async () => ({
+            status: 200,
+            url: `${providerOrigin}${path}?msToken=synthetic&a_bogus=synthetic`,
+            headers: new Headers({ "content-type": "application/json" }),
+            get body() {
+              bodyReads++;
+              return null;
+            },
+          }),
+        })(args),
+    };
+    assert.equal(await probe(page), null);
+    assert.equal(bodyReads, 0);
+  }
+});
 
 for (const example of consumerCases) {
   test(`${example.provider} identity excludes guest/error/name-only records and private contact fallback`, () => {
