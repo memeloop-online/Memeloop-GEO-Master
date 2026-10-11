@@ -188,6 +188,8 @@ export function createRunnerServer({
       const parts = path.split("/").filter(Boolean);
       if (request.method === "GET" && path === "/v1/capabilities") {
         send(response, 200, runner.capabilities());
+      } else if (request.method === "GET" && path === "/v1/lifecycle") {
+        send(response, 200, runner.lifecycle());
       } else if (
         request.method === "POST" &&
         path === "/v1/observation-analyses/ground"
@@ -210,6 +212,18 @@ export function createRunnerServer({
             persistCapture,
             observationAi,
           ),
+        );
+      } else if (
+        parts.length === 4 &&
+        parts[0] === "v1" &&
+        parts[1] === "sessions" &&
+        parts[3] === "dispose" &&
+        request.method === "POST"
+      ) {
+        send(
+          response,
+          200,
+          await runner.disposeSession(parts[2], await readJson(request)),
         );
       } else if (
         parts.length === 4 &&
