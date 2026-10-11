@@ -9,6 +9,7 @@ mod agent;
 mod appearance;
 mod auth;
 pub mod bootstrap;
+mod browser_operations;
 mod channel_jobs;
 mod channels;
 mod proxy_pools;

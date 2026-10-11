@@ -522,7 +522,7 @@ fn semantic_search_projection_valid(proof: &serde_json::Value, outcome: &Channel
 }
 
 #[async_trait]
-pub trait ChannelJobRepository: Send + Sync {
+pub trait ChannelJobRepository: crate::BrowserOperationRepository + Send + Sync {
     async fn replay_measurement_plan(
         &self,
         scope: &TenantScope,
@@ -807,6 +807,7 @@ pub fn frozen_cycle_inputs(
 pub struct MemoryChannelJobRepository(
     Arc<Mutex<HashMap<ChannelScopeKey, MemoryCycle>>>,
     Arc<Mutex<HashMap<AccountReservationKey, AccountReservation>>>,
+    Arc<Mutex<HashMap<Uuid, crate::BrowserOperation>>>,
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -818,6 +819,171 @@ enum ChannelOwner {
 type ChannelScopeKey = (Uuid, Uuid, Uuid, ChannelOwner);
 type AccountReservationKey = (Uuid, Uuid);
 type AccountReservation = (Uuid, DateTime<Utc>);
+
+#[async_trait]
+impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
+    async fn save_owned_login_session(
+        &self,
+        scope: &crate::BrowserOperationScope,
+        operation_id: Uuid,
+        storage: &crate::VerifiedLoginStorage,
+        channels: &dyn crate::ChannelRepository,
+        at: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let gates = self.1.lock().await;
+        let operations = self.2.lock().await;
+        let op = operations
+            .get(&operation_id)
+            .ok_or_else(|| AppError::not_found("browser operation not found"))?;
+        op.validate_login_commit(scope, storage)?;
+        if !gates
+            .get(&(scope.operator_id.as_uuid(), storage.account_id))
+            .is_some_and(|(owner, _)| *owner == op.reservation_id)
+        {
+            return Err(AppError::conflict("login account gate differs"));
+        }
+        // Disposal takes these exact locks. Verification may finish after cancel,
+        // but its credential write cannot pass the terminal state boundary.
+        channels.save_verified_login_storage(storage, at).await
+    }
+    async fn browser_operation_exists(
+        &self,
+        operator: crate::OperatorId,
+        session_id: Uuid,
+    ) -> Result<bool, AppError> {
+        Ok(self
+            .2
+            .lock()
+            .await
+            .values()
+            .any(|op| op.scope.operator_id == operator && op.session_id == session_id))
+    }
+    async fn get_active_browser_operation(
+        &self,
+        scope: &crate::BrowserOperationScope,
+        account_id: Uuid,
+    ) -> Result<Option<crate::BrowserOperation>, AppError> {
+        Ok(self
+            .2
+            .lock()
+            .await
+            .values()
+            .find(|op| {
+                &op.scope == scope
+                    && op.account_id == account_id
+                    && op.state != crate::BrowserOperationState::Disposed
+            })
+            .cloned())
+    }
+    async fn begin_browser_operation(
+        &self,
+        scope: &crate::BrowserOperationScope,
+        input: &crate::BeginBrowserOperation,
+        at: DateTime<Utc>,
+    ) -> Result<crate::BrowserOperation, AppError> {
+        let operation = crate::BrowserOperation::prepare(scope, input, at)?;
+        let mut gates = self.1.lock().await;
+        let mut operations = self.2.lock().await;
+        if let Some(existing) = operations.get(&input.operation_id) {
+            return if existing.matches_begin(&operation) {
+                Ok(existing.clone())
+            } else {
+                Err(AppError::conflict("browser operation differs"))
+            };
+        }
+        let key = (scope.operator_id.as_uuid(), input.account_id);
+        if input.expires_at <= at {
+            return Err(AppError::invalid_request(
+                "browser ownership deadline elapsed",
+            ));
+        }
+        if operations.values().any(|op| {
+            op.session_id == input.session_id
+                || (op.scope.operator_id == scope.operator_id
+                    && op.account_id == input.account_id
+                    && op.state != crate::BrowserOperationState::Disposed)
+        }) {
+            return Err(AppError::conflict("browser ownership busy"));
+        }
+        match (input.reservation_id, gates.get(&key)) {
+            (Some(owner), Some((existing, expiry))) if owner == *existing && *expiry > at => {}
+            (None, None) => {}
+            (None, Some((_, expiry))) if *expiry <= at => {}
+            _ => return Err(AppError::conflict("channel account preflight busy")),
+        }
+        gates.insert(key, (operation.reservation_id, input.expires_at));
+        operations.insert(operation.operation_id, operation.clone());
+        Ok(operation)
+    }
+    async fn get_browser_operation(
+        &self,
+        scope: &crate::BrowserOperationScope,
+        id: Uuid,
+    ) -> Result<Option<crate::BrowserOperation>, AppError> {
+        Ok(self
+            .2
+            .lock()
+            .await
+            .get(&id)
+            .filter(|op| &op.scope == scope)
+            .cloned())
+    }
+    async fn list_due_browser_operations(
+        &self,
+        at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<crate::BrowserOperation>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid browser scan limit"));
+        }
+        let mut found: Vec<_> = self
+            .2
+            .lock()
+            .await
+            .values()
+            .filter(|op| {
+                op.state != crate::BrowserOperationState::Disposed && op.next_check_at <= at
+            })
+            .cloned()
+            .collect();
+        found.sort_by_key(|op| (op.next_check_at, op.operation_id));
+        found.truncate(limit);
+        Ok(found)
+    }
+    async fn transition_browser_operation(
+        &self,
+        scope: &crate::BrowserOperationScope,
+        id: Uuid,
+        action: crate::BrowserOperationTransition,
+        at: DateTime<Utc>,
+    ) -> Result<crate::BrowserOperation, AppError> {
+        let mut gates = self.1.lock().await;
+        let mut operations = self.2.lock().await;
+        let op = operations
+            .get_mut(&id)
+            .ok_or_else(|| AppError::not_found("browser operation not found"))?;
+        let was_disposed = op.state == crate::BrowserOperationState::Disposed;
+        op.transition(scope, action, at)?;
+        let result = op.clone();
+        if !was_disposed && result.state == crate::BrowserOperationState::Disposed {
+            let key = (scope.operator_id.as_uuid(), result.account_id);
+            let another_owner = operations.values().any(|other| {
+                other.operation_id != id
+                    && other.scope.operator_id == scope.operator_id
+                    && other.account_id == result.account_id
+                    && other.state != crate::BrowserOperationState::Disposed
+            });
+            if !another_owner
+                && gates
+                    .get(&key)
+                    .is_some_and(|(owner, _)| *owner == result.reservation_id)
+            {
+                gates.remove(&key);
+            }
+        }
+        Ok(result)
+    }
+}
 
 #[derive(Default)]
 struct MemoryCycle {
@@ -1299,6 +1465,13 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         }
         let mut reservations = self.1.lock().await;
         let key = (scope.operator_id.as_uuid(), account_id);
+        if self.2.lock().await.values().any(|op| {
+            op.scope.operator_id == scope.operator_id
+                && op.account_id == account_id
+                && op.state != crate::BrowserOperationState::Disposed
+        }) {
+            return Err(AppError::conflict("channel account browser busy"));
+        }
         if reservations
             .get(&key)
             .is_some_and(|(_, expiry)| *expiry > at)
@@ -1318,6 +1491,13 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         scope_key(scope)?;
         let mut reservations = self.1.lock().await;
         let key = (scope.operator_id.as_uuid(), account_id);
+        if self.2.lock().await.values().any(|op| {
+            op.scope.operator_id == scope.operator_id
+                && op.account_id == account_id
+                && op.state != crate::BrowserOperationState::Disposed
+        }) {
+            return Ok(());
+        }
         if reservations
             .get(&key)
             .is_some_and(|(owner, _)| *owner == reservation_id)

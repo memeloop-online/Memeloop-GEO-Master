@@ -216,6 +216,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 51,
         description: "operator proxy pools",
     },
+    MigrationMetadata {
+        version: 52,
+        description: "browser operations",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

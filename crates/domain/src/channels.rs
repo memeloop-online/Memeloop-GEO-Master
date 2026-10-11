@@ -197,6 +197,18 @@ fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {
 
 #[async_trait]
 pub trait ChannelRepository: crate::ProxyPoolRepository + Send + Sync {
+    /// Internal transaction adapter; callers use BrowserOperationRepository's
+    /// ownership-serialized commit, never a standalone HTTP credential write.
+    async fn save_verified_login_storage(
+        &self,
+        storage: &crate::VerifiedLoginStorage,
+        at: DateTime<Utc>,
+    ) -> Result<(), AppError>;
+    async fn account_login_sessions(
+        &self,
+        operator: crate::OperatorId,
+        account_id: Uuid,
+    ) -> Result<Vec<Uuid>, AppError>;
     async fn list_import_rows(
         &self,
         operator: crate::OperatorId,
@@ -356,6 +368,97 @@ fn key(scope: &TenantScope, id: Uuid) -> Result<(Uuid, Uuid, Uuid, Uuid), AppErr
 
 #[async_trait]
 impl ChannelRepository for MemoryChannelRepository {
+    async fn save_verified_login_storage(
+        &self,
+        storage: &crate::VerifiedLoginStorage,
+        at: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let mut data = self.0.write().await;
+        let operator = storage.secret_scope.operator_id.as_uuid();
+        let customer_key = if storage.owner_kind == ChannelOwnerKind::Customer {
+            Some(key(&storage.secret_scope, storage.account_id)?)
+        } else {
+            None
+        };
+        if data.accounts.iter().any(|(k, r)| {
+            k.0 == operator
+                && Some(*k) != customer_key
+                && r.account.platform == storage.platform
+                && r.account.platform_account_id.as_deref() == Some(&storage.platform_account_id)
+        }) || data.pool_accounts.iter().any(|(k, r)| {
+            k.0 == operator
+                && !(storage.owner_kind == ChannelOwnerKind::OperatorPool
+                    && k.1 == storage.account_id)
+                && r.account.platform == storage.platform
+                && r.account.platform_account_id.as_deref() == Some(&storage.platform_account_id)
+        }) {
+            return Err(AppError::conflict("platform identity is already connected"));
+        }
+        macro_rules! save {
+            ($record:expr) => {{
+                let record =
+                    $record.ok_or_else(|| AppError::not_found("login account not found"))?;
+                if !record.account.enabled
+                    || record.account.platform != storage.platform
+                    || record.account.platform_account_id != storage.expected_platform_account_id
+                    || record.session.as_ref().map(ChannelSecret::encrypted_bytes)
+                        != storage
+                            .expected_session
+                            .as_ref()
+                            .map(ChannelSecret::encrypted_bytes)
+                {
+                    return Err(AppError::conflict(
+                        "login account changed during verification",
+                    ));
+                }
+                record.account.platform_account_id = Some(storage.platform_account_id.clone());
+                record.account.display_name = Some(storage.display_name.clone());
+                record.account.avatar_url = storage.avatar_url.clone();
+                record.account.status = ChannelStatus::Ready;
+                record.account.updated_at = at;
+                record.session = Some(storage.session.clone());
+            }};
+        }
+        match customer_key {
+            Some(k) => {
+                if data
+                    .accounts
+                    .get(&k)
+                    .is_some_and(|r| r.account.owner_kind != ChannelOwnerKind::Customer)
+                {
+                    return Err(AppError::forbidden("login account owner differs"));
+                }
+                save!(data.accounts.get_mut(&k));
+            }
+            None => {
+                save!(data.pool_accounts.get_mut(&(operator, storage.account_id)));
+            }
+        }
+        Ok(())
+    }
+    async fn account_login_sessions(
+        &self,
+        operator: crate::OperatorId,
+        account_id: Uuid,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let data = self.0.read().await;
+        Ok(data
+            .logins
+            .iter()
+            .filter(|((o, _, _, _), login)| {
+                *o == operator.as_uuid() && login.account_id == account_id
+            })
+            .map(|(_, login)| login.session_id)
+            .chain(
+                data.pool_logins
+                    .iter()
+                    .filter(|((o, _), login)| {
+                        *o == operator.as_uuid() && login.account_id == account_id
+                    })
+                    .map(|(_, login)| login.session_id),
+            )
+            .collect())
+    }
     async fn list_import_rows(
         &self,
         operator: crate::OperatorId,
@@ -755,6 +858,16 @@ impl ChannelRepository for MemoryChannelRepository {
         {
             return Err(AppError::not_found("pool account not found"));
         }
+        if let Some(old) = data
+            .pool_logins
+            .get(&(operator.as_uuid(), session.session_id))
+        {
+            return if old.account_id == session.account_id {
+                Ok(())
+            } else {
+                Err(AppError::conflict("pool login reference differs"))
+            };
+        }
         data.pool_logins
             .insert((operator.as_uuid(), session.session_id), session);
         Ok(())
@@ -972,6 +1085,13 @@ impl ChannelRepository for MemoryChannelRepository {
         let mut data = self.0.write().await;
         if !data.accounts.contains_key(&key(scope, session.account_id)?) {
             return Err(AppError::not_found("account not found"));
+        }
+        if let Some(old) = data.logins.get(&key(scope, session.session_id)?) {
+            return if old.account_id == session.account_id {
+                Ok(())
+            } else {
+                Err(AppError::conflict("login reference differs"))
+            };
         }
         data.logins.insert(key(scope, session.session_id)?, session);
         Ok(())

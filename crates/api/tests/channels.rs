@@ -61,6 +61,343 @@ async fn fixture() -> (Router, String, String, String) {
     )
 }
 
+#[tokio::test]
+async fn both_login_paths_keep_saved_storage_and_retry_handle_until_exact_disposal() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        routing::{get, post},
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[derive(Clone)]
+    struct Lifecycle {
+        fail_close: Arc<AtomicBool>,
+        starts: Arc<AtomicUsize>,
+    }
+    for pool in [false, true] {
+        let lifecycle = Lifecycle {
+            fail_close: Arc::new(AtomicBool::new(true)),
+            starts: Arc::new(AtomicUsize::new(0)),
+        };
+        let runner = Router::new()
+            .route("/v1/lifecycle", get(|| async { Json(json!({"generation":Uuid::from_u128(123)})) }))
+            .route("/v1/sessions", post(|State(s): State<Lifecycle>, Json(input): Json<Value>| async move {
+                s.starts.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"session_id":input["session_id"],"generation":input["expected_generation"]}))
+            }))
+            .route("/v1/sessions/{id}/complete", post(|| async {
+                Json(json!({"identity":{"platform_account_id":"fixture-identity","display_name":"Fixture","avatar_url":null},
+                    "storage_state":{"cookies":[{"name":"fixture-cookie","value":"private-fixture"}]}}))
+            }))
+            .route("/v1/sessions/{id}/dispose", post(|State(s): State<Lifecycle>, Path(id):Path<Uuid>, Json(input):Json<Value>| async move {
+                if s.fail_close.load(Ordering::SeqCst) {
+                    // A plain absence response must not release the account.
+                    (StatusCode::NOT_FOUND, Json(json!({"error":"missing"})))
+                } else {
+                    (StatusCode::OK, Json(json!({"session_id":id,"generation":input["expected_generation"],"state":"disposed"})))
+                }
+            }))
+            .with_state(lifecycle.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, runner).await.unwrap() });
+        let browser =
+            BrowserBridge::new(format!("http://{address}"), "fixture-token".into()).unwrap();
+        let (app, project, cookie, csrf) =
+            pool_fixture_with_browser(Role::ResourceAdmin, true, Some(browser)).await;
+        let prefix = if pool { "/operator" } else { "" };
+        let account_path = format!("/api/v1{prefix}/channel-accounts");
+        let input = if pool {
+            json!({"platform":"zhihu"})
+        } else {
+            json!({"platform":"zhihu","project_id":project})
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &account_path,
+                Some(&cookie),
+                Some(&csrf),
+                input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let account = json_body(response).await;
+        let login_path = format!("/api/v1{prefix}/channel-login-sessions");
+        let input = if pool {
+            json!({"account_id":account["account_id"]})
+        } else {
+            json!({"account_id":account["account_id"],"project_id":project})
+        };
+        let start = || {
+            request(
+                "POST",
+                &login_path,
+                Some(&cookie),
+                Some(&csrf),
+                input.to_string(),
+            )
+        };
+        let response = app.clone().oneshot(start()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let started = json_body(response).await;
+        let response = app.clone().oneshot(start()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["session_id"],
+            started["session_id"]
+        );
+        assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
+        let suffix = if pool {
+            String::new()
+        } else {
+            format!("?project_id={project}")
+        };
+        let session = started["session_id"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!("{login_path}/{session}/complete{suffix}"),
+                Some(&cookie),
+                Some(&csrf),
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        let list = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("{account_path}{suffix}"),
+                Some(&cookie),
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = json_body(list).await;
+        assert!(body.to_string().contains("\"ready\""), "{body}");
+        assert!(!body.to_string().contains("private-fixture"));
+        let response = app.clone().oneshot(start()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["session_id"],
+            started["session_id"]
+        );
+        assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
+        lifecycle.fail_close.store(false, Ordering::SeqCst);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "DELETE",
+                &format!("{login_path}/{session}{suffix}"),
+                Some(&cookie),
+                Some(&csrf),
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app.clone().oneshot(start()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_ne!(
+            json_body(response).await["session_id"],
+            started["session_id"]
+        );
+        assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn canceled_completion_cannot_overwrite_newer_login_storage_on_either_route() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        routing::{get, post},
+    };
+    use tokio::sync::{Mutex, Notify};
+    #[derive(Clone, Default)]
+    struct Race {
+        first: Arc<Mutex<Option<Uuid>>>,
+        entered: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+    for pool in [false, true] {
+        let race = Race::default();
+        let runner = Router::new()
+            .route("/v1/lifecycle", get(|| async { Json(json!({"generation":Uuid::from_u128(123)})) }))
+            .route("/v1/sessions", post(|State(s):State<Race>, Json(input):Json<Value>| async move {
+                let id = serde_json::from_value::<Uuid>(input["session_id"].clone()).unwrap();
+                s.first.lock().await.get_or_insert(id);
+                Json(json!({"session_id":id,"generation":input["expected_generation"]}))
+            }))
+            .route("/v1/sessions/{id}/complete", post(|State(s):State<Race>, Path(id):Path<Uuid>| async move {
+                let is_first = *s.first.lock().await == Some(id);
+                if is_first {
+                    s.entered.notify_one();
+                    s.resume.notified().await;
+                }
+                Json(json!({"identity":{"platform_account_id":"fixture-identity","display_name":id.to_string(),"avatar_url":null},
+                    "storage_state":{"cookies":[{"name":"fixture-cookie","value":id.to_string()}]}}))
+            }))
+            .route("/v1/sessions/{id}/dispose", post(|Path(id):Path<Uuid>, Json(input):Json<Value>| async move {
+                Json(json!({"session_id":id,"generation":input["expected_generation"],"state":"disposed"}))
+            }))
+            .with_state(race.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, runner).await.unwrap() });
+        let browser =
+            BrowserBridge::new(format!("http://{address}"), "fixture-token".into()).unwrap();
+        let (app, project, cookie, csrf, state) =
+            pool_fixture_with_browser_state(Role::ResourceAdmin, true, Some(browser)).await;
+        let prefix = if pool { "/operator" } else { "" };
+        let account_path = format!("/api/v1{prefix}/channel-accounts");
+        let input = if pool {
+            json!({"platform":"zhihu"})
+        } else {
+            json!({"platform":"zhihu","project_id":project})
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &account_path,
+                Some(&cookie),
+                Some(&csrf),
+                input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let account = json_body(response).await;
+        let account_id = serde_json::from_value::<Uuid>(account["account_id"].clone()).unwrap();
+        let login_path = format!("/api/v1{prefix}/channel-login-sessions");
+        let input = if pool {
+            json!({"account_id":account_id})
+        } else {
+            json!({"account_id":account_id,"project_id":project})
+        };
+        let start = || {
+            request(
+                "POST",
+                &login_path,
+                Some(&cookie),
+                Some(&csrf),
+                input.to_string(),
+            )
+        };
+        let response = app.clone().oneshot(start()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let first = json_body(response).await["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let suffix = if pool {
+            String::new()
+        } else {
+            format!("?project_id={project}")
+        };
+        let complete = request(
+            "POST",
+            &format!("{login_path}/{first}/complete{suffix}"),
+            Some(&cookie),
+            Some(&csrf),
+            String::new(),
+        );
+        let completing_app = app.clone();
+        let completing =
+            tokio::spawn(async move { completing_app.oneshot(complete).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(5), race.entered.notified())
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "DELETE",
+                &format!("{login_path}/{first}{suffix}"),
+                Some(&cookie),
+                Some(&csrf),
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app.clone().oneshot(start()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let second = json_body(response).await["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(first, second);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!("{login_path}/{second}/complete{suffix}"),
+                Some(&cookie),
+                Some(&csrf),
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let customer_scope = TenantScope::new(
+            DEVELOPMENT_OPERATOR_ID,
+            DEVELOPMENT_TENANT_ID,
+            Some(Uuid::parse_str(&project).unwrap().into()),
+        );
+        let stored = if pool {
+            state
+                .channel_service()
+                .repository
+                .get_pool_account(DEVELOPMENT_OPERATOR_ID, account_id)
+                .await
+                .unwrap()
+                .session
+                .unwrap()
+        } else {
+            state
+                .channel_service()
+                .repository
+                .get_account(&customer_scope, account_id)
+                .await
+                .unwrap()
+                .session
+                .unwrap()
+        };
+        race.resume.notify_one();
+        let stale = completing.await.unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let (after, display) = if pool {
+            let record = state
+                .channel_service()
+                .repository
+                .get_pool_account(DEVELOPMENT_OPERATOR_ID, account_id)
+                .await
+                .unwrap();
+            (record.session.unwrap(), record.account.display_name)
+        } else {
+            let record = state
+                .channel_service()
+                .repository
+                .get_account(&customer_scope, account_id)
+                .await
+                .unwrap();
+            (record.session.unwrap(), record.account.display_name)
+        };
+        assert_eq!(after.encrypted_bytes(), stored.encrypted_bytes());
+        assert_eq!(display.as_deref(), Some(second.as_str()));
+        server.abort();
+    }
+}
+
 async fn pool_fixture(
     role: Role,
     membership_matches_configured_pool: bool,
@@ -73,6 +410,16 @@ async fn pool_fixture_with_browser(
     membership_matches_configured_pool: bool,
     browser: Option<BrowserBridge>,
 ) -> (Router, String, String, String) {
+    let (app, project, cookie, csrf, _) =
+        pool_fixture_with_browser_state(role, membership_matches_configured_pool, browser).await;
+    (app, project, cookie, csrf)
+}
+
+async fn pool_fixture_with_browser_state(
+    role: Role,
+    membership_matches_configured_pool: bool,
+    browser: Option<BrowserBridge>,
+) -> (Router, String, String, String, AppState) {
     let auth = Arc::new(MemoryAuthRepository::development_with_password(
         "channel-test",
     ));
@@ -119,7 +466,7 @@ async fn pool_fixture_with_browser(
         )
         .await
         .unwrap();
-    let app = router(state);
+    let app = router(state.clone());
     let login = app
         .clone()
         .oneshot(request(
@@ -145,6 +492,7 @@ async fn pool_fixture_with_browser(
         project.id.to_string(),
         cookie,
         body["csrf_token"].as_str().unwrap().to_owned(),
+        state,
     )
 }
 
@@ -457,10 +805,13 @@ async fn desktop_authorization_is_same_origin_and_cookie_session_bound() {
     let ready = Arc::new(AtomicBool::new(true));
     let transport_ready = ready.clone();
     let runner = Router::new()
+        .route("/v1/lifecycle", get(|| async {
+            Json(json!({"generation":Uuid::from_u128(123)}))
+        }))
         .route(
             "/v1/sessions",
             post(|Json(input): Json<Value>| async move {
-                Json(json!({"session_id": input["session_id"]}))
+                Json(json!({"session_id": input["session_id"],"generation":input["expected_generation"]}))
             }),
         )
         .route(
@@ -662,10 +1013,13 @@ async fn pool_desktop_authorization_checks_transport_not_identity() {
     let ready = Arc::new(AtomicBool::new(true));
     let transport_ready = ready.clone();
     let runner = Router::new()
+        .route("/v1/lifecycle", get(|| async {
+            Json(json!({"generation":Uuid::from_u128(123)}))
+        }))
         .route(
             "/v1/sessions",
             post(|Json(input): Json<Value>| async move {
-                Json(json!({"session_id": input["session_id"]}))
+                Json(json!({"session_id": input["session_id"],"generation":input["expected_generation"]}))
             }),
         )
         // No status route: authorization must never perform identity discovery.

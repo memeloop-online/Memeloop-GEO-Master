@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::State,
-    http::{Method, Request, StatusCode, Uri, header::SET_COOKIE},
+    http::{HeaderMap, Method, Request, StatusCode, Uri, header::SET_COOKIE},
     routing::any,
 };
 use chrono::Utc;
@@ -366,9 +366,13 @@ async fn runner(
     State(calls): State<RunnerCalls>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
     payload: Option<Json<serde_json::Value>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    assert_eq!(headers["authorization"], "Bearer test-token");
+    const GENERATION: &str = "5ce59c3b-27b9-4fdc-bc95-fbb5a22ac7cc";
     match (method.as_str(), uri.path()) {
+        ("GET", "/v1/lifecycle") => (StatusCode::OK, Json(json!({"generation":GENERATION}))),
         ("GET", "/v1/capabilities") => {
             let version = calls.runner_version.lock().await.clone();
             (
@@ -378,10 +382,28 @@ async fn runner(
                 "operations":["publish"],"verified":false}]})),
             )
         }
-        ("POST", "/v1/sessions") => (
-            StatusCode::OK,
-            Json(json!({"session_id":payload.unwrap().0["session_id"]})),
-        ),
+        ("POST", "/v1/sessions") => {
+            let input = payload.unwrap().0;
+            assert_eq!(input["expected_generation"], GENERATION);
+            (
+                StatusCode::OK,
+                Json(json!({"session_id":input["session_id"],"generation":GENERATION})),
+            )
+        }
+        ("POST", path) if path.ends_with("/dispose") => {
+            assert_eq!(payload.unwrap().0["expected_generation"], GENERATION);
+            let session = path
+                .strip_prefix("/v1/sessions/")
+                .unwrap()
+                .strip_suffix("/dispose")
+                .unwrap();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "session_id":session,"generation":GENERATION,"state":"disposed"
+                })),
+            )
+        }
         ("POST", "/v1/executions") => {
             let payload = payload.unwrap().0;
             calls.sends.lock().await.push(payload.clone());

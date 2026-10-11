@@ -8,7 +8,7 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{Path, State},
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use chrono::Utc;
 use geo_domain::{
@@ -44,11 +44,18 @@ struct Stub {
     close_stalled: Arc<AtomicBool>,
     close_failed: Arc<AtomicBool>,
     close_absent: Arc<AtomicBool>,
+    close_wrong_generation: Arc<AtomicBool>,
     renewal_race: Arc<tokio::sync::Mutex<Option<RenewalRace>>>,
     capability_override: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
 
 type RenewalRace = (Arc<dyn ChannelRepository>, TenantScope, Uuid, ChannelSecret);
+
+const GENERATION: &str = "5ce59c3b-27b9-4fdc-bc95-fbb5a22ac7cc";
+
+async fn lifecycle() -> Json<Value> {
+    Json(json!({"generation": GENERATION}))
+}
 
 async fn capabilities(State(stub): State<Stub>) -> Json<Value> {
     if let Some(value) = stub.capability_override.lock().await.clone() {
@@ -80,7 +87,8 @@ async fn start(State(stub): State<Stub>, Json(input): Json<Value>) -> Json<Value
     if stub.start_stalled.load(Ordering::SeqCst) {
         std::future::pending::<()>().await;
     }
-    Json(json!({"session_id":input["session_id"]}))
+    assert_eq!(input["expected_generation"], GENERATION);
+    Json(json!({"session_id":input["session_id"],"generation":GENERATION}))
 }
 async fn complete(State(stub): State<Stub>) -> Json<Value> {
     stub.complete_entered.notify_one();
@@ -117,7 +125,9 @@ async fn options(State(stub): State<Stub>) -> (http::StatusCode, Json<Value>) {
 async fn close(
     State(stub): State<Stub>,
     Path(session_id): Path<Uuid>,
+    Json(input): Json<Value>,
 ) -> (http::StatusCode, Json<Value>) {
+    assert_eq!(input["expected_generation"], GENERATION);
     stub.closed.fetch_add(1, Ordering::SeqCst);
     stub.closed_ids.lock().await.push(session_id);
     if stub.close_stalled.load(Ordering::SeqCst) {
@@ -131,7 +141,13 @@ async fn close(
         } else {
             http::StatusCode::OK
         },
-        Json(json!({"closed":true})),
+        Json(json!({
+            "session_id":session_id,
+            "generation":if stub.close_wrong_generation.load(Ordering::SeqCst) {
+                "bd75fe14-7ae2-49d9-8dc9-a176f3d63a6f"
+            } else { GENERATION },
+            "state":"disposed"
+        })),
     )
 }
 
@@ -150,11 +166,12 @@ async fn registered_providers_require_discovery_adapter_and_keep_scoped_lifecycl
 async fn discovery_for_provider(provider: &str) {
     let stub = Stub::default();
     let app = Router::new()
+        .route("/v1/lifecycle", get(lifecycle))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/sessions", post(start))
         .route("/v1/sessions/{id}/complete", post(complete))
         .route("/v1/sessions/{id}/measurement-options", get(options))
-        .route("/v1/sessions/{id}", delete(close))
+        .route("/v1/sessions/{id}/dispose", post(close))
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -554,11 +571,12 @@ async fn boundary_fixture(
 ) -> (AppState, TenantScope, Uuid, tokio::task::JoinHandle<()>) {
     stub.discovery_installed.store(true, Ordering::SeqCst);
     let app = Router::new()
+        .route("/v1/lifecycle", get(lifecycle))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/sessions", post(start))
         .route("/v1/sessions/{id}/complete", post(complete))
         .route("/v1/sessions/{id}/measurement-options", get(options))
-        .route("/v1/sessions/{id}", delete(close))
+        .route("/v1/sessions/{id}/dispose", post(close))
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -741,7 +759,7 @@ async fn credential_cas_loss_rejects_before_reading_model_options() {
 }
 
 #[tokio::test]
-async fn uncertain_start_closes_caller_id_but_retains_account_until_lease_expiry() {
+async fn uncertain_start_requires_pinned_disposal_and_never_expires_into_takeover() {
     for absent in [false, true] {
         let stub = Stub::default();
         stub.start_stalled.store(true, Ordering::SeqCst);
@@ -762,12 +780,8 @@ async fn uncertain_start_closes_caller_id_but_retains_account_until_lease_expiry
         );
         assert_eq!(stub.closed.load(Ordering::SeqCst), 1);
         assert_eq!(stub.options_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            reserve(&state, &scope, account_id).await.unwrap_err().code,
-            ErrorCode::Conflict
-        );
         let after_expiry = Utc::now() + geo_domain::CHANNEL_EXECUTION_LEASE;
-        state
+        let next = state
             .channel_job_repository()
             .reserve_account(
                 &scope,
@@ -776,8 +790,12 @@ async fn uncertain_start_closes_caller_id_but_retains_account_until_lease_expiry
                 after_expiry,
                 after_expiry + geo_domain::CHANNEL_EXECUTION_LEASE,
             )
-            .await
-            .unwrap();
+            .await;
+        if absent {
+            assert_eq!(next.unwrap_err().code, ErrorCode::Conflict);
+        } else {
+            next.unwrap();
+        }
         server.abort();
     }
 }
@@ -810,6 +828,60 @@ async fn failed_or_stalled_close_never_returns_options_or_releases_the_account()
         );
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn mismatched_disposal_retains_durable_owner_until_exact_proof_after_restart() {
+    let stub = Stub::default();
+    stub.close_wrong_generation.store(true, Ordering::SeqCst);
+    let (state, scope, account_id, server) = boundary_fixture(&stub).await;
+    assert_eq!(
+        discover(&state, &scope, account_id).await.unwrap_err().code,
+        ErrorCode::DependencyUnavailable
+    );
+    let session_id = stub.started_ids.lock().await[0];
+    let operation_scope = crate::browser_operations::execution_scope(&scope, session_id);
+    let repository = state.channel_job_repository();
+    let operation = repository
+        .get_browser_operation(&operation_scope, session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    repository
+        .release_account(&scope, account_id, operation.reservation_id)
+        .await
+        .unwrap();
+    let after_expiry = operation.expires_at + chrono::Duration::seconds(1);
+    assert_eq!(
+        repository
+            .reserve_account(
+                &scope,
+                account_id,
+                Uuid::new_v4(),
+                after_expiry,
+                after_expiry + geo_domain::CHANNEL_EXECUTION_LEASE,
+            )
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    // Recreate the application service with the shared durable repository: no
+    // process-local session map is available to authorize this disposal.
+    let restored = ChannelService::persistent(
+        Arc::clone(&state.channel_service().repository),
+        &"17".repeat(32),
+        state.channel_service().browser.clone(),
+    )
+    .unwrap()
+    .with_operation_repository(Arc::clone(&repository));
+    stub.close_wrong_generation.store(false, Ordering::SeqCst);
+    restored
+        .close_owned_browser(&scope, session_id)
+        .await
+        .unwrap();
+    reserve(&state, &scope, account_id).await.unwrap();
+    server.abort();
 }
 
 #[tokio::test]
