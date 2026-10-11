@@ -20,6 +20,8 @@ pub use project_serp_settings::*;
 mod source_channel_recommendations;
 pub use source_channel_recommendations::*;
 mod channel_imports;
+mod proxy_pools;
+pub use proxy_pools::*;
 mod channels;
 pub use channel_imports::*;
 pub use channels::*;

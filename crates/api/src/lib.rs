@@ -26,6 +26,7 @@ pub mod content_runtime;
 mod content_tools;
 mod desktop_gateway;
 pub mod distribution;
+mod proxy_pools;
 mod source_channel_recommendations;
 pub use content::ContentService;
 pub use content_distribution_requests::{
@@ -2425,8 +2426,10 @@ pub fn router(state: AppState) -> Router {
 
     // Operator pool scope comes from deployment configuration plus trusted
     // membership, not a customer tenant selector. The catalogue is session-only.
-    // Credential imports own encrypted, per-row durable idempotency. Keep this
-    // router outside the generic body-hash/response-cache middleware.
+    // Credential imports own encrypted, per-row durable idempotency. Proxy
+    // inventory accepts write-only secrets and uses update CAS, not create
+    // replay. Keep this router outside generic body-hash/response caching,
+    // even when a caller supplies an Idempotency-Key.
     let operator_channel_routes = channels::operator_routes()
         .route(
             "/operator/connector-capabilities",
