@@ -128,7 +128,7 @@ async fn disposal_requires_exact_success_receipt_and_sends_generation() {
         let (bridge, server) = serve(app).await;
         let result = bridge.dispose_in_generation(session_id, generation).await;
         if accepted {
-            let receipt = result.ok().expect("exact receipt");
+            let receipt = result.expect("exact receipt");
             assert_eq!(receipt.session_id(), session_id);
             assert_eq!(receipt.generation(), generation);
         } else {
