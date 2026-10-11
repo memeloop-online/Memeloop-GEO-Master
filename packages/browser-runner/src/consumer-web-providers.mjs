@@ -26,4 +26,16 @@ export const consumerWebProviders = Object.freeze({
     loginEntryAvailable: true,
     loginSupported: true,
   }),
+  qianwen: Object.freeze({
+    origin: "https://www.qianwen.com",
+    entry: "https://www.qianwen.com/",
+    loginEntryAvailable: true,
+    loginSupported: true,
+  }),
+  yuanbao: Object.freeze({
+    origin: "https://yuanbao.tencent.com",
+    entry: "https://yuanbao.tencent.com/",
+    loginEntryAvailable: true,
+    loginSupported: false,
+  }),
 });
