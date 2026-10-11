@@ -152,6 +152,98 @@ impl BrowserBridge {
         format!("{}/v1/sessions/{id}{suffix}", self.base_url)
     }
 
+    /// Discover a generation before persisting a new session's ownership.
+    /// This cannot establish the generation that owns an existing session.
+    pub async fn lifecycle_generation(&self) -> Result<Uuid, AppError> {
+        let response = self
+            .client
+            .get(format!("{}/v1/lifecycle", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| Self::lifecycle_unavailable())?;
+        let receipt: RunnerLifecycle = Self::response(response).await?;
+        Ok(receipt.generation)
+    }
+
+    /// The caller must persist the chosen generation before starting a session.
+    /// A missing generation echo (including from an older runner) is ambiguous.
+    pub async fn start_in_generation(
+        &self,
+        session_id: Uuid,
+        expected_generation: Uuid,
+        platform: &str,
+        proxy: Option<BrowserProxy>,
+        storage_state: Option<&serde_json::Value>,
+    ) -> Result<(), AppError> {
+        let started = async {
+            let response = self
+                .client
+                .post(format!("{}/v1/sessions", self.base_url))
+                .bearer_auth(&self.token)
+                .json(&StartBrowserSession {
+                    session_id,
+                    platform,
+                    proxy,
+                    storage_state,
+                    expected_generation: Some(expected_generation),
+                })
+                .send()
+                .await
+                .map_err(|_| Self::lifecycle_unavailable())?;
+            let receipt: GenerationStartResponse = Self::response(response).await?;
+            if receipt.session_id != session_id || receipt.generation != expected_generation {
+                return Err(Self::lifecycle_unavailable());
+            }
+            Ok(())
+        }
+        .await;
+        if started.is_err() {
+            // Never issue legacy DELETE after a pinned start: the endpoint
+            // could now route to a different instance. Failure stays ambiguous.
+            let _ = self
+                .dispose_in_generation(session_id, expected_generation)
+                .await;
+        }
+        started
+    }
+
+    /// Confirm local browser resource disposal for a durably recorded owner.
+    /// An ordinary 404, current generation discovery, or legacy close is not
+    /// proof. This receipt does not prove deletion of provider conversations.
+    pub async fn dispose_in_generation(
+        &self,
+        session_id: Uuid,
+        expected_generation: Uuid,
+    ) -> Result<BrowserDisposalReceipt, AppError> {
+        let response = self
+            .client
+            .post(self.endpoint(session_id, "/dispose"))
+            .bearer_auth(&self.token)
+            .json(&DisposeBrowserSession {
+                expected_generation,
+            })
+            .send()
+            .await
+            .map_err(|_| Self::lifecycle_unavailable())?;
+        let receipt: DisposalResponse = Self::response(response).await?;
+        if receipt.session_id != session_id || receipt.generation != expected_generation {
+            return Err(Self::lifecycle_unavailable());
+        }
+        let DisposalState::Disposed = receipt.state;
+        Ok(BrowserDisposalReceipt {
+            session_id: receipt.session_id,
+            generation: receipt.generation,
+        })
+    }
+
+    fn lifecycle_unavailable() -> AppError {
+        AppError::new(
+            ErrorCode::DependencyUnavailable,
+            "browser lifecycle confirmation unavailable",
+        )
+    }
+
     async fn response<T: serde::de::DeserializeOwned>(
         mut response: reqwest::Response,
     ) -> Result<T, AppError> {
@@ -211,6 +303,7 @@ impl BrowserBridge {
                     platform,
                     proxy,
                     storage_state,
+                    expected_generation: None,
                 })
                 .send()
                 .await
@@ -741,6 +834,56 @@ struct StartBrowserSession<'a> {
     proxy: Option<BrowserProxy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     storage_state: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_generation: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerLifecycle {
+    generation: Uuid,
+}
+
+#[derive(Deserialize)]
+struct GenerationStartResponse {
+    session_id: Uuid,
+    generation: Uuid,
+}
+
+#[derive(Serialize)]
+struct DisposeBrowserSession {
+    expected_generation: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DisposalState {
+    Disposed,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisposalResponse {
+    session_id: Uuid,
+    generation: Uuid,
+    state: DisposalState,
+}
+
+/// Constructed only after authenticated, exact-generation disposal confirmation.
+/// Deliberately not deserializable from caller-provided data.
+pub struct BrowserDisposalReceipt {
+    session_id: Uuid,
+    generation: Uuid,
+}
+
+impl BrowserDisposalReceipt {
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub fn generation(&self) -> Uuid {
+        self.generation
+    }
 }
 
 #[derive(Deserialize)]
@@ -768,6 +911,10 @@ pub struct VerifiedBrowserSession {
     pub identity: BrowserIdentity,
     pub storage_state: serde_json::Value,
 }
+
+#[cfg(test)]
+#[path = "browser_bridge_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod measurement_options_tests {
