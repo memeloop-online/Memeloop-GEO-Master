@@ -4,7 +4,9 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { AuthProvider } from "../auth/AuthProvider";
+import { AuthProvider, useAuth } from "../auth/AuthProvider";
+import { AppearanceProvider } from "../appearance/AppearanceProvider";
+import { OperatorAppearancePage } from "./OperatorAppearancePage";
 import i18n from "../i18n";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
 import {
@@ -168,6 +170,19 @@ function mockApi(
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     requests.push({ path, method, body, url });
+    if (
+      path.endsWith("/public/appearance") ||
+      path.endsWith("/operator/appearance")
+    )
+      return Promise.resolve(
+        response({
+          display_name: session.operator.display_name,
+          logo_url: null,
+          primary_color: "#2563EB",
+          default_locale: "zh-CN",
+          revision: 1,
+        }),
+      );
     if (path.endsWith("/auth/session"))
       return Promise.resolve(
         response(
@@ -305,6 +320,10 @@ function renderPage(
   );
 }
 
+function AuthStatusProbe() {
+  return <span data-testid="auth-status">{useAuth().status}</span>;
+}
+
 function renderOperator() {
   return render(
     <QueryClientProvider
@@ -314,6 +333,7 @@ function renderOperator() {
     >
       <FluentProvider theme={webLightTheme}>
         <AuthProvider>
+          <AuthStatusProbe />
           <MemoryRouter>
             <OperatorAccountsPage />
           </MemoryRouter>
@@ -1205,6 +1225,60 @@ describe("account page", () => {
   );
 });
 
+describe("operator appearance access", () => {
+  it.each(["operator_admin", "resource_admin", "tenant_admin"])(
+    "uses the canonical wire role for appearance access (%s)",
+    async (role) => {
+      const { requests } = mockApi([], true, unverifiedCapability, role);
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      render(
+        <FluentProvider theme={webLightTheme}>
+          <QueryClientProvider client={client}>
+            <AppearanceProvider>
+              <AuthProvider>
+                <AuthStatusProbe />
+                <MemoryRouter>
+                  <OperatorAppearancePage />
+                </MemoryRouter>
+              </AuthProvider>
+            </AppearanceProvider>
+          </QueryClientProvider>
+        </FluentProvider>,
+      );
+      if (role === "operator_admin") {
+        expect(
+          await screen.findByDisplayValue(session.operator.display_name),
+        ).toBeVisible();
+        expect(
+          screen.getByRole("button", { name: i18n.t("appearance.save") }),
+        ).toBeEnabled();
+        expect(
+          requests.some((entry) => entry.path.endsWith("/operator/appearance")),
+        ).toBe(true);
+      } else {
+        await waitFor(() =>
+          expect(screen.getByTestId("auth-status")).toHaveTextContent(
+            "authenticated",
+          ),
+        );
+        expect(
+          await screen.findByRole("heading", {
+            name: i18n.t("appearance.unavailable"),
+          }),
+        ).toBeVisible();
+        expect(
+          screen.queryByRole("button", { name: i18n.t("appearance.save") }),
+        ).toBeNull();
+        expect(
+          requests.some((entry) => entry.path.endsWith("/operator/appearance")),
+        ).toBe(false);
+      }
+    },
+  );
+});
+
 describe("operator pool", () => {
   it("uses the same noVNC desktop for operator login", async () => {
     const { requests } = mockApi([account], true);
@@ -1227,11 +1301,45 @@ describe("operator pool", () => {
   });
 
   it("offers appearance settings to OEM admins", async () => {
-    mockApi([], true, unverifiedCapability, "oem_admin");
+    const { requests } = mockApi(
+      [],
+      true,
+      unverifiedCapability,
+      "operator_admin",
+    );
     renderOperator();
     expect(
       await screen.findByRole("link", { name: "工作区外观" }),
     ).toHaveAttribute("href", "/ops/appearance");
+    expect(
+      await screen.findByRole("button", { name: "创建并登录总部账号" }),
+    ).toBeEnabled();
+    expect(
+      requests.some((entry) =>
+        entry.path.endsWith("/operator/channel-accounts"),
+      ),
+    ).toBe(true);
+  });
+  it("denies customer admins access to the operator pool", async () => {
+    const { requests } = mockApi(
+      [],
+      true,
+      unverifiedCapability,
+      "tenant_admin",
+    );
+    renderOperator();
+    await waitFor(() =>
+      expect(screen.getByTestId("auth-status")).toHaveTextContent(
+        "authenticated",
+      ),
+    );
+    expect(
+      await screen.findByText("只有总部资源管理员可以管理共享账号资源池。"),
+    ).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "账号资源池" })).toBeNull();
+    expect(requests.some((entry) => entry.path.includes("/operator/"))).toBe(
+      false,
+    );
   });
   it("does not offer appearance settings to resource admins", async () => {
     mockApi([], true);
