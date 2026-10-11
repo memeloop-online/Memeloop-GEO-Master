@@ -20,6 +20,7 @@ import {
   listChannelAccounts,
   listChannelGroups,
   listPoolAccounts,
+  listPoolProjects,
   unassignPoolAccount,
   updateChannelAccount,
   updateOperatorConnectorCapability,
@@ -132,6 +133,12 @@ const snapshot = {
   phase: "login_required",
   identity: null,
 };
+const assignableProject = {
+  tenant_id: "tenant-2",
+  project_id: "project-2",
+  display_name: "示例项目",
+  tenant_display_name: "示例客户",
+};
 const unverifiedCapability: OperatorConnectorCapability = {
   platform_id: "zhihu",
   placement_slot: "primary",
@@ -170,6 +177,10 @@ function mockApi(
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     requests.push({ path, method, body, url });
+    if (path.endsWith("/operator/channel-projects"))
+      return Promise.resolve(
+        response({ items: [assignableProject], next_cursor: null }),
+      );
     if (
       path.endsWith("/public/appearance") ||
       path.endsWith("/operator/appearance")
@@ -321,7 +332,13 @@ function renderPage(
 }
 
 function AuthStatusProbe() {
-  return <span data-testid="auth-status">{useAuth().status}</span>;
+  const auth = useAuth();
+  return (
+    <>
+      <span data-testid="auth-status">{auth.status}</span>
+      <button onClick={() => void auth.refresh()}>Refresh test session</button>
+    </>
+  );
 }
 
 function renderOperator() {
@@ -352,6 +369,18 @@ afterEach(() => {
 });
 
 describe("channel API scope", () => {
+  it("encodes project search and pagination without caller-supplied identity selectors", async () => {
+    const { requests } = mockApi([], true);
+    await listPoolProjects("Example & Team", "cursor/next");
+    const request = requests.find((entry) =>
+      entry.path.endsWith("/operator/channel-projects"),
+    )!;
+    expect(Object.fromEntries(request.url.searchParams)).toEqual({
+      search: "Example & Team",
+      cursor: "cursor/next",
+      limit: "25",
+    });
+  });
   it("keeps project capability reads scoped and passes only revisioned settings to operator PATCH", async () => {
     const { requests } = mockApi();
     await listProjectConnectorCapabilities("tenant-1", "project-1");
@@ -1280,6 +1309,212 @@ describe("operator appearance access", () => {
 });
 
 describe("operator pool", () => {
+  it("searches and loads additional projects while clearing a previous selection on search", async () => {
+    const { fetchMock } = mockApi([account], true);
+    const original = fetchMock.getMockImplementation()!;
+    const queries: URLSearchParams[] = [];
+    fetchMock.mockImplementation((request, init) => {
+      const url = new URL(String(request), "http://localhost");
+      if (url.pathname.endsWith("/operator/channel-projects")) {
+        queries.push(url.searchParams);
+        const searched = Boolean(url.searchParams.get("search"));
+        const next = Boolean(url.searchParams.get("cursor"));
+        return Promise.resolve(
+          response({
+            items: searched
+              ? []
+              : next
+                ? [
+                    {
+                      ...assignableProject,
+                      project_id: "project-3",
+                      display_name: "另一个项目",
+                      tenant_display_name: null,
+                    },
+                  ]
+                : [assignableProject],
+            next_cursor: searched || next ? null : "next-page",
+          }),
+        );
+      }
+      return original(request, init);
+    });
+    renderOperator();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "项目分配" }),
+    );
+    const assign = screen.getByRole("button", { name: "分配项目" });
+    expect(assign).toBeDisabled();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "加载更多项目" }),
+    );
+    await screen.findByRole("option", { name: "另一个项目" });
+    expect(
+      screen.getByRole("option", { name: "示例项目 · 示例客户" }),
+    ).toBeVisible();
+    expect(queries.at(-1)?.get("cursor")).toBe("next-page");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "目标项目" }),
+      "tenant-2:project-3",
+    );
+    expect(assign).toBeEnabled();
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "搜索项目" }),
+      "x",
+    );
+    expect(await screen.findByText("未找到可分配的项目。")).toBeVisible();
+    expect(assign).toBeDisabled();
+    expect(queries.at(-1)?.get("search")).toBe("x");
+    expect(queries.at(-1)?.has("cursor")).toBe(false);
+  });
+
+  it("allows retrying project discovery and preserves assignments outside the current results", async () => {
+    const { fetchMock, requests } = mockApi([account], true);
+    const original = fetchMock.getMockImplementation()!;
+    let attempts = 0;
+    fetchMock.mockImplementation((request, init) => {
+      const path = new URL(String(request), "http://localhost").pathname;
+      if (path.endsWith("/operator/channel-projects")) {
+        attempts++;
+        if (attempts === 1)
+          return Promise.resolve(
+            response({ message: "Projects temporarily unavailable" }, 503),
+          );
+      }
+      if (
+        path.endsWith("/account-1/assignments") &&
+        (init?.method ?? "GET") === "GET"
+      )
+        return Promise.resolve(
+          response({
+            items: [{ tenant_id: "tenant-3", project_id: "project-9" }],
+          }),
+        );
+      return original(request, init);
+    });
+    renderOperator();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "项目分配" }),
+    );
+    expect(
+      await screen.findByText("Projects temporarily unavailable"),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "分配项目" })).toBeDisabled();
+    expect(await screen.findByText("tenant-3 / project-9")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(
+      await screen.findByRole("option", { name: "示例项目 · 示例客户" }),
+    ).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "撤销分配" }));
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (entry) =>
+            entry.method === "DELETE" &&
+            entry.path.endsWith("/account-1/assignments"),
+        )?.body,
+      ).toEqual({ tenant_id: "tenant-3", project_id: "project-9" }),
+    );
+  });
+
+  it.each(["user", "operator"])(
+    "resets project search, pagination and selection when %s changes",
+    async (changed) => {
+      const { fetchMock } = mockApi([account], true);
+      const original = fetchMock.getMockImplementation()!;
+      let switched = false;
+      const queries: { switched: boolean; query: URLSearchParams }[] = [];
+      fetchMock.mockImplementation((request, init) => {
+        const url = new URL(String(request), "http://localhost");
+        if (url.pathname.endsWith("/auth/session") && switched)
+          return Promise.resolve(
+            response({
+              ...session,
+              user: {
+                ...session.user,
+                id: changed === "user" ? "user-2" : session.user.id,
+              },
+              operator: {
+                ...session.operator,
+                id: changed === "operator" ? "operator-2" : session.operator.id,
+              },
+              memberships: [
+                { ...session.memberships[0], role: "resource_admin" },
+              ],
+            }),
+          );
+        if (url.pathname.endsWith("/operator/channel-projects")) {
+          queries.push({ switched, query: url.searchParams });
+          return Promise.resolve(
+            response({
+              items: switched
+                ? []
+                : url.searchParams.has("cursor")
+                  ? [{ ...assignableProject, project_id: "project-3" }]
+                  : [assignableProject],
+              next_cursor:
+                switched || url.searchParams.has("cursor") ? null : "next-page",
+            }),
+          );
+        }
+        return original(request, init);
+      });
+      renderOperator();
+      await userEvent.click(
+        await screen.findByRole("button", { name: "项目分配" }),
+      );
+      await userEvent.type(
+        screen.getByRole("textbox", { name: "搜索项目" }),
+        "x",
+      );
+      await userEvent.click(
+        await screen.findByRole("button", { name: "加载更多项目" }),
+      );
+      await waitFor(() =>
+        expect(queries.at(-1)?.query.get("cursor")).toBe("next-page"),
+      );
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", { name: "目标项目" }),
+        "tenant-2:project-2",
+      );
+      expect(screen.getByRole("button", { name: "分配项目" })).toBeEnabled();
+      switched = true;
+      await userEvent.click(
+        screen.getByRole("button", { name: "Refresh test session" }),
+      );
+      await waitFor(() =>
+        expect(queries.some((entry) => entry.switched)).toBe(true),
+      );
+      expect(screen.getByRole("textbox", { name: "搜索项目" })).toHaveValue("");
+      expect(screen.getByRole("button", { name: "分配项目" })).toBeDisabled();
+      expect(
+        queries
+          .filter((entry) => entry.switched)
+          .every(
+            (entry) => !entry.query.get("search") && !entry.query.has("cursor"),
+          ),
+      ).toBe(true);
+    },
+  );
+
+  it("localizes the project picker in English", async () => {
+    await i18n.changeLanguage("en");
+    mockApi([account], true);
+    renderOperator();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "项目分配" }),
+    );
+    expect(
+      screen.getByRole("textbox", { name: "Search projects" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("combobox", { name: "Target project" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Assign project" }),
+    ).toBeDisabled();
+  });
+
   it("uses the same noVNC desktop for operator login", async () => {
     const { requests } = mockApi([account], true);
     renderOperator();
@@ -1475,13 +1710,11 @@ describe("operator pool", () => {
     expect(await screen.findByText("已识别账号")).toBeTruthy();
     expect(screen.getAllByText("共享组").length).toBeGreaterThan(0);
     await userEvent.click(screen.getByRole("button", { name: "项目分配" }));
-    await userEvent.type(
-      screen.getByRole("textbox", { name: "目标租户 ID" }),
-      "tenant-2",
-    );
-    await userEvent.type(
-      screen.getByRole("textbox", { name: "目标项目 ID" }),
-      "project-2",
+    expect(screen.queryByRole("textbox", { name: "目标租户 ID" })).toBeNull();
+    await screen.findByRole("option", { name: "示例项目 · 示例客户" });
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "目标项目" }),
+      "tenant-2:project-2",
     );
     await userEvent.click(screen.getByRole("button", { name: "分配项目" }));
     await screen.findByText("共享账号已分配给项目。");

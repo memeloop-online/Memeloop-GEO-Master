@@ -183,7 +183,10 @@ pub fn supported_channel(platform: &str) -> bool {
 /// Registered account namespaces, not a claim of installed login or measurement
 /// support. Those capabilities belong to the authenticated running adapter.
 pub fn consumer_web_provider(platform: &str) -> bool {
-    matches!(platform, "kimi" | "doubao" | "deepseek" | "glm")
+    matches!(
+        platform,
+        "kimi" | "doubao" | "deepseek" | "glm" | "qianwen" | "yuanbao"
+    )
 }
 
 fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {

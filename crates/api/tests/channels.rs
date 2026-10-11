@@ -874,6 +874,92 @@ async fn only_pool_tenant_admin_roles_can_manage_pool() {
 }
 
 #[tokio::test]
+async fn operator_project_directory_guards_scope_and_validates_queries() {
+    for (role, matching_pool, allowed) in [
+        (Role::Operator, true, false),
+        (Role::ResourceAdmin, false, false),
+        (Role::ResourceAdmin, true, true),
+        (Role::OemAdmin, true, true),
+    ] {
+        let (app, project, cookie, _) = pool_fixture(role, matching_pool).await;
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/v1/operator/channel-projects",
+                Some(&cookie),
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if allowed {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        if !allowed {
+            continue;
+        }
+        let body = json_body(response).await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["project_id"], project);
+        assert_eq!(body["items"][0]["display_name"], "Pool test");
+        assert_eq!(body["items"][0].as_object().unwrap().len(), 4);
+        assert!(body["next_cursor"].is_null());
+        for query in [
+            "limit=0",
+            "limit=101",
+            "cursor=invalid",
+            "cursor=",
+            "tenant_id=ignored",
+            "operator_id=ignored",
+            "project_id=ignored",
+            &format!("search={}", "a".repeat(201)),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/api/v1/operator/channel-projects?{query}"),
+                    Some(&cookie),
+                    None,
+                    String::new(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        }
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/v1/operator/channel-projects?search=missing",
+                Some(&cookie),
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["items"], json!([]));
+        let response = app
+            .oneshot(request(
+                "GET",
+                "/api/v1/operator/channel-projects",
+                None,
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
 async fn platform_catalogue_requires_session_but_no_tenant_selector() {
     let (app, _, cookie, _) = fixture().await;
     let anonymous = app
@@ -914,7 +1000,9 @@ async fn platform_catalogue_requires_session_but_no_tenant_selector() {
             "kimi",
             "doubao",
             "deepseek",
-            "glm"
+            "glm",
+            "qianwen",
+            "yuanbao"
         ]
     );
     for item in items {

@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ContentProjectGuard, CycleReportView, InitialSource, PendingSuccessorCycle, Project,
-    ProjectCreate, ProjectId, ProjectPatch, ProjectRepository, ProjectSettings,
-    ProjectStartAcceptance, ProjectStartCommand, ProjectStartView, ProjectStatus, ResourceMode,
-    StartAcceptanceStatus, TenantScope, UpdateProject, next_calendar_week_window,
-    previous_calendar_week_window, settings_hash, start_request_hash,
+    AppError, ContentProjectGuard, CycleReportView, InitialSource, OperatorId, OperatorProjectPage,
+    OperatorProjectSummary, PendingSuccessorCycle, Project, ProjectCreate, ProjectId, ProjectPatch,
+    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
+    ProjectStartView, ProjectStatus, ResourceMode, StartAcceptanceStatus, TenantScope,
+    UpdateProject, next_calendar_week_window, previous_calendar_week_window, settings_hash,
+    start_request_hash, validate_operator_project_page,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -447,6 +448,48 @@ fn scope_predicate<'a>(builder: &mut QueryBuilder<'a, Postgres>, scope: &'a Tena
 
 #[async_trait]
 impl ProjectRepository for PgProjectRepository {
+    async fn list_operator_page(
+        &self,
+        operator_id: OperatorId,
+        search: &str,
+        limit: usize,
+        cursor: Option<Uuid>,
+    ) -> Result<OperatorProjectPage, AppError> {
+        validate_operator_project_page(search, limit)?;
+        let mut rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+            "SELECT p.project_id,p.tenant_id,p.display_name,t.display_name \
+             FROM projects p JOIN tenants t \
+               ON t.tenant_id=p.tenant_id AND t.operator_id=p.operator_id \
+             WHERE p.operator_id=$1 AND ($2::uuid IS NULL OR p.project_id>$2) \
+               AND (strpos(lower(p.display_name),lower($3))>0 \
+                    OR strpos(lower(p.slug),lower($3))>0) \
+             ORDER BY p.project_id LIMIT $4",
+        )
+        .bind(operator_id.as_uuid())
+        .bind(cursor)
+        .bind(search.trim())
+        .bind((limit + 1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_database_error)?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let next_cursor = has_more.then(|| rows.last().unwrap().0.to_string());
+        Ok(OperatorProjectPage {
+            items: rows
+                .into_iter()
+                .map(
+                    |(project, tenant, display_name, tenant_name)| OperatorProjectSummary {
+                        project_id: project.into(),
+                        tenant_id: tenant.into(),
+                        display_name,
+                        tenant_display_name: Some(tenant_name),
+                    },
+                )
+                .collect(),
+            next_cursor,
+        })
+    }
     async fn hold_measurement_project<'a>(
         &'a self,
         scope: &TenantScope,

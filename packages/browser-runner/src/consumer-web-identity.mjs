@@ -3,6 +3,15 @@ import { consumerWebProviders } from "./consumer-web-providers.mjs";
 // Public consumer client request contracts inspected 2026-10-10. These are
 // read-only account probes, not inference, token-refresh or login protocols.
 const probes = Object.freeze({
+  qianwen: {
+    // Official web SDK's read-only membership/profile request. This is the
+    // sole cross-origin exception; neither origin nor endpoint is overridable.
+    url: "https://api.qianwen.com/growth/user/benefit/user/member/info",
+    method: "POST",
+    body: '{"clientChannel":"PC"}',
+    headers: { "Content-Type": "application/json" },
+    credential: "session",
+  },
   glm: {
     path: "/chatglm/user-api/user/info",
     headers: {
@@ -70,10 +79,16 @@ export function doubaoIdentity(data) {
   return identity(user.user_id_str, user.name, true);
 }
 
+export function qianwenIdentity(data) {
+  if (data?.success !== true || data?.failed !== false) return null;
+  return identity(data.data?.userId, data.data?.userNick, true);
+}
+
 const identities = {
   glm: glmIdentity,
   deepseek: deepseekIdentity,
   doubao: doubaoIdentity,
+  qianwen: qianwenIdentity,
 };
 
 async function probeAccount(page, provider, trustedOrigin) {
@@ -99,15 +114,16 @@ async function probeAccount(page, provider, trustedOrigin) {
           if (typeof token !== "string" || !token.trim()) return null;
           headers.Authorization = `Bearer ${token}`;
         }
-        const response = await fetch(spec.path, {
-          method: "GET",
-          credentials: "same-origin",
+        const response = await fetch(spec.url ?? spec.path, {
+          method: spec.method ?? "GET",
+          credentials: provider === "qianwen" ? "include" : "same-origin",
+          ...(spec.body ? { body: spec.body } : {}),
           redirect: "error",
           signal: AbortSignal.timeout(10_000),
           headers,
         });
         const matchesResponseUrl = () => {
-          const expected = `${origin}${spec.path}`;
+          const expected = spec.url ?? `${origin}${spec.path}`;
           if (!spec.signedQueryParameters) return response.url === expected;
           try {
             const actual = new URL(response.url);
@@ -139,6 +155,7 @@ async function probeAccount(page, provider, trustedOrigin) {
         };
         if (
           response.status !== 200 ||
+          response.redirected ||
           !matchesResponseUrl() ||
           !/^application\/json(?:\s*;|$)/i.test(
             response.headers.get("content-type") ?? "",
@@ -170,6 +187,15 @@ async function probeAccount(page, provider, trustedOrigin) {
               : null;
         // Only explicit identity fields leave the page. Do not transfer tokens,
         // email, mobile, response diagnostics, or unrelated profile fields.
+        if (provider === "qianwen")
+          return {
+            success: scalar(body?.success),
+            failed: scalar(body?.failed),
+            data: {
+              userId: scalar(body?.data?.userId),
+              userNick: scalar(body?.data?.userNick),
+            },
+          };
         if (provider === "glm")
           return {
             status: scalar(body?.status),
@@ -224,3 +250,6 @@ export const probeDoubaoAccount = (
   page,
   { trustedOrigin = consumerWebProviders.doubao.origin } = {},
 ) => probeAccount(page, "doubao", trustedOrigin);
+// Deliberately no origin/endpoint override: test via browser routing instead.
+export const probeQianwenAccount = (page) =>
+  probeAccount(page, "qianwen", consumerWebProviders.qianwen.origin);
