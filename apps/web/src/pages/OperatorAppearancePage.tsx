@@ -26,7 +26,7 @@ export function OperatorAppearancePage() {
   const { session } = useAuth();
   const { refreshAppearance } = useAppearance();
   const allowed = session?.memberships.some(
-    (membership) => membership.role === "oem_admin",
+    (membership) => membership.role === "operator_admin",
   );
   const [appearance, setAppearance] = useState<Appearance>();
   const [name, setName] = useState("");
