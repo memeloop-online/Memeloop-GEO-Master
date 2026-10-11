@@ -1295,7 +1295,8 @@ export function OperatorAccountsPage() {
   const allowed = Boolean(
     session?.memberships.some(
       (membership) =>
-        membership.role === "oem_admin" || membership.role === "resource_admin",
+        membership.role === "operator_admin" ||
+        membership.role === "resource_admin",
     ),
   );
   const ownerKey = [session?.user.id, session?.operator.id];
@@ -1484,7 +1485,7 @@ export function OperatorAccountsPage() {
             总部连接并维护共享账号，再明确分配给客户项目。客户不能重新登录或修改总部账号。
           </p>
           {session?.memberships.some(
-            (membership) => membership.role === "oem_admin",
+            (membership) => membership.role === "operator_admin",
           ) && <Link to="/ops/appearance">{t("appearance.title")}</Link>}
         </div>
       </section>
