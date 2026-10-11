@@ -642,6 +642,8 @@ fn platform_catalog(
         ("doubao", "豆包网页", "measurement", false),
         ("deepseek", "DeepSeek 网页", "measurement", false),
         ("glm", "GLM 网页", "measurement", false),
+        ("qianwen", "千问网页", "measurement", false),
+        ("yuanbao", "腾讯元宝网页", "measurement", false),
     ]
     .into_iter()
     .map(|(id, label, purpose, legacy_login)| {
@@ -676,7 +678,7 @@ mod platform_catalog_tests {
     #[test]
     fn entry_login_and_measurement_are_independent_and_fail_closed() {
         let empty = platform_catalog(&[]);
-        for provider in ["doubao", "deepseek", "glm"] {
+        for provider in ["doubao", "deepseek", "glm", "qianwen", "yuanbao"] {
             assert!(geo_domain::supported_channel(provider));
             let item = empty.iter().find(|item| item.id == provider).unwrap();
             assert!(
@@ -1586,6 +1588,35 @@ pub struct NewPoolGroup {
     pub name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorProjectQuery {
+    #[serde(default)]
+    pub search: String,
+    pub cursor: Option<Uuid>,
+    pub limit: Option<usize>,
+}
+
+pub async fn list_operator_projects(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Query(query): Query<OperatorProjectQuery>,
+) -> Result<Json<geo_domain::OperatorProjectPage>, ApiError> {
+    pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
+    let page = state
+        .project_repository()
+        .list_operator_page(
+            auth.operator.id,
+            &query.search,
+            query.limit.unwrap_or(25),
+            query.cursor,
+        )
+        .await
+        .map_err(|e| err(e, context))?;
+    Ok(Json(page))
+}
+
 pub async fn list_pool_groups(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -2252,6 +2283,7 @@ pub fn customer_routes() -> Router<AppState> {
 pub fn operator_routes() -> Router<AppState> {
     Router::new()
         .route("/channel-platforms", get(platforms))
+        .route("/operator/channel-projects", get(list_operator_projects))
         .route(
             "/operator/channel-groups",
             get(list_pool_groups).post(create_pool_group),

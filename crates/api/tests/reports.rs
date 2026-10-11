@@ -4,7 +4,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::SET_COOKIE},
 };
-use chrono::{Duration, Utc};
+use chrono::{Datelike, Duration, FixedOffset, Utc};
 use geo_api::{
     AppState, CSRF_HEADER, EventBus, MemoryIdempotencyStore, MemoryOperationStore,
     RepositoryHostOps, preview_cycle_report, reduce_cycle_report, router,
@@ -34,6 +34,48 @@ struct ReportLookup {
     scope: TenantScope,
     row: PublicationLookupReportObservation,
     invalid_newer: bool,
+}
+
+fn future_report_schedule(now: chrono::DateTime<Utc>) -> geo_domain::ReportSchedule {
+    // These integration tests create evidence on the real clock, including
+    // through HTTP handlers. The default Monday cutoff is already past on
+    // Monday before the report runs, so choose a nearby, safely future cutoff
+    // in the fixture's Asia/Shanghai timezone instead.
+    let local = now.with_timezone(&FixedOffset::east_opt(8 * 60 * 60).unwrap());
+    let weekday = [
+        geo_domain::ReportWeekday::Monday,
+        geo_domain::ReportWeekday::Tuesday,
+        geo_domain::ReportWeekday::Wednesday,
+        geo_domain::ReportWeekday::Thursday,
+        geo_domain::ReportWeekday::Friday,
+        geo_domain::ReportWeekday::Saturday,
+        geo_domain::ReportWeekday::Sunday,
+    ][(local + Duration::days(2)).weekday().num_days_from_monday() as usize];
+    geo_domain::ReportSchedule {
+        report_weekday: weekday,
+        report_local_time: "09:00".into(),
+        cutoff_weekday: weekday,
+        cutoff_local_time: "00:00".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn report_fixture_cutoff_stays_future_across_week_and_year_boundaries() {
+    for start in ["2026-10-11T00:00:00Z", "2026-12-27T00:00:00Z"] {
+        let start = start.parse::<chrono::DateTime<Utc>>().unwrap();
+        for hour in 0..(14 * 24) {
+            let now = start + Duration::hours(hour);
+            let (_, _, cutoff) = geo_domain::previous_calendar_week_window(
+                "Asia/Shanghai",
+                &future_report_schedule(now),
+                now,
+            )
+            .unwrap();
+            assert!(cutoff > now + Duration::days(1), "{now}: {cutoff}");
+            assert!(cutoff <= now + Duration::days(2), "{now}: {cutoff}");
+        }
+    }
 }
 
 #[async_trait]
@@ -205,6 +247,7 @@ async fn fixture() -> (
         market: "US".into(),
         language: "en".into(),
         report_timezone: "Asia/Shanghai".into(),
+        report_schedule: future_report_schedule(Utc::now()),
         initial_sources: vec![geo_domain::InitialSource {
             kind: geo_domain::InitialSourceKind::Text,
             value: "Public product description".into(),

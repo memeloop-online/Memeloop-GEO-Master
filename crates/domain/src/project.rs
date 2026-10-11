@@ -967,8 +967,47 @@ impl ProjectPatch {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorProjectSummary {
+    pub project_id: ProjectId,
+    pub tenant_id: TenantId,
+    pub display_name: String,
+    pub tenant_display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorProjectPage {
+    pub items: Vec<OperatorProjectSummary>,
+    pub next_cursor: Option<String>,
+}
+
+pub fn validate_operator_project_page(search: &str, limit: usize) -> Result<(), AppError> {
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::invalid_request("limit must be between 1 and 100"));
+    }
+    if search.chars().count() > 200 {
+        return Err(AppError::invalid_request(
+            "search must be at most 200 characters",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 pub trait ProjectRepository: Send + Sync {
+    /// Minimal cross-tenant directory for authorized operator resource administrators.
+    /// Callers must authorize operator administration before invoking this method.
+    async fn list_operator_page(
+        &self,
+        _operator_id: OperatorId,
+        _search: &str,
+        _limit: usize,
+        _cursor: Option<Uuid>,
+    ) -> Result<OperatorProjectPage, AppError> {
+        Err(AppError::capability_missing(
+            "operator project directory unavailable",
+        ))
+    }
     /// Keep project eligibility stable through a measurement intent commit.
     /// Draft projects may measure arbitrary topics. Release before network I/O;
     /// no project operation may be awaited while the held read lock is alive.
@@ -1238,6 +1277,44 @@ impl MemoryProjectRepository {
 
 #[async_trait]
 impl ProjectRepository for MemoryProjectRepository {
+    async fn list_operator_page(
+        &self,
+        operator_id: OperatorId,
+        search: &str,
+        limit: usize,
+        cursor: Option<Uuid>,
+    ) -> Result<OperatorProjectPage, AppError> {
+        validate_operator_project_page(search, limit)?;
+        let search = search.trim().to_lowercase();
+        let state = self.state.read().await;
+        let mut projects = state
+            .projects
+            .values()
+            .filter(|project| {
+                project.operator_id == operator_id
+                    && cursor.is_none_or(|cursor| project.id.as_uuid() > cursor)
+                    && (project.display_name.to_lowercase().contains(&search)
+                        || project.slug.to_lowercase().contains(&search))
+            })
+            .collect::<Vec<_>>();
+        projects.sort_by_key(|project| project.id);
+        projects.truncate(limit + 1);
+        let has_more = projects.len() > limit;
+        projects.truncate(limit);
+        let next_cursor = has_more.then(|| projects.last().unwrap().id.to_string());
+        Ok(OperatorProjectPage {
+            items: projects
+                .into_iter()
+                .map(|project| OperatorProjectSummary {
+                    project_id: project.id,
+                    tenant_id: project.tenant_id,
+                    display_name: project.display_name.clone(),
+                    tenant_display_name: None,
+                })
+                .collect(),
+            next_cursor,
+        })
+    }
     async fn hold_measurement_project<'a>(
         &'a self,
         scope: &TenantScope,
@@ -1992,6 +2069,78 @@ mod tests {
     };
     use chrono::{DateTime, Utc};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn operator_directory_is_minimal_literal_paginated_and_operator_scoped() {
+        let repository = MemoryProjectRepository::default();
+        let operator = Uuid::new_v4().into();
+        for (id, owner, name) in [
+            (3, operator, "Third"),
+            (1, operator, "First %_"),
+            (2, operator, "Second"),
+            (4, Uuid::new_v4().into(), "Foreign"),
+        ] {
+            let scope = super::TenantScope::new(owner, Uuid::new_v4().into(), None);
+            repository
+                .insert(
+                    super::Project::new(
+                        Uuid::from_u128(id).into(),
+                        &scope,
+                        format!("slug-{id}"),
+                        name,
+                        ProjectSettings::default(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let first = repository
+            .list_operator_page(operator, "", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(first.items[0].project_id.as_uuid(), Uuid::from_u128(1));
+        assert!(first.items[0].tenant_display_name.is_none());
+        let second = repository
+            .list_operator_page(
+                operator,
+                "",
+                2,
+                Some(Uuid::parse_str(first.next_cursor.as_ref().unwrap()).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].display_name, "Third");
+        assert!(second.next_cursor.is_none());
+        for search in ["%_", "FIRST", "slug-1", "  FIRST  "] {
+            let page = repository
+                .list_operator_page(operator, search, 25, None)
+                .await
+                .unwrap();
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].display_name, "First %_");
+        }
+        assert!(
+            repository
+                .list_operator_page(operator, "", 0, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .list_operator_page(operator, "", 101, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .list_operator_page(operator, &"a".repeat(201), 25, None)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn measurement_project_guard_allows_draft_and_holds_pause_until_intent_commit() {
