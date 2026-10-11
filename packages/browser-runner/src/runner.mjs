@@ -215,6 +215,8 @@ export function createRunner(options = {}) {
           platform,
           placement_slot: "primary",
           connector_version: adapter.connectorVersion,
+          model_discovery_supported:
+            typeof adapter.inspectMeasurementOptions === "function",
           operations: adapter.operations.filter(
             (operation) =>
               operation !== "rich_publish" ||
@@ -574,7 +576,7 @@ export function createRunner(options = {}) {
     const record = session(id);
     if (record.busy) throw new RunnerError(409, "session_busy");
     if (!record.completed) throw new RunnerError(409, "login_required");
-    if (!record.adapter.inspectMeasurementOptions)
+    if (typeof record.adapter.inspectMeasurementOptions !== "function")
       throw new RunnerError(422, "measurement_options_unavailable");
     record.busy = true;
     try {

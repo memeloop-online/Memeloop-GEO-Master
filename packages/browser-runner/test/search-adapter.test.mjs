@@ -267,6 +267,7 @@ test("installed measurement capability is explicitly unverified", async () => {
       operations: ["measure"],
       login_entry_available: true,
       login_supported: true,
+      model_discovery_supported: true,
       verified: false,
     });
   } finally {
