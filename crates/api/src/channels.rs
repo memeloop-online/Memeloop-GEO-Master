@@ -105,7 +105,7 @@ impl ChannelService {
         .into_bytes()
     }
 
-    fn encrypt(
+    pub(crate) fn encrypt(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
@@ -120,7 +120,7 @@ impl ChannelService {
             .map_err(|_| AppError::new(ErrorCode::Internal, "channel secret encryption failed"))
     }
 
-    fn decrypt(
+    pub(crate) fn decrypt(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
@@ -2282,6 +2282,18 @@ pub fn customer_routes() -> Router<AppState> {
 
 pub fn operator_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/operator/channel-account-imports",
+            axum::routing::post(crate::channel_imports::create),
+        )
+        .route(
+            "/operator/channel-account-imports/{import_key}",
+            get(crate::channel_imports::get),
+        )
+        .route(
+            "/operator/channel-account-imports/{import_key}/rows/{row_key}/retry",
+            axum::routing::post(crate::channel_imports::retry),
+        )
         .route("/channel-platforms", get(platforms))
         .route("/operator/channel-projects", get(list_operator_projects))
         .route(

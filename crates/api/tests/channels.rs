@@ -183,6 +183,115 @@ async fn json_body(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
+async fn operator_import_http_is_scoped_durable_secretless_and_not_cached() {
+    let (app, _, cookie, csrf) = pool_fixture(Role::ResourceAdmin, true).await;
+    let path = "/api/v1/operator/channel-account-imports";
+    let input = json!({"import_key":"synthetic-batch","rows":[
+        {"row_key":"row-1","platform":"zhihu","username":"synthetic-user","password":"synthetic-password"},
+        {"row_key":"row-2","platform":"unknown","username":"synthetic-user-2","password":"synthetic-password-2"}
+    ]});
+    // No Idempotency-Key header: the repository owns the boundary and never
+    // stores an unkeyed password-bearing body hash in the HTTP cache.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            path,
+            Some(&cookie),
+            Some(&csrf),
+            input.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let outcome = json_body(response).await;
+    assert_eq!(outcome["rows"][0]["status"], "needs_login");
+    assert_eq!(outcome["rows"][1]["error_code"], "unsupported_platform");
+    assert!(!outcome.to_string().contains("synthetic-password"));
+    assert!(!outcome.to_string().contains("synthetic-user"));
+    let reload = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("{path}/synthetic-batch"),
+            Some(&cookie),
+            None,
+            String::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_body(reload).await, outcome);
+    let retry = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("{path}/synthetic-batch/rows/row-2/retry"),
+            Some(&cookie),
+            Some(&csrf),
+            String::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(json_body(retry).await, outcome);
+    let mut changed = input.clone();
+    changed["rows"][0]["password"] = json!("changed-synthetic-password");
+    let conflict = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            path,
+            Some(&cookie),
+            Some(&csrf),
+            changed.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let malformed = app.clone().oneshot(request("POST", path, Some(&cookie), Some(&csrf),
+        r#"{"import_key":"bad","rows":[{"row_key":"row","platform":"zhihu","username":"x","password":"synthetic-password","group_id":"synthetic-secret"}]}"#.into())).await.unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !json_body(malformed)
+            .await
+            .to_string()
+            .contains("synthetic-secret")
+    );
+    let missing_csrf = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            path,
+            Some(&cookie),
+            None,
+            input.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+    for (role, matching) in [(Role::CustomerAdmin, true), (Role::ResourceAdmin, false)] {
+        let (denied, _, cookie, csrf) = pool_fixture(role, matching).await;
+        for (method, uri, body) in [
+            ("POST", path.to_owned(), input.to_string()),
+            ("GET", format!("{path}/synthetic-batch"), String::new()),
+            (
+                "POST",
+                format!("{path}/synthetic-batch/rows/row-1/retry"),
+                String::new(),
+            ),
+        ] {
+            let response = denied
+                .clone()
+                .oneshot(request(method, &uri, Some(&cookie), Some(&csrf), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+}
+
+#[tokio::test]
 async fn desktop_authorization_is_same_origin_and_cookie_session_bound() {
     use axum::{
         Json,

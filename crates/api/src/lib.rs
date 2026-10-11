@@ -11,6 +11,7 @@ pub use project_ai_model::ProjectConfiguredModelBridge;
 mod agent_runtime;
 mod appearance;
 mod browser_bridge;
+mod channel_imports;
 mod channel_jobs;
 mod channel_tools;
 mod channels;
@@ -2424,6 +2425,8 @@ pub fn router(state: AppState) -> Router {
 
     // Operator pool scope comes from deployment configuration plus trusted
     // membership, not a customer tenant selector. The catalogue is session-only.
+    // Credential imports own encrypted, per-row durable idempotency. Keep this
+    // router outside the generic body-hash/response-cache middleware.
     let operator_channel_routes = channels::operator_routes()
         .route(
             "/operator/connector-capabilities",
