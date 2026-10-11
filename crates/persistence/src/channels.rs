@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PgChannelRepository {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl PgChannelRepository {

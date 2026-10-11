@@ -72,6 +72,7 @@ import {
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { RemoteDesktop } from "../components/RemoteDesktop";
 import { OperatorAccountImport } from "../components/OperatorAccountImport";
+import { OperatorProxyPools } from "../components/OperatorProxyPools";
 import { ProjectAiSettingsPanel } from "./ProjectAiSettingsPanel";
 import { ProjectSerpSettingsPanel } from "./ProjectSerpSettingsPanel";
 import "../i18n/projectSerp";
@@ -1626,6 +1627,10 @@ export function OperatorAccountsPage() {
       )}
       <div className="channel-layout">
         <section className="channel-stack" aria-label="总部账号接入">
+          <details>
+            <summary>{t("proxyPools:title")}</summary>
+            <OperatorProxyPools />
+          </details>
           <OperatorAccountImport
             key={`${session?.user.id}:${session?.operator.id}`}
             storageScope={`${session?.user.id}:${session?.operator.id}`}

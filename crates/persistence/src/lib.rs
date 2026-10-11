@@ -11,6 +11,7 @@ mod auth;
 pub mod bootstrap;
 mod channel_jobs;
 mod channels;
+mod proxy_pools;
 pub use channel_jobs::PgChannelJobRepository;
 pub use channels::PgChannelRepository;
 mod connector_capabilities;

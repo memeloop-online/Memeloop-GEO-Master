@@ -196,7 +196,7 @@ fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {
 }
 
 #[async_trait]
-pub trait ChannelRepository: Send + Sync {
+pub trait ChannelRepository: crate::ProxyPoolRepository + Send + Sync {
     async fn list_import_rows(
         &self,
         operator: crate::OperatorId,
@@ -327,7 +327,10 @@ pub trait ChannelRepository: Send + Sync {
 }
 
 #[derive(Default)]
-struct ChannelMemory {
+pub(crate) struct ChannelMemory {
+    pub(crate) proxy_pools: HashMap<(Uuid, Uuid), crate::ProxyPool>,
+    pub(crate) proxy_members: HashMap<(Uuid, Uuid, Uuid), crate::ProxyPoolMember>,
+    pub(crate) proxy_revisions: HashMap<(Uuid, Uuid, Uuid, Uuid), ChannelSecret>,
     imports: HashMap<(Uuid, String, String), crate::ChannelImportRecord>,
     pool_groups: HashMap<(Uuid, Uuid), PoolGroup>,
     pool_accounts: HashMap<(Uuid, Uuid), PoolAccountRecord>,
@@ -340,7 +343,7 @@ struct ChannelMemory {
 }
 
 #[derive(Clone, Default)]
-pub struct MemoryChannelRepository(Arc<RwLock<ChannelMemory>>);
+pub struct MemoryChannelRepository(pub(crate) Arc<RwLock<ChannelMemory>>);
 
 fn key(scope: &TenantScope, id: Uuid) -> Result<(Uuid, Uuid, Uuid, Uuid), AppError> {
     Ok((
