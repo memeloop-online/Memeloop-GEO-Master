@@ -439,10 +439,12 @@ test("desktop readiness stays independent of identity discovery and rejects unav
     assert.equal((await readiness("desktop")).status, 409);
     endpointFailure = false;
     now = 101;
+    assert.equal((await readiness("desktop")).status, 409);
     assert.equal((await readiness("desktop")).status, 404);
 
     await runner.create({ session_id: "closed", platform: "fixture" });
     closed = true;
+    assert.equal((await readiness("closed")).status, 409);
     assert.equal((await readiness("closed")).status, 404);
     closed = false;
     const restored = runner.create({
