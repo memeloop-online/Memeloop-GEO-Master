@@ -105,7 +105,7 @@ impl ChannelService {
         .into_bytes()
     }
 
-    fn encrypt(
+    pub(crate) fn encrypt(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
@@ -120,7 +120,7 @@ impl ChannelService {
             .map_err(|_| AppError::new(ErrorCode::Internal, "channel secret encryption failed"))
     }
 
-    fn decrypt(
+    pub(crate) fn decrypt(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
@@ -642,6 +642,8 @@ fn platform_catalog(
         ("doubao", "豆包网页", "measurement", false),
         ("deepseek", "DeepSeek 网页", "measurement", false),
         ("glm", "GLM 网页", "measurement", false),
+        ("qianwen", "千问网页", "measurement", false),
+        ("yuanbao", "腾讯元宝网页", "measurement", false),
     ]
     .into_iter()
     .map(|(id, label, purpose, legacy_login)| {
@@ -676,7 +678,7 @@ mod platform_catalog_tests {
     #[test]
     fn entry_login_and_measurement_are_independent_and_fail_closed() {
         let empty = platform_catalog(&[]);
-        for provider in ["doubao", "deepseek", "glm"] {
+        for provider in ["doubao", "deepseek", "glm", "qianwen", "yuanbao"] {
             assert!(geo_domain::supported_channel(provider));
             let item = empty.iter().find(|item| item.id == provider).unwrap();
             assert!(
@@ -765,7 +767,7 @@ pub(crate) fn pool_tenant(
     Ok(tenant_id)
 }
 
-fn trusted_pool_scope(
+pub(crate) fn trusted_pool_scope(
     service: &ChannelService,
     auth: &AuthContext,
 ) -> Result<TenantScope, AppError> {
@@ -1586,6 +1588,35 @@ pub struct NewPoolGroup {
     pub name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorProjectQuery {
+    #[serde(default)]
+    pub search: String,
+    pub cursor: Option<Uuid>,
+    pub limit: Option<usize>,
+}
+
+pub async fn list_operator_projects(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Query(query): Query<OperatorProjectQuery>,
+) -> Result<Json<geo_domain::OperatorProjectPage>, ApiError> {
+    pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
+    let page = state
+        .project_repository()
+        .list_operator_page(
+            auth.operator.id,
+            &query.search,
+            query.limit.unwrap_or(25),
+            query.cursor,
+        )
+        .await
+        .map_err(|e| err(e, context))?;
+    Ok(Json(page))
+}
+
 pub async fn list_pool_groups(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -2251,7 +2282,36 @@ pub fn customer_routes() -> Router<AppState> {
 
 pub fn operator_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/operator/channel-proxy-pools",
+            get(crate::proxy_pools::list_pools).post(crate::proxy_pools::create_pool),
+        )
+        .route(
+            "/operator/channel-proxy-pools/{pool_id}",
+            axum::routing::patch(crate::proxy_pools::patch_pool),
+        )
+        .route(
+            "/operator/channel-proxy-pools/{pool_id}/members",
+            get(crate::proxy_pools::list_members).post(crate::proxy_pools::create_member),
+        )
+        .route(
+            "/operator/channel-proxy-pools/{pool_id}/members/{member_id}",
+            axum::routing::patch(crate::proxy_pools::patch_member),
+        )
+        .route(
+            "/operator/channel-account-imports",
+            axum::routing::post(crate::channel_imports::create),
+        )
+        .route(
+            "/operator/channel-account-imports/{import_key}",
+            get(crate::channel_imports::get),
+        )
+        .route(
+            "/operator/channel-account-imports/{import_key}/rows/{row_key}/retry",
+            axum::routing::post(crate::channel_imports::retry),
+        )
         .route("/channel-platforms", get(platforms))
+        .route("/operator/channel-projects", get(list_operator_projects))
         .route(
             "/operator/channel-groups",
             get(list_pool_groups).post(create_pool_group),

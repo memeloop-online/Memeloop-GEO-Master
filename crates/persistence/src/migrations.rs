@@ -208,6 +208,14 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 49,
         description: "project serp settings",
     },
+    MigrationMetadata {
+        version: 50,
+        description: "operator channel imports",
+    },
+    MigrationMetadata {
+        version: 51,
+        description: "operator proxy pools",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

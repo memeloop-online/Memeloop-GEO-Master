@@ -183,6 +183,269 @@ async fn json_body(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
+async fn proxy_inventory_http_versions_redaction_pagination_and_validation() {
+    let (app, _, cookie, csrf) = pool_fixture(Role::ResourceAdmin, true).await;
+    let base = "/api/v1/operator/channel-proxy-pools";
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            base,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"name":"Synthetic pool"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let pool = json_body(response).await;
+    assert_eq!(pool["version"], 1);
+    assert_eq!(pool["enabled"], true);
+    let members = format!("{base}/{}/members", pool["pool_id"].as_str().unwrap());
+    let mut req = request("POST",&members,Some(&cookie),Some(&csrf),json!({"name":"Synthetic member","proxy":{"server":"http://fixture.invalid:3128","username":"synthetic-user","password":"synthetic-secret"}}).to_string());
+    req.headers_mut()
+        .insert("idempotency-key", "synthetic-key".parse().unwrap());
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let member = json_body(response).await;
+    assert!(!member.to_string().contains("synthetic-secret"));
+    assert!(!member.to_string().contains("synthetic-user"));
+    assert_eq!(member["proxy_server"], "http://fixture.invalid:3128");
+    let path = format!("{members}/{}", member["member_id"].as_str().unwrap());
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &path,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_version":1,"enabled":false}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let changed = json_body(response).await;
+    assert_eq!(changed["version"], 2);
+    assert_eq!(changed["revision_id"], member["revision_id"]);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &path,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_version":1,"enabled":true}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app.clone().oneshot(request("PATCH",&path,Some(&cookie),Some(&csrf),json!({"expected_version":2,"proxy":{"server":"socks5://fixture.invalid:1080","password":"new-synthetic-secret"}}).to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let rotated = json_body(response).await;
+    assert_eq!(rotated["version"], 3);
+    assert_ne!(rotated["revision_id"], member["revision_id"]);
+    for server in [
+        "http://user:secret@fixture.invalid:3128",
+        "http://fixture.invalid:3128/private",
+        "http://fixture.invalid:3128?secret=x",
+        "http://fixture.invalid:3128#secret",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &members,
+                Some(&cookie),
+                Some(&csrf),
+                json!({"name":"Synthetic member","proxy":{"server":server}}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!json_body(response).await.to_string().contains(server));
+    }
+    for query in ["?limit=0", "?limit=101", "?cursor=invalid", "?unknown=1"] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("{base}{query}"),
+                Some(&cookie),
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let response = app
+        .clone()
+        .oneshot(request("GET", &members, Some(&cookie), None, String::new()))
+        .await
+        .unwrap();
+    let list = json_body(response).await;
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert_eq!(list["items"][0]["version"], 3);
+    assert_eq!(list["next_cursor"], Value::Null);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &path,
+            Some(&cookie),
+            Some(&csrf),
+            json!({"expected_version":3,"password":"synthetic-secret"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn proxy_inventory_requires_trusted_resource_scope_and_csrf() {
+    let base = "/api/v1/operator/channel-proxy-pools";
+    for (role, matching) in [(Role::CustomerAdmin, true), (Role::ResourceAdmin, false)] {
+        let (app, _, cookie, csrf) = pool_fixture(role, matching).await;
+        for method in ["GET", "POST"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    method,
+                    base,
+                    Some(&cookie),
+                    Some(&csrf),
+                    json!({"name":"Synthetic pool"}).to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+    let (app, _, cookie, _) = pool_fixture(Role::ResourceAdmin, true).await;
+    let response = app
+        .oneshot(request(
+            "POST",
+            base,
+            Some(&cookie),
+            None,
+            json!({"name":"Synthetic pool"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn operator_import_http_is_scoped_durable_secretless_and_not_cached() {
+    let (app, _, cookie, csrf) = pool_fixture(Role::ResourceAdmin, true).await;
+    let path = "/api/v1/operator/channel-account-imports";
+    let input = json!({"import_key":"synthetic-batch","rows":[
+        {"row_key":"row-1","platform":"zhihu","username":"synthetic-user","password":"synthetic-password"},
+        {"row_key":"row-2","platform":"unknown","username":"synthetic-user-2","password":"synthetic-password-2"}
+    ]});
+    // No Idempotency-Key header: the repository owns the boundary and never
+    // stores an unkeyed password-bearing body hash in the HTTP cache.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            path,
+            Some(&cookie),
+            Some(&csrf),
+            input.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let outcome = json_body(response).await;
+    assert_eq!(outcome["rows"][0]["status"], "needs_login");
+    assert_eq!(outcome["rows"][1]["error_code"], "unsupported_platform");
+    assert!(!outcome.to_string().contains("synthetic-password"));
+    assert!(!outcome.to_string().contains("synthetic-user"));
+    let reload = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("{path}/synthetic-batch"),
+            Some(&cookie),
+            None,
+            String::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_body(reload).await, outcome);
+    let retry = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("{path}/synthetic-batch/rows/row-2/retry"),
+            Some(&cookie),
+            Some(&csrf),
+            String::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(json_body(retry).await, outcome);
+    let mut changed = input.clone();
+    changed["rows"][0]["password"] = json!("changed-synthetic-password");
+    let conflict = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            path,
+            Some(&cookie),
+            Some(&csrf),
+            changed.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let malformed = app.clone().oneshot(request("POST", path, Some(&cookie), Some(&csrf),
+        r#"{"import_key":"bad","rows":[{"row_key":"row","platform":"zhihu","username":"x","password":"synthetic-password","group_id":"synthetic-secret"}]}"#.into())).await.unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !json_body(malformed)
+            .await
+            .to_string()
+            .contains("synthetic-secret")
+    );
+    let missing_csrf = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            path,
+            Some(&cookie),
+            None,
+            input.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+    for (role, matching) in [(Role::CustomerAdmin, true), (Role::ResourceAdmin, false)] {
+        let (denied, _, cookie, csrf) = pool_fixture(role, matching).await;
+        for (method, uri, body) in [
+            ("POST", path.to_owned(), input.to_string()),
+            ("GET", format!("{path}/synthetic-batch"), String::new()),
+            (
+                "POST",
+                format!("{path}/synthetic-batch/rows/row-1/retry"),
+                String::new(),
+            ),
+        ] {
+            let response = denied
+                .clone()
+                .oneshot(request(method, &uri, Some(&cookie), Some(&csrf), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+}
+
+#[tokio::test]
 async fn desktop_authorization_is_same_origin_and_cookie_session_bound() {
     use axum::{
         Json,
@@ -874,6 +1137,92 @@ async fn only_pool_tenant_admin_roles_can_manage_pool() {
 }
 
 #[tokio::test]
+async fn operator_project_directory_guards_scope_and_validates_queries() {
+    for (role, matching_pool, allowed) in [
+        (Role::Operator, true, false),
+        (Role::ResourceAdmin, false, false),
+        (Role::ResourceAdmin, true, true),
+        (Role::OemAdmin, true, true),
+    ] {
+        let (app, project, cookie, _) = pool_fixture(role, matching_pool).await;
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/v1/operator/channel-projects",
+                Some(&cookie),
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if allowed {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        if !allowed {
+            continue;
+        }
+        let body = json_body(response).await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["project_id"], project);
+        assert_eq!(body["items"][0]["display_name"], "Pool test");
+        assert_eq!(body["items"][0].as_object().unwrap().len(), 4);
+        assert!(body["next_cursor"].is_null());
+        for query in [
+            "limit=0",
+            "limit=101",
+            "cursor=invalid",
+            "cursor=",
+            "tenant_id=ignored",
+            "operator_id=ignored",
+            "project_id=ignored",
+            &format!("search={}", "a".repeat(201)),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/api/v1/operator/channel-projects?{query}"),
+                    Some(&cookie),
+                    None,
+                    String::new(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        }
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/v1/operator/channel-projects?search=missing",
+                Some(&cookie),
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["items"], json!([]));
+        let response = app
+            .oneshot(request(
+                "GET",
+                "/api/v1/operator/channel-projects",
+                None,
+                None,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
 async fn platform_catalogue_requires_session_but_no_tenant_selector() {
     let (app, _, cookie, _) = fixture().await;
     let anonymous = app
@@ -914,7 +1263,9 @@ async fn platform_catalogue_requires_session_but_no_tenant_selector() {
             "kimi",
             "doubao",
             "deepseek",
-            "glm"
+            "glm",
+            "qianwen",
+            "yuanbao"
         ]
     );
     for item in items {

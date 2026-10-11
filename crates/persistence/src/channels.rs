@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PgChannelRepository {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl PgChannelRepository {
@@ -77,6 +77,104 @@ fn decode_account(
 
 #[async_trait]
 impl ChannelRepository for PgChannelRepository {
+    async fn list_import_rows(
+        &self,
+        operator: OperatorId,
+        import_key: &str,
+    ) -> Result<Vec<geo_domain::ChannelImportRecord>, AppError> {
+        let rows: Vec<(Uuid, Vec<u8>, serde_json::Value)> = sqlx::query_as(
+            "SELECT secret_id,encrypted_input,outcome FROM operator_channel_import_rows WHERE operator_id=$1 AND import_key=$2 ORDER BY (outcome->>'ordinal')::integer,row_key",
+        ).bind(operator.as_uuid()).bind(import_key).fetch_all(&self.pool).await.map_err(db_error)?;
+        rows.into_iter()
+            .map(|(secret_id, encrypted, outcome)| {
+                Ok(geo_domain::ChannelImportRecord {
+                    secret_id,
+                    encrypted_input: ChannelSecret::new(encrypted),
+                    row: serde_json::from_value(outcome).map_err(|_| {
+                        AppError::new(ErrorCode::Internal, "stored import outcome invalid")
+                    })?,
+                })
+            })
+            .collect()
+    }
+
+    async fn save_import_row(
+        &self,
+        operator: OperatorId,
+        import_key: &str,
+        expected: Option<ChannelSecret>,
+        mut record: geo_domain::ChannelImportRecord,
+        account: Option<PoolAccount>,
+    ) -> Result<geo_domain::ChannelImportRecord, AppError> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        // Serialize each batch's insert/count/CAS. The lock input contains only
+        // opaque request keys, never credential material.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "channel-import:{}:{import_key}",
+                operator.as_uuid()
+            ))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        let current: Option<(Uuid, Vec<u8>, serde_json::Value)> = sqlx::query_as(
+            "SELECT secret_id,encrypted_input,outcome FROM operator_channel_import_rows WHERE operator_id=$1 AND import_key=$2 AND row_key=$3 FOR UPDATE",
+        ).bind(operator.as_uuid()).bind(import_key).bind(&record.row.row_key)
+            .fetch_optional(&mut *tx).await.map_err(db_error)?;
+        if let Some((secret_id, encrypted, outcome)) = current {
+            let row: geo_domain::ChannelImportRow = serde_json::from_value(outcome)
+                .map_err(|_| AppError::new(ErrorCode::Internal, "stored import outcome invalid"))?;
+            if row.status != geo_domain::ChannelImportStatus::Failed
+                || expected.as_ref().map(ChannelSecret::encrypted_bytes)
+                    != Some(encrypted.as_slice())
+            {
+                return Ok(geo_domain::ChannelImportRecord {
+                    row,
+                    secret_id,
+                    encrypted_input: ChannelSecret::new(encrypted),
+                });
+            }
+            record.row.ordinal = row.ordinal;
+        } else {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM operator_channel_import_rows WHERE operator_id=$1 AND import_key=$2",
+            ).bind(operator.as_uuid()).bind(import_key).fetch_one(&mut *tx).await.map_err(db_error)?;
+            if count >= 100 {
+                return Err(AppError::invalid_request("import batch exceeds 100 rows"));
+            }
+        }
+        if let Some(account) = account {
+            let group_exists = if let Some(group_id) = account.group_id {
+                // Prevent group deletion between validation and account insertion.
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT group_id FROM operator_channel_groups WHERE operator_id=$1 AND group_id=$2 FOR KEY SHARE",
+                ).bind(operator.as_uuid()).bind(group_id).fetch_optional(&mut *tx).await.map_err(db_error)?.is_some()
+            } else {
+                true
+            };
+            if group_exists {
+                let metadata = serde_json::to_value(&account).map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "cannot encode imported account")
+                })?;
+                sqlx::query(
+                    "INSERT INTO operator_channel_accounts(operator_id,account_id,platform,group_id,metadata) VALUES($1,$2,$3,$4,$5)",
+                ).bind(operator.as_uuid()).bind(account.account_id).bind(account.platform)
+                    .bind(account.group_id).bind(metadata).execute(&mut *tx).await.map_err(db_error)?;
+            } else {
+                record.row.status = geo_domain::ChannelImportStatus::Failed;
+                record.row.account_id = None;
+                record.row.error_code = Some("group_not_found".into());
+            }
+        }
+        let outcome = serde_json::to_value(&record.row)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "cannot encode import outcome"))?;
+        sqlx::query(
+            "INSERT INTO operator_channel_import_rows(operator_id,import_key,row_key,secret_id,encrypted_input,outcome) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(operator_id,import_key,row_key) DO UPDATE SET outcome=EXCLUDED.outcome",
+        ).bind(operator.as_uuid()).bind(import_key).bind(&record.row.row_key).bind(record.secret_id)
+            .bind(record.encrypted_input.encrypted_bytes()).bind(outcome).execute(&mut *tx).await.map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(record)
+    }
     async fn save_account_metadata(
         &self,
         scope: &TenantScope,

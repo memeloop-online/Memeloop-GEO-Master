@@ -96,10 +96,19 @@ export function createLinuxDesktopRuntime({
   reservePort = freePort,
   waitReady = ready,
   stopProcess = stop,
+  runCommand = runWithInput,
 } = {}) {
   if (process.platform !== "linux") throw new Error("linux_desktop_required");
   return {
-    async open({ browserType, browserChannel, proxy, storageState, viewport }) {
+    async open({
+      browserType,
+      browserChannel,
+      proxy,
+      storageState,
+      viewport,
+      onSession,
+      onAcquired,
+    }) {
       const directory = await mkdtemp(join(tmpdir(), "geo-desktop-"));
       await chmod(directory, 0o700);
       const authority = join(directory, "authority");
@@ -128,37 +137,58 @@ export function createLinuxDesktopRuntime({
           port: websocketPort,
         };
       };
-      const closeInput = async () => {
+      let inputClosePromise;
+      const closeInput = () => {
+        if (inputClosePromise) return inputClosePromise;
         if (inputClosed) return;
         inputClosed = true;
-        await stopProcess(relay);
+        inputClosePromise = Promise.resolve()
+          .then(() => stopProcess(relay))
+          .catch((error) => {
+            inputClosed = false;
+            throw error;
+          })
+          .finally(() => {
+            inputClosePromise = undefined;
+          });
+        return inputClosePromise;
       };
       const close = () => {
         if (!closePromise) {
           closed = true;
+          inputClosed = true;
           closePromise = (async () => {
-            try {
-              await closeInput();
-            } finally {
-              await Promise.allSettled([
-                stopProcess(relay),
-                browser?.close(),
-                stopProcess(windowManager),
-                stopProcess(xvnc),
-              ]);
-              try {
-                await rm(directory, { recursive: true, force: true });
-                if (displayLock)
-                  await rm(displayLock, { recursive: true, force: true });
-              } finally {
-                process.removeListener("exit", stopOnExit);
-              }
-            }
-          })();
+            // Attempt every resource, but do not treat a rejected stop as
+            // proof of absence or remove the retry/exit-cleanup handle.
+            const results = await Promise.allSettled([
+              stopProcess(relay),
+              browser?.close(),
+              stopProcess(windowManager),
+              stopProcess(xvnc),
+            ]);
+            if (results.some((result) => result.status === "rejected"))
+              throw new Error("desktop_close_failed");
+            await rm(directory, { recursive: true, force: true });
+            if (displayLock)
+              await rm(displayLock, { recursive: true, force: true });
+            process.removeListener("exit", stopOnExit);
+          })().catch((error) => {
+            closePromise = undefined;
+            throw error;
+          });
         }
         return closePromise;
       };
       let websocketPort;
+      const resource = {
+        endpoint,
+        closeInput,
+        close,
+        get closed() {
+          return closed;
+        },
+      };
+      onSession?.(resource);
       try {
         // Chromium's crashpad database and Openbox config must be writable
         // even when the container root filesystem (including /home) is RO.
@@ -187,7 +217,7 @@ export function createLinuxDesktopRuntime({
         const cookie = randomBytes(16).toString("hex");
         // RFB remains private to this display's loopback and the authenticated
         // runner relay; a VNC credential is never needed in browser code.
-        await runWithInput(
+        await runCommand(
           "xauth",
           ["-f", authority],
           `add :${display} MIT-MAGIC-COOKIE-1 ${cookie}\n`,
@@ -245,12 +275,18 @@ export function createLinuxDesktopRuntime({
           ...(browserChannel ? { channel: browserChannel } : {}),
           env,
         });
+        // Once the browser is owned, closing it also interrupts context/page
+        // creation. Before this point launch can still materialize a resource.
+        onAcquired?.();
+        if (closed) throw new Error("desktop_input_closed");
         const context = await browser.newContext({
           viewport,
           ...(proxy ? { proxy } : {}),
           ...(storageState ? { storageState } : {}),
         });
+        if (closed) throw new Error("desktop_input_closed");
         const page = await context.newPage();
+        if (closed) throw new Error("desktop_input_closed");
         if (
           xvnc.exitCode !== null ||
           relay.exitCode !== null ||
@@ -265,16 +301,10 @@ export function createLinuxDesktopRuntime({
         relay.once("exit", () => {
           if (!inputClosed) void close().catch(() => {});
         });
-        return {
+        return Object.assign(resource, {
           context,
           page,
-          endpoint,
-          closeInput,
-          close,
-          get closed() {
-            return closed;
-          },
-        };
+        });
       } catch (error) {
         await close();
         throw error;
