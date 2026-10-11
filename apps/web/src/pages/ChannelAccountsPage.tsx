@@ -71,6 +71,7 @@ import {
 } from "../api/channels";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { RemoteDesktop } from "../components/RemoteDesktop";
+import { OperatorAccountImport } from "../components/OperatorAccountImport";
 import { ProjectAiSettingsPanel } from "./ProjectAiSettingsPanel";
 import { ProjectSerpSettingsPanel } from "./ProjectSerpSettingsPanel";
 import "../i18n/projectSerp";
@@ -1625,6 +1626,15 @@ export function OperatorAccountsPage() {
       )}
       <div className="channel-layout">
         <section className="channel-stack" aria-label="总部账号接入">
+          <OperatorAccountImport
+            key={`${session?.user.id}:${session?.operator.id}`}
+            storageScope={`${session?.user.id}:${session?.operator.id}`}
+            platforms={platforms.data?.items ?? []}
+            groups={groups.data?.items ?? []}
+            onChanged={refresh}
+            onLogin={(accountId) => void connect(accountId)}
+            loginDisabled={busy || Boolean(activeSession)}
+          />
           <Card className="channel-card">
             <h2>接入总部账号</h2>
             <p>总部资源组与客户项目组相互独立；创建后完成远程登录。</p>
