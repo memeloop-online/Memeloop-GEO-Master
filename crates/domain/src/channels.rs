@@ -183,7 +183,10 @@ pub fn supported_channel(platform: &str) -> bool {
 /// Registered account namespaces, not a claim of installed login or measurement
 /// support. Those capabilities belong to the authenticated running adapter.
 pub fn consumer_web_provider(platform: &str) -> bool {
-    matches!(platform, "kimi" | "doubao" | "deepseek" | "glm")
+    matches!(
+        platform,
+        "kimi" | "doubao" | "deepseek" | "glm" | "qianwen" | "yuanbao"
+    )
 }
 
 fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {
@@ -194,6 +197,22 @@ fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {
 
 #[async_trait]
 pub trait ChannelRepository: Send + Sync {
+    async fn list_import_rows(
+        &self,
+        operator: crate::OperatorId,
+        import_key: &str,
+    ) -> Result<Vec<crate::ChannelImportRecord>, AppError>;
+    /// Atomically stores an outcome and (when successful) its pending account.
+    /// Existing rows are immutable unless the caller supplies the exact stored
+    /// encrypted envelope as a retry compare-and-swap token.
+    async fn save_import_row(
+        &self,
+        operator: crate::OperatorId,
+        import_key: &str,
+        expected: Option<ChannelSecret>,
+        record: crate::ChannelImportRecord,
+        account: Option<PoolAccount>,
+    ) -> Result<crate::ChannelImportRecord, AppError>;
     /// Metadata edits must not restore a session read before a renewal.
     async fn save_account_metadata(
         &self,
@@ -309,6 +328,7 @@ pub trait ChannelRepository: Send + Sync {
 
 #[derive(Default)]
 struct ChannelMemory {
+    imports: HashMap<(Uuid, String, String), crate::ChannelImportRecord>,
     pool_groups: HashMap<(Uuid, Uuid), PoolGroup>,
     pool_accounts: HashMap<(Uuid, Uuid), PoolAccountRecord>,
     pool_logins: HashMap<(Uuid, Uuid), PoolLoginSession>,
@@ -333,6 +353,75 @@ fn key(scope: &TenantScope, id: Uuid) -> Result<(Uuid, Uuid, Uuid, Uuid), AppErr
 
 #[async_trait]
 impl ChannelRepository for MemoryChannelRepository {
+    async fn list_import_rows(
+        &self,
+        operator: crate::OperatorId,
+        import_key: &str,
+    ) -> Result<Vec<crate::ChannelImportRecord>, AppError> {
+        let data = self.0.read().await;
+        let mut rows: Vec<_> = data
+            .imports
+            .iter()
+            .filter(|((op, key, _), _)| *op == operator.as_uuid() && key == import_key)
+            .map(|(_, row)| row.clone())
+            .collect();
+        rows.sort_by_key(|record| (record.row.ordinal, record.row.row_key.clone()));
+        Ok(rows)
+    }
+
+    async fn save_import_row(
+        &self,
+        operator: crate::OperatorId,
+        import_key: &str,
+        expected: Option<ChannelSecret>,
+        mut record: crate::ChannelImportRecord,
+        account: Option<PoolAccount>,
+    ) -> Result<crate::ChannelImportRecord, AppError> {
+        let mut data = self.0.write().await;
+        let key = (
+            operator.as_uuid(),
+            import_key.to_owned(),
+            record.row.row_key.clone(),
+        );
+        if let Some(current) = data.imports.get(&key) {
+            if current.row.status != crate::ChannelImportStatus::Failed
+                || expected.as_ref().map(ChannelSecret::encrypted_bytes)
+                    != Some(current.encrypted_input.encrypted_bytes())
+            {
+                return Ok(current.clone());
+            }
+            record.row.ordinal = current.row.ordinal;
+        } else if data
+            .imports
+            .keys()
+            .filter(|(op, batch, _)| *op == operator.as_uuid() && batch == import_key)
+            .count()
+            >= 100
+        {
+            return Err(AppError::invalid_request("import batch exceeds 100 rows"));
+        }
+        if let Some(account) = account {
+            if account
+                .group_id
+                .is_some_and(|id| !data.pool_groups.contains_key(&(operator.as_uuid(), id)))
+            {
+                record.row.status = crate::ChannelImportStatus::Failed;
+                record.row.account_id = None;
+                record.row.error_code = Some("group_not_found".into());
+            } else {
+                data.pool_accounts.insert(
+                    (operator.as_uuid(), account.account_id),
+                    PoolAccountRecord {
+                        account,
+                        session: None,
+                        proxy: None,
+                    },
+                );
+            }
+        }
+        data.imports.insert(key, record.clone());
+        Ok(record)
+    }
     async fn save_account_metadata(
         &self,
         scope: &TenantScope,

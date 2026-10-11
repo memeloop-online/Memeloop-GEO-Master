@@ -19,7 +19,9 @@ mod project_serp_settings;
 pub use project_serp_settings::*;
 mod source_channel_recommendations;
 pub use source_channel_recommendations::*;
+mod channel_imports;
 mod channels;
+pub use channel_imports::*;
 pub use channels::*;
 mod connector_capabilities;
 pub use connector_capabilities::*;
@@ -56,6 +58,8 @@ mod observation_analysis;
 pub use observation_analysis::*;
 mod provider_conversation_cleanup;
 pub use provider_conversation_cleanup::*;
+mod provider_conversation_lifecycle;
+pub use provider_conversation_lifecycle::provider_conversation_cleanup_supported;
 mod operation;
 mod project;
 mod publication_lookup;
@@ -113,12 +117,13 @@ pub use project::{
     DEVELOPMENT_PROJECT_ID, DEVELOPMENT_TENANT_ID, DistributionManifestAcceptance,
     DistributionScope, DistributionScopeMode, DocumentManifestAcceptance, DocumentScope,
     InitialSource, InitialSourceKind, InitialSourceVisibility, MemoryProjectRepository, Operator,
-    OverviewKnowledgeStatus, PendingSuccessorCycle, PeriodPolicy, Project, ProjectCreate,
-    ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
-    ProjectStartAcceptance, ProjectStartCommand, ProjectStartView, ProjectStatus,
-    QuestionClusterScope, QuestionClusterState, ReplicationPolicy, ReportSchedule, ReportWeekday,
-    ResourceMode, StartAcceptanceStatus, Tenant, UpdateProject, hash_idempotency_key,
-    next_calendar_week_window, previous_calendar_week_window, settings_hash, start_request_hash,
+    OperatorProjectPage, OperatorProjectSummary, OverviewKnowledgeStatus, PendingSuccessorCycle,
+    PeriodPolicy, Project, ProjectCreate, ProjectOverview, ProjectPage, ProjectPatch,
+    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ProjectStartCommand,
+    ProjectStartView, ProjectStatus, QuestionClusterScope, QuestionClusterState, ReplicationPolicy,
+    ReportSchedule, ReportWeekday, ResourceMode, StartAcceptanceStatus, Tenant, UpdateProject,
+    hash_idempotency_key, next_calendar_week_window, previous_calendar_week_window, settings_hash,
+    start_request_hash, validate_operator_project_page,
 };
 pub use report::{
     MemoryReportRepository, REPORT_REDUCER_VERSION, ReportAvailability, ReportCoverage,

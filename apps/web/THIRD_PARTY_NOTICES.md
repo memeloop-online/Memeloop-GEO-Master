@@ -1,5 +1,9 @@
 # Third-party notices for the web client
 
+Account import CSV parsing uses Papa Parse `5.5.3` from
+https://github.com/mholt/PapaParse under the MIT license. Its copyright and
+license are distributed in `public/ACCOUNT_IMPORT_THIRD_PARTY_NOTICES.txt`.
+
 The web client uses noVNC `@novnc/novnc` version `1.7.0`, maintained at
 https://github.com/novnc/noVNC and distributed under the Mozilla Public License
 2.0 (MPL-2.0). Its package includes the license text at

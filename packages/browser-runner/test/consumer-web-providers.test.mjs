@@ -4,14 +4,17 @@ import { adapters } from "../src/adapters.mjs";
 import { consumerWebProviders } from "../src/consumer-web-providers.mjs";
 import { createRunner } from "../src/runner.mjs";
 
-const pending = ["doubao", "deepseek"];
+const pending = ["doubao", "deepseek", "qianwen"];
 
 test("consumer web catalog locks HTTPS entries without conflating identity or measurement", () => {
   assert.ok(Object.isFrozen(consumerWebProviders));
   assert.deepEqual(Object.keys(consumerWebProviders), [
     "kimi",
-    ...pending,
+    "doubao",
+    "deepseek",
     "glm",
+    "qianwen",
+    "yuanbao",
   ]);
   for (const [platform, provider] of Object.entries(consumerWebProviders)) {
     assert.ok(Object.isFrozen(provider));
@@ -24,7 +27,7 @@ test("consumer web catalog locks HTTPS entries without conflating identity or me
     assert.equal(url.hash, "");
     assert.equal(adapters[platform].entry, provider.entry);
     assert.equal(provider.loginEntryAvailable, true);
-    assert.equal(provider.loginSupported, true);
+    assert.equal(provider.loginSupported, platform !== "yuanbao");
     assert.deepEqual(
       adapters[platform].operations,
       platform === "kimi" ? ["measure"] : [],
@@ -52,9 +55,28 @@ test("capabilities expose entry availability separately from supported account c
     assert.equal(glm.login_supported, true);
     assert.equal(glm.model_discovery_supported, false);
     assert.deepEqual(glm.operations, []);
+    const yuanbao = connectors.find((item) => item.platform === "yuanbao");
+    assert.equal(yuanbao.login_entry_available, true);
+    assert.equal(yuanbao.login_supported, false);
+    assert.notEqual(yuanbao.model_discovery_supported, true);
+    assert.equal(yuanbao.verified, false);
+    assert.deepEqual(yuanbao.operations, []);
   } finally {
     await runner.shutdown();
   }
+});
+
+test("entry-only adapter never probes an unverified authenticated schema", async () => {
+  const page = {
+    evaluate() {
+      throw new Error("must not probe");
+    },
+  };
+  assert.equal(await adapters.yuanbao.identify(page), null);
+  assert.equal(
+    (await adapters.yuanbao.execute(page, "measure", {})).status,
+    "unsupported",
+  );
 });
 
 test("installed identity probes do not fabricate identity or measurement on missing responses", async () => {

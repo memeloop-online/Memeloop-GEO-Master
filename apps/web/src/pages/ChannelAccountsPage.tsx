@@ -13,7 +13,11 @@ import {
   Tab,
   TabList,
 } from "@fluentui/react-components";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   Link,
   useNavigate,
@@ -44,6 +48,7 @@ import {
   authorizeChannelDesktop,
   listPoolAccounts,
   listPoolAssignments,
+  listPoolProjects,
   listPoolGroups,
   listOperatorConnectorCapabilities,
   listProjectConnectorCapabilities,
@@ -62,9 +67,11 @@ import {
   type ConnectorAvailability,
   type OperatorConnectorCapability,
   type ProxyInput,
+  type PoolAssignment,
 } from "../api/channels";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { RemoteDesktop } from "../components/RemoteDesktop";
+import { OperatorAccountImport } from "../components/OperatorAccountImport";
 import { ProjectAiSettingsPanel } from "./ProjectAiSettingsPanel";
 import { ProjectSerpSettingsPanel } from "./ProjectSerpSettingsPanel";
 import "../i18n/projectSerp";
@@ -1288,6 +1295,109 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
   );
 }
 
+function OperatorProjectPicker({
+  userId,
+  operatorId,
+  busy,
+  onAssign,
+}: {
+  userId: string;
+  operatorId: string;
+  busy: boolean;
+  onAssign: (target: PoolAssignment) => void;
+}) {
+  const { t } = useTranslation();
+  const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState("");
+  const projects = useInfiniteQuery({
+    queryKey: ["operator-channel-projects", userId, operatorId, search],
+    queryFn: ({ pageParam }) => listPoolProjects(search, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (page) => page.next_cursor ?? undefined,
+    gcTime: 0,
+    retry: false,
+  });
+  const items = projects.data?.pages.flatMap((page) => page.items) ?? [];
+  const target = items.find(
+    (item) => `${item.tenant_id}:${item.project_id}` === selected,
+  );
+  return (
+    <>
+      <h4>{t("account.assignment.title")}</h4>
+      <p>{t("account.assignment.help")}</p>
+      <Field label={t("account.assignment.search")}>
+        <Input
+          value={search}
+          disabled={busy}
+          onChange={(_, data) => {
+            setSearch(data.value);
+            setSelected("");
+          }}
+        />
+      </Field>
+      {projects.isPending && (
+        <LoadingState compact label={t("account.assignment.loading")} />
+      )}
+      {projects.isError && (
+        <ErrorState
+          detail={errorText(projects.error)}
+          onRetry={() =>
+            void (projects.isFetchNextPageError
+              ? projects.fetchNextPage()
+              : projects.refetch())
+          }
+        />
+      )}
+      <Field label={t("account.assignment.project")}>
+        <Select
+          value={selected}
+          disabled={busy || !items.length}
+          onChange={(event) => setSelected(event.target.value)}
+        >
+          <option value="">{t("account.assignment.choose")}</option>
+          {items.map((item) => (
+            <option
+              key={`${item.tenant_id}:${item.project_id}`}
+              value={`${item.tenant_id}:${item.project_id}`}
+            >
+              {item.tenant_display_name
+                ? `${item.display_name} · ${item.tenant_display_name}`
+                : item.display_name}
+            </option>
+          ))}
+        </Select>
+      </Field>
+      {projects.isSuccess && !items.length && (
+        <p>{t("account.assignment.empty")}</p>
+      )}
+      {projects.hasNextPage && (
+        <Button
+          disabled={busy || projects.isFetching}
+          onClick={() => void projects.fetchNextPage()}
+        >
+          {t(
+            projects.isFetchingNextPage
+              ? "account.assignment.loading"
+              : "account.assignment.more",
+          )}
+        </Button>
+      )}
+      <Button
+        disabled={busy || !target}
+        onClick={() => {
+          if (target)
+            onAssign({
+              tenant_id: target.tenant_id,
+              project_id: target.project_id,
+            });
+        }}
+      >
+        {t("account.assignment.assign")}
+      </Button>
+    </>
+  );
+}
+
 export function OperatorAccountsPage() {
   const { session } = useAuth();
   const { t } = useTranslation();
@@ -1339,8 +1449,6 @@ export function OperatorAccountsPage() {
   const [editProxyUsername, setEditProxyUsername] = useState("");
   const [editProxyPassword, setEditProxyPassword] = useState("");
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
-  const [targetTenant, setTargetTenant] = useState("");
-  const [targetProject, setTargetProject] = useState("");
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [loginStarting, setLoginStarting] = useState(false);
   const loginAttempt = useRef<object | null>(null);
@@ -1518,6 +1626,15 @@ export function OperatorAccountsPage() {
       )}
       <div className="channel-layout">
         <section className="channel-stack" aria-label="总部账号接入">
+          <OperatorAccountImport
+            key={`${session?.user.id}:${session?.operator.id}`}
+            storageScope={`${session?.user.id}:${session?.operator.id}`}
+            platforms={platforms.data?.items ?? []}
+            groups={groups.data?.items ?? []}
+            onChanged={refresh}
+            onLogin={(accountId) => void connect(accountId)}
+            loginDisabled={busy || Boolean(activeSession)}
+          />
           <Card className="channel-card">
             <h2>接入总部账号</h2>
             <p>总部资源组与客户项目组相互独立；创建后完成远程登录。</p>
@@ -1887,39 +2004,18 @@ export function OperatorAccountsPage() {
                           </Button>
                         )}
                       </details>
-                      <h4>分配给客户项目</h4>
-                      <p>
-                        填写项目路径中的租户与项目 ID；只有明确分配的项目可见。
-                      </p>
-                      <Field label="目标租户 ID">
-                        <Input
-                          value={targetTenant}
-                          onChange={(_, data) => setTargetTenant(data.value)}
-                        />
-                      </Field>
-                      <Field label="目标项目 ID">
-                        <Input
-                          value={targetProject}
-                          onChange={(_, data) => setTargetProject(data.value)}
-                        />
-                      </Field>
-                      <Button
-                        disabled={
-                          busy || !targetTenant.trim() || !targetProject.trim()
-                        }
-                        onClick={() =>
+                      <OperatorProjectPicker
+                        key={`${session?.user.id}:${session?.operator.id}:${account.account_id}`}
+                        userId={session!.user.id}
+                        operatorId={session!.operator.id}
+                        busy={busy}
+                        onAssign={(target) =>
                           void run(
-                            () =>
-                              assignPoolAccount(account.account_id, {
-                                tenant_id: targetTenant.trim(),
-                                project_id: targetProject.trim(),
-                              }),
-                            "共享账号已分配给项目。",
+                            () => assignPoolAccount(account.account_id, target),
+                            t("account.assignment.assigned"),
                           )
                         }
-                      >
-                        分配项目
-                      </Button>
+                      />
                       {assignments.isPending && (
                         <LoadingState label="正在加载已分配项目" compact />
                       )}
