@@ -767,7 +767,7 @@ pub(crate) fn pool_tenant(
     Ok(tenant_id)
 }
 
-fn trusted_pool_scope(
+pub(crate) fn trusted_pool_scope(
     service: &ChannelService,
     auth: &AuthContext,
 ) -> Result<TenantScope, AppError> {
@@ -2282,6 +2282,22 @@ pub fn customer_routes() -> Router<AppState> {
 
 pub fn operator_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/operator/channel-proxy-pools",
+            get(crate::proxy_pools::list_pools).post(crate::proxy_pools::create_pool),
+        )
+        .route(
+            "/operator/channel-proxy-pools/{pool_id}",
+            axum::routing::patch(crate::proxy_pools::patch_pool),
+        )
+        .route(
+            "/operator/channel-proxy-pools/{pool_id}/members",
+            get(crate::proxy_pools::list_members).post(crate::proxy_pools::create_member),
+        )
+        .route(
+            "/operator/channel-proxy-pools/{pool_id}/members/{member_id}",
+            axum::routing::patch(crate::proxy_pools::patch_member),
+        )
         .route(
             "/operator/channel-account-imports",
             axum::routing::post(crate::channel_imports::create),
