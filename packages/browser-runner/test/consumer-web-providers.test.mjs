@@ -43,7 +43,10 @@ test("capabilities expose entry availability separately from supported account c
       const connector = connectors.find((item) => item.platform === platform);
       assert.equal(connector.login_entry_available, true);
       assert.equal(connector.login_supported, true);
-      assert.equal(connector.model_discovery_supported, false);
+      assert.equal(
+        connector.model_discovery_supported,
+        platform === "deepseek",
+      );
       assert.equal(connector.verified, false);
       assert.deepEqual(
         connector.operations,
@@ -100,7 +103,10 @@ test("installed identity probes do not fabricate identity or measurement on miss
     );
     assert.deepEqual(result.evidence, []);
     assert.equal(result.connector_version, adapters[platform].connectorVersion);
-    assert.equal(adapters[platform].inspectMeasurementOptions, undefined);
+    assert.equal(
+      typeof adapters[platform].inspectMeasurementOptions,
+      platform === "deepseek" ? "function" : "undefined",
+    );
   }
 });
 

@@ -7,6 +7,7 @@ import {
 } from "./kimi-connect-search.mjs";
 import { reportObservationDiagnostic } from "./ai-observation-parser.mjs";
 import { observeDeepSeekWebSearch } from "./deepseek-web-search.mjs";
+import { inspectDeepSeekMeasurementOptions } from "./deepseek-model-discovery.mjs";
 import { capturedNewConversationId } from "./provider-conversation-ownership.mjs";
 import { consumerWebProviders } from "./consumer-web-providers.mjs";
 import {
@@ -1329,6 +1330,7 @@ export const adapters = Object.freeze({
   }),
   deepseek: Object.freeze({
     ...consumerWebProviders.deepseek,
+    inspectMeasurementOptions: inspectDeepSeekMeasurementOptions,
     connectorVersion: CONNECTOR_VERSION,
     operations: Object.freeze(["measure"]),
     identify: probeDeepseekAccount,
