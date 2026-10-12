@@ -1,4 +1,5 @@
 import { createParser } from "eventsource-parser";
+import { reportObservationDiagnostic } from "./ai-observation-parser.mjs";
 
 // Source-derived from the public website bundle, not live-account acceptance.
 // The browser retains its own authentication, PoW and request implementation.
@@ -246,6 +247,7 @@ export async function captureDeepSeekExchange(
     timeoutMs = 30_000,
     maxBytes = MAX_BYTES,
     maxEvents = 4096,
+    onDiagnostic,
   } = {},
 ) {
   if (
@@ -278,6 +280,7 @@ export async function captureDeepSeekExchange(
   let session;
   let timer;
   let settled = false;
+  let stage = "capture_setup";
   let requestId;
   let requestAt;
   let submitted = false;
@@ -297,9 +300,15 @@ export async function captureDeepSeekExchange(
   const startedAt = new Date().toISOString();
   let resolve;
   const result = new Promise((done) => (resolve = done));
-  const settle = (value = null) => {
+  const settle = (value = null, failureStage = stage) => {
     if (settled) return;
     settled = true;
+    if (value === null)
+      reportObservationDiagnostic(
+        onDiagnostic,
+        failureStage,
+        "capture_unverified",
+      );
     controller.abort();
     resolve(value);
   };
@@ -332,7 +341,7 @@ export async function captureDeepSeekExchange(
       if (createdSessions !== undefined) {
         creationProof = await creationLookup;
         if (settled) return;
-        if (!creationProof) return settle();
+        if (!creationProof) return settle(null, "capture_creation");
         // Re-read after EOF, including any newly pending create responses.
         // The observer returns stable proof identities within one document.
         const current = await createdSessions.lookup(binding.chatSessionId);
@@ -341,7 +350,7 @@ export async function captureDeepSeekExchange(
           current !== creationProof ||
           createdSessions.isCurrent(creationProof) !== true
         )
-          return settle();
+          return settle(null, "capture_creation");
       }
       settle({
         ...decoder.finish(),
@@ -404,6 +413,7 @@ export async function captureDeepSeekExchange(
     // Redirects retain the request ID but may leave the completion endpoint.
     if (requestId && event.requestId === requestId) return settle();
     if (event.request?.url !== COMPLETION) return;
+    stage = "capture_request";
     let candidate = binding;
     if (createdSessions !== undefined && binding.chatSessionId === undefined) {
       try {
@@ -447,19 +457,20 @@ export async function captureDeepSeekExchange(
             proof.source !== "browser_observed_create" ||
             createdSessions.status() !== "observing"
           ) {
-            settle();
+            settle(null, "capture_creation");
             return null;
           }
           return proof;
         })
         .catch(() => {
-          settle();
+          settle(null, "capture_creation");
           return null;
         });
     }
   };
   const onResponse = (event) => {
     if (settled || event.requestId !== requestId) return;
+    stage = "capture_response";
     const response = event.response;
     if (
       responseSeen ||
@@ -473,6 +484,7 @@ export async function captureDeepSeekExchange(
     )
       return settle();
     responseSeen = true;
+    stage = "capture_stream";
     responseCharset =
       typeof response.charset === "string"
         ? response.charset.toLowerCase()
@@ -498,7 +510,7 @@ export async function captureDeepSeekExchange(
           typeof error?.message !== "string" ||
           !error.message.includes("already finished loading")
         )
-          return settle();
+          return settle(null, "capture_stream");
         completedBeforeAttachment = true;
         recoverCompletedBody();
       },
@@ -532,6 +544,7 @@ export async function captureDeepSeekExchange(
     )
       return settle();
     networkEnded = true;
+    stage = "capture_eof";
     recoverCompletedBody();
     finish();
   };
@@ -634,9 +647,10 @@ export async function captureDeepSeekExchange(
       )
         return settle();
       submitted = true;
+      stage = "capture_submission";
       return submit(page, controller.signal);
     });
-    void submission.catch(abort);
+    void submission.catch(() => settle(null, "capture_submission"));
     return await result;
   } catch {
     return null;

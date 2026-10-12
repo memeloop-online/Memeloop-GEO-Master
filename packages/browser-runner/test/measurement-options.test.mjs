@@ -28,7 +28,10 @@ function inspectionFixture(operations, inspector) {
         model_discovery_supported: true,
         inspectMeasurementOptions:
           inspector === "installed"
-            ? async () => {
+            ? async (_page, options) => {
+                assert.deepEqual(options, {
+                  expectedAccountId: "synthetic-account",
+                });
                 state.inspections++;
                 return state.options;
               }

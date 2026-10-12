@@ -585,6 +585,7 @@ export function createRunner(options = {}) {
         throw new RunnerError(409, "account_mismatch");
       const result = await record.adapter.inspectMeasurementOptions(
         record.page,
+        { expectedAccountId: record.identity.platform_account_id },
       );
       if (!result)
         throw new RunnerError(422, "measurement_options_unavailable");
