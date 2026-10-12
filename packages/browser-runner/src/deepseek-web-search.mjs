@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import {
   interpretObservation,
   observationAbortCode,
+  ObservationPersistenceError,
+  persistObservationSource,
   reportObservationDiagnostic,
 } from "./ai-observation-parser.mjs";
 import { probeDeepseekAccount } from "./consumer-web-identity.mjs";
@@ -77,6 +79,7 @@ export async function observeDeepSeekWebSearch(
   let ownershipReceiptStatus;
   let sourceRedaction;
   let persistenceFailed = false;
+  let checkpointInFlight = false;
   const unknown = (reason) => ({
     reason,
     ...(ownershipReceiptStatus
@@ -108,19 +111,34 @@ export async function observeDeepSeekWebSearch(
     return unknown("evidence_persistence_unavailable");
 
   const overallDeadline = deadlineAt ?? performance.now() + timeoutMs;
+  const checkpointReserve = Math.min(
+    5_000,
+    Math.max(1, (overallDeadline - performance.now()) / 4),
+  );
   const captureDeadline = Math.min(
     sourceDeadlineAt ?? overallDeadline,
-    overallDeadline,
+    overallDeadline - checkpointReserve,
     performance.now() + 120_000,
   );
   let configurationObserver;
   let createdSessions;
   // Every awaited integration hook is bounded too. A late hook completion
   // never advances this flow; cancellation cannot undo an already sent action.
-  const run = async (operation, end = captureDeadline) => {
+  const run = async (
+    operation,
+    end = captureDeadline,
+    drainCapture = false,
+  ) => {
     const controller = new AbortController();
     let timer;
     let abort;
+    let drainTimer;
+    const rejectDrained = (reject, code) => {
+      if (checkpointInFlight) {
+        persistenceFailed = true;
+        reject(new ObservationPersistenceError());
+      } else reject(new FlowError(code));
+    };
     const check = () => {
       if (signal?.aborted) throw new FlowError(observationAbortCode(signal));
       if (performance.now() >= end) throw new FlowError("budget_exhausted");
@@ -129,8 +147,13 @@ export async function observeDeepSeekWebSearch(
     try {
       const interrupted = new Promise((_, reject) => {
         abort = () => {
-          controller.abort();
-          reject(new FlowError(observationAbortCode(signal)));
+          controller.abort(signal?.reason);
+          if (drainCapture) {
+            drainTimer ??= setTimeout(
+              () => rejectDrained(reject, observationAbortCode(signal)),
+              checkpointReserve,
+            );
+          } else reject(new FlowError(observationAbortCode(signal)));
         };
         const expire = () => {
           const remaining = end - performance.now();
@@ -138,8 +161,15 @@ export async function observeDeepSeekWebSearch(
             timer = setTimeout(expire, Math.max(1, Math.ceil(remaining)));
             return;
           }
-          controller.abort();
-          reject(new FlowError("budget_exhausted"));
+          controller.abort(
+            new DOMException("Capture budget exhausted", "TimeoutError"),
+          );
+          if (drainCapture) {
+            drainTimer ??= setTimeout(
+              () => rejectDrained(reject, "budget_exhausted"),
+              checkpointReserve,
+            );
+          } else reject(new FlowError("budget_exhausted"));
         };
         signal?.addEventListener("abort", abort, { once: true });
         timer = setTimeout(
@@ -161,6 +191,7 @@ export async function observeDeepSeekWebSearch(
       return result;
     } finally {
       clearTimeout(timer);
+      clearTimeout(drainTimer);
       signal?.removeEventListener("abort", abort);
       controller.abort();
     }
@@ -216,32 +247,71 @@ export async function observeDeepSeekWebSearch(
       return unknown("configuration_unverified");
     stage = "capture";
     let submitted = false;
-    const captured = await run((limits) =>
-      capture(page, {
-        ...limits,
-        binding: {
-          question: payload.question,
-          model: payload.model,
-          parentMessageId: null,
-          searchEnabled: true,
-          thinkingEnabled: false,
-        },
-        createdSessions,
-        onDiagnostic,
-        submit: async (_page, captureSignal) => {
-          if (submitted) throw new FlowError("submission_already_attempted");
-          submitted = true;
-          if (captureSignal?.aborted || limits.signal.aborted)
-            throw new FlowError("cancelled");
-          if (performance.now() >= captureDeadline)
-            throw new FlowError("budget_exhausted");
-          return submitQuestion(page, {
+    const captured = await run(
+      (limits) =>
+        capture(page, {
+          ...limits,
+          binding: {
             question: payload.question,
-            signal: captureSignal ?? limits.signal,
-            timeoutMs: Math.max(1, captureDeadline - performance.now()),
-          });
-        },
-      }),
+            model: payload.model,
+            parentMessageId: null,
+            searchEnabled: true,
+            thinkingEnabled: false,
+          },
+          createdSessions,
+          onDiagnostic,
+          onPartialCapture: async (prefix) => {
+            const prepared = prepareSource(prefix);
+            if (!prepared?.exchange)
+              throw new FlowError("source_privacy_unverified");
+            sourceRedaction = prepared.redaction;
+            let checkpointTimer;
+            checkpointInFlight = true;
+            try {
+              // Source checkpoint remains allowed after cancellation: it sends no
+              // provider request and cannot confer ownership or cleanup rights.
+              await Promise.race([
+                persistObservationSource(
+                  { ...prepared.exchange, source_redaction: sourceRedaction },
+                  { provider: "deepseek", onEvidence },
+                ),
+                new Promise((_, reject) => {
+                  checkpointTimer = setTimeout(
+                    () => reject(new ObservationPersistenceError()),
+                    Math.max(
+                      1,
+                      Math.min(
+                        checkpointReserve,
+                        overallDeadline - performance.now(),
+                      ),
+                    ),
+                  );
+                }),
+              ]);
+            } catch (error) {
+              persistenceFailed = true;
+              throw error;
+            } finally {
+              checkpointInFlight = false;
+              clearTimeout(checkpointTimer);
+            }
+          },
+          submit: async (_page, captureSignal) => {
+            if (submitted) throw new FlowError("submission_already_attempted");
+            submitted = true;
+            if (captureSignal?.aborted || limits.signal.aborted)
+              throw new FlowError("cancelled");
+            if (performance.now() >= captureDeadline)
+              throw new FlowError("budget_exhausted");
+            return submitQuestion(page, {
+              question: payload.question,
+              signal: captureSignal ?? limits.signal,
+              timeoutMs: Math.max(1, captureDeadline - performance.now()),
+            });
+          },
+        }),
+      captureDeadline,
+      true,
     );
     if (!captured?.created_session) return unknown("capture_unverified");
     const prepared = prepareSource(captured);
@@ -425,13 +495,16 @@ export async function observeDeepSeekWebSearch(
       },
     };
   } catch (error) {
-    const reason = signal?.aborted
-      ? observationAbortCode(signal)
-      : error instanceof FlowError
-        ? error.code
-        : error?.message === "source_privacy_unverified"
-          ? "source_privacy_unverified"
-          : "observation_unverified";
+    const reason =
+      persistenceFailed || error instanceof ObservationPersistenceError
+        ? "evidence_persist_failed"
+        : signal?.aborted
+          ? observationAbortCode(signal)
+          : error instanceof FlowError
+            ? error.code
+            : error?.message === "source_privacy_unverified"
+              ? "source_privacy_unverified"
+              : "observation_unverified";
     reportObservationDiagnostic(
       onDiagnostic,
       stage,

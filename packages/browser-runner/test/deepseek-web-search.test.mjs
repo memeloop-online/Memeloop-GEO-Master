@@ -207,6 +207,108 @@ function historyFixture() {
   return Object.assign(f, { exchange, history });
 }
 
+test("partial capture persists privacy-projected source without interpretation, ownership or another send", async () => {
+  for (const mode of ["eof", "cancel", "persist-failed"]) {
+    const f = historyFixture();
+    const controller = new AbortController();
+    let record;
+    f.options.signal = controller.signal;
+    f.options.capture = async (_page, limits) => {
+      await limits.submit(f.page, limits.signal);
+      if (mode === "cancel") controller.abort();
+      await limits.onPartialCapture({
+        messages: [
+          {
+            event: "ready",
+            data: { request_message_id: 1, response_message_id: 2 },
+          },
+          {
+            event: "message",
+            data: {
+              p: "response",
+              o: "SET",
+              v: {
+                fragments: [
+                  { type: "RESPONSE", content: "Synthetic partial answer" },
+                  { type: "THINK", content: "Private synthetic thought" },
+                ],
+                access_token: "private-synthetic-token",
+              },
+            },
+          },
+        ],
+        sse_terminal: false,
+        capture_status: {
+          schema_version: "geo.observation.capture-status.v1",
+          transport: "partial",
+          termination: mode === "cancel" ? "aborted" : "eof",
+        },
+      });
+      return null;
+    };
+    f.options.onEvidence = async (value) => {
+      await new Promise((resolve) => setImmediate(resolve));
+      record = value;
+      if (mode === "persist-failed") throw new Error("synthetic failure");
+    };
+    const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+    assert.equal(
+      result.reason,
+      mode === "cancel"
+        ? "cancelled"
+        : mode === "persist-failed"
+          ? "evidence_persist_failed"
+          : "capture_unverified",
+    );
+    assert.equal(record.phase, "source");
+    assert.equal(record.completion, undefined);
+    assert.ok(record.source_json.includes("Synthetic partial answer"));
+    assert.ok(!record.source_json.includes("Private synthetic thought"));
+    assert.ok(!record.source_json.includes("private-synthetic-token"));
+    assert.equal(JSON.parse(record.source_json).ownership, undefined);
+    assert.equal(f.calls.filter((call) => call === "send").length, 1);
+    assert.ok(!f.calls.includes("extract"));
+    assert.ok(!f.calls.includes("ownership"));
+    assert.ok(!f.calls.includes("history"));
+  }
+});
+
+test("hanging partial checkpoints report persistence failure across cancellation and source deadlines", async () => {
+  for (const cancel of [true, false]) {
+    const f = historyFixture();
+    const controller = new AbortController();
+    f.options.timeoutMs = 80;
+    f.options.signal = controller.signal;
+    f.options.onEvidence = () => new Promise(() => {});
+    f.options.capture = async (_page, limits) => {
+      await limits.submit(f.page, limits.signal);
+      if (cancel) controller.abort();
+      else
+        await new Promise((resolve) =>
+          limits.signal.addEventListener("abort", resolve, { once: true }),
+        );
+      await limits.onPartialCapture({
+        messages: [
+          {
+            event: "ready",
+            data: { request_message_id: 1, response_message_id: 2 },
+          },
+        ],
+        capture_status: {
+          schema_version: "geo.observation.capture-status.v1",
+          transport: "partial",
+          termination: cancel ? "aborted" : "timeout",
+        },
+      });
+      return null;
+    };
+    const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+    assert.equal(result.reason, "evidence_persist_failed");
+    assert.equal(f.calls.filter((call) => call === "send").length, 1);
+    assert.ok(!f.calls.includes("extract"));
+  }
+});
+
 test("capture failure forwards its fixed diagnostic without persistence or resubmission", async () => {
   const f = fixture();
   const diagnostics = [];

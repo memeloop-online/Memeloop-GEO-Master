@@ -572,6 +572,131 @@ function fixture() {
 const finishedLoading =
   "Protocol error: Request with the provided ID has already finished loading";
 
+test("decoder snapshots retain only validated bounded events and cannot mutate state", () => {
+  const decoder = createDeepSeekEvidenceDecoder({ model: binding.model });
+  decoder.push(Buffer.from(ready + delta));
+  const snapshot = decoder.snapshot();
+  assert.equal(snapshot.sse_terminal, false);
+  snapshot.messages[0].data.request_message_id = 999;
+  snapshot.messages.pop();
+  assert.equal(decoder.snapshot().messages.length, 2);
+  assert.equal(decoder.snapshot().messages[0].data.request_message_id, 1);
+  assert.throws(() => decoder.push(Buffer.from("data: {broken}\n\n")));
+  assert.equal(decoder.snapshot().messages.length, 2);
+  assert.throws(() => decoder.finish());
+  const limited = createDeepSeekEvidenceDecoder({
+    model: binding.model,
+    maxEvents: 1,
+  });
+  assert.throws(() => limited.push(Buffer.from(ready + delta)));
+  assert.equal(limited.snapshot().messages.length, 1);
+});
+
+test("capture awaits exactly one correlated prefix checkpoint on EOF, malformed, timeout and limits", async () => {
+  for (const termination of ["eof", "malformed", "timeout", "limit_exceeded"]) {
+    const f = fixture();
+    f.session.prefix =
+      ready + (termination === "malformed" ? "data: {broken}\n\n" : delta);
+    let callbacks = 0;
+    let submits = 0;
+    let checkpointDone = false;
+    const result = await captureDeepSeekExchange(f.page, {
+      binding,
+      timeoutMs: 40,
+      ...(termination === "limit_exceeded" ? { maxEvents: 1 } : {}),
+      onPartialCapture: async (prefix) => {
+        callbacks++;
+        assert.equal(prefix.capture_status.transport, "partial");
+        assert.equal(prefix.capture_status.termination, termination);
+        assert.equal(prefix.sse_terminal, false);
+        assert.ok(prefix.messages.length > 0);
+        f.end();
+        await new Promise((resolve) => setImmediate(resolve));
+        checkpointDone = true;
+      },
+      submit: () => {
+        submits++;
+        f.start();
+        if (termination !== "timeout") f.end();
+      },
+    });
+    assert.equal(result, null);
+    assert.equal(callbacks, 1);
+    assert.equal(submits, 1);
+    assert.equal(checkpointDone, true);
+  }
+});
+
+test("missing creation proof keeps the same stream through EOF and checkpoints complete ownerless transport", async () => {
+  const f = fixture();
+  f.session.prefix = ready;
+  const captures = [];
+  let submits = 0;
+  const result = await captureDeepSeekExchange(f.page, {
+    binding,
+    createdSessions: {
+      lookup: async () => null,
+      status: () => "observing",
+      isCurrent: () => false,
+    },
+    onPartialCapture: async (prefix) => captures.push(prefix),
+    submit: async () => {
+      submits++;
+      f.start();
+      await new Promise((resolve) => setImmediate(resolve));
+      f.bytes(delta + finished);
+      f.end();
+    },
+  });
+  assert.equal(result, null);
+  assert.equal(submits, 1);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].capture_status.transport, "complete");
+  assert.equal(captures[0].capture_status.termination, "complete");
+  assert.equal(captures[0].created_session, undefined);
+  assert.equal(captures[0].messages.length, 3);
+});
+
+test("uncorrelated responses never checkpoint and failed checkpoints propagate", async () => {
+  const f = fixture();
+  f.session.prefix = ready;
+  await captureDeepSeekExchange(f.page, {
+    binding,
+    onPartialCapture: () => assert.fail("unmatched response"),
+    submit: () => f.start({ prompt: "unrelated" }),
+  });
+  const g = fixture();
+  g.session.prefix = ready;
+  await assert.rejects(
+    captureDeepSeekExchange(g.page, {
+      binding,
+      onPartialCapture: async () => {
+        throw new Error("private failure");
+      },
+      submit: () => {
+        g.start();
+        g.end();
+      },
+    }),
+    { message: "evidence_persist_failed" },
+  );
+  const h = fixture();
+  h.session.prefix = ready;
+  await assert.rejects(
+    captureDeepSeekExchange(h.page, {
+      binding,
+      checkpointTimeoutMs: 10,
+      onPartialCapture: () => new Promise(() => {}),
+      submit: () => {
+        h.start();
+        h.end();
+      },
+    }),
+    { message: "evidence_persist_failed" },
+  );
+  assert.equal(h.session.detached, 1);
+});
+
 test("failed captures report only fixed stages without exception or request data", async () => {
   for (const failure of [
     "setup",

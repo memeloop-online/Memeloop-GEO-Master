@@ -1,5 +1,8 @@
 import { createParser } from "eventsource-parser";
-import { reportObservationDiagnostic } from "./ai-observation-parser.mjs";
+import {
+  ObservationPersistenceError,
+  reportObservationDiagnostic,
+} from "./ai-observation-parser.mjs";
 
 // Source-derived from the public website bundle, not live-account acceptance.
 // The browser retains its own authentication, PoW and request implementation.
@@ -11,8 +14,10 @@ const object = (value) =>
 const label = (value) =>
   typeof value === "string" && /^[a-zA-Z0-9_.-]{1,128}$/u.test(value);
 const messageId = (value) => Number.isSafeInteger(value) && value >= 0;
-const fail = () => {
-  throw new Error("deepseek_capture_unverified");
+const fail = (termination = "malformed") => {
+  const error = new Error("deepseek_capture_unverified");
+  error.termination = termination;
+  throw error;
 };
 
 /**
@@ -146,9 +151,9 @@ export function createDeepSeekEvidenceDecoder({
   let rejected = false;
   const parser = createParser({
     maxBufferSize: maxBytes,
-    onError: fail,
+    onError: () => fail(),
     onEvent(event) {
-      if (messages.length >= maxEvents) fail();
+      if (messages.length >= maxEvents) fail("limit_exceeded");
       // The site's finish branch does not parse its payload. Preserve those
       // wire bytes without treating them as an answer or completion proof.
       if (event.event === "finish") {
@@ -192,18 +197,21 @@ export function createDeepSeekEvidenceDecoder({
     },
   });
   return {
+    snapshot() {
+      return { messages: structuredClone(messages), sse_terminal: false };
+    },
     push(bytes) {
       if (sealed || rejected) fail();
       try {
         if (!(bytes instanceof Uint8Array)) fail();
         size += bytes.byteLength;
-        if (size > maxBytes) fail();
+        if (size > maxBytes) fail("limit_exceeded");
         const text = utf8.decode(bytes, { stream: true });
         tail = (tail + text).slice(-8);
         parser.feed(text);
-      } catch {
+      } catch (error) {
         rejected = true;
-        fail();
+        fail(error?.termination);
       }
     },
     finish() {
@@ -218,8 +226,8 @@ export function createDeepSeekEvidenceDecoder({
         !finished ||
         !tail.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n").endsWith("\n\n")
       )
-        fail();
-      return { messages, sse_terminal: true };
+        fail("eof");
+      return { messages: structuredClone(messages), sse_terminal: true };
     },
   };
 }
@@ -248,6 +256,8 @@ export async function captureDeepSeekExchange(
     maxBytes = MAX_BYTES,
     maxEvents = 4096,
     onDiagnostic,
+    onPartialCapture,
+    checkpointTimeoutMs = 5_000,
   } = {},
 ) {
   if (
@@ -261,7 +271,10 @@ export async function captureDeepSeekExchange(
     signal?.aborted ||
     !Number.isFinite(timeoutMs) ||
     timeoutMs <= 0 ||
-    timeoutMs > 120_000
+    timeoutMs > 120_000 ||
+    !Number.isFinite(checkpointTimeoutMs) ||
+    checkpointTimeoutMs <= 0 ||
+    checkpointTimeoutMs > 5_000
   )
     return null;
   // Preserve the same frozen request identity throughout asynchronous recovery.
@@ -299,8 +312,19 @@ export async function captureDeepSeekExchange(
   const controller = new AbortController();
   const startedAt = new Date().toISOString();
   let resolve;
-  const result = new Promise((done) => (resolve = done));
-  const settle = (value = null, failureStage = stage) => {
+  let reject;
+  let terminalCapture;
+  const result = new Promise((done, failed) => {
+    resolve = done;
+    reject = failed;
+  });
+  // Event handlers may reject before the main flow starts awaiting result.
+  void result.catch(() => {});
+  const settle = (
+    value = null,
+    failureStage = stage,
+    termination = "malformed",
+  ) => {
     if (settled) return;
     settled = true;
     if (value === null)
@@ -310,9 +334,57 @@ export async function captureDeepSeekExchange(
         "capture_unverified",
       );
     controller.abort();
+    if (
+      value === null &&
+      responseSeen &&
+      typeof onPartialCapture === "function"
+    ) {
+      const prefix = terminalCapture ?? decoder.snapshot();
+      if (prefix.messages.length) {
+        const complete = prefix.sse_terminal === true;
+        let checkpointTimer;
+        const checkpoint = Promise.resolve().then(() =>
+          onPartialCapture({
+            ...prefix,
+            started_at: startedAt,
+            received_at: new Date().toISOString(),
+            capture_status: {
+              schema_version: "geo.observation.capture-status.v1",
+              transport: complete ? "complete" : "partial",
+              termination: complete ? "complete" : termination,
+            },
+          }),
+        );
+        void Promise.race([
+          checkpoint,
+          new Promise((_, failed) => {
+            checkpointTimer = setTimeout(
+              () => failed(new ObservationPersistenceError()),
+              checkpointTimeoutMs,
+            );
+          }),
+        ])
+          .then(
+            () => resolve(null),
+            (error) =>
+              reject(
+                error?.message === "source_privacy_unverified"
+                  ? error
+                  : new ObservationPersistenceError(),
+              ),
+          )
+          .finally(() => clearTimeout(checkpointTimer));
+        return;
+      }
+    }
     resolve(value);
   };
-  const abort = () => settle();
+  const abort = () =>
+    settle(
+      null,
+      stage,
+      signal?.reason?.name === "TimeoutError" ? "timeout" : "aborted",
+    );
   // CDP cannot replay commits which occurred while its session was opening.
   // Guard that gap with Playwright; after the loader is known, Page events
   // distinguish legitimate SPA navigation from replacement documents.
@@ -330,13 +402,14 @@ export async function captureDeepSeekExchange(
       fail();
     const bytes = Buffer.from(data, "base64");
     consumedBytes += bytes.length;
-    if (consumedBytes > maxBytes) fail();
+    if (consumedBytes > maxBytes) fail("limit_exceeded");
     decoder.push(bytes);
   };
   const finish = async () => {
     if (settled || finishing || !streamReady || !networkEnded) return;
     finishing = true;
     try {
+      terminalCapture = decoder.finish();
       let creationProof;
       if (createdSessions !== undefined) {
         creationProof = await creationLookup;
@@ -353,13 +426,18 @@ export async function captureDeepSeekExchange(
           return settle(null, "capture_creation");
       }
       settle({
-        ...decoder.finish(),
+        ...terminalCapture,
+        capture_status: {
+          schema_version: "geo.observation.capture-status.v1",
+          transport: "complete",
+          termination: "complete",
+        },
         ...(creationProof ? { created_session: creationProof } : {}),
         started_at: startedAt,
         received_at: new Date().toISOString(),
       });
-    } catch {
-      settle();
+    } catch (error) {
+      settle(null, stage, error?.termination ?? "malformed");
     }
   };
   const recoverCompletedBody = () => {
@@ -403,8 +481,8 @@ export async function captureDeepSeekExchange(
         }
         streamReady = true;
         finish();
-      } catch {
-        settle();
+      } catch (error) {
+        settle(null, stage, error?.termination ?? "malformed");
       }
     }, abort);
   };
@@ -457,13 +535,11 @@ export async function captureDeepSeekExchange(
             proof.source !== "browser_observed_create" ||
             createdSessions.status() !== "observing"
           ) {
-            settle(null, "capture_creation");
             return null;
           }
           return proof;
         })
         .catch(() => {
-          settle(null, "capture_creation");
           return null;
         });
     }
@@ -498,8 +574,8 @@ export async function captureDeepSeekExchange(
           queued.length = 0;
           streamReady = true;
           finish();
-        } catch {
-          settle();
+        } catch (error) {
+          settle(null, stage, error?.termination ?? "malformed");
         }
       },
       (error) => {
@@ -524,11 +600,11 @@ export async function captureDeepSeekExchange(
       else {
         if (typeof event.data !== "string") fail();
         queuedBytes += event.data.length;
-        if (queuedBytes > Math.ceil(maxBytes / 3) * 4) fail();
+        if (queuedBytes > Math.ceil(maxBytes / 3) * 4) fail("limit_exceeded");
         queued.push(event.data);
       }
-    } catch {
-      settle();
+    } catch (error) {
+      settle(null, stage, error?.termination ?? "malformed");
     }
   };
   const onFinished = (event) => {
@@ -549,7 +625,7 @@ export async function captureDeepSeekExchange(
     finish();
   };
   const onFailed = (event) => {
-    if (event.requestId === requestId) settle();
+    if (event.requestId === requestId) settle(null, stage, "eof");
   };
   const handlers = [
     // Page.frameNavigated is a document commit, unlike navigatedWithinDocument
@@ -585,7 +661,7 @@ export async function captureDeepSeekExchange(
   ];
   signal?.addEventListener("abort", abort, { once: true });
   try {
-    timer = setTimeout(abort, timeoutMs);
+    timer = setTimeout(() => settle(null, stage, "timeout"), timeoutMs);
     if (signal?.aborted) return null;
     page.on("framenavigated", onEarlyNavigation);
     const opening = page
@@ -652,7 +728,12 @@ export async function captureDeepSeekExchange(
     });
     void submission.catch(() => settle(null, "capture_submission"));
     return await result;
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof ObservationPersistenceError ||
+      error?.message === "source_privacy_unverified"
+    )
+      throw error;
     return null;
   } finally {
     settle();
