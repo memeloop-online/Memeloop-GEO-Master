@@ -157,10 +157,11 @@ test("source and extraction checkpoints share lifecycle proof outside source JSO
     source.connect_json_terminal = terminal;
     const records = [];
     await interpretObservation(source, {
+      provider: "kimi",
       onEvidence: async (record) => records.push(record),
       apiExtract: async () => null,
     });
-    const extraction = extractionCaptureRecord(source);
+    const extraction = extractionCaptureRecord(source, { provider: "kimi" });
     assert.equal(records.length, 1);
     assert.deepEqual(records[0].completion, extraction.completion);
     assert.equal(Object.hasOwn(extraction, "completion"), terminal === true);
@@ -174,6 +175,50 @@ test("source and extraction checkpoints share lifecycle proof outside source JSO
     assert.deepEqual(JSON.parse(extraction.source_json), {
       messages: source.messages,
     });
+  }
+});
+
+test("unknown providers persist source without borrowing Kimi lifecycle proof", async () => {
+  const source = {
+    provider: "kimi",
+    connect_json_terminal: true,
+    completion: {
+      protocol: "connect_json",
+      terminal: true,
+      assistant_message_ids: ["invented"],
+    },
+    messages: [
+      { chat: { id: "synthetic-chat" } },
+      {
+        message: {
+          id: "synthetic-answer",
+          role: "assistant",
+          status: "COMPLETED",
+        },
+      },
+    ],
+  };
+  for (const provider of [undefined, "deepseek", "constructor", "__proto__"]) {
+    const records = [];
+    await interpretObservation(source, {
+      provider,
+      onEvidence: async (record) => records.push(record),
+      apiExtract: async () => null,
+      allowLegacyApi: false,
+    });
+    assert.equal(records.length, 1);
+    const extraction = extractionCaptureRecord(source, { provider });
+    for (const record of [records[0], extraction]) {
+      assert.equal(Object.hasOwn(record, "completion"), false);
+      assert.deepEqual(JSON.parse(record.source_json), {
+        messages: source.messages,
+      });
+      assert.equal(
+        record.source_sha256,
+        createHash("sha256").update(record.source_json).digest("hex"),
+      );
+    }
+    assert.equal(records[0].source_json, extraction.source_json);
   }
 });
 
