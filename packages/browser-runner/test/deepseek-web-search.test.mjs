@@ -4,7 +4,10 @@ import { test } from "node:test";
 import { chromium } from "playwright";
 import { observeDeepSeekWebSearch } from "../src/deepseek-web-search.mjs";
 import { projectDeepseekSource } from "../src/deepseek-source-projection.mjs";
-import { capturedConversationCompletion } from "../src/deepseek-conversation-evidence.mjs";
+import {
+  capturedConversationCompletion,
+  capturedNewConversationId,
+} from "../src/deepseek-conversation-evidence.mjs";
 
 const origin = "https://chat.deepseek.com";
 const payload = {
@@ -220,6 +223,8 @@ test("fresh first-turn history is bound to transport IDs and retained in durable
     createHash("sha256").update(payload.question).digest("hex"),
   );
   assert.deepEqual(saved.lifecycle, lifecycle);
+  assert.deepEqual(saved.ownership.creation, lifecycle.creation);
+  assert.deepEqual(saved.ownership.submission, lifecycle.submission);
   assert.deepEqual(
     capturedConversationCompletion(f.receipt.captured),
     capturedConversationCompletion(saved),
@@ -266,6 +271,24 @@ test("unavailable, failed or bounded-out history preserves sanitized evidence wi
     assert.equal(result.raw_answer, "Synthetic answer.", scenario);
     assert.ok(historySignal.aborted, scenario);
     assert.equal(f.receipt.captured.lifecycle, undefined, scenario);
+    const saved = JSON.parse(f.evidence.source_json);
+    assert.equal(
+      capturedNewConversationId(saved),
+      "fixture-selected",
+      scenario,
+    );
+    assert.equal(capturedConversationCompletion(saved), null, scenario);
+    assert.equal(f.evidence.completion, undefined, scenario);
+    assert.equal(
+      saved.ownership.submission.prompt_sha256,
+      createHash("sha256").update(payload.question).digest("hex"),
+      scenario,
+    );
+    assert.equal(
+      f.evidence.source_sha256,
+      createHash("sha256").update(f.evidence.source_json).digest("hex"),
+      scenario,
+    );
     assert.equal(
       JSON.parse(f.evidence.source_json).lifecycle,
       undefined,
@@ -865,6 +888,15 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
     assert.ok(result.source_redaction.omitted_paths.length > 0);
     assert.deepEqual(savedSource.source_redaction, result.source_redaction);
     assert.equal(result.extraction_audit.source_sha256, savedSourceHash);
+    assert.equal(capturedNewConversationId(savedSource), "fixture-selected");
+    assert.deepEqual(
+      savedSource.ownership.creation,
+      savedSource.lifecycle.creation,
+    );
+    assert.deepEqual(
+      savedSource.ownership.submission,
+      savedSource.lifecycle.submission,
+    );
     assert.equal(savedSource.lifecycle.history.messages.length, 2);
     assert.equal(
       JSON.stringify(savedSource).includes(

@@ -6,7 +6,10 @@ import {
 } from "./ai-observation-parser.mjs";
 import { probeDeepseekAccount } from "./consumer-web-identity.mjs";
 import { observeDeepSeekCreatedSessions } from "./deepseek-created-sessions.mjs";
-import { capturedConversationCompletion } from "./deepseek-conversation-evidence.mjs";
+import {
+  capturedConversationCompletion,
+  validDeepSeekEvidence,
+} from "./deepseek-conversation-evidence.mjs";
 import { projectDeepseekSource } from "./deepseek-source-projection.mjs";
 import { observeDeepSeekModelConfiguration } from "./deepseek-web-configuration.mjs";
 import {
@@ -248,6 +251,31 @@ export async function observeDeepSeekWebSearch(
     const questionSha256 = createHash("sha256")
       .update(payload.question, "utf8")
       .digest("hex");
+    // capture() matched the actual first-turn POST against this binding and
+    // revalidated its fresh browser-observed create proof after transport EOF.
+    // Ownership is independent of terminal ready/finish or readable history.
+    const ownership = {
+      schema_version: "geo.deepseek.ownership.v1",
+      provider: "deepseek",
+      creation: {
+        source: captured.created_session.source,
+        chat_session_id: captured.created_session.chatSessionId,
+      },
+      submission: {
+        chat_session_id: captured.created_session.chatSessionId,
+        parent_message_id: null,
+        model_type: payload.model,
+        prompt_sha256: questionSha256,
+        search_enabled: true,
+        thinking_enabled: false,
+      },
+    };
+    if (
+      createdSessions?.isCurrent?.(captured.created_session) === true &&
+      validDeepSeekEvidence({ ...captured, ownership }) &&
+      validDeepSeekEvidence({ ...exchange, ownership })
+    )
+      exchange = { ...exchange, ownership: structuredClone(ownership) };
     stage = "history";
     // Only transport ready IDs select the read. Never use answer text, an
     // inferred ID, a latest-session lookup or a second question submission.
@@ -286,20 +314,8 @@ export async function observeDeepSeekWebSearch(
         const lifecycle = {
           schema_version: "geo.deepseek.lifecycle.v1",
           provider: "deepseek",
-          creation: {
-            source: captured.created_session.source,
-            chat_session_id: captured.created_session.chatSessionId,
-          },
-          // capture() independently matched these fields against the actual
-          // first-turn POST before returning this exact creation proof.
-          submission: {
-            chat_session_id: captured.created_session.chatSessionId,
-            parent_message_id: null,
-            model_type: payload.model,
-            prompt_sha256: questionSha256,
-            search_enabled: true,
-            thinking_enabled: false,
-          },
+          creation: ownership.creation,
+          submission: ownership.submission,
           ready: {
             request_message_id: ready.request_message_id,
             response_message_id: ready.response_message_id,

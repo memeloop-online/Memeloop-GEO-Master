@@ -343,7 +343,9 @@ mod tests {
         }
     }
 
-    fn fixture() -> (
+    fn fixture(
+        provider: &str,
+    ) -> (
         ProviderCleanupCallbackService,
         Arc<Store>,
         serde_json::Value,
@@ -359,10 +361,10 @@ mod tests {
             cleanup_id: Uuid::new_v4(),
             capture_id: Uuid::new_v4(),
             account_id: Uuid::new_v4(),
-            provider: "kimi".into(),
+            provider: provider.into(),
             external_conversation_id: "synthetic-owned-chat".into(),
             original_identity: ObservationProviderIdentity {
-                provider: "kimi".into(),
+                provider: provider.into(),
                 platform_account_id: "synthetic-platform-user".into(),
             },
             retained_message_inventory_sha256: Some(geo_domain::sha256_hex(
@@ -426,130 +428,154 @@ mod tests {
 
     #[tokio::test]
     async fn authentic_service_rechecks_bound_database_state() {
-        let (service, store, body) = fixture();
-        let (status, text) = submit(&service, &body, Some(BEARER)).await;
-        assert_eq!(status, StatusCode::OK);
-        let grant: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(grant["authorized"], true);
-        assert_eq!(grant["platform_account_id"], body["platform_account_id"]);
-        assert_eq!(
-            grant["external_conversation_id"],
-            body["external_conversation_id"]
-        );
-        assert!(
-            grant["delete_not_after"]
-                .as_str()
-                .unwrap()
-                .parse::<DateTime<Utc>>()
-                .unwrap()
-                > Utc::now()
-        );
-        assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+        for provider in ["kimi", "deepseek"] {
+            let (service, store, body) = fixture(provider);
+            let (status, text) = submit(&service, &body, Some(BEARER)).await;
+            assert_eq!(status, StatusCode::OK);
+            let grant: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(grant["authorized"], true);
+            assert_eq!(
+                grant["retained_message_inventory_sha256"],
+                store
+                    .claim
+                    .retained_message_inventory_sha256
+                    .as_deref()
+                    .unwrap()
+            );
+            assert_eq!(grant["platform_account_id"], body["platform_account_id"]);
+            assert_eq!(
+                grant["external_conversation_id"],
+                body["external_conversation_id"]
+            );
+            assert!(
+                grant["delete_not_after"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<DateTime<Utc>>()
+                    .unwrap()
+                    > Utc::now()
+            );
+            assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
     async fn wrong_identity_session_ticket_or_auth_never_reaches_repository() {
-        let (service, store, body) = fixture();
-        assert_eq!(
-            submit(&service, &body, None).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            submit(&service, &body, Some("synthetic-wrong-service-credential"))
-                .await
-                .0,
-            StatusCode::UNAUTHORIZED
-        );
-        for field in [
-            "platform_account_id",
-            "external_conversation_id",
-            "runner_session_id",
-            "authorization_ticket",
-        ] {
-            let mut wrong = body.clone();
-            wrong[field] = serde_json::json!(if field == "runner_session_id" {
-                Uuid::new_v4().to_string()
-            } else {
-                "different".into()
-            });
+        for provider in ["kimi", "deepseek"] {
+            let (service, store, body) = fixture(provider);
             assert_eq!(
-                submit(&service, &wrong, Some(BEARER)).await.0,
-                StatusCode::FORBIDDEN
+                submit(&service, &body, None).await.0,
+                StatusCode::UNAUTHORIZED
             );
+            assert_eq!(
+                submit(&service, &body, Some("synthetic-wrong-service-credential"))
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+            for field in [
+                "platform_account_id",
+                "external_conversation_id",
+                "runner_session_id",
+                "authorization_ticket",
+            ] {
+                let mut missing = body.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert_eq!(
+                    submit(&service, &missing, Some(BEARER)).await.0,
+                    StatusCode::UNPROCESSABLE_ENTITY
+                );
+                let mut wrong = body.clone();
+                wrong[field] = serde_json::json!(if field == "runner_session_id" {
+                    Uuid::new_v4().to_string()
+                } else {
+                    "different".into()
+                });
+                assert_eq!(
+                    submit(&service, &wrong, Some(BEARER)).await.0,
+                    StatusCode::FORBIDDEN
+                );
+            }
+            assert_eq!(store.calls.load(Ordering::SeqCst), 0);
         }
-        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn expired_ticket_and_unknown_fields_are_rejected() {
-        let (service, store, body) = fixture();
-        let bytes = service
-            .cipher
-            .open(
-                AAD,
-                &hex::decode(body["authorization_ticket"].as_str().unwrap()).unwrap(),
-            )
-            .unwrap();
-        let mut ticket: Ticket = serde_json::from_slice(&bytes).unwrap();
-        ticket.expires_at = Utc::now() - Duration::seconds(1);
-        let mut expired = body.clone();
-        expired["authorization_ticket"] = serde_json::json!(hex::encode(
-            service
+        for provider in ["kimi", "deepseek"] {
+            let (service, store, body) = fixture(provider);
+            let bytes = service
                 .cipher
-                .seal(AAD, &serde_json::to_vec(&ticket).unwrap())
-                .unwrap()
-        ));
-        assert_eq!(
-            submit(&service, &expired, Some(BEARER)).await.0,
-            StatusCode::FORBIDDEN
-        );
-        let mut unknown = body.clone();
-        unknown["authorized"] = serde_json::json!(true);
-        assert_eq!(
-            submit(&service, &unknown, Some(BEARER)).await.0,
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+                .open(
+                    AAD,
+                    &hex::decode(body["authorization_ticket"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap();
+            let mut ticket: Ticket = serde_json::from_slice(&bytes).unwrap();
+            ticket.expires_at = Utc::now() - Duration::seconds(1);
+            let mut expired = body.clone();
+            expired["authorization_ticket"] = serde_json::json!(hex::encode(
+                service
+                    .cipher
+                    .seal(AAD, &serde_json::to_vec(&ticket).unwrap())
+                    .unwrap()
+            ));
+            assert_eq!(
+                submit(&service, &expired, Some(BEARER)).await.0,
+                StatusCode::FORBIDDEN
+            );
+            let mut unknown = body.clone();
+            unknown["authorized"] = serde_json::json!(true);
+            assert_eq!(
+                submit(&service, &unknown, Some(BEARER)).await.0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+            assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
     async fn nearly_expired_grant_cannot_start_a_provider_request() {
-        let (service, store, mut body) = fixture();
-        let bytes = service
-            .cipher
-            .open(
-                AAD,
-                &hex::decode(body["authorization_ticket"].as_str().unwrap()).unwrap(),
-            )
-            .unwrap();
-        let mut ticket: Ticket = serde_json::from_slice(&bytes).unwrap();
-        ticket.expires_at = Utc::now() + Duration::seconds(10);
-        body["authorization_ticket"] = serde_json::json!(hex::encode(
-            service
+        for provider in ["kimi", "deepseek"] {
+            let (service, store, mut body) = fixture(provider);
+            let bytes = service
                 .cipher
-                .seal(AAD, &serde_json::to_vec(&ticket).unwrap())
-                .unwrap()
-        ));
-        assert_eq!(
-            submit(&service, &body, Some(BEARER)).await.0,
-            StatusCode::CONFLICT
-        );
-        assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+                .open(
+                    AAD,
+                    &hex::decode(body["authorization_ticket"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap();
+            let mut ticket: Ticket = serde_json::from_slice(&bytes).unwrap();
+            ticket.expires_at = Utc::now() + Duration::seconds(10);
+            body["authorization_ticket"] = serde_json::json!(hex::encode(
+                service
+                    .cipher
+                    .seal(AAD, &serde_json::to_vec(&ticket).unwrap())
+                    .unwrap()
+            ));
+            assert_eq!(
+                submit(&service, &body, Some(BEARER)).await.0,
+                StatusCode::CONFLICT
+            );
+            assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
     async fn store_failure_exposes_no_private_detail_or_grant() {
-        let (service, store, body) = fixture();
-        store.fail.store(true, Ordering::SeqCst);
-        let (status, text) = submit(&service, &body, Some(BEARER)).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(!text.contains("private") && !text.contains("authorized"));
+        for provider in ["kimi", "deepseek"] {
+            let (service, store, body) = fixture(provider);
+            store.fail.store(true, Ordering::SeqCst);
+            let (status, text) = submit(&service, &body, Some(BEARER)).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!text.contains("private") && !text.contains("authorized"));
+        }
     }
 
     #[test]
     fn unregistered_provider_cannot_receive_cleanup_ticket() {
-        let (service, store, _) = fixture();
-        for provider in ["deepseek", "doubao", "glm", "unknown", "Kimi"] {
+        let (service, store, _) = fixture("kimi");
+        for provider in ["DeepSeek", "doubao", "glm", "unknown", "Kimi"] {
             let mut claim = store.claim.clone();
             claim.provider = provider.into();
             claim.original_identity.provider = provider.into();
@@ -564,20 +590,49 @@ mod tests {
 
     #[test]
     fn no_delete_ticket_for_reconciliation_or_expired_lease() {
-        let (service, store, _) = fixture();
-        let mut claim = store.claim.clone();
-        claim.action = ProviderCleanupAction::Reconcile;
-        assert!(
-            service
-                .issue_ticket(&store.scope, &claim, store.reservation_id, Uuid::new_v4())
-                .is_err()
-        );
-        claim.action = ProviderCleanupAction::Delete;
-        claim.lease_until = Utc::now() - Duration::seconds(1);
-        assert!(
-            service
-                .issue_ticket(&store.scope, &claim, store.reservation_id, Uuid::new_v4())
-                .is_err()
-        );
+        for provider in ["kimi", "deepseek"] {
+            let (service, store, _) = fixture(provider);
+            let mut claim = store.claim.clone();
+            claim.action = ProviderCleanupAction::Reconcile;
+            assert!(
+                service
+                    .issue_ticket(&store.scope, &claim, store.reservation_id, Uuid::new_v4())
+                    .is_err()
+            );
+            claim.action = ProviderCleanupAction::Delete;
+            claim.lease_until = Utc::now() - Duration::seconds(1);
+            assert!(
+                service
+                    .issue_ticket(&store.scope, &claim, store.reservation_id, Uuid::new_v4())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn no_cleanup_ticket_without_project_scope_or_matching_provider_identity() {
+        for provider in ["kimi", "deepseek"] {
+            let (service, store, _) = fixture(provider);
+            let mut scope = store.scope.clone();
+            scope.project_id = None;
+            assert!(
+                service
+                    .issue_ticket(&scope, &store.claim, store.reservation_id, Uuid::new_v4())
+                    .is_err()
+            );
+            let mut claim = store.claim.clone();
+            claim.original_identity.provider = if provider == "kimi" {
+                "deepseek"
+            } else {
+                "kimi"
+            }
+            .into();
+            assert!(
+                service
+                    .issue_ticket(&store.scope, &claim, store.reservation_id, Uuid::new_v4())
+                    .is_err()
+            );
+            assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+        }
     }
 }

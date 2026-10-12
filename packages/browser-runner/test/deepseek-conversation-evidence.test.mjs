@@ -14,6 +14,7 @@ import {
   capturedConversationCompletion,
   capturedNewConversationId,
   validDeepSeekLifecycle,
+  validDeepSeekOwnership,
 } from "../src/deepseek-conversation-evidence.mjs";
 
 function exchange() {
@@ -84,6 +85,120 @@ function redactedExchange() {
   };
   return value;
 }
+
+function ownedExchange() {
+  const value = exchange();
+  const { creation, submission } = structuredClone(value.lifecycle);
+  value.ownership = {
+    schema_version: "geo.deepseek.ownership.v1",
+    provider: "deepseek",
+    creation,
+    submission,
+  };
+  return value;
+}
+
+test("minimal creation/request ownership survives absent history without granting completion", () => {
+  const value = ownedExchange();
+  delete value.lifecycle;
+  value.messages = [];
+  assert.equal(validDeepSeekOwnership(value.ownership), true);
+  assert.equal(
+    registeredConversation(value, { provider: "deepseek" }),
+    "synthetic-chat",
+  );
+  assert.equal(registeredConversation(value, { provider: "kimi" }), null);
+  assert.equal(registeredConversation(value, { provider: "unknown" }), null);
+  assert.equal(capturedConversationCompletion(value), null);
+  const record = extractionCaptureRecord(value, { provider: "deepseek" });
+  const document = JSON.parse(record.source_json);
+  assert.deepEqual(document.ownership, value.ownership);
+  assert.equal(record.completion, undefined);
+  assert.equal(
+    record.source_sha256,
+    createHash("sha256").update(record.source_json).digest("hex"),
+  );
+  assert.equal(
+    extractionPrompt(document).includes("geo.deepseek.ownership.v1"),
+    false,
+  );
+  value.ownership.submission.prompt_sha256 = "b".repeat(64);
+  assert.notEqual(
+    extractionCaptureRecord(value).source_sha256,
+    record.source_sha256,
+  );
+  assert.equal(document.ownership.submission.prompt_sha256, "a".repeat(64));
+});
+
+test("minimal ownership is closed at every level and all fields are required", () => {
+  for (const path of [[], ["creation"], ["submission"]]) {
+    const value = ownedExchange().ownership;
+    const target = path.reduce((v, key) => v[key], value);
+    target.extra = true;
+    assert.equal(validDeepSeekOwnership(value), false);
+    delete target.extra;
+    for (const key of Object.keys(target)) {
+      const previous = target[key];
+      delete target[key];
+      assert.equal(validDeepSeekOwnership(value), false, `${path}.${key}`);
+      target[key] = previous;
+    }
+  }
+  for (const mutate of [
+    (v) => (v.provider = "kimi"),
+    (v) => (v.schema_version = "geo.deepseek.ownership.v2"),
+    (v) => (v.creation.source = "model_output"),
+    (v) => (v.creation.chat_session_id = "bad/chat"),
+    (v) => (v.submission.chat_session_id = "other-chat"),
+    (v) => (v.submission.model_type = "bad model"),
+    (v) => (v.submission.prompt_sha256 = "A".repeat(64)),
+    (v) => (v.submission.parent_message_id = 0),
+    (v) => (v.submission.search_enabled = false),
+    (v) => (v.submission.thinking_enabled = true),
+  ]) {
+    const value = ownedExchange();
+    delete value.lifecycle;
+    mutate(value.ownership);
+    assert.equal(validDeepSeekOwnership(value.ownership), false);
+    assert.equal(capturedNewConversationId(value), null);
+    assert.throws(
+      () => observationDocument(value),
+      /observation_lifecycle_invalid/u,
+    );
+  }
+});
+
+test("both proofs must agree, including model/hash, with no malformed-proof fallback", () => {
+  const valid = ownedExchange();
+  assert.deepEqual(
+    capturedConversationCompletion(valid),
+    capturedConversationCompletion(exchange()),
+  );
+  for (const mutate of [
+    (v) => (v.ownership = null),
+    (v) => (v.lifecycle = null),
+    (v) => (v.ownership.submission.prompt_sha256 = "b".repeat(64)),
+    (v) => (v.ownership.submission.model_type = "model-b"),
+    (v) => {
+      v.ownership.creation.chat_session_id = "other-chat";
+      v.ownership.submission.chat_session_id = "other-chat";
+    },
+    (v) => (v.messages[0].data.model_type = "model-b"),
+  ]) {
+    const value = ownedExchange();
+    mutate(value);
+    assert.equal(capturedNewConversationId(value), null);
+    assert.equal(capturedConversationCompletion(value), null);
+    assert.throws(
+      () => observationDocument(value),
+      /observation_lifecycle_invalid/u,
+    );
+  }
+  const value = ownedExchange();
+  delete value.lifecycle;
+  value.messages[0].data.model_type = "model-b";
+  assert.equal(capturedNewConversationId(value), null);
+});
 
 test("saved redacted finish framing preserves completion without restoring opaque bytes", () => {
   const value = redactedExchange();

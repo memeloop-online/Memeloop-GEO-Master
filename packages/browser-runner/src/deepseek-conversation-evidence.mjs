@@ -37,6 +37,43 @@ function timestamp(value) {
   );
 }
 
+function validCreationSubmission({ creation, submission }) {
+  return (
+    closed(creation, ["source", "chat_session_id"]) &&
+    creation.source === "browser_observed_create" &&
+    chatId(creation.chat_session_id) &&
+    closed(submission, [
+      "chat_session_id",
+      "parent_message_id",
+      "model_type",
+      "prompt_sha256",
+      "search_enabled",
+      "thinking_enabled",
+    ]) &&
+    submission.chat_session_id === creation.chat_session_id &&
+    submission.parent_message_id === null &&
+    model(submission.model_type) &&
+    typeof submission.prompt_sha256 === "string" &&
+    /^[a-f0-9]{64}$/u.test(submission.prompt_sha256) &&
+    submission.search_enabled === true &&
+    submission.thinking_enabled === false
+  );
+}
+
+export function validDeepSeekOwnership(ownership) {
+  return (
+    closed(ownership, [
+      "schema_version",
+      "provider",
+      "creation",
+      "submission",
+    ]) &&
+    ownership.schema_version === "geo.deepseek.ownership.v1" &&
+    ownership.provider === "deepseek" &&
+    validCreationSubmission(ownership)
+  );
+}
+
 export function validDeepSeekLifecycle(lifecycle) {
   if (
     !closed(lifecycle, [
@@ -53,26 +90,9 @@ export function validDeepSeekLifecycle(lifecycle) {
     lifecycle.sse_terminal !== true
   )
     return false;
-  const { creation, submission, ready, history } = lifecycle;
+  const { creation, ready, history } = lifecycle;
   if (
-    !closed(creation, ["source", "chat_session_id"]) ||
-    creation.source !== "browser_observed_create" ||
-    !chatId(creation.chat_session_id) ||
-    !closed(submission, [
-      "chat_session_id",
-      "parent_message_id",
-      "model_type",
-      "prompt_sha256",
-      "search_enabled",
-      "thinking_enabled",
-    ]) ||
-    submission.chat_session_id !== creation.chat_session_id ||
-    submission.parent_message_id !== null ||
-    !model(submission.model_type) ||
-    typeof submission.prompt_sha256 !== "string" ||
-    !/^[a-f0-9]{64}$/u.test(submission.prompt_sha256) ||
-    submission.search_enabled !== true ||
-    submission.thinking_enabled !== false ||
+    !validCreationSubmission(lifecycle) ||
     !closed(ready, ["request_message_id", "response_message_id"]) ||
     !messageId(ready.request_message_id) ||
     !messageId(ready.response_message_id) ||
@@ -142,14 +162,49 @@ export function validDeepSeekLifecycle(lifecycle) {
   return user && assistant;
 }
 
+// Presence is meaningful: malformed or conflicting metadata cannot fall back
+// to another proof. Legacy lifecycle-only snapshots retain their v1 behavior.
+export function validDeepSeekEvidence(exchange) {
+  if (!object(exchange)) return false;
+  const hasOwnership = Object.hasOwn(exchange, "ownership");
+  const hasLifecycle = Object.hasOwn(exchange, "lifecycle");
+  if (
+    (!hasOwnership && !hasLifecycle) ||
+    (hasOwnership && !validDeepSeekOwnership(exchange.ownership)) ||
+    (hasLifecycle && !validDeepSeekLifecycle(exchange.lifecycle))
+  )
+    return false;
+  if (!hasOwnership) return true;
+  const { ownership, lifecycle } = exchange;
+  if (
+    hasLifecycle &&
+    ["creation", "submission"].some((section) =>
+      Object.keys(ownership[section]).some(
+        (key) => ownership[section][key] !== lifecycle[section][key],
+      ),
+    )
+  )
+    return false;
+  return (
+    Array.isArray(exchange.messages) &&
+    exchange.messages.every(
+      (message) =>
+        message?.event !== "ready" ||
+        (object(message.data) &&
+          (message.data.model_type == null ||
+            message.data.model_type === ownership.submission.model_type)),
+    )
+  );
+}
+
 export function capturedNewConversationId(exchange) {
-  return validDeepSeekLifecycle(exchange?.lifecycle)
-    ? exchange.lifecycle.creation.chat_session_id
-    : null;
+  if (!validDeepSeekEvidence(exchange)) return null;
+  return (exchange.ownership ?? exchange.lifecycle).creation.chat_session_id;
 }
 
 export function capturedConversationCompletion(exchange) {
   if (
+    !validDeepSeekEvidence(exchange) ||
     !validDeepSeekLifecycle(exchange?.lifecycle) ||
     !Array.isArray(exchange.messages) ||
     exchange.messages.length > 32_768

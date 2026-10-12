@@ -30,7 +30,7 @@ test("consumer web catalog locks HTTPS entries without conflating identity or me
     assert.equal(provider.loginSupported, platform !== "yuanbao");
     assert.deepEqual(
       adapters[platform].operations,
-      platform === "kimi" ? ["measure"] : [],
+      ["kimi", "deepseek"].includes(platform) ? ["measure"] : [],
     );
   }
 });
@@ -45,7 +45,10 @@ test("capabilities expose entry availability separately from supported account c
       assert.equal(connector.login_supported, true);
       assert.equal(connector.model_discovery_supported, false);
       assert.equal(connector.verified, false);
-      assert.deepEqual(connector.operations, []);
+      assert.deepEqual(
+        connector.operations,
+        platform === "deepseek" ? ["measure"] : [],
+      );
     }
     const kimi = connectors.find((item) => item.platform === "kimi");
     assert.equal(kimi.login_supported, true);
@@ -89,7 +92,12 @@ test("installed identity probes do not fabricate identity or measurement on miss
     assert.equal(await adapters[platform].identify(page), null);
     const result = await adapters[platform].execute(page, "measure", {});
     assert.equal(result.status, "unsupported");
-    assert.equal(result.reason, "measurement_adapter_unavailable");
+    assert.equal(
+      result.reason,
+      platform === "deepseek"
+        ? "invalid_measurement_payload"
+        : "measurement_adapter_unavailable",
+    );
     assert.deepEqual(result.evidence, []);
     assert.equal(result.connector_version, adapters[platform].connectorVersion);
     assert.equal(adapters[platform].inspectMeasurementOptions, undefined);

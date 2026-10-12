@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::provider_conversation_lifecycle::{completion_inventory, deepseek_lifecycle_chat_id};
+use crate::provider_conversation_lifecycle::{completion_inventory, deepseek_evidence_chat_id};
 use crate::{AppError, ChannelJobRepository, ChannelTargetInput, TenantScope};
 
 pub const MAX_OBSERVATION_SOURCE_BYTES: usize = 750_000;
@@ -265,14 +265,13 @@ pub(crate) fn valid_observation_source_document(document: &serde_json::Value) ->
     if fields.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "messages" | "rendered_text" | "source_redaction" | "lifecycle"
+            "messages" | "rendered_text" | "source_redaction" | "lifecycle" | "ownership"
         )
     }) || fields
         .get("rendered_text")
         .is_some_and(|value| !value.is_string())
-        || fields
-            .get("lifecycle")
-            .is_some_and(|value| deepseek_lifecycle_chat_id(value).is_none())
+        || ((fields.contains_key("lifecycle") || fields.contains_key("ownership"))
+            && deepseek_evidence_chat_id(document).is_none())
     {
         return false;
     }
@@ -423,10 +422,10 @@ impl ObservationCaptureInput {
                 if !valid_observation_source_document(&document) {
                     return Err(AppError::invalid_request("invalid source document"));
                 }
-                if let Some(lifecycle) = document.get("lifecycle")
+                if (document.get("lifecycle").is_some() || document.get("ownership").is_some())
                     && !self.owned_conversation.as_ref().is_some_and(|owned| {
                         owned.provider == "deepseek"
-                            && deepseek_lifecycle_chat_id(lifecycle)
+                            && deepseek_evidence_chat_id(&document)
                                 == Some(owned.external_conversation_id.as_str())
                     })
                 {
@@ -964,6 +963,159 @@ mod tests {
             source_sha256: hex::encode(Sha256::digest(raw.as_bytes())),
             source_json: raw,
         };
+    }
+
+    #[test]
+    fn deepseek_minimal_ownership_is_retained_without_completion_and_binds_receipt() {
+        let (scope, mut input, _) = completed_capture();
+        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
+        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
+        input.completion = None;
+        let full = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        let document = serde_json::json!({
+            "messages": [],
+            "ownership": {
+                "schema_version": "geo.deepseek.ownership.v1",
+                "provider": "deepseek",
+                "creation": full["lifecycle"]["creation"],
+                "submission": full["lifecycle"]["submission"]
+            }
+        });
+        replace_source(&mut input, &document);
+        let capture = ObservationCapture {
+            receipt: ObservationCaptureReceipt {
+                capture_id: input.capture_id,
+                schema_version: 1,
+                digest_sha256: input.validate(&scope).unwrap(),
+                stored_at: Utc::now(),
+            },
+            input: input.clone(),
+        };
+        assert!(!capture.has_complete_conversation_evidence(&scope));
+        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
+        let mut invalid = input.clone();
+        invalid.completion = Some(ObservationCaptureCompletion {
+            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
+            terminal: true,
+            assistant_message_ids: vec!["2".into()],
+        });
+        assert!(invalid.validate(&scope).is_err());
+        for provider in ["kimi", "unknown"] {
+            let mut invalid = input.clone();
+            invalid.owned_conversation.as_mut().unwrap().provider = provider.into();
+            invalid.original_identity.as_mut().unwrap().provider = provider.into();
+            assert!(invalid.validate(&scope).is_err());
+        }
+        let mut invalid = input.clone();
+        invalid.owned_conversation = None;
+        assert!(invalid.validate(&scope).is_err());
+        let mut invalid = input.clone();
+        invalid
+            .owned_conversation
+            .as_mut()
+            .unwrap()
+            .external_conversation_id = "other-chat".into();
+        assert!(invalid.validate(&scope).is_err());
+        let mut changed = document.clone();
+        changed["ownership"]["submission"]["prompt_sha256"] = serde_json::json!("b".repeat(64));
+        replace_source(&mut invalid, &changed);
+        invalid.owned_conversation = input.owned_conversation.clone();
+        assert_ne!(
+            invalid.validate(&scope).unwrap(),
+            capture.receipt.digest_sha256
+        );
+    }
+
+    #[test]
+    fn deepseek_ownership_rejects_malformed_or_conflicting_proofs() {
+        let (scope, mut input, _) = completed_capture();
+        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
+        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
+        input.completion = None;
+        let mut document = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        document["ownership"] = serde_json::json!({
+            "schema_version": "geo.deepseek.ownership.v1",
+            "provider": "deepseek",
+            "creation": document["lifecycle"]["creation"],
+            "submission": document["lifecycle"]["submission"]
+        });
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_ok());
+        for (path, value) in [
+            ("/ownership/provider", serde_json::json!("kimi")),
+            ("/ownership/schema_version", serde_json::json!("unknown")),
+            (
+                "/ownership/creation/source",
+                serde_json::json!("model_output"),
+            ),
+            (
+                "/ownership/creation/chat_session_id",
+                serde_json::json!("bad/chat"),
+            ),
+            (
+                "/ownership/submission/chat_session_id",
+                serde_json::json!("other"),
+            ),
+            (
+                "/ownership/submission/parent_message_id",
+                serde_json::json!(0),
+            ),
+            (
+                "/ownership/submission/model_type",
+                serde_json::json!("bad model"),
+            ),
+            (
+                "/ownership/submission/prompt_sha256",
+                serde_json::json!("A".repeat(64)),
+            ),
+            (
+                "/ownership/submission/search_enabled",
+                serde_json::json!(false),
+            ),
+            (
+                "/ownership/submission/thinking_enabled",
+                serde_json::json!(true),
+            ),
+            (
+                "/ownership/submission/model_type",
+                serde_json::json!("other-model"),
+            ),
+            (
+                "/ownership/submission/prompt_sha256",
+                serde_json::json!("b".repeat(64)),
+            ),
+            ("/ownership", serde_json::Value::Null),
+            ("/lifecycle", serde_json::Value::Null),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            replace_source(&mut input, &invalid);
+            assert!(input.validate(&scope).is_err(), "{path}");
+        }
+        document.as_object_mut().unwrap().remove("lifecycle");
+        for path in ["/ownership", "/ownership/creation", "/ownership/submission"] {
+            let mut invalid = document.clone();
+            invalid
+                .pointer_mut(path)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("extra".into(), serde_json::json!(true));
+            assert!(!valid_observation_source_document(&invalid), "{path}");
+            for key in document.pointer(path).unwrap().as_object().unwrap().keys() {
+                let mut invalid = document.clone();
+                invalid
+                    .pointer_mut(path)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key);
+                assert!(!valid_observation_source_document(&invalid), "{path}/{key}");
+            }
+        }
+        document["messages"][0]["data"]["model_type"] = serde_json::json!("other-model");
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_err());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { capturedConversationCompletion } from "./provider-conversation-ownership.mjs";
-import { validDeepSeekLifecycle } from "./deepseek-conversation-evidence.mjs";
+import { validDeepSeekEvidence } from "./deepseek-conversation-evidence.mjs";
 import { sourceRedaction } from "./observation-source-redaction.mjs";
 import {
   observationRejectionReason,
@@ -115,10 +115,15 @@ export function observationDocument(exchange, renderedText) {
       exchange.source_redaction,
       document,
     );
-  if (Object.hasOwn(exchange, "lifecycle")) {
-    if (!validDeepSeekLifecycle(exchange.lifecycle))
+  if (
+    Object.hasOwn(exchange, "lifecycle") ||
+    Object.hasOwn(exchange, "ownership")
+  ) {
+    if (!validDeepSeekEvidence(exchange))
       throw new Error("observation_lifecycle_invalid");
-    document.lifecycle = structuredClone(exchange.lifecycle);
+    for (const key of ["ownership", "lifecycle"])
+      if (Object.hasOwn(exchange, key))
+        document[key] = structuredClone(exchange[key]);
   }
   return document;
 }

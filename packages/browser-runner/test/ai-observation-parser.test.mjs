@@ -74,6 +74,64 @@ const redaction = (omitted_paths = ["/messages/1/reasoning"]) => ({
   omitted_paths,
 });
 
+test("independent ownership is hashed before extraction but cannot ground model semantics", async () => {
+  const source = {
+    ...structuredClone(exchange),
+    ownership: {
+      schema_version: "geo.deepseek.ownership.v1",
+      provider: "deepseek",
+      creation: {
+        source: "browser_observed_create",
+        chat_session_id: "synthetic-chat",
+      },
+      submission: {
+        chat_session_id: "synthetic-chat",
+        parent_message_id: null,
+        model_type: "synthetic-model",
+        prompt_sha256: "a".repeat(64),
+        search_enabled: true,
+        thinking_enabled: false,
+      },
+    },
+  };
+  const records = [];
+  const document = observationDocument(source);
+  const result = await interpretObservation(source, {
+    provider: "deepseek",
+    onEvidence: async (record) => records.push(record),
+    apiExtract: async (prompt) => {
+      assert.equal(records.length, 1);
+      assert.deepEqual(
+        JSON.parse(records[0].source_json).ownership,
+        source.ownership,
+      );
+      assert.equal(prompt.includes("geo.deepseek.ownership.v1"), false);
+      return extraction();
+    },
+  });
+  assert.ok(result);
+  assert.equal(records[0].completion, undefined);
+  assert.equal(result.audit.source_sha256, records[0].source_sha256);
+  for (const field of [
+    "completion_evidence",
+    "search_evidence",
+    "answer_segments",
+  ]) {
+    assert.equal(
+      validateAiObservation(
+        {
+          ...extracted,
+          [field]: [{ path: "/ownership/submission/model_type" }],
+        },
+        document,
+        { semanticOnly: true },
+      ),
+      null,
+      field,
+    );
+  }
+});
+
 test("declared source omissions are checkpointed, hashed and supplied to extraction unchanged", async () => {
   const source = {
     ...structuredClone(exchange),
