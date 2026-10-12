@@ -147,6 +147,18 @@ export function createDeepSeekEvidenceDecoder({
     onError: fail,
     onEvent(event) {
       if (messages.length >= maxEvents) fail();
+      // The site's finish branch does not parse its payload. Preserve those
+      // wire bytes without treating them as an answer or completion proof.
+      if (event.event === "finish") {
+        if (!ready || finished) fail();
+        finished = true;
+        messages.push({
+          event: "finish",
+          ...(event.id === undefined ? {} : { id: event.id }),
+          raw_data: event.data,
+        });
+        return;
+      }
       const data = JSON.parse(event.data);
       if (!object(data)) fail();
       if (event.event === "ready") {
@@ -162,10 +174,12 @@ export function createDeepSeekEvidenceDecoder({
         )
           fail();
         ready = true;
-      } else if (event.event === "finish") {
-        if (!ready || finished) fail();
-        finished = true;
-      } else if (event.event === "delta" && (!ready || finished)) {
+      } else if (
+        (!event.event ||
+          event.event === "message" ||
+          event.event === "delta") &&
+        (!ready || finished)
+      ) {
         fail();
       }
       messages.push({
