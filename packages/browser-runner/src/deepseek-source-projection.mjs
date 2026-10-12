@@ -330,7 +330,13 @@ export function projectDeepseekSource(exchange) {
         messages,
         // These are transport context, never synthesized source messages.
         ...Object.fromEntries(
-          ["received_at", "started_at", "sse_terminal", "created_session"]
+          [
+            "received_at",
+            "started_at",
+            "sse_terminal",
+            "created_session",
+            "capture_status",
+          ]
             .filter((key) => Object.hasOwn(exchange, key))
             .map((key) => [key, exchange[key]]),
         ),

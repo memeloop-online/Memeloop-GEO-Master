@@ -253,6 +253,32 @@ fn checked_json(raw: &str, digest: &str, limit: usize) -> Result<serde_json::Val
     Ok(value)
 }
 
+/// Capture transport metadata does not establish conversation ownership,
+/// provider completion, or permission to delete remote data.
+fn valid_capture_status(value: &serde_json::Value) -> bool {
+    let Some(fields) = value.as_object() else {
+        return false;
+    };
+    fields.len() == 3
+        && fields
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            == Some("geo.observation.capture-status.v1")
+        && matches!(
+            (
+                fields.get("transport").and_then(serde_json::Value::as_str),
+                fields
+                    .get("termination")
+                    .and_then(serde_json::Value::as_str),
+            ),
+            (Some("complete"), Some("complete"))
+                | (
+                    Some("partial"),
+                    Some("eof" | "timeout" | "aborted" | "malformed" | "limit_exceeded")
+                )
+        )
+}
+
 /// Closed source envelope shared by capture and replay. An omission declaration
 /// proves neither complete sanitization nor ownership of a remote conversation.
 pub(crate) fn valid_observation_source_document(document: &serde_json::Value) -> bool {
@@ -265,11 +291,19 @@ pub(crate) fn valid_observation_source_document(document: &serde_json::Value) ->
     if fields.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "messages" | "rendered_text" | "source_redaction" | "lifecycle" | "ownership"
+            "messages"
+                | "rendered_text"
+                | "source_redaction"
+                | "lifecycle"
+                | "ownership"
+                | "capture_status"
         )
     }) || fields
         .get("rendered_text")
         .is_some_and(|value| !value.is_string())
+        || fields
+            .get("capture_status")
+            .is_some_and(|value| !valid_capture_status(value))
         || ((fields.contains_key("lifecycle") || fields.contains_key("ownership"))
             && deepseek_evidence_chat_id(document).is_none())
     {
@@ -1234,6 +1268,86 @@ mod tests {
             input.validate(&scope).is_ok(),
             "partial evidence remains retainable with lifecycle omitted"
         );
+    }
+
+    #[test]
+    fn capture_status_retains_ownerless_evidence_without_completion_authority() {
+        let (scope, mut input, _) = completed_capture();
+        input.owned_conversation = None;
+        input.completion = None;
+        for (transport, termination) in [
+            ("complete", "complete"),
+            ("partial", "eof"),
+            ("partial", "timeout"),
+            ("partial", "aborted"),
+            ("partial", "malformed"),
+            ("partial", "limit_exceeded"),
+        ] {
+            let document = serde_json::json!({
+                "messages": [{"text": "synthetic prefix"}],
+                "capture_status": {
+                    "schema_version": "geo.observation.capture-status.v1",
+                    "transport": transport,
+                    "termination": termination
+                }
+            });
+            replace_source(&mut input, &document);
+            let before = input.clone();
+            let capture = ObservationCapture {
+                receipt: ObservationCaptureReceipt {
+                    capture_id: input.capture_id,
+                    schema_version: 1,
+                    digest_sha256: input.validate(&scope).unwrap(),
+                    stored_at: Utc::now(),
+                },
+                input: input.clone(),
+            };
+            assert_eq!(input, before);
+            assert!(!capture.has_complete_conversation_evidence(&scope));
+            assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
+            input.completion = Some(ObservationCaptureCompletion {
+                protocol: ObservationCompletionProtocol::ConnectJson,
+                terminal: true,
+                assistant_message_ids: vec!["synthetic-message".into()],
+            });
+            assert!(input.validate(&scope).is_err());
+            input.completion = None;
+        }
+    }
+
+    #[test]
+    fn capture_status_rejects_unknown_fields_values_and_inconsistent_transport() {
+        let (scope, mut input, mut document) = completed_capture();
+        document["capture_status"] = serde_json::json!({
+            "schema_version": "geo.observation.capture-status.v1",
+            "transport": "complete",
+            "termination": "complete"
+        });
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_ok());
+        for (key, value) in [
+            ("schema_version", serde_json::json!("unknown")),
+            ("transport", serde_json::json!("unknown")),
+            ("termination", serde_json::json!("creation_proof_missing")),
+            ("transport", serde_json::json!("partial")),
+            ("termination", serde_json::json!("timeout")),
+            ("termination", serde_json::json!(null)),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut invalid = document.clone();
+            invalid["capture_status"][key] = value;
+            replace_source(&mut input, &invalid);
+            assert!(input.validate(&scope).is_err(), "{key}");
+        }
+        for status in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"transport": "complete", "termination": "complete"}),
+        ] {
+            document["capture_status"] = status;
+            replace_source(&mut input, &document);
+            assert!(input.validate(&scope).is_err());
+        }
     }
 
     #[test]

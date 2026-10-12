@@ -117,6 +117,26 @@ export function observationDocument(exchange, renderedText) {
       ? { rendered_text: renderedText }
       : {}),
   };
+  if (Object.hasOwn(exchange, "capture_status")) {
+    const status = exchange.capture_status;
+    if (
+      status === null ||
+      typeof status !== "object" ||
+      Array.isArray(status) ||
+      Object.keys(status).length !== 3 ||
+      status.schema_version !== "geo.observation.capture-status.v1" ||
+      !(
+        (status.transport === "complete" &&
+          status.termination === "complete") ||
+        (status.transport === "partial" &&
+          ["eof", "timeout", "aborted", "malformed", "limit_exceeded"].includes(
+            status.termination,
+          ))
+      )
+    )
+      throw new Error("observation_capture_status_invalid");
+    document.capture_status = structuredClone(status);
+  }
   if (Object.hasOwn(exchange, "source_redaction"))
     document.source_redaction = sourceRedaction(
       exchange.source_redaction,
@@ -159,6 +179,27 @@ export class ObservationPersistenceError extends Error {
     super("evidence_persist_failed");
     this.name = "ObservationPersistenceError";
   }
+}
+
+/** Persist privacy-projected source with the same document/hash/byte boundary,
+ * without invoking an extractor or promoting capture status to completion. */
+export async function persistObservationSource(
+  exchange,
+  { provider, renderedText, onEvidence } = {},
+) {
+  const document = observationDocument(exchange, renderedText);
+  const record = captureRecord(
+    document,
+    exchange?.received_at,
+    exchange,
+    provider,
+  );
+  try {
+    await onEvidence?.(record);
+  } catch {
+    throw new ObservationPersistenceError();
+  }
+  return { document, record };
 }
 
 /** Raw extraction transport is evidence even when no JSON candidate exists. */
@@ -212,6 +253,13 @@ export function extractionPrompt(document) {
   if (document.source_redaction !== undefined)
     records.push(
       `/source_redaction = ${JSON.stringify(document.source_redaction)}`,
+    );
+  if (document.capture_status !== undefined)
+    records.push(
+      "Capture status is transport metadata, not answer, search or citation evidence. " +
+        "If /capture_status.transport is partial, the input is incomplete: do not infer a full answer, complete citation inventory, or completed search from the truncated evidence. " +
+        "Complete transport alone does not prove semantic completion or successful search.",
+      `/capture_status = ${JSON.stringify(document.capture_status)}`,
     );
   return `${PROMPT_TEMPLATE}\n${records.join("\n")}`;
 }

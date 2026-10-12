@@ -10,8 +10,65 @@ import {
   invokeExtractionApi,
   observationDocument,
   parseExtractionJson,
+  persistObservationSource,
   reportObservationDiagnostic,
 } from "../src/ai-observation-parser.mjs";
+
+test("persistence-only source helper hashes bounded status-bearing documents and exposes status to extraction", async () => {
+  const status = {
+    schema_version: "geo.observation.capture-status.v1",
+    transport: "partial",
+    termination: "eof",
+  };
+  let stored;
+  const source = {
+    messages: [{ data: { text: "Synthetic prefix" } }],
+    capture_status: status,
+  };
+  const { document, record } = await persistObservationSource(source, {
+    provider: "deepseek",
+    onEvidence: async (value) => {
+      stored = value;
+    },
+  });
+  assert.equal(stored, record);
+  assert.equal(record.phase, "source");
+  assert.equal(record.completion, undefined);
+  assert.equal(
+    record.source_sha256,
+    createHash("sha256").update(record.source_json).digest("hex"),
+  );
+  assert.ok(
+    extractionPrompt(document).includes(
+      '/capture_status = {"schema_version":"geo.observation.capture-status.v1","transport":"partial","termination":"eof"}',
+    ),
+  );
+  status.termination = "timeout";
+  assert.equal(document.capture_status.termination, "eof");
+  for (const invalid of [
+    { ...status, transport: "complete" },
+    { ...status, termination: "complete" },
+    { ...status, private: "untrusted" },
+    { ...status, termination: "arbitrary" },
+  ]) {
+    await assert.rejects(
+      persistObservationSource({ ...source, capture_status: invalid }),
+      /capture_status_invalid/u,
+    );
+  }
+  await assert.rejects(
+    persistObservationSource(source, {
+      onEvidence: async () => {
+        throw new Error("synthetic");
+      },
+    }),
+    { message: "evidence_persist_failed" },
+  );
+  await assert.rejects(
+    persistObservationSource({ messages: ["x".repeat(750_001)] }),
+    /input_too_large/u,
+  );
+});
 
 // Synthetic transport and extraction results only; no external requests.
 const exchange = {

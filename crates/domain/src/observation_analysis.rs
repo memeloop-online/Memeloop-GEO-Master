@@ -1522,7 +1522,26 @@ mod tests {
             provider: "synthetic".into(),
             platform_account_id: "synthetic-account".into(),
         });
+        let ObservationCaptureSnapshot::Source {
+            source_json,
+            source_sha256,
+        } = &mut capture.input.snapshot
+        else {
+            unreachable!();
+        };
+        let mut document: Value = serde_json::from_str(source_json).unwrap();
+        document["capture_status"] = json!({
+            "schema_version": "geo.observation.capture-status.v1",
+            "transport": "partial",
+            "termination": "timeout"
+        });
+        *source_json = document.to_string();
+        *source_sha256 = sha256_hex(source_json.as_bytes());
+        request.source_sha256 = source_sha256.clone();
+        assert!(capture.input.owned_conversation.is_none());
+        assert!(capture.input.completion.is_none());
         capture.receipt.digest_sha256 = capture.input.validate(&f.scope).unwrap();
+        let retained_capture = capture.clone();
         for detail in [
             Some("execution_deadline"),
             Some("official_search_observation_unverified"),
@@ -1537,6 +1556,8 @@ mod tests {
                 "{detail:?}",
             );
             assert_eq!(target, original);
+            assert_eq!(capture, retained_capture);
+            assert!(!capture.has_complete_conversation_evidence(&f.scope));
         }
         assert!(observation_analysis_source_json(&f.scope, &f.request, &target, None).is_err());
         for provenance in ["fixture", "injected", "live", ""] {

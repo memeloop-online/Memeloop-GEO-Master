@@ -1328,6 +1328,12 @@ describe("P09 content revision", () => {
     const body = await screen.findByRole("textbox", { name: "结构化正文" });
     const first = within(body).getByText("原始正文");
     const second = within(body).getByText("第二段");
+    // Resolve native controls before edits arm the one-second autosave.
+    // Avoid full-page role queries between selection and history commands.
+    const listButton = screen.getByText("列表", { selector: "button" });
+    const undoButton = screen.getByText("撤销", { selector: "button" });
+    const redoButton = screen.getByText("重做", { selector: "button" });
+    const saveButton = screen.getByText("保存新版本", { selector: "button" });
     await userEvent.click(first);
     const range = document.createRange();
     range.setStart(first.firstChild!, 0);
@@ -1336,18 +1342,18 @@ describe("P09 content revision", () => {
     selection?.removeAllRanges();
     selection?.addRange(range);
     document.dispatchEvent(new Event("selectionchange"));
-    await userEvent.click(screen.getByRole("button", { name: "列表" }));
+    await userEvent.click(listButton);
     expect(body.querySelectorAll("li")).toHaveLength(2);
-    await userEvent.click(screen.getByRole("button", { name: "撤销" }));
+    await userEvent.click(undoButton);
     expect(body.querySelectorAll("li")).toHaveLength(0);
     expect(
       Array.from(body.querySelectorAll("p[data-geo-block-id]")).map(
         (paragraph) => paragraph.getAttribute("data-geo-block-id"),
       ),
     ).toEqual(["block-1", "block-2"]);
-    await userEvent.click(screen.getByRole("button", { name: "重做" }));
+    await userEvent.click(redoButton);
     expect(body.querySelectorAll("li")).toHaveLength(2);
-    await userEvent.click(screen.getByRole("button", { name: "保存新版本" }));
+    await userEvent.click(saveButton);
     await waitFor(() => {
       const save = requests.mock.calls.find(
         ([url, init]) =>
