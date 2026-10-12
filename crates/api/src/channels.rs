@@ -1735,7 +1735,7 @@ async fn valid_login(
     Ok(session)
 }
 
-fn login_operation_scope(
+pub(crate) fn login_operation_scope(
     scope: &TenantScope,
     auth: &AuthContext,
     pool: bool,
@@ -2414,6 +2414,90 @@ pub struct StartPoolLogin {
     pub account_id: Uuid,
 }
 
+impl ChannelService {
+    pub(crate) async fn prepare_pool_login_input(
+        &self,
+        auth: &AuthContext,
+        account_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<geo_domain::BeginBrowserOperation, AppError> {
+        let scope = trusted_pool_scope(self, auth)?;
+        let record = self
+            .repository
+            .get_pool_account(auth.operator.id, account_id)
+            .await?;
+        if !record.account.enabled {
+            return Err(AppError::conflict("account is disabled"));
+        }
+        let network_scope = geo_domain::AccountNetworkScope {
+            operator_id: scope.operator_id,
+            account_id,
+            tenant_id: None,
+            project_id: None,
+        };
+        let proxy = if let Some(head) = self
+            .operations()?
+            .get_account_network(&network_scope)
+            .await?
+        {
+            self.binding_proxy(&head.active)?
+        } else {
+            record
+                .proxy
+                .as_ref()
+                .map(|secret| {
+                    let bytes = self.decrypt(&scope, account_id, "pool_proxy", secret)?;
+                    let input: ProxyInput = serde_json::from_slice(&bytes).map_err(|_| {
+                        AppError::new(ErrorCode::Internal, "stored proxy is invalid")
+                    })?;
+                    Ok::<_, AppError>(input.runner())
+                })
+                .transpose()?
+        };
+        self.prepare_browser_input(
+            &login_operation_scope(&scope, auth, true),
+            &scope,
+            account_id,
+            session_id,
+            geo_domain::BrowserOperationPurpose::Login,
+            None,
+            &proxy,
+        )
+        .await
+    }
+
+    /// Starts only the already-persisted ownership record; recovery never
+    /// recomputes generation, network selection or expiry.
+    pub(crate) async fn start_pool_login_operation(
+        &self,
+        auth: &AuthContext,
+        operation: &geo_domain::BrowserOperation,
+    ) -> Result<(), AppError> {
+        let scope = trusted_pool_scope(self, auth)?;
+        if operation.scope != login_operation_scope(&scope, auth, true)
+            || operation.purpose != geo_domain::BrowserOperationPurpose::Login
+        {
+            return Err(AppError::forbidden("login ownership mismatch"));
+        }
+        let record = self
+            .repository
+            .get_pool_account(auth.operator.id, operation.account_id)
+            .await?;
+        if !record.account.enabled {
+            return Err(AppError::conflict("account is disabled"));
+        }
+        let Some(operation) = self
+            .operations()?
+            .claim_browser_start(&operation.scope, operation.operation_id, Utc::now())
+            .await?
+        else {
+            return Ok(());
+        };
+        self.start_owned_browser(&operation, &scope, &record.account.platform, None)
+            .await
+    }
+}
+
 pub async fn start_pool_login(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -2464,45 +2548,18 @@ pub async fn start_pool_login(
             }),
         ));
     }
-    let network_scope = geo_domain::AccountNetworkScope {
-        operator_id: scope.operator_id,
-        account_id: input.account_id,
-        tenant_id: None,
-        project_id: None,
-    };
-    let network = service
-        .operations()
-        .map_err(|e| err(e, context))?
-        .get_account_network(&network_scope)
+    let session_id = Uuid::new_v4();
+    let prepared = service
+        .prepare_pool_login_input(&auth, input.account_id, session_id)
         .await
         .map_err(|e| err(e, context))?;
-    let proxy = if let Some(head) = network {
-        service
-            .binding_proxy(&head.active)
-            .map_err(|e| err(e, context))?
-    } else {
-        record
-            .proxy
-            .as_ref()
-            .map(|secret| {
-                let bytes = service.decrypt(&scope, input.account_id, "pool_proxy", secret)?;
-                let input: ProxyInput = serde_json::from_slice(&bytes)
-                    .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
-                Ok::<_, AppError>(input.runner())
-            })
-            .transpose()
-            .map_err(|e| err(e, context))?
-    };
-    let session_id = Uuid::new_v4();
     let operation = service
-        .prepare_owned_browser(
+        .operations()
+        .map_err(|e| err(e, context))?
+        .begin_browser_operation(
             &login_operation_scope(&scope, &auth, true),
-            &scope,
-            input.account_id,
-            session_id,
-            geo_domain::BrowserOperationPurpose::Login,
-            None,
-            &proxy,
+            &prepared,
+            Utc::now(),
         )
         .await
         .map_err(|e| err(e, context))?;
@@ -2522,7 +2579,7 @@ pub async fn start_pool_login(
         return Err(err(error, context));
     }
     service
-        .start_owned_browser(&operation, &scope, &record.account.platform, None)
+        .start_pool_login_operation(&auth, &operation)
         .await
         .map_err(|e| err(e, context))?;
     let pool_tenant = pool_tenant(service, &auth).map_err(|e| err(e, context))?;
@@ -2540,7 +2597,7 @@ pub async fn start_pool_login(
     ))
 }
 
-async fn valid_pool_login(
+pub(crate) async fn valid_pool_login(
     state: &AppState,
     auth: &AuthContext,
     id: Uuid,
@@ -2679,40 +2736,34 @@ pub struct PoolLoginCompleted {
     pub account: PoolAccount,
 }
 
-pub async fn complete_pool_login(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Extension(auth): Extension<AuthContext>,
-    Extension(context): Extension<RequestContext>,
-) -> Result<Json<PoolLoginCompleted>, ApiError> {
-    let session = valid_pool_login(&state, &auth, id, false)
-        .await
-        .map_err(|e| err(e, context))?;
-    let owner_tenant = pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
+/// Shared capture and credential commit. Disposal is separate so queue recovery
+/// can use the persisted verification marker after a process interruption.
+pub(crate) async fn verify_pool_login(
+    state: &AppState,
+    auth: &AuthContext,
+    id: Uuid,
+) -> Result<PoolAccount, AppError> {
+    let session = valid_pool_login(state, auth, id, false).await?;
+    let service = state.channel_service();
+    let scope = trusted_pool_scope(service, auth)?;
     state
         .desktop_grants
-        .verify(id, &auth, &owner_tenant.to_string())
-        .await
-        .map_err(|e| err(e, context))?;
-    let service = state.channel_service();
-    let scope = trusted_pool_scope(service, &auth).map_err(|e| err(e, context))?;
-    let browser = service.browser().map_err(|e| err(e, context))?;
+        .verify(id, auth, &scope.tenant_id.to_string())
+        .await?;
     let record = service
         .repository
         .get_pool_account(auth.operator.id, session.account_id)
-        .await
-        .map_err(|e| err(e, context))?;
-    let verified = browser.complete(id).await.map_err(|e| err(e, context))?;
+        .await?;
+    let verified = service.browser()?.complete(id).await?;
     if verified.identity.platform_account_id.trim().is_empty()
         || verified.identity.display_name.trim().is_empty()
     {
-        return Err(err(
-            AppError::conflict("connector did not verify account identity"),
-            context,
+        return Err(AppError::conflict(
+            "connector did not verify account identity",
         ));
     }
     if !record.account.enabled {
-        return Err(err(AppError::conflict("account is disabled"), context));
+        return Err(AppError::conflict("account is disabled"));
     }
     if record
         .account
@@ -2720,21 +2771,15 @@ pub async fn complete_pool_login(
         .as_ref()
         .is_some_and(|prior| prior != &verified.identity.platform_account_id)
     {
-        return Err(err(
-            AppError::conflict("login resolved to a different platform account"),
-            context,
+        return Err(AppError::conflict(
+            "login resolved to a different platform account",
         ));
     }
-    let bytes = serde_json::to_vec(&verified.storage_state).map_err(|_| {
-        err(
-            AppError::new(ErrorCode::Internal, "browser session invalid"),
-            context,
-        )
-    })?;
+    let bytes = serde_json::to_vec(&verified.storage_state)
+        .map_err(|_| AppError::new(ErrorCode::Internal, "browser session invalid"))?;
     if bytes.len() > 2 * 1024 * 1024 {
-        return Err(err(
-            AppError::invalid_request("browser session exceeds maximum size"),
-            context,
+        return Err(AppError::invalid_request(
+            "browser session exceeds maximum size",
         ));
     }
     let storage = geo_domain::VerifiedLoginStorage {
@@ -2747,33 +2792,41 @@ pub async fn complete_pool_login(
         platform_account_id: verified.identity.platform_account_id,
         display_name: verified.identity.display_name,
         avatar_url: verified.identity.avatar_url,
-        session: service
-            .encrypt(&scope, session.account_id, "pool_session", &bytes)
-            .map_err(|e| err(e, context))?,
+        session: service.encrypt(&scope, session.account_id, "pool_session", &bytes)?,
     };
     service
-        .operations()
-        .map_err(|e| err(e, context))?
+        .operations()?
         .save_owned_login_session(
-            &login_operation_scope(&scope, &auth, true),
+            &login_operation_scope(&scope, auth, true),
             id,
             &storage,
             service.repository.as_ref(),
             Utc::now(),
         )
-        .await
-        .map_err(|e| err(e, context))?;
-    let account = service
+        .await?;
+    Ok(service
         .repository
         .get_pool_account(auth.operator.id, session.account_id)
+        .await?
+        .account)
+}
+
+pub async fn complete_pool_login(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<PoolLoginCompleted>, ApiError> {
+    let account = verify_pool_login(&state, &auth, id)
         .await
-        .map_err(|e| err(e, context))?
-        .account;
+        .map_err(|e| err(e, context))?;
+    let service = state.channel_service();
+    let scope = trusted_pool_scope(service, &auth).map_err(|e| err(e, context))?;
     let operation = authorize_login_operation(
         &state,
         &login_operation_scope(&scope, &auth, true),
         id,
-        session.account_id,
+        account.account_id,
     )
     .await
     .map_err(|e| err(e, context))?;

@@ -24,6 +24,8 @@ pub use project_serp_settings::*;
 mod source_channel_recommendations;
 pub use source_channel_recommendations::*;
 mod channel_imports;
+mod operator_login_queue;
+pub use operator_login_queue::*;
 mod proxy_pools;
 pub use proxy_pools::*;
 mod channels;

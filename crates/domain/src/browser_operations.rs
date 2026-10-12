@@ -59,6 +59,7 @@ pub struct BeginBrowserOperation {
 
 #[derive(Clone)]
 pub struct BrowserOperation {
+    pub login_verified_at: Option<DateTime<Utc>>,
     pub network_binding_id: Option<Uuid>,
     pub network_scope: Option<crate::AccountNetworkScope>,
     pub operation_id: Uuid,
@@ -175,6 +176,7 @@ impl BrowserOperation {
             return Err(AppError::invalid_request("invalid browser ownership"));
         }
         Ok(Self {
+            login_verified_at: None,
             network_binding_id: None,
             network_scope: None,
             operation_id: input.operation_id,
@@ -285,6 +287,14 @@ pub enum BrowserOperationTransition {
 
 #[async_trait]
 pub trait BrowserOperationRepository: Send + Sync {
+    /// Only the successful Prepared transition authorizes a runner start.
+    /// A prior StartRequested is uncertain and must never dispatch again.
+    async fn claim_browser_start(
+        &self,
+        scope: &BrowserOperationScope,
+        operation_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<Option<BrowserOperation>, AppError>;
     /// Trusted server migration/recovery lookup, never a public credential view.
     async fn get_account_browser_operation(
         &self,

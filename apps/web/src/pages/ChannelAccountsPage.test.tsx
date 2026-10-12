@@ -177,6 +177,8 @@ function mockApi(
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     requests.push({ path, method, body, url });
+    if (path.endsWith("/operator/channel-login-queues/active"))
+      return Promise.resolve(response(null));
     if (path.endsWith("/operator/channel-projects"))
       return Promise.resolve(
         response({ items: [assignableProject], next_cursor: null }),
@@ -366,6 +368,239 @@ afterEach(() => {
   vi.unstubAllGlobals();
   setCsrfToken(undefined);
   setUnauthorizedHandler(undefined);
+});
+
+describe("persisted queue remote login adapter", () => {
+  function withQueue(completionStatus = 200) {
+    const fixture = mockApi([account], true);
+    const original = fixture.fetchMock.getMockImplementation()!;
+    const queueRequests: { path: string; body: unknown }[] = [];
+    let saved = {
+      queue_id: "queue-a",
+      import_key: "import-a",
+      version: 1,
+      status: "running",
+      items: [
+        {
+          position: 0,
+          row_key: "row-a",
+          account_id: "account-1",
+          status: "current",
+          attempt: 0,
+          error_code: null,
+        },
+      ],
+      current: {
+        position: 0,
+        account_id: "account-1",
+        session_id: "login-1",
+        phase: "awaiting_login",
+        requires_session_recovery: false,
+      } as object | null,
+      can_drive: false,
+      created_at: "",
+      updated_at: "",
+    };
+    fixture.fetchMock.mockImplementation((request, init) => {
+      const path = new URL(String(request), "http://localhost").pathname;
+      if (!path.includes("/operator/channel-login-queues/"))
+        return original(request, init);
+      if ((init?.method ?? "GET") === "POST") {
+        queueRequests.push({ path, body: JSON.parse(String(init?.body)) });
+        if (path.endsWith("/complete")) {
+          if (completionStatus !== 200)
+            return Promise.resolve(
+              response({ code: "conflict" }, completionStatus),
+            );
+          saved = {
+            ...saved,
+            version: 2,
+            status: "completed",
+            current: null,
+            items: [{ ...saved.items[0], status: "succeeded" }],
+          };
+        } else if (path.endsWith("/pause"))
+          saved = { ...saved, version: 2, status: "paused" };
+      }
+      return Promise.resolve(response(saved));
+    });
+    return { ...fixture, queueRequests };
+  }
+  it("keeps direct login reserved while active lookup is deferred and after the queue is restored", async () => {
+    const fixture = withQueue();
+    const original = fixture.fetchMock.getMockImplementation()!;
+    const pendingResponses = new Map<string, () => Promise<void>>();
+    const accountsPath = "/operator/channel-accounts";
+    const platformsPath = "/channel-platforms";
+    const lookupPath = "/operator/channel-login-queues/active";
+    fixture.fetchMock.mockImplementation((request, init) => {
+      const dependency = [accountsPath, platformsPath, lookupPath].find(
+        (path) => String(request).endsWith(path),
+      );
+      if (dependency && (init?.method ?? "GET") === "GET") {
+        return new Promise<Response>((resolve) => {
+          pendingResponses.set(dependency, () =>
+            original(request, init).then(resolve),
+          );
+        });
+      }
+      return original(request, init);
+    });
+    renderOperator();
+    await waitFor(() => expect(pendingResponses.size).toBe(3));
+    const accounts = within(screen.getByLabelText("总部共享账号"));
+    const onboarding = within(screen.getByLabelText("总部账号接入"));
+    expect(accounts.getByText("正在加载共享账号")).toBeVisible();
+    expect(accounts.queryByRole("button", { name: "重新登录" })).toBeNull();
+
+    // Authentication, accounts and catalog readiness are independent of the
+    // queue lookup. Do not spend the role-query deadline waiting for all three.
+    await act(async () => pendingResponses.get(accountsPath)!());
+    await accounts.findByText(account.display_name);
+    const relogin = accounts.getByRole("button", { name: "重新登录" });
+    expect(relogin).toBeDisabled();
+    expect(onboarding.getByLabelText("正在加载平台")).toBeVisible();
+    expect(
+      onboarding.queryByRole("button", { name: "创建并登录总部账号" }),
+    ).toBeNull();
+
+    await act(async () => pendingResponses.get(platformsPath)!());
+    await onboarding.findByText("创建并登录总部账号");
+    const createLogin = onboarding.getByRole("button", {
+      name: "创建并登录总部账号",
+    });
+    expect(onboarding.getByRole("combobox", { name: "平台" })).toHaveValue(
+      account.platform,
+    );
+    // With the catalog loaded, only the pending queue reservation blocks login.
+    expect(relogin).toBeDisabled();
+    expect(createLogin).toBeDisabled();
+    await userEvent.click(relogin);
+    await userEvent.click(createLogin);
+
+    await act(async () => pendingResponses.get(lookupPath)!());
+    await screen.findByText(/进行中/);
+    expect(relogin).toBeDisabled();
+    expect(createLogin).toBeDisabled();
+    await userEvent.click(relogin);
+    await userEvent.click(createLogin);
+    expect(
+      fixture.requests.some(
+        (entry) =>
+          entry.method === "POST" &&
+          entry.path.endsWith("/channel-login-sessions"),
+      ),
+    ).toBe(false);
+  });
+
+  it.each(["user", "operator", "authentication"] as const)(
+    "reserves direct login for a fresh %s lookup and releases it only after an empty result",
+    async (changed) => {
+      const fixture = mockApi([account], true);
+      const original = fixture.fetchMock.getMockImplementation()!;
+      let switched = false;
+      let resolveLookup!: (result: Response) => void;
+      fixture.fetchMock.mockImplementation((request, init) => {
+        const path = new URL(String(request), "http://localhost").pathname;
+        if (switched && path.endsWith("/auth/session"))
+          return Promise.resolve(
+            response({
+              ...session,
+              user: {
+                ...session.user,
+                id: changed === "user" ? "user-2" : session.user.id,
+              },
+              operator: {
+                ...session.operator,
+                id: changed === "operator" ? "operator-2" : session.operator.id,
+              },
+              csrf_token:
+                changed === "authentication"
+                  ? "csrf-test-next"
+                  : session.csrf_token,
+              memberships: [
+                { ...session.memberships[0], role: "resource_admin" },
+              ],
+            }),
+          );
+        if (switched && path.endsWith("/operator/channel-login-queues/active"))
+          return new Promise<Response>((resolve) => {
+            resolveLookup = resolve;
+          });
+        return original(request, init);
+      });
+      renderOperator();
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "重新登录" })).toBeEnabled(),
+      );
+      switched = true;
+      await userEvent.click(
+        screen.getByRole("button", { name: "Refresh test session" }),
+      );
+      await waitFor(() => expect(resolveLookup).toBeDefined());
+      expect(screen.getByRole("button", { name: "重新登录" })).toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: "创建并登录总部账号" }),
+      ).toBeDisabled();
+      await act(async () => resolveLookup(response(null)));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "重新登录" })).toBeEnabled(),
+      );
+      expect(
+        screen.getByRole("button", { name: "创建并登录总部账号" }),
+      ).toBeEnabled();
+    },
+  );
+  it("completes verified queue identity only through queue CAS, not the direct endpoint", async () => {
+    const fixture = withQueue();
+    fixture.setIdentityReady();
+    renderOperator();
+    await screen.findByText(/本次登录已结束/);
+    expect(fixture.queueRequests).toEqual([
+      {
+        path: "/api/v1/operator/channel-login-queues/queue-a/complete",
+        body: { expected_version: 1 },
+      },
+    ]);
+    expect(
+      fixture.requests.some((request) =>
+        request.path.endsWith("/channel-login-sessions/login-1/complete"),
+      ),
+    ).toBe(false);
+  });
+  it("pauses from the shared remote window without direct DELETE or optimistic disposal", async () => {
+    const fixture = withQueue();
+    renderOperator();
+    const desktop = await screen.findByLabelText("远程登录");
+    await userEvent.click(
+      within(desktop).getByRole("button", { name: "暂停" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByLabelText("远程登录")).not.toBeInTheDocument(),
+    );
+    expect(fixture.queueRequests).toEqual([
+      {
+        path: "/api/v1/operator/channel-login-queues/queue-a/pause",
+        body: { expected_version: 1 },
+      },
+    ]);
+    expect(
+      fixture.requests.some((request) => request.method === "DELETE"),
+    ).toBe(false);
+  });
+  it("does not count a 404 queue completion as success or retry against another account", async () => {
+    const fixture = withQueue(404);
+    fixture.setIdentityReady();
+    renderOperator();
+    await waitFor(() => expect(fixture.queueRequests).toHaveLength(1));
+    await screen.findAllByText("暂时无法完成，请重新加载进度后重试。");
+    expect(screen.queryByText(/本次登录已结束/)).not.toBeInTheDocument();
+    expect(
+      fixture.requests.some((request) =>
+        request.path.endsWith("/channel-login-sessions/login-1/complete"),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("channel API scope", () => {

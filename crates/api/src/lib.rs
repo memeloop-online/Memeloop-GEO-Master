@@ -31,6 +31,7 @@ pub mod content_runtime;
 mod content_tools;
 mod desktop_gateway;
 pub mod distribution;
+mod operator_login_queue;
 mod proxy_pools;
 mod source_channel_recommendations;
 pub use content::ContentService;
@@ -2442,6 +2443,7 @@ pub fn router(state: AppState) -> Router {
     // replay. Keep this router outside generic body-hash/response caching,
     // even when a caller supplies an Idempotency-Key.
     let operator_channel_routes = channels::operator_routes()
+        .merge(operator_login_queue::routes())
         .route(
             "/operator/connector-capabilities",
             get(connector_capabilities::list_operator),

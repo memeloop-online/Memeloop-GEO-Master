@@ -224,6 +224,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 53,
         description: "account network bindings",
     },
+    MigrationMetadata {
+        version: 54,
+        description: "operator login queues",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {
