@@ -54,14 +54,9 @@ impl ChannelService {
             }
         }
         let generation = self.browser()?.lifecycle_generation().await?;
-        let bytes = serde_json::to_vec(proxy)
-            .map_err(|_| AppError::invalid_request("browser network is invalid"))?;
-        let effective_network = self.encrypt(
-            secret_scope,
-            session_id,
-            "browser_operation_network",
-            &bytes,
-        )?;
+        let network_scope = self.account_network_scope(secret_scope, account_id).await?;
+        let network = self.ensure_account_network(&network_scope, proxy).await?;
+        let effective_network = network.active.effective_network;
         self.operations()?
             .begin_browser_operation(
                 scope,
@@ -72,6 +67,10 @@ impl ChannelService {
                     purpose,
                     runner_generation: generation,
                     effective_network,
+                    network_selection: Some(geo_domain::BrowserNetworkSelection {
+                        scope: network_scope,
+                        historical_binding_id: None,
+                    }),
                     reservation_id,
                     expires_at: Utc::now() + Duration::minutes(20),
                 },
@@ -87,14 +86,7 @@ impl ChannelService {
         platform: &str,
         storage_state: Option<&serde_json::Value>,
     ) -> Result<(), AppError> {
-        let network = self.decrypt(
-            secret_scope,
-            operation.operation_id,
-            "browser_operation_network",
-            &operation.effective_network,
-        )?;
-        let proxy: Option<BrowserProxy> = serde_json::from_slice(&network)
-            .map_err(|_| AppError::conflict("stored browser network is invalid"))?;
+        let proxy = self.operation_proxy(operation, secret_scope)?;
         let operation = self
             .operations()?
             .mark_browser_start_requested(&operation.scope, operation.operation_id, Utc::now())

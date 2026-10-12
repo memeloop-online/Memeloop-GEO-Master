@@ -68,6 +68,7 @@ async fn postgres_browser_ownership_contract_and_restart() {
         repo.begin_browser_operation(
             &legacy_scope,
             &BeginBrowserOperation {
+                network_selection: None,
                 operation_id: Uuid::new_v4(),
                 session_id: Uuid::new_v4(),
                 account_id: legacy_account,

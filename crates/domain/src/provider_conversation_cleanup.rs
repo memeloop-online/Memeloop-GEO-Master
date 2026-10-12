@@ -24,6 +24,10 @@ pub struct ProviderCleanupClaim {
     pub provider: String,
     pub external_conversation_id: String,
     pub original_identity: ObservationProviderIdentity,
+    /// Trusted source/extraction capture's original browser operation. Missing
+    /// legacy provenance cannot be reconstructed from the account's current route.
+    #[serde(default)]
+    pub original_runner_session_id: Option<Uuid>,
     pub lease_id: Uuid,
     pub lease_until: DateTime<Utc>,
     pub action: ProviderCleanupAction,
@@ -206,6 +210,7 @@ mod tests {
             "original_identity": {"provider": "synthetic", "platform_account_id": "synthetic-account"}
         })).unwrap();
         assert!(!claim.has_prior_delete_attempt);
+        assert!(claim.original_runner_session_id.is_none());
         assert!(claim.retained_message_inventory_sha256.is_none());
     }
 

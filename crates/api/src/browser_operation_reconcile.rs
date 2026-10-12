@@ -103,6 +103,7 @@ mod tests {
             .begin_browser_operation(
                 scope,
                 &BeginBrowserOperation {
+                    network_selection: None,
                     operation_id: Uuid::new_v4(),
                     session_id: Uuid::new_v4(),
                     account_id: Uuid::new_v4(),

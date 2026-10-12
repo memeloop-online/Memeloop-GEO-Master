@@ -307,6 +307,24 @@ fn decode_claim(
         serde_json::from_value(row.get("original_identity"))
             .map_err(|_| AppError::new(ErrorCode::Internal, "stored cleanup identity invalid"))?;
     original_identity.validate()?;
+    let capture = decode_capture(row)?;
+    let original_runner_session_id = (capture.receipt.capture_id == capture.input.capture_id
+        && capture.input.account_id == row.get::<Uuid, _>("account_id")
+        && capture.input.original_identity.as_ref() == Some(&original_identity)
+        && capture
+            .input
+            .validate(scope)
+            .is_ok_and(|digest| digest == capture.receipt.digest_sha256)
+        && capture
+            .input
+            .owned_conversation
+            .as_ref()
+            .is_some_and(|owned| {
+                owned.provider == row.get::<String, _>("provider")
+                    && owned.external_conversation_id
+                        == row.get::<String, _>("external_conversation_id")
+            }))
+    .then_some(capture.input.runner_session_id);
     Ok(ProviderCleanupClaim {
         cleanup_id: row.get("cleanup_id"),
         capture_id: row.get("capture_id"),
@@ -314,9 +332,9 @@ fn decode_claim(
         provider: row.get("provider"),
         external_conversation_id: row.get("external_conversation_id"),
         original_identity,
+        original_runner_session_id,
         has_prior_delete_attempt: row.get("has_prior_delete_attempt"),
-        retained_message_inventory_sha256: decode_capture(row)?
-            .retained_message_inventory_sha256(scope),
+        retained_message_inventory_sha256: capture.retained_message_inventory_sha256(scope),
         lease_id: row.get("lease_id"),
         lease_until: row.get("lease_until"),
         action: if row.get::<String, _>("action") == "reconcile" {

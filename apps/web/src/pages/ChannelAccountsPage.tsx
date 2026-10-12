@@ -73,6 +73,7 @@ import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { RemoteDesktop } from "../components/RemoteDesktop";
 import { OperatorAccountImport } from "../components/OperatorAccountImport";
 import { OperatorProxyPools } from "../components/OperatorProxyPools";
+import { OperatorAccountNetwork } from "../components/OperatorAccountNetwork";
 import { ProjectAiSettingsPanel } from "./ProjectAiSettingsPanel";
 import { ProjectSerpSettingsPanel } from "./ProjectSerpSettingsPanel";
 import "../i18n/projectSerp";
@@ -1446,9 +1447,6 @@ export function OperatorAccountsPage() {
   const [proxyServer, setProxyServer] = useState("");
   const [proxyUsername, setProxyUsername] = useState("");
   const [proxyPassword, setProxyPassword] = useState("");
-  const [editProxyServer, setEditProxyServer] = useState("");
-  const [editProxyUsername, setEditProxyUsername] = useState("");
-  const [editProxyPassword, setEditProxyPassword] = useState("");
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [loginStarting, setLoginStarting] = useState(false);
@@ -1906,6 +1904,7 @@ export function OperatorAccountsPage() {
                       }
                     />
                   </div>
+                  <OperatorAccountNetwork accountId={account.account_id} />
                   {selectedAccount === account.account_id && (
                     <div className="channel-account-editor">
                       <Field label="共享账号资源组">
@@ -1930,85 +1929,6 @@ export function OperatorAccountsPage() {
                           ))}
                         </Select>
                       </Field>
-                      <details className="channel-proxy">
-                        <summary>管理总部账号代理</summary>
-                        <p>
-                          当前：
-                          {account.proxy_configured
-                            ? (account.proxy_server ?? "已配置")
-                            : "默认出口"}
-                          。更改后不回显凭据。
-                        </p>
-                        <Field label="新代理地址">
-                          <Input
-                            value={editProxyServer}
-                            onChange={(_, data) =>
-                              setEditProxyServer(data.value)
-                            }
-                          />
-                        </Field>
-                        <Field label="新代理用户名">
-                          <Input
-                            value={editProxyUsername}
-                            autoComplete="off"
-                            onChange={(_, data) =>
-                              setEditProxyUsername(data.value)
-                            }
-                          />
-                        </Field>
-                        <Field label="新代理密码">
-                          <Input
-                            type="password"
-                            value={editProxyPassword}
-                            autoComplete="new-password"
-                            onChange={(_, data) =>
-                              setEditProxyPassword(data.value)
-                            }
-                          />
-                        </Field>
-                        <Button
-                          disabled={busy || !editProxyServer.trim()}
-                          onClick={() =>
-                            void run(
-                              () =>
-                                updatePoolAccount(account.account_id, {
-                                  proxy: {
-                                    server: editProxyServer.trim(),
-                                    ...(editProxyUsername
-                                      ? { username: editProxyUsername }
-                                      : {}),
-                                    ...(editProxyPassword
-                                      ? { password: editProxyPassword }
-                                      : {}),
-                                  },
-                                }),
-                              "总部账号代理已更新。",
-                            ).finally(() => {
-                              setEditProxyServer("");
-                              setEditProxyUsername("");
-                              setEditProxyPassword("");
-                            })
-                          }
-                        >
-                          保存代理
-                        </Button>
-                        {account.proxy_configured && (
-                          <Button
-                            disabled={busy}
-                            onClick={() =>
-                              void run(
-                                () =>
-                                  updatePoolAccount(account.account_id, {
-                                    proxy: null,
-                                  }),
-                                "总部账号已恢复默认出口。",
-                              )
-                            }
-                          >
-                            移除代理
-                          </Button>
-                        )}
-                      </details>
                       <OperatorProjectPicker
                         key={`${session?.user.id}:${session?.operator.id}:${account.account_id}`}
                         userId={session!.user.id}

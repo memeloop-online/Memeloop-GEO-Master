@@ -35,7 +35,7 @@ pub struct ChannelService {
     pub(crate) operation_repository: Option<Arc<dyn geo_domain::ChannelJobRepository>>,
     cipher: Option<Arc<SecretEnvelope>>,
     pub browser: Option<BrowserBridge>,
-    operator_pool_tenant_id: Option<TenantId>,
+    pub(crate) operator_pool_tenant_id: Option<TenantId>,
 }
 
 impl ChannelService {
@@ -149,12 +149,25 @@ impl ChannelService {
             .map_err(|_| AppError::new(ErrorCode::Internal, "channel secret authentication failed"))
     }
 
-    async fn resolved_proxy(
+    pub(crate) async fn resolved_proxy(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
         account_proxy: Option<&ChannelSecret>,
     ) -> Result<Option<BrowserProxy>, AppError> {
+        let network_scope = geo_domain::AccountNetworkScope {
+            operator_id: scope.operator_id,
+            account_id,
+            tenant_id: Some(scope.tenant_id),
+            project_id: scope.project_id,
+        };
+        if let Some(head) = self
+            .operations()?
+            .get_account_network(&network_scope)
+            .await?
+        {
+            return self.binding_proxy(&head.active);
+        }
         let default_proxy = if account_proxy.is_none() {
             self.repository
                 .get_settings(scope)
@@ -413,27 +426,37 @@ impl ChannelService {
         let version = self
             .publication_connector_version(&prepared.platform, "publish")
             .await?;
+        let operation = self
+            .prepare_owned_browser(
+                &crate::browser_operations::execution_scope(scope, session_id),
+                scope,
+                account_id,
+                session_id,
+                geo_domain::BrowserOperationPurpose::Publish,
+                reservation_id,
+                &prepared.proxy,
+            )
+            .await?;
         let binding = PublicationBrowserBinding {
-            version: 1,
+            version: 2,
             account_id,
             owner_kind: prepared.owner_kind,
             platform: prepared.platform.clone(),
             platform_account_id: prepared.platform_account_id.clone(),
             connector_version: version,
-            effective_proxy: prepared.effective_proxy.clone(),
+            effective_proxy: serde_json::to_value(self.operation_proxy(&operation, scope)?)
+                .map_err(|_| AppError::conflict("stored publication network is invalid"))?,
+            network_binding_id: operation.network_binding_id,
+            network_scope: operation.network_scope.clone(),
         };
         let bytes = serde_json::to_vec(&binding)
             .map_err(|_| AppError::new(ErrorCode::Internal, "publication binding invalid"))?;
         let sealed = self.encrypt(scope, attempt_id, "publication_execution", &bytes)?;
-        self.open_execution_browser(
+        self.start_owned_browser(
+            &operation,
             scope,
-            account_id,
-            session_id,
-            geo_domain::BrowserOperationPurpose::Publish,
-            reservation_id,
             &prepared.platform,
-            prepared.proxy,
-            &prepared.storage_state,
+            Some(&prepared.storage_state),
         )
         .await?;
         Ok((session_id, sealed, session_version))
@@ -494,7 +517,7 @@ impl ChannelService {
         let bytes = self.decrypt(scope, attempt_id, "publication_execution", binding)?;
         let original: PublicationBrowserBinding = serde_json::from_slice(&bytes)
             .map_err(|_| AppError::conflict("publication browser binding is invalid"))?;
-        if original.version != 1
+        if !matches!(original.version, 1 | 2)
             || original.account_id != account_id
             || original.platform_account_id.trim().is_empty()
             || original.connector_version.trim().is_empty()
@@ -503,11 +526,12 @@ impl ChannelService {
                 "publication browser binding has changed",
             ));
         }
-        let current = self.prepare_available_browser(scope, account_id).await?;
+        let current = self
+            .prepare_available_browser_without_network(scope, account_id)
+            .await?;
         if original.owner_kind != current.owner_kind
             || original.platform != current.platform
             || original.platform_account_id != current.platform_account_id
-            || original.effective_proxy != current.effective_proxy
         {
             return Err(AppError::conflict(
                 "publication browser binding has changed",
@@ -522,15 +546,40 @@ impl ChannelService {
                 "publication browser binding has changed",
             ));
         }
-        self.open_execution_browser(
+        let network = match (original.network_scope, original.network_binding_id) {
+            (Some(network_scope), Some(id)) if original.version == 2 => {
+                if network_scope
+                    != crate::historical_browser_operations::account_network_scope(
+                        scope,
+                        account_id,
+                        current.owner_kind,
+                    )
+                {
+                    return Err(AppError::conflict(
+                        "publication browser binding has changed",
+                    ));
+                }
+                crate::historical_browser_operations::HistoricalBrowserNetwork::Binding {
+                    scope: network_scope,
+                    id,
+                }
+            }
+            (None, None) if original.version == 1 => {
+                let proxy = serde_json::from_value(original.effective_proxy)
+                    .map_err(|_| AppError::conflict("publication browser binding is invalid"))?;
+                crate::historical_browser_operations::HistoricalBrowserNetwork::Legacy(proxy)
+            }
+            _ => return Err(AppError::conflict("publication browser binding is invalid")),
+        };
+        self.open_historical_browser(
             scope,
             account_id,
             session_id,
             geo_domain::BrowserOperationPurpose::Lookup,
             reservation_id,
             &current.platform,
-            current.proxy,
             &current.storage_state,
+            network,
         )
         .await?;
         Ok((
@@ -555,7 +604,7 @@ impl ChannelService {
             .decrypt(scope, attempt_id, "publication_execution", binding)
             .ok()?;
         let original: PublicationBrowserBinding = serde_json::from_slice(&bytes).ok()?;
-        (original.version == 1
+        (matches!(original.version, 1 | 2)
             && original.account_id == account_id
             && original.platform == platform
             && !original.platform_account_id.trim().is_empty()
@@ -574,9 +623,17 @@ impl ChannelService {
         account_id: Uuid,
         identity: &geo_domain::ObservationProviderIdentity,
         session_id: Uuid,
+        original_session_id: Uuid,
     ) -> Result<(), AppError> {
-        self.resume_provider_cleanup_browser_inner(scope, account_id, identity, session_id, None)
-            .await
+        self.resume_provider_cleanup_browser_inner(
+            scope,
+            account_id,
+            identity,
+            session_id,
+            None,
+            original_session_id,
+        )
+        .await
     }
 
     pub(crate) async fn resume_provider_cleanup_browser_reserved(
@@ -586,6 +643,7 @@ impl ChannelService {
         identity: &geo_domain::ObservationProviderIdentity,
         session_id: Uuid,
         reservation_id: Uuid,
+        original_session_id: Uuid,
     ) -> Result<(), AppError> {
         self.resume_provider_cleanup_browser_inner(
             scope,
@@ -593,10 +651,12 @@ impl ChannelService {
             identity,
             session_id,
             Some(reservation_id),
+            original_session_id,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn resume_provider_cleanup_browser_inner(
         &self,
         scope: &TenantScope,
@@ -604,23 +664,67 @@ impl ChannelService {
         identity: &geo_domain::ObservationProviderIdentity,
         session_id: Uuid,
         reservation_id: Option<Uuid>,
+        original_session_id: Uuid,
     ) -> Result<(), AppError> {
         identity.validate()?;
-        let current = self.prepare_available_browser(scope, account_id).await?;
+        let current = self
+            .prepare_available_browser_without_network(scope, account_id)
+            .await?;
         if current.platform != identity.provider
             || current.platform_account_id != identity.platform_account_id
         {
             return Err(AppError::conflict("cleanup browser identity has changed"));
         }
-        self.open_execution_browser(
+        let original = self
+            .operations()?
+            .get_browser_operation(
+                &crate::browser_operations::execution_scope(scope, original_session_id),
+                original_session_id,
+            )
+            .await?
+            .ok_or_else(|| AppError::conflict("original cleanup network is unavailable"))?;
+        if original.account_id != account_id
+            || original.session_id != original_session_id
+            || original.purpose != geo_domain::BrowserOperationPurpose::Measure
+        {
+            return Err(AppError::conflict(
+                "original cleanup network is unavailable",
+            ));
+        }
+        let network = match (&original.network_scope, original.network_binding_id) {
+            (Some(network_scope), Some(id)) => {
+                if *network_scope
+                    != crate::historical_browser_operations::account_network_scope(
+                        scope,
+                        account_id,
+                        current.owner_kind,
+                    )
+                {
+                    return Err(AppError::conflict("original cleanup network scope differs"));
+                }
+                crate::historical_browser_operations::HistoricalBrowserNetwork::Binding {
+                    scope: network_scope.clone(),
+                    id,
+                }
+            }
+            (None, None) => crate::historical_browser_operations::HistoricalBrowserNetwork::Legacy(
+                self.operation_proxy(&original, scope)?,
+            ),
+            _ => {
+                return Err(AppError::conflict(
+                    "original cleanup network is unavailable",
+                ));
+            }
+        };
+        self.open_historical_browser(
             scope,
             account_id,
             session_id,
             geo_domain::BrowserOperationPurpose::Cleanup,
             reservation_id,
             &current.platform,
-            current.proxy,
             &current.storage_state,
+            network,
         )
         .await?;
         Ok(())
@@ -650,6 +754,25 @@ impl ChannelService {
         scope: &TenantScope,
         account_id: Uuid,
     ) -> Result<PreparedPublicationBrowser, AppError> {
+        self.prepare_available_browser_inner(scope, account_id, true)
+            .await
+    }
+
+    async fn prepare_available_browser_without_network(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+    ) -> Result<PreparedPublicationBrowser, AppError> {
+        self.prepare_available_browser_inner(scope, account_id, false)
+            .await
+    }
+
+    async fn prepare_available_browser_inner(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        resolve_network: bool,
+    ) -> Result<PreparedPublicationBrowser, AppError> {
         self.browser()?;
         match self.repository.get_account(scope, account_id).await {
             Ok(record) => {
@@ -669,18 +792,18 @@ impl ChannelService {
                 let storage_state = serde_json::from_slice(&bytes).map_err(|_| {
                     AppError::new(ErrorCode::Internal, "stored browser session is invalid")
                 })?;
-                let proxy = self
-                    .resolved_proxy(scope, account_id, record.proxy.as_ref())
-                    .await?;
-                let effective_proxy = serde_json::to_value(&proxy)
-                    .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
+                let proxy = if resolve_network {
+                    self.resolved_proxy(scope, account_id, record.proxy.as_ref())
+                        .await?
+                } else {
+                    None
+                };
                 Ok(PreparedPublicationBrowser {
                     encrypted_session: session.clone(),
                     owner_kind: ChannelOwnerKind::Customer,
                     platform: record.account.platform,
                     platform_account_id,
                     storage_state,
-                    effective_proxy,
                     proxy,
                 })
             }
@@ -720,26 +843,44 @@ impl ChannelService {
                 let storage_state = serde_json::from_slice(&bytes).map_err(|_| {
                     AppError::new(ErrorCode::Internal, "stored browser session is invalid")
                 })?;
-                let proxy = record
-                    .proxy
-                    .as_ref()
-                    .map(|secret| {
-                        let bytes = self.decrypt(&pool_scope, account_id, "pool_proxy", secret)?;
-                        let proxy: ProxyInput = serde_json::from_slice(&bytes).map_err(|_| {
-                            AppError::new(ErrorCode::Internal, "stored proxy is invalid")
-                        })?;
-                        Ok::<_, AppError>(proxy.runner())
-                    })
-                    .transpose()?;
-                let effective_proxy = serde_json::to_value(&proxy)
-                    .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
+                let network_scope = geo_domain::AccountNetworkScope {
+                    operator_id: scope.operator_id,
+                    account_id,
+                    tenant_id: None,
+                    project_id: None,
+                };
+                let network = if resolve_network {
+                    self.operations()?
+                        .get_account_network(&network_scope)
+                        .await?
+                } else {
+                    None
+                };
+                let proxy = if !resolve_network {
+                    None
+                } else if let Some(head) = network {
+                    self.binding_proxy(&head.active)?
+                } else {
+                    record
+                        .proxy
+                        .as_ref()
+                        .map(|secret| {
+                            let bytes =
+                                self.decrypt(&pool_scope, account_id, "pool_proxy", secret)?;
+                            let proxy: ProxyInput =
+                                serde_json::from_slice(&bytes).map_err(|_| {
+                                    AppError::new(ErrorCode::Internal, "stored proxy is invalid")
+                                })?;
+                            Ok::<_, AppError>(proxy.runner())
+                        })
+                        .transpose()?
+                };
                 Ok(PreparedPublicationBrowser {
                     encrypted_session: session.clone(),
                     owner_kind: ChannelOwnerKind::OperatorPool,
                     platform: record.account.platform,
                     platform_account_id,
                     storage_state,
-                    effective_proxy,
                     proxy,
                 })
             }
@@ -754,7 +895,6 @@ struct PreparedPublicationBrowser {
     platform: String,
     platform_account_id: String,
     storage_state: serde_json::Value,
-    effective_proxy: serde_json::Value,
     proxy: Option<BrowserProxy>,
 }
 
@@ -782,6 +922,10 @@ struct PublicationBrowserBinding {
     // Null means direct access. Any selected proxy includes credentials, all
     // protected by the attempt-scoped authenticated envelope.
     effective_proxy: serde_json::Value,
+    #[serde(default)]
+    network_binding_id: Option<Uuid>,
+    #[serde(default)]
+    network_scope: Option<geo_domain::AccountNetworkScope>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -906,7 +1050,7 @@ fn default_settings(project_id: ProjectId) -> ChannelSettings {
     }
 }
 
-async fn scope(
+pub(crate) async fn scope(
     state: &AppState,
     tenant: &TenantScope,
     project_id: ProjectId,
@@ -1092,17 +1236,28 @@ pub struct ProxyInput {
 }
 
 impl ProxyInput {
-    fn validate(&self) -> Result<(), AppError> {
+    pub(crate) fn validate(&self) -> Result<(), AppError> {
         let url = reqwest::Url::parse(&self.server)
             .map_err(|_| AppError::invalid_request("proxy URL is invalid"))?;
         if !matches!(url.scheme(), "http" | "https" | "socks5")
             || url.host_str().is_none()
-            || url.port().is_none()
+            || url.port_or_known_default().is_none_or(|port| port == 0)
             || url.username() != ""
             || url.password().is_some()
             || url.query().is_some()
             || url.fragment().is_some()
             || self.server.len() > 512
+            || self.server.trim() != self.server
+            || self.server.chars().any(char::is_control)
+            || url.path() != "/"
+            || self
+                .username
+                .as_ref()
+                .is_some_and(|v| v.len() > 512 || v.chars().any(char::is_control))
+            || self
+                .password
+                .as_ref()
+                .is_some_and(|v| v.len() > 4096 || v.chars().any(char::is_control))
         {
             return Err(AppError::invalid_request(
                 "proxy URL must contain scheme, host and port without credentials",
@@ -1111,7 +1266,7 @@ impl ProxyInput {
         Ok(())
     }
 
-    fn runner(self) -> BrowserProxy {
+    pub(crate) fn runner(self) -> BrowserProxy {
         BrowserProxy {
             server: self.server,
             username: self.username,
@@ -1189,15 +1344,15 @@ pub async fn patch_settings(
         .await
         .map_err(|e| err(e, context))?;
     let service = state.channel_service();
-    let mut record = service
+    let expected = service
         .repository
         .get_settings(&scope)
         .await
-        .map_err(|e| err(e, context))?
-        .unwrap_or(ChannelSettingsRecord {
-            settings: default_settings(input.project_id),
-            proxy: None,
-        });
+        .map_err(|e| err(e, context))?;
+    let mut record = expected.clone().unwrap_or(ChannelSettingsRecord {
+        settings: default_settings(input.project_id),
+        proxy: None,
+    });
     if let Some(group) = input.default_group_id {
         record.settings.default_group_id = group;
     }
@@ -1225,8 +1380,7 @@ pub async fn patch_settings(
     }
     record.settings.updated_at = Utc::now();
     let settings = service
-        .repository
-        .save_settings(&scope, record)
+        .save_project_network_defaults(&scope, expected.as_ref(), &record)
         .await
         .map_err(|e| err(e, context))?;
     Ok(Json(settings))
@@ -1247,6 +1401,13 @@ pub async fn list_accounts(
         .list_accounts(&scope)
         .await
         .map_err(|e| err(e, context))?;
+    for account in &mut items {
+        state
+            .channel_service()
+            .project_network_metadata(&scope, account)
+            .await
+            .map_err(|e| err(e, context))?;
+    }
     items.extend(
         state
             .channel_service()
@@ -1356,6 +1517,7 @@ pub async fn patch_account(
         .get_account(&scope, id)
         .await
         .map_err(|e| err(e, context))?;
+    let expected = record.clone();
     if let Some(group) = input.group_id {
         record.account.group_id = group;
     }
@@ -1369,35 +1531,31 @@ pub async fn patch_account(
             ChannelStatus::NeedsLogin
         };
     }
-    if let Some(proxy) = input.proxy {
-        match proxy {
-            Some(proxy) => {
-                proxy.validate().map_err(|e| err(e, context))?;
-                record.account.proxy_server = Some(proxy.server.clone());
-                let bytes = serde_json::to_vec(&proxy).map_err(|_| {
-                    err(
-                        AppError::new(ErrorCode::Internal, "proxy encoding failed"),
-                        context,
-                    )
-                })?;
-                record.proxy = Some(
-                    service
-                        .encrypt(&scope, id, "proxy", &bytes)
-                        .map_err(|e| err(e, context))?,
-                );
-                record.account.proxy_configured = true;
-            }
-            None => {
-                record.proxy = None;
-                record.account.proxy_server = None;
-                record.account.proxy_configured = false;
-            }
-        }
-    }
     record.account.updated_at = Utc::now();
-    let result = service
-        .repository
-        .save_account_metadata(&scope, record)
+    let mut result = if let Some(proxy) = input.proxy {
+        let metadata = geo_domain::AccountNetworkMetadataUpdate::Customer {
+            expected,
+            updated: record,
+        };
+        service
+            .update_legacy_account_proxy(&scope, id, proxy, &metadata)
+            .await
+            .map_err(|e| err(e, context))?;
+        service
+            .repository
+            .get_account(&scope, id)
+            .await
+            .map_err(|e| err(e, context))?
+            .account
+    } else {
+        service
+            .repository
+            .save_account_metadata(&scope, record)
+            .await
+            .map_err(|e| err(e, context))?
+    };
+    service
+        .project_network_metadata(&scope, &mut result)
         .await
         .map_err(|e| err(e, context))?;
     Ok(Json(result))
@@ -2024,12 +2182,19 @@ pub async fn list_pool_accounts(
     Extension(context): Extension<RequestContext>,
 ) -> Result<Json<ChannelList<PoolAccount>>, ApiError> {
     pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
-    let items = state
+    let mut items = state
         .channel_service()
         .repository
         .list_pool_accounts(auth.operator.id)
         .await
         .map_err(|e| err(e, context))?;
+    for account in &mut items {
+        state
+            .channel_service()
+            .pool_network_metadata(auth.operator.id, account)
+            .await
+            .map_err(|e| err(e, context))?;
+    }
     Ok(Json(ChannelList { items }))
 }
 
@@ -2112,6 +2277,7 @@ pub async fn patch_pool_account(
         .get_pool_account(auth.operator.id, id)
         .await
         .map_err(|e| err(e, context))?;
+    let expected = record.clone();
     if let Some(group) = input.group_id {
         record.account.group_id = group;
     }
@@ -2125,39 +2291,34 @@ pub async fn patch_pool_account(
             ChannelStatus::NeedsLogin
         };
     }
-    if let Some(proxy) = input.proxy {
-        match proxy {
-            Some(proxy) => {
-                proxy.validate().map_err(|e| err(e, context))?;
-                record.account.proxy_server = Some(proxy.server.clone());
-                let bytes = serde_json::to_vec(&proxy).map_err(|_| {
-                    err(
-                        AppError::new(ErrorCode::Internal, "proxy encoding failed"),
-                        context,
-                    )
-                })?;
-                record.proxy = Some(
-                    service
-                        .encrypt(&pool_scope, id, "pool_proxy", &bytes)
-                        .map_err(|e| err(e, context))?,
-                );
-                record.account.proxy_configured = true;
-            }
-            None => {
-                record.proxy = None;
-                record.account.proxy_server = None;
-                record.account.proxy_configured = false;
-            }
-        }
-    }
     record.account.updated_at = Utc::now();
-    Ok(Json(
+    let mut result = if let Some(proxy) = input.proxy {
+        let metadata = geo_domain::AccountNetworkMetadataUpdate::OperatorPool {
+            expected,
+            updated: record,
+        };
+        service
+            .update_legacy_account_proxy(&pool_scope, id, proxy, &metadata)
+            .await
+            .map_err(|e| err(e, context))?;
+        service
+            .repository
+            .get_pool_account(auth.operator.id, id)
+            .await
+            .map_err(|e| err(e, context))?
+            .account
+    } else {
         service
             .repository
             .save_pool_account_metadata(auth.operator.id, record)
             .await
-            .map_err(|e| err(e, context))?,
-    ))
+            .map_err(|e| err(e, context))?
+    };
+    service
+        .pool_network_metadata(auth.operator.id, &mut result)
+        .await
+        .map_err(|e| err(e, context))?;
+    Ok(Json(result))
 }
 
 pub async fn delete_pool_account(
@@ -2303,17 +2464,35 @@ pub async fn start_pool_login(
             }),
         ));
     }
-    let proxy = record
-        .proxy
-        .as_ref()
-        .map(|secret| {
-            let bytes = service.decrypt(&scope, input.account_id, "pool_proxy", secret)?;
-            let input: ProxyInput = serde_json::from_slice(&bytes)
-                .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
-            Ok::<_, AppError>(input.runner())
-        })
-        .transpose()
+    let network_scope = geo_domain::AccountNetworkScope {
+        operator_id: scope.operator_id,
+        account_id: input.account_id,
+        tenant_id: None,
+        project_id: None,
+    };
+    let network = service
+        .operations()
+        .map_err(|e| err(e, context))?
+        .get_account_network(&network_scope)
+        .await
         .map_err(|e| err(e, context))?;
+    let proxy = if let Some(head) = network {
+        service
+            .binding_proxy(&head.active)
+            .map_err(|e| err(e, context))?
+    } else {
+        record
+            .proxy
+            .as_ref()
+            .map(|secret| {
+                let bytes = service.decrypt(&scope, input.account_id, "pool_proxy", secret)?;
+                let input: ProxyInput = serde_json::from_slice(&bytes)
+                    .map_err(|_| AppError::new(ErrorCode::Internal, "stored proxy is invalid"))?;
+                Ok::<_, AppError>(input.runner())
+            })
+            .transpose()
+            .map_err(|e| err(e, context))?
+    };
     let session_id = Uuid::new_v4();
     let operation = service
         .prepare_owned_browser(
@@ -2652,6 +2831,10 @@ pub async fn cancel_pool_login(
 
 pub fn customer_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/channel-accounts/{id}/network-binding",
+            get(crate::account_network::get_customer).put(crate::account_network::put_customer),
+        )
         .route("/channel-settings", get(get_settings).patch(patch_settings))
         .route("/channel-groups", get(list_groups).post(create_group))
         .route(
@@ -2682,6 +2865,10 @@ pub fn customer_routes() -> Router<AppState> {
 
 pub fn operator_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/operator/channel-accounts/{id}/network-binding",
+            get(crate::account_network::get_operator).put(crate::account_network::put_operator),
+        )
         .route(
             "/operator/channel-proxy-pools",
             get(crate::proxy_pools::list_pools).post(crate::proxy_pools::create_pool),
@@ -3304,13 +3491,28 @@ mod publication_binding_tests {
     #[tokio::test]
     async fn cleanup_restore_checks_original_identity_before_starting() {
         let (service, scope, account_id, stub, server) = fixture().await;
+        let (original_session, _) = service
+            .resume_available_browser_with_renewal(&scope, account_id)
+            .await
+            .unwrap();
+        service
+            .close_owned_browser(&scope, original_session)
+            .await
+            .unwrap();
+        stub.starts.lock().await.clear();
         let mut identity = geo_domain::ObservationProviderIdentity {
             provider: "zhihu".into(),
             platform_account_id: "different-identity".into(),
         };
         assert!(
             service
-                .resume_provider_cleanup_browser(&scope, account_id, &identity, Uuid::new_v4())
+                .resume_provider_cleanup_browser(
+                    &scope,
+                    account_id,
+                    &identity,
+                    Uuid::new_v4(),
+                    original_session
+                )
                 .await
                 .is_err()
         );
@@ -3319,7 +3521,13 @@ mod publication_binding_tests {
         identity.provider = "other".into();
         assert!(
             service
-                .resume_provider_cleanup_browser(&scope, account_id, &identity, Uuid::new_v4())
+                .resume_provider_cleanup_browser(
+                    &scope,
+                    account_id,
+                    &identity,
+                    Uuid::new_v4(),
+                    original_session
+                )
                 .await
                 .is_err()
         );
@@ -3327,7 +3535,13 @@ mod publication_binding_tests {
         identity.provider = "zhihu".into();
         let session_id = Uuid::new_v4();
         service
-            .resume_provider_cleanup_browser(&scope, account_id, &identity, session_id)
+            .resume_provider_cleanup_browser(
+                &scope,
+                account_id,
+                &identity,
+                session_id,
+                original_session,
+            )
             .await
             .unwrap();
         assert_eq!(stub.starts.lock().await.len(), 1);
@@ -3335,6 +3549,153 @@ mod publication_binding_tests {
             stub.starts.lock().await[0]["session_id"],
             session_id.to_string()
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cleanup_restores_original_route_and_rejects_missing_or_foreign_operation() {
+        let (service, scope, account_id, stub, server) = fixture().await;
+        set_default_proxy(&service, &scope, Some("original-route-secret")).await;
+        let (original_session, _) = service
+            .resume_available_browser_with_renewal(&scope, account_id)
+            .await
+            .unwrap();
+        service
+            .close_owned_browser(&scope, original_session)
+            .await
+            .unwrap();
+        replace_account_route(
+            &service,
+            &scope,
+            account_id,
+            Some("replacement-route-secret"),
+        )
+        .await;
+        let identity = geo_domain::ObservationProviderIdentity {
+            provider: "zhihu".into(),
+            platform_account_id: "original-identity".into(),
+        };
+        assert!(
+            service
+                .resume_provider_cleanup_browser(
+                    &scope,
+                    account_id,
+                    &identity,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                )
+                .await
+                .is_err()
+        );
+        let other_scope = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(ProjectId::new(Uuid::new_v4())),
+        );
+        assert!(
+            service
+                .resume_provider_cleanup_browser(
+                    &other_scope,
+                    account_id,
+                    &identity,
+                    Uuid::new_v4(),
+                    original_session,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(stub.starts.lock().await.len(), 1);
+        let session = Uuid::new_v4();
+        service
+            .resume_provider_cleanup_browser(
+                &scope,
+                account_id,
+                &identity,
+                session,
+                original_session,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.starts.lock().await[1]["proxy"]["password"],
+            "original-route-secret"
+        );
+        service.close_owned_browser(&scope, session).await.unwrap();
+        let (normal, _) = service
+            .resume_available_browser_with_renewal(&scope, account_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.starts.lock().await[2]["proxy"]["password"],
+            "replacement-route-secret"
+        );
+        service.close_owned_browser(&scope, normal).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cleanup_can_retain_pre_binding_operation_snapshot_without_adopting_current_route() {
+        let (service, scope, account_id, stub, server) = fixture().await;
+        let original_session = Uuid::new_v4();
+        service
+            .open_historical_browser(
+                &scope,
+                account_id,
+                original_session,
+                geo_domain::BrowserOperationPurpose::Measure,
+                None,
+                "zhihu",
+                &json!({}),
+                crate::historical_browser_operations::HistoricalBrowserNetwork::Legacy(Some(
+                    BrowserProxy {
+                        server: "http://127.0.0.1:9191".into(),
+                        username: None,
+                        password: Some("legacy-route-secret".into()),
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        service
+            .close_owned_browser(&scope, original_session)
+            .await
+            .unwrap();
+        set_default_proxy(&service, &scope, Some("current-route-secret")).await;
+        let identity = geo_domain::ObservationProviderIdentity {
+            provider: "zhihu".into(),
+            platform_account_id: "original-identity".into(),
+        };
+        let session = Uuid::new_v4();
+        service
+            .resume_provider_cleanup_browser(
+                &scope,
+                account_id,
+                &identity,
+                session,
+                original_session,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.starts.lock().await[1]["proxy"]["password"],
+            "legacy-route-secret"
+        );
+        let operation = service
+            .operations()
+            .unwrap()
+            .get_browser_operation(
+                &crate::browser_operations::execution_scope(&scope, session),
+                session,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(operation.network_binding_id.is_none());
+        assert!(
+            !String::from_utf8_lossy(operation.effective_network.encrypted_bytes())
+                .contains("legacy-route-secret")
+        );
+        service.close_owned_browser(&scope, session).await.unwrap();
         server.abort();
     }
 
@@ -3464,6 +3825,7 @@ mod publication_binding_tests {
         complete_evidence: bool,
         failure: bool,
         reconcile_proof: Option<bool>,
+        historical_provenance: bool,
     ) {
         use geo_domain::{
             ObservationProviderIdentity, ProviderCleanupAction, ProviderCleanupClaim,
@@ -3484,8 +3846,21 @@ mod publication_binding_tests {
             .await
             .unwrap();
         let state = AppState::development().with_channel_service(service);
+        let (original_session, _) = state
+            .channel_service()
+            .resume_available_browser_with_renewal(&scope, account_id)
+            .await
+            .unwrap();
+        state
+            .channel_service()
+            .close_owned_browser(&scope, original_session)
+            .await
+            .unwrap();
+        stub.cleanup_events.lock().await.clear();
+        stub.starts.lock().await.clear();
         let repository = Arc::new(CleanupStore {
             claim: ProviderCleanupClaim {
+                original_runner_session_id: historical_provenance.then_some(original_session),
                 has_prior_delete_attempt: reconcile_proof.unwrap_or(false),
                 cleanup_id: Uuid::new_v4(),
                 capture_id: Uuid::new_v4(),
@@ -3536,7 +3911,9 @@ mod publication_binding_tests {
         )
         .await
         .unwrap();
-        let expected = if reconcile_proof.is_some() {
+        let expected = if !historical_provenance {
+            vec!["claim", "release", "finish"]
+        } else if reconcile_proof.is_some() {
             vec![
                 "claim", "start", "complete", "rpc", "close", "release", "finish",
             ]
@@ -3558,21 +3935,26 @@ mod publication_binding_tests {
         assert_eq!(*stub.cleanup_events.lock().await, expected);
         assert_eq!(
             *repository.outcome.lock().await,
-            Some(
-                if reconcile_proof.is_some()
-                    && !(reconcile_proof == Some(true) && complete_evidence)
-                {
-                    ProviderCleanupOutcome::Unknown
-                } else if complete_evidence && !failure {
-                    ProviderCleanupOutcome::Deleted
-                } else {
-                    ProviderCleanupOutcome::Failed
-                }
-            )
+            Some(if !historical_provenance {
+                ProviderCleanupOutcome::Failed
+            } else if reconcile_proof.is_some()
+                && !(reconcile_proof == Some(true) && complete_evidence)
+            {
+                ProviderCleanupOutcome::Unknown
+            } else if complete_evidence && !failure {
+                ProviderCleanupOutcome::Deleted
+            } else {
+                ProviderCleanupOutcome::Failed
+            })
         );
         assert_eq!(
             *repository.diagnostic.lock().await,
-            if !complete_evidence && reconcile_proof.is_none() {
+            if !historical_provenance {
+                Some(geo_domain::ProviderCleanupDiagnostic {
+                    stage: geo_domain::ProviderCleanupStage::Preflight,
+                    code: geo_domain::ProviderCleanupCode::RetainedEvidenceRequired,
+                })
+            } else if !complete_evidence && reconcile_proof.is_none() {
                 Some(geo_domain::ProviderCleanupDiagnostic {
                     stage: geo_domain::ProviderCleanupStage::Authorization,
                     code: geo_domain::ProviderCleanupCode::AuthorizationRequired,
@@ -3591,24 +3973,29 @@ mod publication_binding_tests {
 
     #[tokio::test]
     async fn cleanup_dispatch_orders_reservation_authorization_identity_rpc_close_and_finish() {
-        cleanup_dispatch_fixture(true, false, None).await;
+        cleanup_dispatch_fixture(true, false, None, true).await;
     }
 
     #[tokio::test]
     async fn cleanup_dispatch_incomplete_evidence_releases_without_start_or_model_call() {
-        cleanup_dispatch_fixture(false, false, None).await;
+        cleanup_dispatch_fixture(false, false, None, true).await;
     }
 
     #[tokio::test]
     async fn cleanup_dispatch_retained_receipt_preserves_diagnostic_through_finish() {
-        cleanup_dispatch_fixture(true, true, None).await;
+        cleanup_dispatch_fixture(true, true, None, true).await;
     }
 
     #[tokio::test]
     async fn cleanup_absence_settles_only_retained_prior_delete_without_new_delete_authorization() {
-        cleanup_dispatch_fixture(true, false, Some(true)).await;
-        cleanup_dispatch_fixture(true, false, Some(false)).await;
-        cleanup_dispatch_fixture(false, false, Some(true)).await;
+        cleanup_dispatch_fixture(true, false, Some(true), true).await;
+        cleanup_dispatch_fixture(true, false, Some(false), true).await;
+        cleanup_dispatch_fixture(false, false, Some(true), true).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_missing_historical_provenance_has_explicit_diagnostic_without_start() {
+        cleanup_dispatch_fixture(true, false, None, false).await;
     }
 
     async fn set_default_proxy(
@@ -3649,9 +4036,57 @@ mod publication_binding_tests {
             .unwrap();
     }
 
+    async fn replace_account_route(
+        service: &ChannelService,
+        scope: &TenantScope,
+        account_id: Uuid,
+        password: Option<&str>,
+    ) {
+        let network_scope = crate::historical_browser_operations::account_network_scope(
+            scope,
+            account_id,
+            ChannelOwnerKind::Customer,
+        );
+        let head = service
+            .operations()
+            .unwrap()
+            .get_account_network(&network_scope)
+            .await
+            .unwrap()
+            .unwrap();
+        let proxy = password.map(|password| BrowserProxy {
+            server: "http://127.0.0.1:9191".into(),
+            username: Some("proxy-user".into()),
+            password: Some(password.into()),
+        });
+        let binding = service
+            .network_binding(
+                &network_scope,
+                if proxy.is_some() {
+                    geo_domain::AccountNetworkSource::Standalone
+                } else {
+                    geo_domain::AccountNetworkSource::Direct
+                },
+                &proxy,
+            )
+            .unwrap();
+        service
+            .operations()
+            .unwrap()
+            .set_account_network(
+                &network_scope,
+                Some(head.version),
+                &binding,
+                service.repository.as_ref(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
-    async fn original_proxy_and_identity_survive_session_rotation_but_not_network_or_scope_changes()
-    {
+    async fn original_proxy_survives_network_and_session_rotation_but_not_identity_or_scope_changes()
+     {
         let (service, scope, account_id, stub, server) = fixture().await;
         set_default_proxy(&service, &scope, Some("proxy-secret")).await;
         let attempt = Uuid::new_v4();
@@ -3688,7 +4123,7 @@ mod publication_binding_tests {
             .save_account(&scope, record.clone())
             .await
             .unwrap();
-        let (_, identity, version) = service
+        let (lookup_session, identity, version) = service
             .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
             .await
             .unwrap();
@@ -3700,6 +4135,10 @@ mod publication_binding_tests {
             stub.starts.lock().await[1]["storage_state"]["cookies"][0]["name"],
             "renewed"
         );
+        service
+            .close_owned_browser(&scope, lookup_session)
+            .await
+            .unwrap();
         assert!(
             service
                 .resume_publication_lookup_browser(&scope, account_id, Uuid::new_v4(), &bound)
@@ -3717,23 +4156,21 @@ mod publication_binding_tests {
                 .await
                 .is_err()
         );
-        set_default_proxy(&service, &scope, None).await;
-        assert_eq!(
-            service
+        for replacement in [None, Some("changed-secret")] {
+            replace_account_route(&service, &scope, account_id, replacement).await;
+            let (lookup_session, _, _) = service
                 .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
                 .await
-                .unwrap_err()
-                .code,
-            ErrorCode::Conflict
-        );
-        set_default_proxy(&service, &scope, Some("changed-secret")).await;
-        assert!(
+                .unwrap();
+            assert_eq!(
+                stub.starts.lock().await.last().unwrap()["proxy"]["password"],
+                "proxy-secret"
+            );
             service
-                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+                .close_owned_browser(&scope, lookup_session)
                 .await
-                .is_err()
-        );
-        set_default_proxy(&service, &scope, Some("proxy-secret")).await;
+                .unwrap();
+        }
         record.account.platform_account_id = Some("changed-identity".into());
         service
             .repository
@@ -3759,7 +4196,74 @@ mod publication_binding_tests {
                 .await
                 .is_err()
         );
-        assert_eq!(stub.starts.lock().await.len(), 2);
+        assert_eq!(stub.starts.lock().await.len(), 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_snapshot_is_authoritative_but_incomplete_new_binding_is_not() {
+        let (service, scope, account_id, stub, server) = fixture().await;
+        let mut account = service
+            .repository
+            .get_account(&scope, account_id)
+            .await
+            .unwrap();
+        // Today's network is unreadable; historical work must not parse it.
+        account.proxy = Some(
+            service
+                .encrypt(&scope, account_id, "proxy", b"invalid-current-proxy")
+                .unwrap(),
+        );
+        service
+            .repository
+            .save_account(&scope, account)
+            .await
+            .unwrap();
+        let attempt = Uuid::new_v4();
+        let mut binding = PublicationBrowserBinding {
+            version: 1,
+            account_id,
+            owner_kind: ChannelOwnerKind::Customer,
+            platform: "zhihu".into(),
+            platform_account_id: "original-identity".into(),
+            connector_version: "connector.v1".into(),
+            effective_proxy: json!({"server":"http://127.0.0.1:9191","username":null,"password":"historical-secret"}),
+            network_scope: None,
+            network_binding_id: None,
+        };
+        let sealed = service
+            .encrypt(
+                &scope,
+                attempt,
+                "publication_execution",
+                &serde_json::to_vec(&binding).unwrap(),
+            )
+            .unwrap();
+        let (session, _, _) = service
+            .resume_publication_lookup_browser(&scope, account_id, attempt, &sealed)
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.starts.lock().await[0]["proxy"]["password"],
+            "historical-secret"
+        );
+        service.close_owned_browser(&scope, session).await.unwrap();
+        binding.version = 2;
+        let incomplete = service
+            .encrypt(
+                &scope,
+                attempt,
+                "publication_execution",
+                &serde_json::to_vec(&binding).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            service
+                .resume_publication_lookup_browser(&scope, account_id, attempt, &incomplete)
+                .await
+                .is_err()
+        );
+        assert_eq!(stub.starts.lock().await.len(), 1);
         server.abort();
     }
 

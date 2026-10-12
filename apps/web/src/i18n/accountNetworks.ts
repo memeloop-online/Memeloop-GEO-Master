@@ -1,0 +1,83 @@
+import i18n from "./index";
+
+const resources = {
+  en: {
+    title: "Account network",
+    active: "Current network",
+    pending: "Next network",
+    pendingHelp:
+      "The new network will take effect after the current browser closes.",
+    direct: "Default network",
+    manual: "Custom proxy",
+    pool: "Proxy from a pool",
+    configured: "Saved proxy",
+    configuration: "Configuration {{reference}}",
+    source: "Network choice",
+    poolLabel: "Proxy pool",
+    memberLabel: "Proxy",
+    choosePool: "Choose a pool",
+    chooseMember: "Choose a proxy",
+    noPools: "No enabled proxy pools found.",
+    noMembers: "No enabled proxies found in this pool.",
+    server: "Proxy server",
+    username: "Proxy username (optional)",
+    password: "Proxy password (optional)",
+    authHelp:
+      "Enter the new proxy's authentication when changing its configuration.",
+    save: "Save network",
+    saved: "Network saved.",
+    queued:
+      "Network saved. It will take effect after the current browser closes.",
+    reload: "Reload",
+    more: "Load more",
+    loading: "Loading network",
+    loadFailed: "Unable to load the network. Please reload.",
+    failed:
+      "Unable to save. Your selection and address are kept; enter authentication again.",
+    conflict: "The network changed. Reload and review it before saving again.",
+    uncertain:
+      "The result is not confirmed. Reload and check the current and next networks.",
+    invalid:
+      "Enter an HTTP, HTTPS or SOCKS5 server. Use separate fields for authentication.",
+    denied:
+      "Only operator and resource administrators can manage this network.",
+    disabled: "Disabled",
+  },
+  "zh-CN": {
+    title: "账号网络",
+    active: "当前网络",
+    pending: "待生效网络",
+    pendingHelp: "当前浏览器关闭后，新网络将生效。",
+    direct: "默认网络",
+    manual: "自定义代理",
+    pool: "代理池中的代理",
+    configured: "已保存代理",
+    configuration: "配置 {{reference}}",
+    source: "网络选择",
+    poolLabel: "代理池",
+    memberLabel: "代理",
+    choosePool: "选择代理池",
+    chooseMember: "选择代理",
+    noPools: "未找到已启用的代理池。",
+    noMembers: "此池没有已启用的代理。",
+    server: "代理服务器",
+    username: "代理用户名（可选）",
+    password: "代理密码（可选）",
+    authHelp: "更换代理配置时，请填写新代理的认证信息。",
+    save: "保存网络",
+    saved: "网络已保存。",
+    queued: "网络已保存，将在当前浏览器关闭后生效。",
+    reload: "重新加载",
+    more: "加载更多",
+    loading: "正在加载网络",
+    loadFailed: "无法加载网络，请重新加载。",
+    failed: "保存失败，已保留选择和地址；请重新输入认证信息。",
+    conflict: "网络已更新，请重新加载并核对后保存。",
+    uncertain: "结果待确认，请重新加载并核对当前及待生效网络。",
+    invalid: "请填写 HTTP、HTTPS 或 SOCKS5 服务器地址，认证信息请单独填写。",
+    denied: "只有运营管理员和资源管理员可以管理此网络。",
+    disabled: "已停用",
+  },
+};
+for (const [language, translation] of Object.entries(resources))
+  i18n.addResourceBundle(language, "accountNetworks", translation, true, true);
