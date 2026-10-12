@@ -93,6 +93,14 @@ jobs:
           fi
           pnpm --filter @memeloop-geo/browser-runner exec playwright install --with-deps chromium
 
+      - name: Verify editor link selection in Chromium
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          node scripts/verify-markdown-link.mjs 2>&1 | tee logs/editor-link-selection.log
+
       - name: Build generated MemeLoop bundle
         shell: bash
         run: |
