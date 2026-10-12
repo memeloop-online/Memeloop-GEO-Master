@@ -1,9 +1,11 @@
 import * as kimiConversationEvidence from "./kimi-conversation-evidence.mjs";
+import * as deepseekConversationEvidence from "./deepseek-conversation-evidence.mjs";
 
 // Transport lifecycle proofs only, not measurement capabilities or semantic
 // answer parsers. Selection belongs to the provider flow, never captured data.
 const adapters = Object.freeze({
   kimi: kimiConversationEvidence,
+  deepseek: deepseekConversationEvidence,
 });
 
 function adapterFor(provider) {

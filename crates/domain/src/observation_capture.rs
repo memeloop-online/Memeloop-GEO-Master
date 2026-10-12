@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::provider_conversation_lifecycle::completion_inventory;
+use crate::provider_conversation_lifecycle::{completion_inventory, deepseek_lifecycle_chat_id};
 use crate::{AppError, ChannelJobRepository, ChannelTargetInput, TenantScope};
 
 pub const MAX_OBSERVATION_SOURCE_BYTES: usize = 750_000;
@@ -80,6 +80,7 @@ pub struct ObservationProviderIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum ObservationCompletionProtocol {
     ConnectJson,
+    DeepseekHistoryJson,
 }
 
 /// Transport lifecycle proof, independent of answer interpretation.
@@ -264,11 +265,14 @@ pub(crate) fn valid_observation_source_document(document: &serde_json::Value) ->
     if fields.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "messages" | "rendered_text" | "source_redaction"
+            "messages" | "rendered_text" | "source_redaction" | "lifecycle"
         )
     }) || fields
         .get("rendered_text")
         .is_some_and(|value| !value.is_string())
+        || fields
+            .get("lifecycle")
+            .is_some_and(|value| deepseek_lifecycle_chat_id(value).is_none())
     {
         return false;
     }
@@ -418,6 +422,17 @@ impl ObservationCaptureInput {
                     checked_json(source_json, source_sha256, MAX_OBSERVATION_SOURCE_BYTES)?;
                 if !valid_observation_source_document(&document) {
                     return Err(AppError::invalid_request("invalid source document"));
+                }
+                if let Some(lifecycle) = document.get("lifecycle")
+                    && !self.owned_conversation.as_ref().is_some_and(|owned| {
+                        owned.provider == "deepseek"
+                            && deepseek_lifecycle_chat_id(lifecycle)
+                                == Some(owned.external_conversation_id.as_str())
+                    })
+                {
+                    return Err(AppError::invalid_request(
+                        "observation lifecycle conversation mismatch",
+                    ));
                 }
                 if let Some(completion) = &self.completion {
                     let owned = self.owned_conversation.as_ref().filter(|owned| {
@@ -949,6 +964,124 @@ mod tests {
             source_sha256: hex::encode(Sha256::digest(raw.as_bytes())),
             source_json: raw,
         };
+    }
+
+    #[test]
+    fn deepseek_completion_binds_owned_source_and_canonical_inventory() {
+        let (scope, mut input, _) = completed_capture();
+        let document = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
+        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
+        input.completion = Some(ObservationCaptureCompletion {
+            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
+            terminal: true,
+            assistant_message_ids: vec!["2".into()],
+        });
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_ok());
+        let serialized = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            serialized["completion"]["protocol"],
+            "deepseek_history_json"
+        );
+        assert_eq!(
+            serde_json::from_value::<ObservationCaptureInput>(serialized).unwrap(),
+            input
+        );
+        let capture = ObservationCapture {
+            receipt: ObservationCaptureReceipt {
+                capture_id: input.capture_id,
+                schema_version: 1,
+                digest_sha256: input.validate(&scope).unwrap(),
+                stored_at: Utc::now(),
+            },
+            input: input.clone(),
+        };
+        assert!(capture.has_complete_conversation_evidence(&scope));
+        assert_eq!(
+            capture.retained_message_inventory_sha256(&scope),
+            Some(hex::encode(Sha256::digest(
+                br#"[["1","user"],["2","assistant"]]"#
+            )))
+        );
+        for no_completion in [false, true] {
+            let mut invalid = input.clone();
+            if no_completion {
+                invalid.completion = None;
+            }
+            invalid
+                .owned_conversation
+                .as_mut()
+                .unwrap()
+                .external_conversation_id = "other-chat".into();
+            assert!(invalid.validate(&scope).is_err());
+            invalid
+                .owned_conversation
+                .as_mut()
+                .unwrap()
+                .external_conversation_id = "synthetic-chat".into();
+            invalid.owned_conversation.as_mut().unwrap().provider = "kimi".into();
+            invalid.original_identity.as_mut().unwrap().provider = "kimi".into();
+            assert!(invalid.validate(&scope).is_err());
+            invalid.owned_conversation = None;
+            assert!(invalid.validate(&scope).is_err());
+        }
+        let mut invalid = input.clone();
+        invalid.original_identity = None;
+        assert!(invalid.validate(&scope).is_err());
+        let mut metadata_only = input.clone();
+        metadata_only.completion = None;
+        assert!(metadata_only.validate(&scope).is_ok());
+        let mut capture = capture;
+        capture.input = metadata_only;
+        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
+        assert!(!capture.has_complete_conversation_evidence(&scope));
+        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
+    }
+
+    #[test]
+    fn deepseek_source_accepts_only_closed_metadata_without_granting_completion() {
+        let (scope, mut input, _) = completed_capture();
+        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
+        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
+        input.completion = None;
+        let document = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        assert!(valid_observation_source_document(&document));
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("geo.deepseek.lifecycle.v1"),
+            serde_json::json!({"provider": "kimi"}),
+        ] {
+            let mut invalid = document.clone();
+            invalid["lifecycle"] = value;
+            assert!(!valid_observation_source_document(&invalid));
+            replace_source(&mut input, &invalid);
+            assert!(input.validate(&scope).is_err());
+        }
+        let mut missing_sse = document.clone();
+        missing_sse["messages"] = serde_json::json!([]);
+        replace_source(&mut input, &missing_sse);
+        assert!(
+            input.validate(&scope).is_ok(),
+            "metadata may be retained without declaring completion"
+        );
+        input.completion = Some(ObservationCaptureCompletion {
+            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
+            terminal: true,
+            assistant_message_ids: vec!["2".into()],
+        });
+        assert!(
+            input.validate(&scope).is_err(),
+            "metadata cannot substitute for actual stream evidence"
+        );
+        input.completion = None;
+        missing_sse.as_object_mut().unwrap().remove("lifecycle");
+        replace_source(&mut input, &missing_sse);
+        assert!(
+            input.validate(&scope).is_ok(),
+            "partial evidence remains retainable with lifecycle omitted"
+        );
     }
 
     #[test]

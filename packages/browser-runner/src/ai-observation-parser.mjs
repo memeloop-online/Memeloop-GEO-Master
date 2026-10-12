@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { capturedConversationCompletion } from "./provider-conversation-ownership.mjs";
+import { validDeepSeekLifecycle } from "./deepseek-conversation-evidence.mjs";
 import {
   observationRejectionReason,
   validateAiObservation,
@@ -168,6 +169,11 @@ export function observationDocument(exchange, renderedText) {
       exchange.source_redaction,
       document,
     );
+  if (Object.hasOwn(exchange, "lifecycle")) {
+    if (!validDeepSeekLifecycle(exchange.lifecycle))
+      throw new Error("observation_lifecycle_invalid");
+    document.lifecycle = structuredClone(exchange.lifecycle);
+  }
   return document;
 }
 
