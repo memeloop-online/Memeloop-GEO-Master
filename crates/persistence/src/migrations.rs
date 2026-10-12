@@ -228,6 +228,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 54,
         description: "operator login queues",
     },
+    MigrationMetadata {
+        version: 55,
+        description: "observation completion recoveries",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

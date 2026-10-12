@@ -62,6 +62,8 @@ mod model_routes;
 pub use model_routes::ModelRouteGrant;
 mod observation_capture;
 pub use observation_capture::*;
+mod observation_completion_recovery;
+pub use observation_completion_recovery::*;
 mod observation_analysis;
 pub use observation_analysis::*;
 mod provider_conversation_cleanup;
