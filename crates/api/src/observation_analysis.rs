@@ -17,6 +17,7 @@ use geo_domain::{
     ObservationCaptureRepository, ObservationCaptureSnapshot, ProjectAiUsage, ProjectId,
     TenantScope, observation_analysis_source_json, sha256_hex,
 };
+use geo_provider::diagnostics::{ModelPhase, ModelPhaseTimer};
 use geo_worker::{HostOpError, HostOpErrorCode, ModelCompletionRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -303,6 +304,7 @@ impl ObservationAnalysisService {
             .await
     }
 
+    #[tracing::instrument(name = "saved_observation_analysis", skip_all, fields(call_id = %Uuid::new_v4()))]
     pub async fn execute(&self, scope: &TenantScope, revision_id: Uuid) -> Result<(), AppError> {
         let Some(claim) = self
             .repository
@@ -319,7 +321,10 @@ impl ObservationAnalysisService {
         {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => failed("analysis_source_unavailable"),
-            Err(_) => failed("analysis_timeout"),
+            Err(_) => {
+                tracing::info!(failure = "analysis_timeout", "observation analysis failed");
+                failed("analysis_timeout")
+            }
         };
         self.repository
             .finish(scope, revision_id, claim.claim_token, result, Utc::now())
@@ -361,7 +366,13 @@ impl ObservationAnalysisService {
             Ok(completion) => completion,
             // Classify only bridge-owned vocabulary. Never persist an error
             // message, upstream body, request, endpoint or credential.
-            Err(error) => return Ok(failed(model_failure_code(&error))),
+            Err(error) => {
+                tracing::info!(
+                    failure = model_failure_code(&error),
+                    "observation model failed"
+                );
+                return Ok(failed(model_failure_code(&error)));
+            }
         };
         let output_reason = if completion.text.len() > 150_000 {
             "model_output_too_large"
@@ -399,12 +410,21 @@ impl ObservationAnalysisService {
             else {
                 return Err(AppError::invalid_request("measurement required"));
             };
-            match self.grounder.ground(&source, &request.source_sha256, &completion.text,
+            let phase = ModelPhaseTimer::start(ModelPhase::Grounding);
+            let grounded = self.grounder.ground(&source, &request.source_sha256, &completion.text,
                 json!({ "provider":provider,"model":model,"surface":surface,"search_mode":search_mode,
-                    "protocol_version":protocol_version,"market":market,"language":language })).await
-            {
-                Ok(grounded) => { result.candidate_json = grounded.candidate_json; result.outcome = grounded.outcome; }
-                Err(_) => { result.outcome = ObservationAnalysisOutcome::Failed { code: "grounding_unavailable".into() }; }
+                    "protocol_version":protocol_version,"market":market,"language":language })).await;
+            phase.finish(grounded.is_ok());
+            match grounded {
+                Ok(grounded) => {
+                    result.candidate_json = grounded.candidate_json;
+                    result.outcome = grounded.outcome;
+                }
+                Err(_) => {
+                    result.outcome = ObservationAnalysisOutcome::Failed {
+                        code: "grounding_unavailable".into(),
+                    };
+                }
             }
         }
         if result.validate().is_err() {
@@ -423,7 +443,7 @@ impl ObservationAnalysisService {
     }
 }
 
-fn model_failure_code(error: &HostOpError) -> &'static str {
+pub(crate) fn model_failure_code(error: &HostOpError) -> &'static str {
     match error.code {
         HostOpErrorCode::InvalidRequest => "model_request_invalid",
         HostOpErrorCode::CapabilityMissing => "model_unconfigured",

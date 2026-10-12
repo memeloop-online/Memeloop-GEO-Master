@@ -1,5 +1,6 @@
 //! Bounded HTTP transport; endpoint and credentials are supplied by the caller.
 
+use crate::diagnostics::{ModelPhase, ModelPhaseTimer};
 use async_trait::async_trait;
 use reqwest::{Client, redirect::Policy};
 use tokio::time::timeout;
@@ -60,19 +61,27 @@ impl Transport for HttpTransport {
         let send = async {
             let public_client;
             let client = if self.public_only {
-                public_client = crate::public_endpoint_client(&url).await?;
+                let phase = ModelPhaseTimer::start(ModelPhase::PublicEndpoint);
+                let result = crate::public_endpoint_client(&url).await;
+                phase.finish(result.is_ok());
+                public_client = result?;
                 &public_client
             } else {
                 &self.client
             };
-            let mut response = client
+            let headers_phase = ModelPhaseTimer::start(ModelPhase::HttpHeaders);
+            let response = client
                 .post(url)
                 .bearer_auth(request.bearer_token())
                 .json(&request.body)
                 .send()
                 .await
-                .map_err(|_| ProviderError::Transport("HTTP request failed".into()))?;
+                .map_err(|_| ProviderError::Transport("HTTP request failed".into()));
+            headers_phase.finish(response.is_ok());
+            let mut response = response?;
             let status = response.status().as_u16();
+            tracing::info!(http_status = status, "model response headers received");
+            let body_phase = ModelPhaseTimer::start(ModelPhase::FullBody);
             if response
                 .content_length()
                 .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
@@ -90,9 +99,12 @@ impl Transport for HttpTransport {
                 }
                 bytes.extend_from_slice(&chunk);
             }
+            body_phase.finish(true);
+            let decode_phase = ModelPhaseTimer::start(ModelPhase::Decode);
             let body = String::from_utf8(bytes).map_err(|_| {
                 ProviderError::InvalidResponse("provider response is not UTF-8".into())
             })?;
+            decode_phase.finish(true);
             Ok(TransportResponse { status, body })
         };
         tokio::select! {
