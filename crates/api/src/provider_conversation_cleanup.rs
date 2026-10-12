@@ -83,6 +83,41 @@ async fn cleanup_once(
             Code::AccountMismatch,
         );
     }
+    let Some(original_session_id) = claim.original_runner_session_id.filter(|id| !id.is_nil())
+    else {
+        return diagnosed(
+            ProviderCleanupOutcome::Failed,
+            Stage::Preflight,
+            Code::RetainedEvidenceRequired,
+        );
+    };
+    let original = state
+        .channel_job_repository()
+        .get_browser_operation(
+            &crate::browser_operations::execution_scope(scope, original_session_id),
+            original_session_id,
+        )
+        .await;
+    match original {
+        Ok(Some(operation))
+            if operation.account_id == claim.account_id
+                && operation.session_id == original_session_id
+                && operation.purpose == geo_domain::BrowserOperationPurpose::Measure => {}
+        Ok(_) => {
+            return diagnosed(
+                ProviderCleanupOutcome::Failed,
+                Stage::Preflight,
+                Code::RetainedEvidenceRequired,
+            );
+        }
+        Err(_) => {
+            return diagnosed(
+                ProviderCleanupOutcome::Failed,
+                Stage::Preflight,
+                Code::DependencyUnavailable,
+            );
+        }
+    }
     let reservation_id = Uuid::new_v4();
     if let Err(error) = state
         .channel_job_repository()
@@ -142,6 +177,7 @@ async fn cleanup_once(
                 &claim.original_identity,
                 session_id,
                 reservation_id,
+                original_session_id,
             )
             .await;
         // Repository/network errors do not identify a specific login failure.

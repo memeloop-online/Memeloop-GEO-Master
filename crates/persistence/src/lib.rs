@@ -5,6 +5,7 @@
 //! that role is ready to persist state. Database credentials are supplied at
 //! runtime through configuration; they are never embedded in this crate.
 
+mod account_networks;
 mod agent;
 mod appearance;
 mod auth;

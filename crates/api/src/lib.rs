@@ -8,6 +8,7 @@ pub use project_ai_settings::{
 };
 mod project_ai_model;
 pub use project_ai_model::ProjectConfiguredModelBridge;
+mod account_network;
 mod agent_runtime;
 mod appearance;
 mod browser_bridge;
@@ -15,6 +16,7 @@ mod browser_operation_reconcile;
 mod browser_operations;
 mod channel_imports;
 mod channel_jobs;
+mod historical_browser_operations;
 pub use browser_operation_reconcile::reconcile_browser_operations;
 mod channel_tools;
 mod channels;

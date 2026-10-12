@@ -160,10 +160,20 @@ pub async fn verify(repo: &dyn ChannelRepository, scope: &TenantScope) {
                 .await
                 .unwrap()
         );
-        // Current metadata and network edits survive a session-only write.
+        // Metadata changes survive renewal. Legacy proxy bytes are no longer
+        // changed by generic account saves: versioned network bindings own
+        // routing edits, so a stale record cannot reinstall its proxy snapshot.
         record.account.display_name = Some("Edited synthetic account".into());
         record.proxy = Some(ChannelSecret::new(vec![10]));
         save(repo, scope, &record).await;
+        assert_eq!(
+            read(repo, scope, &version)
+                .await
+                .proxy
+                .unwrap()
+                .encrypted_bytes(),
+            &[8, 9]
+        );
         assert!(
             repo.renew_session(scope, &version, ChannelSecret::new(vec![7]))
                 .await
@@ -171,7 +181,7 @@ pub async fn verify(repo: &dyn ChannelRepository, scope: &TenantScope) {
         );
         let current = read(repo, scope, &version).await;
         assert_eq!(current.account.display_name, record.account.display_name);
-        assert_eq!(current.proxy.unwrap().encrypted_bytes(), &[10]);
+        assert_eq!(current.proxy.unwrap().encrypted_bytes(), &[8, 9]);
         version.session = ChannelSecret::new(vec![7]);
         if owner_kind == ChannelOwnerKind::OperatorPool {
             assert!(repo.get_account(scope, account.account_id).await.is_err());
