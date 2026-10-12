@@ -62,15 +62,16 @@ export async function inspectDeepSeekMeasurementOptions(
   }
 }
 
-function validBinding(binding) {
+function validBinding(binding, allowUnresolvedSession = false) {
   return (
     object(binding) &&
     label(binding.model) &&
     typeof binding.question === "string" &&
     binding.question.trim().length > 0 &&
     Buffer.byteLength(binding.question) <= 16_000 &&
-    typeof binding.chatSessionId === "string" &&
-    /^[\w-]{1,128}$/u.test(binding.chatSessionId) &&
+    ((allowUnresolvedSession && binding.chatSessionId === undefined) ||
+      (typeof binding.chatSessionId === "string" &&
+        /^[\w-]{1,128}$/u.test(binding.chatSessionId))) &&
     binding.parentMessageId === null &&
     typeof binding.searchEnabled === "boolean" &&
     typeof binding.thinkingEnabled === "boolean"
@@ -226,11 +227,20 @@ export function createDeepSeekEvidenceDecoder({
  * Capture one browser-owned request using bounded CDP streaming. No direct
  * HTTP, headers/cookies in output, retry, PoW implementation or page injection.
  * Cancellation stops observation, NOT necessarily remote generation.
+ *
+ * Optional createdSessions is the caller-owned observeDeepSeekCreatedSessions()
+ * handle, armed before navigation/prefetch. With it, binding.chatSessionId may
+ * be omitted: the exact ordinary POST ID is looked up, never the latest create.
+ * Streaming is attached immediately while lookup waits for pending creates.
+ * Success revalidates the same proof after EOF; created_session is creation
+ * evidence only, not account identity, successful answering or cleanup authority.
+ * The caller owns the observer's timeout, cancellation and disposal.
  */
 export async function captureDeepSeekExchange(
   page,
   {
     binding,
+    createdSessions,
     submit,
     signal,
     timeoutMs = 30_000,
@@ -239,7 +249,12 @@ export async function captureDeepSeekExchange(
   } = {},
 ) {
   if (
-    !validBinding(binding) ||
+    !validBinding(binding, createdSessions !== undefined) ||
+    (createdSessions !== undefined &&
+      (!object(createdSessions) ||
+        typeof createdSessions.lookup !== "function" ||
+        typeof createdSessions.isCurrent !== "function" ||
+        typeof createdSessions.status !== "function")) ||
     typeof submit !== "function" ||
     signal?.aborted ||
     !Number.isFinite(timeoutMs) ||
@@ -266,12 +281,15 @@ export async function captureDeepSeekExchange(
   let requestId;
   let requestAt;
   let submitted = false;
+  let document;
   let responseSeen = false;
   let responseCharset = "";
   let streamReady = false;
   let networkEnded = false;
   let completedBeforeAttachment = false;
   let bodyReadStarted = false;
+  let creationLookup;
+  let finishing = false;
   let queuedBytes = 0;
   let consumedBytes = 0;
   const queued = [];
@@ -286,6 +304,12 @@ export async function captureDeepSeekExchange(
     resolve(value);
   };
   const abort = () => settle();
+  // CDP cannot replay commits which occurred while its session was opening.
+  // Guard that gap with Playwright; after the loader is known, Page events
+  // distinguish legitimate SPA navigation from replacement documents.
+  const onEarlyNavigation = (frame) => {
+    if (!document && frame === page.mainFrame()) settle();
+  };
   const feed = (data) => {
     if (
       typeof data !== "string" ||
@@ -300,11 +324,28 @@ export async function captureDeepSeekExchange(
     if (consumedBytes > maxBytes) fail();
     decoder.push(bytes);
   };
-  const finish = () => {
-    if (settled || !streamReady || !networkEnded) return;
+  const finish = async () => {
+    if (settled || finishing || !streamReady || !networkEnded) return;
+    finishing = true;
     try {
+      let creationProof;
+      if (createdSessions !== undefined) {
+        creationProof = await creationLookup;
+        if (settled) return;
+        if (!creationProof) return settle();
+        // Re-read after EOF, including any newly pending create responses.
+        // The observer returns stable proof identities within one document.
+        const current = await createdSessions.lookup(binding.chatSessionId);
+        if (settled) return;
+        if (
+          current !== creationProof ||
+          createdSessions.isCurrent(creationProof) !== true
+        )
+          return settle();
+      }
       settle({
         ...decoder.finish(),
+        ...(creationProof ? { created_session: creationProof } : {}),
         started_at: startedAt,
         received_at: new Date().toISOString(),
       });
@@ -359,25 +400,71 @@ export async function captureDeepSeekExchange(
     }, abort);
   };
   const onRequest = (event) => {
-    if (settled || event.request?.url !== COMPLETION) return;
+    if (settled) return;
+    // Redirects retain the request ID but may leave the completion endpoint.
+    if (requestId && event.requestId === requestId) return settle();
+    if (event.request?.url !== COMPLETION) return;
+    let candidate = binding;
+    if (createdSessions !== undefined && binding.chatSessionId === undefined) {
+      try {
+        if (
+          typeof event.request.postData !== "string" ||
+          Buffer.byteLength(event.request.postData) > 64_000
+        )
+          return settle();
+        candidate = {
+          ...binding,
+          chatSessionId: JSON.parse(event.request.postData)?.chat_session_id,
+        };
+      } catch {
+        return settle();
+      }
+    }
     if (
       requestId ||
       !submitted ||
+      event.frameId !== document?.id ||
+      event.loaderId !== document?.loaderId ||
       event.redirectResponse ||
       typeof event.requestId !== "string" ||
       !event.requestId ||
       !Number.isFinite(event.timestamp) ||
-      !matchesDeepSeekSubmission(event.request, binding)
+      !matchesDeepSeekSubmission(event.request, candidate)
     )
       return settle();
     requestId = event.requestId;
     requestAt = event.timestamp;
+    binding = candidate;
+    if (createdSessions !== undefined) {
+      // Do not await here: response/data/EOF may arrive before create body().
+      creationLookup = Promise.resolve()
+        .then(() => createdSessions.lookup(binding.chatSessionId))
+        .then((proof) => {
+          if (settled) return null;
+          if (
+            !object(proof) ||
+            proof.chatSessionId !== binding.chatSessionId ||
+            proof.source !== "browser_observed_create" ||
+            createdSessions.status() !== "observing"
+          ) {
+            settle();
+            return null;
+          }
+          return proof;
+        })
+        .catch(() => {
+          settle();
+          return null;
+        });
+    }
   };
   const onResponse = (event) => {
     if (settled || event.requestId !== requestId) return;
     const response = event.response;
     if (
       responseSeen ||
+      event.frameId !== document?.id ||
+      event.loaderId !== document?.loaderId ||
       !Number.isFinite(event.timestamp) ||
       event.timestamp < requestAt ||
       response?.url !== COMPLETION ||
@@ -452,6 +539,31 @@ export async function captureDeepSeekExchange(
     if (event.requestId === requestId) settle();
   };
   const handlers = [
+    // Page.frameNavigated is a document commit, unlike navigatedWithinDocument
+    // (history.pushState used by the ordinary new-conversation flow).
+    [
+      "Page.frameNavigated",
+      ({ frame }) => {
+        if (!frame?.parentId || frame.id === document?.id) settle();
+      },
+    ],
+    [
+      "Page.frameDetached",
+      ({ frameId }) => {
+        if (frameId === document?.id) settle();
+      },
+    ],
+    [
+      "Page.navigatedWithinDocument",
+      ({ frameId, url }) => {
+        if (frameId !== document?.id) return;
+        try {
+          if (new URL(url).origin !== DEEPSEEK_WEB_ORIGIN) settle();
+        } catch {
+          settle();
+        }
+      },
+    ],
     ["Network.requestWillBeSent", onRequest],
     ["Network.responseReceived", onResponse],
     ["Network.dataReceived", onData],
@@ -462,6 +574,7 @@ export async function captureDeepSeekExchange(
   try {
     timer = setTimeout(abort, timeoutMs);
     if (signal?.aborted) return null;
+    page.on("framenavigated", onEarlyNavigation);
     const opening = page
       .context()
       .newCDPSession(page)
@@ -475,6 +588,23 @@ export async function captureDeepSeekExchange(
     session = await Promise.race([opening, result]);
     if (!session || settled) return null;
     for (const [name, handler] of handlers) session.on(name, handler);
+    const command = (method, args) =>
+      Promise.race([session.send(method, args), result]);
+    await command("Page.enable");
+    if (settled) return null;
+    const initial = await command("Page.getFrameTree");
+    if (settled) return null;
+    document = initial?.frameTree?.frame;
+    if (
+      !document ||
+      document.parentId ||
+      typeof document.id !== "string" ||
+      !document.id ||
+      typeof document.loaderId !== "string" ||
+      !document.loaderId ||
+      new URL(document.url).origin !== DEEPSEEK_WEB_ORIGIN
+    )
+      return null;
     await Promise.race([
       session.send("Network.enable", {
         maxTotalBufferSize: maxBytes,
@@ -484,9 +614,25 @@ export async function captureDeepSeekExchange(
       result,
     ]);
     if (settled) return null;
+    const current = (await command("Page.getFrameTree"))?.frameTree?.frame;
+    if (
+      settled ||
+      current?.id !== document.id ||
+      current?.loaderId !== document.loaderId ||
+      current.parentId ||
+      new URL(current.url).origin !== DEEPSEEK_WEB_ORIGIN ||
+      new URL(page.url()).origin !== DEEPSEEK_WEB_ORIGIN
+    )
+      return null;
     // A hanging UI callback must not prevent cancellation or the deadline.
     const submission = Promise.resolve().then(() => {
       if (settled) return;
+      if (new URL(page.url()).origin !== DEEPSEEK_WEB_ORIGIN) return settle();
+      if (
+        createdSessions !== undefined &&
+        createdSessions.status() !== "observing"
+      )
+        return settle();
       submitted = true;
       return submit(page, controller.signal);
     });
@@ -498,6 +644,7 @@ export async function captureDeepSeekExchange(
     settle();
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
+    page.off?.("framenavigated", onEarlyNavigation);
     if (session) {
       for (const [name, handler] of handlers) session.off(name, handler);
       // Do not keep the execution alive waiting on a broken CDP connection.
