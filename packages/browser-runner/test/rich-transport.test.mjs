@@ -9,6 +9,8 @@ import { createRunnerServer } from "../src/server.mjs";
 const OBJECT = "44444444-4444-4444-8444-444444444444";
 const ATTEMPT = "66666666-6666-4666-8666-666666666666";
 const SESSION = "77777777-7777-4777-8777-777777777777";
+// The prior rich session may be disposed; a new operation needs a new ID.
+const MEASUREMENT_SESSION = "99999999-9999-4999-8999-999999999999";
 const image = Buffer.from("synthetic original image bytes");
 const digest = createHash("sha256").update(image).digest("hex");
 const serviceToken = "synthetic-callback-service-credential-123";
@@ -511,7 +513,7 @@ async function sendMeasurement(executionId, ticket = "abcd") {
     },
     body: JSON.stringify({
       execution_id: executionId,
-      session_id: SESSION,
+      session_id: MEASUREMENT_SESSION,
       operation: "measure",
       payload: {},
       source_capture_ticket: ticket,
@@ -528,16 +530,19 @@ test("source and raw extraction checkpoints precede candidate with shared ordere
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      session_id: SESSION,
+      session_id: MEASUREMENT_SESSION,
       platform: "fixture",
       storage_state: { cookies: [], origins: [] },
     }),
   });
   assert.equal(created.status, 201);
-  const completed = await fetch(`${base}/v1/sessions/${SESSION}/complete`, {
-    method: "POST",
-    headers: { authorization: "Bearer internal-runner-token" },
-  });
+  const completed = await fetch(
+    `${base}/v1/sessions/${MEASUREMENT_SESSION}/complete`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer internal-runner-token" },
+    },
+  );
   assert.equal(completed.status, 200);
   const result = await sendMeasurement("capture-1");
   assert.equal(result.body.status, "completed");

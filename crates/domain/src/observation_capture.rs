@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::provider_conversation_lifecycle::completion_inventory;
 use crate::{AppError, ChannelJobRepository, ChannelTargetInput, TenantScope};
 
 pub const MAX_OBSERVATION_SOURCE_BYTES: usize = 750_000;
@@ -172,6 +173,7 @@ impl ObservationCapture {
         };
         let document = serde_json::from_str(source_json).ok()?;
         let inventory = completion_inventory(
+            &self.input.owned_conversation.as_ref()?.provider,
             &document,
             &self
                 .input
@@ -184,127 +186,6 @@ impl ObservationCapture {
             serde_json::to_vec(&inventory).ok()?,
         )))
     }
-}
-
-fn valid_message_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-}
-
-fn completion_matches(
-    document: &serde_json::Value,
-    chat_id: &str,
-    completion: &ObservationCaptureCompletion,
-) -> bool {
-    completion_inventory(document, chat_id, completion).is_some()
-}
-
-fn completion_inventory<'a>(
-    document: &'a serde_json::Value,
-    chat_id: &str,
-    completion: &ObservationCaptureCompletion,
-) -> Option<Vec<(&'a str, &'static str)>> {
-    use serde_json::Value;
-    if !completion.terminal
-        || completion.assistant_message_ids.is_empty()
-        || completion.assistant_message_ids.len() > 256
-        || completion
-            .assistant_message_ids
-            .iter()
-            .any(|id| !valid_message_id(id))
-    {
-        return None;
-    }
-    let envelopes = document.get("messages").and_then(Value::as_array)?;
-    #[derive(Default)]
-    struct MessageState {
-        role: Option<&'static str>,
-        completed: bool,
-    }
-    let mut states: HashMap<&str, MessageState> = HashMap::new();
-    let mut order = Vec::new();
-    let mut saw_chat = false;
-    for envelope in envelopes {
-        let fields = envelope.as_object()?;
-        if fields.get("error").is_some_and(|value| !value.is_null())
-            || ["chat", "message", "block", "ref", "done"]
-                .iter()
-                .filter(|key| fields.get(**key).is_some_and(|value| !value.is_null()))
-                .count()
-                > 1
-        {
-            return None;
-        }
-        if let Some(chat) = fields.get("chat").filter(|value| !value.is_null()) {
-            if chat.get("id").and_then(Value::as_str) != Some(chat_id) {
-                return None;
-            }
-            saw_chat = true;
-        }
-        let Some(message) = fields.get("message").filter(|value| !value.is_null()) else {
-            continue;
-        };
-        // The exact preceding chat envelope establishes the stream's scope.
-        // Message-local chat IDs are optional in this provider's transport.
-        if !saw_chat {
-            return None;
-        }
-        let message = message.as_object()?;
-        let id = message
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| valid_message_id(id))?;
-        if !states.contains_key(id) {
-            order.push(id);
-        }
-        let state = states.entry(id).or_default();
-        if let Some(role) = message.get("role") {
-            let role = match (role.as_str(), role.as_u64()) {
-                (Some("assistant"), _) | (_, Some(3)) => "assistant",
-                (Some("user"), _) | (_, Some(2)) => "user",
-                (Some("system"), _) => "system",
-                _ => return None,
-            };
-            if state.role.is_some_and(|prior| prior != role) {
-                return None;
-            }
-            state.role = Some(role);
-        }
-        if let Some(chat) = message.get("chat_id")
-            && chat.as_str() != Some(chat_id)
-        {
-            return None;
-        }
-        if let Some(status) = message.get("status") {
-            state.completed = matches!(
-                status.as_str(),
-                Some("COMPLETED" | "MESSAGE_STATUS_COMPLETED")
-            ) || status.as_u64() == Some(2);
-        }
-    }
-    let mut assistants = Vec::new();
-    let mut inventory = Vec::new();
-    for id in order {
-        let state = &states[id];
-        match state.role {
-            Some("assistant") if state.completed => {
-                assistants.push(id);
-                inventory.push((id, "assistant"));
-            }
-            Some(role @ ("user" | "system")) => inventory.push((id, role)),
-            _ => return None,
-        }
-    }
-    let matched = saw_chat
-        && assistants
-            .iter()
-            .copied()
-            .eq(completion.assistant_message_ids.iter().map(String::as_str));
-    inventory.sort_unstable_by_key(|(id, _)| *id);
-    matched.then_some(inventory)
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -478,14 +359,18 @@ impl ObservationCaptureInput {
                 }
                 if let Some(completion) = &self.completion {
                     let owned = self.owned_conversation.as_ref().filter(|owned| {
-                        owned.provider == "kimi"
-                            && self
-                                .original_identity
-                                .as_ref()
-                                .is_some_and(|identity| identity.provider == owned.provider)
+                        self.original_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.provider == owned.provider)
                     });
                     if !owned.is_some_and(|owned| {
-                        completion_matches(&document, &owned.external_conversation_id, completion)
+                        completion_inventory(
+                            &owned.provider,
+                            &document,
+                            &owned.external_conversation_id,
+                            completion,
+                        )
+                        .is_some()
                     }) {
                         return Err(AppError::invalid_request(
                             "invalid observation completion evidence",
@@ -1002,6 +887,35 @@ mod tests {
             source_sha256: hex::encode(Sha256::digest(raw.as_bytes())),
             source_json: raw,
         };
+    }
+
+    #[test]
+    fn unregistered_provider_cannot_borrow_kimi_completion_or_inventory() {
+        let (scope, input, _) = completed_capture();
+        for provider in ["deepseek", "doubao", "glm", "unknown", "Kimi"] {
+            let mut invalid = input.clone();
+            invalid.original_identity.as_mut().unwrap().provider = provider.into();
+            invalid.owned_conversation.as_mut().unwrap().provider = provider.into();
+            assert!(invalid.validate(&scope).is_err());
+            // Match the actual input bytes so a digest mismatch cannot mask
+            // accidental acceptance of another provider's lifecycle evidence.
+            let digest = hex::encode(Sha256::digest(serde_json::to_vec(&invalid).unwrap()));
+            let capture = ObservationCapture {
+                receipt: ObservationCaptureReceipt {
+                    capture_id: invalid.capture_id,
+                    schema_version: 1,
+                    digest_sha256: digest,
+                    stored_at: Utc::now(),
+                },
+                input: invalid.clone(),
+            };
+            assert!(!capture.has_complete_conversation_evidence(&scope));
+            assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
+            // Unknown-provider raw evidence remains retainable, but it cannot
+            // establish transport completion or authorize remote deletion.
+            invalid.completion = None;
+            assert!(invalid.validate(&scope).is_ok());
+        }
     }
 
     #[test]

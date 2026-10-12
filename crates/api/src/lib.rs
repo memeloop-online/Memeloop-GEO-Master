@@ -8,10 +8,16 @@ pub use project_ai_settings::{
 };
 mod project_ai_model;
 pub use project_ai_model::ProjectConfiguredModelBridge;
+mod account_network;
 mod agent_runtime;
 mod appearance;
 mod browser_bridge;
+mod browser_operation_reconcile;
+mod browser_operations;
+mod channel_imports;
 mod channel_jobs;
+mod historical_browser_operations;
+pub use browser_operation_reconcile::reconcile_browser_operations;
 mod channel_tools;
 mod channels;
 mod citation_insights;
@@ -25,6 +31,7 @@ pub mod content_runtime;
 mod content_tools;
 mod desktop_gateway;
 pub mod distribution;
+mod proxy_pools;
 mod source_channel_recommendations;
 pub use content::ContentService;
 pub use content_distribution_requests::{
@@ -341,6 +348,8 @@ impl AppState {
             origin_scheme: Arc::from("http"),
             origin_config: OriginConfig::local_http(),
         };
+        state.channel_service.operation_repository =
+            Some(Arc::clone(&state.channel_job_repository));
         state.refresh_memory_request_authorities();
         state
     }
@@ -500,6 +509,8 @@ impl AppState {
             origin_scheme: Arc::from("http"),
             origin_config: OriginConfig::local_http(),
         };
+        state.channel_service.operation_repository =
+            Some(Arc::clone(&state.channel_job_repository));
         state.refresh_memory_request_authorities();
         state
     }
@@ -991,12 +1002,14 @@ impl AppState {
         mut self,
         repository: Arc<dyn geo_domain::ChannelJobRepository>,
     ) -> Self {
+        self.channel_service.operation_repository = Some(Arc::clone(&repository));
         self.channel_job_repository = repository;
         self
     }
 
     pub fn with_channel_service(mut self, service: ChannelService) -> Self {
-        self.channel_service = service;
+        self.channel_service =
+            service.with_operation_repository(Arc::clone(&self.channel_job_repository));
         self.refresh_memory_request_authorities();
         self
     }
@@ -2424,6 +2437,10 @@ pub fn router(state: AppState) -> Router {
 
     // Operator pool scope comes from deployment configuration plus trusted
     // membership, not a customer tenant selector. The catalogue is session-only.
+    // Credential imports own encrypted, per-row durable idempotency. Proxy
+    // inventory accepts write-only secrets and uses update CAS, not create
+    // replay. Keep this router outside generic body-hash/response caching,
+    // even when a caller supplies an Idempotency-Key.
     let operator_channel_routes = channels::operator_routes()
         .route(
             "/operator/connector-capabilities",

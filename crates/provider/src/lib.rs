@@ -5,6 +5,7 @@
 //! keep provider-contract tests deterministic.
 
 pub mod dataforseo;
+pub mod diagnostics;
 mod http_transport;
 mod public_endpoint;
 pub use public_endpoint::{public_endpoint_client, validate_public_endpoint};
@@ -561,16 +562,19 @@ where
         }
         // Credential resolution and HTTP share one budget, not one each.
         let expires_at = Instant::now() + control.timeout();
+        let credentials_phase =
+            diagnostics::ModelPhaseTimer::start(diagnostics::ModelPhase::Credentials);
         let resolve = self.token_center.resolve(&self.secret_ref);
         tokio::pin!(resolve);
         let deadline = timeout_at(expires_at, &mut resolve);
         tokio::pin!(deadline);
         let token = tokio::select! {
             biased;
-            result = &mut deadline => result.map_err(|_| ProviderError::Timeout)?,
-            () = wait_for_cancellation(control.clone()) => return Err(ProviderError::Cancelled),
-        }
-        .map_err(ProviderError::redact)?;
+            result = &mut deadline => result.unwrap_or(Err(ProviderError::Timeout)),
+            () = wait_for_cancellation(control.clone()) => Err(ProviderError::Cancelled),
+        };
+        credentials_phase.finish(token.is_ok());
+        let token = token.map_err(ProviderError::redact)?;
         if control.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
@@ -585,16 +589,19 @@ where
             body: request.to_provider_body(),
             token,
         };
+        let transport_phase =
+            diagnostics::ModelPhaseTimer::start(diagnostics::ModelPhase::Transport);
         let sent = self.transport.send(transport_request, control.clone());
         tokio::pin!(sent);
         let deadline = timeout_at(expires_at, &mut sent);
         tokio::pin!(deadline);
         let response = tokio::select! {
             biased;
-            result = &mut deadline => result.map_err(|_| ProviderError::Timeout)?,
-            () = wait_for_cancellation(control.clone()) => return Err(ProviderError::Cancelled),
-        }
-        .map_err(ProviderError::redact)?;
+            result = &mut deadline => result.unwrap_or(Err(ProviderError::Timeout)),
+            () = wait_for_cancellation(control.clone()) => Err(ProviderError::Cancelled),
+        };
+        transport_phase.finish(response.is_ok());
+        let response = response.map_err(ProviderError::redact)?;
         if response.body.len() > MAX_RESPONSE_BYTES {
             return Err(ProviderError::InvalidResponse(
                 "provider response exceeds the size limit".into(),
@@ -610,7 +617,10 @@ where
             }
             .redact());
         }
-        normalize_response(&response.body, &request)
+        let decode_phase = diagnostics::ModelPhaseTimer::start(diagnostics::ModelPhase::Decode);
+        let result = normalize_response(&response.body, &request);
+        decode_phase.finish(result.is_ok());
+        result
     }
 }
 

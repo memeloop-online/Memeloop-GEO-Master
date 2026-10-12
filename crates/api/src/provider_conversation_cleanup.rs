@@ -83,6 +83,41 @@ async fn cleanup_once(
             Code::AccountMismatch,
         );
     }
+    let Some(original_session_id) = claim.original_runner_session_id.filter(|id| !id.is_nil())
+    else {
+        return diagnosed(
+            ProviderCleanupOutcome::Failed,
+            Stage::Preflight,
+            Code::RetainedEvidenceRequired,
+        );
+    };
+    let original = state
+        .channel_job_repository()
+        .get_browser_operation(
+            &crate::browser_operations::execution_scope(scope, original_session_id),
+            original_session_id,
+        )
+        .await;
+    match original {
+        Ok(Some(operation))
+            if operation.account_id == claim.account_id
+                && operation.session_id == original_session_id
+                && operation.purpose == geo_domain::BrowserOperationPurpose::Measure => {}
+        Ok(_) => {
+            return diagnosed(
+                ProviderCleanupOutcome::Failed,
+                Stage::Preflight,
+                Code::RetainedEvidenceRequired,
+            );
+        }
+        Err(_) => {
+            return diagnosed(
+                ProviderCleanupOutcome::Failed,
+                Stage::Preflight,
+                Code::DependencyUnavailable,
+            );
+        }
+    }
     let reservation_id = Uuid::new_v4();
     if let Err(error) = state
         .channel_job_repository()
@@ -132,22 +167,22 @@ async fn cleanup_once(
         );
     }
     let session_id = Uuid::new_v4();
-    let mut start_confirmed = false;
     let mut operation_stage = Stage::Preflight;
     let operation = async {
         let restored = state
             .channel_service()
-            .resume_provider_cleanup_browser(
+            .resume_provider_cleanup_browser_reserved(
                 scope,
                 claim.account_id,
                 &claim.original_identity,
                 session_id,
+                reservation_id,
+                original_session_id,
             )
             .await;
         // Repository/network errors do not identify a specific login failure.
         // Preserve uncertainty rather than depending on English error strings.
         restored?;
-        start_confirmed = true;
         operation_stage = Stage::Identity;
         let verified = bridge.complete(session_id).await?;
         if verified.identity.platform_account_id != claim.original_identity.platform_account_id {
@@ -221,18 +256,19 @@ async fn cleanup_once(
             Code::DeadlineExceeded,
         ),
     };
-    let closed = matches!(
-        tokio::time::timeout(Duration::from_secs(10), bridge.close(session_id)).await,
-        Ok(Ok(()))
-    );
-    // A timed-out start may create a context after this close. Expiry, not a
-    // speculative close receipt, releases the account on that path.
-    if start_confirmed
-        && closed
-        && let Err(error) = state
-            .channel_job_repository()
-            .release_account(scope, claim.account_id, reservation_id)
-            .await
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        state
+            .channel_service()
+            .close_owned_browser(scope, session_id),
+    )
+    .await;
+    // Legacy release can remove only an unattached preflight; durable ownership
+    // remains fenced until the exact pinned browser has confirmed disposal.
+    if let Err(error) = state
+        .channel_job_repository()
+        .release_account(scope, claim.account_id, reservation_id)
+        .await
     {
         tracing::warn!(code = ?error.code, "conversation cleanup reservation release failed");
     }

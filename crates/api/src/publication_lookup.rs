@@ -452,46 +452,45 @@ async fn lookup_once(
         Err(error) if error.code == ErrorCode::Conflict => return unknown("account_busy"),
         Err(_) => return unknown("account_reservation_failed"),
     }
-    // A failed start may have created a context, and is not proof of cleanup.
-    // Hold the reservation until its bounded expiry on that path.
+    let session_id = Uuid::new_v4();
     let (session, original_identity, bound_version) = match state
         .channel_service()
-        .resume_publication_lookup_browser(scope, job.account_id, job.attempt_id, &binding)
+        .resume_publication_lookup_browser_reserved(
+            scope,
+            job.account_id,
+            job.attempt_id,
+            &binding,
+            session_id,
+            reservation_id,
+        )
         .await
     {
         Ok(value) => value,
-        Err(error) => {
-            // These validation errors occur before browser startup. They must
-            // not unnecessarily occupy the account's execution reservation.
-            if matches!(
-                error.message.as_str(),
-                "publication browser binding has changed"
-                    | "publication browser binding is invalid"
-                    | "channel account is not ready"
-                    | "channel account needs login"
-                    | "channel account not assigned to project"
-                    | "publication connector is unavailable"
-            ) {
-                release_reservation(state, scope, job.account_id, reservation_id).await;
-            }
-            // A failed start can itself have created a context; its client
-            // tries to close by UUID, but we cannot prove cleanup succeeded.
+        Err(_) => {
+            let _ = state
+                .channel_service()
+                .close_owned_browser(scope, session_id)
+                .await;
+            // This cannot release attached durable ownership without proof.
+            release_reservation(state, scope, job.account_id, reservation_id).await;
             return unknown("account_or_network_unavailable");
         }
     };
     if bound_version != original_version {
-        if bridge.close(session).await.is_ok() {
-            release_reservation(state, scope, job.account_id, reservation_id).await;
-        }
+        let _ = state
+            .channel_service()
+            .close_owned_browser(scope, session)
+            .await;
         return unknown("connector_version_mismatch");
     }
     // The runner may remain active for two minutes after an HTTP timeout.
     // Leave enough of both durable leases for identity checking and that
     // remote deadline before starting a read-only operation.
     if Utc::now() + Duration::minutes(3) >= claimed_at + LEASE {
-        if bridge.close(session).await.is_ok() {
-            release_reservation(state, scope, job.account_id, reservation_id).await;
-        }
+        let _ = state
+            .channel_service()
+            .close_owned_browser(scope, session)
+            .await;
         return unknown("lookup_preflight_expired");
     }
     let payload = match candidate {
@@ -500,6 +499,8 @@ async fn lookup_once(
     };
     let (receipt, closed) = execute_and_close_with_cleanup(
         bridge,
+        state.channel_service(),
+        scope,
         session,
         Some(&original_identity),
         execution_id,
@@ -986,12 +987,26 @@ mod tests {
         body: axum::body::Bytes,
     ) -> (StatusCode, Json<Value>) {
         let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let generation = "5ce59c3b-27b9-4fdc-bc95-fbb5a22ac7cc";
         let result = match (method.as_str(), uri.path()) {
+            ("GET", "/v1/lifecycle") => json!({"generation":generation}),
             ("GET", "/v1/capabilities") => json!({"connectors":[{
                 "platform":"zhihu","placement_slot":"primary","connector_version":"zhihu.v1",
                 "operations":["publish","lookup"],"verified":false
             }]}),
-            ("POST", "/v1/sessions") => json!({"session_id":payload["session_id"]}),
+            ("POST", "/v1/sessions") => {
+                assert_eq!(payload["expected_generation"], generation);
+                json!({"session_id":payload["session_id"],"generation":generation})
+            }
+            ("POST", path) if path.ends_with("/dispose") => {
+                assert_eq!(payload["expected_generation"], generation);
+                let session = path
+                    .strip_prefix("/v1/sessions/")
+                    .unwrap()
+                    .strip_suffix("/dispose")
+                    .unwrap();
+                json!({"session_id":session,"generation":generation,"state":"disposed"})
+            }
             ("POST", "/v1/executions") => {
                 stub.requests.lock().await.push(payload.clone());
                 let discovery = payload["payload"].get("public_url").is_none();
@@ -1116,9 +1131,6 @@ mod tests {
         )
         .await
         .unwrap();
-        jobs.claim(&scope, job.target_id, job.attempt_id, Utc::now())
-            .await
-            .unwrap();
         let (session, binding, _) = state
             .channel_service()
             .resume_available_browser_bound(&scope, job.account_id, job.attempt_id)
@@ -1126,10 +1138,10 @@ mod tests {
             .unwrap();
         state
             .channel_service()
-            .browser
-            .as_ref()
-            .unwrap()
-            .close(session)
+            .close_owned_browser(&scope, session)
+            .await
+            .unwrap();
+        jobs.claim(&scope, job.target_id, job.attempt_id, Utc::now())
             .await
             .unwrap();
         jobs.store_publication_binding(&scope, job.target_id, job.attempt_id, binding)

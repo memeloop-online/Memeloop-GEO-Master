@@ -4,6 +4,18 @@ const accounts = {
   "zh-CN": {
     account: {
       operationFailed: "操作失败，请重试。",
+      assignment: {
+        title: "分配给客户项目",
+        help: "选择可使用此共享账号的项目。",
+        search: "搜索项目",
+        project: "目标项目",
+        choose: "请选择项目",
+        loading: "正在加载项目",
+        empty: "未找到可分配的项目。",
+        more: "加载更多项目",
+        assign: "分配项目",
+        assigned: "共享账号已分配给项目。",
+      },
       state: {
         needs_login: "需要登录",
         unverified: "等待身份验证",
@@ -122,6 +134,18 @@ const accounts = {
   en: {
     account: {
       operationFailed: "Operation failed. Please try again.",
+      assignment: {
+        title: "Assign to a project",
+        help: "Choose a project that can use this shared account.",
+        search: "Search projects",
+        project: "Target project",
+        choose: "Choose a project",
+        loading: "Loading projects",
+        empty: "No available projects found.",
+        more: "Load more projects",
+        assign: "Assign project",
+        assigned: "Shared account assigned to the project.",
+      },
       state: {
         needs_login: "Sign-in required",
         unverified: "Awaiting identity verification",
