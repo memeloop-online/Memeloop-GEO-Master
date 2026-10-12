@@ -407,6 +407,50 @@ pub(crate) fn deepseek_lifecycle_chat_id(value: &Value) -> Option<&str> {
     deepseek_lifecycle(value).map(|lifecycle| lifecycle.chat_id)
 }
 
+/// Compose only in memory. History cannot supply missing original stream IDs,
+/// creation, submission or terminal evidence. The normal inventory verifier
+/// subsequently checks the complete original stream, including finish ordering.
+pub(crate) fn deepseek_recovery_document(
+    source: &Value,
+    history: Value,
+) -> Option<(Value, ObservationCaptureCompletion)> {
+    if source.get("lifecycle").is_some() {
+        return None;
+    }
+    let ownership = source.get("ownership")?;
+    deepseek_ownership(ownership)?;
+    let mut ready_messages = source["messages"]
+        .as_array()?
+        .iter()
+        .filter(|message| message["event"] == "ready");
+    let ready = &ready_messages.next()?["data"];
+    if ready_messages.next().is_some() {
+        return None;
+    }
+    let request_id = deepseek_message_id(&ready["request_message_id"])?;
+    let response_id = deepseek_message_id(&ready["response_message_id"])?;
+    let mut document = source.clone();
+    document["lifecycle"] = serde_json::json!({
+        "schema_version": "geo.deepseek.lifecycle.v1",
+        "provider": "deepseek",
+        "creation": ownership["creation"],
+        "submission": ownership["submission"],
+        "ready": {"request_message_id": request_id, "response_message_id": response_id},
+        // A claim checked against the ORIGINAL messages by completion_inventory,
+        // never accepted as a substitute for an original finish event.
+        "sse_terminal": true,
+        "history": history,
+    });
+    Some((
+        document,
+        ObservationCaptureCompletion {
+            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
+            terminal: true,
+            assistant_message_ids: vec![response_id.to_string()],
+        },
+    ))
+}
+
 fn deepseek_completion_inventory<'a>(
     document: &'a Value,
     chat_id: &str,

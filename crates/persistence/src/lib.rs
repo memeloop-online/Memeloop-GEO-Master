@@ -37,6 +37,8 @@ mod model_routes;
 pub use model_routes::PgModelRouteRepository;
 mod observation_capture;
 pub use observation_capture::PgObservationCaptureRepository;
+mod observation_completion_recovery;
+pub use observation_completion_recovery::PgObservationCompletionRecoveryRepository;
 mod observation_analysis;
 pub use observation_analysis::PgObservationAnalysisRepository;
 mod provider_conversation_cleanup;
