@@ -65,6 +65,92 @@ fn decode_group(json: serde_json::Value) -> Result<ChannelGroup, AppError> {
         .map_err(|_| AppError::new(ErrorCode::Internal, "stored channel group invalid"))
 }
 
+pub(crate) async fn save_verified_login_storage_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    storage: &geo_domain::VerifiedLoginStorage,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), AppError> {
+    lock_platform_identity(
+        tx,
+        storage.secret_scope.operator_id,
+        &storage.platform,
+        &storage.platform_account_id,
+    )
+    .await?;
+    let cross_table = match storage.owner_kind {
+        ChannelOwnerKind::Customer => {
+            "SELECT EXISTS(SELECT 1 FROM operator_channel_accounts WHERE operator_id=$1 AND platform=$2 AND platform_account_id=$3)"
+        }
+        ChannelOwnerKind::OperatorPool => {
+            "SELECT EXISTS(SELECT 1 FROM channel_accounts WHERE operator_id=$1 AND platform=$2 AND platform_account_id=$3)"
+        }
+    };
+    let duplicate: bool = sqlx::query_scalar(cross_table)
+        .bind(storage.secret_scope.operator_id.as_uuid())
+        .bind(&storage.platform)
+        .bind(&storage.platform_account_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    if duplicate {
+        return Err(AppError::conflict("platform identity is already connected"));
+    }
+    let patch = serde_json::json!({
+        "platform_account_id": storage.platform_account_id,
+        "display_name": storage.display_name,
+        "avatar_url": storage.avatar_url,
+        "status": "ready",
+        "updated_at": at,
+    });
+    let sql = match storage.owner_kind {
+        ChannelOwnerKind::Customer => {
+            "UPDATE channel_accounts SET platform_account_id=$6,encrypted_session=$7,metadata=metadata || $8::jsonb \
+            WHERE operator_id=$1 AND account_id=$2 AND platform=$3 AND platform_account_id IS NOT DISTINCT FROM $4 \
+            AND encrypted_session IS NOT DISTINCT FROM $5 AND metadata->>'enabled'='true' AND metadata->>'owner_kind'='customer' \
+            AND tenant_id=$9 AND project_id=$10"
+        }
+        ChannelOwnerKind::OperatorPool => {
+            "UPDATE operator_channel_accounts SET platform_account_id=$6,encrypted_session=$7,metadata=metadata || $8::jsonb \
+            WHERE operator_id=$1 AND account_id=$2 AND platform=$3 AND platform_account_id IS NOT DISTINCT FROM $4 \
+            AND encrypted_session IS NOT DISTINCT FROM $5 AND metadata->>'enabled'='true'"
+        }
+    };
+    let query = sqlx::query(sql)
+        .bind(storage.secret_scope.operator_id.as_uuid())
+        .bind(storage.account_id)
+        .bind(&storage.platform)
+        .bind(&storage.expected_platform_account_id)
+        .bind(
+            storage
+                .expected_session
+                .as_ref()
+                .map(ChannelSecret::encrypted_bytes),
+        )
+        .bind(&storage.platform_account_id)
+        .bind(storage.session.encrypted_bytes())
+        .bind(patch);
+    let result = match storage.owner_kind {
+        ChannelOwnerKind::Customer => {
+            crate::set_local_scope(tx, &storage.secret_scope)
+                .await
+                .map_err(db_error)?;
+            query
+                .bind(storage.secret_scope.tenant_id.as_uuid())
+                .bind(project(&storage.secret_scope)?)
+                .execute(&mut **tx)
+                .await
+        }
+        ChannelOwnerKind::OperatorPool => query.execute(&mut **tx).await,
+    }
+    .map_err(db_error)?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "login account changed during verification",
+        ));
+    }
+    Ok(())
+}
+
 fn decode_account(
     json: serde_json::Value,
     group_id: Option<Uuid>,
@@ -77,6 +163,25 @@ fn decode_account(
 
 #[async_trait]
 impl ChannelRepository for PgChannelRepository {
+    async fn save_verified_login_storage(
+        &self,
+        storage: &geo_domain::VerifiedLoginStorage,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        save_verified_login_storage_tx(&mut tx, storage, at).await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(())
+    }
+    async fn account_login_sessions(
+        &self,
+        operator: OperatorId,
+        account_id: Uuid,
+    ) -> Result<Vec<Uuid>, AppError> {
+        sqlx::query_scalar("SELECT session_id FROM channel_login_sessions WHERE operator_id=$1 AND account_id=$2 \
+            UNION SELECT session_id FROM operator_channel_login_sessions WHERE operator_id=$1 AND account_id=$2")
+            .bind(operator.as_uuid()).bind(account_id).fetch_all(&self.pool).await.map_err(db_error)
+    }
     async fn list_import_rows(
         &self,
         operator: OperatorId,
@@ -477,9 +582,14 @@ impl ChannelRepository for PgChannelRepository {
         operator: OperatorId,
         session: PoolLoginSession,
     ) -> Result<(), AppError> {
-        sqlx::query("INSERT INTO operator_channel_login_sessions(operator_id,session_id,account_id,created_at) VALUES($1,$2,$3,$4)")
+        let result = sqlx::query("INSERT INTO operator_channel_login_sessions(operator_id,session_id,account_id,created_at) VALUES($1,$2,$3,$4) \
+            ON CONFLICT(operator_id,session_id) DO UPDATE SET account_id=operator_channel_login_sessions.account_id \
+            WHERE operator_channel_login_sessions.account_id=EXCLUDED.account_id")
             .bind(operator.as_uuid()).bind(session.session_id).bind(session.account_id).bind(session.created_at)
             .execute(&self.pool).await.map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::conflict("pool login reference differs"));
+        }
         Ok(())
     }
 
@@ -682,12 +792,17 @@ impl ChannelRepository for PgChannelRepository {
         if scope.project_id != Some(session.project_id) {
             return Err(AppError::forbidden("login outside project"));
         }
-        sqlx::query(
-            "INSERT INTO channel_login_sessions (operator_id,tenant_id,project_id,session_id,account_id,created_at) VALUES ($1,$2,$3,$4,$5,$6)",
+        let result = sqlx::query(
+            "INSERT INTO channel_login_sessions (operator_id,tenant_id,project_id,session_id,account_id,created_at) VALUES ($1,$2,$3,$4,$5,$6) \
+             ON CONFLICT(operator_id,tenant_id,project_id,session_id) DO UPDATE SET account_id=channel_login_sessions.account_id \
+             WHERE channel_login_sessions.account_id=EXCLUDED.account_id",
         )
         .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
         .bind(project(scope)?).bind(session.session_id).bind(session.account_id)
         .bind(session.created_at).execute(&self.pool).await.map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::conflict("login reference differs"));
+        }
         Ok(())
     }
 

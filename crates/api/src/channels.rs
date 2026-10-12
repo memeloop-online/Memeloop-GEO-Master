@@ -32,6 +32,7 @@ use crate::{
 #[derive(Clone)]
 pub struct ChannelService {
     pub repository: Arc<dyn ChannelRepository>,
+    pub(crate) operation_repository: Option<Arc<dyn geo_domain::ChannelJobRepository>>,
     cipher: Option<Arc<SecretEnvelope>>,
     pub browser: Option<BrowserBridge>,
     operator_pool_tenant_id: Option<TenantId>,
@@ -41,6 +42,7 @@ impl ChannelService {
     pub fn development() -> Self {
         Self {
             repository: Arc::new(geo_domain::MemoryChannelRepository::default()),
+            operation_repository: None,
             cipher: Some(Arc::new(SecretEnvelope::ephemeral())),
             browser: None,
             operator_pool_tenant_id: None,
@@ -53,6 +55,7 @@ impl ChannelService {
     pub fn unconfigured(repository: Arc<dyn ChannelRepository>) -> Self {
         Self {
             repository,
+            operation_repository: None,
             cipher: None,
             browser: None,
             operator_pool_tenant_id: None,
@@ -68,6 +71,7 @@ impl ChannelService {
             .map_err(|_| AppError::invalid_request("GEO_CHANNEL_SECRET_KEY is invalid"))?;
         Ok(Self {
             repository,
+            operation_repository: None,
             cipher: Some(Arc::new(cipher)),
             browser,
             operator_pool_tenant_id: None,
@@ -79,12 +83,20 @@ impl ChannelService {
         self
     }
 
+    pub fn with_operation_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::ChannelJobRepository>,
+    ) -> Self {
+        self.operation_repository = Some(repository);
+        self
+    }
+
     pub fn with_operator_pool_tenant_id(mut self, tenant_id: TenantId) -> Self {
         self.operator_pool_tenant_id = Some(tenant_id);
         self
     }
 
-    fn browser(&self) -> Result<&BrowserBridge, AppError> {
+    pub(crate) fn browser(&self) -> Result<&BrowserBridge, AppError> {
         self.browser
             .as_ref()
             .ok_or_else(|| AppError::capability_missing("browser login runner is not configured"))
@@ -173,7 +185,6 @@ impl ChannelService {
         scope: &TenantScope,
         account_id: Uuid,
     ) -> Result<Uuid, AppError> {
-        let browser = self.browser()?;
         let record = self.repository.get_account(scope, account_id).await?;
         if !record.account.enabled || record.account.status != ChannelStatus::Ready {
             return Err(AppError::conflict("channel account is not ready"));
@@ -189,9 +200,17 @@ impl ChannelService {
             .resolved_proxy(scope, account_id, record.proxy.as_ref())
             .await?;
         let id = Uuid::new_v4();
-        browser
-            .start(id, &record.account.platform, proxy, Some(&storage_state))
-            .await?;
+        self.open_execution_browser(
+            scope,
+            account_id,
+            id,
+            geo_domain::BrowserOperationPurpose::Measure,
+            None,
+            &record.account.platform,
+            proxy,
+            &storage_state,
+        )
+        .await?;
         Ok(id)
     }
 
@@ -237,17 +256,67 @@ impl ChannelService {
         scope: &TenantScope,
         account_id: Uuid,
     ) -> Result<(Uuid, ChannelSessionVersion), AppError> {
+        self.resume_available_browser_with_renewal_id(scope, account_id, Uuid::new_v4())
+            .await
+    }
+
+    /// The caller retains the context ID even if restore times out after the
+    /// runner has accepted it, so cleanup never depends on a received handle.
+    pub(crate) async fn resume_available_browser_with_renewal_id(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        id: Uuid,
+    ) -> Result<(Uuid, ChannelSessionVersion), AppError> {
+        self.resume_available_browser_with_renewal_id_inner(
+            scope,
+            account_id,
+            id,
+            None,
+            geo_domain::BrowserOperationPurpose::Measure,
+        )
+        .await
+    }
+
+    pub(crate) async fn resume_available_browser_with_renewal_id_reserved(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        id: Uuid,
+        reservation_id: Uuid,
+        purpose: geo_domain::BrowserOperationPurpose,
+    ) -> Result<(Uuid, ChannelSessionVersion), AppError> {
+        self.resume_available_browser_with_renewal_id_inner(
+            scope,
+            account_id,
+            id,
+            Some(reservation_id),
+            purpose,
+        )
+        .await
+    }
+
+    async fn resume_available_browser_with_renewal_id_inner(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        id: Uuid,
+        reservation_id: Option<Uuid>,
+        purpose: geo_domain::BrowserOperationPurpose,
+    ) -> Result<(Uuid, ChannelSessionVersion), AppError> {
         let prepared = self.prepare_available_browser(scope, account_id).await?;
         let version = prepared.session_version(account_id);
-        let id = Uuid::new_v4();
-        self.browser()?
-            .start(
-                id,
-                &prepared.platform,
-                prepared.proxy,
-                Some(&prepared.storage_state),
-            )
-            .await?;
+        self.open_execution_browser(
+            scope,
+            account_id,
+            id,
+            purpose,
+            reservation_id,
+            &prepared.platform,
+            prepared.proxy,
+            &prepared.storage_state,
+        )
+        .await?;
         Ok((id, version))
     }
 
@@ -296,11 +365,48 @@ impl ChannelService {
     /// Freeze the actual browser network and account used by this send attempt.
     /// The returned opaque envelope is exclusively server-side; never include
     /// it (or its decrypted proxy credentials) in a response or receipt.
+    #[cfg(test)]
     pub(crate) async fn resume_available_browser_bound(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
         attempt_id: Uuid,
+    ) -> Result<(Uuid, ChannelSecret, ChannelSessionVersion), AppError> {
+        self.resume_available_browser_bound_inner(
+            scope,
+            account_id,
+            attempt_id,
+            Uuid::new_v4(),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn resume_available_browser_bound_reserved(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        attempt_id: Uuid,
+        session_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<(Uuid, ChannelSecret, ChannelSessionVersion), AppError> {
+        self.resume_available_browser_bound_inner(
+            scope,
+            account_id,
+            attempt_id,
+            session_id,
+            Some(reservation_id),
+        )
+        .await
+    }
+
+    async fn resume_available_browser_bound_inner(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        attempt_id: Uuid,
+        session_id: Uuid,
+        reservation_id: Option<Uuid>,
     ) -> Result<(Uuid, ChannelSecret, ChannelSessionVersion), AppError> {
         let prepared = self.prepare_available_browser(scope, account_id).await?;
         let session_version = prepared.session_version(account_id);
@@ -319,15 +425,17 @@ impl ChannelService {
         let bytes = serde_json::to_vec(&binding)
             .map_err(|_| AppError::new(ErrorCode::Internal, "publication binding invalid"))?;
         let sealed = self.encrypt(scope, attempt_id, "publication_execution", &bytes)?;
-        let session_id = Uuid::new_v4();
-        self.browser()?
-            .start(
-                session_id,
-                &prepared.platform,
-                prepared.proxy,
-                Some(&prepared.storage_state),
-            )
-            .await?;
+        self.open_execution_browser(
+            scope,
+            account_id,
+            session_id,
+            geo_domain::BrowserOperationPurpose::Publish,
+            reservation_id,
+            &prepared.platform,
+            prepared.proxy,
+            &prepared.storage_state,
+        )
+        .await?;
         Ok((session_id, sealed, session_version))
     }
 
@@ -335,12 +443,53 @@ impl ChannelService {
     /// publication's account identity, owner, network and connector version.
     /// The original platform account ID and connector version must be checked
     /// against the runner's completion/lookup receipt by the caller.
+    #[cfg(test)]
     pub(crate) async fn resume_publication_lookup_browser(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
         attempt_id: Uuid,
         binding: &ChannelSecret,
+    ) -> Result<(Uuid, String, String), AppError> {
+        self.resume_publication_lookup_browser_inner(
+            scope,
+            account_id,
+            attempt_id,
+            binding,
+            Uuid::new_v4(),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn resume_publication_lookup_browser_reserved(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        attempt_id: Uuid,
+        binding: &ChannelSecret,
+        session_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<(Uuid, String, String), AppError> {
+        self.resume_publication_lookup_browser_inner(
+            scope,
+            account_id,
+            attempt_id,
+            binding,
+            session_id,
+            Some(reservation_id),
+        )
+        .await
+    }
+
+    async fn resume_publication_lookup_browser_inner(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        attempt_id: Uuid,
+        binding: &ChannelSecret,
+        session_id: Uuid,
+        reservation_id: Option<Uuid>,
     ) -> Result<(Uuid, String, String), AppError> {
         let bytes = self.decrypt(scope, attempt_id, "publication_execution", binding)?;
         let original: PublicationBrowserBinding = serde_json::from_slice(&bytes)
@@ -373,15 +522,17 @@ impl ChannelService {
                 "publication browser binding has changed",
             ));
         }
-        let session_id = Uuid::new_v4();
-        self.browser()?
-            .start(
-                session_id,
-                &current.platform,
-                current.proxy,
-                Some(&current.storage_state),
-            )
-            .await?;
+        self.open_execution_browser(
+            scope,
+            account_id,
+            session_id,
+            geo_domain::BrowserOperationPurpose::Lookup,
+            reservation_id,
+            &current.platform,
+            current.proxy,
+            &current.storage_state,
+        )
+        .await?;
         Ok((
             session_id,
             original.platform_account_id,
@@ -416,12 +567,43 @@ impl ChannelService {
 
     /// Restore current authorization, but never adopt a replacement identity.
     /// The caller owns the supplied session ID and must close even if start fails.
+    #[cfg(test)]
     pub(crate) async fn resume_provider_cleanup_browser(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
         identity: &geo_domain::ObservationProviderIdentity,
         session_id: Uuid,
+    ) -> Result<(), AppError> {
+        self.resume_provider_cleanup_browser_inner(scope, account_id, identity, session_id, None)
+            .await
+    }
+
+    pub(crate) async fn resume_provider_cleanup_browser_reserved(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        identity: &geo_domain::ObservationProviderIdentity,
+        session_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<(), AppError> {
+        self.resume_provider_cleanup_browser_inner(
+            scope,
+            account_id,
+            identity,
+            session_id,
+            Some(reservation_id),
+        )
+        .await
+    }
+
+    async fn resume_provider_cleanup_browser_inner(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        identity: &geo_domain::ObservationProviderIdentity,
+        session_id: Uuid,
+        reservation_id: Option<Uuid>,
     ) -> Result<(), AppError> {
         identity.validate()?;
         let current = self.prepare_available_browser(scope, account_id).await?;
@@ -430,14 +612,17 @@ impl ChannelService {
         {
             return Err(AppError::conflict("cleanup browser identity has changed"));
         }
-        self.browser()?
-            .start(
-                session_id,
-                &current.platform,
-                current.proxy,
-                Some(&current.storage_state),
-            )
-            .await?;
+        self.open_execution_browser(
+            scope,
+            account_id,
+            session_id,
+            geo_domain::BrowserOperationPurpose::Cleanup,
+            reservation_id,
+            &current.platform,
+            current.proxy,
+            &current.storage_state,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1270,7 +1455,6 @@ pub async fn start_login(
         .await
         .map_err(|e| err(e, context))?;
     let service = state.channel_service();
-    let browser = service.browser().map_err(|e| err(e, context))?;
     let record = service
         .repository
         .get_account(&scope, input.account_id)
@@ -1279,14 +1463,58 @@ pub async fn start_login(
     if !record.account.enabled {
         return Err(err(AppError::conflict("account is disabled"), context));
     }
+    if let Some(operation) = service
+        .operations()
+        .map_err(|e| err(e, context))?
+        .get_active_browser_operation(
+            &login_operation_scope(&scope, &auth, false),
+            input.account_id,
+        )
+        .await
+        .map_err(|e| err(e, context))?
+    {
+        if operation.purpose != geo_domain::BrowserOperationPurpose::Login {
+            return Err(err(AppError::conflict("account is in use"), context));
+        }
+        // Recover a dropped response, or a crash between operation and login
+        // reference persistence, without allocating a second browser.
+        service
+            .repository
+            .save_login(
+                &scope,
+                LoginSession {
+                    session_id: operation.session_id,
+                    account_id: input.account_id,
+                    project_id: input.project_id,
+                    created_at: operation.created_at,
+                },
+            )
+            .await
+            .map_err(|e| err(e, context))?;
+        return Ok((
+            StatusCode::OK,
+            Json(LoginStarted {
+                session_id: operation.session_id,
+                account_id: input.account_id,
+                phase: "reconnecting",
+            }),
+        ));
+    }
     let proxy = service
         .resolved_proxy(&scope, input.account_id, record.proxy.as_ref())
         .await
         .map_err(|e| err(e, context))?;
-    // The browser runner must fail closed if the selected proxy cannot start.
     let session_id = Uuid::new_v4();
-    browser
-        .start(session_id, &record.account.platform, proxy, None)
+    let operation = service
+        .prepare_owned_browser(
+            &login_operation_scope(&scope, &auth, false),
+            &scope,
+            input.account_id,
+            session_id,
+            geo_domain::BrowserOperationPurpose::Login,
+            None,
+            &proxy,
+        )
         .await
         .map_err(|e| err(e, context))?;
     let session = LoginSession {
@@ -1296,9 +1524,13 @@ pub async fn start_login(
         created_at: Utc::now(),
     };
     if let Err(error) = service.repository.save_login(&scope, session).await {
-        let _ = browser.close(session_id).await;
+        let _ = service.dispose_owned_operation(&operation).await;
         return Err(err(error, context));
     }
+    service
+        .start_owned_browser(&operation, &scope, &record.account.platform, None)
+        .await
+        .map_err(|e| err(e, context))?;
     state
         .desktop_grants
         .bind(session_id, &auth, &tenant.tenant_id.to_string())
@@ -1316,24 +1548,67 @@ pub async fn start_login(
 async fn valid_login(
     state: &AppState,
     scope: &TenantScope,
+    auth: &AuthContext,
     id: Uuid,
+    allow_expired: bool,
 ) -> Result<LoginSession, AppError> {
     let session = state
         .channel_service()
         .repository
         .get_login(scope, id)
         .await?;
-    if Utc::now() - session.created_at > Duration::minutes(20) {
-        state.desktop_grants.revoke(id).await;
-        let _ = state.channel_service().browser()?.close(id).await;
-        let _ = state
-            .channel_service()
-            .repository
-            .delete_login(scope, id)
-            .await;
+    let operation = authorize_login_operation(
+        state,
+        &login_operation_scope(scope, auth, false),
+        id,
+        session.account_id,
+    )
+    .await?;
+    if !allow_expired && operation.state == geo_domain::BrowserOperationState::Disposed {
+        return Err(AppError::conflict("login browser has been closed"));
+    }
+    if !allow_expired && Utc::now() - session.created_at > Duration::minutes(20) {
         return Err(AppError::not_found("login session expired"));
     }
+    state
+        .desktop_grants
+        .bind(id, auth, &scope.tenant_id.to_string())
+        .await;
     Ok(session)
+}
+
+fn login_operation_scope(
+    scope: &TenantScope,
+    auth: &AuthContext,
+    pool: bool,
+) -> geo_domain::BrowserOperationScope {
+    geo_domain::BrowserOperationScope {
+        operator_id: scope.operator_id,
+        tenant_id: if pool { None } else { Some(scope.tenant_id) },
+        project_id: if pool { None } else { scope.project_id },
+        owner_id: auth.session.id.as_uuid(),
+    }
+}
+
+async fn authorize_login_operation(
+    state: &AppState,
+    scope: &geo_domain::BrowserOperationScope,
+    id: Uuid,
+    account_id: Uuid,
+) -> Result<geo_domain::BrowserOperation, AppError> {
+    let operation = state
+        .channel_service()
+        .operations()?
+        .get_browser_operation(scope, id)
+        .await?
+        .ok_or_else(|| AppError::forbidden("browser ownership or generation is unknown"))?;
+    if operation.account_id != account_id
+        || operation.session_id != id
+        || operation.purpose != geo_domain::BrowserOperationPurpose::Login
+    {
+        return Err(AppError::forbidden("login ownership mismatch"));
+    }
+    Ok(operation)
 }
 
 #[derive(Serialize)]
@@ -1355,7 +1630,7 @@ pub async fn desktop_authorization(
     let scope = scope(&state, &tenant, query.project_id)
         .await
         .map_err(|e| err(e, context))?;
-    valid_login(&state, &scope, id)
+    valid_login(&state, &scope, &auth, id, false)
         .await
         .map_err(|e| err(e, context))?;
     state
@@ -1401,7 +1676,7 @@ pub async fn desktop_socket(
     let scope = scope(&state, &tenant, query.project_id)
         .await
         .map_err(|e| err(e, context))?;
-    let session = valid_login(&state, &scope, id)
+    let session = valid_login(&state, &scope, &auth, id, false)
         .await
         .map_err(|e| err(e, context))?;
     let browser = state
@@ -1443,7 +1718,7 @@ pub async fn desktop_status(
     let scope = scope(&state, &tenant, query.project_id)
         .await
         .map_err(|e| err(e, context))?;
-    valid_login(&state, &scope, id)
+    valid_login(&state, &scope, &auth, id, false)
         .await
         .map_err(|e| err(e, context))?;
     state
@@ -1474,7 +1749,7 @@ pub async fn complete_login(
     let scope = scope(&state, &tenant, query.project_id)
         .await
         .map_err(|e| err(e, context))?;
-    let session = valid_login(&state, &scope, id)
+    let session = valid_login(&state, &scope, &auth, id, false)
         .await
         .map_err(|e| err(e, context))?;
     state
@@ -1484,8 +1759,12 @@ pub async fn complete_login(
         .map_err(|e| err(e, context))?;
     let service = state.channel_service();
     let browser = service.browser().map_err(|e| err(e, context))?;
+    let record = service
+        .repository
+        .get_account(&scope, session.account_id)
+        .await
+        .map_err(|e| err(e, context))?;
     let verified = browser.complete(id).await.map_err(|e| err(e, context))?;
-    state.desktop_grants.revoke(id).await;
     if verified.identity.platform_account_id.trim().is_empty()
         || verified.identity.display_name.trim().is_empty()
     {
@@ -1494,11 +1773,6 @@ pub async fn complete_login(
             context,
         ));
     }
-    let mut record = service
-        .repository
-        .get_account(&scope, session.account_id)
-        .await
-        .map_err(|e| err(e, context))?;
     if !record.account.enabled {
         return Err(err(AppError::conflict("account is disabled"), context));
     }
@@ -1525,23 +1799,56 @@ pub async fn complete_login(
             context,
         ));
     }
-    record.session = Some(
-        service
+    let storage = geo_domain::VerifiedLoginStorage {
+        account_id: session.account_id,
+        secret_scope: scope.clone(),
+        owner_kind: ChannelOwnerKind::Customer,
+        platform: record.account.platform,
+        expected_platform_account_id: record.account.platform_account_id,
+        expected_session: record.session,
+        platform_account_id: verified.identity.platform_account_id,
+        display_name: verified.identity.display_name,
+        avatar_url: verified.identity.avatar_url,
+        session: service
             .encrypt(&scope, session.account_id, "session", &bytes)
             .map_err(|e| err(e, context))?,
-    );
-    record.account.display_name = Some(verified.identity.display_name);
-    record.account.avatar_url = verified.identity.avatar_url;
-    record.account.platform_account_id = Some(verified.identity.platform_account_id);
-    record.account.status = ChannelStatus::Ready;
-    record.account.updated_at = Utc::now();
-    let account = service
-        .repository
-        .save_account(&scope, record)
+    };
+    service
+        .operations()
+        .map_err(|e| err(e, context))?
+        .save_owned_login_session(
+            &login_operation_scope(&scope, &auth, false),
+            id,
+            &storage,
+            service.repository.as_ref(),
+            Utc::now(),
+        )
         .await
         .map_err(|e| err(e, context))?;
-    let _ = browser.close(id).await;
-    let _ = service.repository.delete_login(&scope, id).await;
+    let account = service
+        .repository
+        .get_account(&scope, session.account_id)
+        .await
+        .map_err(|e| err(e, context))?
+        .account;
+    let operation = authorize_login_operation(
+        &state,
+        &login_operation_scope(&scope, &auth, false),
+        id,
+        session.account_id,
+    )
+    .await
+    .map_err(|e| err(e, context))?;
+    service
+        .dispose_owned_operation(&operation)
+        .await
+        .map_err(|e| err(e, context))?;
+    service
+        .repository
+        .delete_login(&scope, id)
+        .await
+        .map_err(|e| err(e, context))?;
+    state.desktop_grants.revoke(id).await;
     Ok(Json(LoginCompleted { account }))
 }
 
@@ -1557,7 +1864,7 @@ pub async fn cancel_login(
     let scope = scope(&state, &tenant, query.project_id)
         .await
         .map_err(|e| err(e, context))?;
-    valid_login(&state, &scope, id)
+    let session = valid_login(&state, &scope, &auth, id, true)
         .await
         .map_err(|e| err(e, context))?;
     state
@@ -1565,12 +1872,17 @@ pub async fn cancel_login(
         .verify(id, &auth, &tenant.tenant_id.to_string())
         .await
         .map_err(|e| err(e, context))?;
-    state.desktop_grants.revoke(id).await;
+    let operation = authorize_login_operation(
+        &state,
+        &login_operation_scope(&scope, &auth, false),
+        id,
+        session.account_id,
+    )
+    .await
+    .map_err(|e| err(e, context))?;
     state
         .channel_service()
-        .browser()
-        .map_err(|e| err(e, context))?
-        .close(id)
+        .dispose_owned_operation(&operation)
         .await
         .map_err(|e| err(e, context))?;
     state
@@ -1579,6 +1891,7 @@ pub async fn cancel_login(
         .delete_login(&scope, id)
         .await
         .map_err(|e| err(e, context))?;
+    state.desktop_grants.revoke(id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1956,6 +2269,40 @@ pub async fn start_pool_login(
     if !record.account.enabled {
         return Err(err(AppError::conflict("account is disabled"), context));
     }
+    if let Some(operation) = service
+        .operations()
+        .map_err(|e| err(e, context))?
+        .get_active_browser_operation(
+            &login_operation_scope(&scope, &auth, true),
+            input.account_id,
+        )
+        .await
+        .map_err(|e| err(e, context))?
+    {
+        if operation.purpose != geo_domain::BrowserOperationPurpose::Login {
+            return Err(err(AppError::conflict("account is in use"), context));
+        }
+        service
+            .repository
+            .save_pool_login(
+                auth.operator.id,
+                PoolLoginSession {
+                    session_id: operation.session_id,
+                    account_id: input.account_id,
+                    created_at: operation.created_at,
+                },
+            )
+            .await
+            .map_err(|e| err(e, context))?;
+        return Ok((
+            StatusCode::OK,
+            Json(LoginStarted {
+                session_id: operation.session_id,
+                account_id: input.account_id,
+                phase: "reconnecting",
+            }),
+        ));
+    }
     let proxy = record
         .proxy
         .as_ref()
@@ -1968,9 +2315,16 @@ pub async fn start_pool_login(
         .transpose()
         .map_err(|e| err(e, context))?;
     let session_id = Uuid::new_v4();
-    let browser = service.browser().map_err(|e| err(e, context))?;
-    browser
-        .start(session_id, &record.account.platform, proxy, None)
+    let operation = service
+        .prepare_owned_browser(
+            &login_operation_scope(&scope, &auth, true),
+            &scope,
+            input.account_id,
+            session_id,
+            geo_domain::BrowserOperationPurpose::Login,
+            None,
+            &proxy,
+        )
         .await
         .map_err(|e| err(e, context))?;
     if let Err(error) = service
@@ -1985,9 +2339,13 @@ pub async fn start_pool_login(
         )
         .await
     {
-        let _ = browser.close(session_id).await;
+        let _ = service.dispose_owned_operation(&operation).await;
         return Err(err(error, context));
     }
+    service
+        .start_owned_browser(&operation, &scope, &record.account.platform, None)
+        .await
+        .map_err(|e| err(e, context))?;
     let pool_tenant = pool_tenant(service, &auth).map_err(|e| err(e, context))?;
     state
         .desktop_grants
@@ -2007,25 +2365,31 @@ async fn valid_pool_login(
     state: &AppState,
     auth: &AuthContext,
     id: Uuid,
+    allow_expired: bool,
 ) -> Result<PoolLoginSession, AppError> {
-    pool_tenant(state.channel_service(), auth)?;
+    let scope = trusted_pool_scope(state.channel_service(), auth)?;
     let session = state
         .channel_service()
         .repository
         .get_pool_login(auth.operator.id, id)
         .await?;
-    if Utc::now() - session.created_at > Duration::minutes(20) {
-        state.desktop_grants.revoke(id).await;
-        if let Ok(browser) = state.channel_service().browser() {
-            let _ = browser.close(id).await;
-        }
-        let _ = state
-            .channel_service()
-            .repository
-            .delete_pool_login(auth.operator.id, id)
-            .await;
+    let operation = authorize_login_operation(
+        state,
+        &login_operation_scope(&scope, auth, true),
+        id,
+        session.account_id,
+    )
+    .await?;
+    if !allow_expired && operation.state == geo_domain::BrowserOperationState::Disposed {
+        return Err(AppError::conflict("login browser has been closed"));
+    }
+    if !allow_expired && Utc::now() - session.created_at > Duration::minutes(20) {
         return Err(AppError::not_found("login session expired"));
     }
+    state
+        .desktop_grants
+        .bind(id, auth, &scope.tenant_id.to_string())
+        .await;
     Ok(session)
 }
 
@@ -2036,7 +2400,7 @@ pub async fn pool_desktop_authorization(
     Extension(auth): Extension<AuthContext>,
     Extension(context): Extension<RequestContext>,
 ) -> Result<Json<DesktopAuthorization>, ApiError> {
-    valid_pool_login(&state, &auth, id)
+    valid_pool_login(&state, &auth, id, false)
         .await
         .map_err(|e| err(e, context))?;
     let browser = state
@@ -2072,7 +2436,7 @@ pub async fn pool_desktop_socket(
     Extension(auth): Extension<AuthContext>,
     Extension(context): Extension<RequestContext>,
 ) -> Result<Response, ApiError> {
-    let session = valid_pool_login(&state, &auth, id)
+    let session = valid_pool_login(&state, &auth, id, false)
         .await
         .map_err(|e| err(e, context))?;
     crate::desktop_gateway::validate_desktop_origin(&headers, state.origin_config())
@@ -2111,7 +2475,7 @@ pub async fn pool_desktop_status(
     Extension(auth): Extension<AuthContext>,
     Extension(context): Extension<RequestContext>,
 ) -> Result<Json<BrowserDesktopStatus>, ApiError> {
-    valid_pool_login(&state, &auth, id)
+    valid_pool_login(&state, &auth, id, false)
         .await
         .map_err(|e| err(e, context))?;
     let tenant = pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
@@ -2142,7 +2506,7 @@ pub async fn complete_pool_login(
     Extension(auth): Extension<AuthContext>,
     Extension(context): Extension<RequestContext>,
 ) -> Result<Json<PoolLoginCompleted>, ApiError> {
-    let session = valid_pool_login(&state, &auth, id)
+    let session = valid_pool_login(&state, &auth, id, false)
         .await
         .map_err(|e| err(e, context))?;
     let owner_tenant = pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
@@ -2154,8 +2518,12 @@ pub async fn complete_pool_login(
     let service = state.channel_service();
     let scope = trusted_pool_scope(service, &auth).map_err(|e| err(e, context))?;
     let browser = service.browser().map_err(|e| err(e, context))?;
+    let record = service
+        .repository
+        .get_pool_account(auth.operator.id, session.account_id)
+        .await
+        .map_err(|e| err(e, context))?;
     let verified = browser.complete(id).await.map_err(|e| err(e, context))?;
-    state.desktop_grants.revoke(id).await;
     if verified.identity.platform_account_id.trim().is_empty()
         || verified.identity.display_name.trim().is_empty()
     {
@@ -2164,11 +2532,6 @@ pub async fn complete_pool_login(
             context,
         ));
     }
-    let mut record = service
-        .repository
-        .get_pool_account(auth.operator.id, session.account_id)
-        .await
-        .map_err(|e| err(e, context))?;
     if !record.account.enabled {
         return Err(err(AppError::conflict("account is disabled"), context));
     }
@@ -2195,26 +2558,56 @@ pub async fn complete_pool_login(
             context,
         ));
     }
-    record.session = Some(
-        service
+    let storage = geo_domain::VerifiedLoginStorage {
+        account_id: session.account_id,
+        secret_scope: scope.clone(),
+        owner_kind: ChannelOwnerKind::OperatorPool,
+        platform: record.account.platform,
+        expected_platform_account_id: record.account.platform_account_id,
+        expected_session: record.session,
+        platform_account_id: verified.identity.platform_account_id,
+        display_name: verified.identity.display_name,
+        avatar_url: verified.identity.avatar_url,
+        session: service
             .encrypt(&scope, session.account_id, "pool_session", &bytes)
             .map_err(|e| err(e, context))?,
-    );
-    record.account.display_name = Some(verified.identity.display_name);
-    record.account.avatar_url = verified.identity.avatar_url;
-    record.account.platform_account_id = Some(verified.identity.platform_account_id);
-    record.account.status = ChannelStatus::Ready;
-    record.account.updated_at = Utc::now();
-    let account = service
-        .repository
-        .save_pool_account(auth.operator.id, record)
+    };
+    service
+        .operations()
+        .map_err(|e| err(e, context))?
+        .save_owned_login_session(
+            &login_operation_scope(&scope, &auth, true),
+            id,
+            &storage,
+            service.repository.as_ref(),
+            Utc::now(),
+        )
         .await
         .map_err(|e| err(e, context))?;
-    let _ = browser.close(id).await;
-    let _ = service
+    let account = service
+        .repository
+        .get_pool_account(auth.operator.id, session.account_id)
+        .await
+        .map_err(|e| err(e, context))?
+        .account;
+    let operation = authorize_login_operation(
+        &state,
+        &login_operation_scope(&scope, &auth, true),
+        id,
+        session.account_id,
+    )
+    .await
+    .map_err(|e| err(e, context))?;
+    service
+        .dispose_owned_operation(&operation)
+        .await
+        .map_err(|e| err(e, context))?;
+    service
         .repository
         .delete_pool_login(auth.operator.id, id)
-        .await;
+        .await
+        .map_err(|e| err(e, context))?;
+    state.desktop_grants.revoke(id).await;
     Ok(Json(PoolLoginCompleted { account }))
 }
 
@@ -2224,7 +2617,7 @@ pub async fn cancel_pool_login(
     Extension(auth): Extension<AuthContext>,
     Extension(context): Extension<RequestContext>,
 ) -> Result<StatusCode, ApiError> {
-    valid_pool_login(&state, &auth, id)
+    let session = valid_pool_login(&state, &auth, id, true)
         .await
         .map_err(|e| err(e, context))?;
     let owner_tenant = pool_tenant(state.channel_service(), &auth).map_err(|e| err(e, context))?;
@@ -2233,12 +2626,18 @@ pub async fn cancel_pool_login(
         .verify(id, &auth, &owner_tenant.to_string())
         .await
         .map_err(|e| err(e, context))?;
-    state.desktop_grants.revoke(id).await;
+    let scope = trusted_pool_scope(state.channel_service(), &auth).map_err(|e| err(e, context))?;
+    let operation = authorize_login_operation(
+        &state,
+        &login_operation_scope(&scope, &auth, true),
+        id,
+        session.account_id,
+    )
+    .await
+    .map_err(|e| err(e, context))?;
     state
         .channel_service()
-        .browser()
-        .map_err(|e| err(e, context))?
-        .close(id)
+        .dispose_owned_operation(&operation)
         .await
         .map_err(|e| err(e, context))?;
     state
@@ -2247,6 +2646,7 @@ pub async fn cancel_pool_login(
         .delete_pool_login(auth.operator.id, id)
         .await
         .map_err(|e| err(e, context))?;
+    state.desktop_grants.revoke(id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2375,6 +2775,8 @@ mod publication_binding_tests {
         cleanup_events: Arc<Mutex<Vec<&'static str>>>,
         cleanup_failure: Arc<Mutex<bool>>,
         cleanup_absent: Arc<Mutex<bool>>,
+        start_failure: Arc<Mutex<bool>>,
+        disposal_failure: Arc<Mutex<bool>>,
     }
 
     async fn runner(
@@ -2383,6 +2785,25 @@ mod publication_binding_tests {
         uri: axum::http::Uri,
         body: axum::body::Bytes,
     ) -> (StatusCode, Json<Value>) {
+        if uri.path() == "/v1/lifecycle" {
+            return (
+                StatusCode::OK,
+                Json(json!({"generation": Uuid::from_u128(123)})),
+            );
+        }
+        if uri.path().ends_with("/dispose") {
+            stub.cleanup_events.lock().await.push("close");
+            if *stub.disposal_failure.lock().await {
+                return (StatusCode::NOT_FOUND, Json(json!({"error":"missing"})));
+            }
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let session = uri.path().split('/').nth(3).unwrap();
+            return (
+                StatusCode::OK,
+                Json(json!({"session_id":session,
+                "generation":payload["expected_generation"], "state":"disposed"})),
+            );
+        }
         if uri.path() == "/v1/capabilities" {
             return (
                 StatusCode::OK,
@@ -2397,9 +2818,17 @@ mod publication_binding_tests {
             stub.cleanup_events.lock().await.push("start");
             let payload: Value = serde_json::from_slice(&body).unwrap();
             stub.starts.lock().await.push(payload.clone());
+            if *stub.start_failure.lock().await {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":"unavailable"})),
+                );
+            }
             return (
                 StatusCode::OK,
-                Json(json!({"session_id":payload["session_id"]})),
+                Json(
+                    json!({"session_id":payload["session_id"], "generation":payload["expected_generation"]}),
+                ),
             );
         }
         if uri.path().ends_with("/complete") {
@@ -2462,7 +2891,9 @@ mod publication_binding_tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let browser =
             BrowserBridge::new(format!("http://{address}"), "runner-token".into()).unwrap();
-        let service = ChannelService::development().with_browser(browser);
+        let service = ChannelService::development()
+            .with_browser(browser)
+            .with_operation_repository(Arc::new(geo_domain::MemoryChannelJobRepository::default()));
         let scope = TenantScope::new(
             DEVELOPMENT_OPERATOR_ID,
             DEVELOPMENT_TENANT_ID,
@@ -2506,6 +2937,298 @@ mod publication_binding_tests {
             .await
             .unwrap();
         (service, scope, account_id, stub, server)
+    }
+
+    #[tokio::test]
+    async fn legacy_login_reference_blocks_new_execution_without_inventing_generation() {
+        let (service, scope, account_id, stub, server) = fixture().await;
+        let legacy = Uuid::new_v4();
+        service
+            .repository
+            .save_login(
+                &scope,
+                LoginSession {
+                    session_id: legacy,
+                    account_id,
+                    project_id: scope.project_id.unwrap(),
+                    created_at: Utc::now() - Duration::hours(1),
+                },
+            )
+            .await
+            .unwrap();
+        let error = service
+            .resume_available_browser(&scope, account_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(stub.starts.lock().await.is_empty());
+        assert!(service.repository.get_login(&scope, legacy).await.is_ok());
+        assert!(
+            !service
+                .operations()
+                .unwrap()
+                .browser_operation_exists(scope.operator_id, legacy)
+                .await
+                .unwrap()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn login_expiry_retains_reference_and_restart_restores_only_durable_cookie_owner() {
+        let (service, scope, account_id, stub, server) = fixture().await;
+        let state =
+            AppState::development_with_password("fixture-password").with_channel_service(service);
+        let repository = state.auth_repository();
+        let identity = repository
+            .authenticate(scope.operator_id, "demo@localhost", "fixture-password")
+            .await
+            .unwrap()
+            .unwrap();
+        let session = repository
+            .create_session(scope.operator_id, identity.user.id, Duration::hours(1))
+            .await
+            .unwrap()
+            .session;
+        let auth = AuthContext {
+            operator: identity.operator,
+            user: identity.user,
+            memberships: identity.memberships,
+            session,
+            scope: scope.clone(),
+        };
+        let id = Uuid::new_v4();
+        let service = state.channel_service();
+        let operation = service
+            .prepare_owned_browser(
+                &login_operation_scope(&scope, &auth, false),
+                &scope,
+                account_id,
+                id,
+                geo_domain::BrowserOperationPurpose::Login,
+                None,
+                &None,
+            )
+            .await
+            .unwrap();
+        service
+            .repository
+            .save_login(
+                &scope,
+                LoginSession {
+                    session_id: id,
+                    account_id,
+                    project_id: scope.project_id.unwrap(),
+                    created_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .start_owned_browser(&operation, &scope, "zhihu", None)
+            .await
+            .unwrap();
+        // A fresh grant cache (as after restart) starts empty and is restored
+        // only after verifying the durable operation's cookie owner.
+        assert!(
+            state
+                .desktop_grants
+                .verify(id, &auth, &scope.tenant_id.to_string())
+                .await
+                .is_err()
+        );
+        valid_login(&state, &scope, &auth, id, false).await.unwrap();
+        assert!(
+            state
+                .desktop_grants
+                .verify(id, &auth, &scope.tenant_id.to_string())
+                .await
+                .is_ok()
+        );
+        let mut other = auth.clone();
+        other.session = repository
+            .create_session(scope.operator_id, auth.user.id, Duration::hours(1))
+            .await
+            .unwrap()
+            .session;
+        assert!(
+            valid_login(&state, &scope, &other, id, false)
+                .await
+                .is_err()
+        );
+        // Reconstruct an older reference rather than mutating the immutable
+        // creation timestamp through idempotent save.
+        service.repository.delete_login(&scope, id).await.unwrap();
+        service
+            .repository
+            .save_login(
+                &scope,
+                LoginSession {
+                    session_id: id,
+                    account_id,
+                    project_id: scope.project_id.unwrap(),
+                    created_at: Utc::now() - Duration::minutes(21),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(valid_login(&state, &scope, &auth, id, false).await.is_err());
+        assert!(service.repository.get_login(&scope, id).await.is_ok());
+        valid_login(&state, &scope, &auth, id, true).await.unwrap();
+        *stub.disposal_failure.lock().await = true;
+        assert!(service.dispose_owned_operation(&operation).await.is_err());
+        assert!(service.repository.get_login(&scope, id).await.is_ok());
+        assert!(
+            state
+                .desktop_grants
+                .verify(id, &auth, &scope.tenant_id.to_string())
+                .await
+                .is_ok()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_start_and_disposal_retain_gate_until_exact_receipt() {
+        use geo_domain::BrowserOperationPurpose;
+        let (service, scope, account_id, stub, server) = fixture().await;
+        *stub.start_failure.lock().await = true;
+        *stub.disposal_failure.lock().await = true;
+        let session_id = Uuid::new_v4();
+        assert!(
+            service
+                .open_execution_browser(
+                    &scope,
+                    account_id,
+                    session_id,
+                    BrowserOperationPurpose::Login,
+                    None,
+                    "zhihu",
+                    None,
+                    &json!({})
+                )
+                .await
+                .is_err()
+        );
+        let op_scope = crate::browser_operations::execution_scope(&scope, session_id);
+        let operation = service
+            .operations()
+            .unwrap()
+            .get_browser_operation(&op_scope, session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.state, geo_domain::BrowserOperationState::Closing);
+        assert!(
+            service
+                .open_execution_browser(
+                    &scope,
+                    account_id,
+                    Uuid::new_v4(),
+                    BrowserOperationPurpose::Measure,
+                    None,
+                    "zhihu",
+                    None,
+                    &json!({})
+                )
+                .await
+                .is_err()
+        );
+        // Rebuilding the service does not release or replace durable ownership.
+        let restarted = ChannelService::development()
+            .with_browser(service.browser.clone().unwrap())
+            .with_operation_repository(service.operation_repository.clone().unwrap());
+        assert!(
+            restarted
+                .close_owned_browser(&scope, session_id)
+                .await
+                .is_err()
+        );
+        *stub.disposal_failure.lock().await = false;
+        restarted
+            .close_owned_browser(&scope, session_id)
+            .await
+            .unwrap();
+        *stub.start_failure.lock().await = false;
+        service
+            .open_execution_browser(
+                &scope,
+                account_id,
+                Uuid::new_v4(),
+                BrowserOperationPurpose::Measure,
+                None,
+                "zhihu",
+                None,
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_login_operations_share_execution_account_gate() {
+        use geo_domain::BrowserOperationPurpose;
+        let (service, scope, account_id, stub, server) = fixture().await;
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let storage = json!({});
+        let (a, b) = tokio::join!(
+            service.open_execution_browser(
+                &scope,
+                account_id,
+                first,
+                BrowserOperationPurpose::Login,
+                None,
+                "zhihu",
+                None,
+                &storage
+            ),
+            service.open_execution_browser(
+                &scope,
+                account_id,
+                second,
+                BrowserOperationPurpose::Login,
+                None,
+                "zhihu",
+                None,
+                &storage
+            ),
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        assert_eq!(stub.starts.lock().await.len(), 1);
+        assert!(
+            service
+                .operations()
+                .unwrap()
+                .reserve_account(
+                    &scope,
+                    account_id,
+                    Uuid::new_v4(),
+                    Utc::now(),
+                    Utc::now() + Duration::minutes(2)
+                )
+                .await
+                .is_err()
+        );
+        service
+            .close_owned_browser(&scope, if a.is_ok() { first } else { second })
+            .await
+            .unwrap();
+        service
+            .open_execution_browser(
+                &scope,
+                account_id,
+                Uuid::new_v4(),
+                BrowserOperationPurpose::Measure,
+                None,
+                "zhihu",
+                None,
+                &storage,
+            )
+            .await
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]
@@ -2932,8 +3655,12 @@ mod publication_binding_tests {
         let (service, scope, account_id, stub, server) = fixture().await;
         set_default_proxy(&service, &scope, Some("proxy-secret")).await;
         let attempt = Uuid::new_v4();
-        let (_, bound, _) = service
+        let (session_id, bound, _) = service
             .resume_available_browser_bound(&scope, account_id, attempt)
+            .await
+            .unwrap();
+        service
+            .close_owned_browser(&scope, session_id)
             .await
             .unwrap();
         assert_eq!(

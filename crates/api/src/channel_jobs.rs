@@ -1160,12 +1160,14 @@ async fn generated_publication_preflight(
     Ok(false)
 }
 
-/// Always release the fresh browser context after a resumed account has
-/// completed identity verification and its one typed operation. The runner's
-/// idle reaper remains the fallback if this process dies mid-request.
+/// Close through persisted, generation-pinned ownership after identity
+/// verification and the typed operation. Lost disposal retains the account gate.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_and_close(
     bridge: &crate::browser_bridge::BrowserBridge,
+    service: &crate::channels::ChannelService,
+    scope: &TenantScope,
     session: Uuid,
     expected_identity: Option<&str>,
     attempt_id: Uuid,
@@ -1174,6 +1176,8 @@ pub(crate) async fn execute_and_close(
 ) -> Result<crate::browser_bridge::BrowserExecution, AppError> {
     execute_and_close_with_cleanup(
         bridge,
+        service,
+        scope,
         session,
         expected_identity,
         attempt_id,
@@ -1184,8 +1188,11 @@ pub(crate) async fn execute_and_close(
     .0
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_and_close_with_cleanup(
     bridge: &crate::browser_bridge::BrowserBridge,
+    service: &crate::channels::ChannelService,
+    scope: &TenantScope,
     session: Uuid,
     expected_identity: Option<&str>,
     attempt_id: Uuid,
@@ -1197,6 +1204,8 @@ pub(crate) async fn execute_and_close_with_cleanup(
 ) {
     execute_and_close_with_cleanup_and_ticket(
         bridge,
+        service,
+        scope,
         session,
         expected_identity,
         attempt_id,
@@ -1238,8 +1247,11 @@ async fn retain_browser_renewal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_and_close_with_cleanup_and_ticket(
     bridge: &crate::browser_bridge::BrowserBridge,
+    service: &crate::channels::ChannelService,
+    scope: &TenantScope,
     session: Uuid,
     expected_identity: Option<&str>,
     attempt_id: Uuid,
@@ -1277,10 +1289,10 @@ async fn execute_and_close_with_cleanup_and_ticket(
     if let Some((service, scope, version)) = context.renewal.as_mut() {
         retain_browser_renewal(bridge, session, service, scope, version).await;
     }
-    let closed = bridge.close(session).await.is_ok();
+    let closed = service.close_owned_browser(scope, session).await.is_ok();
     if !closed {
         // A successful external result is still evidence if cleanup fails.
-        // The runner owns a bounded idle reaper as the crash/outage fallback.
+        // Ownership remains durable for proof-based reconciliation.
         tracing::warn!("browser execution session cleanup failed");
     }
     (result, closed)
@@ -1690,9 +1702,8 @@ pub async fn execute_channel_target(
     let result =
         execute_reserved_channel_target(state, scope, target_id, planned, reservation_id, bridge)
             .await;
-    // A claimed unknown (including a lost runner response) may still be in
-    // flight remotely. Keep the reservation until expiry so another target
-    // cannot start the same account while the runner's deadline elapses.
+    // Legacy release only removes unsent preflight reservations. Once attached
+    // to browser ownership, only exact generation-pinned disposal can release it.
     let release = match &result {
         Ok(ChannelDispatchResult::Executed(view)) => view
             .attempts
@@ -1819,14 +1830,27 @@ async fn execute_reserved_channel_target(
     // publication or measurement is sent before the durable claim. This also
     // checks runner/cipher/session availability without consuming the attempt.
     let attempt_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
     let opened = if planned.target.input.is_publication() {
         service
-            .resume_available_browser_bound(scope, account.account_id, attempt_id)
+            .resume_available_browser_bound_reserved(
+                scope,
+                account.account_id,
+                attempt_id,
+                session_id,
+                reservation_id,
+            )
             .await
             .map(|(session, binding, version)| (session, Some(binding), version))
     } else {
         service
-            .resume_available_browser_with_renewal(scope, account.account_id)
+            .resume_available_browser_with_renewal_id_reserved(
+                scope,
+                account.account_id,
+                session_id,
+                reservation_id,
+                geo_domain::BrowserOperationPurpose::Measure,
+            )
             .await
             .map(|(session, version)| (session, None, version))
     };
@@ -1841,11 +1865,15 @@ async fn execute_reserved_channel_target(
                     | ErrorCode::DependencyUnavailable
             ) =>
         {
+            let _ = service.close_owned_browser(scope, session_id).await;
             return Ok(ChannelDispatchResult::Deferred(
                 ChannelDispatchDeferred::AccountUnavailable,
             ));
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            let _ = service.close_owned_browser(scope, session_id).await;
+            return Err(error);
+        }
     };
     let identity = bridge.complete(session).await;
     let verified = matches!(
@@ -1853,7 +1881,7 @@ async fn execute_reserved_channel_target(
         Ok(ref result) if Some(result.identity.platform_account_id.as_str()) == account.platform_account_id.as_deref()
     );
     if !verified {
-        if bridge.close(session).await.is_err() {
+        if service.close_owned_browser(scope, session).await.is_err() {
             tracing::warn!("browser preflight session cleanup failed");
         }
         return Ok(ChannelDispatchResult::Deferred(
@@ -1865,7 +1893,7 @@ async fn execute_reserved_channel_target(
             .persist_browser_renewal(scope, &mut session_version, identity)
             .await
     {
-        let _ = bridge.close(session).await;
+        let _ = service.close_owned_browser(scope, session).await;
         return Err(error);
     }
     let (target, attempt) = match repo
@@ -1874,7 +1902,7 @@ async fn execute_reserved_channel_target(
     {
         Ok(claimed) => claimed,
         Err(error) => {
-            if bridge.close(session).await.is_err() {
+            if service.close_owned_browser(scope, session).await.is_err() {
                 tracing::warn!("browser preflight session cleanup failed");
             }
             return Err(error);
@@ -2031,7 +2059,7 @@ async fn execute_reserved_channel_target(
             }
             .await;
             retain_browser_renewal(bridge, session, service, scope, &mut session_version).await;
-            if bridge.close(session).await.is_err() {
+            if service.close_owned_browser(scope, session).await.is_err() {
                 tracing::warn!("browser execution session cleanup failed");
             }
             return result;
@@ -2067,6 +2095,8 @@ async fn execute_reserved_channel_target(
         execution_started = true;
         execute_and_close_with_cleanup_and_ticket(
             bridge,
+            service,
+            scope,
             session,
             account.platform_account_id.as_deref(),
             attempt.attempt_id,
@@ -2082,7 +2112,7 @@ async fn execute_reserved_channel_target(
         .0
     }
     .await;
-    if !execution_started && bridge.close(session).await.is_err() {
+    if !execution_started && service.close_owned_browser(scope, session).await.is_err() {
         tracing::warn!("browser execution session cleanup failed");
     }
     let received_at = Utc::now();
@@ -2286,6 +2316,8 @@ mod tests {
         fail: Option<&'static str>,
     }
 
+    const GENERATION: &str = "5ce59c3b-27b9-4fdc-bc95-fbb5a22ac7cc";
+
     async fn runner_stub(
         State(state): State<RunnerStub>,
         method: Method,
@@ -2294,6 +2326,24 @@ mod tests {
     ) -> (StatusCode, Json<serde_json::Value>) {
         let path = uri.path();
         state.calls.lock().await.push(format!("{method} {path}"));
+        if path == "/v1/lifecycle" {
+            return (StatusCode::OK, Json(json!({"generation": GENERATION})));
+        }
+        if path.ends_with("/dispose") {
+            let Json(input) = payload.unwrap();
+            assert_eq!(input["expected_generation"], GENERATION);
+            let session = path
+                .strip_prefix("/v1/sessions/")
+                .unwrap()
+                .strip_suffix("/dispose")
+                .unwrap();
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "session_id":session,"generation":GENERATION,"state":"disposed"
+                })),
+            );
+        }
         if state.fail == Some("start") && method == Method::POST && path == "/v1/sessions" {
             return (StatusCode::OK, Json(json!({"invalid":"start response"})));
         }
@@ -2338,9 +2388,44 @@ mod tests {
             );
         }
         if method == Method::POST && path == "/v1/sessions" {
-            return (StatusCode::OK, Json(json!({"invalid":"start response"})));
+            let Json(input) = payload.unwrap();
+            assert_eq!(input["expected_generation"], GENERATION);
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "session_id":input["session_id"],"generation":GENERATION
+                })),
+            );
         }
         (StatusCode::OK, Json(json!({"closed":true})))
+    }
+
+    fn owned_test_service(
+        bridge: &crate::browser_bridge::BrowserBridge,
+    ) -> crate::channels::ChannelService {
+        crate::channels::ChannelService::development()
+            .with_browser(bridge.clone())
+            .with_operation_repository(Arc::new(geo_domain::MemoryChannelJobRepository::default()))
+    }
+
+    async fn open_test_browser(
+        service: &crate::channels::ChannelService,
+        scope: &TenantScope,
+        session: Uuid,
+    ) {
+        service
+            .open_execution_browser(
+                scope,
+                Uuid::new_v4(),
+                session,
+                geo_domain::BrowserOperationPurpose::Measure,
+                None,
+                "kimi",
+                None,
+                &json!({"cookies":[],"origins":[]}),
+            )
+            .await
+            .unwrap();
     }
 
     async fn stub_bridge(
@@ -2376,7 +2461,7 @@ mod tests {
     async fn execution_retains_renewal_without_losing_results_when_post_send_capture_fails() {
         for fail in [None, Some("post_complete")] {
             let (bridge, calls, server) = stub_bridge(fail).await;
-            let service = crate::channels::ChannelService::development();
+            let service = owned_test_service(&bridge);
             let scope = TenantScope::new(
                 Uuid::new_v4().into(),
                 Uuid::new_v4().into(),
@@ -2419,8 +2504,11 @@ mod tests {
                 .await
                 .unwrap();
             let session = Uuid::new_v4();
+            open_test_browser(&service, &scope, session).await;
             let (result, closed) = execute_and_close_with_cleanup_and_ticket(
                 &bridge,
+                &service,
+                &scope,
                 session,
                 Some("verified-id"),
                 Uuid::new_v4(),
@@ -2460,7 +2548,14 @@ mod tests {
     async fn closes_execution_context_after_success_identity_mismatch_and_errors() {
         for fail in [None, Some("complete"), Some("execute")] {
             let (bridge, calls, server) = stub_bridge(fail).await;
+            let service = owned_test_service(&bridge);
+            let scope = TenantScope::new(
+                Uuid::new_v4().into(),
+                Uuid::new_v4().into(),
+                Some(Uuid::new_v4().into()),
+            );
             let session = Uuid::new_v4();
+            open_test_browser(&service, &scope, session).await;
             let expected = if fail.is_none() {
                 Some("different-id")
             } else {
@@ -2468,6 +2563,8 @@ mod tests {
             };
             let result = execute_and_close(
                 &bridge,
+                &service,
+                &scope,
                 session,
                 expected,
                 Uuid::new_v4(),
@@ -2479,7 +2576,7 @@ mod tests {
             let calls = calls.lock().await.clone();
             assert_eq!(
                 calls.last().unwrap(),
-                &format!("DELETE /v1/sessions/{session}")
+                &format!("POST /v1/sessions/{session}/dispose")
             );
             if fail == Some("complete") || fail.is_none() {
                 assert!(!calls.iter().any(|call| call == "POST /v1/executions"));
@@ -2487,9 +2584,18 @@ mod tests {
             server.abort();
         }
         let (bridge, calls, server) = stub_bridge(None).await;
+        let service = owned_test_service(&bridge);
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
         let session = Uuid::new_v4();
+        open_test_browser(&service, &scope, session).await;
         let completed = execute_and_close(
             &bridge,
+            &service,
+            &scope,
             session,
             Some("verified-id"),
             Uuid::new_v4(),
@@ -2500,7 +2606,7 @@ mod tests {
         assert_eq!(completed.unwrap().status, "unsupported");
         assert_eq!(
             calls.lock().await.last().unwrap(),
-            &format!("DELETE /v1/sessions/{session}")
+            &format!("POST /v1/sessions/{session}/dispose")
         );
         server.abort();
     }
@@ -2508,11 +2614,31 @@ mod tests {
     #[tokio::test]
     async fn failed_start_with_possible_remote_context_is_closed() {
         let (bridge, calls, server) = stub_bridge(Some("start")).await;
+        let service = owned_test_service(&bridge);
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
         let session = Uuid::new_v4();
-        assert!(bridge.start(session, "zhihu", None, None).await.is_err());
+        assert!(
+            service
+                .open_execution_browser(
+                    &scope,
+                    Uuid::new_v4(),
+                    session,
+                    geo_domain::BrowserOperationPurpose::Publish,
+                    None,
+                    "zhihu",
+                    None,
+                    &json!({}),
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(
             calls.lock().await.last().unwrap(),
-            &format!("DELETE /v1/sessions/{session}")
+            &format!("POST /v1/sessions/{session}/dispose")
         );
         server.abort();
     }
@@ -2664,6 +2790,7 @@ mod tests {
             operations: vec!["publish".into()],
             login_entry_available: None,
             login_supported: None,
+            model_discovery_supported: false,
             verified: true,
         };
         assert!(!rich_runner_operation_available(

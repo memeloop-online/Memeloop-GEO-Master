@@ -1,5 +1,6 @@
 mod agent_dispatch;
 mod bootstrap;
+mod browser_operation_dispatch;
 mod channels;
 mod config;
 mod content_dispatch;
@@ -215,6 +216,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         content_dispatch::spawn(state.clone(), scanner, cycles);
     }
     dispatch::spawn(state.clone());
+    browser_operation_dispatch::spawn(state.clone());
     content_request_dispatch::spawn(state.clone());
     let app: Router = router(state);
     let listener = TcpListener::bind(config.bind_addr).await?;

@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::State,
-    http::{Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -46,8 +46,11 @@ async fn mock_runner(
     State(runner): State<Runner>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
     payload: Option<Json<Value>>,
 ) -> Response {
+    assert_eq!(headers["authorization"], "Bearer fixture-token");
+    const GENERATION: &str = "5ce59c3b-27b9-4fdc-bc95-fbb5a22ac7cc";
     if method == Method::POST
         && uri.path() == "/v1/executions"
         && matches!(runner.failure, RunnerFailure::LostReceipt)
@@ -75,6 +78,7 @@ async fn mock_runner(
             .into_response();
     }
     match (method.as_str(), uri.path()) {
+        ("GET", "/v1/lifecycle") => (StatusCode::OK, Json(json!({"generation": GENERATION}))),
         ("GET", "/v1/capabilities") => (
             StatusCode::OK,
             Json(json!({"connectors":[{
@@ -83,12 +87,36 @@ async fn mock_runner(
                 "operations":["publish","lookup"],"verified":false
             }]})),
         ),
-        ("POST", "/v1/sessions") => (
-            StatusCode::OK,
-            Json(json!({
-                "session_id":payload.unwrap().0["session_id"]
-            })),
-        ),
+        ("POST", "/v1/sessions") => {
+            let input = payload.unwrap().0;
+            assert_eq!(input["expected_generation"], GENERATION);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "session_id":input["session_id"],"generation":GENERATION
+                })),
+            )
+        }
+        ("POST", path) if path.ends_with("/dispose") => {
+            assert_eq!(payload.unwrap().0["expected_generation"], GENERATION);
+            if runner.sends.load(Ordering::SeqCst) > 0 {
+                // An ambiguous accepted execution remains busy, including a
+                // lost receipt. No disposal proof is issued for this case.
+                (StatusCode::CONFLICT, Json(json!({"error":"busy"})))
+            } else {
+                let session = path
+                    .strip_prefix("/v1/sessions/")
+                    .unwrap()
+                    .strip_suffix("/dispose")
+                    .unwrap();
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "session_id":session,"generation":GENERATION,"state":"disposed"
+                    })),
+                )
+            }
+        }
         ("POST", "/v1/executions") => {
             runner.sends.fetch_add(1, Ordering::SeqCst);
             (
@@ -386,7 +414,7 @@ async fn duplicated_dispatch_sends_once_and_unknown_is_never_retried() {
     assert!(view.attempts[0].outcome.as_ref().unwrap().fixture);
     assert_eq!(sends.load(Ordering::SeqCst), 1);
     // Unknown may mean the remote request outlived our response; retain the
-    // account reservation for its bounded deadline, without retrying target.
+    // account ownership until confirmed disposal, without retrying target.
     let now = Utc::now();
     assert!(
         repo.reserve_account(

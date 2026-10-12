@@ -11,6 +11,8 @@ pub use appearance::{
 mod auth;
 mod channel_jobs;
 pub use channel_jobs::*;
+mod browser_operations;
+pub use browser_operations::*;
 mod citation_insights;
 pub use citation_insights::*;
 mod serp;

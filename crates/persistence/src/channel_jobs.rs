@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PgChannelJobRepository {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl PgChannelJobRepository {
@@ -577,7 +577,8 @@ impl ChannelJobRepository for PgChannelJobRepository {
              (operator_id,account_id,reservation_id,expires_at) VALUES ($1,$2,$3,$4) \
              ON CONFLICT (operator_id,account_id) DO UPDATE \
                SET reservation_id=EXCLUDED.reservation_id,expires_at=EXCLUDED.expires_at \
-             WHERE channel_account_preflight_reservations.expires_at <= $5",
+             WHERE channel_account_preflight_reservations.expires_at <= $5 \
+               AND channel_account_preflight_reservations.browser_operation_id IS NULL",
         )
         .bind(scope.operator_id.as_uuid())
         .bind(account_id)
@@ -602,7 +603,8 @@ impl ChannelJobRepository for PgChannelJobRepository {
         project(scope)?;
         sqlx::query(
             "DELETE FROM channel_account_preflight_reservations \
-             WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3",
+             WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3 \
+               AND browser_operation_id IS NULL",
         )
         .bind(scope.operator_id.as_uuid())
         .bind(account_id)
