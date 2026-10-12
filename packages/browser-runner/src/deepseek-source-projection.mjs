@@ -46,6 +46,13 @@ const eventFields = {
   hint: ["content", "type", "clear_response", "finish_reason"],
   update_session: ["updated_at"],
 };
+// These first-party events are outside the delta parser. Their opaque debug,
+// prior-message and file metadata is not answer evidence or safe to retain.
+const omittedAuxiliaryEvents = new Set([
+  "debug",
+  "update_parent_message",
+  "update_file",
+]);
 const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const fragmentFieldShape = {
@@ -288,21 +295,38 @@ export function projectDeepseekSource(exchange) {
       if (
         !object(message) ||
         Object.keys(message).some(
-          (key) => !["event", "data", "raw_data"].includes(key),
+          (key) => !["event", "data", "raw_data", "id"].includes(key),
         )
       )
         reject();
       const event = message.event ?? "";
       if (typeof event !== "string") reject();
+      const result = { ...message };
+      if (Object.hasOwn(message, "id")) {
+        if (typeof message.id !== "string") reject();
+        // SSE transport IDs are not provider message IDs. Omit them entirely;
+        // they cannot establish ownership or contribute to semantic evidence.
+        delete result.id;
+        omit(pointer(at, "id"));
+      }
+      if (omittedAuxiliaryEvents.has(event)) {
+        if (
+          !Object.hasOwn(message, "data") ||
+          Object.hasOwn(message, "raw_data")
+        )
+          reject();
+        delete result.data;
+        omit(pointer(at, "data"));
+        return result;
+      }
       if (event === "" || event === "message" || event === "delta") {
         if (Object.hasOwn(message, "raw_data")) reject();
         return {
-          ...message,
+          ...result,
           data: delta(message.data, scope, "", pointer(at, "data"), 0),
         };
       }
       if (!Object.hasOwn(eventFields, event)) reject();
-      const result = { ...message };
       if (Object.hasOwn(message, "raw_data")) {
         // Opaque finish data is not AI evidence. Do not inspect it for a
         // completion claim or silently preserve a possible reasoning payload.

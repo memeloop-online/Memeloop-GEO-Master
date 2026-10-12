@@ -451,6 +451,26 @@ pub(crate) fn deepseek_recovery_document(
     ))
 }
 
+/// Original transport only: history never supplies absent message identifiers
+/// or terminal events for recovery scheduling.
+pub(crate) fn deepseek_recovery_binding(source: &Value) -> Option<(&str, u64, u64)> {
+    if source.get("lifecycle").is_some() {
+        return None;
+    }
+    let (chat_id, model) = deepseek_ownership(source.get("ownership")?)?;
+    let ready = source["messages"]
+        .as_array()?
+        .iter()
+        .find(|message| message["event"] == "ready")?;
+    let request_id = deepseek_message_id(&ready["data"]["request_message_id"])?;
+    let response_id = deepseek_message_id(&ready["data"]["response_message_id"])?;
+    if request_id == response_id {
+        return None;
+    }
+    deepseek_stream_complete(source, model, request_id, response_id)?;
+    Some((chat_id, request_id, response_id))
+}
+
 fn deepseek_completion_inventory<'a>(
     document: &'a Value,
     chat_id: &str,
@@ -464,6 +484,26 @@ fn deepseek_completion_inventory<'a>(
     {
         return None;
     }
+    deepseek_stream_complete(
+        document,
+        lifecycle.model,
+        lifecycle.request_id,
+        lifecycle.response_id,
+    )?;
+    let mut inventory: MessageInventory<'a> = vec![
+        (Cow::Owned(lifecycle.request_id.to_string()), "user"),
+        (Cow::Owned(lifecycle.response_id.to_string()), "assistant"),
+    ];
+    inventory.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    Some(inventory)
+}
+
+fn deepseek_stream_complete(
+    document: &Value,
+    model_name: &str,
+    request_id: u64,
+    response_id: u64,
+) -> Option<()> {
     let mut ready = false;
     let mut finished = false;
     let messages = document.get("messages")?.as_array()?;
@@ -501,15 +541,14 @@ fn deepseek_completion_inventory<'a>(
         if event == "ready" {
             if ready
                 || finished
-                || data.get("request_message_id").and_then(deepseek_message_id)
-                    != Some(lifecycle.request_id)
+                || data.get("request_message_id").and_then(deepseek_message_id) != Some(request_id)
                 || data
                     .get("response_message_id")
                     .and_then(deepseek_message_id)
-                    != Some(lifecycle.response_id)
-                || data.get("model_type").is_some_and(|model| {
-                    !model.is_null() && model.as_str() != Some(lifecycle.model)
-                })
+                    != Some(response_id)
+                || data
+                    .get("model_type")
+                    .is_some_and(|model| !model.is_null() && model.as_str() != Some(model_name))
             {
                 return None;
             }
@@ -521,12 +560,7 @@ fn deepseek_completion_inventory<'a>(
     if !ready || !finished {
         return None;
     }
-    let mut inventory: MessageInventory<'a> = vec![
-        (Cow::Owned(lifecycle.request_id.to_string()), "user"),
-        (Cow::Owned(lifecycle.response_id.to_string()), "assistant"),
-    ];
-    inventory.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-    Some(inventory)
+    Some(())
 }
 
 #[cfg(test)]
