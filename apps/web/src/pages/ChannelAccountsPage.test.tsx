@@ -429,34 +429,66 @@ describe("persisted queue remote login adapter", () => {
   it("keeps direct login reserved while active lookup is deferred and after the queue is restored", async () => {
     const fixture = withQueue();
     const original = fixture.fetchMock.getMockImplementation()!;
-    let release!: () => void;
+    const pendingResponses = new Map<string, () => Promise<void>>();
+    const accountsPath = "/operator/channel-accounts";
+    const platformsPath = "/channel-platforms";
+    const lookupPath = "/operator/channel-login-queues/active";
     fixture.fetchMock.mockImplementation((request, init) => {
-      if (String(request).endsWith("/operator/channel-login-queues/active")) {
+      const dependency = [accountsPath, platformsPath, lookupPath].find(
+        (path) => String(request).endsWith(path),
+      );
+      if (dependency && (init?.method ?? "GET") === "GET") {
         return new Promise<Response>((resolve) => {
-          release = () => {
-            void original(request, init).then(resolve);
-          };
+          pendingResponses.set(dependency, () =>
+            original(request, init).then(resolve),
+          );
         });
       }
       return original(request, init);
     });
     renderOperator();
-    const relogin = await screen.findByRole("button", { name: "重新登录" });
+    await waitFor(() => expect(pendingResponses.size).toBe(3));
+    const accounts = within(screen.getByLabelText("总部共享账号"));
+    const onboarding = within(screen.getByLabelText("总部账号接入"));
+    expect(accounts.getByText("正在加载共享账号")).toBeVisible();
+    expect(accounts.queryByRole("button", { name: "重新登录" })).toBeNull();
+
+    // Authentication, accounts and catalog readiness are independent of the
+    // queue lookup. Do not spend the role-query deadline waiting for all three.
+    await act(async () => pendingResponses.get(accountsPath)!());
+    await accounts.findByText(account.display_name);
+    const relogin = accounts.getByRole("button", { name: "重新登录" });
     expect(relogin).toBeDisabled();
+    expect(onboarding.getByLabelText("正在加载平台")).toBeVisible();
     expect(
-      screen.getByRole("button", { name: "创建并登录总部账号" }),
-    ).toBeDisabled();
-    await act(async () => release());
+      onboarding.queryByRole("button", { name: "创建并登录总部账号" }),
+    ).toBeNull();
+
+    await act(async () => pendingResponses.get(platformsPath)!());
+    await onboarding.findByText("创建并登录总部账号");
+    const createLogin = onboarding.getByRole("button", {
+      name: "创建并登录总部账号",
+    });
+    expect(onboarding.getByRole("combobox", { name: "平台" })).toHaveValue(
+      account.platform,
+    );
+    // With the catalog loaded, only the pending queue reservation blocks login.
+    expect(relogin).toBeDisabled();
+    expect(createLogin).toBeDisabled();
+    await userEvent.click(relogin);
+    await userEvent.click(createLogin);
+
+    await act(async () => pendingResponses.get(lookupPath)!());
     await screen.findByText(/进行中/);
     expect(relogin).toBeDisabled();
-    expect(
-      screen.getByRole("button", { name: "创建并登录总部账号" }),
-    ).toBeDisabled();
+    expect(createLogin).toBeDisabled();
     await userEvent.click(relogin);
+    await userEvent.click(createLogin);
     expect(
       fixture.requests.some(
         (entry) =>
-          entry.method === "POST" && entry.path.endsWith("/login-sessions"),
+          entry.method === "POST" &&
+          entry.path.endsWith("/channel-login-sessions"),
       ),
     ).toBe(false);
   });
