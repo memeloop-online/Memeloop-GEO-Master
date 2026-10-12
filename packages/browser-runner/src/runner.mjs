@@ -6,6 +6,7 @@ import { parseExtractionJson } from "./ai-observation-parser.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
 import { cleanupDiagnostic } from "./provider-conversation-cleanup.mjs";
 import { providerCleanupAdapter } from "./provider-cleanup-registry.mjs";
+import { providerCompletionRecoveryAdapter } from "./provider-completion-recovery.mjs";
 import {
   stageRichPublication,
   executeAuthorizedRichPublication,
@@ -1181,6 +1182,157 @@ export function createRunner(options = {}) {
     return promise;
   }
 
+  async function recoverConversationCompletion(sessionId, input) {
+    if (
+      !validId(sessionId) ||
+      !fields(input, [
+        "execution_id",
+        "expected_identity",
+        "external_conversation_id",
+        "request_message_id",
+        "response_message_id",
+      ]) ||
+      typeof input.execution_id !== "string" ||
+      !UUID.test(input.execution_id) ||
+      !fields(input.expected_identity, ["provider", "platform_account_id"]) ||
+      !providerCompletionRecoveryAdapter(input.expected_identity.provider) ||
+      !validId(input.expected_identity.platform_account_id) ||
+      !providerCompletionRecoveryAdapter(
+        input.expected_identity.provider,
+      ).validScope(input)
+    )
+      throw new RunnerError(400, "invalid_completion_recovery");
+    const fingerprint = createHash("sha256")
+      .update(
+        JSON.stringify({
+          completion_recovery_session_id: sessionId,
+          execution_id: input.execution_id,
+          provider: input.expected_identity.provider,
+          platform_account_id: input.expected_identity.platform_account_id,
+          external_conversation_id: input.external_conversation_id,
+          request_message_id: input.request_message_id,
+          response_message_id: input.response_message_id,
+        }),
+      )
+      .digest("hex");
+    const previous = executions.get(input.execution_id);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint)
+        throw new RunnerError(409, "execution_conflict");
+      return previous.promise;
+    }
+    const record = session(sessionId);
+    const reply = (status, stage, code) => ({
+      execution_id: input.execution_id,
+      external_conversation_id: input.external_conversation_id,
+      status,
+      ...(stage ? { diagnostic: { stage, code } } : {}),
+    });
+    const adapter = providerCompletionRecoveryAdapter(record.platform);
+    if (!adapter || record.platform !== input.expected_identity.provider)
+      return reply("retained", "scope", "unsupported_platform");
+    if (!record.completed)
+      return reply("needs_login", "identity", "reauth_required");
+    if (record.busy) throw new RunnerError(409, "session_busy");
+    record.busy = true;
+    const entry = { fingerprint, promise: null, settledAt: null };
+    const deadlineAt = performance.now() + Math.min(60_000, executionTimeoutMs);
+    const expired = () => performance.now() >= deadlineAt;
+    const deadlineReply = () =>
+      reply("unknown", "deadline", "deadline_exceeded");
+    const page = {
+      async evaluate(fn, args) {
+        if (expired()) throw new Error("recovery_deadline");
+        return record.page.evaluate(fn, args);
+      },
+      async evaluateHandle(fn, args) {
+        if (expired()) throw new Error("recovery_deadline");
+        return record.page.evaluateHandle(fn, args);
+      },
+      url: () => record.page.url(),
+      mainFrame: () => record.page.mainFrame(),
+      isClosed: () => record.page.isClosed(),
+      on: (event, listener) => record.page.on(event, listener),
+      off: (event, listener) => record.page.off(event, listener),
+    };
+    const identityFailure = (identity) => {
+      if (!validateIdentity(identity))
+        return reply("needs_login", "identity", "reauth_required");
+      if (
+        identity.platform_account_id !==
+          input.expected_identity.platform_account_id ||
+        identity.platform_account_id !== record.identity?.platform_account_id
+      )
+        return reply("retained", "identity", "account_mismatch");
+      return null;
+    };
+    let timer;
+    const work = (async () => {
+      try {
+        const identity = await record.adapter.identify(page);
+        if (expired()) return deadlineReply();
+        const failure = identityFailure(identity);
+        if (failure) return failure;
+        const result = await adapter.read(page, input, {
+          timeoutMs: Math.max(
+            1,
+            Math.min(12_000, Math.floor(deadlineAt - performance.now())),
+          ),
+        });
+        if (expired()) return deadlineReply();
+        if (!result)
+          return reply("retained", "history", "completion_unverified");
+        // Recheck independently after the read: login drift cannot promote
+        // history observed under another account into recovery evidence.
+        const finalIdentity = await record.adapter.identify(page);
+        if (expired()) return deadlineReply();
+        const finalFailure = identityFailure(finalIdentity);
+        if (finalFailure) return finalFailure;
+        const historyJson = JSON.stringify(result.history);
+        return {
+          ...reply("recovered"),
+          recovery_identity: {
+            provider: record.platform,
+            platform_account_id: identity.platform_account_id,
+          },
+          observed_at: result.history.observed_at,
+          history_json: historyJson,
+          history_sha256: createHash("sha256")
+            .update(historyJson)
+            .digest("hex"),
+        };
+      } catch {
+        return expired()
+          ? deadlineReply()
+          : reply("unknown", "runner", "transport_unknown");
+      } finally {
+        clearTimeout(timer);
+        record.busy = false;
+        record.lastTouched = clock();
+        entry.settledAt = clock();
+      }
+    })();
+    entry.promise = Promise.race([
+      work,
+      new Promise((resolve) => {
+        const expire = () => {
+          const remaining = deadlineAt - performance.now();
+          if (remaining > 0) {
+            timer = setTimeout(expire, Math.max(1, Math.ceil(remaining)));
+            return;
+          }
+          resolve(deadlineReply());
+        };
+        timer = setTimeout(
+          expire,
+          Math.max(1, Math.ceil(deadlineAt - performance.now())),
+        );
+      }),
+    ]);
+    executions.set(input.execution_id, entry);
+    return entry.promise;
+  }
+
   async function cleanupConversation(sessionId, input, authorizeDeletion) {
     if (
       !validId(sessionId) ||
@@ -1432,6 +1584,7 @@ export function createRunner(options = {}) {
     execute,
     executeRich,
     cleanupConversation,
+    recoverConversationCompletion,
     close,
     lifecycle: () => ({ generation }),
     disposeSession,

@@ -4,11 +4,11 @@ use geo_domain::{
     ChannelTargetInput, ConversationCorrelation, ErrorCode, ObservationCaptureInput,
     ObservationCaptureRepository, ObservationCaptureSnapshot, ObservationCompletionRecoveryInput,
     ObservationCompletionRecoveryRepository, ObservationProviderIdentity,
-    StandaloneMeasurementPlan, TenantScope, sha256_hex,
+    ProviderConversationCleanupRepository, StandaloneMeasurementPlan, TenantScope, sha256_hex,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgChannelJobRepository, PgObservationCaptureRepository,
-    PgObservationCompletionRecoveryRepository,
+    PgObservationCompletionRecoveryRepository, PgProviderConversationCleanupRepository,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -162,7 +162,92 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
         history_json,
     };
     let store = PgObservationCompletionRecoveryRepository::from_database(&database);
+    assert!(
+        store
+            .get_by_source(&scope, original.capture_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let cleanup = PgProviderConversationCleanupRepository::from_database(&database);
+    let cleanup_id = cleanup.enqueue(&scope, original.capture_id).await.unwrap();
+    // A sidecar cannot bypass a still-running original operation.
+    assert!(cleanup.claim(&scope, cleanup_id).await.unwrap().is_none());
+    sqlx::query("UPDATE channel_execution_attempts SET outcome='{\"status\":\"unknown\"}',received_at=now() WHERE attempt_id=$1")
+        .bind(attempt).execute(database.pool()).await.unwrap();
+    let claim = cleanup.claim(&scope, cleanup_id).await.unwrap().unwrap();
+    assert!(claim.retained_message_inventory_sha256.is_none());
+    let reservation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO channel_account_preflight_reservations \
+         (operator_id,account_id,reservation_id,expires_at) VALUES ($1,$2,$3,now()+interval '2 minutes')",
+    ).bind(operator).bind(account).bind(reservation_id)
+        .execute(database.pool()).await.unwrap();
+    assert!(
+        cleanup
+            .authorize_delete(&scope, cleanup_id, claim.lease_id, reservation_id)
+            .await
+            .is_err()
+    );
     let receipt = store.save(&scope, input.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .get_by_source(&scope, original.capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .receipt,
+        receipt
+    );
+    assert!(
+        store
+            .get_by_source(&scope, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        cleanup
+            .authorize_delete(&scope, cleanup_id, claim.lease_id, Uuid::new_v4())
+            .await
+            .is_err()
+    );
+    let authorized = cleanup
+        .authorize_delete(&scope, cleanup_id, claim.lease_id, reservation_id)
+        .await
+        .unwrap();
+    assert_eq!(authorized.capture_id, original.capture_id);
+    assert_eq!(
+        authorized.original_runner_session_id,
+        Some(original.runner_session_id)
+    );
+    assert_eq!(
+        authorized.retained_message_inventory_sha256,
+        Some(sha256_hex(br#"[["1","user"],["2","assistant"]]"#))
+    );
+    cleanup
+        .finish(
+            &scope,
+            cleanup_id,
+            claim.lease_id,
+            geo_domain::ProviderCleanupOutcome::Failed,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE provider_conversation_cleanup SET next_attempt_at=now() WHERE cleanup_id=$1",
+    )
+    .bind(cleanup_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim = cleanup.claim(&scope, cleanup_id).await.unwrap().unwrap();
+    assert_eq!(
+        claim.retained_message_inventory_sha256,
+        authorized.retained_message_inventory_sha256
+    );
+    assert_eq!(claim.capture_id, original.capture_id);
+    assert!(!claim.has_prior_delete_attempt);
     assert_eq!(store.save(&scope, input.clone()).await.unwrap(), receipt);
     let other_scope = TenantScope::new(operator.into(), tenant.into(), Some(other_project.into()));
     let no_project = TenantScope::new(operator.into(), tenant.into(), None);
@@ -171,6 +256,13 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
         TenantScope::new(Uuid::new_v4().into(), tenant.into(), Some(project.into())),
         TenantScope::new(operator.into(), Uuid::new_v4().into(), Some(project.into())),
     ] {
+        assert!(
+            store
+                .get_by_source(&wrong_scope, original.capture_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             store
                 .get(&wrong_scope, input.recovery_id)
@@ -278,6 +370,18 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
             .unwrap_err()
             .code,
         ErrorCode::Internal
+    );
+    assert!(
+        store
+            .get_by_source(&scope, original.capture_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        cleanup
+            .authorize_delete(&scope, cleanup_id, claim.lease_id, reservation_id)
+            .await
+            .is_err()
     );
     drop(store);
     let restarted_database = Database::connect_and_migrate(&config).await.unwrap();

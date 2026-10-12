@@ -176,6 +176,47 @@ pub struct ObservationCompletionRecovery {
     pub receipt: ObservationCompletionRecoveryReceipt,
 }
 
+impl ObservationCompletionRecovery {
+    pub fn validate(
+        &self,
+        scope: &TenantScope,
+        original: &ObservationCapture,
+    ) -> Result<ValidatedObservationCompletionRecovery, AppError> {
+        let evidence = self.input.validate(scope, original)?;
+        if self.receipt.schema_version != 1
+            || self.receipt.recovery_id != self.input.recovery_id
+            || self.receipt.digest_sha256 != evidence.digest_sha256()
+        {
+            return Err(AppError::invalid_request(
+                "invalid completion recovery receipt",
+            ));
+        }
+        Ok(evidence)
+    }
+}
+
+impl ObservationCapture {
+    /// Resolve retained inventory without changing the immutable original or
+    /// granting deletion authority. The caller must independently enforce
+    /// ownership, account reservation, leases, and current remote inventory.
+    pub fn resolved_message_inventory_sha256(
+        &self,
+        scope: &TenantScope,
+        recovery: Option<&ObservationCompletionRecovery>,
+    ) -> Result<Option<String>, AppError> {
+        if let Some(inventory) = self.retained_message_inventory_sha256(scope) {
+            return Ok(Some(inventory));
+        }
+        recovery
+            .map(|recovery| {
+                recovery
+                    .validate(scope, self)
+                    .map(|evidence| evidence.retained_message_inventory_sha256().to_owned())
+            })
+            .transpose()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait ObservationCompletionRecoveryRepository: Send + Sync {
     async fn save(
@@ -188,6 +229,14 @@ pub trait ObservationCompletionRecoveryRepository: Send + Sync {
         &self,
         scope: &TenantScope,
         recovery_id: Uuid,
+    ) -> Result<Option<ObservationCompletionRecovery>, AppError>;
+
+    /// Latest retained recovery for this scoped original source. Implementations
+    /// must validate both immutable receipts before returning the evidence.
+    async fn get_by_source(
+        &self,
+        scope: &TenantScope,
+        source_capture_id: Uuid,
     ) -> Result<Option<ObservationCompletionRecovery>, AppError>;
 }
 
@@ -307,6 +356,54 @@ mod tests {
         assert_eq!(original, before);
         assert!(!original.has_complete_conversation_evidence(&scope));
         assert!(original.retained_message_inventory_sha256(&scope).is_none());
+    }
+
+    #[test]
+    fn inventory_resolution_requires_bound_sidecar_and_valid_receipt() {
+        let (scope, original, input) = fixture();
+        let before = original.clone();
+        let recovery = ObservationCompletionRecovery {
+            receipt: ObservationCompletionRecoveryReceipt {
+                recovery_id: input.recovery_id,
+                schema_version: 1,
+                digest_sha256: input
+                    .validate(&scope, &original)
+                    .unwrap()
+                    .digest_sha256()
+                    .into(),
+                stored_at: input.observed_at,
+            },
+            input,
+        };
+        assert_eq!(
+            original
+                .resolved_message_inventory_sha256(&scope, None)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            original
+                .resolved_message_inventory_sha256(&scope, Some(&recovery))
+                .unwrap(),
+            Some(digest(r#"[["1","user"],["2","assistant"]]"#))
+        );
+        for mutation in 0..6 {
+            let mut invalid = recovery.clone();
+            match mutation {
+                0 => invalid.receipt.recovery_id = Uuid::new_v4(),
+                1 => invalid.receipt.schema_version = 2,
+                2 => invalid.receipt.digest_sha256 = "0".repeat(64),
+                3 => invalid.input.source_capture_id = Uuid::new_v4(),
+                4 => invalid.input.scope.tenant_id = Uuid::new_v4().into(),
+                _ => invalid.input.source_receipt_sha256 = "0".repeat(64),
+            }
+            assert!(
+                original
+                    .resolved_message_inventory_sha256(&scope, Some(&invalid))
+                    .is_err()
+            );
+        }
+        assert_eq!(original, before);
     }
 
     #[test]
