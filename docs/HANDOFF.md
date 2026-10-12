@@ -7,7 +7,7 @@
 - 当前部署：API 源码 `52c6ec0`、Web `59d6781`、执行器 `8391fad`，三组件均 Ready。API 迁移 0052 成功，一次启动连接超时（5 秒）后自动恢复；执行器认证生命周期接口 HTTP 200、实例标识格式有效，旧实例已退出。精确镜像摘要与排空证据见 `WORKLOG.md`。
 - PR #16／#20／#21／#22／#23 均已合并、精确 CI 通过，相关模型发现、会话释放、代理库存和持久占用已随上述组件部署。持久占用覆盖两种登录及发现／测量／发布／查回／清理；接口与限制见 [`durable-browser-ownership.md`](durable-browser-ownership.md) 和 [`browser-disposal-receipts.md`](browser-disposal-receipts.md)。关闭不证明远端生成结束或远端会话删除，跨副本稳定路由与旧环境终止证明仍待完成。
 - 实际浏览器读回同一历史成功解析答案及六条引用，启动测量界面可见既有已登录账号与模型选项。菜单读回后持久占用账本有一条 `Discovery`／`Disposed` 记录，证明本次实际发现路径及确认资源释放，不证明新问题测量或远端对话删除。未发送新 AI 问题或发布；运营账号页仍缺角色，未提升权限，后台导入及供应商登录／恢复验收仍缺。
-- 固定网络绑定尚未部署、待提交及精确 CI：API 185/185、channels 16／派发 6／生成发布 10／测量执行 9（共 41 项）通过；领域 3 项、PostgreSQL 网络 1／占用 1／channels 3、界面 20+93 项及审查证据保留。追加 PostgreSQL 导入 1/1 与远端会话清理 1/1 已用 `--ignored` 实际执行通过，非跳过；领域／持久化／API 全目标严格 Clippy 与格式通过，见 [`account-network-bindings.md`](account-network-bindings.md)。
+- 固定网络绑定 PR #24 的精确提交 `348a25d` Linux／Windows 检查通过，已合入 `202b2cb`，尚未部署。API 185、相关集成 41、界面 20+93 项、实际 PostgreSQL 契约及严格 Clippy／格式通过；见 [`account-network-bindings.md`](account-network-bindings.md)。自动分配、顺序登录及真实出口检查独立待完成。
 - 导入已支持 CSV／粘贴／逐条添加、逐行加密、幂等读回和失败行重试；持久顺序登录、经验证的自动填表、代理自动分配及真实不同出口检查仍未实现。后台拒绝访问不等于这些能力验收完成。
 - PR #9 `101deb0` 的 Linux 失败已定位到编辑器先输入无效 URL、再更新有效链接后的选区断言，独立修复中；Rust 阶段通过，Windows 与桌面检查成功，整体尚未通过。PR #9／#10／#11 继续独立交付，保留并发修改。
 
