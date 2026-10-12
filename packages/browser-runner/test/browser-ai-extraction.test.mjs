@@ -284,6 +284,36 @@ test("raw extraction is committed before DOM parsing even when JSON is malformed
   }
 });
 
+test("signed-in extraction selects Kimi lifecycle proof for its durable checkpoint", async () => {
+  const records = [];
+  const f = fixture({
+    responseChatId: "synthetic-extraction",
+    responseMessages: [
+      {
+        message: {
+          id: "synthetic-answer",
+          role: "assistant",
+          status: "COMPLETED",
+        },
+      },
+    ],
+  });
+  await extractWithSignedInBrowser(
+    f.page,
+    prompt,
+    options({
+      onEvidence: async (record) => records.push(record),
+    }),
+  );
+  assert.equal(records.length, 1);
+  assert.deepEqual(records[0].completion, {
+    protocol: "connect_json",
+    terminal: true,
+    assistant_message_ids: ["synthetic-answer"],
+  });
+  assert.equal(f.stats().sent, 1);
+});
+
 test("raw checkpoint failure blocks DOM and API fallback, including after browser deadline", async () => {
   for (const delayed of [false, true]) {
     let rejectWrite;
