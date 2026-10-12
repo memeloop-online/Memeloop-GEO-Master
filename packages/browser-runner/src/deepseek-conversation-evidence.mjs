@@ -1,5 +1,7 @@
 // Internal authenticated-runner metadata, never an AI-generated ownership claim.
 // Completion identifies a finished graph; it does not authorize deletion.
+import { sourceRedaction } from "./observation-source-redaction.mjs";
+
 const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const closed = (value, required, optional = []) =>
@@ -154,9 +156,19 @@ export function capturedConversationCompletion(exchange) {
   )
     return null;
   const { lifecycle } = exchange;
+  let omittedPaths = new Set();
+  if (Object.hasOwn(exchange, "source_redaction")) {
+    try {
+      const manifest = sourceRedaction(exchange.source_redaction, exchange);
+      omittedPaths = new Set(manifest.omitted_paths);
+      if (omittedPaths.size !== manifest.omitted_paths.length) return null;
+    } catch {
+      return null;
+    }
+  }
   let ready = false;
   let finished = false;
-  for (const envelope of exchange.messages) {
+  for (const [index, envelope] of exchange.messages.entries()) {
     if (
       !object(envelope) ||
       typeof envelope.event !== "string" ||
@@ -179,8 +191,13 @@ export function capturedConversationCompletion(exchange) {
         return null;
       ready = true;
     } else if (envelope.event === "finish") {
-      if (!ready || finished || typeof envelope.raw_data !== "string")
-        return null;
+      // The omitted payload remains opaque; only its observed event framing
+      // and an exact, validated omission declaration survive projection.
+      const finishPayload =
+        typeof envelope.raw_data === "string" ||
+        (!Object.hasOwn(envelope, "raw_data") &&
+          omittedPaths.has(`/messages/${index}/raw_data`));
+      if (!ready || finished || !finishPayload) return null;
       finished = true;
     } else if (
       (!envelope.event ||
