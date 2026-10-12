@@ -46,7 +46,11 @@ const accepted = (request: AccountImportRequest): AccountImportResult => ({
     ordinal,
   })),
 });
-function show() {
+function show(
+  onQueueSelection?: (
+    selection: import("../api/loginQueues").LoginQueueSelection,
+  ) => void,
+) {
   return render(
     <FluentProvider theme={webLightTheme}>
       <OperatorAccountImport
@@ -64,6 +68,7 @@ function show() {
         onChanged={onChanged}
         onLogin={onLogin}
         storageScope="synthetic-scope"
+        onQueueSelection={onQueueSelection}
       />
     </FluentProvider>,
   );
@@ -83,6 +88,49 @@ beforeEach(async () => {
   );
 });
 afterEach(() => cleanup());
+
+it("prepares explicit click order with the exact durable import row-account pairs", async () => {
+  const onQueueSelection = vi.fn();
+  vi.mocked(createAccountImport).mockResolvedValue({
+    import_key: "selected-import",
+    rows: [
+      {
+        ...result.rows[0],
+        row_key: "row-first",
+        account_id: "account-first",
+        ordinal: 0,
+      },
+      {
+        ...result.rows[0],
+        row_key: "row-second",
+        account_id: "account-second",
+        ordinal: 0,
+      },
+    ],
+  });
+  show(onQueueSelection);
+  prepare(
+    "username,password\nsynthetic-one,synthetic-secret\nsynthetic-two,synthetic-secret",
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Import prepared accounts" }),
+  );
+  const checkboxes = await screen.findAllByRole("checkbox", {
+    name: "Include in login order",
+  });
+  fireEvent.click(checkboxes[1]);
+  fireEvent.click(checkboxes[0]);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Use selected login order" }),
+  );
+  expect(onQueueSelection).toHaveBeenCalledExactlyOnceWith({
+    import_key: "selected-import",
+    items: [
+      { row_key: "row-second", account_id: "account-second" },
+      { row_key: "row-first", account_id: "account-first" },
+    ],
+  });
+});
 
 describe("operator account import", () => {
   it("imports without a password preview, clears credentials and opens existing login", async () => {

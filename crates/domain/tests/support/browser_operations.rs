@@ -75,12 +75,28 @@ pub async fn verify_login_commit(
             .await
             .is_err()
     );
+    assert!(
+        repo.get_browser_operation(&scope, operation.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .login_verified_at
+            .is_none()
+    );
     repo.mark_browser_start_requested(&scope, operation.operation_id, now)
         .await
         .unwrap();
     repo.save_owned_login_session(&scope, operation.operation_id, &storage, channels, now)
         .await
         .unwrap();
+    assert!(
+        repo.get_browser_operation(&scope, operation.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .login_verified_at
+            .is_some()
+    );
     let readback = channels
         .get_pool_account(operator, account_id)
         .await

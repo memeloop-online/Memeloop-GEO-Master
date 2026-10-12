@@ -523,7 +523,11 @@ fn semantic_search_projection_valid(proof: &serde_json::Value, outcome: &Channel
 
 #[async_trait]
 pub trait ChannelJobRepository:
-    crate::BrowserOperationRepository + crate::AccountNetworkBindingRepository + Send + Sync
+    crate::BrowserOperationRepository
+    + crate::AccountNetworkBindingRepository
+    + crate::OperatorLoginQueueRepository
+    + Send
+    + Sync
 {
     async fn replay_measurement_plan(
         &self,
@@ -808,9 +812,10 @@ pub fn frozen_cycle_inputs(
 #[derive(Default, Clone)]
 pub struct MemoryChannelJobRepository(
     Arc<Mutex<HashMap<ChannelScopeKey, MemoryCycle>>>,
-    Arc<Mutex<HashMap<AccountReservationKey, AccountReservation>>>,
-    Arc<Mutex<HashMap<Uuid, crate::BrowserOperation>>>,
-    Arc<Mutex<crate::account_networks::MemoryAccountNetworks>>,
+    pub(crate) Arc<Mutex<HashMap<AccountReservationKey, AccountReservation>>>,
+    pub(crate) Arc<Mutex<HashMap<Uuid, crate::BrowserOperation>>>,
+    pub(crate) Arc<Mutex<crate::account_networks::MemoryAccountNetworks>>,
+    pub(crate) Arc<Mutex<HashMap<Uuid, crate::OperatorLoginQueue>>>,
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1007,6 +1012,29 @@ impl crate::AccountNetworkBindingRepository for MemoryChannelJobRepository {
 
 #[async_trait]
 impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
+    async fn claim_browser_start(
+        &self,
+        scope: &crate::BrowserOperationScope,
+        id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<Option<crate::BrowserOperation>, AppError> {
+        let _gates = self.1.lock().await;
+        let mut operations = self.2.lock().await;
+        let op = operations
+            .get_mut(&id)
+            .ok_or_else(|| AppError::not_found("browser operation not found"))?;
+        if &op.scope != scope {
+            return Err(AppError::forbidden("browser ownership scope mismatch"));
+        }
+        if op.state == crate::BrowserOperationState::StartRequested {
+            return Ok(None);
+        }
+        if op.state != crate::BrowserOperationState::Prepared {
+            return Err(AppError::conflict("browser cannot start"));
+        }
+        op.transition(scope, crate::BrowserOperationTransition::Start, at)?;
+        Ok(Some(op.clone()))
+    }
     async fn get_account_browser_operation(
         &self,
         operator: crate::OperatorId,
@@ -1033,7 +1061,7 @@ impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
         at: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let gates = self.1.lock().await;
-        let operations = self.2.lock().await;
+        let mut operations = self.2.lock().await;
         let op = operations
             .get(&operation_id)
             .ok_or_else(|| AppError::not_found("browser operation not found"))?;
@@ -1046,7 +1074,13 @@ impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
         }
         // Disposal takes these exact locks. Verification may finish after cancel,
         // but its credential write cannot pass the terminal state boundary.
-        channels.save_verified_login_storage(storage, at).await
+        channels.save_verified_login_storage(storage, at).await?;
+        operations
+            .get_mut(&operation_id)
+            .expect("validated operation")
+            .login_verified_at
+            .get_or_insert(at);
+        Ok(())
     }
     async fn browser_operation_exists(
         &self,
@@ -1083,55 +1117,19 @@ impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
         input: &crate::BeginBrowserOperation,
         at: DateTime<Utc>,
     ) -> Result<crate::BrowserOperation, AppError> {
-        let mut operation = crate::BrowserOperation::prepare(scope, input, at)?;
         let mut gates = self.1.lock().await;
         let mut operations = self.2.lock().await;
-        if let Some(existing) = operations.get(&input.operation_id) {
-            operation.replay_network(input.network_selection.as_ref(), existing)?;
-            return if existing.matches_begin(&operation) {
-                Ok(existing.clone())
-            } else {
-                Err(AppError::conflict("browser operation differs"))
-            };
+        let networks = self.3.lock().await;
+        let operation = prepare_memory_browser(scope, input, at, &gates, &operations, &networks)?;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            operations.entry(operation.operation_id)
+        {
+            gates.insert(
+                (scope.operator_id.as_uuid(), input.account_id),
+                (operation.reservation_id, input.expires_at),
+            );
+            entry.insert(operation.clone());
         }
-        let key = (scope.operator_id.as_uuid(), input.account_id);
-        if input.expires_at <= at {
-            return Err(AppError::invalid_request(
-                "browser ownership deadline elapsed",
-            ));
-        }
-        if operations.values().any(|op| {
-            op.session_id == input.session_id
-                || (op.scope.operator_id == scope.operator_id
-                    && op.account_id == input.account_id
-                    && op.state != crate::BrowserOperationState::Disposed)
-        }) {
-            return Err(AppError::conflict("browser ownership busy"));
-        }
-        match (input.reservation_id, gates.get(&key)) {
-            (Some(owner), Some((existing, expiry))) if owner == *existing && *expiry > at => {}
-            (None, None) => {}
-            (None, Some((_, expiry))) if *expiry <= at => {}
-            _ => return Err(AppError::conflict("channel account preflight busy")),
-        }
-        if let Some(selection) = &input.network_selection {
-            let networks = self.3.lock().await;
-            let head = networks
-                .heads
-                .get(&key)
-                .filter(|h| h.active.scope == selection.scope)
-                .ok_or_else(|| AppError::conflict("account network is not initialized"))?;
-            let binding = match selection.historical_binding_id {
-                Some(id) => networks
-                    .bindings
-                    .get(&id)
-                    .ok_or_else(|| AppError::not_found("historical network binding not found"))?,
-                None => &head.active,
-            };
-            operation.pin_network(selection, binding)?;
-        }
-        gates.insert(key, (operation.reservation_id, input.expires_at));
-        operations.insert(operation.operation_id, operation.clone());
         Ok(operation)
     }
     async fn get_browser_operation(
@@ -1210,6 +1208,61 @@ impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
         }
         Ok(result)
     }
+}
+
+pub(crate) fn prepare_memory_browser(
+    scope: &crate::BrowserOperationScope,
+    input: &crate::BeginBrowserOperation,
+    at: DateTime<Utc>,
+    gates: &HashMap<AccountReservationKey, AccountReservation>,
+    operations: &HashMap<Uuid, crate::BrowserOperation>,
+    networks: &crate::account_networks::MemoryAccountNetworks,
+) -> Result<crate::BrowserOperation, AppError> {
+    let mut operation = crate::BrowserOperation::prepare(scope, input, at)?;
+    if let Some(existing) = operations.get(&input.operation_id) {
+        operation.replay_network(input.network_selection.as_ref(), existing)?;
+        return if existing.matches_begin(&operation) {
+            Ok(existing.clone())
+        } else {
+            Err(AppError::conflict("browser operation differs"))
+        };
+    }
+    let key = (scope.operator_id.as_uuid(), input.account_id);
+    if input.expires_at <= at {
+        return Err(AppError::invalid_request(
+            "browser ownership deadline elapsed",
+        ));
+    }
+    if operations.values().any(|op| {
+        op.session_id == input.session_id
+            || (op.scope.operator_id == scope.operator_id
+                && op.account_id == input.account_id
+                && op.state != crate::BrowserOperationState::Disposed)
+    }) {
+        return Err(AppError::conflict("browser ownership busy"));
+    }
+    match (input.reservation_id, gates.get(&key)) {
+        (Some(owner), Some((existing, expiry))) if owner == *existing && *expiry > at => {}
+        (None, None) => {}
+        (None, Some((_, expiry))) if *expiry <= at => {}
+        _ => return Err(AppError::conflict("channel account preflight busy")),
+    }
+    if let Some(selection) = &input.network_selection {
+        let head = networks
+            .heads
+            .get(&key)
+            .filter(|h| h.active.scope == selection.scope)
+            .ok_or_else(|| AppError::conflict("account network is not initialized"))?;
+        let binding = match selection.historical_binding_id {
+            Some(id) => networks
+                .bindings
+                .get(&id)
+                .ok_or_else(|| AppError::not_found("historical network binding not found"))?,
+            None => &head.active,
+        };
+        operation.pin_network(selection, binding)?;
+    }
+    Ok(operation)
 }
 
 #[derive(Default)]

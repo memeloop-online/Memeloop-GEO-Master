@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Badge,
   Button,
@@ -72,6 +72,8 @@ import {
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { RemoteDesktop } from "../components/RemoteDesktop";
 import { OperatorAccountImport } from "../components/OperatorAccountImport";
+import { OperatorLoginQueue } from "../components/OperatorLoginQueue";
+import type { LoginQueueSelection } from "../api/loginQueues";
 import { OperatorProxyPools } from "../components/OperatorProxyPools";
 import { OperatorAccountNetwork } from "../components/OperatorAccountNetwork";
 import { ProjectAiSettingsPanel } from "./ProjectAiSettingsPanel";
@@ -262,6 +264,7 @@ function RemoteLogin({
   projectId,
   onDone,
   onClose,
+  queueActions,
 }: {
   sessionId: string;
   mode?: "customer" | "operator";
@@ -269,6 +272,7 @@ function RemoteLogin({
   projectId?: string;
   onDone: () => void;
   onClose: () => void;
+  queueActions?: { complete: () => Promise<void>; pause: () => Promise<void> };
 }) {
   const { t } = useTranslation();
   const queryKey =
@@ -284,13 +288,17 @@ function RemoteLogin({
       ? authorizePoolDesktop(sessionId)
       : authorizeChannelDesktop(tenantId!, projectId!, sessionId);
   const complete = () =>
-    mode === "operator"
-      ? completePoolLogin(sessionId)
-      : completeChannelLogin(tenantId!, projectId!, sessionId);
+    queueActions
+      ? queueActions.complete()
+      : mode === "operator"
+        ? completePoolLogin(sessionId)
+        : completeChannelLogin(tenantId!, projectId!, sessionId);
   const cancelSession = () =>
-    mode === "operator"
-      ? cancelPoolLogin(sessionId)
-      : cancelChannelLogin(tenantId!, projectId!, sessionId);
+    queueActions
+      ? queueActions.pause()
+      : mode === "operator"
+        ? cancelPoolLogin(sessionId)
+        : cancelChannelLogin(tenantId!, projectId!, sessionId);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const completionAttempted = useRef(false);
@@ -353,7 +361,7 @@ function RemoteLogin({
       await cancelSession();
       onClose();
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 404) {
+      if (!queueActions && cause instanceof ApiError && cause.status === 404) {
         // An expired runner session is already gone. Let the user reconnect.
         onClose();
         return;
@@ -369,7 +377,7 @@ function RemoteLogin({
       <div className="channel-row">
         <h2>{t("account.remote.title")}</h2>
         <Button onClick={() => void cancel()} disabled={busy}>
-          {t("account.remote.cancel")}
+          {queueActions ? t("loginQueues:pause") : t("account.remote.cancel")}
         </Button>
       </div>
       <p>{t("account.remote.help")}</p>
@@ -1403,6 +1411,7 @@ function OperatorProjectPicker({
 export function OperatorAccountsPage() {
   const { session } = useAuth();
   const { t } = useTranslation();
+  const [queueSelection, setQueueSelection] = useState<LoginQueueSelection>();
   const client = useQueryClient();
   const allowed = Boolean(
     session?.memberships.some(
@@ -1410,6 +1419,23 @@ export function OperatorAccountsPage() {
         membership.role === "operator_admin" ||
         membership.role === "resource_admin",
     ),
+  );
+  const queueOwner = useMemo(
+    () => ({}),
+    [session?.user.id, session?.operator.id, session?.csrf_token, allowed],
+  );
+  const [queueReservation, setQueueReservation] = useState<{
+    owner: object;
+    active: boolean;
+  }>();
+  // Each authentication starts reserved until its own queue lookup resolves.
+  // Do not reset this in a parent effect: it would overwrite the child's
+  // initial reservation because child passive effects run first.
+  const queueActive =
+    queueReservation?.owner === queueOwner ? queueReservation.active : allowed;
+  const setQueueActive = useCallback(
+    (active: boolean) => setQueueReservation({ owner: queueOwner, active }),
+    [queueOwner],
   );
   const ownerKey = [session?.user.id, session?.operator.id];
   const accountsKey = ["operator-channel-accounts", ...ownerKey];
@@ -1459,6 +1485,7 @@ export function OperatorAccountsPage() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   useEffect(() => {
+    setQueueSelection(undefined);
     setActiveSession(null);
     setLoginStarting(false);
     setFailedLogin(null);
@@ -1503,7 +1530,14 @@ export function OperatorAccountsPage() {
   }
 
   async function connect(accountId?: string) {
-    if (!allowed || busy || activeSession || loginAttempt.current) return;
+    if (
+      !allowed ||
+      busy ||
+      activeSession ||
+      loginAttempt.current ||
+      queueActive
+    )
+      return;
     const selectedPlatform = accountId
       ? (accounts.data?.items.find((item) => item.account_id === accountId)
           ?.platform ??
@@ -1636,7 +1670,32 @@ export function OperatorAccountsPage() {
             groups={groups.data?.items ?? []}
             onChanged={refresh}
             onLogin={(accountId) => void connect(accountId)}
-            loginDisabled={busy || Boolean(activeSession)}
+            loginDisabled={busy || Boolean(activeSession) || queueActive}
+            onQueueSelection={setQueueSelection}
+          />
+          <OperatorLoginQueue
+            selection={queueSelection}
+            accountNames={Object.fromEntries(
+              (accounts.data?.items ?? [])
+                .filter((account) => account.display_name)
+                .map((account) => [account.account_id, account.display_name!]),
+            )}
+            directBusy={busy || Boolean(activeSession)}
+            onActiveChange={setQueueActive}
+            renderDesktop={({ sessionId, complete, pause }) => (
+              <RemoteLogin
+                key={sessionId}
+                mode="operator"
+                sessionId={sessionId}
+                queueActions={{ complete, pause }}
+                onDone={() => {
+                  void refresh();
+                }}
+                onClose={() => {
+                  void refresh();
+                }}
+              />
+            )}
           />
           <Card className="channel-card">
             <h2>接入总部账号</h2>
@@ -1713,6 +1772,7 @@ export function OperatorAccountsPage() {
                   disabled={
                     busy ||
                     Boolean(activeSession) ||
+                    queueActive ||
                     !platforms.data.items.some(
                       (item) =>
                         item.id === platform && item.login_entry_available,
@@ -1868,6 +1928,7 @@ export function OperatorAccountsPage() {
                       disabled={
                         busy ||
                         Boolean(activeSession) ||
+                        queueActive ||
                         !platforms.data?.items.some(
                           (item) =>
                             item.id === account.platform &&

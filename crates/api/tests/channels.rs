@@ -996,6 +996,343 @@ async fn json_body(response: axum::response::Response) -> Value {
     .unwrap()
 }
 
+#[derive(Clone, Default)]
+struct QueueRunner {
+    starts: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    captures: Arc<std::sync::atomic::AtomicUsize>,
+    fail_close: Arc<std::sync::atomic::AtomicBool>,
+}
+async fn queue_fixture() -> (
+    Router,
+    String,
+    String,
+    AppState,
+    QueueRunner,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        routing::{get, post},
+    };
+    use std::sync::atomic::Ordering;
+    let capture = QueueRunner::default();
+    let runner = Router::new()
+        .route("/v1/lifecycle", get(|| async { Json(json!({"generation":Uuid::from_u128(954)})) }))
+        .route("/v1/sessions", post(|State(s): State<QueueRunner>, Json(input): Json<Value>| async move {
+            s.starts.lock().await.push(input.clone());
+            Json(json!({"session_id":input["session_id"],"generation":input["expected_generation"]}))
+        }))
+        .route("/v1/sessions/{id}/status", get(|| async { Json(json!({"phase":"awaiting_login","identity":null})) }))
+        .route("/v1/sessions/{id}/desktop-readiness", get(|| async { Json(json!({"ready":true})) }))
+        .route("/v1/sessions/{id}/complete", post(|State(s): State<QueueRunner>, Path(id): Path<Uuid>| async move {
+            s.captures.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"identity":{"platform_account_id":format!("fixture-{id}"),"display_name":"Fixture","avatar_url":null},
+                "storage_state":{"cookies":[{"name":"fixture","value":"private-fixture-storage"}]}}))
+        }))
+        .route("/v1/sessions/{id}/dispose", post(|State(s): State<QueueRunner>, Path(id): Path<Uuid>, Json(input): Json<Value>| async move {
+            if s.fail_close.load(Ordering::SeqCst) { (StatusCode::NOT_FOUND, Json(json!({}))) }
+            else { (StatusCode::OK, Json(json!({"session_id":id,"generation":input["expected_generation"],"state":"disposed"}))) }
+        }))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, runner).await.unwrap() });
+    let browser = BrowserBridge::new(format!("http://{address}"), "fixture-token".into()).unwrap();
+    let (app, _, cookie, csrf, state) =
+        pool_fixture_with_browser_state(Role::ResourceAdmin, true, Some(browser)).await;
+    (app, cookie, csrf, state, capture, server)
+}
+async fn queue_import(app: &Router, cookie: &str, csrf: &str) -> Value {
+    let response = app.clone().oneshot(request("POST", "/api/v1/operator/channel-account-imports",
+        Some(cookie), Some(csrf), json!({"import_key":"queue-fixture","rows":[
+            {"row_key":"one","platform":"zhihu","username":"fixture-one","password":"fixture-password-one"},
+            {"row_key":"two","platform":"zhihu","username":"fixture-two","password":"fixture-password-two"}
+        ]}).to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+fn queue_create_input(import: &Value, id: Uuid) -> Value {
+    // Caller order is authoritative, independent of import row ordinals.
+    json!({"queue_id":id,"import_key":"queue-fixture","items":[
+        {"row_key":"two","account_id":import["rows"][1]["account_id"]},
+        {"row_key":"one","account_id":import["rows"][0]["account_id"]}
+    ]})
+}
+async fn queue_post(
+    app: &Router,
+    cookie: &str,
+    csrf: &str,
+    path: &str,
+    input: Value,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(request(
+            "POST",
+            path,
+            Some(cookie),
+            Some(csrf),
+            input.to_string(),
+        ))
+        .await
+        .unwrap()
+}
+async fn queue_read(app: &Router, cookie: &str, path: &str) -> Value {
+    let response = app
+        .clone()
+        .oneshot(request("GET", path, Some(cookie), None, String::new()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+#[tokio::test]
+async fn operator_queue_sequential_refresh_pause_verified_close_and_stale_completion() {
+    use std::sync::atomic::Ordering;
+    let (app, cookie, csrf, state, runner, server) = queue_fixture().await;
+    let import = queue_import(&app, &cookie, &csrf).await;
+    let id = Uuid::new_v4();
+    let path = format!("/api/v1/operator/channel-login-queues/{id}");
+    let create = queue_create_input(&import, id);
+    let response = queue_post(
+        &app,
+        &cookie,
+        &csrf,
+        "/api/v1/operator/channel-login-queues",
+        create.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut queue = json_body(response).await;
+    assert_eq!(
+        queue["items"][0]["account_id"],
+        import["rows"][1]["account_id"]
+    );
+    assert_eq!(queue["current"]["phase"], "awaiting_login");
+    assert_eq!(queue["can_drive"], false);
+    let first = queue["current"]["session_id"].clone();
+    let reloaded = router(state.clone());
+    assert_eq!(queue_read(&reloaded, &cookie, &path).await, queue);
+    let replay = queue_post(
+        &reloaded,
+        &cookie,
+        &csrf,
+        "/api/v1/operator/channel-login-queues",
+        create,
+    )
+    .await;
+    assert_eq!(response_status_and_body(replay).await.0, StatusCode::OK);
+    assert_eq!(runner.starts.lock().await.len(), 1);
+    assert!(!queue.to_string().contains("fixture-password"));
+    assert!(queue.get("creator_user_id").is_none());
+    assert!(queue["current"].get("owner_session_id").is_none());
+
+    let paused = queue_post(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("{path}/pause"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(paused.status(), StatusCode::OK);
+    queue = json_body(paused).await;
+    assert_eq!(queue["status"], "paused");
+    let completed = queue_post(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("{path}/complete"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(completed.status(), StatusCode::OK);
+    queue = json_body(completed).await;
+    assert_eq!(queue["items"][0]["status"], "succeeded");
+    assert!(queue["current"].is_null());
+    assert_eq!(runner.starts.lock().await.len(), 1);
+    let resumed = queue_post(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("{path}/resume"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    queue = json_body(resumed).await;
+    assert_ne!(queue["current"]["session_id"], first);
+    assert_eq!(runner.starts.lock().await.len(), 2);
+
+    runner.fail_close.store(true, Ordering::SeqCst);
+    let failed = queue_post(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("{path}/complete"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    queue = queue_read(&app, &cookie, &path).await;
+    assert_eq!(queue["status"], "paused");
+    assert_eq!(queue["current"]["phase"], "closing");
+    assert_eq!(queue["items"][1]["status"], "current");
+    assert_eq!(runner.captures.load(Ordering::SeqCst), 2);
+    runner.fail_close.store(false, Ordering::SeqCst);
+    let intended_version = queue["version"].clone();
+    let recovered = queue_post(
+        &reloaded,
+        &cookie,
+        &csrf,
+        &format!("{path}/complete"),
+        json!({"expected_version":intended_version}),
+    )
+    .await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    queue = json_body(recovered).await;
+    assert_eq!(queue["status"], "completed");
+    assert_eq!(runner.captures.load(Ordering::SeqCst), 2);
+    let stale = queue_post(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("{path}/complete"),
+        json!({"expected_version":intended_version}),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(runner.captures.load(Ordering::SeqCst), 2);
+    assert_eq!(runner.starts.lock().await.len(), 2);
+    server.abort();
+}
+async fn response_status_and_body(response: axum::response::Response) -> (StatusCode, Value) {
+    (response.status(), json_body(response).await)
+}
+
+#[tokio::test]
+async fn operator_queue_new_cookie_cannot_attach_and_skip_waits_for_exact_disposal() {
+    use std::sync::atomic::Ordering;
+    let (app, cookie, csrf, _, runner, server) = queue_fixture().await;
+    let import = queue_import(&app, &cookie, &csrf).await;
+    let id = Uuid::new_v4();
+    let path = format!("/api/v1/operator/channel-login-queues/{id}");
+    let response = queue_post(
+        &app,
+        &cookie,
+        &csrf,
+        "/api/v1/operator/channel-login-queues",
+        queue_create_input(&import, id),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let initial = json_body(response).await;
+    let old_session = initial["current"]["session_id"].as_str().unwrap();
+    let login = queue_post(
+        &app,
+        &cookie,
+        &csrf,
+        "/api/v1/auth/login",
+        json!({"login_name":"demo@localhost","password":"channel-test"}),
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::OK);
+    let new_cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let new_csrf = json_body(login).await["csrf_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let queue = queue_read(&app, &new_cookie, &path).await;
+    assert!(queue["current"]["session_id"].is_null());
+    assert_eq!(queue["current"]["requires_session_recovery"], true);
+    assert_eq!(queue["can_drive"], false);
+    let attach = queue_post(
+        &app,
+        &new_cookie,
+        &new_csrf,
+        &format!("/api/v1/operator/channel-login-sessions/{old_session}/desktop-authorization"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(attach.status(), StatusCode::FORBIDDEN);
+    let complete = queue_post(
+        &app,
+        &new_cookie,
+        &new_csrf,
+        &format!("{path}/complete"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(complete.status(), StatusCode::FORBIDDEN);
+    assert_eq!(runner.captures.load(Ordering::SeqCst), 0);
+    runner.fail_close.store(true, Ordering::SeqCst);
+    let skip = queue_post(
+        &app,
+        &new_cookie,
+        &new_csrf,
+        &format!("{path}/skip"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(skip.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let queue = queue_read(&app, &new_cookie, &path).await;
+    assert_eq!(queue["items"][0]["status"], "current");
+    assert_eq!(runner.starts.lock().await.len(), 1);
+    runner.fail_close.store(false, Ordering::SeqCst);
+    let retry = queue_post(
+        &app,
+        &new_cookie,
+        &new_csrf,
+        &format!("{path}/retry"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let queue = json_body(retry).await;
+    assert_eq!(queue["status"], "paused");
+    assert_eq!(queue["items"][0]["attempt"], 1);
+    assert!(queue["current"].is_null());
+    let resumed = queue_post(
+        &app,
+        &new_cookie,
+        &new_csrf,
+        &format!("{path}/resume"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let queue = json_body(resumed).await;
+    assert_ne!(
+        queue["current"]["session_id"],
+        initial["current"]["session_id"]
+    );
+    assert_eq!(runner.starts.lock().await.len(), 2);
+    let skipped = queue_post(
+        &app,
+        &new_cookie,
+        &new_csrf,
+        &format!("{path}/skip"),
+        json!({"expected_version":queue["version"]}),
+    )
+    .await;
+    assert_eq!(skipped.status(), StatusCode::OK);
+    let queue = json_body(skipped).await;
+    assert_eq!(queue["items"][0]["status"], "skipped");
+    assert_eq!(
+        queue["current"]["account_id"],
+        import["rows"][0]["account_id"]
+    );
+    assert_eq!(runner.starts.lock().await.len(), 3);
+    server.abort();
+}
+
 #[tokio::test]
 async fn proxy_inventory_http_versions_redaction_pagination_and_validation() {
     let (app, _, cookie, csrf) = pool_fixture(Role::ResourceAdmin, true).await;

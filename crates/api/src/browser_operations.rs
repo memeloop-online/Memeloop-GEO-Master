@@ -38,6 +38,36 @@ impl ChannelService {
         reservation_id: Option<Uuid>,
         proxy: &Option<BrowserProxy>,
     ) -> Result<BrowserOperation, AppError> {
+        let input = self
+            .prepare_browser_input(
+                scope,
+                secret_scope,
+                account_id,
+                session_id,
+                purpose,
+                reservation_id,
+                proxy,
+            )
+            .await?;
+        self.operations()?
+            .begin_browser_operation(scope, &input, Utc::now())
+            .await
+    }
+
+    /// Construct the immutable start input before its transactional claim. Queue
+    /// claims persist this input and the login reference together, without I/O
+    /// to the runner while holding repository locks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_browser_input(
+        &self,
+        scope: &BrowserOperationScope,
+        secret_scope: &TenantScope,
+        account_id: Uuid,
+        session_id: Uuid,
+        purpose: BrowserOperationPurpose,
+        reservation_id: Option<Uuid>,
+        proxy: &Option<BrowserProxy>,
+    ) -> Result<BeginBrowserOperation, AppError> {
         for retained in self
             .repository
             .account_login_sessions(scope.operator_id, account_id)
@@ -57,26 +87,20 @@ impl ChannelService {
         let network_scope = self.account_network_scope(secret_scope, account_id).await?;
         let network = self.ensure_account_network(&network_scope, proxy).await?;
         let effective_network = network.active.effective_network;
-        self.operations()?
-            .begin_browser_operation(
-                scope,
-                &BeginBrowserOperation {
-                    operation_id: session_id,
-                    session_id,
-                    account_id,
-                    purpose,
-                    runner_generation: generation,
-                    effective_network,
-                    network_selection: Some(geo_domain::BrowserNetworkSelection {
-                        scope: network_scope,
-                        historical_binding_id: None,
-                    }),
-                    reservation_id,
-                    expires_at: Utc::now() + Duration::minutes(20),
-                },
-                Utc::now(),
-            )
-            .await
+        Ok(BeginBrowserOperation {
+            operation_id: session_id,
+            session_id,
+            account_id,
+            purpose,
+            runner_generation: generation,
+            effective_network,
+            network_selection: Some(geo_domain::BrowserNetworkSelection {
+                scope: network_scope,
+                historical_binding_id: None,
+            }),
+            reservation_id,
+            expires_at: Utc::now() + Duration::minutes(20),
+        })
     }
 
     pub(crate) async fn start_owned_browser(
