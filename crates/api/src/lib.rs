@@ -147,8 +147,9 @@ use uuid::Uuid;
 
 pub use agent_runtime::{EmbeddedAgentRuntime, RepositoryHostOps};
 pub use browser_bridge::{
-    BrowserBridge, CompletionRecoveryCode, CompletionRecoveryDiagnostic, CompletionRecoveryIdentity,
-    CompletionRecoveryRequest, CompletionRecoveryResult, CompletionRecoveryStage,
+    BrowserBridge, CompletionRecoveryCode, CompletionRecoveryDiagnostic,
+    CompletionRecoveryIdentity, CompletionRecoveryRequest, CompletionRecoveryResult,
+    CompletionRecoveryStage,
 };
 pub use channel_jobs::{
     ChannelDispatchDeferred, ChannelDispatchResult, MeasurementRequest, PlanRequest,
