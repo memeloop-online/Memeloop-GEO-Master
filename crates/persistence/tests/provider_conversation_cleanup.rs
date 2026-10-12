@@ -313,6 +313,10 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
         Some(&claim.original_identity),
         input.original_identity.as_ref()
     );
+    assert_eq!(
+        claim.original_runner_session_id,
+        Some(input.runner_session_id)
+    );
     assert!(cleanup.claim_due(&scope).await.unwrap().is_none());
     assert!(
         due_ids(&cleanup, &scope, database_now(&database).await)

@@ -21,6 +21,12 @@ fn decode<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Result<T, App
 }
 fn record(row: PgRow) -> Result<BrowserOperation, AppError> {
     Ok(BrowserOperation {
+        network_binding_id: row.try_get("network_binding_id").map_err(db)?,
+        network_scope: row
+            .try_get::<Option<serde_json::Value>, _>("network_scope")
+            .map_err(db)?
+            .map(decode)
+            .transpose()?,
         operation_id: row.try_get("operation_id").map_err(db)?,
         session_id: row.try_get("session_id").map_err(db)?,
         account_id: row.try_get("account_id").map_err(db)?,
@@ -41,6 +47,15 @@ fn record(row: PgRow) -> Result<BrowserOperation, AppError> {
 
 #[async_trait]
 impl BrowserOperationRepository for PgChannelJobRepository {
+    async fn get_account_browser_operation(
+        &self,
+        operator: OperatorId,
+        account_id: Uuid,
+    ) -> Result<Option<BrowserOperation>, AppError> {
+        sqlx::query("SELECT op.* FROM browser_operations op JOIN channel_account_preflight_reservations gate ON gate.browser_operation_id=op.operation_id \
+            WHERE op.operator_id=$1 AND op.account_id=$2 AND op.state<>'\"Disposed\"'::jsonb")
+            .bind(operator.as_uuid()).bind(account_id).fetch_optional(&self.pool).await.map_err(db)?.map(record).transpose()
+    }
     async fn save_owned_login_session(
         &self,
         scope: &BrowserOperationScope,
@@ -96,8 +111,9 @@ impl BrowserOperationRepository for PgChannelJobRepository {
         input: &BeginBrowserOperation,
         at: DateTime<Utc>,
     ) -> Result<BrowserOperation, AppError> {
-        let op = BrowserOperation::prepare(scope, input, at)?;
+        let mut op = BrowserOperation::prepare(scope, input, at)?;
         let mut tx = self.pool.begin().await.map_err(db)?;
+        crate::account_networks::lock_head(&mut tx, scope.operator_id, input.account_id).await?;
         // Serialize idempotent replays independently of the shared account gate.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
             .bind(op.operation_id.to_string())
@@ -111,6 +127,7 @@ impl BrowserOperationRepository for PgChannelJobRepository {
             .map_err(db)?
         {
             let existing = record(row)?;
+            op.replay_network(input.network_selection.as_ref(), &existing)?;
             return if existing.matches_begin(&op) {
                 Ok(existing)
             } else {
@@ -162,13 +179,33 @@ impl BrowserOperationRepository for PgChannelJobRepository {
                 "retained login requires browser ownership reconciliation",
             ));
         }
+        if let Some(selection) = &input.network_selection {
+            let head = crate::account_networks::state_tx(&mut tx, &selection.scope)
+                .await?
+                .ok_or_else(|| AppError::conflict("account network is not initialized"))?;
+            let binding = match selection.historical_binding_id {
+                Some(id) => {
+                    crate::account_networks::binding_tx(&mut tx, &selection.scope, id).await?
+                }
+                None => head.active,
+            };
+            // Account ownership remains required for historical routes, but
+            // inventory disable/rotation cannot rewrite their immutable bytes.
+            crate::account_networks::validate_assignment(
+                &mut tx,
+                &selection.scope,
+                &AccountNetworkSource::LegacySnapshot,
+            )
+            .await?;
+            op.pin_network(selection, &binding)?;
+        }
         let inserted = sqlx::query("INSERT INTO browser_operations \
-            (operation_id,operator_id,account_id,session_id,reservation_id,scope,purpose,runner_generation,effective_network,state,version,expires_at,created_at,updated_at,next_check_at) \
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$12) ON CONFLICT DO NOTHING")
+            (operation_id,operator_id,account_id,session_id,reservation_id,scope,purpose,runner_generation,effective_network,state,version,expires_at,created_at,updated_at,next_check_at,network_binding_id,network_scope) \
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$12,$14,$15) ON CONFLICT DO NOTHING")
             .bind(op.operation_id).bind(scope.operator_id.as_uuid()).bind(op.account_id).bind(op.session_id)
             .bind(op.reservation_id).bind(json(scope)?).bind(json(&op.purpose)?).bind(op.runner_generation)
             .bind(op.effective_network.encrypted_bytes()).bind(json(&op.state)?).bind(op.version)
-            .bind(op.expires_at).bind(at).execute(&mut *tx).await.map_err(db)?;
+            .bind(op.expires_at).bind(at).bind(op.network_binding_id).bind(op.network_scope.as_ref().map(json).transpose()?).execute(&mut *tx).await.map_err(db)?;
         if inserted.rows_affected() != 1 {
             return Err(AppError::conflict("browser session already owned"));
         }
@@ -224,6 +261,16 @@ impl BrowserOperationRepository for PgChannelJobRepository {
         at: DateTime<Utc>,
     ) -> Result<BrowserOperation, AppError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
+        let account: Uuid = sqlx::query_scalar(
+            "SELECT account_id FROM browser_operations WHERE operation_id=$1 AND operator_id=$2",
+        )
+        .bind(id)
+        .bind(scope.operator_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        .ok_or_else(|| AppError::not_found("browser operation not found"))?;
+        crate::account_networks::lock_head(&mut tx, scope.operator_id, account).await?;
         let row = sqlx::query(
             "SELECT * FROM browser_operations WHERE operation_id=$1 AND operator_id=$2 FOR UPDATE",
         )
@@ -238,10 +285,14 @@ impl BrowserOperationRepository for PgChannelJobRepository {
         sqlx::query("UPDATE browser_operations SET state=$2,version=$3,updated_at=$4,next_check_at=$5,released_unstarted=$6 WHERE operation_id=$1")
             .bind(id).bind(json(&op.state)?).bind(op.version).bind(op.updated_at).bind(op.next_check_at).bind(op.released_unstarted).execute(&mut *tx).await.map_err(db)?;
         if op.state == BrowserOperationState::Disposed {
-            sqlx::query("DELETE FROM channel_account_preflight_reservations \
+            let released=sqlx::query("DELETE FROM channel_account_preflight_reservations \
                 WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3 AND browser_operation_id=$4")
                 .bind(scope.operator_id.as_uuid()).bind(op.account_id).bind(op.reservation_id).bind(op.operation_id)
                 .execute(&mut *tx).await.map_err(db)?;
+            if released.rows_affected() == 1 {
+                crate::account_networks::promote_pending(&mut tx, scope.operator_id, op.account_id)
+                    .await?;
+            }
         }
         tx.commit().await.map_err(db)?;
         Ok(op)

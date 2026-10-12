@@ -46,6 +46,7 @@ pub enum BrowserOperationState {
 
 #[derive(Clone)]
 pub struct BeginBrowserOperation {
+    pub network_selection: Option<crate::BrowserNetworkSelection>,
     pub operation_id: Uuid,
     pub session_id: Uuid,
     pub account_id: Uuid,
@@ -58,6 +59,8 @@ pub struct BeginBrowserOperation {
 
 #[derive(Clone)]
 pub struct BrowserOperation {
+    pub network_binding_id: Option<Uuid>,
+    pub network_scope: Option<crate::AccountNetworkScope>,
     pub operation_id: Uuid,
     pub session_id: Uuid,
     pub account_id: Uuid,
@@ -76,6 +79,51 @@ pub struct BrowserOperation {
 }
 
 impl BrowserOperation {
+    pub fn pin_network(
+        &mut self,
+        selection: &crate::BrowserNetworkSelection,
+        binding: &crate::AccountNetworkBinding,
+    ) -> Result<(), AppError> {
+        selection.scope.validate()?;
+        if binding.scope != selection.scope
+            || binding.scope.operator_id != self.scope.operator_id
+            || binding.scope.account_id != self.account_id
+            || binding.scope.tenant_id.is_some()
+                && (binding.scope.tenant_id != self.scope.tenant_id
+                    || binding.scope.project_id != self.scope.project_id)
+            || selection
+                .historical_binding_id
+                .is_some_and(|id| id != binding.binding_id)
+        {
+            return Err(AppError::forbidden("browser network ownership differs"));
+        }
+        self.network_scope = Some(binding.scope.clone());
+        self.network_binding_id = Some(binding.binding_id);
+        self.effective_network = binding.effective_network.clone();
+        Ok(())
+    }
+    pub fn replay_network(
+        &mut self,
+        selection: Option<&crate::BrowserNetworkSelection>,
+        existing: &Self,
+    ) -> Result<(), AppError> {
+        match (
+            selection,
+            existing.network_scope.as_ref(),
+            existing.network_binding_id,
+        ) {
+            (Some(s), Some(scope), Some(id))
+                if &s.scope == scope && s.historical_binding_id.is_none_or(|pin| pin == id) =>
+            {
+                self.network_scope = Some(scope.clone());
+                self.network_binding_id = Some(id);
+                self.effective_network = existing.effective_network.clone();
+                Ok(())
+            }
+            (None, None, None) => Ok(()),
+            _ => Err(AppError::conflict("browser network request differs")),
+        }
+    }
     pub fn validate_login_commit(
         &self,
         scope: &BrowserOperationScope,
@@ -127,6 +175,8 @@ impl BrowserOperation {
             return Err(AppError::invalid_request("invalid browser ownership"));
         }
         Ok(Self {
+            network_binding_id: None,
+            network_scope: None,
             operation_id: input.operation_id,
             session_id: input.session_id,
             account_id: input.account_id,
@@ -145,7 +195,9 @@ impl BrowserOperation {
         })
     }
     pub fn matches_begin(&self, other: &Self) -> bool {
-        self.operation_id == other.operation_id
+        self.network_binding_id == other.network_binding_id
+            && self.network_scope == other.network_scope
+            && self.operation_id == other.operation_id
             && self.session_id == other.session_id
             && self.account_id == other.account_id
             && self.scope == other.scope
@@ -233,6 +285,12 @@ pub enum BrowserOperationTransition {
 
 #[async_trait]
 pub trait BrowserOperationRepository: Send + Sync {
+    /// Trusted server migration/recovery lookup, never a public credential view.
+    async fn get_account_browser_operation(
+        &self,
+        operator: OperatorId,
+        account_id: Uuid,
+    ) -> Result<Option<BrowserOperation>, AppError>;
     async fn save_owned_login_session(
         &self,
         scope: &BrowserOperationScope,
