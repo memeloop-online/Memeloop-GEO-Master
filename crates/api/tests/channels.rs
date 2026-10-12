@@ -62,6 +62,472 @@ async fn fixture() -> (Router, String, String, String) {
 }
 
 #[tokio::test]
+async fn fixed_pool_revision_runs_and_switch_waits_for_exact_disposal() {
+    use axum::{
+        Json,
+        extract::{Path, State},
+        routing::{get, post},
+    };
+    use tokio::sync::Mutex;
+    #[derive(Clone, Default)]
+    struct Capture {
+        starts: Arc<Mutex<Vec<Value>>>,
+        fail_close: Arc<Mutex<bool>>,
+    }
+    let capture = Capture::default();
+    let runner=Router::new()
+        .route("/v1/lifecycle",get(||async {Json(json!({"generation":Uuid::from_u128(321)}))}))
+        .route("/v1/sessions",post(|State(s):State<Capture>,Json(input):Json<Value>|async move{
+            s.starts.lock().await.push(input.clone());
+            Json(json!({"session_id":input["session_id"],"generation":input["expected_generation"]}))
+        }))
+        .route("/v1/sessions/{id}/dispose",post(|State(s):State<Capture>,Path(id):Path<Uuid>,Json(input):Json<Value>|async move{
+            if *s.fail_close.lock().await {(StatusCode::NOT_FOUND,Json(json!({})))}
+            else {(StatusCode::OK,Json(json!({"session_id":id,"generation":input["expected_generation"],"state":"disposed"})))}
+        })).with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, runner).await.unwrap() });
+    let browser = BrowserBridge::new(format!("http://{address}"), "fixture-token".into()).unwrap();
+    let (app, project, cookie, csrf, state) =
+        pool_fixture_with_browser_state(Role::ResourceAdmin, true, Some(browser)).await;
+    let call = |method: &str, path: &str, value: Value| {
+        request(method, path, Some(&cookie), Some(&csrf), value.to_string())
+    };
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/operator/channel-accounts",
+            json!({"platform":"zhihu"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let account = json_body(response).await;
+    let id = account["account_id"].as_str().unwrap();
+    let network_path = format!("/api/v1/operator/channel-accounts/{id}/network-binding");
+    let response = app
+        .clone()
+        .oneshot(call("GET", &network_path, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let initial = json_body(response).await;
+    assert_eq!(initial["version"], 0);
+    assert!(initial["active"]["binding_id"].is_null());
+    let network_scope = geo_domain::AccountNetworkScope {
+        operator_id: DEVELOPMENT_OPERATOR_ID,
+        account_id: Uuid::parse_str(id).unwrap(),
+        tenant_id: None,
+        project_id: None,
+    };
+    assert!(
+        state
+            .channel_job_repository()
+            .get_account_network(&network_scope)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/operator/channel-proxy-pools",
+            json!({"name":"Fixture pool"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let pool = json_body(response).await;
+    let member_path = format!(
+        "/api/v1/operator/channel-proxy-pools/{}/members",
+        pool["pool_id"].as_str().unwrap()
+    );
+    let response=app.clone().oneshot(call("POST",&member_path,json!({"name":"Fixture member","proxy":{"server":"http://127.0.0.1:8089","username":"fixture-user","password":"fixture-old"}}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let member = json_body(response).await;
+    let input = json!({"expected_version":0,"source":{"kind":"pool_revision","pool_id":pool["pool_id"],"member_id":member["member_id"],"revision_id":member["revision_id"]}});
+    let response = app
+        .clone()
+        .oneshot(call("PUT", &network_path, input.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let head = json_body(response).await;
+    assert_eq!(head["version"], 1);
+    assert_eq!(head["active"]["pool_name"], "Fixture pool");
+    assert_eq!(head["active"]["member_name"], "Fixture member");
+    assert!(!head.to_string().contains("fixture-old"));
+    let stale = app
+        .clone()
+        .oneshot(call("PUT", &network_path, input))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let response=app.clone().oneshot(call("PATCH",&format!("{member_path}/{}",member["member_id"].as_str().unwrap()),json!({"expected_version":1,"proxy":{"server":"http://127.0.0.1:8090","password":"fixture-new"}}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/operator/channel-login-sessions",
+            json!({"account_id":id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let login = json_body(response).await;
+    assert_eq!(
+        capture.starts.lock().await[0]["proxy"]["password"],
+        "fixture-old"
+    );
+    assert_eq!(
+        capture.starts.lock().await[0]["proxy"]["server"],
+        "http://127.0.0.1:8089"
+    );
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PUT",
+            &network_path,
+            json!({"expected_version":1,"source":{"kind":"direct"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let waiting = json_body(response).await;
+    assert_eq!(waiting["active"]["source"]["kind"], "pool_revision");
+    assert_eq!(waiting["pending"]["source"]["kind"], "direct");
+    assert_eq!(waiting["busy"], true);
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PATCH",
+            &format!("/api/v1/operator/channel-accounts/{id}"),
+            json!({"group_id":null}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    *capture.fail_close.lock().await = true;
+    let cancel_path = format!(
+        "/api/v1/operator/channel-login-sessions/{}",
+        login["session_id"].as_str().unwrap()
+    );
+    let response = app
+        .clone()
+        .oneshot(call("DELETE", &cancel_path, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = app
+        .clone()
+        .oneshot(call("GET", &network_path, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(response).await["pending"]["source"]["kind"],
+        "direct"
+    );
+    *capture.fail_close.lock().await = false;
+    let response = app
+        .clone()
+        .oneshot(call("DELETE", &cancel_path, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = app
+        .clone()
+        .oneshot(call("GET", &network_path, Value::Null))
+        .await
+        .unwrap();
+    let promoted = json_body(response).await;
+    assert_eq!(promoted["active"]["source"]["kind"], "direct");
+    assert!(promoted["pending"].is_null());
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/operator/channel-login-sessions",
+            json!({"account_id":id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(capture.starts.lock().await[1]["proxy"].is_null());
+    // Project defaults retain inheritance, while explicit direct overrides do
+    // not change. The running inherited browser keeps its original route.
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PATCH",
+            "/api/v1/channel-settings",
+            json!({"project_id":project,"proxy":{"server":"http://127.0.0.1:8091"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/channel-accounts",
+            json!({"project_id":project,"platform":"zhihu"}),
+        ))
+        .await
+        .unwrap();
+    let inherited = json_body(response).await["account_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/channel-accounts",
+            json!({"project_id":project,"platform":"zhihu"}),
+        ))
+        .await
+        .unwrap();
+    let explicit = json_body(response).await["account_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let inherited_path =
+        format!("/api/v1/channel-accounts/{inherited}/network-binding?project_id={project}");
+    let explicit_path =
+        format!("/api/v1/channel-accounts/{explicit}/network-binding?project_id={project}");
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PUT",
+            &explicit_path,
+            json!({"expected_version":0,"source":{"kind":"direct"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/channel-login-sessions",
+            json!({"project_id":project,"account_id":inherited}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let inherited_login = json_body(response).await;
+    assert_eq!(
+        capture.starts.lock().await[2]["proxy"]["server"],
+        "http://127.0.0.1:8091"
+    );
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PATCH",
+            "/api/v1/channel-settings",
+            json!({"project_id":project,"proxy":{"server":"http://127.0.0.1:8092"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(call("GET", &inherited_path, Value::Null))
+        .await
+        .unwrap();
+    let default_pending = json_body(response).await;
+    assert_eq!(
+        default_pending["active"]["source"]["kind"],
+        "project_default"
+    );
+    assert_eq!(default_pending["active"]["server"], "http://127.0.0.1:8091");
+    assert_eq!(
+        default_pending["pending"]["server"],
+        "http://127.0.0.1:8092"
+    );
+    let response = app
+        .clone()
+        .oneshot(call("GET", &explicit_path, Value::Null))
+        .await
+        .unwrap();
+    let direct_override = json_body(response).await;
+    assert_eq!(direct_override["active"]["source"]["kind"], "direct");
+    assert!(direct_override["pending"].is_null());
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PATCH",
+            "/api/v1/channel-settings",
+            json!({"project_id":project,"default_group_id":null}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(call("GET", &inherited_path, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(
+        json_body(response).await["version"],
+        default_pending["version"]
+    );
+    let response = app
+        .clone()
+        .oneshot(call(
+            "DELETE",
+            &format!(
+                "/api/v1/channel-login-sessions/{}?project_id={project}",
+                inherited_login["session_id"].as_str().unwrap()
+            ),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/channel-login-sessions",
+            json!({"project_id":project,"account_id":inherited}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        capture.starts.lock().await[3]["proxy"]["server"],
+        "http://127.0.0.1:8092"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn customer_network_binding_is_scoped_secret_write_only_and_rejects_operator_inventory() {
+    let (app, project, cookie, csrf) = fixture().await;
+    let call = |method: &str, path: &str, value: Value| {
+        request(method, path, Some(&cookie), Some(&csrf), value.to_string())
+    };
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/channel-accounts",
+            json!({"project_id":project,"platform":"zhihu"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let account = json_body(response).await;
+    let id = account["account_id"].as_str().unwrap();
+    let path = format!("/api/v1/channel-accounts/{id}/network-binding?project_id={project}");
+    let response = app
+        .clone()
+        .oneshot(call("GET", &path, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["version"], 0);
+    let response=app.clone().oneshot(call("PUT",&path,json!({"expected_version":0,"source":{"kind":"pool_revision","pool_id":Uuid::new_v4(),"member_id":Uuid::new_v4(),"revision_id":Uuid::new_v4()}}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let input = json!({"expected_version":0,"source":{"kind":"standalone","proxy":{"server":"https://proxy.example.invalid:443","username":"fixture-private-user","password":"fixture-private-password"}}});
+    let response = app
+        .clone()
+        .oneshot(call("PUT", &path, input.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved = json_body(response).await;
+    assert_eq!(saved["active"]["source"]["kind"], "standalone");
+    assert!(!saved.to_string().contains("fixture-private"));
+    let response = app
+        .clone()
+        .oneshot(call("PUT", &path, input))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PATCH",
+            &format!("/api/v1/channel-accounts/{id}?project_id={project}"),
+            json!({"group_id":null}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(call("GET", &path, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(json_body(response).await, saved);
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PUT",
+            &path,
+            json!({"expected_version":1,"source":{"kind":"direct"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let direct = json_body(response).await;
+    assert_eq!(direct["active"]["source"]["kind"], "direct");
+    assert!(direct["active"]["server"].is_null());
+    let response = app
+        .clone()
+        .oneshot(call(
+            "POST",
+            "/api/v1/channel-groups",
+            json!({"project_id":project,"name":"Fixture group"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let group = json_body(response).await;
+    let account_path = format!("/api/v1/channel-accounts/{id}?project_id={project}");
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PATCH",
+            &account_path,
+            json!({"group_id":group["group_id"],"proxy":{"server":"http://127.0.0.1:8087"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["group_id"], group["group_id"]);
+    let response = app
+        .clone()
+        .oneshot(call("GET", &path, Value::Null))
+        .await
+        .unwrap();
+    let combined = json_body(response).await;
+    assert_eq!(combined["active"]["server"], "http://127.0.0.1:8087");
+    let response = app
+        .clone()
+        .oneshot(call(
+            "PATCH",
+            &account_path,
+            json!({"group_id":Uuid::new_v4(),"proxy":{"server":"http://127.0.0.1:8088"}}),
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+    let response = app
+        .clone()
+        .oneshot(call("GET", &path, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(json_body(response).await, combined);
+}
+
+#[tokio::test]
 async fn both_login_paths_keep_saved_storage_and_retry_handle_until_exact_disposal() {
     use axum::{
         Json,

@@ -44,6 +44,7 @@ pub async fn verify_login_commit(
         .begin_browser_operation(
             &scope,
             &BeginBrowserOperation {
+                network_selection: None,
                 operation_id: Uuid::new_v4(),
                 session_id: Uuid::new_v4(),
                 account_id,
@@ -133,6 +134,7 @@ pub async fn verify(
         Some(Uuid::new_v4().into()),
     );
     let make = |account_id| BeginBrowserOperation {
+        network_selection: None,
         operation_id: Uuid::new_v4(),
         session_id: Uuid::new_v4(),
         account_id,

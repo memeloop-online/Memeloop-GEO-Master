@@ -2413,10 +2413,11 @@ mod tests {
         scope: &TenantScope,
         session: Uuid,
     ) {
+        let account_id = seed_browser_account(service, scope, "kimi").await;
         service
             .open_execution_browser(
                 scope,
-                Uuid::new_v4(),
+                account_id,
                 session,
                 geo_domain::BrowserOperationPurpose::Measure,
                 None,
@@ -2426,6 +2427,43 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn seed_browser_account(
+        service: &crate::channels::ChannelService,
+        scope: &TenantScope,
+        platform: &str,
+    ) -> Uuid {
+        let account_id = Uuid::new_v4();
+        let now = Utc::now();
+        service
+            .repository
+            .save_account(
+                scope,
+                geo_domain::ChannelAccountRecord {
+                    account: geo_domain::ChannelAccount {
+                        account_id,
+                        project_id: scope.project_id.unwrap(),
+                        owner_kind: geo_domain::ChannelOwnerKind::Customer,
+                        platform: platform.into(),
+                        group_id: None,
+                        status: geo_domain::ChannelStatus::Ready,
+                        display_name: None,
+                        platform_account_id: Some("verified-id".into()),
+                        avatar_url: None,
+                        enabled: true,
+                        proxy_configured: false,
+                        proxy_server: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    session: None,
+                    proxy: None,
+                },
+            )
+            .await
+            .unwrap();
+        account_id
     }
 
     async fn stub_bridge(
@@ -2504,7 +2542,19 @@ mod tests {
                 .await
                 .unwrap();
             let session = Uuid::new_v4();
-            open_test_browser(&service, &scope, session).await;
+            service
+                .open_execution_browser(
+                    &scope,
+                    account_id,
+                    session,
+                    geo_domain::BrowserOperationPurpose::Measure,
+                    None,
+                    "kimi",
+                    None,
+                    &json!({"cookies":[],"origins":[]}),
+                )
+                .await
+                .unwrap();
             let (result, closed) = execute_and_close_with_cleanup_and_ticket(
                 &bridge,
                 &service,
@@ -2621,11 +2671,12 @@ mod tests {
             Some(Uuid::new_v4().into()),
         );
         let session = Uuid::new_v4();
+        let account_id = seed_browser_account(&service, &scope, "zhihu").await;
         assert!(
             service
                 .open_execution_browser(
                     &scope,
-                    Uuid::new_v4(),
+                    account_id,
                     session,
                     geo_domain::BrowserOperationPurpose::Publish,
                     None,

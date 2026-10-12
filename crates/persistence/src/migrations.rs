@@ -220,6 +220,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 52,
         description: "browser operations",
     },
+    MigrationMetadata {
+        version: 53,
+        description: "account network bindings",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {
