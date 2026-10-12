@@ -74,6 +74,74 @@ function exchange() {
   };
 }
 
+function redactedExchange() {
+  const value = exchange();
+  delete value.messages[2].raw_data;
+  value.source_redaction = {
+    schema_version: "geo.observation.source-redaction.v1",
+    policy: "reasoning-and-private-fields",
+    omitted_paths: ["/messages/2/raw_data"],
+  };
+  return value;
+}
+
+test("saved redacted finish framing preserves completion without restoring opaque bytes", () => {
+  const value = redactedExchange();
+  const record = extractionCaptureRecord(value, { provider: "deepseek" });
+  const saved = JSON.parse(record.source_json);
+  assert.deepEqual(
+    record.completion,
+    capturedConversationCompletion(exchange()),
+  );
+  assert.deepEqual(capturedConversationCompletion(saved), record.completion);
+  assert.equal(Object.hasOwn(saved.messages[2], "raw_data"), false);
+  assert.equal(extractionPrompt(saved).includes("not necessarily JSON"), false);
+  value.messages.unshift({ event: "unknown", data: {} });
+  value.source_redaction.omitted_paths = ["/messages/3/raw_data"];
+  assert.deepEqual(capturedConversationCompletion(value), record.completion);
+});
+
+test("redacted finish requires exact unique absent paths in a closed valid manifest", () => {
+  const invalid = {
+    "missing manifest": (v) => delete v.source_redaction,
+    "null manifest": (v) => (v.source_redaction = null),
+    "wrong schema": (v) => (v.source_redaction.schema_version = "unknown"),
+    "wrong policy": (v) => (v.source_redaction.policy = "unknown"),
+    "extra field": (v) => (v.source_redaction.extra = true),
+    "missing paths": (v) => delete v.source_redaction.omitted_paths,
+    "empty paths": (v) => (v.source_redaction.omitted_paths = []),
+    "wrong event index": (v) =>
+      (v.source_redaction.omitted_paths = ["/messages/1/raw_data"]),
+    "noncanonical index": (v) =>
+      (v.source_redaction.omitted_paths = ["/messages/02/raw_data"]),
+    "wrong field": (v) =>
+      (v.source_redaction.omitted_paths = ["/messages/2/data"]),
+    duplicate: (v) =>
+      v.source_redaction.omitted_paths.push("/messages/2/raw_data"),
+    "non-string path": (v) => v.source_redaction.omitted_paths.push(null),
+    "invalid escape": (v) =>
+      v.source_redaction.omitted_paths.push("/messages/1/~2"),
+    "out of bounds": (v) =>
+      v.source_redaction.omitted_paths.push("/messages/3/raw_data"),
+    "present field": (v) =>
+      v.source_redaction.omitted_paths.push("/messages/0/data"),
+    "null raw data": (v) => (v.messages[2].raw_data = null),
+    "present raw data": (v) => (v.messages[2].raw_data = ""),
+    "wrong event": (v) => (v.messages[2].event = "close"),
+    "missing finish": (v) => v.messages.pop(),
+    "missing ready": (v) => v.messages.splice(0, 1),
+    "missing history": (v) => delete v.lifecycle.history,
+    "modified ready ID": (v) => (v.messages[0].data.response_message_id = 2),
+    "modified history ID": (v) =>
+      (v.lifecycle.history.messages[1].message_id = 2),
+  };
+  for (const [label, mutate] of Object.entries(invalid)) {
+    const value = redactedExchange();
+    mutate(value);
+    assert.equal(capturedConversationCompletion(value), null, label);
+  }
+});
+
 test("shared source persistence retains lifecycle without exposing it as AI answer evidence", () => {
   const source = exchange();
   const document = observationDocument(source);

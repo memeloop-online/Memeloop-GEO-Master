@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { chromium } from "playwright";
 import { observeDeepSeekWebSearch } from "../src/deepseek-web-search.mjs";
+import { projectDeepseekSource } from "../src/deepseek-source-projection.mjs";
+import { capturedConversationCompletion } from "../src/deepseek-conversation-evidence.mjs";
 
 const origin = "https://chat.deepseek.com";
 const payload = {
@@ -99,6 +101,265 @@ function fixture() {
   };
   return { page, calls, options };
 }
+
+function historyFixture() {
+  const f = fixture();
+  const exchange = {
+    ...source,
+    sse_terminal: true,
+    messages: [
+      {
+        event: "ready",
+        data: {
+          request_message_id: 0,
+          response_message_id: 2,
+          model_type: payload.model,
+        },
+      },
+      {
+        event: "message",
+        data: {
+          p: "response",
+          o: "SET",
+          v: {
+            status: "FINISHED",
+            fragments: [
+              { type: "RESPONSE", content: "Synthetic answer." },
+              { type: "SEARCH", queries: ["synthetic rainfall"] },
+              { type: "THINK", content: "Synthetic private reasoning" },
+            ],
+          },
+        },
+      },
+      { event: "finish", raw_data: "[DONE]" },
+    ],
+  };
+  const history = {
+    source: "browser_observed_history",
+    observed_at: "2026-01-01T00:00:01.000Z",
+    cache_request: { cache_version: null, cache_reset_at: null },
+    cache_control: "REPLACE",
+    chat_session_id: source.created_session.chatSessionId,
+    current_message_id: 2,
+    messages: [
+      {
+        message_id: 0,
+        parent_id: null,
+        role: "USER",
+        status: "FINISHED",
+        has_pending_fragment: false,
+      },
+      {
+        message_id: 2,
+        parent_id: 0,
+        role: "ASSISTANT",
+        status: "FINISHED",
+        has_pending_fragment: false,
+      },
+    ],
+  };
+  const originalObserver = f.options.observeCreatedSessions;
+  f.options.observeCreatedSessions = (...args) => ({
+    ...originalObserver(...args),
+    isCurrent: (proof) => proof === exchange.created_session,
+  });
+  f.options.capture = async (_page, limits) => {
+    f.calls.push("capture");
+    await limits.submit(f.page, limits.signal);
+    return exchange;
+  };
+  f.options.prepareSource = projectDeepseekSource;
+  f.options.readHistory = async (_page, limits) => {
+    f.calls.push("history");
+    assert.equal(limits.conversationId, "fixture-selected");
+    assert.equal(limits.requestMessageId, 0);
+    assert.equal(limits.responseMessageId, 2);
+    return { history, inventory: { conversationId: "fixture-selected" } };
+  };
+  f.options.persistConversation = async (receipt) => {
+    f.calls.push("ownership");
+    f.receipt = receipt;
+    return { durable: true };
+  };
+  f.options.onEvidence = async (record) => {
+    f.calls.push(record.phase);
+    if (record.phase === "source") f.evidence = record;
+  };
+  f.options.apiExtract = async () => {
+    f.calls.push("extract");
+    const path = `/messages/${exchange.messages.findIndex((message) => message.event === "message")}/data/v`;
+    return {
+      model: "fixture-parser",
+      surface: "model_api",
+      extracted: {
+        completion: "complete",
+        completion_evidence: [{ path: `${path}/status` }],
+        search_used: "yes",
+        search_evidence: [{ path: `${path}/fragments/1/queries` }],
+        answer_segments: [{ path: `${path}/fragments/0/content` }],
+        citations: [],
+      },
+    };
+  };
+  return Object.assign(f, { exchange, history });
+}
+
+test("fresh first-turn history is bound to transport IDs and retained in durable source and hash", async () => {
+  const f = historyFixture();
+  const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+  assert.equal(result.raw_answer, "Synthetic answer.");
+  const saved = JSON.parse(f.evidence.source_json);
+  const lifecycle = f.receipt.captured.lifecycle;
+  assert.equal(lifecycle.creation.chat_session_id, "fixture-selected");
+  assert.deepEqual(lifecycle.ready, {
+    request_message_id: 0,
+    response_message_id: 2,
+  });
+  assert.equal(
+    lifecycle.submission.prompt_sha256,
+    createHash("sha256").update(payload.question).digest("hex"),
+  );
+  assert.deepEqual(saved.lifecycle, lifecycle);
+  assert.deepEqual(
+    capturedConversationCompletion(f.receipt.captured),
+    capturedConversationCompletion(saved),
+  );
+  assert.deepEqual(capturedConversationCompletion(saved), {
+    protocol: "deepseek_history_json",
+    terminal: true,
+    assistant_message_ids: ["2"],
+  });
+  assert.equal(
+    f.evidence.source_sha256,
+    createHash("sha256").update(f.evidence.source_json).digest("hex"),
+  );
+  assert.equal(result.extraction_audit.source_sha256, f.evidence.source_sha256);
+  assert.equal(
+    f.evidence.source_json.includes("Synthetic private reasoning"),
+    false,
+  );
+  assert.ok(f.calls.indexOf("history") < f.calls.indexOf("ownership"));
+  assert.ok(f.calls.indexOf("source") < f.calls.indexOf("extract"));
+  assert.equal(f.calls.filter((call) => call === "send").length, 1);
+});
+
+test("unavailable, failed or bounded-out history preserves sanitized evidence without a second submission", async () => {
+  for (const scenario of ["unavailable", "failure", "timeout"]) {
+    const f = historyFixture();
+    let late;
+    let historySignal;
+    f.options.readHistory = async (_page, limits) => {
+      f.calls.push("history");
+      historySignal = limits.signal;
+      assert.ok(limits.timeoutMs > 0 && limits.timeoutMs <= 100, scenario);
+      if (scenario === "failure") throw new Error("synthetic private error");
+      if (scenario === "timeout")
+        return new Promise((resolve) => {
+          late = resolve;
+        });
+      return null;
+    };
+    const result = await observeDeepSeekWebSearch(f.page, payload, {
+      ...f.options,
+      deadlineAt: performance.now() + 400,
+    });
+    assert.equal(result.raw_answer, "Synthetic answer.", scenario);
+    assert.ok(historySignal.aborted, scenario);
+    assert.equal(f.receipt.captured.lifecycle, undefined, scenario);
+    assert.equal(
+      JSON.parse(f.evidence.source_json).lifecycle,
+      undefined,
+      scenario,
+    );
+    assert.equal(
+      f.evidence.source_json.includes("Synthetic private reasoning"),
+      false,
+      scenario,
+    );
+    assert.equal(f.calls.filter((call) => call === "send").length, 1, scenario);
+    if (late) {
+      late({ history: f.history });
+      await new Promise(setImmediate);
+      assert.equal(f.receipt.captured.lifecycle, undefined);
+      assert.equal(f.calls.filter((call) => call === "ownership").length, 1);
+    }
+  }
+});
+
+test("history respects the source deadline while leaving the overall persistence budget available", async () => {
+  const f = historyFixture();
+  const sourceDeadlineAt = performance.now() + 40;
+  let historySignal;
+  f.options.readHistory = (_page, limits) => {
+    historySignal = limits.signal;
+    assert.ok(limits.timeoutMs <= sourceDeadlineAt - performance.now() + 2);
+    return new Promise(() => {});
+  };
+  const result = await observeDeepSeekWebSearch(f.page, payload, {
+    ...f.options,
+    sourceDeadlineAt,
+    deadlineAt: performance.now() + 2_000,
+  });
+  assert.equal(result.raw_answer, "Synthetic answer.");
+  assert.ok(historySignal.aborted);
+  assert.equal(f.receipt.captured.lifecycle, undefined);
+  assert.ok(f.evidence.source_json);
+  assert.equal(f.calls.filter((call) => call === "send").length, 1);
+});
+
+test("invalid transport, mismatched history and expired creation proof cannot attach lifecycle", async () => {
+  for (const scenario of [
+    "duplicate-ready",
+    "wrong-model",
+    "no-eof",
+    "history-id",
+    "history-private-field",
+    "navigation-before",
+    "navigation-after",
+  ]) {
+    const f = historyFixture();
+    if (scenario === "duplicate-ready")
+      f.exchange.messages.unshift(f.exchange.messages[0]);
+    if (scenario === "wrong-model")
+      f.exchange.messages[0].data.model_type = "another-model";
+    if (scenario === "no-eof") f.exchange.sse_terminal = false;
+    if (scenario === "history-id") f.history.messages[1].message_id = 3;
+    if (scenario === "history-private-field")
+      f.history.private_field = "synthetic private metadata";
+    if (scenario.startsWith("navigation-")) {
+      let current = scenario !== "navigation-before";
+      const observe = f.options.observeCreatedSessions;
+      f.options.observeCreatedSessions = (...args) => ({
+        ...observe(...args),
+        isCurrent: () => current,
+      });
+      const readHistory = f.options.readHistory;
+      f.options.readHistory = async (...args) => {
+        const result = await readHistory(...args);
+        current = false;
+        return result;
+      };
+    }
+    const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+    assert.equal(result.raw_answer, "Synthetic answer.", scenario);
+    assert.equal(f.receipt.captured.lifecycle, undefined, scenario);
+    assert.equal(
+      JSON.parse(f.evidence.source_json).lifecycle,
+      undefined,
+      scenario,
+    );
+    assert.equal(f.calls.filter((call) => call === "send").length, 1, scenario);
+    if (
+      [
+        "duplicate-ready",
+        "wrong-model",
+        "no-eof",
+        "navigation-before",
+      ].includes(scenario)
+    )
+      assert.equal(f.calls.includes("history"), false, scenario);
+  }
+});
 
 test("arms both observers before fresh navigation, persists before shared AI extraction, disposes only observers", async () => {
   const f = fixture();
@@ -338,6 +599,7 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
   const calls = [];
   let sends = 0;
   let creates = 0;
+  let historyReads = 0;
   let savedSource;
   let savedSourceHash;
   const event = (name, data) =>
@@ -452,6 +714,53 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
           contentType: "text/event-stream; charset=utf-8",
           body: wire,
         });
+      } else if (url.pathname === "/api/v0/chat/history_messages") {
+        historyReads++;
+        assert.equal(request.method(), "GET");
+        assert.equal(
+          url.searchParams.get("chat_session_id"),
+          "fixture-selected",
+        );
+        assert.equal(url.searchParams.get("cache_version"), "null");
+        assert.equal(url.searchParams.get("cache_reset_at"), "null");
+        await route.fulfill({
+          json: {
+            code: 0,
+            data: {
+              biz_code: 0,
+              biz_data: {
+                cache_control: "REPLACE",
+                chat_session: {
+                  id: "fixture-selected",
+                  current_message_id: 2,
+                },
+                chat_messages: [
+                  {
+                    message_id: 1,
+                    parent_id: null,
+                    role: "USER",
+                    status: "FINISHED",
+                    has_pending_fragment: false,
+                    fragments: [],
+                  },
+                  {
+                    message_id: 2,
+                    parent_id: 1,
+                    role: "ASSISTANT",
+                    status: "FINISHED",
+                    has_pending_fragment: false,
+                    fragments: [
+                      {
+                        type: "THINK",
+                        content: "Synthetic private history reasoning",
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        });
       } else await route.abort();
     });
     const page = await context.newPage();
@@ -477,6 +786,15 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
         assert.equal(binding.searchEnabled, true);
         assert.equal(binding.thinkingEnabled, false);
         assert.match(binding.questionSha256, /^[a-f0-9]{64}$/u);
+        assert.equal(
+          captured.lifecycle.creation.chat_session_id,
+          "fixture-selected",
+        );
+        assert.deepEqual(capturedConversationCompletion(captured), {
+          protocol: "deepseek_history_json",
+          terminal: true,
+          assistant_message_ids: ["2"],
+        });
         return { durable: true };
       },
       onEvidence: async (record) => {
@@ -531,6 +849,7 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
     assert.deepEqual(calls, ["ownership", "source", "extract", "candidate"]);
     assert.equal(sends, 1);
     assert.equal(creates, 2);
+    assert.equal(historyReads, 1);
     assert.equal(page.isClosed(), false);
     assert.equal(page.listenerCount("response"), 0);
     assert.equal(page.listenerCount("request"), 0);
@@ -546,6 +865,13 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
     assert.ok(result.source_redaction.omitted_paths.length > 0);
     assert.deepEqual(savedSource.source_redaction, result.source_redaction);
     assert.equal(result.extraction_audit.source_sha256, savedSourceHash);
+    assert.equal(savedSource.lifecycle.history.messages.length, 2);
+    assert.equal(
+      JSON.stringify(savedSource).includes(
+        "Synthetic private history reasoning",
+      ),
+      false,
+    );
     await context.close();
   } finally {
     await browser.close();

@@ -6,6 +6,7 @@ import {
 } from "./ai-observation-parser.mjs";
 import { probeDeepseekAccount } from "./consumer-web-identity.mjs";
 import { observeDeepSeekCreatedSessions } from "./deepseek-created-sessions.mjs";
+import { capturedConversationCompletion } from "./deepseek-conversation-evidence.mjs";
 import { projectDeepseekSource } from "./deepseek-source-projection.mjs";
 import { observeDeepSeekModelConfiguration } from "./deepseek-web-configuration.mjs";
 import {
@@ -16,6 +17,7 @@ import {
   captureDeepSeekExchange,
   DEEPSEEK_WEB_ORIGIN,
 } from "./deepseek-web-measurement.mjs";
+import { readDeepSeekFirstTurnHistory } from "./deepseek-web-history.mjs";
 
 class FlowError extends Error {
   constructor(code) {
@@ -26,18 +28,21 @@ class FlowError extends Error {
 
 /**
  * Inactive integration entry point: the caller owns the page/context lifetime.
- * A provider-specific durable ownership adapter must be explicitly supplied
- * before any question can be sent. The existing Kimi-only registry is not one.
+ * A provider-specific ownership staging adapter must be explicitly supplied
+ * before any question can be sent; transport evidence registration alone is
+ * not that persistence integration.
  *
  * persistConversation receives the exact creation proof and sanitized capture,
- * plus the independently reverified account. Only {durable:true} acknowledges
- * persistence; it is not completion or deletion authority. Failure cannot
- * discard captured source or cause a second submission.
+ * plus the independently reverified account. An adapter may stage ownership
+ * with {durable:false}, then atomically persist it with the source in onEvidence.
+ * It must not wait here for that later checkpoint. Only {durable:true}
+ * acknowledges independent ownership persistence; neither status is completion
+ * or deletion authority. Failure cannot discard source or cause another send.
  *
  * Source projection is privacy-only. The shared interpreter owns all answer,
  * search and citation semantics. The source document retains messages and the
- * privacy redaction manifest. Durable creation/request binding and lifecycle
- * contracts must be completed before this entry point is registered.
+ * privacy redaction manifest and, when independently verified, history lifecycle.
+ * Production registration and remote cleanup remain separate integrations.
  */
 export async function observeDeepSeekWebSearch(
   page,
@@ -60,6 +65,7 @@ export async function observeDeepSeekWebSearch(
     configure = configureDeepSeekPage,
     capture = captureDeepSeekExchange,
     submitQuestion = submitDeepSeekQuestion,
+    readHistory = readDeepSeekFirstTurnHistory,
     prepareSource = projectDeepseekSource,
     interpret = interpretObservation,
   } = {},
@@ -236,8 +242,92 @@ export async function observeDeepSeekWebSearch(
     if (!captured?.created_session) return unknown("capture_unverified");
     const prepared = prepareSource(captured);
     if (!prepared?.exchange) return unknown("source_privacy_unverified");
+    let exchange = prepared.exchange;
     // Keep privacy metadata separate from provider transport evidence.
     sourceRedaction = prepared.redaction;
+    const questionSha256 = createHash("sha256")
+      .update(payload.question, "utf8")
+      .digest("hex");
+    stage = "history";
+    // Only transport ready IDs select the read. Never use answer text, an
+    // inferred ID, a latest-session lookup or a second question submission.
+    const readyEvents = captured.messages?.filter(
+      (message) => message?.event === "ready",
+    );
+    const ready = readyEvents?.length === 1 ? readyEvents[0].data : null;
+    const validId = (id) =>
+      Number.isSafeInteger(id) && id >= 0 && !Object.is(id, -0);
+    if (
+      captured.sse_terminal === true &&
+      validId(ready?.request_message_id) &&
+      validId(ready?.response_message_id) &&
+      ready.request_message_id !== ready.response_message_id &&
+      (ready.model_type == null || ready.model_type === payload.model) &&
+      createdSessions?.isCurrent?.(captured.created_session) === true
+    ) {
+      try {
+        // Leave at least three quarters of the remaining overall budget for
+        // durable ownership/source checkpoints and the shared interpreter.
+        const historyDeadline = Math.min(
+          captureDeadline,
+          performance.now() +
+            Math.min(5_000, (overallDeadline - performance.now()) / 4),
+        );
+        const observed = await run(
+          (limits) =>
+            readHistory(page, {
+              ...limits,
+              conversationId: captured.created_session.chatSessionId,
+              requestMessageId: ready.request_message_id,
+              responseMessageId: ready.response_message_id,
+            }),
+          historyDeadline,
+        );
+        const lifecycle = {
+          schema_version: "geo.deepseek.lifecycle.v1",
+          provider: "deepseek",
+          creation: {
+            source: captured.created_session.source,
+            chat_session_id: captured.created_session.chatSessionId,
+          },
+          // capture() independently matched these fields against the actual
+          // first-turn POST before returning this exact creation proof.
+          submission: {
+            chat_session_id: captured.created_session.chatSessionId,
+            parent_message_id: null,
+            model_type: payload.model,
+            prompt_sha256: questionSha256,
+            search_enabled: true,
+            thinking_enabled: false,
+          },
+          ready: {
+            request_message_id: ready.request_message_id,
+            response_message_id: ready.response_message_id,
+          },
+          sse_terminal: captured.sse_terminal,
+          history: observed?.history,
+        };
+        if (
+          createdSessions.isCurrent(captured.created_session) === true &&
+          capturedConversationCompletion({ ...captured, lifecycle }) &&
+          capturedConversationCompletion({
+            ...exchange,
+            source_redaction: sourceRedaction,
+            lifecycle,
+          })
+        ) {
+          // Validate against raw transport, then retain only the closed
+          // metadata contract. Never restore privacy-omitted finish payloads.
+          exchange = {
+            ...exchange,
+            source_redaction: sourceRedaction,
+            lifecycle: structuredClone(lifecycle),
+          };
+        }
+      } catch {
+        // Optional history cannot discard a captured, privacy-safe source.
+      }
+    }
     // Never route an AI-inferred ID to the ownership ledger.
     ownershipReceiptStatus = "unpersisted";
     try {
@@ -245,15 +335,13 @@ export async function observeDeepSeekWebSearch(
         (limits) =>
           persistConversation({
             createdSession: captured.created_session,
-            captured: prepared.exchange,
+            captured: exchange,
             binding: {
               model: payload.model,
               parentMessageId: null,
               searchEnabled: true,
               thinkingEnabled: false,
-              questionSha256: createHash("sha256")
-                .update(payload.question, "utf8")
-                .digest("hex"),
+              questionSha256,
             },
             expectedAccountId,
             onConversationCaptured,
@@ -273,7 +361,7 @@ export async function observeDeepSeekWebSearch(
     const observation = await run(
       (limits) =>
         interpret(
-          { ...prepared.exchange, source_redaction: sourceRedaction },
+          { ...exchange, source_redaction: sourceRedaction },
           {
             provider: "deepseek",
             deadlineAt: overallDeadline,
@@ -316,9 +404,7 @@ export async function observeDeepSeekWebSearch(
         source_sha256: observation.audit.source_sha256,
         observed_at: captured.received_at,
         request_model: payload.model,
-        request_question_sha256: createHash("sha256")
-          .update(payload.question, "utf8")
-          .digest("hex"),
+        request_question_sha256: questionSha256,
       },
     };
   } catch (error) {

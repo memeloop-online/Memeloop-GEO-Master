@@ -1,7 +1,10 @@
 //! Closed provider registry for transport lifecycle evidence, not answer
 //! interpretation or account-wide cleanup authority.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use chrono::DateTime;
 use serde_json::Value;
@@ -367,10 +370,28 @@ fn deepseek_completion_inventory<'a>(
     if messages.len() > 32_768 {
         return None;
     }
-    for message in messages {
+    let mut omitted_paths = HashSet::new();
+    if document.get("source_redaction").is_some() {
+        // This shared check validates the lifecycle shape, not completion,
+        // so it cannot recursively enter this inventory verifier.
+        if !crate::observation_capture::valid_observation_source_document(document) {
+            return None;
+        }
+        for path in document["source_redaction"]["omitted_paths"].as_array()? {
+            if !omitted_paths.insert(path.as_str()?) {
+                return None;
+            }
+        }
+    }
+    for (index, message) in messages.iter().enumerate() {
         let event = message.get("event")?.as_str()?;
         if event == "finish" {
-            if !ready || finished || !message.get("raw_data").is_some_and(Value::is_string) {
+            // Do not restore or interpret opaque payloads removed by projection.
+            let finish_payload = match message.get("raw_data") {
+                Some(value) => value.is_string(),
+                None => omitted_paths.contains(format!("/messages/{index}/raw_data").as_str()),
+            };
+            if !ready || finished || !finish_payload {
                 return None;
             }
             finished = true;
@@ -485,6 +506,109 @@ mod tests {
             &deepseek_completion(),
         )
         .is_some()
+    }
+
+    fn redacted_deepseek_source() -> Value {
+        let mut document = synthetic_deepseek_source();
+        document["messages"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("raw_data");
+        document["source_redaction"] = serde_json::json!({
+            "schema_version": "geo.observation.source-redaction.v1",
+            "policy": "reasoning-and-private-fields",
+            "omitted_paths": ["/messages/2/raw_data"]
+        });
+        document
+    }
+
+    #[test]
+    fn deepseek_redacted_finish_preserves_completion_without_opaque_payload() {
+        let document = redacted_deepseek_source();
+        let saved: Value = serde_json::from_str(&document.to_string()).unwrap();
+        assert!(complete(&saved));
+        assert_eq!(
+            completion_inventory("deepseek", &saved, "synthetic-chat", &deepseek_completion()),
+            completion_inventory(
+                "deepseek",
+                &synthetic_deepseek_source(),
+                "synthetic-chat",
+                &deepseek_completion()
+            )
+        );
+        assert!(saved["messages"][2].get("raw_data").is_none());
+        let mut shifted = saved;
+        shifted["messages"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, serde_json::json!({"event": "unknown", "data": {}}));
+        shifted["source_redaction"]["omitted_paths"] = serde_json::json!(["/messages/3/raw_data"]);
+        assert!(complete(&shifted));
+    }
+
+    #[test]
+    fn deepseek_redacted_finish_requires_closed_unique_exact_absent_paths() {
+        let document = redacted_deepseek_source();
+        for paths in [
+            serde_json::json!([]),
+            serde_json::json!(["/messages/1/raw_data"]),
+            serde_json::json!(["/messages/02/raw_data"]),
+            serde_json::json!(["/messages/2/data"]),
+            serde_json::json!(["/messages/2/raw_data", "/messages/2/raw_data"]),
+            serde_json::json!(["/messages/2/raw_data", null]),
+            serde_json::json!(["/messages/2/raw_data", "/messages/1/~2"]),
+            serde_json::json!(["/messages/2/raw_data", "/messages/3/raw_data"]),
+            serde_json::json!(["/messages/2/raw_data", "/messages/0/data"]),
+        ] {
+            let mut invalid = document.clone();
+            invalid["source_redaction"]["omitted_paths"] = paths;
+            assert!(!complete(&invalid), "{}", invalid["source_redaction"]);
+        }
+        for (path, value) in [
+            ("/source_redaction", Value::Null),
+            (
+                "/source_redaction/schema_version",
+                serde_json::json!("unknown"),
+            ),
+            ("/source_redaction/policy", serde_json::json!("unknown")),
+            ("/messages/2/event", serde_json::json!("close")),
+            ("/messages/0/data/response_message_id", serde_json::json!(3)),
+            (
+                "/lifecycle/history/messages/1/message_id",
+                serde_json::json!(3),
+            ),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(!complete(&invalid), "{path}");
+        }
+        for raw_data in [Value::Null, serde_json::json!("")] {
+            let mut invalid = document.clone();
+            invalid["messages"][2]["raw_data"] = raw_data;
+            assert!(!complete(&invalid));
+        }
+        let mut invalid = document.clone();
+        invalid["source_redaction"]["extra"] = serde_json::json!(true);
+        assert!(!complete(&invalid));
+        for (path, key) in [
+            ("", "source_redaction"),
+            ("/source_redaction", "omitted_paths"),
+            ("/lifecycle", "history"),
+        ] {
+            let mut invalid = document.clone();
+            invalid
+                .pointer_mut(path)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(!complete(&invalid), "missing {path}/{key}");
+        }
+        for index in [0, 2] {
+            let mut invalid = document.clone();
+            invalid["messages"].as_array_mut().unwrap().remove(index);
+            assert!(!complete(&invalid), "missing event {index}");
+        }
     }
 
     #[test]
