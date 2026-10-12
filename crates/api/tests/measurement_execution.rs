@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use axum::{
     Json, Router,
     extract::State,
-    http::{Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     routing::any,
 };
 use chrono::{Duration, Utc};
@@ -109,11 +109,32 @@ async fn runner(
     State(Runner(case, executions)): State<Runner>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
     payload: Option<Json<Value>>,
 ) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer private-test-token");
+    const GENERATION: &str = "5ce59c3b-27b9-4fdc-bc95-fbb5a22ac7cc";
     let input = payload.map(|Json(value)| value).unwrap_or(Value::Null);
     let response = match (method.as_str(), uri.path()) {
-        ("POST", "/v1/sessions") => json!({"session_id": input["session_id"]}),
+        ("GET", "/v1/lifecycle") => json!({"generation":GENERATION}),
+        ("POST", "/v1/sessions") => {
+            assert_eq!(input["expected_generation"], GENERATION);
+            json!({"session_id":input["session_id"],"generation":GENERATION})
+        }
+        ("POST", path) if path.ends_with("/dispose") => {
+            assert_eq!(input["expected_generation"], GENERATION);
+            if matches!(case, Receipt::InvalidProvenance) {
+                // Preserve this case's successful-but-unproven cleanup: an
+                // ordinary acknowledgement must not release durable ownership.
+                return (StatusCode::OK, Json(json!({"closed":true})));
+            }
+            let session = path
+                .strip_prefix("/v1/sessions/")
+                .unwrap()
+                .strip_suffix("/dispose")
+                .unwrap();
+            json!({"session_id":session,"generation":GENERATION,"state":"disposed"})
+        }
         ("POST", "/v1/executions") => {
             executions.lock().unwrap().push(input.clone());
             let frozen = &input["payload"];
@@ -555,8 +576,8 @@ async fn run_with_provider(
     assert_eq!(executions.lock().unwrap().len(), 1);
     if matches!(case, Receipt::InvalidProvenance) {
         // A malformed top-level receipt cannot establish the execution's
-        // outcome. Even the fixture's successful close is not evidence that
-        // the external measurement stopped, so retain the account lease.
+        // outcome. This fixture returns only a legacy cleanup acknowledgement,
+        // not pinned disposal proof, so retain the account ownership.
         let now = Utc::now();
         assert!(
             repo.reserve_account(

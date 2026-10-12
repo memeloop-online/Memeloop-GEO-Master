@@ -106,15 +106,19 @@ async fn discover_with_timeouts(
         )
         .await?;
     let session_id = Uuid::new_v4();
-    let mut start_confirmed = false;
     let operation = async {
         if tokio::time::Instant::now() >= operation_deadline {
             return Err(discovery_timeout());
         }
         let (_, mut version) = service
-            .resume_available_browser_with_renewal_id(scope, account_id, session_id)
+            .resume_available_browser_with_renewal_id_reserved(
+                scope,
+                account_id,
+                session_id,
+                reservation_id,
+                geo_domain::BrowserOperationPurpose::Discovery,
+            )
             .await?;
-        start_confirmed = true;
         if version.platform != account.platform || &version.platform_account_id != expected {
             return Err(AppError::conflict(
                 "channel account changed while checking models; reconnect or retry",
@@ -141,25 +145,23 @@ async fn discover_with_timeouts(
         .unwrap_or_else(|_| Err(discovery_timeout()));
     // Always discard the temporary inspection context, including on identity
     // failure or unavailable menus. Verified renewal stays encrypted server-side.
-    let closed = tokio::time::timeout(close_timeout, browser.close(session_id))
-        .await
-        .unwrap_or_else(|_| {
-            Err(AppError::new(
-                ErrorCode::DependencyUnavailable,
-                "browser inspection cleanup timed out; retry later",
-            ))
-        });
-    // A lost start response can complete after close. Keep that reservation
-    // until expiry even if close currently reports absence.
-    if start_confirmed && closed.is_ok() {
-        let released = state
-            .channel_job_repository()
-            .release_account(scope, account_id, reservation_id)
-            .await;
-        if result.is_ok() {
-            released?;
-        }
-    }
+    let closed = tokio::time::timeout(
+        close_timeout,
+        service.close_owned_browser(scope, session_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(AppError::new(
+            ErrorCode::DependencyUnavailable,
+            "browser inspection cleanup timed out; retry later",
+        ))
+    });
+    // Only the pinned generation's disposal proof releases attached ownership.
+    // This also releases an unsent preflight if preparation failed before start.
+    let _ = state
+        .channel_job_repository()
+        .release_account(scope, account_id, reservation_id)
+        .await;
     match result {
         Ok(options) => {
             closed?;
