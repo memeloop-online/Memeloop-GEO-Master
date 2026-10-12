@@ -551,6 +551,11 @@ function RevisionEditor({
   );
   const [baselineDocument, setBaselineDocument] = useState(revision.document);
   const changeGeneration = useRef(0);
+  const draftGeneration = changeGeneration.current;
+  const saveRequest = useRef<{
+    generation: number;
+    status: "pending" | "saved" | "conflicted";
+  } | null>(null);
   const [baseId, setBaseId] = useState(revision.revision_id);
   const [dirty, setDirty] = useState(false);
   const [conflicted, setConflicted] = useState(false);
@@ -590,17 +595,33 @@ function RevisionEditor({
   const save = () => {
     if (
       !dirty ||
+      readonly ||
+      draftGeneration !== changeGeneration.current ||
+      saveRequest.current?.status === "pending" ||
+      saveRequest.current?.status === "conflicted" ||
+      (saveRequest.current?.status === "saved" &&
+        saveRequest.current.generation >= draftGeneration) ||
       mutation.isPending ||
       conflicted ||
       editorError ||
       unsupported
     )
       return;
-    const submittedGeneration = changeGeneration.current;
+    const submittedGeneration = draftGeneration;
+    // A timer and a click can share the same render before isPending updates.
+    // Keep successful generations too, so an already queued timer cannot replay.
+    saveRequest.current = {
+      generation: submittedGeneration,
+      status: "pending",
+    };
     mutation.mutate(
       { baseRevisionId: baseId, document: draft },
       {
         onSuccess: (result) => {
+          saveRequest.current = {
+            generation: submittedGeneration,
+            status: "saved",
+          };
           setBaseId(result.revision_id);
           setBaselineDocument(result.document);
           if (submittedGeneration === changeGeneration.current) {
@@ -615,8 +636,15 @@ function RevisionEditor({
           }
         },
         onError: (error) => {
-          if (error instanceof ApiError && error.status === 409)
+          if (error instanceof ApiError && error.status === 409) {
+            saveRequest.current = {
+              generation: submittedGeneration,
+              status: "conflicted",
+            };
             setConflicted(true);
+          } else {
+            saveRequest.current = null;
+          }
         },
       },
     );
@@ -747,6 +775,8 @@ function RevisionEditor({
       {conflicted && (
         <Button
           onClick={() => {
+            changeGeneration.current++;
+            saveRequest.current = null;
             setConflicted(false);
             setDirty(false);
             onDirtyChange?.(false);

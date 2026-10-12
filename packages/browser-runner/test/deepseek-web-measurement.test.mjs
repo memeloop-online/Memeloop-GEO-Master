@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { chromium } from "playwright";
+import { observeDeepSeekCreatedSessions } from "../src/deepseek-created-sessions.mjs";
 import {
   captureDeepSeekExchange,
   createDeepSeekEvidenceDecoder,
@@ -45,6 +46,7 @@ const ready = event("ready", {
 const delta = event("delta", { p: "response", o: "APPEND", v: "雨水" });
 const finished = event("finish", { reason: "synthetic" });
 const wire = ready + delta + finished;
+const { chatSessionId: _sessionId, ...unresolvedBinding } = binding;
 
 test("real Chromium captures buffered and subsequent chunks from a local streaming HTTP server", async () => {
   let posts = 0;
@@ -101,6 +103,9 @@ test("real Chromium captures buffered and subsequent chunks from a local streami
     // and ordering event still come from real Chromium/CDP, not Session doubles.
     const localPage = {
       url: () => `${origin}/`,
+      on: (...args) => page.on(...args),
+      off: (...args) => page.off(...args),
+      mainFrame: () => page.mainFrame(),
       context: () => ({
         async newCDPSession() {
           const session = await context.newCDPSession(page);
@@ -142,6 +147,20 @@ test("real Chromium captures buffered and subsequent chunks from a local streami
             },
             async send(method, args) {
               const result = await session.send(method, args);
+              if (method === "Page.getFrameTree") {
+                const frame = result.frameTree.frame;
+                assert.equal(new URL(frame.url).origin, localOrigin);
+                return {
+                  ...result,
+                  frameTree: {
+                    ...result.frameTree,
+                    frame: {
+                      ...frame,
+                      url: `${origin}${new URL(frame.url).pathname}`,
+                    },
+                  },
+                };
+              }
               if (method === "Network.streamResourceContent") {
                 buffered = Buffer.from(
                   result.bufferedData,
@@ -185,12 +204,18 @@ test("real Chromium recovers a completed response by its original request ID wit
   await completedBrowserRecovery(false);
 });
 
-async function completedBrowserRecovery(declaredUtf8) {
+test("real Chromium correlates a prefetched exact create ID instead of the latest session", async () => {
+  await completedBrowserRecovery(true, true);
+});
+
+async function completedBrowserRecovery(declaredUtf8, freshSession = false) {
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
   });
   let posts = 0;
+  let creates = 0;
+  let createdSessions;
   const commands = [];
   try {
     const context = await browser.newContext();
@@ -223,12 +248,39 @@ async function completedBrowserRecovery(declaredUtf8) {
         await route.fulfill({
           contentType: "text/html",
           body: `<button id="send">Send fixture</button><script>
+            ${
+              freshSession
+                ? `Promise.all([0,1].map(() => fetch("/api/v0/chat_session/create",
+                  {method:"POST",body:"{}"}).then(r => r.json())))
+                  .then(results => window.prefetchedId = results[0].data.biz_data.chat_session.id);`
+                : ""
+            }
             document.getElementById("send").onclick = () => fetch(
               ${JSON.stringify(endpoint)},
               {method:"POST",headers:{"content-type":"application/json"},
-               body:${JSON.stringify(JSON.stringify(body))}}
+               body:JSON.stringify({...${JSON.stringify(body)},
+                 chat_session_id:${freshSession ? "window.prefetchedId" : JSON.stringify(binding.chatSessionId)}})}
             ).then(response => response.text());
           </script>`,
+        });
+      } else if (
+        freshSession &&
+        route.request().url() === `${origin}/api/v0/chat_session/create`
+      ) {
+        creates++;
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: 0,
+            data: {
+              biz_code: 0,
+              biz_data: {
+                chat_session: {
+                  id: creates === 1 ? binding.chatSessionId : "other-prefetch",
+                },
+              },
+            },
+          }),
         });
       } else if (route.request().url() === endpoint) {
         posts++;
@@ -243,13 +295,26 @@ async function completedBrowserRecovery(declaredUtf8) {
       }
     });
     const page = await context.newPage();
+    if (freshSession)
+      createdSessions = observeDeepSeekCreatedSessions(page, {
+        timeoutMs: 5000,
+      });
     await page.goto(`${origin}/`);
+    if (freshSession) await page.waitForFunction(() => window.prefetchedId);
     const captured = await captureDeepSeekExchange(page, {
-      binding,
+      binding: freshSession ? unresolvedBinding : binding,
+      createdSessions,
       submit: () => page.locator("#send").click(),
       timeoutMs: 5000,
     });
     assert.equal(posts, 1);
+    if (freshSession) {
+      assert.equal(creates, 2);
+      assert.deepEqual(captured?.created_session, {
+        chatSessionId: binding.chatSessionId,
+        source: "browser_observed_create",
+      });
+    }
     if (declaredUtf8) {
       assert.equal(captured?.sse_terminal, true);
       assert.deepEqual(captured.messages, decode(wire).messages);
@@ -267,15 +332,19 @@ async function completedBrowserRecovery(declaredUtf8) {
     assert.equal(stream.length, 1);
     assert.equal(recovery.length, 1);
     assert.equal(recovery[0].args.requestId, stream[0].args.requestId);
-    assert.deepEqual(commands[0], {
-      method: "Network.enable",
-      args: {
-        maxTotalBufferSize: 750_000,
-        maxResourceBufferSize: 750_000,
-        maxPostDataSize: 64_000,
+    assert.deepEqual(
+      commands.find((item) => item.method === "Network.enable"),
+      {
+        method: "Network.enable",
+        args: {
+          maxTotalBufferSize: 750_000,
+          maxResourceBufferSize: 750_000,
+          maxPostDataSize: 64_000,
+        },
       },
-    });
+    );
   } finally {
+    createdSessions?.dispose();
     await browser.close();
   }
 }
@@ -432,6 +501,7 @@ test("maintained SSE decoder retains bounded raw events and requires ready/finis
 });
 
 class Session extends EventEmitter {
+  frame = { id: "main", loaderId: "document-1", url: `${origin}/` };
   detached = 0;
   commands = [];
   prefix = "";
@@ -441,6 +511,9 @@ class Session extends EventEmitter {
   async send(method, args) {
     this.commands.push(method);
     this.calls.push({ method, args });
+    if (method === "Page.enable") return {};
+    if (method === "Page.getFrameTree")
+      return { frameTree: { frame: { ...this.frame } } };
     if (method === "Network.streamResourceContent") {
       if (this.streamError) throw new Error(this.streamError);
       return { bufferedData: Buffer.from(this.prefix).toString("base64") };
@@ -455,18 +528,23 @@ class Session extends EventEmitter {
 }
 function fixture() {
   const session = new Session();
-  const page = {
+  const page = Object.assign(new EventEmitter(), {
     url: () => `${origin}/`,
+    mainFrame: () => page,
     context: () => ({ newCDPSession: async () => session }),
-  };
+  });
   const start = (patch = {}, responsePatch = {}) => {
     session.emit("Network.requestWillBeSent", {
       requestId: "request-1",
+      frameId: "main",
+      loaderId: "document-1",
       timestamp: 1,
       request: request(patch),
     });
     session.emit("Network.responseReceived", {
       requestId: "request-1",
+      frameId: "main",
+      loaderId: "document-1",
       timestamp: 2,
       response: {
         url: endpoint,
@@ -493,6 +571,349 @@ function fixture() {
 
 const finishedLoading =
   "Protocol error: Request with the provided ID has already finished loading";
+
+function createdFixture(f, options = {}) {
+  const observer = observeDeepSeekCreatedSessions(f.page, options);
+  const create = (id) => {
+    const request = {
+      frame: () => f.page,
+      isNavigationRequest: () => false,
+      url: () => `${origin}/api/v0/chat_session/create`,
+      method: () => "POST",
+      redirectedFrom: () => null,
+      postData: () => "{}",
+    };
+    let release;
+    const body = new Promise((resolve) => (release = resolve));
+    f.page.emit("request", request);
+    f.page.emit("response", {
+      request: () => request,
+      url: request.url,
+      status: () => 200,
+      headerValue: async () => null,
+      body: () => body,
+    });
+    return () =>
+      release(
+        Buffer.from(
+          JSON.stringify({
+            code: 0,
+            data: {
+              biz_code: 0,
+              biz_data: { chat_session: { id } },
+            },
+          }),
+        ),
+      );
+  };
+  return { observer, create };
+}
+
+test("exact fresh-session lookup waits across live streaming or recovered EOF without resubmission", async () => {
+  for (const recover of [false, true]) {
+    const f = fixture();
+    const { observer, create } = createdFixture(f);
+    const releaseSelected = create(binding.chatSessionId);
+    const releaseOther = create("newest-unrelated");
+    releaseOther();
+    if (recover) f.session.streamError = finishedLoading;
+    let submits = 0;
+    let completed = false;
+    try {
+      const capture = captureDeepSeekExchange(f.page, {
+        binding: unresolvedBinding,
+        createdSessions: observer,
+        submit: async () => {
+          submits++;
+          f.start();
+          if (!recover) f.bytes(wire);
+          f.end();
+          await new Promise(setImmediate);
+          assert.equal(completed, false, "EOF cannot bypass pending proof");
+          assert.ok(
+            f.session.commands.includes("Network.streamResourceContent"),
+          );
+          if (recover)
+            assert.ok(f.session.commands.includes("Network.getResponseBody"));
+          releaseSelected();
+        },
+      }).then((result) => {
+        completed = true;
+        return result;
+      });
+      const captured = await capture;
+      assert.equal(submits, 1);
+      assert.deepEqual(captured?.messages, decode(wire).messages);
+      assert.equal(
+        captured.created_session,
+        await observer.lookup(binding.chatSessionId),
+      );
+      assert.equal(observer.status(), "observing", "caller owns observer");
+      assert.equal(f.session.detached, 1);
+    } finally {
+      observer.dispose();
+    }
+  }
+});
+
+test("fresh-session correlation retains every ordinary-submission and document check", async () => {
+  for (const patch of [
+    { prompt: "other" },
+    { model_type: "other" },
+    { search_enabled: false },
+    { thinking_enabled: true },
+    { parent_message_id: 1 },
+    { ref_file_ids: ["file"] },
+    { action: "regenerate" },
+    { child_message_id: 2 },
+    { message_id: 1 },
+    { chat_session_id: "unobserved" },
+    { chat_session_id: null },
+    { chat_session_id: "invalid/id" },
+  ]) {
+    const f = fixture();
+    const { observer, create } = createdFixture(f);
+    create(binding.chatSessionId)();
+    try {
+      assert.equal(
+        await captureDeepSeekExchange(f.page, {
+          binding: unresolvedBinding,
+          createdSessions: observer,
+          submit: () => {
+            f.start(patch);
+            f.bytes(wire);
+            f.end();
+          },
+        }),
+        null,
+        JSON.stringify(patch),
+      );
+    } finally {
+      observer.dispose();
+    }
+  }
+  for (const field of ["frameId", "loaderId"]) {
+    const f = fixture();
+    const { observer, create } = createdFixture(f);
+    create(binding.chatSessionId)();
+    try {
+      assert.equal(
+        await captureDeepSeekExchange(f.page, {
+          binding: unresolvedBinding,
+          createdSessions: observer,
+          submit: () =>
+            f.session.emit("Network.requestWillBeSent", {
+              requestId: "request-1",
+              frameId: "main",
+              loaderId: "document-1",
+              timestamp: 1,
+              request: request(),
+              [field]: "different",
+            }),
+        }),
+        null,
+      );
+    } finally {
+      observer.dispose();
+    }
+  }
+});
+
+test("pending fresh-session proof cannot outlive cancellation, navigation, duplicates or deadlines", async () => {
+  for (const scenario of [
+    "cancel",
+    "navigate",
+    "duplicate",
+    "ambiguous",
+    "observer-disposed",
+    "observer-timeout",
+    "capture-timeout",
+  ]) {
+    const f = fixture();
+    const { observer, create } = createdFixture(f, {
+      timeoutMs: scenario === "observer-timeout" ? 20 : 1000,
+    });
+    const release = create(binding.chatSessionId);
+    const controller = new AbortController();
+    let submits = 0;
+    try {
+      const result = await captureDeepSeekExchange(f.page, {
+        binding: unresolvedBinding,
+        createdSessions: observer,
+        signal: controller.signal,
+        timeoutMs: scenario === "capture-timeout" ? 20 : 1000,
+        submit: () => {
+          submits++;
+          f.start();
+          f.bytes(wire);
+          f.end();
+          if (scenario === "cancel") controller.abort();
+          if (scenario === "navigate")
+            f.session.emit("Page.frameNavigated", {
+              frame: { ...f.session.frame, loaderId: "replacement" },
+            });
+          if (scenario === "duplicate")
+            f.session.emit("Network.requestWillBeSent", {
+              requestId: "second",
+              request: request(),
+            });
+          if (scenario === "ambiguous") {
+            create(binding.chatSessionId)();
+            release();
+          }
+          if (scenario === "observer-disposed") observer.dispose();
+        },
+      });
+      assert.equal(result, null, scenario);
+      assert.equal(submits, 1, scenario);
+      release();
+      await new Promise(setImmediate);
+      assert.equal(f.session.eventNames().length, 0, scenario);
+      assert.equal(f.session.detached, 1, scenario);
+    } finally {
+      observer.dispose();
+    }
+  }
+});
+
+test("proof is checked again after EOF and invalidation cannot be replaced with a new proof", async () => {
+  for (const scenario of ["duplicate-create", "navigation", "disposed"]) {
+    const f = fixture();
+    const { observer, create } = createdFixture(f);
+    create(binding.chatSessionId)();
+    let firstProof;
+    const lookup = observer.lookup;
+    let lookups = 0;
+    observer.lookup = async (id) => {
+      const proof = await lookup(id);
+      if (++lookups === 1) firstProof = proof;
+      return proof;
+    };
+    try {
+      const result = await captureDeepSeekExchange(f.page, {
+        binding: unresolvedBinding,
+        createdSessions: observer,
+        submit: async () => {
+          f.start();
+          f.bytes(wire);
+          await new Promise(setImmediate);
+          assert.ok(firstProof);
+          if (scenario === "duplicate-create") create(binding.chatSessionId)();
+          if (scenario === "navigation") {
+            // Observer invalidates on navigation request, before CDP commit.
+            f.page.emit("request", {
+              frame: () => f.page,
+              isNavigationRequest: () => true,
+            });
+            f.page.emit("framenavigated", f.page);
+            create(binding.chatSessionId)();
+          }
+          if (scenario === "disposed") observer.dispose();
+          f.end();
+        },
+      });
+      assert.equal(result, null, scenario);
+      assert.equal(lookups, 2, scenario);
+    } finally {
+      observer.dispose();
+    }
+  }
+});
+
+test("navigation after final lookup resolves but before capture resumes invalidates success", async () => {
+  const f = fixture();
+  const { observer, create } = createdFixture(f);
+  create(binding.chatSessionId)();
+  const unrelated = {
+    frame: () => f.page,
+    isNavigationRequest: () => false,
+    url: () => `${origin}/api/v0/chat_session/create`,
+    method: () => "POST",
+    redirectedFrom: () => null,
+    postData: () => "{}",
+  };
+  let lookups = 0;
+  let submits = 0;
+  const lookup = observer.lookup;
+  observer.lookup = (id) => {
+    const result = lookup(id);
+    if (++lookups === 2) {
+      // Resolves the final lookup with the old proof, then clears that proof
+      // synchronously before capture's await continuation. No commit is needed
+      // yet: the observer already knows a navigation request has begun.
+      f.page.emit("requestfailed", unrelated);
+      f.page.emit("request", {
+        frame: () => f.page,
+        isNavigationRequest: () => true,
+      });
+    }
+    return result;
+  };
+  try {
+    const captured = await captureDeepSeekExchange(f.page, {
+      binding: unresolvedBinding,
+      createdSessions: observer,
+      submit: async () => {
+        submits++;
+        f.start();
+        f.bytes(wire);
+        await new Promise(setImmediate);
+        f.page.emit("request", unrelated);
+        f.end();
+      },
+    });
+    assert.equal(captured, null);
+    assert.equal(lookups, 2);
+    assert.equal(submits, 1);
+    assert.equal(observer.status(), "observing");
+    assert.equal(f.session.detached, 1);
+  } finally {
+    observer.dispose();
+  }
+});
+
+test("unresolved or inactive resolver options cannot submit and resolver errors fail closed", async () => {
+  for (const createdSessions of [
+    undefined,
+    null,
+    {},
+    { lookup() {}, status: () => "observing" },
+    { lookup() {}, isCurrent: () => false, status: () => "disposed" },
+  ]) {
+    const f = fixture();
+    assert.equal(
+      await captureDeepSeekExchange(f.page, {
+        binding: unresolvedBinding,
+        createdSessions,
+        submit: () => assert.fail("invalid options cannot submit"),
+      }),
+      null,
+    );
+  }
+  for (const lookup of [
+    () => Promise.reject(new Error("synthetic resolver failure")),
+    async () => ({ chatSessionId: "wrong", source: "browser_observed_create" }),
+    async () => ({ chatSessionId: binding.chatSessionId, source: "guessed" }),
+  ]) {
+    const f = fixture();
+    assert.equal(
+      await captureDeepSeekExchange(f.page, {
+        binding: unresolvedBinding,
+        createdSessions: {
+          lookup,
+          isCurrent: () => true,
+          status: () => "observing",
+        },
+        submit: () => {
+          f.start();
+          f.bytes(wire);
+          f.end();
+        },
+      }),
+      null,
+    );
+  }
+});
 
 test("completed-body recovery waits for validated EOF and reads exactly the original request once", async () => {
   for (const base64Encoded of [false, true]) {
@@ -677,7 +1098,10 @@ test("capture binds browser request, orders buffered bytes before live chunks an
   assert.equal(f.session.detached, 1);
   assert.equal(f.session.eventNames().length, 0);
   assert.deepEqual(f.session.commands, [
+    "Page.enable",
+    "Page.getFrameTree",
     "Network.enable",
+    "Page.getFrameTree",
     "Network.streamResourceContent",
   ]);
   assert.equal(result.request, undefined);
@@ -750,4 +1174,238 @@ test("cancellation and deadline settle even when UI submission never resolves", 
     null,
   );
   assert.equal(f.session.commands.length, 0);
+});
+
+test("capture rejects subframe, replaced-document and redirected requests", async () => {
+  for (const scenario of [
+    "subframe",
+    "loader",
+    "replacement",
+    "redirect-away",
+  ]) {
+    const f = fixture();
+    let submits = 0;
+    const result = await captureDeepSeekExchange(f.page, {
+      binding,
+      submit: () => {
+        submits++;
+        if (scenario === "replacement")
+          f.session.emit("Page.frameNavigated", {
+            frame: { ...f.session.frame, loaderId: "replacement" },
+          });
+        f.session.emit("Network.requestWillBeSent", {
+          requestId: "request-1",
+          timestamp: 1,
+          frameId: scenario === "subframe" ? "child" : "main",
+          loaderId: scenario === "loader" ? "other" : "document-1",
+          request: request(),
+        });
+        if (scenario === "redirect-away")
+          f.session.emit("Network.requestWillBeSent", {
+            requestId: "request-1",
+            timestamp: 2,
+            request: { ...request(), url: `${origin}/redirected` },
+            redirectResponse: { status: 302 },
+          });
+      },
+      timeoutMs: 100,
+    });
+    assert.equal(result, null, scenario);
+    assert.equal(submits, 1);
+  }
+});
+
+test("document is revalidated after Network.enable without rejecting same-document paths", async () => {
+  for (const scenario of [
+    "commit",
+    "silent-loader",
+    "origin",
+    "same-document",
+  ]) {
+    const f = fixture();
+    let submits = 0;
+    const send = f.session.send.bind(f.session);
+    f.session.send = async (method, args) => {
+      const result = await send(method, args);
+      if (method === "Network.enable") {
+        if (scenario === "commit")
+          f.session.emit("Page.frameNavigated", {
+            frame: { ...f.session.frame, loaderId: "new" },
+          });
+        if (scenario === "silent-loader") f.session.frame.loaderId = "new";
+        if (scenario === "origin") f.page.url = () => "https://example.org/";
+        if (scenario === "same-document") {
+          f.session.frame.url = `${origin}/a/new-conversation`;
+          f.session.emit("Page.navigatedWithinDocument", {
+            frameId: "main",
+            url: f.session.frame.url,
+          });
+        }
+      }
+      return result;
+    };
+    const result = await captureDeepSeekExchange(f.page, {
+      binding,
+      submit: () => {
+        submits++;
+        f.start();
+        f.bytes(wire);
+        f.end();
+      },
+    });
+    assert.equal(
+      result?.sse_terminal ?? false,
+      scenario === "same-document",
+      scenario,
+    );
+    assert.equal(submits, scenario === "same-document" ? 1 : 0, scenario);
+  }
+});
+
+test("deadline and cancellation bound CDP opening and every setup command", async () => {
+  for (const stage of [
+    "open",
+    "Page.enable",
+    "Page.getFrameTree",
+    "Network.enable",
+  ]) {
+    for (const cancel of [false, true]) {
+      const f = fixture();
+      const controller = new AbortController();
+      const hang = () => {
+        if (cancel) controller.abort();
+        return new Promise(() => {});
+      };
+      if (stage === "open") f.page.context = () => ({ newCDPSession: hang });
+      else {
+        const send = f.session.send.bind(f.session);
+        f.session.send = (method, args) =>
+          method === stage ? hang() : send(method, args);
+      }
+      assert.equal(
+        await captureDeepSeekExchange(f.page, {
+          binding,
+          signal: controller.signal,
+          timeoutMs: 10,
+          submit: () => assert.fail("unverified document cannot submit"),
+        }),
+        null,
+        `${stage}/${cancel}`,
+      );
+    }
+  }
+});
+
+test("main-frame navigation during CDP opening cannot silently rebind the document", async () => {
+  const f = fixture();
+  f.page.context = () => ({
+    newCDPSession: async () => {
+      f.page.emit("framenavigated", f.page);
+      return f.session;
+    },
+  });
+  assert.equal(
+    await captureDeepSeekExchange(f.page, {
+      binding,
+      submit: () => assert.fail("changed document cannot submit"),
+    }),
+    null,
+  );
+  assert.equal(f.session.detached, 1);
+  assert.equal(f.page.listenerCount("framenavigated"), 0);
+});
+
+test("real Chromium rejects subframe requests and document replacement but accepts SPA navigation", async () => {
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
+  });
+  try {
+    for (const scenario of [
+      "subframe",
+      "network-navigation",
+      "replacement",
+      "same-document",
+    ]) {
+      const context = await browser.newContext();
+      let posts = 0;
+      let observePost;
+      const postObserved = new Promise((resolve) => (observePost = resolve));
+      await context.route("**/*", async (route) => {
+        if (route.request().url() === endpoint) {
+          posts++;
+          observePost();
+          await route.fulfill({
+            contentType: "text/event-stream; charset=utf-8",
+            body: wire,
+          });
+        } else {
+          await route.fulfill({
+            contentType: "text/html",
+            body: `<button id="send">Send fixture</button><script>
+            document.getElementById("send").onclick=()=>{
+              ${scenario === "same-document" ? 'history.pushState({}, "", "/a/created");' : ""}
+              fetch("/api/v0/chat/completion",{method:"POST",headers:{"content-type":"application/json"},body:${JSON.stringify(JSON.stringify(body))}});
+            };</script>`,
+          });
+        }
+      });
+      const page = await context.newPage();
+      await page.goto(`${origin}/`);
+      if (scenario === "subframe") {
+        await page.evaluate(() => {
+          const frame = document.createElement("iframe");
+          frame.src = "/child";
+          document.body.append(frame);
+        });
+        await page.frameLocator("iframe").locator("#send").waitFor();
+      }
+      if (scenario === "network-navigation") {
+        const open = context.newCDPSession.bind(context);
+        context.newCDPSession = async (target) => {
+          const session = await open(target);
+          const send = session.send.bind(session);
+          session.send = async (method, args) => {
+            const result = await send(method, args);
+            if (method === "Network.enable")
+              await page.goto(`${origin}/replacement`);
+            return result;
+          };
+          return session;
+        };
+      }
+      let submits = 0;
+      const result = await captureDeepSeekExchange(page, {
+        binding,
+        timeoutMs: 3000,
+        submit: async () => {
+          submits++;
+          if (scenario === "replacement")
+            await page.goto(`${origin}/replacement`);
+          else if (scenario === "subframe")
+            await page.frameLocator("iframe").locator("#send").click();
+          else await page.locator("#send").click();
+        },
+      });
+      assert.equal(
+        result?.sse_terminal ?? false,
+        scenario === "same-document",
+        scenario,
+      );
+      assert.equal(
+        submits,
+        scenario === "network-navigation" ? 0 : 1,
+        scenario,
+      );
+      if (["subframe", "same-document"].includes(scenario)) await postObserved;
+      assert.equal(
+        posts,
+        ["subframe", "same-document"].includes(scenario) ? 1 : 0,
+        scenario,
+      );
+      await context.close();
+    }
+  } finally {
+    await browser.close();
+  }
 });

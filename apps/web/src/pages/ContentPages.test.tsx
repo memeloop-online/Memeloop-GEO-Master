@@ -261,6 +261,7 @@ function mockApi({
   resumeStatus = 202,
   cancelStatus = 200,
   forkStatus = 201,
+  forkDeferred,
   sourceAdvanced = false,
   documentOverride,
   exportStatus = 200,
@@ -281,6 +282,7 @@ function mockApi({
   resumeStatus?: number;
   cancelStatus?: number;
   forkStatus?: number;
+  forkDeferred?: Promise<void>;
   sourceAdvanced?: boolean;
   documentOverride?: StructuredDocument;
   exportStatus?: number;
@@ -444,7 +446,10 @@ function mockApi({
             }
           : item,
       );
-      return Promise.resolve(json(forkedRevision, 201));
+      const response = json(forkedRevision, 201);
+      return forkDeferred
+        ? forkDeferred.then(() => response)
+        : Promise.resolve(response);
     }
     if (path.endsWith("/contents/asset-1"))
       return Promise.resolve(
@@ -964,6 +969,83 @@ describe("P09 content revision", () => {
     expect(screen.getByText("revision-1")).toBeInTheDocument();
   });
 
+  it.each(["autosave-first", "manual-first"] as const)(
+    "coalesces a reused item's overlapping fork saves (%s)",
+    async (order) => {
+      let releaseFork!: () => void;
+      const forkDeferred = new Promise<void>((resolve) => {
+        releaseFork = resolve;
+      });
+      const requests = mockApi({
+        itemList: [reusedItem, items[1]],
+        forkDeferred,
+      });
+      renderPage(
+        "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+      );
+      await screen.findByText("证据原文片段");
+      const title = screen.getByLabelText("标题");
+      const button = screen.getByText("创建本轮修订", {
+        selector: "button",
+      });
+      const nativeSetTimeout = window.setTimeout.bind(window);
+      let autosave: (() => void) | undefined;
+      const timeout = vi
+        .spyOn(window as Window, "setTimeout")
+        .mockImplementation((handler, delay, ...args) => {
+          if (delay === 1000 && typeof handler === "function") {
+            autosave = () => handler();
+            return nativeSetTimeout(() => {}, 0);
+          }
+          return nativeSetTimeout(handler, delay, ...args);
+        });
+      const forkWrites = () =>
+        requests.mock.calls.filter(
+          ([url, init]) =>
+            String(url).includes("/items/item-1/fork?") &&
+            init?.method === "POST",
+        );
+      try {
+        await userEvent.type(title, "新");
+        expect(autosave).toBeDefined();
+        // Deliver both events before React publishes the pending mutation.
+        // The held response also covers a timer already queued before cleanup.
+        await act(async () => {
+          if (order === "autosave-first") {
+            autosave?.();
+            button.click();
+          } else {
+            button.click();
+            autosave?.();
+          }
+        });
+        expect(forkWrites()).toHaveLength(1);
+        expect(JSON.parse(String(forkWrites()[0][1]?.body))).toEqual({
+          base_revision_id: "revision-1",
+          document: { ...revision.document, title: "有来源的指南新" },
+        });
+        await act(async () => autosave?.());
+        expect(forkWrites()).toHaveLength(1);
+        await act(async () => releaseFork());
+        await screen.findByText("查看原版本标识");
+        await act(async () => autosave?.());
+        expect(forkWrites()).toHaveLength(1);
+        expect(
+          requests.mock.calls.some(
+            ([url, init]) =>
+              String(url).includes("/contents/asset-1/revisions") &&
+              init?.method === "POST",
+          ),
+        ).toBe(false);
+        await userEvent.click(screen.getByText("查看原版本标识"));
+        expect(screen.getByText("revision-1")).toBeInTheDocument();
+      } finally {
+        releaseFork();
+        timeout.mockRestore();
+      }
+    },
+  );
+
   it("keeps editing pinned to the checked source revision if the original asset advances", async () => {
     const requests = mockApi({
       itemList: [reusedItem, items[1]],
@@ -1005,6 +1087,44 @@ describe("P09 content revision", () => {
     await userEvent.click(screen.getByRole("button", { name: "创建本轮修订" }));
     expect(await screen.findByText(/本地输入仍保留/)).toBeInTheDocument();
     expect(title).toHaveValue("有来源的指南本地改动");
+  });
+
+  it("allows retrying the same fork draft after a transient failure", async () => {
+    const requests = mockApi({ itemList: [reusedItem, items[1]] });
+    const respond = requests.getMockImplementation()!;
+    let rejectFirstFork = true;
+    requests.mockImplementation((url, init) => {
+      if (rejectFirstFork && String(url).includes("/items/item-1/fork?")) {
+        rejectFirstFork = false;
+        return Promise.resolve(
+          json({ code: "unavailable", message: "暂时无法保存" }, 503),
+        );
+      }
+      return respond(url, init);
+    });
+    renderPage(
+      "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
+    );
+    await screen.findByText("证据原文片段");
+    const title = screen.getByLabelText("标题");
+    await userEvent.type(title, "新");
+    await userEvent.click(
+      screen.getByText("创建本轮修订", { selector: "button" }),
+    );
+    await screen.findByText("暂时无法保存", { selector: "span" });
+    expect(title).toHaveValue("有来源的指南新");
+    await userEvent.click(screen.getByText("重试", { selector: "button" }));
+    await screen.findByText("查看原版本标识");
+    const writes = requests.mock.calls.filter(
+      ([url, init]) =>
+        String(url).includes("/items/item-1/fork?") && init?.method === "POST",
+    );
+    expect(writes).toHaveLength(2);
+    expect(writes[1][1]?.body).toEqual(writes[0][1]?.body);
+    expect(JSON.parse(String(writes[1][1]?.body))).toEqual({
+      base_revision_id: "revision-1",
+      document: { ...revision.document, title: "有来源的指南新" },
+    });
   });
 
   it("does not permit a viewer to fork a reused asset", async () => {

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::provider_conversation_lifecycle::completion_inventory;
+use crate::provider_conversation_lifecycle::{completion_inventory, deepseek_lifecycle_chat_id};
 use crate::{AppError, ChannelJobRepository, ChannelTargetInput, TenantScope};
 
 pub const MAX_OBSERVATION_SOURCE_BYTES: usize = 750_000;
@@ -80,6 +80,7 @@ pub struct ObservationProviderIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum ObservationCompletionProtocol {
     ConnectJson,
+    DeepseekHistoryJson,
 }
 
 /// Transport lifecycle proof, independent of answer interpretation.
@@ -252,6 +253,84 @@ fn checked_json(raw: &str, digest: &str, limit: usize) -> Result<serde_json::Val
     Ok(value)
 }
 
+/// Closed source envelope shared by capture and replay. An omission declaration
+/// proves neither complete sanitization nor ownership of a remote conversation.
+pub(crate) fn valid_observation_source_document(document: &serde_json::Value) -> bool {
+    let Some(fields) = document.as_object() else {
+        return false;
+    };
+    let Some(messages) = fields.get("messages").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "messages" | "rendered_text" | "source_redaction" | "lifecycle"
+        )
+    }) || fields
+        .get("rendered_text")
+        .is_some_and(|value| !value.is_string())
+        || fields
+            .get("lifecycle")
+            .is_some_and(|value| deepseek_lifecycle_chat_id(value).is_none())
+    {
+        return false;
+    }
+    let Some(manifest) = fields.get("source_redaction") else {
+        return true;
+    };
+    let Some(manifest) = manifest.as_object() else {
+        return false;
+    };
+    if manifest.len() != 3
+        || manifest
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            != Some("geo.observation.source-redaction.v1")
+        || manifest.get("policy").and_then(serde_json::Value::as_str)
+            != Some("reasoning-and-private-fields")
+    {
+        return false;
+    }
+    let Some(paths) = manifest
+        .get("omitted_paths")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    paths.len() <= 32_768
+        && paths.iter().all(|value| {
+            let Some(path) = value.as_str() else {
+                return false;
+            };
+            if path.len() > 2_048 || path.chars().any(char::is_control) {
+                return false;
+            }
+            let Some(rest) = path.strip_prefix("/messages/") else {
+                return false;
+            };
+            let Some((index, _)) = rest.split_once('/') else {
+                return false;
+            };
+            if index.is_empty()
+                || (index.len() > 1 && index.starts_with('0'))
+                || !index.bytes().all(|byte| byte.is_ascii_digit())
+                || !index
+                    .parse::<usize>()
+                    .is_ok_and(|index| index < messages.len())
+            {
+                return false;
+            }
+            let mut bytes = path.bytes();
+            while let Some(byte) = bytes.next() {
+                if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+                    return false;
+                }
+            }
+            document.pointer(path).is_none()
+        })
+}
+
 impl ObservationCaptureInput {
     pub fn validate(&self, scope: &TenantScope) -> Result<String, AppError> {
         if scope.project_id.is_none() {
@@ -341,21 +420,19 @@ impl ObservationCaptureInput {
                 }
                 let document =
                     checked_json(source_json, source_sha256, MAX_OBSERVATION_SOURCE_BYTES)?;
-                let Some(fields) = document.as_object() else {
+                if !valid_observation_source_document(&document) {
                     return Err(AppError::invalid_request("invalid source document"));
-                };
-                if fields.len() > 2
-                    || fields
-                        .keys()
-                        .any(|key| key != "messages" && key != "rendered_text")
-                    || !fields
-                        .get("messages")
-                        .is_some_and(serde_json::Value::is_array)
-                    || fields
-                        .get("rendered_text")
-                        .is_some_and(|value| !value.is_string())
+                }
+                if let Some(lifecycle) = document.get("lifecycle")
+                    && !self.owned_conversation.as_ref().is_some_and(|owned| {
+                        owned.provider == "deepseek"
+                            && deepseek_lifecycle_chat_id(lifecycle)
+                                == Some(owned.external_conversation_id.as_str())
+                    })
                 {
-                    return Err(AppError::invalid_request("invalid source document"));
+                    return Err(AppError::invalid_request(
+                        "observation lifecycle conversation mismatch",
+                    ));
                 }
                 if let Some(completion) = &self.completion {
                     let owned = self.owned_conversation.as_ref().filter(|owned| {
@@ -887,6 +964,171 @@ mod tests {
             source_sha256: hex::encode(Sha256::digest(raw.as_bytes())),
             source_json: raw,
         };
+    }
+
+    #[test]
+    fn deepseek_completion_binds_owned_source_and_canonical_inventory() {
+        let (scope, mut input, _) = completed_capture();
+        let document = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
+        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
+        input.completion = Some(ObservationCaptureCompletion {
+            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
+            terminal: true,
+            assistant_message_ids: vec!["2".into()],
+        });
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_ok());
+        let serialized = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            serialized["completion"]["protocol"],
+            "deepseek_history_json"
+        );
+        assert_eq!(
+            serde_json::from_value::<ObservationCaptureInput>(serialized).unwrap(),
+            input
+        );
+        let capture = ObservationCapture {
+            receipt: ObservationCaptureReceipt {
+                capture_id: input.capture_id,
+                schema_version: 1,
+                digest_sha256: input.validate(&scope).unwrap(),
+                stored_at: Utc::now(),
+            },
+            input: input.clone(),
+        };
+        assert!(capture.has_complete_conversation_evidence(&scope));
+        assert_eq!(
+            capture.retained_message_inventory_sha256(&scope),
+            Some(hex::encode(Sha256::digest(
+                br#"[["1","user"],["2","assistant"]]"#
+            )))
+        );
+        for no_completion in [false, true] {
+            let mut invalid = input.clone();
+            if no_completion {
+                invalid.completion = None;
+            }
+            invalid
+                .owned_conversation
+                .as_mut()
+                .unwrap()
+                .external_conversation_id = "other-chat".into();
+            assert!(invalid.validate(&scope).is_err());
+            invalid
+                .owned_conversation
+                .as_mut()
+                .unwrap()
+                .external_conversation_id = "synthetic-chat".into();
+            invalid.owned_conversation.as_mut().unwrap().provider = "kimi".into();
+            invalid.original_identity.as_mut().unwrap().provider = "kimi".into();
+            assert!(invalid.validate(&scope).is_err());
+            invalid.owned_conversation = None;
+            assert!(invalid.validate(&scope).is_err());
+        }
+        let mut invalid = input.clone();
+        invalid.original_identity = None;
+        assert!(invalid.validate(&scope).is_err());
+        let mut metadata_only = input.clone();
+        metadata_only.completion = None;
+        assert!(metadata_only.validate(&scope).is_ok());
+        let mut capture = capture;
+        capture.input = metadata_only;
+        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
+        assert!(!capture.has_complete_conversation_evidence(&scope));
+        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
+    }
+
+    #[test]
+    fn deepseek_source_accepts_only_closed_metadata_without_granting_completion() {
+        let (scope, mut input, _) = completed_capture();
+        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
+        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
+        input.completion = None;
+        let document = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        assert!(valid_observation_source_document(&document));
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("geo.deepseek.lifecycle.v1"),
+            serde_json::json!({"provider": "kimi"}),
+        ] {
+            let mut invalid = document.clone();
+            invalid["lifecycle"] = value;
+            assert!(!valid_observation_source_document(&invalid));
+            replace_source(&mut input, &invalid);
+            assert!(input.validate(&scope).is_err());
+        }
+        let mut missing_sse = document.clone();
+        missing_sse["messages"] = serde_json::json!([]);
+        replace_source(&mut input, &missing_sse);
+        assert!(
+            input.validate(&scope).is_ok(),
+            "metadata may be retained without declaring completion"
+        );
+        input.completion = Some(ObservationCaptureCompletion {
+            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
+            terminal: true,
+            assistant_message_ids: vec!["2".into()],
+        });
+        assert!(
+            input.validate(&scope).is_err(),
+            "metadata cannot substitute for actual stream evidence"
+        );
+        input.completion = None;
+        missing_sse.as_object_mut().unwrap().remove("lifecycle");
+        replace_source(&mut input, &missing_sse);
+        assert!(
+            input.validate(&scope).is_ok(),
+            "partial evidence remains retainable with lifecycle omitted"
+        );
+    }
+
+    #[test]
+    fn source_redaction_retains_closed_manifest_without_changing_completion() {
+        let (scope, mut input, mut document) = completed_capture();
+        document["source_redaction"] = serde_json::json!({
+            "schema_version": "geo.observation.source-redaction.v1",
+            "policy": "reasoning-and-private-fields",
+            "omitted_paths": ["/messages/1/message/reasoning", "/messages/0/escaped~1~0"]
+        });
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_ok());
+        let before = input.clone();
+        assert!(input.validate(&scope).is_ok());
+        assert_eq!(input, before);
+        for paths in [
+            serde_json::json!(["/messages/1/message/id"]),
+            serde_json::json!(["/messages/2/reasoning"]),
+            serde_json::json!(["/messages/01/reasoning"]),
+            serde_json::json!(["/messages/-1/reasoning"]),
+            serde_json::json!(["/messages/1"]),
+            serde_json::json!(["/rendered_text"]),
+            serde_json::json!(["/messages/1/invalid~2"]),
+            serde_json::json!(["/messages/1/control\n"]),
+            serde_json::json!([format!("/messages/1/{}", "x".repeat(2048))]),
+            serde_json::json!([null]),
+            serde_json::json!("not-an-array"),
+            serde_json::json!(vec!["/messages/1/reasoning"; 32_769]),
+        ] {
+            let mut invalid = document.clone();
+            invalid["source_redaction"]["omitted_paths"] = paths;
+            replace_source(&mut input, &invalid);
+            assert!(input.validate(&scope).is_err());
+        }
+        for (key, value) in [
+            ("schema_version", serde_json::json!("unknown")),
+            ("policy", serde_json::json!("unknown")),
+            ("extra", serde_json::json!("synthetic")),
+        ] {
+            let mut invalid = document.clone();
+            invalid["source_redaction"][key] = value;
+            replace_source(&mut input, &invalid);
+            assert!(input.validate(&scope).is_err());
+        }
+        document["source_redaction"] = serde_json::Value::Null;
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_err());
     }
 
     #[test]
