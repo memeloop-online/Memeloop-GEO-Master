@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   Button,
   Card,
+  Checkbox,
   Field,
   Input,
   MessageBar,
@@ -13,6 +14,8 @@ import {
 import { useTranslation } from "react-i18next";
 import Papa from "papaparse";
 import "../i18n/accountImports";
+import "../i18n/loginQueues";
+import type { LoginQueueSelection } from "../api/loginQueues";
 import { ApiError, createIdempotencyKey } from "../api/client";
 import {
   createAccountImport,
@@ -39,6 +42,7 @@ export function OperatorAccountImport({
   onLogin,
   storageScope,
   loginDisabled = false,
+  onQueueSelection,
 }: {
   platforms: ChannelPlatform[];
   groups: PoolGroup[];
@@ -46,8 +50,11 @@ export function OperatorAccountImport({
   onLogin: (accountId: string) => void;
   storageScope: string;
   loginDisabled?: boolean;
+  onQueueSelection?: (selection: LoginQueueSelection) => void;
 }) {
   const { t } = useTranslation("accountImports");
+  const { t: tq } = useTranslation("loginQueues");
+  const [queueRows, setQueueRows] = useState<LoginQueueSelection["items"]>([]);
   const [platform, setPlatform] = useState<ChannelPlatformId>(
     platforms[0]?.id ?? "zhihu",
   );
@@ -62,6 +69,9 @@ export function OperatorAccountImport({
   const [error, setError] = useState("");
   const [reference, setReference] = useState("");
   const [result, setResult] = useState<AccountImportResult>();
+  useEffect(() => {
+    setQueueRows([]);
+  }, [result?.import_key]);
   const [recovery, setRecovery] = useState<RecoveryManifest>();
   const [legacyResult, setLegacyResult] = useState(false);
   // Secrets never enter a query cache, browser storage, URL, or result preview.
@@ -533,6 +543,39 @@ export function OperatorAccountImport({
           <ul className="channel-accounts">
             {result.rows.map((row) => (
               <li key={row.row_key}>
+                {onQueueSelection &&
+                  row.status === "needs_login" &&
+                  row.account_id && (
+                    <Checkbox
+                      label={tq("select")}
+                      disabled={
+                        busy ||
+                        loginDisabled ||
+                        (queueRows.length >= 200 &&
+                          !queueRows.some(
+                            (entry) => entry.row_key === row.row_key,
+                          ))
+                      }
+                      checked={queueRows.some(
+                        (entry) => entry.row_key === row.row_key,
+                      )}
+                      onChange={(_, data) =>
+                        setQueueRows((current) =>
+                          data.checked
+                            ? [
+                                ...current,
+                                {
+                                  row_key: row.row_key,
+                                  account_id: row.account_id!,
+                                },
+                              ]
+                            : current.filter(
+                                (entry) => entry.row_key !== row.row_key,
+                              ),
+                        )
+                      }
+                    />
+                  )}
                 <p>
                   {t("row", { number: row.ordinal + 1 })} ·{" "}
                   {row.display_alias || row.masked_username}
@@ -568,6 +611,32 @@ export function OperatorAccountImport({
               </li>
             ))}
           </ul>
+          {onQueueSelection && (
+            <>
+              <p>{tq("selected", { count: queueRows.length })}</p>
+              <ol>
+                {queueRows.map((entry) => (
+                  <li key={entry.row_key}>
+                    {result.rows.find((row) => row.row_key === entry.row_key)
+                      ?.display_alias ||
+                      result.rows.find((row) => row.row_key === entry.row_key)
+                        ?.masked_username}
+                  </li>
+                ))}
+              </ol>
+              <Button
+                disabled={busy || loginDisabled || !queueRows.length}
+                onClick={() =>
+                  onQueueSelection({
+                    import_key: result.import_key,
+                    items: [...queueRows],
+                  })
+                }
+              >
+                {tq("prepare")}
+              </Button>
+            </>
+          )}
         </section>
       )}
     </Card>

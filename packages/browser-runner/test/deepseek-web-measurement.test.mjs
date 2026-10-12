@@ -371,6 +371,25 @@ function decode(text, options = {}) {
   return decoder.finish();
 }
 
+test("finish payload is opaque and unnamed deltas obey ready/finish ordering", () => {
+  const unnamed = 'data: {"p":"response","o":"SET","v":{"synthetic":true}}\n\n';
+  for (const payload of ["", "not-json", '{"reason":"synthetic"}']) {
+    const terminal = `event: finish\ndata: ${payload}\n\n`;
+    const output = decode(ready + unnamed + terminal);
+    assert.equal(output.sse_terminal, true);
+    assert.deepEqual(output.messages.at(-1), {
+      event: "finish",
+      raw_data: payload,
+    });
+    assert.equal(output.completion, undefined);
+    assert.equal(output.raw_answer, undefined);
+    assert.throws(() => decode(terminal));
+    assert.throws(() => decode(unnamed + ready + terminal));
+    assert.throws(() => decode(ready + terminal + unnamed));
+    assert.throws(() => decode(ready + terminal + terminal));
+  }
+});
+
 test("maintained SSE decoder retains bounded raw events and requires ready/finish/framed EOF", () => {
   const output = decode(wire);
   assert.equal(output.sse_terminal, true);

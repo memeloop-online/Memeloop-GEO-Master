@@ -928,22 +928,31 @@ describe("P09 content revision", () => {
         ),
       ),
     ).toBe(true);
-    const title = screen.getByRole("textbox", { name: "标题" });
+    const title = screen.getByLabelText("标题");
+    // Resolve the native action before typing arms the one-second autosave.
+    // Full-page role queries also walk the editor toolbar and application shell.
+    const forkButton = screen.getByText("创建本轮修订", {
+      selector: "button",
+    });
+    expect(title).toBeEnabled();
+    expect(forkButton).toBeDisabled();
     await userEvent.type(title, "新");
-    await userEvent.click(screen.getByRole("button", { name: "创建本轮修订" }));
-    await waitFor(() =>
-      expect(
-        requests.mock.calls.some(
-          ([url, init]) =>
-            String(url).endsWith(
-              "/projects/project-1/document-executions/execution-1/items/item-1/fork?tenant_id=tenant-1&project_id=project-1",
-            ) &&
-            init?.method === "POST" &&
-            JSON.parse(String(init.body)).base_revision_id === "revision-1" &&
-            JSON.parse(String(init.body)).document.title === "有来源的指南新",
-        ),
-      ).toBe(true),
-    );
+    expect(title).toHaveValue("有来源的指南新");
+    expect(forkButton).toBeEnabled();
+    await userEvent.click(forkButton);
+    await waitFor(() => {
+      const forkWrites = requests.mock.calls.filter(
+        ([url, init]) =>
+          String(url).endsWith(
+            "/projects/project-1/document-executions/execution-1/items/item-1/fork?tenant_id=tenant-1&project_id=project-1",
+          ) && init?.method === "POST",
+      );
+      expect(forkWrites).toHaveLength(1);
+      expect(JSON.parse(String(forkWrites[0][1]?.body))).toEqual({
+        base_revision_id: "revision-1",
+        document: { ...revision.document, title: "有来源的指南新" },
+      });
+    });
     expect(
       requests.mock.calls.some(
         ([url, init]) =>
