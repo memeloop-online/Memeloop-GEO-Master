@@ -68,6 +68,95 @@ const api = (fetchImpl, options = {}) =>
     ...options,
   });
 
+const redaction = (omitted_paths = ["/messages/1/reasoning"]) => ({
+  schema_version: "geo.observation.source-redaction.v1",
+  policy: "reasoning-and-private-fields",
+  omitted_paths,
+});
+
+test("declared source omissions are checkpointed, hashed and supplied to extraction unchanged", async () => {
+  const source = {
+    ...structuredClone(exchange),
+    source_redaction: redaction(),
+  };
+  const before = structuredClone(source);
+  const records = [];
+  const document = observationDocument(source);
+  const result = await interpretObservation(source, {
+    onEvidence: async (record) => records.push(record),
+    apiExtract: async (prompt) => {
+      assert.equal(records.length, 1);
+      assert.deepEqual(JSON.parse(records[0].source_json), document);
+      assert.equal(prompt, extractionPrompt(document));
+      assert.ok(
+        prompt.includes(`/source_redaction = ${JSON.stringify(redaction())}`),
+      );
+      return extraction();
+    },
+  });
+  assert.equal(records[0].source_json, JSON.stringify(document));
+  assert.equal(
+    records[0].source_sha256,
+    createHash("sha256").update(records[0].source_json).digest("hex"),
+  );
+  assert.equal(result.audit.source_json, records[0].source_json);
+  assert.equal(result.audit.source_sha256, records[0].source_sha256);
+  assert.deepEqual(source, before);
+  assert.deepEqual(document.messages, exchange.messages);
+  assert.equal(Object.hasOwn(records[0], "completion"), false);
+  source.source_redaction.omitted_paths.push("/messages/1/thinking");
+  assert.deepEqual(document.source_redaction, redaction());
+});
+
+test("source omissions validate escaped paths and reject malformed manifests before extraction", async () => {
+  const source = structuredClone(exchange);
+  source.messages[0]["escaped/~"] = { present: null };
+  assert.deepEqual(
+    observationDocument({
+      ...source,
+      source_redaction: redaction(["/messages/0/escaped~1~0/removed"]),
+    }).source_redaction.omitted_paths,
+    ["/messages/0/escaped~1~0/removed"],
+  );
+  const invalid = [
+    null,
+    [],
+    {},
+    { ...redaction(), extra: "synthetic" },
+    { ...redaction(), schema_version: "unknown" },
+    { ...redaction(), policy: "unknown" },
+    { ...redaction(), omitted_paths: "not-an-array" },
+    redaction([null]),
+    redaction(["/messages/0/escaped~1~0/present"]),
+    redaction(["/messages/0/conversation"]),
+    redaction(["/messages/5/absent"]),
+    redaction(["/messages/01/absent"]),
+    redaction(["/messages/-1/absent"]),
+    redaction(["/messages/1"]),
+    redaction(["/rendered_text"]),
+    redaction(["/messages/1/invalid~2"]),
+    redaction(["/messages/1/control\n"]),
+    redaction([`/messages/1/${"x".repeat(2048)}`]),
+    redaction(Array(32_769).fill("/messages/1/absent")),
+  ];
+  for (const source_redaction of invalid) {
+    const input = { ...source, source_redaction };
+    assert.throws(() => observationDocument(input), {
+      message: "observation_source_redaction_invalid",
+    });
+    const calls = [];
+    assert.equal(
+      await interpretObservation(input, {
+        onEvidence: () => calls.push("persist"),
+        browserExtract: () => calls.push("browser"),
+        apiExtract: () => calls.push("api"),
+      }),
+      null,
+    );
+    assert.deepEqual(calls, []);
+  }
+});
+
 test("saved project preference selects API only after raw persistence", async () => {
   const calls = [];
   const result = await interpretObservation(exchange, {

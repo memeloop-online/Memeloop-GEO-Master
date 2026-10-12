@@ -10,7 +10,12 @@ const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
 function pointer(document, path) {
-  if (typeof path !== "string" || !path.startsWith("/") || path.length > 2048)
+  // Audit metadata must never become provider answer/search/completion evidence.
+  if (
+    typeof path !== "string" ||
+    !/^\/(?:messages|rendered_text)(?:\/|$)/u.test(path) ||
+    path.length > 2048
+  )
     return null;
   let current = document;
   for (const escaped of path.slice(1).split("/")) {

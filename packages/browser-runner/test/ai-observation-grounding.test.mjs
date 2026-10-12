@@ -96,6 +96,57 @@ const semanticCandidate = {
   ],
 };
 
+test("source redaction metadata cannot ground any semantic evidence role", () => {
+  const document = {
+    ...structuredClone(semanticSource),
+    source_redaction: {
+      schema_version: "geo.observation.source-redaction.v1",
+      policy: "reasoning-and-private-fields",
+      omitted_paths: ["/messages/0/reasoning"],
+    },
+    // Unknown root aliases are not evidence, even if they hold usable values.
+    "messages/alias": "Exact observed answer.",
+  };
+  assert.ok(
+    validateAiObservation(document, semanticCandidate, { semanticOnly: true }),
+  );
+  for (const path of [
+    "/source_redaction/policy",
+    "/source_redaction/omitted_paths/0",
+    "/source_redaction",
+    "/messages~1alias",
+  ]) {
+    for (const role of [
+      "completion_evidence",
+      "search_evidence",
+      "answer_segments",
+      "usage",
+      "url",
+    ]) {
+      const candidate = structuredClone(semanticCandidate);
+      if (["usage", "url"].includes(role))
+        candidate.citations[0][role] = { path };
+      else candidate[role] = [{ path }];
+      assert.equal(
+        validateAiObservation(document, candidate, { semanticOnly: true }),
+        null,
+      );
+      assert.equal(
+        observationRejectionReason(document, candidate, { semanticOnly: true }),
+        "path_rejected",
+      );
+    }
+  }
+  const rendered = { ...document, rendered_text: "Exact rendered answer." };
+  assert.equal(
+    validateAiObservation(rendered, {
+      ...semanticCandidate,
+      answer_segments: [{ path: "/rendered_text" }],
+    }).raw_answer,
+    "Exact rendered answer.",
+  );
+});
+
 test("semantic v4 grounds selections without provider identities or status interpretation", () => {
   const result = validateAiObservation(semanticSource, semanticCandidate, {
     semanticOnly: true,

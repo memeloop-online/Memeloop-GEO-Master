@@ -505,13 +505,7 @@ pub fn observation_analysis_source_json(
     }
     let document: Value = serde_json::from_str(&source_json)
         .map_err(|_| AppError::invalid_request("saved observation document invalid"))?;
-    if !document.as_object().is_some_and(|fields| {
-        fields
-            .keys()
-            .all(|key| key == "messages" || key == "rendered_text")
-            && document["messages"].is_array()
-            && fields.get("rendered_text").is_none_or(Value::is_string)
-    }) {
+    if !crate::observation_capture::valid_observation_source_document(&document) {
         return Err(AppError::invalid_request(
             "saved observation document invalid",
         ));
@@ -1336,6 +1330,87 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn analysis_replays_exact_redaction_manifest_and_rejects_tampering() {
+        let f = fixture().await;
+        let target = f
+            .jobs
+            .get_target(&f.scope, f.request.target_id)
+            .await
+            .unwrap();
+        let manifest = json!({
+            "schema_version": "geo.observation.source-redaction.v1",
+            "policy": "reasoning-and-private-fields",
+            "omitted_paths": ["/messages/0/reasoning"]
+        });
+        for omission in [
+            json!(["/messages/0/reasoning"]),
+            json!(["/messages/0/content"]),
+            json!(["/messages/1/reasoning"]),
+            json!(["/messages/0/invalid~2"]),
+        ] {
+            let valid = omission == manifest["omitted_paths"];
+            let mut document = json!({
+                "messages": [{"content": "Synthetic saved answer"}],
+                "source_redaction": manifest
+            });
+            document["source_redaction"]["omitted_paths"] = omission;
+            let raw = document.to_string();
+            let digest = sha256_hex(raw.as_bytes());
+            let mut request = f.request.clone();
+            request.source_sha256 = digest.clone();
+            let mut replay_target = target.clone();
+            let evidence = &mut replay_target.attempts[0]
+                .outcome
+                .as_mut()
+                .unwrap()
+                .runner_evidence[0];
+            evidence["source_json"] = json!(raw);
+            evidence["source_sha256"] = json!(digest);
+            let replay = observation_analysis_source_json(&f.scope, &request, &replay_target, None);
+            assert_eq!(replay.is_ok(), valid);
+            if valid {
+                assert_eq!(replay.unwrap(), raw);
+                replay_target.attempts[0]
+                    .outcome
+                    .as_mut()
+                    .unwrap()
+                    .runner_evidence[0]["source_json"] =
+                    json!(raw.replace("/messages/0/reasoning", "/messages/0/thinking"));
+                assert!(
+                    observation_analysis_source_json(&f.scope, &request, &replay_target, None)
+                        .is_err()
+                );
+            }
+            let mut capture = f
+                .captures
+                .get(&f.scope, f.source_capture_id)
+                .await
+                .unwrap()
+                .unwrap();
+            capture.input.snapshot = ObservationCaptureSnapshot::Source {
+                source_json: raw,
+                source_sha256: digest,
+            };
+            request.source = ObservationAnalysisSource::Capture {
+                capture_id: f.source_capture_id,
+            };
+            if valid {
+                capture.receipt.digest_sha256 = capture.input.validate(&f.scope).unwrap();
+                assert!(
+                    observation_analysis_source_json(&f.scope, &request, &target, Some(&capture))
+                        .is_ok()
+                );
+            } else {
+                assert!(capture.input.validate(&f.scope).is_err());
+                assert!(
+                    observation_analysis_source_json(&f.scope, &request, &target, Some(&capture))
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -252,6 +252,81 @@ fn checked_json(raw: &str, digest: &str, limit: usize) -> Result<serde_json::Val
     Ok(value)
 }
 
+/// Closed source envelope shared by capture and replay. An omission declaration
+/// proves neither complete sanitization nor ownership of a remote conversation.
+pub(crate) fn valid_observation_source_document(document: &serde_json::Value) -> bool {
+    let Some(fields) = document.as_object() else {
+        return false;
+    };
+    let Some(messages) = fields.get("messages").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "messages" | "rendered_text" | "source_redaction"
+        )
+    }) || fields
+        .get("rendered_text")
+        .is_some_and(|value| !value.is_string())
+    {
+        return false;
+    }
+    let Some(manifest) = fields.get("source_redaction") else {
+        return true;
+    };
+    let Some(manifest) = manifest.as_object() else {
+        return false;
+    };
+    if manifest.len() != 3
+        || manifest
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            != Some("geo.observation.source-redaction.v1")
+        || manifest.get("policy").and_then(serde_json::Value::as_str)
+            != Some("reasoning-and-private-fields")
+    {
+        return false;
+    }
+    let Some(paths) = manifest
+        .get("omitted_paths")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    paths.len() <= 32_768
+        && paths.iter().all(|value| {
+            let Some(path) = value.as_str() else {
+                return false;
+            };
+            if path.len() > 2_048 || path.chars().any(char::is_control) {
+                return false;
+            }
+            let Some(rest) = path.strip_prefix("/messages/") else {
+                return false;
+            };
+            let Some((index, _)) = rest.split_once('/') else {
+                return false;
+            };
+            if index.is_empty()
+                || (index.len() > 1 && index.starts_with('0'))
+                || !index.bytes().all(|byte| byte.is_ascii_digit())
+                || !index
+                    .parse::<usize>()
+                    .is_ok_and(|index| index < messages.len())
+            {
+                return false;
+            }
+            let mut bytes = path.bytes();
+            while let Some(byte) = bytes.next() {
+                if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+                    return false;
+                }
+            }
+            document.pointer(path).is_none()
+        })
+}
+
 impl ObservationCaptureInput {
     pub fn validate(&self, scope: &TenantScope) -> Result<String, AppError> {
         if scope.project_id.is_none() {
@@ -341,20 +416,7 @@ impl ObservationCaptureInput {
                 }
                 let document =
                     checked_json(source_json, source_sha256, MAX_OBSERVATION_SOURCE_BYTES)?;
-                let Some(fields) = document.as_object() else {
-                    return Err(AppError::invalid_request("invalid source document"));
-                };
-                if fields.len() > 2
-                    || fields
-                        .keys()
-                        .any(|key| key != "messages" && key != "rendered_text")
-                    || !fields
-                        .get("messages")
-                        .is_some_and(serde_json::Value::is_array)
-                    || fields
-                        .get("rendered_text")
-                        .is_some_and(|value| !value.is_string())
-                {
+                if !valid_observation_source_document(&document) {
                     return Err(AppError::invalid_request("invalid source document"));
                 }
                 if let Some(completion) = &self.completion {
@@ -887,6 +949,53 @@ mod tests {
             source_sha256: hex::encode(Sha256::digest(raw.as_bytes())),
             source_json: raw,
         };
+    }
+
+    #[test]
+    fn source_redaction_retains_closed_manifest_without_changing_completion() {
+        let (scope, mut input, mut document) = completed_capture();
+        document["source_redaction"] = serde_json::json!({
+            "schema_version": "geo.observation.source-redaction.v1",
+            "policy": "reasoning-and-private-fields",
+            "omitted_paths": ["/messages/1/message/reasoning", "/messages/0/escaped~1~0"]
+        });
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_ok());
+        let before = input.clone();
+        assert!(input.validate(&scope).is_ok());
+        assert_eq!(input, before);
+        for paths in [
+            serde_json::json!(["/messages/1/message/id"]),
+            serde_json::json!(["/messages/2/reasoning"]),
+            serde_json::json!(["/messages/01/reasoning"]),
+            serde_json::json!(["/messages/-1/reasoning"]),
+            serde_json::json!(["/messages/1"]),
+            serde_json::json!(["/rendered_text"]),
+            serde_json::json!(["/messages/1/invalid~2"]),
+            serde_json::json!(["/messages/1/control\n"]),
+            serde_json::json!([format!("/messages/1/{}", "x".repeat(2048))]),
+            serde_json::json!([null]),
+            serde_json::json!("not-an-array"),
+            serde_json::json!(vec!["/messages/1/reasoning"; 32_769]),
+        ] {
+            let mut invalid = document.clone();
+            invalid["source_redaction"]["omitted_paths"] = paths;
+            replace_source(&mut input, &invalid);
+            assert!(input.validate(&scope).is_err());
+        }
+        for (key, value) in [
+            ("schema_version", serde_json::json!("unknown")),
+            ("policy", serde_json::json!("unknown")),
+            ("extra", serde_json::json!("synthetic")),
+        ] {
+            let mut invalid = document.clone();
+            invalid["source_redaction"][key] = value;
+            replace_source(&mut input, &invalid);
+            assert!(input.validate(&scope).is_err());
+        }
+        document["source_redaction"] = serde_json::Value::Null;
+        replace_source(&mut input, &document);
+        assert!(input.validate(&scope).is_err());
     }
 
     #[test]
