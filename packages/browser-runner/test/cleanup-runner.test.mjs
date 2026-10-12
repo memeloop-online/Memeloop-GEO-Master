@@ -123,6 +123,29 @@ test("cleanup validates exact scope, needs authority, and never leaks recovered 
       }),
       /invalid_cleanup/,
     );
+    await assert.rejects(
+      runner.cleanupConversation("session", {
+        ...input(),
+        expected_identity: {
+          provider: "__proto__",
+          platform_account_id: account,
+        },
+      }),
+      /invalid_cleanup/,
+    );
+    const wrongProvider = await runner.cleanupConversation("session", {
+      ...input(),
+      expected_identity: {
+        provider: "deepseek",
+        platform_account_id: account,
+      },
+    });
+    assert.equal(wrongProvider.status, "retained");
+    assert.deepEqual(wrongProvider.diagnostic, {
+      stage: "scope",
+      code: "unsupported_platform",
+    });
+    assert.equal(calls.length, 0);
     const unauthorized = await runner.cleanupConversation(
       "session",
       input("delete"),

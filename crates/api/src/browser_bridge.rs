@@ -956,7 +956,7 @@ mod measurement_options_tests {
     }
 
     #[tokio::test]
-    async fn unregistered_cleanup_provider_is_rejected_before_network() {
+    async fn unregistered_cleanup_provider_or_invalid_scope_is_rejected_before_network() {
         use axum::{Router, routing::post};
         use std::sync::{
             Arc,
@@ -979,7 +979,7 @@ mod measurement_options_tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let bridge = BrowserBridge::new(format!("http://{addr}"), "fixture-token".into()).unwrap();
-        for provider in ["deepseek", "doubao", "glm", "unknown", "Kimi"] {
+        for provider in ["DeepSeek", "doubao", "glm", "unknown", "Kimi"] {
             for action in [CleanupAction::Delete, CleanupAction::Reconcile] {
                 let error = bridge
                     .cleanup_conversation(
@@ -999,6 +999,33 @@ mod measurement_options_tests {
                 assert_eq!(error.code, ErrorCode::InvalidRequest);
             }
         }
+        for provider in ["kimi", "deepseek"] {
+            for (account, chat, ticket) in [
+                ("", "fixture-chat", "aabb"),
+                ("fixture-account", "", "aabb"),
+                ("fixture-account", "fixture-chat", ""),
+                ("fixture-account", "fixture-chat", "not-a-ticket"),
+            ] {
+                for action in [CleanupAction::Delete, CleanupAction::Reconcile] {
+                    let error = bridge
+                        .cleanup_conversation(
+                            session_id,
+                            Uuid::new_v4(),
+                            &CleanupExpectedIdentity {
+                                provider: provider.into(),
+                                platform_account_id: account.into(),
+                            },
+                            chat,
+                            action,
+                            Some(ticket),
+                        )
+                        .await
+                        .err()
+                        .expect("invalid scope must not reach runner");
+                    assert_eq!(error.code, ErrorCode::InvalidRequest);
+                }
+            }
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
     }
@@ -1006,12 +1033,13 @@ mod measurement_options_tests {
     #[tokio::test]
     async fn cleanup_wire_is_scoped_and_rejects_mismatched_receipts() {
         use axum::{Router, body::to_bytes, extract::Request, routing::post};
-        for mismatch in [false, true] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let session_id = Uuid::new_v4();
-            let execution_id = Uuid::new_v4();
-            let app = Router::new().route(
+        for provider in ["kimi", "deepseek"] {
+            for mismatch in [None, Some("execution_id"), Some("external_conversation_id")] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let session_id = Uuid::new_v4();
+                let execution_id = Uuid::new_v4();
+                let app = Router::new().route(
                 &format!("/v1/sessions/{session_id}/cleanup-conversation"),
                 post(move |request: Request| async move {
                     assert_eq!(request.headers()["authorization"], "Bearer fixture-token");
@@ -1019,38 +1047,40 @@ mod measurement_options_tests {
                     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(body, serde_json::json!({
                         "execution_id": execution_id,
-                        "expected_identity": { "provider": "kimi", "platform_account_id": "fixture-account" },
+                        "expected_identity": { "provider": provider, "platform_account_id": "fixture-account" },
                         "external_conversation_id": "fixture-chat",
                         "action": "delete", "authorization_ticket": "aabb"
                     }));
                     axum::Json(serde_json::json!({
-                        "execution_id": if mismatch { Uuid::new_v4() } else { execution_id },
-                        "external_conversation_id": "fixture-chat", "status": "deleted"
+                        "execution_id": if mismatch == Some("execution_id") { Uuid::new_v4() } else { execution_id },
+                        "external_conversation_id": if mismatch == Some("external_conversation_id") { "other-chat" } else { "fixture-chat" },
+                        "status": "deleted"
                     }))
                 }),
             );
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let bridge =
-                BrowserBridge::new(format!("http://{addr}"), "fixture-token".into()).unwrap();
-            let result = bridge
-                .cleanup_conversation(
-                    session_id,
-                    execution_id,
-                    &CleanupExpectedIdentity {
-                        provider: "kimi".into(),
-                        platform_account_id: "fixture-account".into(),
-                    },
-                    "fixture-chat",
-                    CleanupAction::Delete,
-                    Some("aabb"),
-                )
-                .await;
-            if mismatch {
-                assert!(result.is_err());
-            } else {
-                assert_eq!(result.unwrap().status, CleanupStatus::Deleted);
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let bridge =
+                    BrowserBridge::new(format!("http://{addr}"), "fixture-token".into()).unwrap();
+                let result = bridge
+                    .cleanup_conversation(
+                        session_id,
+                        execution_id,
+                        &CleanupExpectedIdentity {
+                            provider: provider.into(),
+                            platform_account_id: "fixture-account".into(),
+                        },
+                        "fixture-chat",
+                        CleanupAction::Delete,
+                        Some("aabb"),
+                    )
+                    .await;
+                if mismatch.is_some() {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap().status, CleanupStatus::Deleted);
+                }
+                server.abort();
             }
-            server.abort();
         }
     }
 

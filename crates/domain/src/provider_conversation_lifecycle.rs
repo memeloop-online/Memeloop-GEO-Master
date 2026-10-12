@@ -33,8 +33,7 @@ const KIMI: LifecycleAdapter = LifecycleAdapter {
 const DEEPSEEK: LifecycleAdapter = LifecycleAdapter {
     protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
     inventory: deepseek_completion_inventory,
-    // Completion evidence alone does not implement remote deletion.
-    cleanup_supported: false,
+    cleanup_supported: true,
 };
 
 fn adapter(provider: &str) -> Option<&'static LifecycleAdapter> {
@@ -197,6 +196,96 @@ struct DeepseekLifecycle<'a> {
     response_id: u64,
 }
 
+fn deepseek_creation_submission(value: &Value) -> Option<(&str, &str)> {
+    let creation = &value["creation"];
+    let submission = &value["submission"];
+    if !closed_fields(creation, &["source", "chat_session_id"], &[])
+        || creation["source"] != "browser_observed_create"
+        || !closed_fields(
+            submission,
+            &[
+                "chat_session_id",
+                "parent_message_id",
+                "model_type",
+                "prompt_sha256",
+                "search_enabled",
+                "thinking_enabled",
+            ],
+            &[],
+        )
+        || submission["parent_message_id"] != Value::Null
+        || submission["search_enabled"] != true
+        || submission["thinking_enabled"] != false
+    {
+        return None;
+    }
+    let chat_id = creation["chat_session_id"]
+        .as_str()
+        .filter(|id| valid_message_id(id))?;
+    let model = submission["model_type"].as_str().filter(|model| {
+        !model.is_empty()
+            && model.len() <= 128
+            && model
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    })?;
+    let digest = submission["prompt_sha256"].as_str()?;
+    if submission["chat_session_id"].as_str() != Some(chat_id)
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some((chat_id, model))
+}
+
+fn deepseek_ownership(value: &Value) -> Option<(&str, &str)> {
+    if !closed_fields(
+        value,
+        &["schema_version", "provider", "creation", "submission"],
+        &[],
+    ) || value["schema_version"] != "geo.deepseek.ownership.v1"
+        || value["provider"] != "deepseek"
+    {
+        return None;
+    }
+    deepseek_creation_submission(value)
+}
+
+/// Validate all present proofs together, independently of completion. Existing
+/// lifecycle-only saved sources keep their v1 contract.
+pub(crate) fn deepseek_evidence_chat_id(document: &Value) -> Option<&str> {
+    let ownership = document.get("ownership");
+    let lifecycle = document.get("lifecycle");
+    let legacy_chat = match lifecycle {
+        Some(value) => Some(deepseek_lifecycle_chat_id(value)?),
+        None => None,
+    };
+    let Some(ownership) = ownership else {
+        return legacy_chat;
+    };
+    let (chat_id, model) = deepseek_ownership(ownership)?;
+    if lifecycle.is_some_and(|value| {
+        value["creation"] != ownership["creation"] || value["submission"] != ownership["submission"]
+    }) {
+        return None;
+    }
+    for message in document["messages"].as_array()? {
+        if message["event"] == "ready" {
+            let data = message["data"].as_object()?;
+            if data
+                .get("model_type")
+                .is_some_and(|value| !value.is_null() && value.as_str() != Some(model))
+            {
+                return None;
+            }
+        }
+    }
+    Some(chat_id)
+}
+
 /// This is a closed transport projection made by the authenticated runner.
 /// Its graph shape is checked here; actual SSE correlation is checked separately
 /// before it can grant completion. It says nothing about answer/search semantics.
@@ -219,28 +308,10 @@ fn deepseek_lifecycle(value: &Value) -> Option<DeepseekLifecycle<'_>> {
     {
         return None;
     }
-    let creation = &value["creation"];
-    let submission = &value["submission"];
+    let (chat_id, model) = deepseek_creation_submission(value)?;
     let ready = &value["ready"];
     let history = &value["history"];
-    if !closed_fields(creation, &["source", "chat_session_id"], &[])
-        || creation["source"] != "browser_observed_create"
-        || !closed_fields(
-            submission,
-            &[
-                "chat_session_id",
-                "parent_message_id",
-                "model_type",
-                "prompt_sha256",
-                "search_enabled",
-                "thinking_enabled",
-            ],
-            &[],
-        )
-        || submission["parent_message_id"] != Value::Null
-        || submission["search_enabled"] != true
-        || submission["thinking_enabled"] != false
-        || !closed_fields(ready, &["request_message_id", "response_message_id"], &[])
+    if !closed_fields(ready, &["request_message_id", "response_message_id"], &[])
         || !closed_fields(
             history,
             &[
@@ -265,24 +336,8 @@ fn deepseek_lifecycle(value: &Value) -> Option<DeepseekLifecycle<'_>> {
     {
         return None;
     }
-    let chat_id = creation["chat_session_id"]
-        .as_str()
-        .filter(|id| valid_message_id(id))?;
-    let model = submission["model_type"].as_str().filter(|model| {
-        !model.is_empty()
-            && model.len() <= 128
-            && model
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    })?;
-    let digest = submission["prompt_sha256"].as_str()?;
     let observed_at = history["observed_at"].as_str()?;
-    if submission["chat_session_id"].as_str() != Some(chat_id)
-        || history["chat_session_id"].as_str() != Some(chat_id)
-        || digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    if history["chat_session_id"].as_str() != Some(chat_id)
         || observed_at.len() > 64
         || DateTime::parse_from_rfc3339(observed_at).is_err()
     {
@@ -358,7 +413,8 @@ fn deepseek_completion_inventory<'a>(
     completion: &ObservationCaptureCompletion,
 ) -> Option<MessageInventory<'a>> {
     let lifecycle = deepseek_lifecycle(document.get("lifecycle")?)?;
-    if lifecycle.chat_id != chat_id
+    if deepseek_evidence_chat_id(document) != Some(chat_id)
+        || lifecycle.chat_id != chat_id
         || !completion.terminal
         || completion.assistant_message_ids != [lifecycle.response_id.to_string()]
     {
@@ -477,12 +533,15 @@ mod tests {
             terminal: true,
             assistant_message_ids: vec!["synthetic-answer".into()],
         };
-        for provider in ["", "Kimi", "deepseek", "doubao", "glm", "unknown"] {
+        for provider in ["", "Kimi", "DeepSeek", "doubao", "glm", "unknown"] {
             assert!(!provider_conversation_cleanup_supported(provider));
             assert!(
                 completion_inventory(provider, &document, "synthetic-chat", &completion).is_none()
             );
         }
+        assert!(
+            completion_inventory("deepseek", &document, "synthetic-chat", &completion).is_none()
+        );
         assert!(provider_conversation_cleanup_supported("kimi"));
         assert_eq!(
             completion_inventory("kimi", &document, "synthetic-chat", &completion),
@@ -496,6 +555,66 @@ mod tests {
             terminal: true,
             assistant_message_ids: vec!["2".into()],
         }
+    }
+
+    #[test]
+    fn deepseek_minimal_proof_cannot_replace_completion_or_conflict_with_legacy_proof() {
+        let mut document = synthetic_deepseek_source();
+        document["ownership"] = serde_json::json!({
+            "schema_version": "geo.deepseek.ownership.v1",
+            "provider": "deepseek",
+            "creation": document["lifecycle"]["creation"],
+            "submission": document["lifecycle"]["submission"]
+        });
+        assert!(
+            completion_inventory(
+                "deepseek",
+                &document,
+                "synthetic-chat",
+                &deepseek_completion()
+            )
+            .is_some()
+        );
+        for (path, value) in [
+            (
+                "/ownership/submission/prompt_sha256",
+                serde_json::json!("b".repeat(64)),
+            ),
+            (
+                "/ownership/submission/model_type",
+                serde_json::json!("other-model"),
+            ),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(deepseek_evidence_chat_id(&invalid).is_none());
+            assert!(
+                completion_inventory(
+                    "deepseek",
+                    &invalid,
+                    "synthetic-chat",
+                    &deepseek_completion()
+                )
+                .is_none()
+            );
+        }
+        let mut invalid = document.clone();
+        invalid["ownership"]["creation"]["chat_session_id"] = serde_json::json!("other-chat");
+        invalid["ownership"]["submission"]["chat_session_id"] = serde_json::json!("other-chat");
+        assert!(deepseek_evidence_chat_id(&invalid).is_none());
+        document.as_object_mut().unwrap().remove("lifecycle");
+        assert_eq!(deepseek_evidence_chat_id(&document), Some("synthetic-chat"));
+        assert!(
+            completion_inventory(
+                "deepseek",
+                &document,
+                "synthetic-chat",
+                &deepseek_completion()
+            )
+            .is_none()
+        );
+        document["messages"][0]["data"]["model_type"] = serde_json::json!("other-model");
+        assert!(deepseek_evidence_chat_id(&document).is_none());
     }
 
     fn complete(document: &Value) -> bool {
@@ -627,7 +746,7 @@ mod tests {
                 (Cow::Owned("2".into()), "assistant")
             ])
         );
-        assert!(!provider_conversation_cleanup_supported("deepseek"));
+        assert!(provider_conversation_cleanup_supported("deepseek"));
         for provider in ["kimi", "DeepSeek", "unknown"] {
             assert!(
                 completion_inventory(

@@ -391,7 +391,10 @@ for (const example of consumerCases) {
       assert.equal(await page.locator("#draft").inputValue(), "unsent");
       assert.equal(page.url(), `${origin}/`);
       assert.equal(context.pages().length, 1);
-      assert.deepEqual(adapters[example.provider].operations, []);
+      assert.deepEqual(
+        adapters[example.provider].operations,
+        example.provider === "deepseek" ? ["measure"] : [],
+      );
     } finally {
       await browser?.close();
       await new Promise((resolve) => server.close(resolve));

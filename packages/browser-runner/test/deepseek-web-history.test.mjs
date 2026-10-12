@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { after, before, test } from "node:test";
 import { chromium } from "playwright";
-import { readDeepSeekFirstTurnHistory } from "../src/deepseek-web-history.mjs";
+import {
+  readDeepSeekFirstTurnHistory,
+  readDeepSeekCleanupHistory,
+  projectDeepSeekCleanupHistory,
+} from "../src/deepseek-web-history.mjs";
 import { validDeepSeekLifecycle } from "../src/deepseek-conversation-evidence.mjs";
 
 const ORIGIN = "https://chat.deepseek.com";
@@ -505,4 +509,80 @@ test("already-aborted caller signal never opens the browser handle", async () =>
     null,
   );
   clean(page);
+});
+
+test("cleanup fresh reader derives candidates but measurement still requires expected IDs", async (t) => {
+  const { page, requests } = await synthetic(t);
+  const result = await readDeepSeekCleanupHistory(page, {
+    conversationId: expected.conversationId,
+  });
+  assert.deepEqual(result, {
+    status: "verified",
+    inventory: {
+      conversationId: expected.conversationId,
+      messages: [
+        { id: "1", role: "user" },
+        { id: "2", role: "assistant" },
+      ],
+    },
+  });
+  assert.equal(
+    await readDeepSeekFirstTurnHistory(page, {
+      conversationId: expected.conversationId,
+    }),
+    null,
+  );
+  assert.equal(requests.length, 1);
+  assert.equal(JSON.stringify(result).includes("synthetic answer"), false);
+});
+
+test("cleanup reader distinguishes strict business absence from empty/error history", async (t) => {
+  const { page, state } = await synthetic(t);
+  for (const [response, status] of [
+    [{ code: 0, data: { biz_code: 1 } }, "absent"],
+    [{ code: 0, data: { biz_code: 5 } }, "unknown"],
+    [{ code: 1, data: { biz_code: 1 } }, "unknown"],
+    [{ code: 0, data: { biz_code: "1" } }, "unknown"],
+    [
+      { code: 0, data: { biz_code: 0, biz_data: { chat_messages: [] } } },
+      "unknown",
+    ],
+  ]) {
+    state.body = JSON.stringify(response);
+    assert.deepEqual(
+      await readDeepSeekCleanupHistory(page, {
+        conversationId: expected.conversationId,
+      }),
+      { status },
+    );
+  }
+  state.status = 404;
+  state.body = JSON.stringify({ code: 0, data: { biz_code: 1 } });
+  assert.deepEqual(
+    await readDeepSeekCleanupHistory(page, {
+      conversationId: expected.conversationId,
+    }),
+    { status: "unknown" },
+  );
+});
+
+test("candidate IDs cannot bypass raw numeric, complete graph or terminal verification", () => {
+  const raw = JSON.stringify(fixture());
+  for (const body of [
+    raw.replace('"message_id":2', '"message_id":2.0'),
+    raw.replace('"message_id":2', '"message_id":2e0'),
+    raw.replace('"message_id":2', '"message_id":"2"'),
+    raw.replace('"parent_id":1', '"parent_id":0'),
+    raw.replace('"has_pending_fragment":false', '"has_pending_fragment":true'),
+    raw.replace('"status":"FINISHED"', '"status":"RUNNING"'),
+    raw.replace('"cache_control":"REPLACE"', '"cache_control":"APPEND"'),
+    raw.replace('"id":"synthetic-session"', '"id":"other-session"'),
+  ])
+    assert.deepEqual(
+      projectDeepSeekCleanupHistory(
+        { status: 200, body },
+        expected.conversationId,
+      ),
+      { status: "unknown" },
+    );
 });

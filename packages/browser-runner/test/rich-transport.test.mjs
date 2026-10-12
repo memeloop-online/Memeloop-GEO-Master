@@ -241,7 +241,7 @@ before(async () => {
       fixture: {
         entry: "https://fixture.invalid/",
         connectorVersion: "fixture.rich.v1",
-        operations: ["publish", "rich_publish", "measure"],
+        operations: ["publish", "rich_publish"],
         async identify() {
           return { platform_account_id: "fixture-id", display_name: "Fixture" };
         },
@@ -256,6 +256,14 @@ before(async () => {
             evidence: [],
             provenance: "live",
           };
+        },
+      },
+      kimi: {
+        entry: "https://fixture.invalid/",
+        connectorVersion: "fixture.measure.v1",
+        operations: ["measure"],
+        async identify() {
+          return { platform_account_id: "fixture-id", display_name: "Fixture" };
         },
         async execute(_page, operation, _payload, network) {
           assert.equal(operation, "measure");
@@ -531,7 +539,7 @@ test("source and raw extraction checkpoints precede candidate with shared ordere
     },
     body: JSON.stringify({
       session_id: MEASUREMENT_SESSION,
-      platform: "fixture",
+      platform: "kimi",
       storage_state: { cookies: [], origins: [] },
     }),
   });

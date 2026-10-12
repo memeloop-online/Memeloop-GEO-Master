@@ -719,12 +719,32 @@ describe("P08 content assets", () => {
   });
 
   it("resumes a persisted running execution without posting fabricated body", async () => {
+    let releaseExecutions!: () => void;
+    const executionsDeferred = new Promise<void>((resolve) => {
+      releaseExecutions = resolve;
+    });
     const requests = mockApi({
       executionList: [{ ...execution, status: "running" }],
+      executionsDeferred,
     });
     renderPage("/app/tenant-1/project-1/content");
+    await waitFor(() =>
+      expect(
+        requests.mock.calls.some(
+          ([url, init]) =>
+            String(url).includes("/cycles/cycle-1/document-executions") &&
+            init?.method === "GET",
+        ),
+      ).toBe(true),
+    );
+    expect(
+      screen.queryByRole("button", { name: "恢复未完成分支" }),
+    ).not.toBeInTheDocument();
+    await act(async () => releaseExecutions());
+    // Wait for persisted state before computing button accessible names.
+    expect(await screen.findByText(/执行：running/)).toBeInTheDocument();
     await userEvent.click(
-      await screen.findByRole("button", { name: "恢复未完成分支" }),
+      screen.getByRole("button", { name: "恢复未完成分支" }),
     );
     expect(await screen.findByText(/恢复请求已受理/)).toBeInTheDocument();
     expect(
@@ -797,8 +817,9 @@ describe("P08 content assets", () => {
       resumeStatus: 503,
     });
     renderPage("/app/tenant-1/project-1/content");
+    expect(await screen.findByText(/执行：running/)).toBeInTheDocument();
     await userEvent.click(
-      await screen.findByRole("button", { name: "恢复未完成分支" }),
+      screen.getByRole("button", { name: "恢复未完成分支" }),
     );
     expect(await screen.findByText("内容生成能力尚未配置")).toBeInTheDocument();
     expect(screen.queryByText(/恢复请求已受理/)).not.toBeInTheDocument();
@@ -810,8 +831,9 @@ describe("P08 content assets", () => {
       role: "viewer",
     });
     renderPage("/app/tenant-1/project-1/content");
+    expect(await screen.findByText(/执行：running/)).toBeInTheDocument();
     expect(
-      await screen.findByRole("button", { name: "恢复未完成分支" }),
+      screen.getByRole("button", { name: "恢复未完成分支" }),
     ).toBeDisabled();
     expect(
       screen.getByRole("button", { name: "取消未完成分支" }),

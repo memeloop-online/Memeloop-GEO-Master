@@ -4,11 +4,8 @@ import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
 import { parseExtractionJson } from "./ai-observation-parser.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
-import {
-  cleanupDiagnostic,
-  recoverKimiConversation,
-  deleteKimiConversation,
-} from "./provider-conversation-cleanup.mjs";
+import { cleanupDiagnostic } from "./provider-conversation-cleanup.mjs";
+import { providerCleanupAdapter } from "./provider-cleanup-registry.mjs";
 import {
   stageRichPublication,
   executeAuthorizedRichPublication,
@@ -795,8 +792,10 @@ export function createRunner(options = {}) {
                 },
                 onConversationCaptured(receipt) {
                   if (
-                    receipt?.provider === "kimi" &&
-                    ["measurement", "extraction"].includes(receipt.purpose) &&
+                    ((receipt?.purpose === "measurement" &&
+                      receipt.provider === record.platform) ||
+                      (receipt?.purpose === "extraction" &&
+                        receipt.provider === "kimi")) &&
                     validId(receipt.external_conversation_id)
                   ) {
                     if (receipt.purpose === "measurement")
@@ -1194,7 +1193,7 @@ export function createRunner(options = {}) {
       typeof input.execution_id !== "string" ||
       !UUID.test(input.execution_id) ||
       !fields(input.expected_identity, ["provider", "platform_account_id"]) ||
-      input.expected_identity.provider !== "kimi" ||
+      !providerCleanupAdapter(input.expected_identity.provider) ||
       !validId(input.expected_identity.platform_account_id) ||
       !validId(input.external_conversation_id) ||
       !["delete", "reconcile"].includes(input.action) ||
@@ -1222,7 +1221,8 @@ export function createRunner(options = {}) {
         ...(diagnostic ? { diagnostic } : {}),
       };
     };
-    if (record.platform !== "kimi")
+    const cleanupAdapter = providerCleanupAdapter(record.platform);
+    if (!cleanupAdapter || record.platform !== input.expected_identity.provider)
       return reply("retained", {
         stage: "scope",
         code: "unsupported_platform",
@@ -1257,6 +1257,15 @@ export function createRunner(options = {}) {
         if (expired()) throw new Error("cleanup_deadline");
         return record.page.evaluate(fn, args);
       },
+      async evaluateHandle(fn, args) {
+        if (expired()) throw new Error("cleanup_deadline");
+        return record.page.evaluateHandle(fn, args);
+      },
+      url: () => record.page.url(),
+      mainFrame: () => record.page.mainFrame(),
+      isClosed: () => record.page.isClosed(),
+      on: (event, listener) => record.page.on(event, listener),
+      off: (event, listener) => record.page.off(event, listener),
     };
     let timer;
     const work = (async () => {
@@ -1288,11 +1297,11 @@ export function createRunner(options = {}) {
         let authorizationDiagnostic;
         const result =
           input.action === "reconcile"
-            ? await recoverKimiConversation(page, {
+            ? await cleanupAdapter.recover(page, {
                 ...options,
                 verifyAbsence: true,
               })
-            : await deleteKimiConversation(page, {
+            : await cleanupAdapter.delete(page, {
                 ...options,
                 async authorizeDeletion() {
                   if (expired()) throw new Error("cleanup_deadline");
