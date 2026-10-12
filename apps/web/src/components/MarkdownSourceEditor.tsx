@@ -27,6 +27,7 @@ import { Markdown } from "@tiptap/markdown";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { TableKit } from "@tiptap/extension-table";
+import type { SelectionBookmark, Transaction } from "@tiptap/pm/state";
 import { useTranslation } from "react-i18next";
 import "./StructuredContentEditor.css";
 
@@ -121,6 +122,7 @@ export function MarkdownSourceEditor({
   const [linkHref, setLinkHref] = useState("");
   const [linkError, setLinkError] = useState(false);
   const [linkSelectedOnOpen, setLinkSelectedOnOpen] = useState(false);
+  const linkSelection = useRef<SelectionBookmark | null>(null);
   const editor = useEditor({
     immediatelyRender: false,
     extensions,
@@ -154,6 +156,30 @@ export function MarkdownSourceEditor({
   const visualAvailable = canEditMarkdownVisually(value, editor?.markdown);
   const raw = sourceMode || !visualAvailable;
   const previousRaw = useRef(raw);
+  useEffect(() => {
+    if (!editor) return;
+    const mapSelection = ({
+      transaction,
+      appendedTransactions,
+    }: {
+      transaction: Transaction;
+      appendedTransactions: Transaction[];
+    }) => {
+      for (const applied of [transaction, ...appendedTransactions])
+        if (linkSelection.current)
+          linkSelection.current = linkSelection.current.map(applied.mapping);
+    };
+    editor.on("transaction", mapSelection);
+    return () => {
+      editor.off("transaction", mapSelection);
+      linkSelection.current = null;
+    };
+  }, [editor]);
+  const restoreLinkSelection = ({ tr }: { tr: Transaction }) => {
+    if (!linkSelection.current) return false;
+    tr.setSelection(linkSelection.current.resolve(tr.doc));
+    return true;
+  };
   const active = useEditorState({
     editor,
     selector: ({ editor: current }) => ({
@@ -244,11 +270,13 @@ export function MarkdownSourceEditor({
             <Popover
               onOpenChange={(_, data) => {
                 if (data.open) {
+                  linkSelection.current =
+                    editor?.state.selection.getBookmark() ?? null;
                   const selectedLink = editor?.getAttributes("link").href;
                   setLinkHref(String(selectedLink ?? ""));
                   setLinkSelectedOnOpen(Boolean(selectedLink));
                   setLinkError(false);
-                }
+                } else linkSelection.current = null;
               }}
             >
               <PopoverTrigger disableButtonEnhancement>
@@ -273,12 +301,28 @@ export function MarkdownSourceEditor({
                   size="small"
                   disabled={!linkHref.trim()}
                   onClick={() => {
+                    const href = linkHref.trim();
+                    // can() invokes the installed Link extension's URI policy
+                    // without dispatching focus or a document transaction.
+                    if (
+                      !editor
+                        ?.can()
+                        .chain()
+                        .command(restoreLinkSelection)
+                        .extendMarkRange("link")
+                        .setLink({ href })
+                        .run()
+                    ) {
+                      setLinkError(true);
+                      return;
+                    }
                     const accepted = editor
-                      ?.chain()
+                      .chain()
+                      .command(restoreLinkSelection)
                       .focus()
                       .extendMarkRange("link")
                       .setLink({
-                        href: linkHref.trim(),
+                        href,
                       })
                       .run();
                     setLinkError(!accepted);
@@ -292,6 +336,7 @@ export function MarkdownSourceEditor({
                     onClick={() => {
                       editor
                         ?.chain()
+                        .command(restoreLinkSelection)
                         .focus()
                         .extendMarkRange("link")
                         .unsetLink()
