@@ -5,12 +5,12 @@ use geo_domain::{
     ChannelSettingsRecord, ErrorCode, LoginSession, OperatorId, PoolAccount, PoolAccountRecord,
     PoolAssignment, PoolGroup, PoolLoginSession, TenantScope,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PgChannelRepository {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl PgChannelRepository {
@@ -65,6 +65,213 @@ fn decode_group(json: serde_json::Value) -> Result<ChannelGroup, AppError> {
         .map_err(|_| AppError::new(ErrorCode::Internal, "stored channel group invalid"))
 }
 
+pub(crate) async fn compare_set_network_settings_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &TenantScope,
+    expected: Option<&ChannelSettingsRecord>,
+    record: &ChannelSettingsRecord,
+) -> Result<(), AppError> {
+    if scope.project_id != Some(record.settings.project_id) {
+        return Err(AppError::forbidden("settings outside project"));
+    }
+    let row=sqlx::query("SELECT metadata,default_group_id,encrypted_proxy FROM channel_settings WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 FOR UPDATE")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?).fetch_optional(&mut **tx).await.map_err(db_error)?;
+    let actual = match row {
+        Some(row) => {
+            let mut settings: ChannelSettings =
+                serde_json::from_value(row.try_get("metadata").map_err(db_error)?)
+                    .map_err(|_| AppError::new(ErrorCode::Internal, "stored settings invalid"))?;
+            settings.default_group_id = row.try_get("default_group_id").map_err(db_error)?;
+            Some(ChannelSettingsRecord {
+                settings,
+                proxy: row
+                    .try_get::<Option<Vec<u8>>, _>("encrypted_proxy")
+                    .map_err(db_error)?
+                    .map(ChannelSecret::new),
+            })
+        }
+        None => None,
+    };
+    if !geo_domain::settings_snapshot_matches(actual.as_ref(), expected) {
+        return Err(AppError::conflict("project settings changed"));
+    }
+    let metadata = serde_json::to_value(&record.settings)
+        .map_err(|_| AppError::new(ErrorCode::Internal, "cannot encode settings"))?;
+    sqlx::query("INSERT INTO channel_settings(operator_id,tenant_id,project_id,default_group_id,metadata,encrypted_proxy) VALUES($1,$2,$3,$4,$5,$6) \
+        ON CONFLICT(operator_id,tenant_id,project_id) DO UPDATE SET default_group_id=EXCLUDED.default_group_id,metadata=EXCLUDED.metadata,encrypted_proxy=EXCLUDED.encrypted_proxy")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?).bind(record.settings.default_group_id)
+        .bind(metadata).bind(record.proxy.as_ref().map(ChannelSecret::encrypted_bytes)).execute(&mut **tx).await.map_err(db_error)?;
+    Ok(())
+}
+
+pub(crate) async fn save_network_metadata_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &geo_domain::AccountNetworkScope,
+    update: &geo_domain::AccountNetworkMetadataUpdate,
+) -> Result<(), AppError> {
+    let encode_error = |_| AppError::new(ErrorCode::Internal, "cannot encode account metadata");
+    let (expected, updated, group, session, proxy) = match update {
+        geo_domain::AccountNetworkMetadataUpdate::Customer { expected, updated } => {
+            if scope.project_id != Some(updated.account.project_id)
+                || scope.tenant_id.is_none()
+                || updated.account.owner_kind != ChannelOwnerKind::Customer
+                || updated.account.account_id != scope.account_id
+                || updated.account.platform != expected.account.platform
+                || updated.account.platform_account_id != expected.account.platform_account_id
+            {
+                return Err(AppError::forbidden("account metadata scope differs"));
+            }
+            (
+                serde_json::to_value(&expected.account).map_err(encode_error)?,
+                serde_json::to_value(&updated.account).map_err(encode_error)?,
+                updated.account.group_id,
+                expected
+                    .session
+                    .as_ref()
+                    .map(ChannelSecret::encrypted_bytes),
+                expected.proxy.as_ref().map(ChannelSecret::encrypted_bytes),
+            )
+        }
+        geo_domain::AccountNetworkMetadataUpdate::OperatorPool { expected, updated } => {
+            if scope.tenant_id.is_some()
+                || scope.project_id.is_some()
+                || updated.account.account_id != scope.account_id
+                || updated.account.platform != expected.account.platform
+                || updated.account.platform_account_id != expected.account.platform_account_id
+            {
+                return Err(AppError::forbidden("account metadata scope differs"));
+            }
+            (
+                serde_json::to_value(&expected.account).map_err(encode_error)?,
+                serde_json::to_value(&updated.account).map_err(encode_error)?,
+                updated.account.group_id,
+                expected
+                    .session
+                    .as_ref()
+                    .map(ChannelSecret::encrypted_bytes),
+                expected.proxy.as_ref().map(ChannelSecret::encrypted_bytes),
+            )
+        }
+    };
+    let sql = if scope.project_id.is_some() {
+        "UPDATE channel_accounts SET metadata=$3 || jsonb_build_object('proxy_configured',metadata->'proxy_configured','proxy_server',metadata->'proxy_server'),group_id=$4 \
+         WHERE operator_id=$1 AND account_id=$2 AND (metadata || jsonb_build_object('group_id',group_id))=$5 AND encrypted_session IS NOT DISTINCT FROM $6 \
+         AND encrypted_proxy IS NOT DISTINCT FROM $7 AND tenant_id=$8 AND project_id=$9"
+    } else {
+        "UPDATE operator_channel_accounts SET metadata=$3 || jsonb_build_object('proxy_configured',metadata->'proxy_configured','proxy_server',metadata->'proxy_server'),group_id=$4 \
+         WHERE operator_id=$1 AND account_id=$2 AND (metadata || jsonb_build_object('group_id',group_id))=$5 AND encrypted_session IS NOT DISTINCT FROM $6 AND encrypted_proxy IS NOT DISTINCT FROM $7"
+    };
+    let query = sqlx::query(sql)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.account_id)
+        .bind(updated)
+        .bind(group)
+        .bind(expected)
+        .bind(session)
+        .bind(proxy);
+    let result = match (scope.tenant_id, scope.project_id) {
+        (Some(t), Some(p)) => {
+            query
+                .bind(t.as_uuid())
+                .bind(p.as_uuid())
+                .execute(&mut **tx)
+                .await
+        }
+        _ => query.execute(&mut **tx).await,
+    }
+    .map_err(db_error)?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::conflict("account metadata changed"));
+    }
+    Ok(())
+}
+
+pub(crate) async fn save_verified_login_storage_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    storage: &geo_domain::VerifiedLoginStorage,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), AppError> {
+    lock_platform_identity(
+        tx,
+        storage.secret_scope.operator_id,
+        &storage.platform,
+        &storage.platform_account_id,
+    )
+    .await?;
+    let cross_table = match storage.owner_kind {
+        ChannelOwnerKind::Customer => {
+            "SELECT EXISTS(SELECT 1 FROM operator_channel_accounts WHERE operator_id=$1 AND platform=$2 AND platform_account_id=$3)"
+        }
+        ChannelOwnerKind::OperatorPool => {
+            "SELECT EXISTS(SELECT 1 FROM channel_accounts WHERE operator_id=$1 AND platform=$2 AND platform_account_id=$3)"
+        }
+    };
+    let duplicate: bool = sqlx::query_scalar(cross_table)
+        .bind(storage.secret_scope.operator_id.as_uuid())
+        .bind(&storage.platform)
+        .bind(&storage.platform_account_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    if duplicate {
+        return Err(AppError::conflict("platform identity is already connected"));
+    }
+    let patch = serde_json::json!({
+        "platform_account_id": storage.platform_account_id,
+        "display_name": storage.display_name,
+        "avatar_url": storage.avatar_url,
+        "status": "ready",
+        "updated_at": at,
+    });
+    let sql = match storage.owner_kind {
+        ChannelOwnerKind::Customer => {
+            "UPDATE channel_accounts SET platform_account_id=$6,encrypted_session=$7,metadata=metadata || $8::jsonb \
+            WHERE operator_id=$1 AND account_id=$2 AND platform=$3 AND platform_account_id IS NOT DISTINCT FROM $4 \
+            AND encrypted_session IS NOT DISTINCT FROM $5 AND metadata->>'enabled'='true' AND metadata->>'owner_kind'='customer' \
+            AND tenant_id=$9 AND project_id=$10"
+        }
+        ChannelOwnerKind::OperatorPool => {
+            "UPDATE operator_channel_accounts SET platform_account_id=$6,encrypted_session=$7,metadata=metadata || $8::jsonb \
+            WHERE operator_id=$1 AND account_id=$2 AND platform=$3 AND platform_account_id IS NOT DISTINCT FROM $4 \
+            AND encrypted_session IS NOT DISTINCT FROM $5 AND metadata->>'enabled'='true'"
+        }
+    };
+    let query = sqlx::query(sql)
+        .bind(storage.secret_scope.operator_id.as_uuid())
+        .bind(storage.account_id)
+        .bind(&storage.platform)
+        .bind(&storage.expected_platform_account_id)
+        .bind(
+            storage
+                .expected_session
+                .as_ref()
+                .map(ChannelSecret::encrypted_bytes),
+        )
+        .bind(&storage.platform_account_id)
+        .bind(storage.session.encrypted_bytes())
+        .bind(patch);
+    let result = match storage.owner_kind {
+        ChannelOwnerKind::Customer => {
+            crate::set_local_scope(tx, &storage.secret_scope)
+                .await
+                .map_err(db_error)?;
+            query
+                .bind(storage.secret_scope.tenant_id.as_uuid())
+                .bind(project(&storage.secret_scope)?)
+                .execute(&mut **tx)
+                .await
+        }
+        ChannelOwnerKind::OperatorPool => query.execute(&mut **tx).await,
+    }
+    .map_err(db_error)?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "login account changed during verification",
+        ));
+    }
+    Ok(())
+}
+
 fn decode_account(
     json: serde_json::Value,
     group_id: Option<Uuid>,
@@ -77,6 +284,152 @@ fn decode_account(
 
 #[async_trait]
 impl ChannelRepository for PgChannelRepository {
+    async fn save_network_metadata(
+        &self,
+        scope: &geo_domain::AccountNetworkScope,
+        update: &geo_domain::AccountNetworkMetadataUpdate,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        save_network_metadata_tx(&mut tx, scope, update).await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(())
+    }
+    async fn compare_set_network_settings(
+        &self,
+        scope: &TenantScope,
+        expected: Option<&ChannelSettingsRecord>,
+        record: &ChannelSettingsRecord,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        compare_set_network_settings_tx(&mut tx, scope, expected, record).await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(())
+    }
+    async fn validate_account_network_assignment(
+        &self,
+        scope: &geo_domain::AccountNetworkScope,
+        source: &geo_domain::AccountNetworkSource,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        crate::account_networks::validate_assignment(&mut tx, scope, source).await
+    }
+    async fn save_verified_login_storage(
+        &self,
+        storage: &geo_domain::VerifiedLoginStorage,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        save_verified_login_storage_tx(&mut tx, storage, at).await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(())
+    }
+    async fn account_login_sessions(
+        &self,
+        operator: OperatorId,
+        account_id: Uuid,
+    ) -> Result<Vec<Uuid>, AppError> {
+        sqlx::query_scalar("SELECT session_id FROM channel_login_sessions WHERE operator_id=$1 AND account_id=$2 \
+            UNION SELECT session_id FROM operator_channel_login_sessions WHERE operator_id=$1 AND account_id=$2")
+            .bind(operator.as_uuid()).bind(account_id).fetch_all(&self.pool).await.map_err(db_error)
+    }
+    async fn list_import_rows(
+        &self,
+        operator: OperatorId,
+        import_key: &str,
+    ) -> Result<Vec<geo_domain::ChannelImportRecord>, AppError> {
+        let rows: Vec<(Uuid, Vec<u8>, serde_json::Value)> = sqlx::query_as(
+            "SELECT secret_id,encrypted_input,outcome FROM operator_channel_import_rows WHERE operator_id=$1 AND import_key=$2 ORDER BY (outcome->>'ordinal')::integer,row_key",
+        ).bind(operator.as_uuid()).bind(import_key).fetch_all(&self.pool).await.map_err(db_error)?;
+        rows.into_iter()
+            .map(|(secret_id, encrypted, outcome)| {
+                Ok(geo_domain::ChannelImportRecord {
+                    secret_id,
+                    encrypted_input: ChannelSecret::new(encrypted),
+                    row: serde_json::from_value(outcome).map_err(|_| {
+                        AppError::new(ErrorCode::Internal, "stored import outcome invalid")
+                    })?,
+                })
+            })
+            .collect()
+    }
+
+    async fn save_import_row(
+        &self,
+        operator: OperatorId,
+        import_key: &str,
+        expected: Option<ChannelSecret>,
+        mut record: geo_domain::ChannelImportRecord,
+        account: Option<PoolAccount>,
+    ) -> Result<geo_domain::ChannelImportRecord, AppError> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        // Serialize each batch's insert/count/CAS. The lock input contains only
+        // opaque request keys, never credential material.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "channel-import:{}:{import_key}",
+                operator.as_uuid()
+            ))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        let current: Option<(Uuid, Vec<u8>, serde_json::Value)> = sqlx::query_as(
+            "SELECT secret_id,encrypted_input,outcome FROM operator_channel_import_rows WHERE operator_id=$1 AND import_key=$2 AND row_key=$3 FOR UPDATE",
+        ).bind(operator.as_uuid()).bind(import_key).bind(&record.row.row_key)
+            .fetch_optional(&mut *tx).await.map_err(db_error)?;
+        if let Some((secret_id, encrypted, outcome)) = current {
+            let row: geo_domain::ChannelImportRow = serde_json::from_value(outcome)
+                .map_err(|_| AppError::new(ErrorCode::Internal, "stored import outcome invalid"))?;
+            if row.status != geo_domain::ChannelImportStatus::Failed
+                || expected.as_ref().map(ChannelSecret::encrypted_bytes)
+                    != Some(encrypted.as_slice())
+            {
+                return Ok(geo_domain::ChannelImportRecord {
+                    row,
+                    secret_id,
+                    encrypted_input: ChannelSecret::new(encrypted),
+                });
+            }
+            record.row.ordinal = row.ordinal;
+        } else {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM operator_channel_import_rows WHERE operator_id=$1 AND import_key=$2",
+            ).bind(operator.as_uuid()).bind(import_key).fetch_one(&mut *tx).await.map_err(db_error)?;
+            if count >= 100 {
+                return Err(AppError::invalid_request("import batch exceeds 100 rows"));
+            }
+        }
+        if let Some(account) = account {
+            let group_exists = if let Some(group_id) = account.group_id {
+                // Prevent group deletion between validation and account insertion.
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT group_id FROM operator_channel_groups WHERE operator_id=$1 AND group_id=$2 FOR KEY SHARE",
+                ).bind(operator.as_uuid()).bind(group_id).fetch_optional(&mut *tx).await.map_err(db_error)?.is_some()
+            } else {
+                true
+            };
+            if group_exists {
+                let metadata = serde_json::to_value(&account).map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "cannot encode imported account")
+                })?;
+                sqlx::query(
+                    "INSERT INTO operator_channel_accounts(operator_id,account_id,platform,group_id,metadata) VALUES($1,$2,$3,$4,$5)",
+                ).bind(operator.as_uuid()).bind(account.account_id).bind(account.platform)
+                    .bind(account.group_id).bind(metadata).execute(&mut *tx).await.map_err(db_error)?;
+            } else {
+                record.row.status = geo_domain::ChannelImportStatus::Failed;
+                record.row.account_id = None;
+                record.row.error_code = Some("group_not_found".into());
+            }
+        }
+        let outcome = serde_json::to_value(&record.row)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "cannot encode import outcome"))?;
+        sqlx::query(
+            "INSERT INTO operator_channel_import_rows(operator_id,import_key,row_key,secret_id,encrypted_input,outcome) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(operator_id,import_key,row_key) DO UPDATE SET outcome=EXCLUDED.outcome",
+        ).bind(operator.as_uuid()).bind(import_key).bind(&record.row.row_key).bind(record.secret_id)
+            .bind(record.encrypted_input.encrypted_bytes()).bind(outcome).execute(&mut *tx).await.map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(record)
+    }
     async fn save_account_metadata(
         &self,
         scope: &TenantScope,
@@ -87,11 +440,11 @@ impl ChannelRepository for PgChannelRepository {
         }
         let metadata = serde_json::to_value(&record.account)
             .map_err(|_| AppError::new(ErrorCode::Internal, "cannot encode channel account"))?;
-        let result = sqlx::query(
-            "UPDATE channel_accounts SET metadata=$5,group_id=$6,encrypted_proxy=$7 \
+        let result:Option<serde_json::Value> = sqlx::query_scalar(
+            "UPDATE channel_accounts SET metadata=$5 || jsonb_build_object('proxy_configured',metadata->'proxy_configured','proxy_server',metadata->'proxy_server'),group_id=$6 \
             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND account_id=$4 \
-            AND encrypted_session IS NOT DISTINCT FROM $8 AND platform=$9 \
-            AND platform_account_id IS NOT DISTINCT FROM $10 AND metadata->>'owner_kind'=$11",
+            AND encrypted_session IS NOT DISTINCT FROM $7 AND platform=$8 \
+            AND platform_account_id IS NOT DISTINCT FROM $9 AND metadata->>'owner_kind'=$10 RETURNING metadata",
         )
         .bind(scope.operator_id.as_uuid())
         .bind(scope.tenant_id.as_uuid())
@@ -99,7 +452,6 @@ impl ChannelRepository for PgChannelRepository {
         .bind(record.account.account_id)
         .bind(metadata)
         .bind(record.account.group_id)
-        .bind(record.proxy.as_ref().map(ChannelSecret::encrypted_bytes))
         .bind(record.session.as_ref().map(ChannelSecret::encrypted_bytes))
         .bind(&record.account.platform)
         .bind(&record.account.platform_account_id)
@@ -107,15 +459,13 @@ impl ChannelRepository for PgChannelRepository {
             ChannelOwnerKind::Customer => "customer",
             ChannelOwnerKind::OperatorPool => "operator_pool",
         })
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_error)?;
-        if result.rows_affected() != 1 {
-            return Err(AppError::conflict(
-                "channel account changed; retry the edit",
-            ));
-        }
-        Ok(record.account)
+        decode_account(
+            result.ok_or_else(|| AppError::conflict("channel account changed; retry the edit"))?,
+            record.account.group_id,
+        )
     }
 
     async fn save_pool_account_metadata(
@@ -125,28 +475,25 @@ impl ChannelRepository for PgChannelRepository {
     ) -> Result<PoolAccount, AppError> {
         let metadata = serde_json::to_value(&record.account)
             .map_err(|_| AppError::new(ErrorCode::Internal, "cannot encode pool account"))?;
-        let result = sqlx::query(
-            "UPDATE operator_channel_accounts SET metadata=$3,group_id=$4,encrypted_proxy=$5 \
-            WHERE operator_id=$1 AND account_id=$2 AND encrypted_session IS NOT DISTINCT FROM $6 \
-            AND platform=$7 AND platform_account_id IS NOT DISTINCT FROM $8",
+        let result:Option<serde_json::Value> = sqlx::query_scalar(
+            "UPDATE operator_channel_accounts SET metadata=$3 || jsonb_build_object('proxy_configured',metadata->'proxy_configured','proxy_server',metadata->'proxy_server'),group_id=$4 \
+            WHERE operator_id=$1 AND account_id=$2 AND encrypted_session IS NOT DISTINCT FROM $5 \
+            AND platform=$6 AND platform_account_id IS NOT DISTINCT FROM $7 RETURNING metadata",
         )
         .bind(operator.as_uuid())
         .bind(record.account.account_id)
         .bind(metadata)
         .bind(record.account.group_id)
-        .bind(record.proxy.as_ref().map(ChannelSecret::encrypted_bytes))
         .bind(record.session.as_ref().map(ChannelSecret::encrypted_bytes))
         .bind(&record.account.platform)
         .bind(&record.account.platform_account_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_error)?;
-        if result.rows_affected() != 1 {
-            return Err(AppError::conflict(
-                "channel account changed; retry the edit",
-            ));
-        }
-        Ok(record.account)
+        serde_json::from_value(
+            result.ok_or_else(|| AppError::conflict("channel account changed; retry the edit"))?,
+        )
+        .map_err(|_| AppError::new(ErrorCode::Internal, "stored pool account invalid"))
     }
 
     async fn renew_session(
@@ -290,14 +637,17 @@ impl ChannelRepository for PgChannelRepository {
             }
         }
         sqlx::query(
-            "INSERT INTO operator_channel_accounts(operator_id,account_id,platform,platform_account_id,group_id,metadata,encrypted_session,encrypted_proxy) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(operator_id,account_id) DO UPDATE SET platform_account_id=EXCLUDED.platform_account_id,group_id=EXCLUDED.group_id,metadata=EXCLUDED.metadata,encrypted_session=EXCLUDED.encrypted_session,encrypted_proxy=EXCLUDED.encrypted_proxy",
+            "INSERT INTO operator_channel_accounts(operator_id,account_id,platform,platform_account_id,group_id,metadata,encrypted_session,encrypted_proxy) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(operator_id,account_id) DO UPDATE SET platform_account_id=EXCLUDED.platform_account_id,group_id=EXCLUDED.group_id,metadata=EXCLUDED.metadata || jsonb_build_object('proxy_configured',operator_channel_accounts.metadata->'proxy_configured','proxy_server',operator_channel_accounts.metadata->'proxy_server'),encrypted_session=EXCLUDED.encrypted_session",
         ).bind(operator.as_uuid()).bind(account.account_id).bind(&account.platform)
             .bind(&account.platform_account_id).bind(account.group_id).bind(metadata)
             .bind(record.session.as_ref().map(ChannelSecret::encrypted_bytes))
             .bind(record.proxy.as_ref().map(ChannelSecret::encrypted_bytes))
             .execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
-        Ok(account.clone())
+        Ok(self
+            .get_pool_account(operator, account.account_id)
+            .await?
+            .account)
     }
 
     async fn delete_pool_account(&self, operator: OperatorId, id: Uuid) -> Result<(), AppError> {
@@ -379,9 +729,14 @@ impl ChannelRepository for PgChannelRepository {
         operator: OperatorId,
         session: PoolLoginSession,
     ) -> Result<(), AppError> {
-        sqlx::query("INSERT INTO operator_channel_login_sessions(operator_id,session_id,account_id,created_at) VALUES($1,$2,$3,$4)")
+        let result = sqlx::query("INSERT INTO operator_channel_login_sessions(operator_id,session_id,account_id,created_at) VALUES($1,$2,$3,$4) \
+            ON CONFLICT(operator_id,session_id) DO UPDATE SET account_id=operator_channel_login_sessions.account_id \
+            WHERE operator_channel_login_sessions.account_id=EXCLUDED.account_id")
             .bind(operator.as_uuid()).bind(session.session_id).bind(session.account_id).bind(session.created_at)
             .execute(&self.pool).await.map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::conflict("pool login reference differs"));
+        }
         Ok(())
     }
 
@@ -556,7 +911,7 @@ impl ChannelRepository for PgChannelRepository {
             }
         }
         sqlx::query(
-            "INSERT INTO channel_accounts (operator_id,tenant_id,project_id,account_id,platform,platform_account_id,group_id,metadata,encrypted_session,encrypted_proxy) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (operator_id,tenant_id,project_id,account_id) DO UPDATE SET platform_account_id=EXCLUDED.platform_account_id,group_id=EXCLUDED.group_id,metadata=EXCLUDED.metadata,encrypted_session=EXCLUDED.encrypted_session,encrypted_proxy=EXCLUDED.encrypted_proxy",
+            "INSERT INTO channel_accounts (operator_id,tenant_id,project_id,account_id,platform,platform_account_id,group_id,metadata,encrypted_session,encrypted_proxy) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (operator_id,tenant_id,project_id,account_id) DO UPDATE SET platform_account_id=EXCLUDED.platform_account_id,group_id=EXCLUDED.group_id,metadata=EXCLUDED.metadata || jsonb_build_object('proxy_configured',channel_accounts.metadata->'proxy_configured','proxy_server',channel_accounts.metadata->'proxy_server'),encrypted_session=EXCLUDED.encrypted_session",
         )
         .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
         .bind(project(scope)?).bind(account.account_id).bind(&account.platform)
@@ -565,7 +920,7 @@ impl ChannelRepository for PgChannelRepository {
         .bind(record.proxy.as_ref().map(ChannelSecret::encrypted_bytes))
         .execute(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
-        Ok(account.clone())
+        Ok(self.get_account(scope, account.account_id).await?.account)
     }
 
     async fn delete_account(&self, scope: &TenantScope, id: Uuid) -> Result<(), AppError> {
@@ -584,12 +939,17 @@ impl ChannelRepository for PgChannelRepository {
         if scope.project_id != Some(session.project_id) {
             return Err(AppError::forbidden("login outside project"));
         }
-        sqlx::query(
-            "INSERT INTO channel_login_sessions (operator_id,tenant_id,project_id,session_id,account_id,created_at) VALUES ($1,$2,$3,$4,$5,$6)",
+        let result = sqlx::query(
+            "INSERT INTO channel_login_sessions (operator_id,tenant_id,project_id,session_id,account_id,created_at) VALUES ($1,$2,$3,$4,$5,$6) \
+             ON CONFLICT(operator_id,tenant_id,project_id,session_id) DO UPDATE SET account_id=channel_login_sessions.account_id \
+             WHERE channel_login_sessions.account_id=EXCLUDED.account_id",
         )
         .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
         .bind(project(scope)?).bind(session.session_id).bind(session.account_id)
         .bind(session.created_at).execute(&self.pool).await.map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::conflict("login reference differs"));
+        }
         Ok(())
     }
 

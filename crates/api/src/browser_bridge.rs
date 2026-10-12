@@ -152,6 +152,98 @@ impl BrowserBridge {
         format!("{}/v1/sessions/{id}{suffix}", self.base_url)
     }
 
+    /// Discover a generation before persisting a new session's ownership.
+    /// This cannot establish the generation that owns an existing session.
+    pub async fn lifecycle_generation(&self) -> Result<Uuid, AppError> {
+        let response = self
+            .client
+            .get(format!("{}/v1/lifecycle", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| Self::lifecycle_unavailable())?;
+        let receipt: RunnerLifecycle = Self::response(response).await?;
+        Ok(receipt.generation)
+    }
+
+    /// The caller must persist the chosen generation before starting a session.
+    /// A missing generation echo (including from an older runner) is ambiguous.
+    pub async fn start_in_generation(
+        &self,
+        session_id: Uuid,
+        expected_generation: Uuid,
+        platform: &str,
+        proxy: Option<BrowserProxy>,
+        storage_state: Option<&serde_json::Value>,
+    ) -> Result<(), AppError> {
+        let started = async {
+            let response = self
+                .client
+                .post(format!("{}/v1/sessions", self.base_url))
+                .bearer_auth(&self.token)
+                .json(&StartBrowserSession {
+                    session_id,
+                    platform,
+                    proxy,
+                    storage_state,
+                    expected_generation: Some(expected_generation),
+                })
+                .send()
+                .await
+                .map_err(|_| Self::lifecycle_unavailable())?;
+            let receipt: GenerationStartResponse = Self::response(response).await?;
+            if receipt.session_id != session_id || receipt.generation != expected_generation {
+                return Err(Self::lifecycle_unavailable());
+            }
+            Ok(())
+        }
+        .await;
+        if started.is_err() {
+            // Never issue legacy DELETE after a pinned start: the endpoint
+            // could now route to a different instance. Failure stays ambiguous.
+            let _ = self
+                .dispose_in_generation(session_id, expected_generation)
+                .await;
+        }
+        started
+    }
+
+    /// Confirm local browser resource disposal for a durably recorded owner.
+    /// An ordinary 404, current generation discovery, or legacy close is not
+    /// proof. This receipt does not prove deletion of provider conversations.
+    pub async fn dispose_in_generation(
+        &self,
+        session_id: Uuid,
+        expected_generation: Uuid,
+    ) -> Result<BrowserDisposalReceipt, AppError> {
+        let response = self
+            .client
+            .post(self.endpoint(session_id, "/dispose"))
+            .bearer_auth(&self.token)
+            .json(&DisposeBrowserSession {
+                expected_generation,
+            })
+            .send()
+            .await
+            .map_err(|_| Self::lifecycle_unavailable())?;
+        let receipt: DisposalResponse = Self::response(response).await?;
+        if receipt.session_id != session_id || receipt.generation != expected_generation {
+            return Err(Self::lifecycle_unavailable());
+        }
+        let DisposalState::Disposed = receipt.state;
+        Ok(BrowserDisposalReceipt {
+            session_id: receipt.session_id,
+            generation: receipt.generation,
+        })
+    }
+
+    fn lifecycle_unavailable() -> AppError {
+        AppError::new(
+            ErrorCode::DependencyUnavailable,
+            "browser lifecycle confirmation unavailable",
+        )
+    }
+
     async fn response<T: serde::de::DeserializeOwned>(
         mut response: reqwest::Response,
     ) -> Result<T, AppError> {
@@ -211,6 +303,7 @@ impl BrowserBridge {
                     platform,
                     proxy,
                     storage_state,
+                    expected_generation: None,
                 })
                 .send()
                 .await
@@ -372,7 +465,7 @@ impl BrowserBridge {
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
         };
-        if expected_identity.provider != "kimi"
+        if !geo_domain::provider_conversation_cleanup_supported(&expected_identity.provider)
             || !valid_id(&expected_identity.platform_account_id)
             || !valid_id(chat_id)
             || ticket.is_some_and(|value| {
@@ -671,6 +764,8 @@ pub struct RunnerConnector {
     pub login_entry_available: Option<bool>,
     #[serde(default)]
     pub login_supported: Option<bool>,
+    #[serde(default)]
+    pub model_discovery_supported: bool,
     // Explicitly never use a self-reported verification claim to authorize
     // publishing; independent publication/readback history is the authority.
     #[allow(dead_code)]
@@ -724,7 +819,7 @@ pub struct BrowserExecution {
     pub stage: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct BrowserProxy {
     pub server: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -741,6 +836,56 @@ struct StartBrowserSession<'a> {
     proxy: Option<BrowserProxy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     storage_state: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_generation: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerLifecycle {
+    generation: Uuid,
+}
+
+#[derive(Deserialize)]
+struct GenerationStartResponse {
+    session_id: Uuid,
+    generation: Uuid,
+}
+
+#[derive(Serialize)]
+struct DisposeBrowserSession {
+    expected_generation: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DisposalState {
+    Disposed,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisposalResponse {
+    session_id: Uuid,
+    generation: Uuid,
+    state: DisposalState,
+}
+
+/// Constructed only after authenticated, exact-generation disposal confirmation.
+/// Deliberately not deserializable from caller-provided data.
+pub struct BrowserDisposalReceipt {
+    session_id: Uuid,
+    generation: Uuid,
+}
+
+impl BrowserDisposalReceipt {
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub fn generation(&self) -> Uuid {
+        self.generation
+    }
 }
 
 #[derive(Deserialize)]
@@ -768,6 +913,10 @@ pub struct VerifiedBrowserSession {
     pub identity: BrowserIdentity,
     pub storage_state: serde_json::Value,
 }
+
+#[cfg(test)]
+#[path = "browser_bridge_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod measurement_options_tests {
@@ -804,6 +953,54 @@ mod measurement_options_tests {
             serde_json::to_value(result.diagnostic).unwrap(),
             serde_json::json!({"stage":"delete","code":"http_error"})
         );
+    }
+
+    #[tokio::test]
+    async fn unregistered_cleanup_provider_is_rejected_before_network() {
+        use axum::{Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let session_id = Uuid::new_v4();
+        let app = Router::new().route(
+            &format!("/v1/sessions/{session_id}/cleanup-conversation"),
+            post(move || {
+                let calls = observed.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bridge = BrowserBridge::new(format!("http://{addr}"), "fixture-token".into()).unwrap();
+        for provider in ["deepseek", "doubao", "glm", "unknown", "Kimi"] {
+            for action in [CleanupAction::Delete, CleanupAction::Reconcile] {
+                let error = bridge
+                    .cleanup_conversation(
+                        session_id,
+                        Uuid::new_v4(),
+                        &CleanupExpectedIdentity {
+                            provider: provider.into(),
+                            platform_account_id: "fixture-account".into(),
+                        },
+                        "fixture-chat",
+                        action,
+                        Some("aabb"),
+                    )
+                    .await
+                    .err()
+                    .expect("unregistered provider must not reach runner");
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     #[tokio::test]

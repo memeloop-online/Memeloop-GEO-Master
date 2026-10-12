@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
@@ -158,16 +158,44 @@ export function createRunner(options = {}) {
     throw new Error("invalid_runner_retention");
   }
   const sessions = new Map();
-  const pendingSessions = new Set();
+  const generation = randomUUID();
+  // Retain fences for this runner generation, including never-started IDs.
+  // This grows with closed IDs and is intentionally not TTL-reaped: eviction
+  // could resurrect delayed starts. Restart/other replicas are not covered.
+  const disposedIds = new Set();
   const executions = new Map();
   let browserPromise;
   let reapingPromise;
+  let shuttingDown = false;
 
   function dispose(record) {
     record.lifetime.abort();
     for (const client of record.desktopClients) client.terminate();
     record.desktopClients.clear();
-    return record.desktop ? record.desktop.close() : record.context.close();
+    return record.desktop ? record.desktop.close() : record.context?.close();
+  }
+
+  function closeRecord(id, record) {
+    disposedIds.add(id);
+    if (record.disposed) return Promise.resolve();
+    record.closing = true;
+    record.lifetime.abort();
+    if (!record.closePromise) {
+      record.closePromise = (async () => {
+        // Resource acquisition can materialize a late context. Navigation and
+        // identity probes cannot: close their context to interrupt them rather
+        // than waiting for a probe that itself needs disposal to settle.
+        await record.acquired;
+        await dispose(record);
+        record.disposed = true;
+        if (sessions.get(id) === record) sessions.delete(id);
+      })().finally(() => {
+        // Failed disposal must remain addressable, and a subsequent DELETE
+        // must retry the actual resource rather than report it absent.
+        record.closePromise = undefined;
+      });
+    }
+    return record.closePromise;
   }
 
   function capabilities() {
@@ -187,6 +215,8 @@ export function createRunner(options = {}) {
           platform,
           placement_slot: "primary",
           connector_version: adapter.connectorVersion,
+          model_discovery_supported:
+            typeof adapter.inspectMeasurementOptions === "function",
           operations: adapter.operations.filter(
             (operation) =>
               operation !== "rich_publish" ||
@@ -224,14 +254,14 @@ export function createRunner(options = {}) {
   function session(id) {
     const found = sessions.get(id);
     if (!found) throw new RunnerError(404, "session_not_found");
-    if (found.desktop?.closed) {
-      sessions.delete(id);
-      throw new RunnerError(404, "session_not_found");
-    }
-    if (!found.busy && clock() - found.lastTouched >= sessionIdleMs) {
-      sessions.delete(id);
-      void dispose(found).catch(() => {});
-      throw new RunnerError(404, "session_not_found");
+    if (found.closing) throw new RunnerError(409, "session_closing");
+    if (found.starting) throw new RunnerError(409, "session_starting");
+    if (
+      found.desktop?.closed ||
+      (!found.busy && clock() - found.lastTouched >= sessionIdleMs)
+    ) {
+      void closeRecord(id, found).catch(() => {});
+      throw new RunnerError(409, "session_closing");
     }
     found.lastTouched = clock();
     return found;
@@ -244,11 +274,12 @@ export function createRunner(options = {}) {
       const expired = [];
       for (const [id, record] of sessions) {
         if (
-          record.desktop?.closed ||
-          (!record.busy && now - record.lastTouched >= sessionIdleMs)
+          record.closing ||
+          (!record.starting &&
+            (record.desktop?.closed ||
+              (!record.busy && now - record.lastTouched >= sessionIdleMs)))
         ) {
-          sessions.delete(id);
-          expired.push(dispose(record));
+          expired.push(closeRecord(id, record));
         }
       }
       for (const [id, entry] of executions) {
@@ -293,29 +324,54 @@ export function createRunner(options = {}) {
 
   async function create(input) {
     if (
-      !fields(input, ["session_id", "platform", "storage_state", "proxy"]) ||
+      !fields(input, [
+        "session_id",
+        "platform",
+        "storage_state",
+        "proxy",
+        "expected_generation",
+      ]) ||
       !validId(input.session_id) ||
       typeof input.platform !== "string"
     ) {
       throw new RunnerError(400, "invalid_session");
     }
+    if (Object.hasOwn(input, "expected_generation"))
+      requireGeneration(input.expected_generation);
     const adapter = platformAdapters[input.platform];
     if (!adapter) throw new RunnerError(400, "unsupported_platform");
-    if (
-      sessions.has(input.session_id) ||
-      pendingSessions.has(input.session_id)
-    ) {
+    if (shuttingDown) throw new RunnerError(503, "runner_unavailable");
+    if (sessions.has(input.session_id)) {
       throw new RunnerError(409, "session_exists");
     }
+    if (disposedIds.has(input.session_id))
+      throw new RunnerError(409, "session_disposed");
     const proxy = parseProxy(input.proxy);
     const storageState = parseState(input.storage_state);
     if (!desktop && !storageState) {
       throw new RunnerError(503, "capability_missing");
     }
-    pendingSessions.add(input.session_id);
-    let context;
-    let desktopSession;
-    try {
+    const acquisition = Promise.withResolvers();
+    const record = {
+      platform: input.platform,
+      adapter,
+      connectorVersion: adapter.connectorVersion,
+      desktopClients: new Set(),
+      proxy,
+      restoredKimi: input.platform === "kimi" && !!storageState,
+      lifetime: new AbortController(),
+      identity: null,
+      completed: false,
+      busy: false,
+      starting: true,
+      closing: false,
+      acquired: acquisition.promise,
+      lastTouched: clock(),
+    };
+    sessions.set(input.session_id, record);
+    const work = (async () => {
+      let context;
+      let desktopSession;
       let page;
       if (desktop && !storageState) {
         desktopSession = await desktop.open({
@@ -324,8 +380,14 @@ export function createRunner(options = {}) {
           proxy,
           storageState,
           viewport: VIEWPORT,
+          onSession: (resource) => {
+            record.desktop = resource;
+          },
+          onAcquired: () => acquisition.resolve(),
         });
+        record.desktop = desktopSession;
         ({ context, page } = desktopSession);
+        acquisition.resolve();
       } else {
         context = await (
           await browser()
@@ -334,45 +396,40 @@ export function createRunner(options = {}) {
           ...(proxy ? { proxy } : {}),
           ...(storageState ? { storageState } : {}),
         });
+        record.context = context;
+        acquisition.resolve();
+        if (record.closing) throw new RunnerError(409, "session_closing");
         page = await context.newPage();
       }
+      record.context = context;
+      record.page = page;
+      if (record.closing) throw new RunnerError(409, "session_closing");
       // The caller cannot provide navigation targets. OAuth redirects, if any,
       // are handled by the platform's own UI in this isolated context.
       await page.goto(adapter.entry, {
         waitUntil: "domcontentloaded",
         timeout: BROWSER_READINESS_TIMEOUT_MS,
       });
-      const record = {
-        platform: input.platform,
-        adapter,
-        // Snapshot host configuration before executing any adapter code.
-        connectorVersion: adapter.connectorVersion,
-        context,
-        page,
-        desktop: desktopSession,
-        desktopClients: new Set(),
-        proxy,
-        restoredKimi: input.platform === "kimi" && !!storageState,
-        lifetime: new AbortController(),
-        identity: null,
-        completed: false,
-        busy: false,
-        lastTouched: clock(),
-      };
-      sessions.set(input.session_id, record);
+      if (record.closing) throw new RunnerError(409, "session_closing");
       // A new desktop is useful before account discovery finishes. Identity
       // remains unverified until status/completion; restored sessions still
       // perform their existing identity probe.
-      return {
+      const result = {
         session_id: input.session_id,
+        ...(Object.hasOwn(input, "expected_generation") ? { generation } : {}),
         phase: desktopSession ? "login_required" : await phase(record),
       };
+      if (record.closing) throw new RunnerError(409, "session_closing");
+      return result;
+    })();
+    try {
+      return await work;
     } catch (error) {
-      if (desktopSession) await desktopSession.close();
-      else if (context) await context.close();
+      acquisition.resolve();
+      await closeRecord(input.session_id, record);
       throw error;
     } finally {
-      pendingSessions.delete(input.session_id);
+      record.starting = false;
     }
   }
 
@@ -468,8 +525,7 @@ export function createRunner(options = {}) {
       } catch (error) {
         // An ordinary incomplete-login probe must not strand the user.
         if (revokingInput || record.desktop.closed) {
-          sessions.delete(id);
-          await dispose(record).catch(() => {});
+          await closeRecord(id, record).catch(() => {});
         }
         throw error;
       } finally {
@@ -520,7 +576,7 @@ export function createRunner(options = {}) {
     const record = session(id);
     if (record.busy) throw new RunnerError(409, "session_busy");
     if (!record.completed) throw new RunnerError(409, "login_required");
-    if (!record.adapter.inspectMeasurementOptions)
+    if (typeof record.adapter.inspectMeasurementOptions !== "function")
       throw new RunnerError(422, "measurement_options_unavailable");
     record.busy = true;
     try {
@@ -638,10 +694,7 @@ export function createRunner(options = {}) {
         // The external side effect may have happened. Closing this browser
         // context prevents a stalled adapter from issuing later actions;
         // Rust must reconcile before any new attempt.
-        if (sessions.get(input.session_id) === record) {
-          sessions.delete(input.session_id);
-        }
-        void dispose(record).catch(() => {});
+        void closeRecord(input.session_id, record).catch(() => {});
         return {
           status: "unknown",
           reason: "execution_deadline",
@@ -1036,8 +1089,7 @@ export function createRunner(options = {}) {
         timer = setTimeout(expire, executionTimeoutMs);
       });
       const unknown = (reason) => {
-        if (sessions.get(sessionId) === record) sessions.delete(sessionId);
-        void dispose(record).catch(() => {});
+        void closeRecord(sessionId, record).catch(() => {});
         return { status: "unknown", reason, evidence: [], ...hostReceipt };
       };
       try {
@@ -1301,8 +1353,17 @@ export function createRunner(options = {}) {
     entry.promise = Promise.race([
       work,
       new Promise((resolve) => {
+        const expire = () => {
+          const remaining = deadlineAt - performance.now();
+          if (remaining > 0) {
+            // A timer wakeup does not prove the monotonic deadline has passed.
+            timer = setTimeout(expire, Math.max(1, Math.ceil(remaining)));
+            return;
+          }
+          resolve(deadlineReply());
+        };
         timer = setTimeout(
-          () => resolve(deadlineReply()),
+          expire,
           Math.max(1, Math.ceil(deadlineAt - performance.now())),
         );
       }),
@@ -1312,24 +1373,41 @@ export function createRunner(options = {}) {
   }
 
   async function close(id) {
-    const record = session(id);
-    if (record.busy) throw new RunnerError(409, "session_busy");
-    sessions.delete(id);
-    for (const client of record.desktopClients) client.terminate();
-    record.desktopClients.clear();
-    await dispose(record);
+    const record = sessions.get(id);
+    if (!record) throw new RunnerError(404, "session_not_found");
+    if (record.busy && !record.closing)
+      throw new RunnerError(409, "session_busy");
+    await closeRecord(id, record);
+  }
+
+  function requireGeneration(expected) {
+    if (typeof expected !== "string" || !UUID.test(expected))
+      throw new RunnerError(400, "invalid_generation");
+    if (expected !== generation)
+      throw new RunnerError(409, "runner_generation_mismatch");
+  }
+
+  async function disposeSession(id, input) {
+    if (!validId(id) || !fields(input, ["expected_generation"]))
+      throw new RunnerError(400, "invalid_disposal");
+    requireGeneration(input.expected_generation);
+    const record = sessions.get(id);
+    if (record?.busy && !record.closing)
+      throw new RunnerError(409, "session_busy");
+    // Synchronous fence insertion precedes resource disposal and every await.
+    // A failed close leaves its resource record for a real retry, not a receipt.
+    disposedIds.add(id);
+    if (record) await closeRecord(id, record);
+    return { session_id: id, generation, state: "disposed" };
   }
 
   async function shutdown() {
     clearInterval(maintenance);
-    const records = [...sessions.values()];
-    sessions.clear();
+    shuttingDown = true;
     executions.clear();
-    for (const record of records) {
-      for (const client of record.desktopClients) client.terminate();
-      record.desktopClients.clear();
-    }
-    await Promise.allSettled(records.map((record) => dispose(record)));
+    await Promise.allSettled(
+      [...sessions].map(([id, record]) => closeRecord(id, record)),
+    );
     if (browserPromise) await (await browserPromise).close();
   }
 
@@ -1345,6 +1423,8 @@ export function createRunner(options = {}) {
     executeRich,
     cleanupConversation,
     close,
+    lifecycle: () => ({ generation }),
+    disposeSession,
     shutdown,
     reap,
     capabilities,

@@ -5,12 +5,15 @@
 //! that role is ready to persist state. Database credentials are supplied at
 //! runtime through configuration; they are never embedded in this crate.
 
+mod account_networks;
 mod agent;
 mod appearance;
 mod auth;
 pub mod bootstrap;
+mod browser_operations;
 mod channel_jobs;
 mod channels;
+mod proxy_pools;
 pub use channel_jobs::PgChannelJobRepository;
 pub use channels::PgChannelRepository;
 mod connector_capabilities;

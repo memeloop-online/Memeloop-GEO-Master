@@ -1623,8 +1623,33 @@ async function main() {
   await linkInput.fill("/updated");
   await linkPopover.getByRole("button", { name: "添加链接" }).click();
   await page.keyboard.press("Escape");
+  const linkedTextUpdated =
+    (await visualEditor.locator("a").getAttribute("href")) === "/updated";
+  if (!linkedTextUpdated) {
+    // Only fixed synthetic comparisons and selection positions; never print
+    // document text, arbitrary URLs, storage or authenticated application data.
+    const diagnostic = await visualEditor
+      .evaluate((editor) => {
+        const anchor = editor.querySelector("a");
+        const selection = document.getSelection();
+        return {
+          expectedHref: anchor?.getAttribute("href") === "/updated",
+          originalHref:
+            anchor?.getAttribute("href") === "https://example.invalid/guide",
+          selectionCollapsed: selection?.isCollapsed ?? null,
+          selectedTextLength: selection?.toString().length ?? 0,
+          anchorWithinLink: anchor?.contains(selection?.anchorNode) ?? false,
+          focusWithinLink: anchor?.contains(selection?.focusNode) ?? false,
+          anchorOffset: selection?.anchorOffset ?? null,
+          focusOffset: selection?.focusOffset ?? null,
+          editorFocused: editor.contains(document.activeElement),
+        };
+      })
+      .catch(() => ({ diagnosticUnavailable: true }));
+    console.error("Synthetic link update diagnostic:", diagnostic);
+  }
   assert(
-    (await visualEditor.locator("a").getAttribute("href")) === "/updated",
+    linkedTextUpdated,
     "Updating a link must update the linked text, not just future typing",
   );
   await visualEditor.locator("h1").click();

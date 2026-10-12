@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use geo_provider::diagnostics::{ModelPhase, ModelPhaseTimer};
 use geo_provider::{
     CompletionRequest, FunctionCall, FunctionDefinition, Message, NormalizedCompletion,
     ProviderClient, ProviderError, ProviderSurface, RequestControl, SearchMode, SecretRef,
@@ -107,13 +108,15 @@ where
         request: &ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
+        let phase = ModelPhaseTimer::start(ModelPhase::Route);
         let route = tokio::time::timeout_at(
             deadline,
             self.routes.resolve(scope, request.model.as_deref()),
         )
         .await
-        .map_err(|_| map_provider_error(ProviderError::Timeout, self.timeout))?
-        .map_err(|error| map_provider_error(error, self.timeout))?;
+        .unwrap_or(Err(ProviderError::Timeout));
+        phase.finish(route.is_ok());
+        let route = route.map_err(|error| map_provider_error(error, self.timeout))?;
         let client = ProviderClient::new(
             route.base_url,
             route.secret_ref,
@@ -223,6 +226,8 @@ where
         _scope: &TenantScope,
         request: &ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
+        // Also covers the scoped-test runtime's exact-project injected bridge.
+        let phase = ModelPhaseTimer::start(ModelPhase::DirectDispatch);
         let model = request
             .model
             .as_deref()
@@ -237,11 +242,9 @@ where
         let provider_request = provider_request(model, request);
         let control = RequestControl::new(self.timeout)
             .map_err(|error| map_provider_error(error, self.timeout))?;
-        let completion = self
-            .client
-            .complete(provider_request, control)
-            .await
-            .map_err(|error| map_provider_error(error, self.timeout))?;
+        let completion = self.client.complete(provider_request, control).await;
+        phase.finish(completion.is_ok());
+        let completion = completion.map_err(|error| map_provider_error(error, self.timeout))?;
         Ok(map_completion(completion))
     }
 }

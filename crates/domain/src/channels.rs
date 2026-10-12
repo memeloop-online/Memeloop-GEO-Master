@@ -183,7 +183,10 @@ pub fn supported_channel(platform: &str) -> bool {
 /// Registered account namespaces, not a claim of installed login or measurement
 /// support. Those capabilities belong to the authenticated running adapter.
 pub fn consumer_web_provider(platform: &str) -> bool {
-    matches!(platform, "kimi" | "doubao" | "deepseek" | "glm")
+    matches!(
+        platform,
+        "kimi" | "doubao" | "deepseek" | "glm" | "qianwen" | "yuanbao"
+    )
 }
 
 fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {
@@ -193,7 +196,51 @@ fn project(scope: &TenantScope) -> Result<ProjectId, AppError> {
 }
 
 #[async_trait]
-pub trait ChannelRepository: Send + Sync {
+pub trait ChannelRepository: crate::ProxyPoolRepository + Send + Sync {
+    async fn save_network_metadata(
+        &self,
+        scope: &crate::AccountNetworkScope,
+        update: &crate::AccountNetworkMetadataUpdate,
+    ) -> Result<(), AppError>;
+    async fn compare_set_network_settings(
+        &self,
+        scope: &TenantScope,
+        expected: Option<&ChannelSettingsRecord>,
+        record: &ChannelSettingsRecord,
+    ) -> Result<(), AppError>;
+    async fn validate_account_network_assignment(
+        &self,
+        scope: &crate::AccountNetworkScope,
+        source: &crate::AccountNetworkSource,
+    ) -> Result<(), AppError>;
+    /// Internal transaction adapter; callers use BrowserOperationRepository's
+    /// ownership-serialized commit, never a standalone HTTP credential write.
+    async fn save_verified_login_storage(
+        &self,
+        storage: &crate::VerifiedLoginStorage,
+        at: DateTime<Utc>,
+    ) -> Result<(), AppError>;
+    async fn account_login_sessions(
+        &self,
+        operator: crate::OperatorId,
+        account_id: Uuid,
+    ) -> Result<Vec<Uuid>, AppError>;
+    async fn list_import_rows(
+        &self,
+        operator: crate::OperatorId,
+        import_key: &str,
+    ) -> Result<Vec<crate::ChannelImportRecord>, AppError>;
+    /// Atomically stores an outcome and (when successful) its pending account.
+    /// Existing rows are immutable unless the caller supplies the exact stored
+    /// encrypted envelope as a retry compare-and-swap token.
+    async fn save_import_row(
+        &self,
+        operator: crate::OperatorId,
+        import_key: &str,
+        expected: Option<ChannelSecret>,
+        record: crate::ChannelImportRecord,
+        account: Option<PoolAccount>,
+    ) -> Result<crate::ChannelImportRecord, AppError>;
     /// Metadata edits must not restore a session read before a renewal.
     async fn save_account_metadata(
         &self,
@@ -308,7 +355,11 @@ pub trait ChannelRepository: Send + Sync {
 }
 
 #[derive(Default)]
-struct ChannelMemory {
+pub(crate) struct ChannelMemory {
+    pub(crate) proxy_pools: HashMap<(Uuid, Uuid), crate::ProxyPool>,
+    pub(crate) proxy_members: HashMap<(Uuid, Uuid, Uuid), crate::ProxyPoolMember>,
+    pub(crate) proxy_revisions: HashMap<(Uuid, Uuid, Uuid, Uuid), ChannelSecret>,
+    imports: HashMap<(Uuid, String, String), crate::ChannelImportRecord>,
     pool_groups: HashMap<(Uuid, Uuid), PoolGroup>,
     pool_accounts: HashMap<(Uuid, Uuid), PoolAccountRecord>,
     pool_logins: HashMap<(Uuid, Uuid), PoolLoginSession>,
@@ -320,7 +371,7 @@ struct ChannelMemory {
 }
 
 #[derive(Clone, Default)]
-pub struct MemoryChannelRepository(Arc<RwLock<ChannelMemory>>);
+pub struct MemoryChannelRepository(pub(crate) Arc<RwLock<ChannelMemory>>);
 
 fn key(scope: &TenantScope, id: Uuid) -> Result<(Uuid, Uuid, Uuid, Uuid), AppError> {
     Ok((
@@ -333,6 +384,323 @@ fn key(scope: &TenantScope, id: Uuid) -> Result<(Uuid, Uuid, Uuid, Uuid), AppErr
 
 #[async_trait]
 impl ChannelRepository for MemoryChannelRepository {
+    async fn compare_set_network_settings(
+        &self,
+        scope: &TenantScope,
+        expected: Option<&ChannelSettingsRecord>,
+        record: &ChannelSettingsRecord,
+    ) -> Result<(), AppError> {
+        let project = project(scope)?;
+        if record.settings.project_id != project {
+            return Err(AppError::forbidden("settings outside project"));
+        }
+        let mut data = self.0.write().await;
+        let settings_key = (
+            scope.operator_id.as_uuid(),
+            scope.tenant_id.as_uuid(),
+            project.as_uuid(),
+        );
+        if !crate::settings_snapshot_matches(data.settings.get(&settings_key), expected) {
+            return Err(AppError::conflict("project settings changed"));
+        }
+        if let Some(group) = record.settings.default_group_id
+            && !data.groups.contains_key(&key(scope, group)?)
+        {
+            return Err(AppError::not_found("group not found"));
+        }
+        data.settings.insert(settings_key, record.clone());
+        Ok(())
+    }
+    async fn save_network_metadata(
+        &self,
+        scope: &crate::AccountNetworkScope,
+        update: &crate::AccountNetworkMetadataUpdate,
+    ) -> Result<(), AppError> {
+        let mut data = self.0.write().await;
+        macro_rules! update {
+            ($current:expr,$expected:expr,$updated:expr) => {{
+                let current =
+                    $current.ok_or_else(|| AppError::not_found("network account not found"))?;
+                if serde_json::to_value(&current.account).ok()
+                    != serde_json::to_value(&$expected.account).ok()
+                    || current.session.as_ref().map(ChannelSecret::encrypted_bytes)
+                        != $expected
+                            .session
+                            .as_ref()
+                            .map(ChannelSecret::encrypted_bytes)
+                    || current.proxy.as_ref().map(ChannelSecret::encrypted_bytes)
+                        != $expected.proxy.as_ref().map(ChannelSecret::encrypted_bytes)
+                    || $updated.account.account_id != scope.account_id
+                    || $updated.account.platform != $expected.account.platform
+                    || $updated.account.platform_account_id != $expected.account.platform_account_id
+                {
+                    return Err(AppError::conflict("account metadata changed"));
+                }
+                let mut account = $updated.account.clone();
+                account.proxy_configured = current.account.proxy_configured;
+                account.proxy_server = current.account.proxy_server.clone();
+                current.account = account;
+            }};
+        }
+        match update {
+            crate::AccountNetworkMetadataUpdate::Customer { expected, updated } => {
+                let (Some(tenant), Some(project)) = (scope.tenant_id, scope.project_id) else {
+                    return Err(AppError::forbidden("customer network scope required"));
+                };
+                let tenant_scope = TenantScope::new(scope.operator_id, tenant, Some(project));
+                if updated.account.project_id != project
+                    || updated.account.owner_kind != ChannelOwnerKind::Customer
+                {
+                    return Err(AppError::forbidden("account metadata scope differs"));
+                }
+                if let Some(group) = updated.account.group_id
+                    && !data.groups.contains_key(&key(&tenant_scope, group)?)
+                {
+                    return Err(AppError::not_found("group not found"));
+                }
+                update!(
+                    data.accounts
+                        .get_mut(&key(&tenant_scope, scope.account_id)?),
+                    expected,
+                    updated
+                );
+            }
+            crate::AccountNetworkMetadataUpdate::OperatorPool { expected, updated } => {
+                if scope.tenant_id.is_some() || scope.project_id.is_some() {
+                    return Err(AppError::forbidden("operator network scope required"));
+                }
+                if let Some(group) = updated.account.group_id
+                    && !data
+                        .pool_groups
+                        .contains_key(&(scope.operator_id.as_uuid(), group))
+                {
+                    return Err(AppError::not_found("group not found"));
+                }
+                update!(
+                    data.pool_accounts
+                        .get_mut(&(scope.operator_id.as_uuid(), scope.account_id)),
+                    expected,
+                    updated
+                );
+            }
+        }
+        Ok(())
+    }
+    async fn validate_account_network_assignment(
+        &self,
+        scope: &crate::AccountNetworkScope,
+        source: &crate::AccountNetworkSource,
+    ) -> Result<(), AppError> {
+        scope.validate()?;
+        let data = self.0.read().await;
+        let op = scope.operator_id.as_uuid();
+        let exists = match (scope.tenant_id, scope.project_id) {
+            (Some(t), Some(p)) => data
+                .accounts
+                .get(&(op, t.as_uuid(), p.as_uuid(), scope.account_id))
+                .is_some_and(|r| r.account.owner_kind == ChannelOwnerKind::Customer),
+            (None, None) => data.pool_accounts.contains_key(&(op, scope.account_id)),
+            _ => false,
+        };
+        if !exists {
+            return Err(AppError::not_found("network account not found"));
+        }
+        if let crate::AccountNetworkSource::ProjectDefault {
+            settings_updated_at,
+        } = source
+        {
+            let (Some(t), Some(p)) = (scope.tenant_id, scope.project_id) else {
+                return Err(AppError::forbidden("project default scope required"));
+            };
+            let actual = data
+                .settings
+                .get(&(op, t.as_uuid(), p.as_uuid()))
+                .map(|r| r.settings.updated_at);
+            if actual != *settings_updated_at {
+                return Err(AppError::conflict("project default changed"));
+            }
+        }
+        if let crate::AccountNetworkSource::PoolRevision {
+            pool_id,
+            member_id,
+            revision_id,
+        } = source
+            && (!data
+                .proxy_pools
+                .get(&(op, *pool_id))
+                .is_some_and(|p| p.enabled)
+                || !data
+                    .proxy_members
+                    .get(&(op, *pool_id, *member_id))
+                    .is_some_and(|m| m.enabled && m.revision_id == *revision_id)
+                || !data
+                    .proxy_revisions
+                    .contains_key(&(op, *pool_id, *member_id, *revision_id)))
+        {
+            return Err(AppError::conflict("proxy member revision is unavailable"));
+        }
+        Ok(())
+    }
+    async fn save_verified_login_storage(
+        &self,
+        storage: &crate::VerifiedLoginStorage,
+        at: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let mut data = self.0.write().await;
+        let operator = storage.secret_scope.operator_id.as_uuid();
+        let customer_key = if storage.owner_kind == ChannelOwnerKind::Customer {
+            Some(key(&storage.secret_scope, storage.account_id)?)
+        } else {
+            None
+        };
+        if data.accounts.iter().any(|(k, r)| {
+            k.0 == operator
+                && Some(*k) != customer_key
+                && r.account.platform == storage.platform
+                && r.account.platform_account_id.as_deref() == Some(&storage.platform_account_id)
+        }) || data.pool_accounts.iter().any(|(k, r)| {
+            k.0 == operator
+                && !(storage.owner_kind == ChannelOwnerKind::OperatorPool
+                    && k.1 == storage.account_id)
+                && r.account.platform == storage.platform
+                && r.account.platform_account_id.as_deref() == Some(&storage.platform_account_id)
+        }) {
+            return Err(AppError::conflict("platform identity is already connected"));
+        }
+        macro_rules! save {
+            ($record:expr) => {{
+                let record =
+                    $record.ok_or_else(|| AppError::not_found("login account not found"))?;
+                if !record.account.enabled
+                    || record.account.platform != storage.platform
+                    || record.account.platform_account_id != storage.expected_platform_account_id
+                    || record.session.as_ref().map(ChannelSecret::encrypted_bytes)
+                        != storage
+                            .expected_session
+                            .as_ref()
+                            .map(ChannelSecret::encrypted_bytes)
+                {
+                    return Err(AppError::conflict(
+                        "login account changed during verification",
+                    ));
+                }
+                record.account.platform_account_id = Some(storage.platform_account_id.clone());
+                record.account.display_name = Some(storage.display_name.clone());
+                record.account.avatar_url = storage.avatar_url.clone();
+                record.account.status = ChannelStatus::Ready;
+                record.account.updated_at = at;
+                record.session = Some(storage.session.clone());
+            }};
+        }
+        match customer_key {
+            Some(k) => {
+                if data
+                    .accounts
+                    .get(&k)
+                    .is_some_and(|r| r.account.owner_kind != ChannelOwnerKind::Customer)
+                {
+                    return Err(AppError::forbidden("login account owner differs"));
+                }
+                save!(data.accounts.get_mut(&k));
+            }
+            None => {
+                save!(data.pool_accounts.get_mut(&(operator, storage.account_id)));
+            }
+        }
+        Ok(())
+    }
+    async fn account_login_sessions(
+        &self,
+        operator: crate::OperatorId,
+        account_id: Uuid,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let data = self.0.read().await;
+        Ok(data
+            .logins
+            .iter()
+            .filter(|((o, _, _, _), login)| {
+                *o == operator.as_uuid() && login.account_id == account_id
+            })
+            .map(|(_, login)| login.session_id)
+            .chain(
+                data.pool_logins
+                    .iter()
+                    .filter(|((o, _), login)| {
+                        *o == operator.as_uuid() && login.account_id == account_id
+                    })
+                    .map(|(_, login)| login.session_id),
+            )
+            .collect())
+    }
+    async fn list_import_rows(
+        &self,
+        operator: crate::OperatorId,
+        import_key: &str,
+    ) -> Result<Vec<crate::ChannelImportRecord>, AppError> {
+        let data = self.0.read().await;
+        let mut rows: Vec<_> = data
+            .imports
+            .iter()
+            .filter(|((op, key, _), _)| *op == operator.as_uuid() && key == import_key)
+            .map(|(_, row)| row.clone())
+            .collect();
+        rows.sort_by_key(|record| (record.row.ordinal, record.row.row_key.clone()));
+        Ok(rows)
+    }
+
+    async fn save_import_row(
+        &self,
+        operator: crate::OperatorId,
+        import_key: &str,
+        expected: Option<ChannelSecret>,
+        mut record: crate::ChannelImportRecord,
+        account: Option<PoolAccount>,
+    ) -> Result<crate::ChannelImportRecord, AppError> {
+        let mut data = self.0.write().await;
+        let key = (
+            operator.as_uuid(),
+            import_key.to_owned(),
+            record.row.row_key.clone(),
+        );
+        if let Some(current) = data.imports.get(&key) {
+            if current.row.status != crate::ChannelImportStatus::Failed
+                || expected.as_ref().map(ChannelSecret::encrypted_bytes)
+                    != Some(current.encrypted_input.encrypted_bytes())
+            {
+                return Ok(current.clone());
+            }
+            record.row.ordinal = current.row.ordinal;
+        } else if data
+            .imports
+            .keys()
+            .filter(|(op, batch, _)| *op == operator.as_uuid() && batch == import_key)
+            .count()
+            >= 100
+        {
+            return Err(AppError::invalid_request("import batch exceeds 100 rows"));
+        }
+        if let Some(account) = account {
+            if account
+                .group_id
+                .is_some_and(|id| !data.pool_groups.contains_key(&(operator.as_uuid(), id)))
+            {
+                record.row.status = crate::ChannelImportStatus::Failed;
+                record.row.account_id = None;
+                record.row.error_code = Some("group_not_found".into());
+            } else {
+                data.pool_accounts.insert(
+                    (operator.as_uuid(), account.account_id),
+                    PoolAccountRecord {
+                        account,
+                        session: None,
+                        proxy: None,
+                    },
+                );
+            }
+        }
+        data.imports.insert(key, record.clone());
+        Ok(record)
+    }
     async fn save_account_metadata(
         &self,
         scope: &TenantScope,
@@ -362,8 +730,10 @@ impl ChannelRepository for MemoryChannelRepository {
                 "channel account changed; retry the edit",
             ));
         }
-        current.account = record.account;
-        current.proxy = record.proxy;
+        let mut account = record.account;
+        account.proxy_configured = current.account.proxy_configured;
+        account.proxy_server = current.account.proxy_server.clone();
+        current.account = account;
         Ok(current.account.clone())
     }
 
@@ -391,8 +761,10 @@ impl ChannelRepository for MemoryChannelRepository {
                 "channel account changed; retry the edit",
             ));
         }
-        current.account = record.account;
-        current.proxy = record.proxy;
+        let mut account = record.account;
+        account.proxy_configured = current.account.proxy_configured;
+        account.proxy_server = current.account.proxy_server.clone();
+        current.account = account;
         Ok(current.account.clone())
     }
 
@@ -533,6 +905,15 @@ impl ChannelRepository for MemoryChannelRepository {
         record: PoolAccountRecord,
     ) -> Result<PoolAccount, AppError> {
         let mut data = self.0.write().await;
+        let mut record = record;
+        if let Some(current) = data
+            .pool_accounts
+            .get(&(operator.as_uuid(), record.account.account_id))
+        {
+            record.proxy = current.proxy.clone();
+            record.account.proxy_configured = current.account.proxy_configured;
+            record.account.proxy_server = current.account.proxy_server.clone();
+        }
         if let Some(group) = record.account.group_id
             && !data.pool_groups.contains_key(&(operator.as_uuid(), group))
         {
@@ -662,6 +1043,16 @@ impl ChannelRepository for MemoryChannelRepository {
             .contains_key(&(operator.as_uuid(), session.account_id))
         {
             return Err(AppError::not_found("pool account not found"));
+        }
+        if let Some(old) = data
+            .pool_logins
+            .get(&(operator.as_uuid(), session.session_id))
+        {
+            return if old.account_id == session.account_id {
+                Ok(())
+            } else {
+                Err(AppError::conflict("pool login reference differs"))
+            };
         }
         data.pool_logins
             .insert((operator.as_uuid(), session.session_id), session);
@@ -832,6 +1223,12 @@ impl ChannelRepository for MemoryChannelRepository {
             return Err(AppError::forbidden("account outside project"));
         }
         let mut data = self.0.write().await;
+        let mut record = record;
+        if let Some(current) = data.accounts.get(&key(scope, record.account.account_id)?) {
+            record.proxy = current.proxy.clone();
+            record.account.proxy_configured = current.account.proxy_configured;
+            record.account.proxy_server = current.account.proxy_server.clone();
+        }
         if let Some(group_id) = record.account.group_id
             && !data.groups.contains_key(&key(scope, group_id)?)
         {
@@ -880,6 +1277,13 @@ impl ChannelRepository for MemoryChannelRepository {
         let mut data = self.0.write().await;
         if !data.accounts.contains_key(&key(scope, session.account_id)?) {
             return Err(AppError::not_found("account not found"));
+        }
+        if let Some(old) = data.logins.get(&key(scope, session.session_id)?) {
+            return if old.account_id == session.account_id {
+                Ok(())
+            } else {
+                Err(AppError::conflict("login reference differs"))
+            };
         }
         data.logins.insert(key(scope, session.session_id)?, session);
         Ok(())

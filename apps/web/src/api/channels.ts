@@ -10,7 +10,9 @@ export type ChannelPlatformId =
   | "kimi"
   | "doubao"
   | "deepseek"
-  | "glm";
+  | "glm"
+  | "qianwen"
+  | "yuanbao";
 
 export interface ChannelPlatform {
   id: ChannelPlatformId;
@@ -82,6 +84,11 @@ export interface PoolAccount extends Omit<
 export interface PoolAssignment {
   tenant_id: string;
   project_id: string;
+}
+
+export interface PoolProject extends PoolAssignment {
+  display_name: string;
+  tenant_display_name: string | null;
 }
 
 export interface ProxyInput {
@@ -292,6 +299,14 @@ export const cancelChannelLogin = (
     ...scope(tenantId, projectId),
     method: "DELETE",
   });
+
+export const listPoolProjects = (search: string, cursor?: string) => {
+  const query = new URLSearchParams({ search, limit: "25" });
+  if (cursor) query.set("cursor", cursor);
+  return apiFetch<{ items: PoolProject[]; next_cursor: string | null }>(
+    `/operator/channel-projects?${query}`,
+  );
+};
 
 export const listPoolGroups = () =>
   apiFetch<{ items: PoolGroup[] }>("/operator/channel-groups");
