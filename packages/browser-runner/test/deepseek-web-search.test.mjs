@@ -207,6 +207,32 @@ function historyFixture() {
   return Object.assign(f, { exchange, history });
 }
 
+test("capture failure forwards its fixed diagnostic without persistence or resubmission", async () => {
+  const f = fixture();
+  const diagnostics = [];
+  const diagnostic = {
+    kind: "observation_diagnostic",
+    schema_version: "geo.observation.diagnostic.v1",
+    stage: "capture_creation",
+    code: "capture_unverified",
+  };
+  const result = await observeDeepSeekWebSearch(f.page, payload, {
+    ...f.options,
+    onDiagnostic: (entry) => diagnostics.push(entry),
+    capture: async (_page, options) => {
+      await options.submit(f.page, options.signal);
+      options.onDiagnostic(diagnostic);
+      return null;
+    },
+  });
+  assert.equal(result.reason, "capture_unverified");
+  assert.deepEqual(diagnostics, [diagnostic]);
+  assert.equal(f.calls.filter((call) => call === "send").length, 1);
+  assert.equal(f.calls.includes("ownership"), false);
+  assert.equal(f.calls.includes("source"), false);
+  assert.equal(f.calls.includes("extract"), false);
+});
+
 test("fresh first-turn history is bound to transport IDs and retained in durable source and hash", async () => {
   const f = historyFixture();
   const result = await observeDeepSeekWebSearch(f.page, payload, f.options);

@@ -572,6 +572,63 @@ function fixture() {
 const finishedLoading =
   "Protocol error: Request with the provided ID has already finished loading";
 
+test("failed captures report only fixed stages without exception or request data", async () => {
+  for (const failure of [
+    "setup",
+    "submission",
+    "request",
+    "creation",
+    "response",
+    "stream",
+    "eof",
+  ]) {
+    const f = fixture();
+    const diagnostics = [];
+    let submits = 0;
+    if (failure === "setup")
+      f.page.context = () => {
+        throw new Error("private-token");
+      };
+    if (failure === "stream") f.session.streamError = "private-token";
+    if (failure === "eof") f.session.prefix = "not an SSE stream";
+    else f.session.prefix = wire;
+    const captured = await captureDeepSeekExchange(f.page, {
+      binding,
+      timeoutMs: 1000,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      ...(failure === "creation"
+        ? {
+            createdSessions: {
+              lookup: async () => null,
+              isCurrent: () => false,
+              status: () => "observing",
+            },
+          }
+        : {}),
+      submit: async () => {
+        submits++;
+        if (failure === "submission") throw new Error("private-token");
+        f.start(
+          failure === "request" ? { prompt: "private-token" } : {},
+          failure === "response" ? { status: 403 } : {},
+        );
+        f.end();
+      },
+    });
+    assert.equal(captured, null);
+    assert.equal(submits, failure === "setup" ? 0 : 1);
+    assert.deepEqual(diagnostics, [
+      {
+        kind: "observation_diagnostic",
+        schema_version: "geo.observation.diagnostic.v1",
+        stage: `capture_${failure}`,
+        code: "capture_unverified",
+      },
+    ]);
+    assert.equal(JSON.stringify(diagnostics).includes("private-token"), false);
+  }
+});
+
 function createdFixture(f, options = {}) {
   const observer = observeDeepSeekCreatedSessions(f.page, options);
   const create = (id) => {

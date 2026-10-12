@@ -227,6 +227,7 @@ export async function observeDeepSeekWebSearch(
           thinkingEnabled: false,
         },
         createdSessions,
+        onDiagnostic,
         submit: async (_page, captureSignal) => {
           if (submitted) throw new FlowError("submission_already_attempted");
           submitted = true;
