@@ -111,6 +111,34 @@ pub enum ObservationExtractionState {
     Interrupted,
 }
 
+impl ObservationExtractionState {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running | Self::ResponseReceived)
+    }
+}
+
+/// Public task status contains no source binding, model response or claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationExtractionStatus {
+    pub state: ObservationExtractionState,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub interruption: Option<ObservationExtractionInterruption>,
+}
+
+impl From<&ObservationExtractionIntent> for ObservationExtractionStatus {
+    fn from(intent: &ObservationExtractionIntent) -> Self {
+        Self {
+            state: intent.state,
+            created_at: intent.created_at,
+            started_at: intent.started_at,
+            finished_at: intent.finished_at,
+            interruption: intent.interruption,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationExtractionInterruption {
@@ -312,6 +340,15 @@ pub trait ObservationExtractionRepository: Send + Sync {
         scope: &TenantScope,
         intent_id: Uuid,
     ) -> Result<Option<ObservationExtractionIntent>, AppError>;
+    /// One scoped status: newest active task, otherwise newest terminal task.
+    /// Order ties by intent ID. An older active task must not be hidden by a
+    /// newer terminal task; no status is inferred from elapsed time.
+    async fn status_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Option<ObservationExtractionStatus>, AppError>;
     /// Service-only keyset discovery. Fix as_of across pages; no claim tokens or
     /// response text are returned. Running inference is never rediscovered.
     async fn scan_ready(
@@ -485,6 +522,32 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
         items.sort_by_key(|item| item.intent_id);
         items.truncate(limit);
         Ok(items)
+    }
+    async fn status_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Option<ObservationExtractionStatus>, AppError> {
+        validate_observation_extraction_scope(scope)?;
+        Ok(self
+            .records
+            .lock()
+            .await
+            .values()
+            .filter(|stored| {
+                stored.scope == *scope
+                    && stored.intent.request.target_id == target_id
+                    && stored.intent.request.attempt_id == attempt_id
+            })
+            .max_by_key(|stored| {
+                (
+                    stored.intent.state.is_active(),
+                    stored.intent.created_at,
+                    stored.intent.intent_id,
+                )
+            })
+            .map(|stored| ObservationExtractionStatus::from(&stored.intent)))
     }
     async fn claim(
         &self,
@@ -685,6 +748,155 @@ mod tests {
             request
                 .intent_key(&TenantScope::new(scope.operator_id, scope.tenant_id, None))
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn status_is_scoped_and_selects_latest_active_before_terminal() {
+        let (store, scope, oldest) = seeded().await;
+        let target = oldest.request.target_id;
+        let attempt = oldest.request.attempt_id;
+        let mut newer = oldest.clone();
+        newer.intent_id = Uuid::new_v4();
+        newer.created_at += chrono::Duration::seconds(1);
+        newer.state = ObservationExtractionState::Interrupted;
+        newer.interruption = Some(ObservationExtractionInterruption::InferenceInterrupted);
+        store.records.lock().await.insert(
+            newer.intent_id,
+            Stored {
+                scope: scope.clone(),
+                intent: newer.clone(),
+                claim_token: Some(Uuid::new_v4()),
+            },
+        );
+        let status = store
+            .status_for_attempt(&scope, target, attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, ObservationExtractionStatus::from(&oldest));
+        for wrong in [
+            TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, scope.project_id),
+            TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id),
+            TenantScope::new(
+                scope.operator_id,
+                scope.tenant_id,
+                Some(Uuid::new_v4().into()),
+            ),
+        ] {
+            assert!(
+                store
+                    .status_for_attempt(&wrong, target, attempt)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            store
+                .status_for_attempt(&scope, Uuid::new_v4(), attempt)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .status_for_attempt(&scope, target, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let claim = store
+            .claim(&scope, oldest.intent_id, oldest.created_at)
+            .await
+            .unwrap()
+            .unwrap();
+        // An old running claim remains the stored state; age is not completion.
+        assert_eq!(
+            store
+                .status_for_attempt(&scope, target, attempt)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ObservationExtractionState::Running
+        );
+        store
+            .interrupt(
+                &scope,
+                oldest.intent_id,
+                claim.claim_token,
+                ObservationExtractionInterruption::InferenceInterrupted,
+                newer.created_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .status_for_attempt(&scope, target, attempt)
+                .await
+                .unwrap()
+                .unwrap(),
+            ObservationExtractionStatus::from(&newer)
+        );
+        let serialized = serde_json::to_value(status).unwrap();
+        assert_eq!(serialized.as_object().unwrap().len(), 5);
+        for secret in [
+            "request",
+            "response",
+            "intent_id",
+            "claim_token",
+            "completion",
+            "intent_key",
+        ] {
+            assert!(serialized.get(secret).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn status_orders_matching_tasks_by_created_at_then_intent_id() {
+        let (store, scope, oldest) = seeded().await;
+        let mut first = oldest.clone();
+        first.intent_id = Uuid::from_u128(1);
+        first.created_at += chrono::Duration::seconds(1);
+        let mut second = first.clone();
+        second.intent_id = Uuid::from_u128(2);
+        second.state = ObservationExtractionState::Running;
+        second.started_at = Some(second.created_at);
+        for intent in [first.clone(), second.clone()] {
+            store.records.lock().await.insert(
+                intent.intent_id,
+                Stored {
+                    scope: scope.clone(),
+                    intent,
+                    claim_token: Some(Uuid::new_v4()),
+                },
+            );
+        }
+        assert_eq!(
+            store
+                .status_for_attempt(&scope, oldest.request.target_id, oldest.request.attempt_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            ObservationExtractionStatus::from(&second)
+        );
+        first.created_at += chrono::Duration::seconds(1);
+        store
+            .records
+            .lock()
+            .await
+            .get_mut(&first.intent_id)
+            .unwrap()
+            .intent = first.clone();
+        assert_eq!(
+            store
+                .status_for_attempt(&scope, oldest.request.target_id, oldest.request.attempt_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            ObservationExtractionStatus::from(&first)
         );
     }
     #[test]

@@ -38,6 +38,10 @@ pub fn configure_callbacks(
                 geo_persistence::PgObservationCaptureRepository::from_database(database),
             ),
         ));
+    let extraction_repository: std::sync::Arc<dyn geo_domain::ObservationExtractionRepository> =
+        std::sync::Arc::new(
+            geo_persistence::PgObservationExtractionRepository::from_database(database),
+        );
     let state = match (
         env::var("GEO_BROWSER_RUNNER_URL").ok(),
         env::var("GEO_BROWSER_RUNNER_TOKEN").ok(),
@@ -56,7 +60,8 @@ pub fn configure_callbacks(
                 ),
                 geo_api::ProjectConfiguredModelBridge::new(settings, inherited)?,
                 std::sync::Arc::new(geo_api::HttpSavedObservationGrounder::new(&url, &token)?),
-            );
+            )
+            .with_extraction_repository(extraction_repository.clone());
             state.with_observation_analysis(analysis)
         }
         (None, None) => state,
@@ -64,7 +69,13 @@ pub fn configure_callbacks(
     };
     let token = env::var("GEO_BROWSER_RUNNER_CALLBACK_TOKEN").ok();
     let key = env::var("GEO_CHANNEL_SECRET_KEY").ok();
-    callbacks_with_credentials(state, database, token.as_deref(), key.as_deref())
+    callbacks_with_credentials(
+        state,
+        database,
+        token.as_deref(),
+        key.as_deref(),
+        extraction_repository,
+    )
 }
 
 fn callbacks_with_credentials(
@@ -72,6 +83,7 @@ fn callbacks_with_credentials(
     database: &geo_persistence::Database,
     token: Option<&str>,
     key: Option<&str>,
+    extraction_repository: std::sync::Arc<dyn geo_domain::ObservationExtractionRepository>,
 ) -> Result<AppState, Box<dyn Error>> {
     let Some(token) = token else {
         return Ok(state);
@@ -88,9 +100,7 @@ fn callbacks_with_credentials(
     let settings = state.project_ai_settings();
     let inherited = settings.inherited_provider(geo_domain::ProjectAiUsage::ObservationAnalysis);
     let mut extraction = geo_api::ObservationExtractionService::new(
-        std::sync::Arc::new(
-            geo_persistence::PgObservationExtractionRepository::from_database(database),
-        ),
+        extraction_repository,
         std::sync::Arc::new(
             geo_persistence::PgObservationCaptureRepository::from_database(database),
         ),

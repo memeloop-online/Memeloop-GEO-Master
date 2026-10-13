@@ -400,6 +400,16 @@ mod tests {
         ) -> Result<Option<ObservationExtractionIntent>, AppError> {
             self.inner.get(scope, id).await
         }
+        async fn status_for_attempt(
+            &self,
+            scope: &TenantScope,
+            target_id: Uuid,
+            attempt_id: Uuid,
+        ) -> Result<Option<geo_domain::ObservationExtractionStatus>, AppError> {
+            self.inner
+                .status_for_attempt(scope, target_id, attempt_id)
+                .await
+        }
         async fn scan_ready(
             &self,
             at: chrono::DateTime<Utc>,
