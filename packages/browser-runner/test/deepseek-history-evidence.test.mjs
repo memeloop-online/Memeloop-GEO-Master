@@ -339,3 +339,117 @@ test("absence is only HTTP 200, top-level code 0, business code 1", () => {
       false,
     );
 });
+
+test("existing rejection branches report fixed reasons without changing null or success", () => {
+  for (const [change, reason] of [
+    [
+      (v) => {
+        v.status = 403;
+      },
+      "response_envelope_unverified",
+    ],
+    [
+      (v) => {
+        v.body = "{";
+      },
+      "history_envelope_unverified",
+    ],
+    [
+      (v) => {
+        const body = fixture();
+        body.data.biz_code = 5;
+        v.body = JSON.stringify(body);
+      },
+      "history_envelope_unverified",
+    ],
+    [
+      (v) => {
+        const body = fixture();
+        history(body).chat_session.id = "other-synthetic-session";
+        v.body = JSON.stringify(body);
+      },
+      "history_binding_mismatch",
+    ],
+    [
+      (v) => {
+        const body = fixture();
+        history(body).chat_session.current_message_id = 3;
+        v.body = JSON.stringify(body);
+      },
+      "history_binding_mismatch",
+    ],
+    [
+      (v) => {
+        const body = fixture();
+        history(body).cache_control = "APPEND";
+        v.body = JSON.stringify(body);
+      },
+      "inventory_unverified",
+    ],
+    [
+      (v) => {
+        const body = fixture();
+        messages(body).pop();
+        v.body = JSON.stringify(body);
+      },
+      "inventory_unverified",
+    ],
+    [
+      (v) => {
+        v.body = v.body.replace('"message_id":1', '"message_id":1e0');
+      },
+      "inventory_unverified",
+    ],
+    [
+      (v) => {
+        const body = fixture();
+        messages(body)[1].parent_id = 3;
+        v.body = JSON.stringify(body);
+      },
+      "inventory_unverified",
+    ],
+    [
+      (v) => {
+        const body = fixture();
+        messages(body)[1].status = "WIP";
+        v.body = JSON.stringify(body);
+      },
+      "completion_unverified",
+    ],
+    [
+      (v) => {
+        const body = fixture();
+        messages(body)[1].has_pending_fragment = true;
+        v.body = JSON.stringify(body);
+      },
+      "completion_unverified",
+    ],
+  ]) {
+    const value = envelope();
+    change(value);
+    const reasons = [];
+    assert.equal(
+      verifyDeepSeekFirstTurnHistory(value, expected, {
+        onFailureReason: (value) => reasons.push(value),
+      }),
+      null,
+    );
+    assert.deepEqual(reasons, [reason]);
+    assert.equal(verifyDeepSeekFirstTurnHistory(value, expected), null);
+  }
+  assert.deepEqual(
+    verifyDeepSeekFirstTurnHistory(envelope(), expected, {
+      onFailureReason: () =>
+        assert.fail("successful inventory has no failure reason"),
+    }),
+    inventory,
+  );
+  assert.equal(
+    verifyDeepSeekFirstTurnHistory(null, expected, {
+      onFailureReason: () => {
+        throw new Error("synthetic callback failure");
+      },
+    }),
+    null,
+  );
+});

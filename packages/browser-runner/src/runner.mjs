@@ -1223,11 +1223,13 @@ export function createRunner(options = {}) {
       return previous.promise;
     }
     const record = session(sessionId);
-    const reply = (status, stage, code) => ({
+    const reply = (status, stage, code, reason) => ({
       execution_id: input.execution_id,
       external_conversation_id: input.external_conversation_id,
       status,
-      ...(stage ? { diagnostic: { stage, code } } : {}),
+      ...(stage
+        ? { diagnostic: { stage, code, ...(reason ? { reason } : {}) } }
+        : {}),
     });
     const adapter = providerCompletionRecoveryAdapter(record.platform);
     if (!adapter || record.platform !== input.expected_identity.provider)
@@ -1274,7 +1276,11 @@ export function createRunner(options = {}) {
         if (expired()) return deadlineReply();
         const failure = identityFailure(identity);
         if (failure) return failure;
+        let historyReason;
         const result = await adapter.read(page, input, {
+          onFailureReason: (reason) => {
+            if (!expired()) historyReason ??= reason;
+          },
           timeoutMs: Math.max(
             1,
             Math.min(12_000, Math.floor(deadlineAt - performance.now())),
@@ -1282,7 +1288,12 @@ export function createRunner(options = {}) {
         });
         if (expired()) return deadlineReply();
         if (!result)
-          return reply("retained", "history", "completion_unverified");
+          return reply(
+            "retained",
+            "history",
+            "completion_unverified",
+            historyReason,
+          );
         // Recheck independently after the read: login drift cannot promote
         // history observed under another account into recovery evidence.
         const finalIdentity = await record.adapter.identify(page);

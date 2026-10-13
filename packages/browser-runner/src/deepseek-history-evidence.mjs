@@ -22,7 +22,7 @@ function expectedId(value) {
     : null;
 }
 
-function parseEnvelope(envelope) {
+function parseEnvelope(envelope, fail = () => null) {
   if (
     !object(envelope) ||
     envelope.status !== 200 ||
@@ -30,7 +30,7 @@ function parseEnvelope(envelope) {
     envelope.body.length > MAX_BYTES ||
     Buffer.byteLength(envelope.body, "utf8") > MAX_BYTES
   )
-    return null;
+    return fail("response_envelope_unverified");
   try {
     const invalidIds = new WeakSet();
     const value = JSON.parse(envelope.body, function (key, entry, context) {
@@ -43,11 +43,12 @@ function parseEnvelope(envelope) {
         invalidIds.add(this);
       return entry;
     });
-    if (!object(value) || value.code !== 0 || !object(value.data)) return null;
+    if (!object(value) || value.code !== 0 || !object(value.data))
+      return fail("history_envelope_unverified");
     return { data: value.data, invalidIds };
   } catch {
     // Raw response content and parser diagnostics never leave this boundary.
-    return null;
+    return fail("history_envelope_unverified");
   }
 }
 
@@ -63,56 +64,76 @@ function parseEnvelope(envelope) {
  * Numeric wire IDs must use canonical nonnegative safe-integer JSON literals.
  * Fragment bodies, citations and session metadata are never returned.
  */
-export function verifyDeepSeekFirstTurnHistory(envelope, expected) {
+export function verifyDeepSeekFirstTurnHistory(
+  envelope,
+  expected,
+  { onFailureReason } = {},
+) {
+  const fail = (reason) => {
+    try {
+      onFailureReason?.(reason);
+    } catch {
+      /* Diagnostics cannot affect evidence. */
+    }
+    return null;
+  };
   if (
     !object(expected) ||
     typeof expected.conversationId !== "string" ||
     !SESSION_ID.test(expected.conversationId)
   )
-    return null;
+    return fail("history_binding_mismatch");
   const requestId = expectedId(expected.requestMessageId);
   const responseId = expectedId(expected.responseMessageId);
   if (requestId === null || responseId === null || requestId === responseId)
-    return null;
-  const parsed = parseEnvelope(envelope);
+    return fail("history_binding_mismatch");
+  const parsed = parseEnvelope(envelope, fail);
+  if (!parsed) return null;
   const history = parsed?.data?.biz_data;
   if (
     parsed?.data?.biz_code !== 0 ||
     !object(history) ||
-    !object(history.chat_session) ||
+    !object(history.chat_session)
+  )
+    return fail("history_envelope_unverified");
+  if (
     history.chat_session.id !== expected.conversationId ||
     parsed.invalidIds.has(history.chat_session) ||
     (history.chat_session.current_message_id != null &&
-      numericId(history.chat_session.current_message_id) !== responseId) ||
+      numericId(history.chat_session.current_message_id) !== responseId)
+  )
+    return fail("history_binding_mismatch");
+  if (
     history.cache_control !== "REPLACE" ||
     !Array.isArray(history.chat_messages) ||
     history.chat_messages.length !== 2
   )
-    return null;
+    return fail("inventory_unverified");
   const nodes = new Map();
   for (const message of history.chat_messages) {
+    if (!object(message) || parsed.invalidIds.has(message))
+      return fail("inventory_unverified");
     if (
-      !object(message) ||
-      parsed.invalidIds.has(message) ||
       message.status !== "FINISHED" ||
       ![undefined, null, "FINISHED"].includes(message.quasi_status) ||
-      message.has_pending_fragment !== false ||
-      !Array.isArray(message.fragments)
+      message.has_pending_fragment !== false
     )
-      return null;
+      return fail("completion_unverified");
+    if (!Array.isArray(message.fragments)) return fail("inventory_unverified");
     const id = numericId(message.message_id);
-    if (id === null || nodes.has(id)) return null;
+    if (id === null || nodes.has(id)) return fail("inventory_unverified");
     nodes.set(id, message);
   }
   const user = nodes.get(requestId);
   const assistant = nodes.get(responseId);
+  if (!user || !assistant) return fail("history_binding_mismatch");
   if (
     user?.role !== "USER" ||
     user.parent_id !== null ||
     assistant?.role !== "ASSISTANT" ||
     numericId(assistant.parent_id) !== requestId
   )
-    return null;
+    return fail("inventory_unverified");
   return {
     conversationId: expected.conversationId,
     messages: [

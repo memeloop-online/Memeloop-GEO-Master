@@ -180,13 +180,32 @@ test("completion recovery rejects changed IDs, later/incomplete history and acco
       });
       assert.equal(result.status, "retained");
       assert.equal(result.history_json, undefined);
+      assert.deepEqual(result.diagnostic, {
+        stage: "history",
+        code: "completion_unverified",
+        reason: "history_binding_mismatch",
+      });
     }
     for (const flag of ["incomplete", "later"]) {
       state[flag] = true;
-      assert.equal(
-        (await runner.recoverConversationCompletion("session", input())).status,
-        "retained",
+      const request = input();
+      const result = await runner.recoverConversationCompletion(
+        "session",
+        request,
       );
+      assert.equal(result.status, "retained");
+      assert.equal(
+        result.diagnostic.reason,
+        flag === "incomplete"
+          ? "completion_unverified"
+          : "history_binding_mismatch",
+      );
+      const reads = calls.length;
+      assert.deepEqual(
+        await runner.recoverConversationCompletion("session", request),
+        result,
+      );
+      assert.equal(calls.length, reads);
       state[flag] = false;
     }
     const count = calls.length;
@@ -209,6 +228,7 @@ test("completion recovery rejects changed IDs, later/incomplete history and acco
       input(),
     );
     assert.equal(drift.diagnostic.code, "account_mismatch");
+    assert.equal(drift.diagnostic.reason, undefined);
     assert.equal(drift.history_json, undefined);
   });
 });
@@ -250,6 +270,7 @@ test("deadline keeps blocked identity work fenced and prevents late history disp
       );
       assert.equal(result.status, "unknown");
       assert.equal(result.diagnostic.code, "deadline_exceeded");
+      assert.equal(result.diagnostic.reason, undefined);
       await assert.rejects(
         runner.recoverConversationCompletion("session", input()),
         /session_busy/,

@@ -225,7 +225,21 @@ test("redirects never follow, and HTTP/MIME/malformed responses fail closed", as
       },
       reply,
     );
-    assert.equal(await readDeepSeekFirstTurnHistory(page, expected), null);
+    const reasons = [];
+    assert.equal(
+      await readDeepSeekFirstTurnHistory(page, {
+        ...expected,
+        onFailureReason: (reason) => reasons.push(reason),
+      }),
+      null,
+    );
+    assert.deepEqual(reasons, [
+      reply.status === 302
+        ? "transport_unavailable"
+        : reply.body === "{"
+          ? "history_envelope_unverified"
+          : "response_envelope_unverified",
+    ]);
   }
   assert.equal(requests.length, 4);
   assert.ok(requests.every((request) => request.url() === historyUrl));
@@ -287,13 +301,20 @@ test("native browser streams enforce actual byte cap and fatal UTF-8 without a c
       },
       { kind, url: historyUrl },
     );
+    const reasons = [];
     assert.equal(
       await readDeepSeekFirstTurnHistory(page, {
         ...expected,
         timeoutMs: kind === "hanging" ? 50 : 1000,
+        onFailureReason: (reason) => reasons.push(reason),
       }),
       null,
     );
+    assert.deepEqual(reasons, [
+      kind === "hanging"
+        ? "read_deadline_exceeded"
+        : "response_envelope_unverified",
+    ]);
     if (kind !== "hanging")
       assert.equal(
         await page.evaluate(() => globalThis.syntheticCancelled),
@@ -438,10 +459,16 @@ test("hung evaluate and handle acquisition settle by outer deadline without awai
     if (stage === "handle") page.evaluateHandle = () => new Promise(() => {});
     if (stage === "cleanup") page.handle.evaluate = () => new Promise(() => {});
     const started = Date.now();
+    const reasons = [];
     assert.equal(
-      await readDeepSeekFirstTurnHistory(page, { ...expected, timeoutMs: 20 }),
+      await readDeepSeekFirstTurnHistory(page, {
+        ...expected,
+        timeoutMs: 20,
+        onFailureReason: (reason) => reasons.push(reason),
+      }),
       null,
     );
+    assert.deepEqual(reasons, ["read_deadline_exceeded"]);
     assert.ok(Date.now() - started < 1000);
     clean(page);
     if (stage !== "handle") {
@@ -460,9 +487,11 @@ test("abort, close, navigation and late rejected evaluate remain inert and clean
         reject = fail;
       });
     const controller = new AbortController();
+    const reasons = [];
     const reading = readDeepSeekFirstTurnHistory(page, {
       ...expected,
       signal: controller.signal,
+      onFailureReason: (reason) => reasons.push(reason),
     });
     await new Promise((resolve) => setImmediate(resolve));
     if (action === "abort") controller.abort();
@@ -472,6 +501,7 @@ test("abort, close, navigation and late rejected evaluate remain inert and clean
     reject(new Error("synthetic private error must remain suppressed"));
     await new Promise((resolve) => setImmediate(resolve));
     clean(page);
+    assert.deepEqual(reasons, ["document_unavailable"]);
   }
 });
 
@@ -585,4 +615,57 @@ test("candidate IDs cannot bypass raw numeric, complete graph or terminal verifi
       ),
       { status: "unknown" },
     );
+});
+
+test("document and browser transport failures expose only one reason while remaining null", async (t) => {
+  const { page, requests } = await synthetic(t);
+  for (const kind of ["auth", "fetch"]) {
+    await page.evaluate((kind) => {
+      if (kind === "auth") localStorage.setItem("userToken", "{");
+      else {
+        localStorage.setItem(
+          "userToken",
+          JSON.stringify({ __version: "0", value: "synthetic-token" }),
+        );
+        globalThis.fetch = async () => {
+          throw new Error("synthetic private transport detail");
+        };
+      }
+    }, kind);
+    const reasons = [];
+    assert.equal(
+      await readDeepSeekFirstTurnHistory(page, {
+        ...expected,
+        onFailureReason: (reason) => reasons.push(reason),
+      }),
+      null,
+    );
+    assert.deepEqual(reasons, [
+      kind === "auth" ? "document_unavailable" : "transport_unavailable",
+    ]);
+  }
+  assert.equal(requests.length, 0);
+});
+
+test("late successful evaluation cannot change a settled deadline reason or start cleanup", async () => {
+  const page = new FakePage();
+  let release;
+  page.evaluate = () =>
+    new Promise((resolve) => {
+      release = resolve;
+    });
+  const reasons = [];
+  assert.equal(
+    await readDeepSeekFirstTurnHistory(page, {
+      ...expected,
+      timeoutMs: 20,
+      onFailureReason: (reason) => reasons.push(reason),
+    }),
+    null,
+  );
+  assert.deepEqual(reasons, ["read_deadline_exceeded"]);
+  release({ status: 200, body: JSON.stringify(fixture()) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(reasons, ["read_deadline_exceeded"]);
+  clean(page);
 });

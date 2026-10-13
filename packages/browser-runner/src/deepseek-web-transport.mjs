@@ -12,25 +12,43 @@ const DELETE_CLOSE_MARGIN_MS = 2_000;
  */
 export async function withDeepSeekDocument(
   page,
-  { timeoutMs = 10_000, signal } = {},
+  { timeoutMs = 10_000, signal, onFailureReason } = {},
   operation,
 ) {
+  const report = (reason) => {
+    try {
+      onFailureReason?.(reason);
+    } catch {
+      /* Diagnostics are advisory. */
+    }
+  };
   if (
     !Number.isFinite(timeoutMs) ||
     timeoutMs <= 0 ||
     timeoutMs > 120_000 ||
     signal?.aborted
-  )
+  ) {
+    report(signal?.aborted ? "document_unavailable" : "read_deadline_exceeded");
     return null;
+  }
   let handle;
   let timer;
   let settled = false;
+  let reason = "document_unavailable";
+  let succeeded = false;
+  const note = (value) => {
+    if (!settled) reason = value;
+  };
   let resolve;
   const stopped = new Promise((done) => (resolve = done));
   const stop = () => {
     if (settled) return;
     settled = true;
     resolve(null);
+  };
+  const timedOut = () => {
+    note("read_deadline_exceeded");
+    stop();
   };
   const navigated = (frame) => {
     if (frame === page.mainFrame()) stop();
@@ -66,7 +84,7 @@ export async function withDeepSeekDocument(
       !signal?.aborted &&
       !page.isClosed() &&
       page.url() === href;
-    timer = setTimeout(stop, timeoutMs);
+    timer = setTimeout(timedOut, timeoutMs);
     signal?.addEventListener("abort", stop, { once: true });
     page.on("framenavigated", navigated);
     page.on("close", stop);
@@ -92,15 +110,28 @@ export async function withDeepSeekDocument(
         },
         { origin: DEEPSEEK_ORIGIN, href, deadline },
       )
-      .then((opened) => {
-        if (settled) {
-          dispose(opened);
-          return null;
-        }
-        return opened;
-      });
+      .then(
+        (opened) => {
+          if (settled) {
+            dispose(opened);
+            return null;
+          }
+          return opened;
+        },
+        (error) => {
+          note("transport_unavailable");
+          throw error;
+        },
+      );
     handle = await Promise.race([opening, stopped]);
-    if (!handle || !active()) return null;
+    if (!handle || !active()) {
+      note(
+        Date.now() >= deadline
+          ? "read_deadline_exceeded"
+          : "document_unavailable",
+      );
+      return null;
+    }
     const check = async () => {
       if (!active()) return false;
       const valid = await Promise.race([
@@ -141,6 +172,11 @@ export async function withDeepSeekDocument(
             closeMarginMs,
           }) => {
             let reader;
+            let failureReason = "transport_unavailable";
+            // The carrier is consumed below; request() still returns null.
+            // Delete operations retain their existing null-only failure shape.
+            const failure = (reason) =>
+              kind === "history" ? [null, reason] : null;
             try {
               const valid = () =>
                 !!state &&
@@ -150,14 +186,21 @@ export async function withDeepSeekDocument(
                 Date.now() < deadline &&
                 !state.controller.signal.aborted &&
                 localStorage.getItem("userToken") === state.credential;
-              if (!valid()) return null;
+              if (!valid())
+                return failure(
+                  Date.now() >= deadline
+                    ? "read_deadline_exceeded"
+                    : "document_unavailable",
+                );
+              failureReason = "document_unavailable";
               const stored = JSON.parse(state.credential ?? "null");
               if (
                 stored?.__version !== "0" ||
                 typeof stored.value !== "string" ||
                 !stored.value.trim()
               )
-                return null;
+                return failure("document_unavailable");
+              failureReason = "transport_unavailable";
               if (
                 kind === "delete" &&
                 (!Number.isFinite(deleteNotAfterMs) ||
@@ -199,9 +242,9 @@ export async function withDeepSeekDocument(
                 (length !== null &&
                   (!/^\d+$/u.test(length) || Number(length) > maxBytes))
               )
-                return null;
+                return failure("response_envelope_unverified");
               reader = response.body?.getReader();
-              if (!reader) return null;
+              if (!reader) return failure("response_envelope_unverified");
               const decoder = new TextDecoder("utf-8", { fatal: true });
               let bytes = 0;
               let body = "";
@@ -209,14 +252,33 @@ export async function withDeepSeekDocument(
                 const { done, value } = await reader.read();
                 if (done) break;
                 bytes += value.byteLength;
-                if (bytes > maxBytes || !valid()) return null;
+                if (bytes > maxBytes)
+                  return failure("response_envelope_unverified");
+                if (!valid())
+                  return failure(
+                    Date.now() >= deadline
+                      ? "read_deadline_exceeded"
+                      : "document_unavailable",
+                  );
+                failureReason = "response_envelope_unverified";
                 body += decoder.decode(value, { stream: true });
+                failureReason = "transport_unavailable";
               }
+              failureReason = "response_envelope_unverified";
               body += decoder.decode();
-              if (!valid()) return null;
+              if (!valid())
+                return failure(
+                  Date.now() >= deadline
+                    ? "read_deadline_exceeded"
+                    : "document_unavailable",
+                );
               return { status: response.status, body };
             } catch {
-              return null;
+              return failure(
+                Date.now() >= deadline
+                  ? "read_deadline_exceeded"
+                  : failureReason,
+              );
             } finally {
               if (reader) void reader.cancel().catch(() => {});
             }
@@ -236,14 +298,40 @@ export async function withDeepSeekDocument(
         ),
         stopped,
       ]);
+      if (
+        kind === "history" &&
+        Array.isArray(envelope) &&
+        envelope[0] === null
+      ) {
+        if (
+          [
+            "document_unavailable",
+            "read_deadline_exceeded",
+            "transport_unavailable",
+            "response_envelope_unverified",
+          ].includes(envelope[1])
+        )
+          note(envelope[1]);
+        return null;
+      }
       return active() ? envelope : null;
     };
     const result = await Promise.race([
       operation({ active, check, request }),
       stopped,
     ]);
-    return active() ? result : null;
+    const stillActive = active();
+    if (!stillActive)
+      note(
+        Date.now() >= deadline
+          ? "read_deadline_exceeded"
+          : "document_unavailable",
+      );
+    const value = stillActive ? result : null;
+    succeeded = value !== null && value !== undefined;
+    return value;
   } catch {
+    note("transport_unavailable");
     return null;
   } finally {
     stop();
@@ -252,5 +340,6 @@ export async function withDeepSeekDocument(
     page.off?.("framenavigated", navigated);
     page.off?.("close", stop);
     if (handle) dispose(handle);
+    if (!succeeded) report(reason);
   }
 }

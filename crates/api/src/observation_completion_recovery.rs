@@ -14,7 +14,8 @@ use crate::{
     AppState,
     browser_bridge::{
         CompletionRecoveryCode, CompletionRecoveryDiagnostic, CompletionRecoveryIdentity,
-        CompletionRecoveryRequest, CompletionRecoveryResult, CompletionRecoveryStage,
+        CompletionRecoveryReason, CompletionRecoveryRequest, CompletionRecoveryResult,
+        CompletionRecoveryStage,
     },
 };
 
@@ -78,6 +79,22 @@ impl RetryDiagnostic {
 
     fn retry(self) -> Outcome {
         self.record();
+        Outcome::Retry
+    }
+
+    fn retry_with_reason(self, reason: Option<CompletionRecoveryReason>) -> Outcome {
+        if let Some(reason) = reason {
+            let (stage, code) = self.fields();
+            tracing::info!(
+                stage,
+                code,
+                reason = reason.as_str(),
+                outcome = "retry",
+                "completion recovery deferred"
+            );
+        } else {
+            self.record();
+        }
         Outcome::Retry
     }
 }
@@ -277,9 +294,10 @@ async fn recover_once(
                     Some(CompletionRecoveryDiagnostic {
                         stage: CompletionRecoveryStage::History,
                         code: CompletionRecoveryCode::CompletionUnverified,
+                        reason,
                     }),
                 ..
-            } => Ok(RetryDiagnostic::CompletionUnverified.retry()),
+            } => Ok(RetryDiagnostic::CompletionUnverified.retry_with_reason(reason)),
             CompletionRecoveryResult::Retained { .. } => Ok(Outcome::Retained),
             CompletionRecoveryResult::Unknown { .. } => Ok(RetryDiagnostic::RunnerUnknown.retry()),
         }
@@ -435,13 +453,16 @@ mod tests {
             if matches!(
                 stub.mode,
                 "retained" | "needs_login" | "incomplete-history" | "unsupported"
-            ) {
+            ) || serde_json::from_value::<CompletionRecoveryReason>(json!(stub.mode)).is_ok()
+            {
                 json!({"status":if stub.mode == "needs_login" {"needs_login"} else {"retained"},
                 "execution_id":payload["execution_id"],
                 "external_conversation_id":"synthetic-chat",
                 "diagnostic":match stub.mode {
                     "incomplete-history" => json!({"stage":"history","code":"completion_unverified"}),
                     "unsupported" => json!({"stage":"scope","code":"unsupported_platform"}),
+                    _ if serde_json::from_value::<CompletionRecoveryReason>(json!(stub.mode)).is_ok() =>
+                        json!({"stage":"history","code":"completion_unverified","reason":stub.mode}),
                     _ => Value::Null,
                 }})
             } else {
@@ -746,6 +767,42 @@ mod tests {
                 read
             );
             assert!(events.last().unwrap().ends_with("/dispose"));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_history_reasons_preserve_retry_and_owned_browser_disposal() {
+        for reason in [
+            "document_unavailable",
+            "read_deadline_exceeded",
+            "transport_unavailable",
+            "response_envelope_unverified",
+            "history_envelope_unverified",
+            "history_binding_mismatch",
+            "inventory_unverified",
+            "completion_unverified",
+        ] {
+            let (state, scope, claim, evidence, stub, server) = fixture(reason).await;
+            assert_eq!(
+                recover_once(&state, &evidence, &scope, &claim).await,
+                Outcome::Retry
+            );
+            assert!(evidence.stored.lock().await.is_none());
+            let events = stub.events.lock().await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|path| path.ends_with("/recover-conversation-completion"))
+                    .count(),
+                1
+            );
+            assert!(events.last().unwrap().ends_with("/dispose"));
+            assert!(
+                !events
+                    .iter()
+                    .any(|path| path.contains("delete") || path.contains("execute"))
+            );
             server.abort();
         }
     }

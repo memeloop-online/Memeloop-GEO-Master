@@ -47,24 +47,62 @@ function observedHistory(envelope) {
  */
 export async function readDeepSeekFirstTurnHistory(
   page,
-  { conversationId, requestMessageId, responseMessageId, ...options } = {},
+  {
+    conversationId,
+    requestMessageId,
+    responseMessageId,
+    onFailureReason,
+    ...options
+  } = {},
 ) {
+  const report = (reason) => {
+    try {
+      onFailureReason?.(reason);
+    } catch {
+      /* Diagnostics cannot affect evidence. */
+    }
+  };
   if (
     !validDeepSeekSessionId(conversationId) ||
     !messageId(requestMessageId) ||
     !messageId(responseMessageId) ||
     String(requestMessageId) === String(responseMessageId)
-  )
+  ) {
+    report("history_binding_mismatch");
     return null;
-  return withDeepSeekDocument(page, options, async ({ request }) => {
-    const envelope = await request("history", conversationId);
-    const inventory = verifyDeepSeekFirstTurnHistory(envelope, {
-      conversationId,
-      requestMessageId,
-      responseMessageId,
-    });
-    return inventory ? { inventory, history: observedHistory(envelope) } : null;
-  });
+  }
+  let reason;
+  const result = await withDeepSeekDocument(
+    page,
+    {
+      ...options,
+      onFailureReason: (value) => {
+        reason ??= value;
+      },
+    },
+    async ({ request, active }) => {
+      const envelope = await request("history", conversationId);
+      if (!envelope || !active()) return null;
+      const inventory = verifyDeepSeekFirstTurnHistory(
+        envelope,
+        {
+          conversationId,
+          requestMessageId,
+          responseMessageId,
+        },
+        {
+          onFailureReason: (value) => {
+            if (active()) reason ??= value;
+          },
+        },
+      );
+      return inventory
+        ? { inventory, history: observedHistory(envelope) }
+        : null;
+    },
+  );
+  if (!result) report(reason ?? "completion_unverified");
+  return result;
 }
 
 /**

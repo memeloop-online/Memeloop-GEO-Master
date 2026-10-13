@@ -26,6 +26,12 @@
 
 失败返回 `retained`、`needs_login` 或 `unknown` 与可选闭合诊断；不返回原始异常或凭据。Rust 桥接校验作用域、标识、身份、字节上限及摘要，领域验证仍负责会话完成证明。
 
+历史读取的 `retained/history/completion_unverified` 可附加闭合 `reason`：
+`document_unavailable`、`read_deadline_exceeded`、`transport_unavailable`、
+`response_envelope_unverified`、`history_envelope_unverified`、
+`history_binding_mismatch`、`inventory_unverified`、`completion_unverified`。
+原因只解释既有拒绝分支，不改变返回状态、重试、完成证明或清理权限；不保存原始异常、正文、账号、地址或实际业务码。缺少原因仍兼容旧执行器。必须先部署支持该字段的 API，再部署新执行器；旧 API 会拒绝额外字段。
+
 同一执行标识的参数不可改变；重放不产生新提问。执行器在读取前后识别账号，在独立截止内保持浏览器占用，超时后的迟到操作不能继续读取历史。适配器通过供应商注册表选择。
 
 ## 持久调度
@@ -40,4 +46,4 @@
 
 代码入口为领域及持久层的 `observation_completion_recovery_jobs.rs`、API 的 `observation_completion_recovery.rs` 和应用的 `observation_completion_recovery_dispatch.rs`。
 
-当前实现已通过定向测试、独立审查及 CI PostgreSQL 实库测试，迁移 0056 和调度 API 已部署；当前没有合格的待恢复任务，重启恢复和真实同会话验收尚未完成。不得把代码接线、表存在、空队列或服务就绪标为自动恢复验收完成。
+基础恢复实现已通过定向测试、独立审查及 CI PostgreSQL 实库测试，迁移 0056 和调度 API 已部署；后续真实任务已进入重试，闭合原因诊断仍待交付，重启恢复和真实同会话验收尚未完成。不得把代码接线、表存在、历史空队列或服务就绪标为自动恢复验收完成。最新交付和部署状态以 `HANDOFF.md` 为准。
