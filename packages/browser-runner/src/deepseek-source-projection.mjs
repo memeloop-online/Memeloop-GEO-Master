@@ -390,17 +390,21 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
         omit(pointer(at, "raw_data"));
       }
       if (Object.hasOwn(message, "data")) {
-        if (
-          !object(message.data) ||
-          Object.keys(message.data).some(
-            (key) =>
-              !eventFields[event].includes(key) &&
-              !privateKey.test(key) &&
-              !reasoningKey.test(key),
+        if (!object(message.data)) reject("source_event_rejected");
+        // Known named events do not participate in delta inheritance. Unknown
+        // metadata can be omitted wholly without interpreting its contents or
+        // discarding the event and its reviewed source fields.
+        const retained = [];
+        for (const [key, value] of Object.entries(message.data)) {
+          if (
+            !eventFields[event].includes(key) &&
+            !privateKey.test(key) &&
+            !reasoningKey.test(key)
           )
-        )
-          reject("source_event_rejected");
-        result.data = clean(message.data, pointer(at, "data"));
+            omit(pointer(pointer(at, "data"), key));
+          else retained.push([key, value]);
+        }
+        result.data = clean(Object.fromEntries(retained), pointer(at, "data"));
       } else if (event !== "finish") reject("source_event_rejected");
       return result;
     });
