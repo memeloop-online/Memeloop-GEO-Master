@@ -123,6 +123,32 @@ async fn read(
     }))
 }
 
+pub(crate) async fn read_by_source(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    source_capture_id: Uuid,
+) -> Result<Option<ObservationCompletionRecovery>, AppError> {
+    // The existing unique index starts with these scoped source columns.
+    // Multiple executions may retain evidence; never silently skip an invalid
+    // latest record in favour of an older record.
+    let recovery_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT recovery_id FROM observation_completion_recoveries \
+         WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND source_capture_id=$4 \
+         ORDER BY stored_at DESC,recovery_id DESC LIMIT 1",
+    )
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project(scope)?)
+    .bind(source_capture_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    match recovery_id {
+        Some(id) => read(tx, scope, id).await,
+        None => Ok(None),
+    }
+}
+
 #[async_trait]
 impl ObservationCompletionRecoveryRepository for PgObservationCompletionRecoveryRepository {
     async fn save(
@@ -175,6 +201,21 @@ impl ObservationCompletionRecoveryRepository for PgObservationCompletionRecovery
             .await
             .map_err(unavailable)?;
         let stored = read(&mut tx, scope, recovery_id).await?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(stored)
+    }
+
+    async fn get_by_source(
+        &self,
+        scope: &TenantScope,
+        source_capture_id: Uuid,
+    ) -> Result<Option<ObservationCompletionRecovery>, AppError> {
+        project(scope)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        let stored = read_by_source(&mut tx, scope, source_capture_id).await?;
         tx.commit().await.map_err(unavailable)?;
         Ok(stored)
     }

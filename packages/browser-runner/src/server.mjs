@@ -229,6 +229,21 @@ export function createRunnerServer({
         parts.length === 4 &&
         parts[0] === "v1" &&
         parts[1] === "sessions" &&
+        parts[3] === "recover-conversation-completion" &&
+        request.method === "POST"
+      ) {
+        send(
+          response,
+          200,
+          await runner.recoverConversationCompletion(
+            parts[2],
+            await readJson(request),
+          ),
+        );
+      } else if (
+        parts.length === 4 &&
+        parts[0] === "v1" &&
+        parts[1] === "sessions" &&
         parts[3] === "cleanup-conversation" &&
         request.method === "POST"
       ) {

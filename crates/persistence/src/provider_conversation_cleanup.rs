@@ -6,7 +6,7 @@ use geo_domain::{
     ProviderCleanupClaim, ProviderCleanupDiagnostic, ProviderCleanupDueItem,
     ProviderCleanupOutcome, ProviderConversationCleanupRepository, TenantScope,
 };
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -223,7 +223,7 @@ impl ProviderConversationCleanupRepository for PgProviderConversationCleanupRepo
             .fetch_optional(&mut *tx).await.map_err(db)?
             .ok_or_else(|| AppError::conflict("cleanup conversation is not exclusively idle"))?;
         let capture = decode_capture(&row)?;
-        let claim = decode_claim(&row, scope)?;
+        let claim = decode_claim(&mut tx, &row, scope).await?;
         if claim.retained_message_inventory_sha256.is_none()
             || capture.input.account_id != claim.account_id
             || capture.input.original_identity.as_ref() != Some(&claim.original_identity)
@@ -299,7 +299,8 @@ fn decode_capture(row: &sqlx::postgres::PgRow) -> Result<ObservationCapture, App
     })
 }
 
-fn decode_claim(
+async fn decode_claim(
+    tx: &mut Transaction<'_, Postgres>,
     row: &sqlx::postgres::PgRow,
     scope: &TenantScope,
 ) -> Result<ProviderCleanupClaim, AppError> {
@@ -308,6 +309,18 @@ fn decode_claim(
             .map_err(|_| AppError::new(ErrorCode::Internal, "stored cleanup identity invalid"))?;
     original_identity.validate()?;
     let capture = decode_capture(row)?;
+    let recovery = if capture.retained_message_inventory_sha256(scope).is_none() {
+        crate::observation_completion_recovery::read_by_source(
+            tx,
+            scope,
+            capture.receipt.capture_id,
+        )
+        .await?
+    } else {
+        None
+    };
+    let retained_message_inventory_sha256 =
+        capture.resolved_message_inventory_sha256(scope, recovery.as_ref())?;
     let original_runner_session_id = (capture.receipt.capture_id == capture.input.capture_id
         && capture.input.account_id == row.get::<Uuid, _>("account_id")
         && capture.input.original_identity.as_ref() == Some(&original_identity)
@@ -334,7 +347,7 @@ fn decode_claim(
         original_identity,
         original_runner_session_id,
         has_prior_delete_attempt: row.get("has_prior_delete_attempt"),
-        retained_message_inventory_sha256: capture.retained_message_inventory_sha256(scope),
+        retained_message_inventory_sha256,
         lease_id: row.get("lease_id"),
         lease_until: row.get("lease_until"),
         action: if row.get::<String, _>("action") == "reconcile" {
@@ -402,10 +415,10 @@ impl PgProviderConversationCleanupRepository {
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
             .bind(project(scope)?).bind(Uuid::new_v4()).bind(cleanup_id)
             .fetch_optional(&mut *tx).await.map_err(db)?;
-        let claim = row
-            .as_ref()
-            .map(|row| decode_claim(row, scope))
-            .transpose()?;
+        let claim = match row.as_ref() {
+            Some(row) => Some(decode_claim(&mut tx, row, scope).await?),
+            None => None,
+        };
         tx.commit().await.map_err(db)?;
         Ok(claim)
     }

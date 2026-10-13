@@ -146,7 +146,11 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 pub use agent_runtime::{EmbeddedAgentRuntime, RepositoryHostOps};
-pub use browser_bridge::BrowserBridge;
+pub use browser_bridge::{
+    BrowserBridge, CompletionRecoveryCode, CompletionRecoveryDiagnostic,
+    CompletionRecoveryIdentity, CompletionRecoveryRequest, CompletionRecoveryResult,
+    CompletionRecoveryStage,
+};
 pub use channel_jobs::{
     ChannelDispatchDeferred, ChannelDispatchResult, MeasurementRequest, PlanRequest,
     PublicationRequest, create_channel_plan, execute_channel_target,
