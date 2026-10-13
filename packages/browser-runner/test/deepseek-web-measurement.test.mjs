@@ -459,7 +459,58 @@ test("finish payload is opaque and unnamed deltas obey ready/finish ordering", (
   }
 });
 
-test("maintained SSE decoder retains bounded raw events and requires ready/finish/framed EOF", () => {
+test("close is an independent transport terminal with preserved source framing", () => {
+  for (const payload of [
+    {},
+    { click_behavior: "none" },
+    { click_behavior: "retry" },
+  ]) {
+    const close = event("close", payload);
+    for (const ending of [
+      close,
+      finished,
+      finished + close,
+      close + finished,
+    ]) {
+      const output = decode(ready + delta + ending);
+      assert.equal(output.sse_terminal, true);
+      assert.equal(
+        output.messages.filter((item) => item.event === "finish").length,
+        ending.includes("event: finish") ? 1 : 0,
+      );
+      const decoder = createDeepSeekEvidenceDecoder({ model: binding.model });
+      decoder.push(Buffer.from(ready + delta + ending));
+      assert.equal(decoder.snapshot().sse_terminal, false);
+    }
+    for (const invalid of [
+      close,
+      close + ready,
+      ready + close + close,
+      ready + close + delta,
+      ready + close + "data: {}\n\n",
+      ready + close.slice(0, -1),
+      ready + close + "data: {broken}\n\n",
+    ]) {
+      assert.throws(() => decode(invalid));
+    }
+  }
+  for (const payload of [
+    null,
+    [],
+    { click_behavior: null },
+    { click_behavior: "unknown" },
+    { click_behavior: 1 },
+  ]) {
+    assert.throws(() => decode(ready + event("close", payload)));
+  }
+  assert.throws(() => decode(ready + event("delta", { status: "FINISHED" })));
+  const decoder = createDeepSeekEvidenceDecoder({ model: binding.model });
+  decoder.push(Buffer.from(ready + event("close", {})));
+  decoder.push(Uint8Array.of(0xe9));
+  assert.throws(() => decoder.finish());
+});
+
+test("maintained SSE decoder retains bounded raw events and requires ready/terminal/framed EOF", () => {
   const output = decode(wire);
   assert.equal(output.sse_terminal, true);
   assert.deepEqual(
@@ -477,7 +528,6 @@ test("maintained SSE decoder retains bounded raw events and requires ready/finis
   assert.deepEqual(decode(wire.replace(/\n/gu, "\r\n")), output);
   for (const incomplete of [
     ready + delta,
-    ready + event("close", {}),
     finished,
     ready + finished.slice(0, -1),
     wire + "event: delta\ndata: {",
@@ -571,6 +621,38 @@ function fixture() {
 
 const finishedLoading =
   "Protocol error: Request with the provided ID has already finished loading";
+
+test("close needs clean network EOF and remains partial on failure or missing EOF", async () => {
+  for (const outcome of ["complete", "failure", "timeout"]) {
+    const f = fixture();
+    f.session.prefix = ready + delta + event("close", {});
+    const partial = [];
+    const result = await captureDeepSeekExchange(f.page, {
+      binding,
+      timeoutMs: 40,
+      onPartialCapture: (value) => partial.push(value),
+      submit: async () => {
+        f.start();
+        await new Promise((resolve) => setImmediate(resolve));
+        if (outcome === "complete") f.end();
+        if (outcome === "failure")
+          f.session.emit("Network.loadingFailed", { requestId: "request-1" });
+      },
+    });
+    if (outcome === "complete") {
+      assert.equal(result.sse_terminal, true);
+      assert.equal(result.capture_status.transport, "complete");
+      assert.equal(result.messages.at(-1).event, "close");
+      assert.equal(partial.length, 0);
+    } else {
+      assert.equal(result, null);
+      assert.equal(partial.length, 1);
+      assert.equal(partial[0].sse_terminal, false);
+      assert.equal(partial[0].capture_status.transport, "partial");
+      assert.equal(partial[0].messages.at(-1).event, "close");
+    }
+  }
+});
 
 test("decoder snapshots retain only validated bounded events and cannot mutate state", () => {
   const decoder = createDeepSeekEvidenceDecoder({ model: binding.model });

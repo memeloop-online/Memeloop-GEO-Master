@@ -409,7 +409,7 @@ pub(crate) fn deepseek_lifecycle_chat_id(value: &Value) -> Option<&str> {
 
 /// Compose only in memory. History cannot supply missing original stream IDs,
 /// creation, submission or terminal evidence. The normal inventory verifier
-/// subsequently checks the complete original stream, including finish ordering.
+/// subsequently checks the complete original stream, including terminal ordering.
 pub(crate) fn deepseek_recovery_document(
     source: &Value,
     history: Value,
@@ -437,7 +437,7 @@ pub(crate) fn deepseek_recovery_document(
         "submission": ownership["submission"],
         "ready": {"request_message_id": request_id, "response_message_id": response_id},
         // A claim checked against the ORIGINAL messages by completion_inventory,
-        // never accepted as a substitute for an original finish event.
+        // never accepted as a substitute for an original terminal event.
         "sse_terminal": true,
         "history": history,
     });
@@ -506,6 +506,7 @@ fn deepseek_stream_complete(
 ) -> Option<()> {
     let mut ready = false;
     let mut finished = false;
+    let mut closed = false;
     let messages = document.get("messages")?.as_array()?;
     if messages.len() > 32_768 {
         return None;
@@ -538,9 +539,20 @@ fn deepseek_stream_complete(
             continue;
         }
         let data = message.get("data")?.as_object()?;
-        if event == "ready" {
+        if event == "close" {
+            if !ready
+                || closed
+                || data
+                    .get("click_behavior")
+                    .is_some_and(|value| !matches!(value.as_str(), Some("retry" | "none")))
+            {
+                return None;
+            }
+            closed = true;
+        } else if event == "ready" {
             if ready
                 || finished
+                || closed
                 || data.get("request_message_id").and_then(deepseek_message_id) != Some(request_id)
                 || data
                     .get("response_message_id")
@@ -553,12 +565,26 @@ fn deepseek_stream_complete(
                 return None;
             }
             ready = true;
-        } else if matches!(event, "" | "message" | "delta") && (!ready || finished) {
+        } else if matches!(event, "" | "message" | "delta") && (!ready || finished || closed) {
             return None;
         }
     }
-    if !ready || !finished {
+    if !ready || (!finished && !closed) {
         return None;
+    }
+    // Legacy finish evidence retains its original contract. A close-only
+    // capture additionally needs the runner's clean-framing attestation:
+    // old partial/eof archives can contain an unterminated frame and must not
+    // become recovery-eligible merely because close is now recognized.
+    if !finished {
+        let status = document.get("capture_status")?;
+        if !closed_fields(status, &["schema_version", "transport", "termination"], &[])
+            || status["schema_version"] != "geo.observation.capture-status.v1"
+            || status["transport"] != "complete"
+            || status["termination"] != "complete"
+        {
+            return None;
+        }
     }
     Some(())
 }
@@ -920,6 +946,152 @@ mod tests {
                 .swap(left, right);
             assert!(!complete(&invalid));
         }
+    }
+
+    fn close_deepseek_source() -> Value {
+        let mut document = synthetic_deepseek_source();
+        document["messages"][2] = serde_json::json!({"event": "close", "data": {}});
+        document["capture_status"] = serde_json::json!({
+            "schema_version": "geo.observation.capture-status.v1",
+            "transport": "complete",
+            "termination": "complete"
+        });
+        document
+    }
+
+    #[test]
+    fn deepseek_close_terminal_preserves_original_events_and_requires_history() {
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"click_behavior": "retry"}),
+            serde_json::json!({"click_behavior": "none", "opaque": "synthetic"}),
+        ] {
+            let mut document = close_deepseek_source();
+            document["messages"][2]["data"] = data;
+            assert!(complete(&document));
+            let original_messages = document["messages"].clone();
+            let history = document["lifecycle"]["history"].clone();
+            document["ownership"] = serde_json::json!({
+                "schema_version": "geo.deepseek.ownership.v1",
+                "provider": "deepseek",
+                "creation": document["lifecycle"]["creation"],
+                "submission": document["lifecycle"]["submission"]
+            });
+            document.as_object_mut().unwrap().remove("lifecycle");
+            assert!(!complete(&document));
+            assert_eq!(
+                deepseek_recovery_binding(&document),
+                Some(("synthetic-chat", 1, 2))
+            );
+            let original = document.clone();
+            let (recovered, completion) =
+                deepseek_recovery_document(&document, history.clone()).unwrap();
+            assert_eq!(document, original);
+            assert_eq!(recovered["messages"], original_messages);
+            assert!(
+                completion_inventory("deepseek", &recovered, "synthetic-chat", &completion)
+                    .is_some()
+            );
+            let mut invalid = recovered;
+            invalid["lifecycle"]["history"]["messages"][1]["status"] = serde_json::json!("RUNNING");
+            assert!(!complete(&invalid));
+        }
+    }
+
+    #[test]
+    fn deepseek_close_terminal_validates_payload_and_event_order() {
+        let document = close_deepseek_source();
+        for data in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(""),
+            serde_json::json!({"click_behavior": null}),
+            serde_json::json!({"click_behavior": true}),
+            serde_json::json!({"click_behavior": "unknown"}),
+        ] {
+            let mut invalid = document.clone();
+            invalid["messages"][2]["data"] = data;
+            assert!(!complete(&invalid));
+        }
+        for terminal in [0, 2] {
+            let mut invalid = document.clone();
+            invalid["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(document["messages"][terminal].clone());
+            assert!(!complete(&invalid));
+        }
+        for event in ["", "message", "delta"] {
+            let mut invalid = document.clone();
+            invalid["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"event": event, "data": {}}));
+            assert!(!complete(&invalid));
+        }
+        for (left, right) in [(0, 1), (0, 2), (1, 2)] {
+            let mut invalid = document.clone();
+            invalid["messages"]
+                .as_array_mut()
+                .unwrap()
+                .swap(left, right);
+            assert!(!complete(&invalid));
+        }
+        for insert_at in [2, 3] {
+            let mut compatible = document.clone();
+            compatible["messages"].as_array_mut().unwrap().insert(
+                insert_at,
+                serde_json::json!({"event": "finish", "raw_data": ""}),
+            );
+            assert!(complete(&compatible));
+        }
+    }
+
+    #[test]
+    fn deepseek_close_does_not_upgrade_partial_or_unattested_archives() {
+        let document = close_deepseek_source();
+        let mut statuses = vec![
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({
+                "schema_version": "unknown",
+                "transport": "complete", "termination": "complete"
+            }),
+            serde_json::json!({
+                "schema_version": "geo.observation.capture-status.v1",
+                "transport": "complete", "termination": "complete", "extra": true
+            }),
+        ];
+        for termination in ["eof", "timeout", "aborted", "malformed", "limit_exceeded"] {
+            statuses.push(serde_json::json!({
+                "schema_version": "geo.observation.capture-status.v1",
+                "transport": "partial", "termination": termination
+            }));
+        }
+        for status in statuses {
+            let mut invalid = document.clone();
+            invalid["capture_status"] = status;
+            assert!(!complete(&invalid));
+            invalid["ownership"] = serde_json::json!({
+                "schema_version": "geo.deepseek.ownership.v1",
+                "provider": "deepseek",
+                "creation": invalid["lifecycle"]["creation"],
+                "submission": invalid["lifecycle"]["submission"]
+            });
+            invalid.as_object_mut().unwrap().remove("lifecycle");
+            let original = invalid.clone();
+            assert!(deepseek_recovery_binding(&invalid).is_none());
+            assert_eq!(invalid, original);
+        }
+        let mut missing_status = document.clone();
+        missing_status
+            .as_object_mut()
+            .unwrap()
+            .remove("capture_status");
+        assert!(!complete(&missing_status));
+        let mut no_terminal = document;
+        no_terminal["messages"].as_array_mut().unwrap().pop();
+        assert!(!complete(&no_terminal));
     }
 
     #[test]

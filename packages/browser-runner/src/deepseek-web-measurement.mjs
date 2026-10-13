@@ -123,7 +123,7 @@ export function matchesDeepSeekSubmission(request, binding) {
 /**
  * Maintained SSE parser handles framing, UTF-8 is decoded strictly here.
  * Keep raw event JSON. Do not merge deltas, extract answer text or interpret
- * citations/search semantics. ready + finish + EOF prove transport boundaries
+ * citations/search semantics. ready + (finish or close) + EOF prove transport boundaries
  * only, not successful answering, web search, or authorization to clean up.
  */
 export function createDeepSeekEvidenceDecoder({
@@ -147,6 +147,7 @@ export function createDeepSeekEvidenceDecoder({
   let tail = "";
   let ready = false;
   let finished = false;
+  let closed = false;
   let sealed = false;
   let rejected = false;
   const parser = createParser({
@@ -172,6 +173,7 @@ export function createDeepSeekEvidenceDecoder({
         if (
           ready ||
           finished ||
+          closed ||
           !messageId(data.request_message_id) ||
           !messageId(data.response_message_id) ||
           data.request_message_id === data.response_message_id ||
@@ -181,11 +183,23 @@ export function createDeepSeekEvidenceDecoder({
         )
           fail();
         ready = true;
+      } else if (event.event === "close") {
+        // Public parseClose accepts an optional retry/none click behavior.
+        // This closes transport, not the answer or its independently read graph.
+        if (
+          !ready ||
+          closed ||
+          (Object.hasOwn(data, "click_behavior") &&
+            data.click_behavior !== "retry" &&
+            data.click_behavior !== "none")
+        )
+          fail();
+        closed = true;
       } else if (
         (!event.event ||
           event.event === "message" ||
           event.event === "delta") &&
-        (!ready || finished)
+        (!ready || finished || closed)
       ) {
         fail();
       }
@@ -223,7 +237,7 @@ export function createDeepSeekEvidenceDecoder({
       // Do not flush incomplete SSE data into a synthetic terminal event.
       if (
         !ready ||
-        !finished ||
+        (!finished && !closed) ||
         !tail.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n").endsWith("\n\n")
       )
         fail("eof");
