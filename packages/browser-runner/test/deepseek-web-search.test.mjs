@@ -231,6 +231,14 @@ test("partial capture persists privacy-projected source without interpretation, 
                 fragments: [
                   { type: "RESPONSE", content: "Synthetic partial answer" },
                   { type: "THINK", content: "Private synthetic thought" },
+                  { type: "FUTURE", content: "private-synthetic-unknown" },
+                  {
+                    type: "RESPONSE",
+                    content: {
+                      type: "THINK",
+                      content: "private-synthetic-shaped",
+                    },
+                  },
                 ],
                 access_token: "private-synthetic-token",
                 future_metadata: {
@@ -274,6 +282,12 @@ test("partial capture persists privacy-projected source without interpretation, 
     assert.ok(!record.source_json.includes("private-synthetic-token"));
     assert.ok(!record.source_json.includes("private-synthetic-metadata"));
     assert.ok(!record.source_json.includes("private-synthetic-credentials"));
+    assert.ok(!record.source_json.includes("private-synthetic-unknown"));
+    assert.ok(!record.source_json.includes("private-synthetic-shaped"));
+    assert.deepEqual(
+      JSON.parse(record.source_json).messages[1].data.v.fragments.slice(2),
+      [{}, { type: "RESPONSE" }],
+    );
     assert.ok(
       JSON.parse(record.source_json).source_redaction.omitted_paths.includes(
         "/messages/1/data/v/future_metadata",
@@ -285,6 +299,39 @@ test("partial capture persists privacy-projected source without interpretation, 
     assert.ok(!f.calls.includes("ownership"));
     assert.ok(!f.calls.includes("history"));
   }
+});
+
+test("full capture persists omitted fragment fields before extraction without shifting known evidence", async () => {
+  const f = historyFixture();
+  const fragments = f.exchange.messages[1].data.v.fragments;
+  fragments.push(
+    { type: "FUTURE", content: "private-synthetic-unknown" },
+    {
+      type: "RESPONSE",
+      content: { type: "THINK", content: "private-synthetic-shaped" },
+    },
+  );
+  delete f.options.prepareSource;
+  const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+  assert.equal(result.raw_answer, "Synthetic answer.");
+  const saved = JSON.parse(f.evidence.source_json);
+  assert.deepEqual(saved.messages[1].data.v.fragments.slice(3), [
+    {},
+    { type: "RESPONSE" },
+  ]);
+  assert.doesNotMatch(f.evidence.source_json, /private-synthetic/u);
+  assert.ok(
+    saved.source_redaction.omitted_paths.includes(
+      "/messages/1/data/v/fragments/3/type",
+    ),
+  );
+  assert.ok(
+    saved.source_redaction.omitted_paths.includes(
+      "/messages/1/data/v/fragments/4/content",
+    ),
+  );
+  assert.ok(f.calls.indexOf("source") < f.calls.indexOf("extract"));
+  assert.equal(f.calls.filter((call) => call === "send").length, 1);
 });
 
 test("hanging partial checkpoints report persistence failure across cancellation and source deadlines", async () => {
