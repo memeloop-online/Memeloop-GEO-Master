@@ -1402,7 +1402,7 @@ mod tests {
                 .admit_automatic(&f.scope, newer, f.now)
                 .await
                 .unwrap(),
-            Admission::Intent(terminal)
+            Admission::Intent(Box::new(terminal))
         );
         assert!(
             extraction
