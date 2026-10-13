@@ -22,6 +22,8 @@ use crate::{
 
 pub const DEVELOPMENT_USER_EMAIL: &str = "demo@localhost";
 pub const DEFAULT_SESSION_TTL_SECS: i64 = 60 * 60 * 12;
+/// Browser storage lifetime, not a server-side authentication deadline.
+pub const SESSION_COOKIE_MAX_AGE_SECS: i64 = 60 * 60 * 24 * 400;
 
 macro_rules! auth_id {
     ($name:ident) => {
@@ -229,7 +231,7 @@ pub struct Session {
     pub operator_id: OperatorId,
     pub user_id: UserId,
     pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing)]
     csrf_token: String,
@@ -253,12 +255,18 @@ impl Session {
             operator_id,
             user_id,
             created_at: now,
-            expires_at: now + ttl,
+            expires_at: Some(now + ttl),
             revoked_at: None,
             csrf_token: random_token(),
             token_hash: hash_token(&token),
         };
         SessionCredentials { session, token }
+    }
+
+    pub fn persistent(operator_id: OperatorId, user_id: UserId) -> SessionCredentials {
+        let mut credentials = Self::new(operator_id, user_id, Duration::zero());
+        credentials.session.expires_at = None;
+        credentials
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -269,7 +277,7 @@ impl Session {
         csrf_token: impl Into<String>,
         token_hash: impl Into<String>,
         created_at: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
         revoked_at: Option<DateTime<Utc>>,
     ) -> Self {
         Self {
@@ -291,7 +299,7 @@ impl Session {
         &self.token_hash
     }
     pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
-        self.revoked_at.is_none() && self.expires_at > now
+        self.revoked_at.is_none() && self.expires_at.is_none_or(|expiry| expiry > now)
     }
 }
 
@@ -353,6 +361,11 @@ pub trait AuthRepository: Send + Sync {
         operator_id: OperatorId,
         user_id: UserId,
         ttl: Duration,
+    ) -> Result<SessionCredentials, AppError>;
+    async fn create_persistent_session(
+        &self,
+        operator_id: OperatorId,
+        user_id: UserId,
     ) -> Result<SessionCredentials, AppError>;
     async fn revoke_session(
         &self,
@@ -653,6 +666,25 @@ impl AuthRepository for MemoryAuthRepository {
             return Err(AppError::unauthorized("user does not exist"));
         }
         let credentials = Session::new(operator_id, user_id, ttl);
+        data.sessions
+            .insert(credentials.session.id, credentials.session.clone());
+        Ok(credentials)
+    }
+
+    async fn create_persistent_session(
+        &self,
+        operator_id: OperatorId,
+        user_id: UserId,
+    ) -> Result<SessionCredentials, AppError> {
+        let mut data = self.data.write().await;
+        if !data
+            .users
+            .get(&user_id)
+            .is_some_and(|user| user.operator_id == operator_id && user.active)
+        {
+            return Err(AppError::unauthorized("user does not exist"));
+        }
+        let credentials = Session::persistent(operator_id, user_id);
         data.sessions
             .insert(credentials.session.id, credentials.session.clone());
         Ok(credentials)

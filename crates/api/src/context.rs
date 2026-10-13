@@ -168,9 +168,10 @@ pub async fn auth_scope_from_request(mut request: Request, next: Next) -> Respon
         Ok(auth) => auth,
         Err(error) => return crate::error::error_response(error, request_context),
     };
+    let renewal = persistent_cookie_renewal(&request, &auth, Some(cookie_name));
     request.extensions_mut().insert(auth.scope.clone());
     request.extensions_mut().insert(auth);
-    next.run(request).await
+    renew_cookie_response(next.run(request).await, renewal)
 }
 
 pub async fn auth_scope_with_repository(
@@ -196,9 +197,10 @@ pub async fn auth_scope_with_repository_and_cookie(
         Ok(auth) => auth,
         Err(error) => return crate::error::error_response(error, request_context),
     };
+    let renewal = persistent_cookie_renewal(&request, &auth, cookie_name);
     request.extensions_mut().insert(auth.scope.clone());
     request.extensions_mut().insert(auth);
-    next.run(request).await
+    renew_cookie_response(next.run(request).await, renewal)
 }
 
 pub async fn auth_scope_from_extension(
@@ -278,8 +280,9 @@ pub async fn session_auth_from_request(mut request: Request, next: Next) -> Resp
         Ok(auth) => auth,
         Err(error) => return crate::error::error_response(error, request_context),
     };
+    let renewal = persistent_cookie_renewal(&request, &auth, Some(cookie_name));
     request.extensions_mut().insert(auth);
-    next.run(request).await
+    renew_cookie_response(next.run(request).await, renewal)
 }
 
 pub async fn session_auth_with_repository(
@@ -305,8 +308,59 @@ pub async fn session_auth_with_repository_and_cookie(
         Ok(auth) => auth,
         Err(error) => return crate::error::error_response(error, request_context),
     };
+    let renewal = persistent_cookie_renewal(&request, &auth, cookie_name);
     request.extensions_mut().insert(auth);
-    next.run(request).await
+    renew_cookie_response(next.run(request).await, renewal)
+}
+
+/// Refresh browser storage only after normal authentication and authorization.
+/// The raw token stays in request/response memory; no session database write or
+/// idle deadline is needed. Logout's clearing cookies always take precedence.
+fn persistent_cookie_renewal(
+    request: &Request,
+    auth: &AuthContext,
+    expected_cookie_name: Option<&str>,
+) -> Option<HeaderValue> {
+    if auth.session.expires_at.is_some() || request.method() == Method::DELETE {
+        return None;
+    }
+    let cookies = request.headers().get("cookie")?.to_str().ok()?;
+    let cookie_name = expected_cookie_name.unwrap_or_else(|| {
+        if cookie_value(cookies, SESSION_COOKIE_NAME).is_some() {
+            SESSION_COOKIE_NAME
+        } else {
+            DEV_SESSION_COOKIE_NAME
+        }
+    });
+    let token = cookie_value(cookies, cookie_name)?;
+    let secure = if cookie_name == SESSION_COOKIE_NAME {
+        "; Secure"
+    } else {
+        ""
+    };
+    HeaderValue::from_str(&format!(
+        "{cookie_name}={token}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax{secure}",
+        geo_domain::SESSION_COOKIE_MAX_AGE_SECS,
+    ))
+    .ok()
+}
+
+fn renew_cookie_response(mut response: Response, renewal: Option<HeaderValue>) -> Response {
+    if response.status().is_success()
+        && !response
+            .headers()
+            .contains_key(axum::http::header::SET_COOKIE)
+        && let Some(cookie) = renewal
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, cookie);
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 pub async fn session_auth_from_extension(

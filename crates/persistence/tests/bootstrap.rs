@@ -55,6 +55,110 @@ impl Fixture {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL in GEO_TEST_DATABASE_URL"]
+async fn persistent_and_finite_sessions_round_trip_without_reviving_expired_sessions() {
+    let config = DatabaseConfig::from_url(
+        std::env::var("GEO_TEST_DATABASE_URL").expect("test database URL"),
+    )
+    .unwrap();
+    let database = Database::connect_and_migrate(&config).await.unwrap();
+    let fixture = Fixture::new();
+    bootstrap_identity(database.pool(), &fixture.input("customer_admin"))
+        .await
+        .unwrap();
+    let repo = PgAuthRepository::from_database(&database);
+    let operator = fixture.operator_id.into();
+    let user = fixture.user_id.into();
+    let finite = repo
+        .create_session(operator, user, chrono::Duration::hours(12))
+        .await
+        .unwrap();
+    let expired = repo
+        .create_session(operator, user, chrono::Duration::hours(-1))
+        .await
+        .unwrap();
+    let persistent = repo
+        .create_persistent_session(operator, user)
+        .await
+        .unwrap();
+    let stored_hash: String =
+        sqlx::query_scalar("SELECT token_hash FROM sessions WHERE session_id=$1")
+            .bind(persistent.session.id.as_uuid())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_hash, geo_domain::hash_token(&persistent.token));
+    assert_ne!(stored_hash, persistent.token);
+    database.migrate().await.unwrap();
+    // A new connection/repository reads both legacy finite timestamps and NULL.
+    let reopened = Database::connect_and_migrate(&config).await.unwrap();
+    let repo = PgAuthRepository::from_database(&reopened);
+    let read_finite = repo
+        .find_session(operator, &finite.token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read_finite.expires_at.unwrap().timestamp_micros(),
+        finite.session.expires_at.unwrap().timestamp_micros(),
+    );
+    assert!(
+        !repo
+            .find_session(operator, &expired.token)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_active_at(chrono::Utc::now())
+    );
+    let read_persistent = repo
+        .find_session(operator, &persistent.token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_persistent.expires_at, None);
+    assert!(read_persistent.is_active_at(chrono::Utc::now() + chrono::Duration::days(3650)));
+    assert!(
+        repo.find_session(Uuid::new_v4().into(), &persistent.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.create_persistent_session(Uuid::new_v4().into(), user)
+            .await
+            .is_err()
+    );
+    repo.revoke_session(operator, persistent.session.id)
+        .await
+        .unwrap();
+    let revoked = repo
+        .find_session(operator, &persistent.token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!revoked.is_active_at(chrono::Utc::now()));
+    assert_eq!(revoked.expires_at, None);
+    sqlx::query("UPDATE users SET active=false WHERE user_id=$1")
+        .bind(fixture.user_id)
+        .execute(reopened.pool())
+        .await
+        .unwrap();
+    assert!(
+        !repo
+            .find_user(operator, user)
+            .await
+            .unwrap()
+            .unwrap()
+            .active
+    );
+    assert!(
+        repo.create_persistent_session(operator, user)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL in GEO_TEST_DATABASE_URL"]
 async fn transaction_replay_and_conflicts_preserve_identity() {
     let config = DatabaseConfig::from_url(
         std::env::var("GEO_TEST_DATABASE_URL").expect("test database URL"),

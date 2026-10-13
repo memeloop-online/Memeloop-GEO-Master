@@ -26,6 +26,34 @@ impl PgAuthRepository {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    async fn insert_session(
+        &self,
+        credentials: SessionCredentials,
+    ) -> Result<SessionCredentials, AppError> {
+        let result = sqlx::query(
+            r#"INSERT INTO sessions
+                (session_id, operator_id, user_id, csrf_token, token_hash,
+                 created_at, expires_at, revoked_at)
+               SELECT $1, $2, $3, $4, $5, $6, $7, $8
+               FROM users WHERE user_id = $3 AND operator_id = $2 AND active"#,
+        )
+        .bind(credentials.session.id.as_uuid())
+        .bind(credentials.session.operator_id.as_uuid())
+        .bind(credentials.session.user_id.as_uuid())
+        .bind(credentials.session.csrf_token())
+        .bind(credentials.session.token_hash())
+        .bind(credentials.session.created_at)
+        .bind(credentials.session.expires_at)
+        .bind(credentials.session.revoked_at)
+        .execute(&self.pool)
+        .await
+        .map_err(database_unavailable)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::unauthorized("user does not exist"));
+        }
+        Ok(credentials)
+    }
 }
 
 #[async_trait]
@@ -185,31 +213,17 @@ impl AuthRepository for PgAuthRepository {
         user_id: UserId,
         ttl: Duration,
     ) -> Result<SessionCredentials, AppError> {
-        let credentials = Session::new(operator_id, user_id, ttl);
-        let result = sqlx::query(
-            r#"INSERT INTO sessions
-                (session_id, operator_id, user_id, csrf_token, token_hash,
-                 created_at, expires_at, revoked_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
-        )
-        .bind(credentials.session.id.as_uuid())
-        .bind(credentials.session.operator_id.as_uuid())
-        .bind(credentials.session.user_id.as_uuid())
-        .bind(credentials.session.csrf_token())
-        .bind(credentials.session.token_hash())
-        .bind(credentials.session.created_at)
-        .bind(credentials.session.expires_at)
-        .bind(credentials.session.revoked_at)
-        .execute(&self.pool)
-        .await
-        .map_err(database_unavailable)?;
-        if result.rows_affected() != 1 {
-            return Err(AppError::new(
-                geo_domain::ErrorCode::Internal,
-                "session was not created",
-            ));
-        }
-        Ok(credentials)
+        self.insert_session(Session::new(operator_id, user_id, ttl))
+            .await
+    }
+
+    async fn create_persistent_session(
+        &self,
+        operator_id: OperatorId,
+        user_id: UserId,
+    ) -> Result<SessionCredentials, AppError> {
+        self.insert_session(Session::persistent(operator_id, user_id))
+            .await
     }
 
     async fn revoke_session(

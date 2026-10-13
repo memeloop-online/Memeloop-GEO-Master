@@ -98,8 +98,8 @@ pub use agent::{
 };
 pub use auth::{
     AuthRepository, DEFAULT_SESSION_TTL_SECS, DEVELOPMENT_USER_EMAIL, LoginIdentity, Membership,
-    MemoryAuthRepository, Role, Session, SessionCredentials, SessionId, User, UserId, hash_token,
-    normalize_email, normalize_host,
+    MemoryAuthRepository, Role, SESSION_COOKIE_MAX_AGE_SECS, Session, SessionCredentials,
+    SessionId, User, UserId, hash_token, normalize_email, normalize_host,
 };
 pub use error::{AppError, ErrorCode};
 pub use event::EventEnvelope;

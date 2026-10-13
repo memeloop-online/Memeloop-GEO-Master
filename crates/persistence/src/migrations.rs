@@ -236,6 +236,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 56,
         description: "observation completion recovery jobs",
     },
+    MigrationMetadata {
+        version: 57,
+        description: "persistent auth sessions",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {
