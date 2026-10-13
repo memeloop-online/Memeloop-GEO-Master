@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { projectDeepseekSource } from "../src/deepseek-source-projection.mjs";
 import { createDeepSeekEvidenceDecoder } from "../src/deepseek-web-measurement.mjs";
+import { reportObservationDiagnostic } from "../src/ai-observation-parser.mjs";
 
 const event = (data) => ({ event: "message", data });
 const snapshot = (fragments) =>
@@ -19,7 +20,10 @@ test("rejection diagnostics contain only fixed codes and cannot change null outc
   for (const [input, code] of [
     [null, "shape_rejected"],
     [throwing, "shape_rejected"],
-    [{ messages: [{ event: "synthetic-private-event" }] }, "shape_rejected"],
+    [
+      { messages: [{ event: "synthetic-private-event" }] },
+      "source_event_rejected",
+    ],
     [
       {
         messages: [
@@ -47,6 +51,96 @@ test("rejection diagnostics contain only fixed codes and cannot change null outc
       }),
       null,
     );
+  }
+});
+
+test("structural rejection categories cross only the closed diagnostic wire", () => {
+  for (const [messages, code] of [
+    [
+      [event({ v: { "synthetic-private-key": "synthetic-private-value" } })],
+      "source_root_rejected",
+    ],
+    [
+      [
+        event({
+          p: "response",
+          v: { "synthetic-private-key": "synthetic-private-value" },
+        }),
+      ],
+      "source_response_rejected",
+    ],
+    [
+      [
+        {
+          event: "ready",
+          data: { "synthetic-private-key": "synthetic-private-value" },
+        },
+      ],
+      "source_event_rejected",
+    ],
+    [
+      [{ event: "finish", "synthetic-private-key": "synthetic-private-value" }],
+      "source_event_rejected",
+    ],
+    [
+      [event({ v: {}, "synthetic-private-key": "synthetic-private-value" })],
+      "source_delta_rejected",
+    ],
+    [[snapshot([{ ...answer(), content: {} }])], "source_fragment_rejected"],
+    [
+      [
+        snapshot([answer()]),
+        event({
+          p: "response/fragments/0",
+          v: { type: "synthetic-private-type" },
+        }),
+      ],
+      "source_fragment_rejected",
+    ],
+    [
+      [
+        snapshot([answer()]),
+        event({ p: "response/fragments/0/content", v: {} }),
+      ],
+      "source_fragment_rejected",
+    ],
+    [[event({ o: "BATCH", v: {} })], "source_delta_rejected"],
+  ]) {
+    const diagnostics = [];
+    const input = { messages };
+    const before = structuredClone(input);
+    assert.equal(
+      projectDeepseekSource(input, (rejection) =>
+        reportObservationDiagnostic(
+          (record) => {
+            diagnostics.push(record);
+            throw new Error("synthetic-private-callback");
+          },
+          "capture",
+          rejection,
+        ),
+      ),
+      null,
+    );
+    assert.deepEqual(input, before);
+    assert.deepEqual(diagnostics, [
+      {
+        kind: "observation_diagnostic",
+        schema_version: "geo.observation.diagnostic.v1",
+        stage: "capture",
+        code,
+      },
+    ]);
+    assert.equal(
+      JSON.stringify(diagnostics).includes("synthetic-private"),
+      false,
+    );
+    reportObservationDiagnostic(
+      (record) => diagnostics.push(record),
+      "capture",
+      `${code}:synthetic-private-detail`,
+    );
+    assert.equal(diagnostics.length, 1);
   }
 });
 

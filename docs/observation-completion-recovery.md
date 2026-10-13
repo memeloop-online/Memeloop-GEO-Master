@@ -40,4 +40,4 @@
 
 代码入口为领域及持久层的 `observation_completion_recovery_jobs.rs`、API 的 `observation_completion_recovery.rs` 和应用的 `observation_completion_recovery_dispatch.rs`。
 
-当前实现已通过定向测试及独立审查，新增任务实库测试仍待 CI 执行；迁移部署、重启恢复和真实同会话验收尚未完成。不得把代码接线、表存在或服务就绪标为自动恢复验收完成。
+当前实现已通过定向测试、独立审查及 CI PostgreSQL 实库测试，迁移 0056 和调度 API 已部署；当前没有合格的待恢复任务，重启恢复和真实同会话验收尚未完成。不得把代码接线、表存在、空队列或服务就绪标为自动恢复验收完成。

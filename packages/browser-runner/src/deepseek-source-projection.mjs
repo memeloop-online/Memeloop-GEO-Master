@@ -89,6 +89,7 @@ const pointer = (path, key) =>
  */
 export function projectDeepseekSource(exchange, onDiagnostic) {
   // Only locally selected codes escape this boundary, never exception details.
+  // Structural categories identify the rejected layer, not its keys or values.
   let rejectionCode = "shape_rejected";
   const reject = (code = "shape_rejected") => {
     rejectionCode = code;
@@ -137,22 +138,23 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
       );
     };
     const fragments = (value, path, depth) => {
-      if (!Array.isArray(value) || value.length > 10_000) reject();
+      if (!Array.isArray(value) || value.length > 10_000)
+        reject("source_fragment_rejected");
       const nextTypes = value.map((fragment) => {
-        if (!validFragment(fragment)) reject();
+        if (!validFragment(fragment)) reject("source_fragment_rejected");
         return fragment.type;
       });
       return { value: clean(value, path, depth), types: nextTypes };
     };
     const response = (value, path, depth) => {
-      if (!object(value)) reject();
+      if (!object(value)) reject("source_response_rejected");
       for (const key of Object.keys(value))
         if (
           !responseFields.has(key) &&
           !privateKey.test(key) &&
           !reasoningKey.test(key)
         )
-          reject();
+          reject("source_response_rejected");
       // Snapshots reset the type index; absence cannot inherit old fragments.
       types = null;
       if (Object.hasOwn(value, "fragments")) {
@@ -181,7 +183,7 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
           !object(value) ||
           Object.keys(value).some((key) => key !== "response")
         )
-          reject();
+          reject("source_root_rejected");
         return {
           keep: true,
           value: {
@@ -226,7 +228,7 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
           return { keep: true, value: result.value };
         }
         if (index < 0 || index > types.length) reject("path_rejected");
-        if (!validFragment(value)) reject();
+        if (!validFragment(value)) reject("source_fragment_rejected");
         types[index] = value.type;
         return { keep: true, value: clean(value, at, depth) };
       }
@@ -246,7 +248,7 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
           (parts[3] === "status" ||
             !(typeof value === "string" || Array.isArray(value))))
       )
-        reject();
+        reject("source_fragment_rejected");
       return { keep: true, value: clean(value, at, depth) };
     };
     const delta = (data, scope, prefix, at, depth) => {
@@ -256,18 +258,19 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
         Object.keys(data).some((key) => !["p", "o", "v"].includes(key)) ||
         !Object.hasOwn(data, "v")
       )
-        reject();
+        reject("source_delta_rejected");
       const path = data.p ?? scope.path;
       const operation = data.o ?? scope.operation;
       if (typeof path !== "string" || path.length > 2_048)
         reject("path_rejected");
-      if (!["SET", "APPEND", "BATCH"].includes(operation)) reject();
+      if (!["SET", "APPEND", "BATCH"].includes(operation))
+        reject("source_delta_rejected");
       scope.path = path;
       scope.operation = operation;
       const absolute = prefix ? `${prefix}/${path}` : path;
       const result = { ...data };
       if (operation === "BATCH") {
-        if (!Array.isArray(data.v)) reject();
+        if (!Array.isArray(data.v)) reject("source_delta_rejected");
         const child = { path: "", operation: "SET" };
         result.v = data.v.map((item, index) =>
           delta(
@@ -300,9 +303,9 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
           (key) => !["event", "data", "raw_data", "id"].includes(key),
         )
       )
-        reject();
+        reject("source_event_rejected");
       const event = message.event ?? "";
-      if (typeof event !== "string") reject();
+      if (typeof event !== "string") reject("source_event_rejected");
       const result = { ...message };
       if (Object.hasOwn(message, "id")) {
         if (typeof message.id !== "string") reject("identifier_rejected");
@@ -316,23 +319,23 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
           !Object.hasOwn(message, "data") ||
           Object.hasOwn(message, "raw_data")
         )
-          reject();
+          reject("source_event_rejected");
         delete result.data;
         omit(pointer(at, "data"));
         return result;
       }
       if (event === "" || event === "message" || event === "delta") {
-        if (Object.hasOwn(message, "raw_data")) reject();
+        if (Object.hasOwn(message, "raw_data")) reject("source_event_rejected");
         return {
           ...result,
           data: delta(message.data, scope, "", pointer(at, "data"), 0),
         };
       }
-      if (!Object.hasOwn(eventFields, event)) reject();
+      if (!Object.hasOwn(eventFields, event)) reject("source_event_rejected");
       if (Object.hasOwn(message, "raw_data")) {
         // Opaque finish data is not AI evidence. Do not inspect it for a
         // completion claim or silently preserve a possible reasoning payload.
-        if (event !== "finish") reject();
+        if (event !== "finish") reject("source_event_rejected");
         delete result.raw_data;
         omit(pointer(at, "raw_data"));
       }
@@ -346,9 +349,9 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
               !reasoningKey.test(key),
           )
         )
-          reject();
+          reject("source_event_rejected");
         result.data = clean(message.data, pointer(at, "data"));
-      } else if (event !== "finish") reject();
+      } else if (event !== "finish") reject("source_event_rejected");
       return result;
     });
     return {

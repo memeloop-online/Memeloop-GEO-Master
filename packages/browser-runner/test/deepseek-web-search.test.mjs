@@ -650,7 +650,10 @@ test("default projection reports fixed capture diagnostics for full and partial 
         messages: [
           {
             event: "message",
-            data: { p: "synthetic-private-path", v: "synthetic-private-value" },
+            data: {
+              p: "response",
+              v: { "synthetic-private-key": "synthetic-private-value" },
+            },
           },
         ],
       };
@@ -665,7 +668,7 @@ test("default projection reports fixed capture diagnostics for full and partial 
         kind: "observation_diagnostic",
         schema_version: "geo.observation.diagnostic.v1",
         stage: "capture",
-        code: "path_rejected",
+        code: "source_response_rejected",
       });
       assert.equal(
         JSON.stringify(diagnostics).includes("synthetic-private"),
