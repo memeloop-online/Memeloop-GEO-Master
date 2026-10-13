@@ -69,6 +69,74 @@ fn decode(row: &sqlx::postgres::PgRow) -> Result<ObservationAnalysisRevision, Ap
 
 #[async_trait]
 impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
+    async fn project_response(
+        &self,
+        scope: &TenantScope,
+        idempotency_key: &str,
+        request_digest: &str,
+        request: ObservationAnalysisRequest,
+        result: ObservationAnalysisResult,
+        analyzed_at: DateTime<Utc>,
+    ) -> Result<ObservationAnalysisRevision, AppError> {
+        request.validate(scope, idempotency_key, request_digest, analyzed_at)?;
+        result.validate()?;
+        let project = project(scope)?;
+        let target = self.jobs.get_target(scope, request.target_id).await?;
+        let capture = match request.source {
+            ObservationAnalysisSource::Capture { capture_id } => {
+                self.captures.get(scope, capture_id).await?
+            }
+            ObservationAnalysisSource::AttemptEvidence { .. } => None,
+        };
+        observation_analysis_source_json(scope, &request, &target, capture.as_ref())?;
+        let key_hash = sha256_hex(idempotency_key.as_bytes());
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        let inserted = sqlx::query(
+            "INSERT INTO observation_analyses \
+             (revision_id,operator_id,tenant_id,project_id,target_id,attempt_id,idempotency_key_hash,\
+              request_digest,request,state,created_at,started_at,analyzed_at,claim_token,result) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$10,$10,$11,$12) \
+             ON CONFLICT DO NOTHING RETURNING *",
+        )
+        .bind(request.revision_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
+        .bind(project).bind(request.target_id).bind(request.attempt_id).bind(&key_hash)
+        .bind(request_digest)
+        .bind(serde_json::to_value(&request).map_err(|_| AppError::invalid_request("invalid analysis request"))?)
+        .bind(analyzed_at).bind(Uuid::new_v4())
+        .bind(serde_json::to_value(&result).map_err(|_| AppError::invalid_request("invalid analysis result"))?)
+        .fetch_optional(&mut *tx).await.map_err(unavailable)?;
+        let revision = match inserted {
+            Some(row) => decode(&row)?,
+            None => {
+                let row = sqlx::query(
+                    "SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 \
+                     AND project_id=$3 AND idempotency_key_hash=$4",
+                )
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(project)
+                .bind(key_hash)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(unavailable)?
+                .ok_or_else(|| AppError::conflict("analysis revision identity already exists"))?;
+                let prior = decode(&row)?;
+                if prior.request_digest != request_digest
+                    || !prior.request.same_input(&request)
+                    || prior.state != ObservationAnalysisState::Completed
+                    || prior.result.as_ref() != Some(&result)
+                {
+                    return Err(AppError::conflict("analysis projection already differs"));
+                }
+                prior
+            }
+        };
+        tx.commit().await.map_err(unavailable)?;
+        Ok(revision)
+    }
     async fn latest_grounded_for_attempts(
         &self,
         scope: &TenantScope,

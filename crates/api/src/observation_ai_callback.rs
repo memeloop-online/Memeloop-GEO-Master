@@ -1,7 +1,5 @@
 //! Service-only interpretation of an exact persisted browser source.
 //! Model credentials, routing and prompt construction never leave Rust.
-use std::sync::Arc;
-
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Request, State},
@@ -11,12 +9,11 @@ use axum::{
     routing::post,
 };
 use geo_domain::ProjectAiUsage;
-use geo_worker::ModelCompletionRequest;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    ObservationCaptureCallbackService, ProjectAiSettingsService, ProjectConfiguredModelBridge,
+    ObservationCaptureCallbackService, ObservationExtractionService, ProjectAiSettingsService,
 };
 
 const PROMPT: &str =
@@ -30,7 +27,7 @@ const EXTRACT_PATH: &str = "/internal/v1/observation-ai/extract";
 pub struct ObservationAiCallbackService {
     capture: ObservationCaptureCallbackService,
     settings: ProjectAiSettingsService,
-    model: Arc<ProjectConfiguredModelBridge>,
+    extraction: ObservationExtractionService,
 }
 
 #[derive(Deserialize)]
@@ -60,12 +57,12 @@ impl ObservationAiCallbackService {
     pub fn new(
         capture: ObservationCaptureCallbackService,
         settings: ProjectAiSettingsService,
-        model: ProjectConfiguredModelBridge,
+        extraction: ObservationExtractionService,
     ) -> Self {
         Self {
             capture,
             settings,
-            model: Arc::new(model),
+            extraction,
         }
     }
 
@@ -167,44 +164,42 @@ async fn extract(
     State(service): State<ObservationAiCallbackService>,
     Json(request): Json<SourceRequest>,
 ) -> Result<Json<Extraction>, StatusCode> {
-    let (scope, source) = service.source(&request).await?;
-    let request = ModelCompletionRequest {
-        prompt: extraction_prompt_versioned(
-            &source,
-            request
-                .prompt_version
-                .as_deref()
-                .unwrap_or("geo.observation.extract.v2"),
-        )?,
-        system: None,
-        model: None,
-        max_output_tokens: Some(24_000),
-        messages: Vec::new(),
-        tools: Vec::new(),
-    };
-    let (completion, config_version) = service
-        .model
-        .complete_for_usage_with_revision(&scope, ProjectAiUsage::ObservationAnalysis, &request)
+    let (scope, _) = service.source(&request).await?;
+    let version = request
+        .prompt_version
+        .as_deref()
+        .unwrap_or("geo.observation.extract.v2");
+    if !matches!(
+        version,
+        "geo.observation.extract.v2" | "geo.observation.extract.v3"
+    ) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let intent = service
+        .extraction
+        .enqueue_source(
+            &scope,
+            request.source_capture_id,
+            &request.source_sha256,
+            version,
+        )
         .await
-        .map_err(|error| {
-            tracing::info!(
-                failure = crate::observation_analysis::model_failure_code(&error),
-                "observation model failed"
-            );
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
-    if completion.text.len() > 150_000
-        || completion.finish_reason != "stop"
-        || !completion.tool_calls.is_empty()
-        || completion.model.is_empty()
-        || completion.model.len() > 256
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let completion = service
+        .extraction
+        .wait_response(&scope, intent.intent_id, std::time::Duration::from_secs(55))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::GATEWAY_TIMEOUT)?;
+    if completion.model_text.len() > 150_000
+        || completion.disposition != geo_domain::ObservationExtractionResponseDisposition::Complete
     {
         return Err(StatusCode::BAD_GATEWAY);
     }
     Ok(Json(Extraction {
-        text: completion.text,
-        model: completion.model,
-        config_version,
+        text: completion.model_text,
+        model: completion.actual_model,
+        config_version: completion.config_revision.ok_or(StatusCode::BAD_GATEWAY)?,
     }))
 }
 
@@ -238,7 +233,7 @@ pub(crate) fn routes(service: Option<ObservationAiCallbackService>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ModelProviderBridge;
+    use crate::{ModelProviderBridge, ProjectConfiguredModelBridge};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, header::AUTHORIZATION},
@@ -248,8 +243,11 @@ mod tests {
         ObservationCaptureRepository, TenantScope,
     };
     use geo_provider::SecretEnvelope;
-    use geo_worker::{HostOpError, ModelCompletion};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use geo_worker::{HostOpError, ModelCompletion, ModelCompletionRequest};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tower::ServiceExt;
 
     const BEARER: &str = "synthetic-observation-service-credential";
@@ -356,8 +354,9 @@ mod tests {
             Uuid::new_v4().into(),
             Some(Uuid::new_v4().into()),
         );
+        let store = Arc::new(Store::default());
         let capture = ObservationCaptureCallbackService::new(
-            Arc::new(Store::default()),
+            store.clone(),
             Arc::new(SecretEnvelope::ephemeral()),
             BEARER,
         )
@@ -389,7 +388,15 @@ mod tests {
         let model = Arc::new(Model::default());
         let bridge =
             ProjectConfiguredModelBridge::new(settings.clone(), Some(model.clone())).unwrap();
-        let service = ObservationAiCallbackService::new(capture, settings, bridge);
+        let extraction = ObservationExtractionService::new(
+            Arc::new(geo_domain::MemoryObservationExtractionRepository::new(
+                store.clone(),
+            )),
+            store,
+            bridge,
+        );
+        let dispatcher = crate::spawn_observation_extraction_dispatcher(extraction.clone());
+        let service = ObservationAiCallbackService::new(capture, settings, extraction);
         let body = serde_json::json!({"schema_version":1,"capture_ticket":ticket,"source_capture_id":receipt.capture_id,"source_sha256":geo_domain::sha256_hex(source.as_bytes())});
         for path in [POLICY_PATH, EXTRACT_PATH] {
             for bearer in [None, Some("wrong")] {
@@ -438,6 +445,7 @@ mod tests {
             serde_json::json!({"text":"{\"completion\":\"unknown\"}","model":"actual-model","config_version":0})
         );
         assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        dispatcher.abort();
     }
 
     #[test]

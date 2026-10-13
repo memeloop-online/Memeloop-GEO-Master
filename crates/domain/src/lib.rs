@@ -68,6 +68,8 @@ mod observation_completion_recovery_jobs;
 pub use observation_completion_recovery_jobs::*;
 mod observation_analysis;
 pub use observation_analysis::*;
+mod observation_extraction;
+pub use observation_extraction::*;
 mod provider_conversation_cleanup;
 pub use provider_conversation_cleanup::*;
 mod provider_conversation_lifecycle;

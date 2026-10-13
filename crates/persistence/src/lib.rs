@@ -43,6 +43,8 @@ mod observation_completion_recovery_jobs;
 pub use observation_completion_recovery_jobs::PgObservationCompletionRecoveryJobRepository;
 mod observation_analysis;
 pub use observation_analysis::PgObservationAnalysisRepository;
+mod observation_extraction;
+pub use observation_extraction::PgObservationExtractionRepository;
 mod provider_conversation_cleanup;
 pub use provider_conversation_cleanup::PgProviderConversationCleanupRepository;
 mod projects;

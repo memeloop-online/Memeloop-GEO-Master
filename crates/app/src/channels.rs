@@ -87,11 +87,22 @@ fn callbacks_with_credentials(
     )?;
     let settings = state.project_ai_settings();
     let inherited = settings.inherited_provider(geo_domain::ProjectAiUsage::ObservationAnalysis);
-    let observation_ai = geo_api::ObservationAiCallbackService::new(
-        captures.clone(),
-        settings.clone(),
-        geo_api::ProjectConfiguredModelBridge::new(settings, inherited)?,
+    let mut extraction = geo_api::ObservationExtractionService::new(
+        std::sync::Arc::new(
+            geo_persistence::PgObservationExtractionRepository::from_database(database),
+        ),
+        std::sync::Arc::new(
+            geo_persistence::PgObservationCaptureRepository::from_database(database),
+        ),
+        geo_api::ProjectConfiguredModelBridge::new(settings.clone(), inherited)?,
     );
+    if let Some(analysis) = state.observation_analysis_service() {
+        extraction = extraction.with_continuation(std::sync::Arc::new(analysis.clone()));
+    }
+    let _extraction_dispatcher =
+        geo_api::spawn_observation_extraction_dispatcher(extraction.clone());
+    let observation_ai =
+        geo_api::ObservationAiCallbackService::new(captures.clone(), settings.clone(), extraction);
     let publication = geo_api::PublicationSendCallbackService::new(
         std::sync::Arc::new(
             geo_persistence::PgPublicationSendAuthorizationRepository::from_database(database),
