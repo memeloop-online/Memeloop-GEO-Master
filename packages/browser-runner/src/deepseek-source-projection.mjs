@@ -64,13 +64,7 @@ const fragmentFieldShape = {
   references: (value) => value === null || Array.isArray(value),
   result: (value) => value === null || object(value),
 };
-const validFragment = (value) =>
-  object(value) &&
-  fragmentTypes.has(value.type) &&
-  (value.type === "THINK" ||
-    Object.entries(fragmentFieldShape).every(
-      ([field, valid]) => !Object.hasOwn(value, field) || valid(value[field]),
-    ));
+const unknownFragment = Symbol("unknown-fragment");
 const pointer = (path, key) =>
   `${path}/${String(key).replace(/~/gu, "~0").replace(/\//gu, "~1")}`;
 
@@ -81,7 +75,7 @@ const pointer = (path, key) =>
  *
  * Delta p/o inherit independently, initially ""/SET. Each BATCH has a fresh
  * child inheritance scope, while its siblings share that scope. Fragment array
- * SET/replacement/APPEND insertion changes only the type/order privacy index.
+ * SET/replacement/APPEND insertion carries type and omitted-field provenance.
  * Only direct, shape-checked fragment-field deltas are retained. Updating an
  * arbitrary nested subtree would require privacy provenance beyond this index;
  * such paths fail closed, including nested discriminator changes.
@@ -137,14 +131,46 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
         }),
       );
     };
+    const fragment = (value, path, depth) => {
+      bound(depth);
+      if (!object(value)) reject("source_fragment_rejected");
+      const taintedFields = new Set();
+      if (!fragmentTypes.has(value.type)) {
+        for (const key of Object.keys(value)) omit(pointer(path, key));
+        return {
+          value: {},
+          state: { type: unknownFragment, taintedFields },
+        };
+      }
+      const retained = Object.fromEntries(
+        Object.entries(value).filter(([key, child]) => {
+          if (
+            value.type !== "THINK" &&
+            Object.hasOwn(fragmentFieldShape, key) &&
+            !fragmentFieldShape[key](child)
+          ) {
+            omit(pointer(path, key));
+            taintedFields.add(key);
+            return false;
+          }
+          return true;
+        }),
+      );
+      return {
+        value: clean(retained, path, depth),
+        state: { type: value.type, taintedFields },
+      };
+    };
     const fragments = (value, path, depth) => {
       if (!Array.isArray(value) || value.length > 10_000)
         reject("source_fragment_rejected");
-      const nextTypes = value.map((fragment) => {
-        if (!validFragment(fragment)) reject("source_fragment_rejected");
-        return fragment.type;
-      });
-      return { value: clean(value, path, depth), types: nextTypes };
+      const projected = value.map((item, index) =>
+        fragment(item, pointer(path, index), depth + 1),
+      );
+      return {
+        value: projected.map((item) => item.value),
+        types: projected.map((item) => item.state),
+      };
     };
     const response = (value, path, depth) => {
       if (!object(value)) reject("source_response_rejected");
@@ -176,6 +202,18 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
     };
     const leaf = (value, path, operation, at, depth) => {
       const parts = path.split("/").filter(Boolean);
+      // Even private-key omissions cannot turn an unverified fragment slot or
+      // nested mutation into an accepted delta.
+      if (
+        parts[0] === "response" &&
+        parts[1] === "fragments" &&
+        parts.length > 3
+      ) {
+        const number = Number(parts[2]);
+        const index = number < 0 ? (types?.length ?? 0) + number : number;
+        if (parts.length !== 4 || types?.[index]?.type === unknownFragment)
+          reject("path_rejected");
+      }
       if (
         parts.some((part) => privateKey.test(part) || reasoningKey.test(part))
       ) {
@@ -233,28 +271,35 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
           return { keep: true, value: result.value };
         }
         if (index < 0 || index > types.length) reject("path_rejected");
-        if (!validFragment(value)) reject("source_fragment_rejected");
-        types[index] = value.type;
-        return { keep: true, value: clean(value, at, depth) };
+        const result = fragment(value, at, depth);
+        types[index] = result.state;
+        return { keep: true, value: result.value };
       }
       if (index < 0 || index >= types.length) reject("path_rejected");
       // Changing a discriminator independently could reinterpret earlier
       // retained text. Such shapes need a new reviewed privacy contract.
-      if (parts[3] === "type") reject("path_rejected");
-      if (types[index] === "THINK") {
+      if (
+        parts.length !== 4 ||
+        parts[3] === "type" ||
+        types[index].type === unknownFragment
+      )
+        reject("path_rejected");
+      if (types[index].type === "THINK") {
         omit(at);
         return { keep: false };
       }
-      if (parts.length !== 4 || !Object.hasOwn(fragmentFieldShape, parts[3]))
-        reject("path_rejected");
+      if (!Object.hasOwn(fragmentFieldShape, parts[3])) reject("path_rejected");
       if (
         !fragmentFieldShape[parts[3]](value) ||
+        (operation === "APPEND" && types[index].taintedFields.has(parts[3])) ||
         (operation === "APPEND" &&
           (parts[3] === "status" ||
             !(typeof value === "string" || Array.isArray(value))))
       )
         reject("source_fragment_rejected");
-      return { keep: true, value: clean(value, at, depth) };
+      const cleaned = clean(value, at, depth);
+      if (operation === "SET") types[index].taintedFields.delete(parts[3]);
+      return { keep: true, value: cleaned };
     };
     const delta = (data, scope, prefix, at, depth) => {
       bound(depth);

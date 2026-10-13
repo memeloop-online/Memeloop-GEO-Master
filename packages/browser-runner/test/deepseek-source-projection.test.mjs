@@ -87,13 +87,13 @@ test("structural rejection categories cross only the closed diagnostic wire", ()
       [event({ v: {}, "synthetic-private-key": "synthetic-private-value" })],
       "source_delta_rejected",
     ],
-    [[snapshot([{ ...answer(), content: {} }])], "source_fragment_rejected"],
+    [[snapshot([null])], "source_fragment_rejected"],
     [
       [
         snapshot([answer()]),
         event({
           p: "response/fragments/0",
-          v: { type: "synthetic-private-type" },
+          v: "synthetic-private-value",
         }),
       ],
       "source_fragment_rejected",
@@ -671,11 +671,7 @@ test("retains proven direct content and whole search-field updates unchanged", (
 });
 
 for (const [name, messages] of [
-  [
-    "unknown fragment type",
-    [snapshot([{ type: "FUTURE", content: "unknown" }])],
-  ],
-  ["untyped fragment", [snapshot([{ content: "unknown" }])]],
+  ["nonobject fragment", [snapshot(["unknown"])]],
   [
     "missing fragment provenance",
     [event({ p: "response/fragments/0/content", v: "unknown" })],
@@ -726,4 +722,226 @@ test("bounds depth, message count, total bytes and circular inputs", () => {
   const circular = {};
   circular.self = circular;
   assert.equal(project(circular), null);
+});
+
+test("snapshot omissions preserve positions and exact manifests without retaining unknown values", () => {
+  const input = snapshot([
+    answer(),
+    { type: "FUTURE", content: "private-unknown", "future/~key": think() },
+    { content: "private-untyped" },
+    {
+      ...answer(),
+      content: think(),
+      status: {},
+      pattern: [],
+      queries: {},
+      results: "private-results",
+      references: false,
+      result: [],
+    },
+    { type: "SEARCH", results: [], queries: ["Public query"] },
+  ]);
+  const before = structuredClone(input);
+  const source = project(input);
+  assert.ok(source);
+  assert.deepEqual(source.exchange.messages[0].data.v.response.fragments, [
+    answer(),
+    {},
+    {},
+    { type: "RESPONSE" },
+    { type: "SEARCH", results: [], queries: ["Public query"] },
+  ]);
+  assert.deepEqual(source.redaction.omitted_paths, [
+    ...["type", "content", "future~1~0key"].map(
+      (key) => `/messages/0/data/v/response/fragments/1/${key}`,
+    ),
+    "/messages/0/data/v/response/fragments/2/content",
+    ...[
+      "content",
+      "status",
+      "pattern",
+      "queries",
+      "results",
+      "references",
+      "result",
+    ].map((key) => `/messages/0/data/v/response/fragments/3/${key}`),
+  ]);
+  assert.deepEqual(
+    sourceRedaction(source.redaction, source.exchange),
+    source.redaction,
+  );
+  assert.doesNotMatch(JSON.stringify(source.exchange), /private-|FUTURE/u);
+  assert.deepEqual(input, before);
+});
+
+test("only a validated SET clears its own field taint", () => {
+  const initial = snapshot([
+    { ...answer(), content: think(), queries: think() },
+  ]);
+  const safeSet = event({
+    p: "response/fragments/0/content",
+    o: "SET",
+    v: "Recovered",
+  });
+  const append = event({
+    p: "response/fragments/0/content",
+    o: "APPEND",
+    v: " public",
+  });
+  const source = project(initial, safeSet, append);
+  assert.ok(source);
+  assert.deepEqual(source.exchange.messages.slice(1), [safeSet, append]);
+  assert.doesNotMatch(JSON.stringify(source), /private-thought/u);
+  assert.equal(
+    project(
+      initial,
+      safeSet,
+      event({
+        p: "response/fragments/0/queries",
+        o: "APPEND",
+        v: ["private-later"],
+      }),
+    ),
+    null,
+  );
+  assert.equal(
+    project(
+      initial,
+      event({
+        p: "response/fragments/0/content",
+        o: "SET",
+        v: think(),
+      }),
+      append,
+    ),
+    null,
+  );
+});
+
+test("array mutations carry taint and unknown provenance until verified replacement", () => {
+  for (const slot of [
+    { ...answer(), content: think() },
+    { type: "FUTURE", content: "private-initial" },
+    {},
+  ]) {
+    for (const setup of [
+      [snapshot([slot])],
+      [
+        snapshot([]),
+        event({ p: "response/fragments", o: "APPEND", v: [slot] }),
+      ],
+      [
+        snapshot([answer()]),
+        event({ p: "response/fragments/-1", o: "SET", v: slot }),
+      ],
+      [
+        snapshot([answer()]),
+        event({ p: "response/fragments", o: "SET", v: [slot] }),
+      ],
+      [
+        snapshot([answer()]),
+        event({ p: "response/fragments/-99", o: "APPEND", v: [slot] }),
+      ],
+      [
+        snapshot([slot]),
+        event({ p: "response/fragments/0", o: "APPEND", v: [answer()] }),
+      ],
+    ]) {
+      const shifted = setup.at(-1).data.p === "response/fragments/0";
+      const index = shifted ? "-1" : "0";
+      const append = event({
+        p: `response/fragments/${index}/content`,
+        o: "APPEND",
+        v: "private-later",
+      });
+      assert.equal(project(...setup, append), null);
+      if (slot.type !== "RESPONSE")
+        assert.equal(
+          project(
+            ...setup,
+            event({
+              p: `response/fragments/${index}/content`,
+              o: "SET",
+              v: "unverified",
+            }),
+          ),
+          null,
+        );
+      const replacement = event({
+        p: `response/fragments/${index}`,
+        o: "SET",
+        v: answer(),
+      });
+      const recovered = project(...setup, replacement, {
+        ...append,
+        data: { ...append.data, v: " public" },
+      });
+      assert.ok(recovered);
+      assert.deepEqual(
+        sourceRedaction(recovered.redaction, recovered.exchange),
+        recovered.redaction,
+      );
+      assert.doesNotMatch(
+        JSON.stringify(recovered.exchange),
+        /private-|FUTURE/u,
+      );
+    }
+  }
+});
+
+test("unknown slots reject every field delta and nested private paths remain closed", () => {
+  for (const field of [
+    "content",
+    "type",
+    "authorization",
+    "reasoning_content",
+    "metadata/content",
+  ]) {
+    assert.equal(
+      project(
+        snapshot([{ type: "FUTURE", content: "private-initial" }]),
+        event({ p: `response/fragments/0/${field}`, v: "private-later" }),
+      ),
+      null,
+    );
+  }
+  assert.equal(
+    project(
+      snapshot([think()]),
+      event({
+        p: "response/fragments/0/metadata/authorization",
+        v: "private-later",
+      }),
+    ),
+    null,
+  );
+  assert.equal(
+    project(
+      snapshot([{ ...answer(), content: think() }]),
+      event({
+        p: "response/fragments/0",
+        o: "BATCH",
+        v: [{ p: "content", o: "APPEND", v: "" }, { v: "private-later" }],
+      }),
+    ),
+    null,
+  );
+});
+
+test("omission compatibility still bounds fragment arrays, bytes and clean traversal", () => {
+  assert.equal(project(snapshot(Array(10_001).fill({ type: "FUTURE" }))), null);
+  assert.equal(
+    project(
+      snapshot(Array(10_000).fill({})),
+      event({ p: "response/fragments", o: "APPEND", v: [{}] }),
+    ),
+    null,
+  );
+  assert.equal(
+    project(snapshot([{ type: "FUTURE", content: "x".repeat(750_001) }])),
+    null,
+  );
+  let nested = {};
+  for (let index = 0; index < 40; index++) nested = { child: nested };
+  assert.equal(project(snapshot([{ ...answer(), metadata: nested }])), null);
 });
