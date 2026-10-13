@@ -223,6 +223,7 @@ export function capturedConversationCompletion(exchange) {
   }
   let ready = false;
   let finished = false;
+  let closeSeen = false;
   for (const [index, envelope] of exchange.messages.entries()) {
     if (
       !object(envelope) ||
@@ -234,6 +235,7 @@ export function capturedConversationCompletion(exchange) {
       if (
         ready ||
         finished ||
+        closeSeen ||
         !object(envelope.data) ||
         envelope.data.request_message_id !==
           lifecycle.ready.request_message_id ||
@@ -254,16 +256,38 @@ export function capturedConversationCompletion(exchange) {
           omittedPaths.has(`/messages/${index}/raw_data`));
       if (!ready || finished || !finishPayload) return null;
       finished = true;
+    } else if (envelope.event === "close") {
+      if (
+        !ready ||
+        closeSeen ||
+        (Object.hasOwn(envelope.data, "click_behavior") &&
+          envelope.data.click_behavior !== "retry" &&
+          envelope.data.click_behavior !== "none")
+      )
+        return null;
+      closeSeen = true;
     } else if (
       (!envelope.event ||
         envelope.event === "message" ||
         envelope.event === "delta") &&
-      (!ready || finished)
+      (!ready || finished || closeSeen)
     )
       return null;
     // Do not interpret delta bodies, answer text, citations or finish payload.
   }
-  return ready && finished
+  // Old partial/eof records are immutable evidence, not upgrade candidates.
+  const completeClose =
+    closeSeen &&
+    closed(exchange.capture_status, [
+      "schema_version",
+      "transport",
+      "termination",
+    ]) &&
+    exchange.capture_status.schema_version ===
+      "geo.observation.capture-status.v1" &&
+    exchange.capture_status.transport === "complete" &&
+    exchange.capture_status.termination === "complete";
+  return ready && (finished || completeClose)
     ? {
         protocol: "deepseek_history_json",
         terminal: true,

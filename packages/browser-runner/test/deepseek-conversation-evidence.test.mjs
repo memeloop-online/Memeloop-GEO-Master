@@ -86,6 +86,86 @@ function redactedExchange() {
   return value;
 }
 
+test("close completion preserves independent exact history and terminal ordering", () => {
+  for (const data of [
+    {},
+    { click_behavior: "retry" },
+    { click_behavior: "none" },
+  ]) {
+    for (const order of ["close", "finish-close", "close-finish"]) {
+      const value = exchange();
+      value.capture_status = {
+        schema_version: "geo.observation.capture-status.v1",
+        transport: "complete",
+        termination: "complete",
+      };
+      const finish = value.messages.pop();
+      const close = { event: "close", data };
+      value.messages.push(
+        ...(order === "close"
+          ? [close]
+          : order === "finish-close"
+            ? [finish, close]
+            : [close, finish]),
+      );
+      assert.ok(capturedConversationCompletion(value));
+      if (order === "close") {
+        for (const status of [
+          undefined,
+          { ...value.capture_status, transport: "partial", termination: "eof" },
+          { ...value.capture_status, termination: "eof" },
+        ]) {
+          const invalid = structuredClone(value);
+          invalid.capture_status = status;
+          assert.equal(capturedConversationCompletion(invalid), null);
+        }
+      }
+      for (const mutate of [
+        (v) => v.messages.push(close),
+        (v) => v.messages.push({ event: "delta", data: {} }),
+        (v) => v.messages.shift(),
+        (v) => {
+          v.lifecycle.sse_terminal = false;
+        },
+        (v) => {
+          v.lifecycle.history.messages[1].status = "PENDING";
+        },
+        (v) => {
+          v.lifecycle.history.messages[1].parent_id = 99;
+        },
+        (v) => {
+          delete v.lifecycle;
+        },
+      ]) {
+        const invalid = structuredClone(value);
+        mutate(invalid);
+        assert.equal(capturedConversationCompletion(invalid), null);
+      }
+    }
+  }
+  for (const data of [
+    null,
+    [],
+    { click_behavior: null },
+    { click_behavior: "unknown" },
+  ]) {
+    const value = exchange();
+    value.messages[2] = { event: "close", data };
+    assert.equal(capturedConversationCompletion(value), null);
+  }
+  const omitted = exchange();
+  omitted.messages[2] = { event: "close" };
+  omitted.source_redaction = {
+    schema_version: "geo.observation.source-redaction.v1",
+    policy: "reasoning-and-private-fields",
+    omitted_paths: ["/messages/2/data"],
+  };
+  assert.equal(capturedConversationCompletion(omitted), null);
+  const noMarker = exchange();
+  noMarker.messages.pop();
+  assert.equal(capturedConversationCompletion(noMarker), null);
+});
+
 function ownedExchange() {
   const value = exchange();
   const { creation, submission } = structuredClone(value.lifecycle);
