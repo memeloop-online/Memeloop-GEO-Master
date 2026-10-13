@@ -436,6 +436,6 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
             .admit_automatic(&scope, automatic_v3, now)
             .await
             .unwrap(),
-        geo_domain::AutomaticExtractionAdmission::Intent(terminal)
+        geo_domain::AutomaticExtractionAdmission::Intent(Box::new(terminal))
     );
 }

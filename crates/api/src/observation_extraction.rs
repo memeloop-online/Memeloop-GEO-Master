@@ -132,7 +132,7 @@ impl ObservationExtractionService {
             .admit_automatic(scope, request.clone(), Utc::now())
             .await?
         {
-            AutomaticExtractionAdmission::Intent(intent) => intent,
+            AutomaticExtractionAdmission::Intent(intent) => *intent,
             AutomaticExtractionAdmission::DeferredManual => {
                 return Err(AppError::conflict("extraction deferred by saved analysis"));
             }
