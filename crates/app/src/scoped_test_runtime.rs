@@ -1,7 +1,7 @@
 //! Explicit deployment inference test for one pinned project. This does not
 //! resolve durable model grants or change the production Token Center route.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use geo_api::{AppState, EmbeddedAgentRuntime, ModelProviderBridge, SharedModelProvider};
@@ -35,6 +35,23 @@ impl ModelProviderBridge for ExactProjectProvider {
             ));
         }
         self.inner.complete(scope, request).await
+    }
+
+    async fn complete_with_timeout(
+        &self,
+        scope: &TenantScope,
+        request: &ModelCompletionRequest,
+        timeout: Duration,
+    ) -> Result<ModelCompletion, HostOpError> {
+        if self.scope.project_id.is_none() || self.scope != *scope {
+            return Err(HostOpError::denied(
+                HostOp::ModelComplete,
+                "test model unavailable for this scope",
+            ));
+        }
+        self.inner
+            .complete_with_timeout(scope, request, timeout)
+            .await
     }
 }
 
@@ -355,6 +372,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_project_provider_forwards_background_budget_to_transport() {
+        struct BudgetTransport;
+        #[async_trait]
+        impl Transport for BudgetTransport {
+            async fn send(
+                &self,
+                _: TransportRequest,
+                control: RequestControl,
+            ) -> Result<TransportResponse, ProviderError> {
+                assert_eq!(control.timeout(), Duration::from_secs(300));
+                Err(ProviderError::Transport("budget reached transport".into()))
+            }
+        }
+        let ai = config();
+        let provider = guarded_provider(&ai, Arc::new(BudgetTransport)).unwrap();
+        let error = provider
+            .complete_with_timeout(&ai.scope, &request(None), Duration::from_secs(300))
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "budget reached transport");
+    }
+
+    #[tokio::test]
     async fn exact_project_provider_denies_other_scopes_before_transport() {
         let ai = config();
         let transport = Arc::new(CountingTransport::default());
@@ -380,11 +420,27 @@ mod tests {
         for scope in &forbidden {
             let error = provider.complete(scope, &request(None)).await.unwrap_err();
             assert_eq!(error.code, HostOpErrorCode::Denied);
+            let error = provider
+                .complete_with_timeout(scope, &request(None), Duration::from_secs(300))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, HostOpErrorCode::Denied);
             assert_eq!(transport.0.load(Ordering::SeqCst), 0);
         }
         assert!(
             provider
                 .complete(&ai.scope, &request(Some("other-model")))
+                .await
+                .is_err()
+        );
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+        assert!(
+            provider
+                .complete_with_timeout(
+                    &ai.scope,
+                    &request(Some("other-model")),
+                    Duration::from_secs(300),
+                )
                 .await
                 .is_err()
         );

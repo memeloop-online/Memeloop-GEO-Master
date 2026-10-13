@@ -66,6 +66,23 @@ impl ModelProviderBridge for PinnedDevelopmentProvider {
         }
         self.inner.complete(scope, request).await
     }
+
+    async fn complete_with_timeout(
+        &self,
+        scope: &TenantScope,
+        request: &ModelCompletionRequest,
+        timeout: Duration,
+    ) -> Result<ModelCompletion, HostOpError> {
+        if !self.scope.contains(scope) {
+            return Err(HostOpError::denied(
+                HostOp::ModelComplete,
+                "development model unavailable for this scope",
+            ));
+        }
+        self.inner
+            .complete_with_timeout(scope, request, timeout)
+            .await
+    }
 }
 
 impl fmt::Debug for LocalTokenCenter {
@@ -560,6 +577,11 @@ mod tests {
         for scope in denied {
             let error = bridge.complete(&scope, &request).await.unwrap_err();
             assert_eq!(error.code, geo_worker::HostOpErrorCode::Denied);
+            let error = bridge
+                .complete_with_timeout(&scope, &request, Duration::from_secs(300))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, geo_worker::HostOpErrorCode::Denied);
             assert_eq!(*transport.0.lock().unwrap(), 0);
         }
         assert_eq!(
@@ -573,6 +595,50 @@ mod tests {
         };
         tenant_wide.complete(&pinned, &request).await.unwrap();
         assert_eq!(*transport.0.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_development_provider_forwards_background_budget_to_transport() {
+        struct BudgetTransport;
+        #[async_trait]
+        impl Transport for BudgetTransport {
+            async fn send(
+                &self,
+                _: TransportRequest,
+                control: RequestControl,
+            ) -> Result<TransportResponse, ProviderError> {
+                assert_eq!(control.timeout(), Duration::from_secs(300));
+                Err(ProviderError::Transport("budget reached transport".into()))
+            }
+        }
+        let scope = TenantScope::new(
+            uuid::Uuid::new_v4().into(),
+            uuid::Uuid::new_v4().into(),
+            Some(uuid::Uuid::new_v4().into()),
+        );
+        let bridge = PinnedDevelopmentProvider {
+            scope: scope.clone(),
+            inner: injected_provider(
+                "https://provider.invalid/v1",
+                "synthetic-key",
+                "model",
+                Arc::new(BudgetTransport),
+            )
+            .unwrap(),
+        };
+        let request = ModelCompletionRequest {
+            prompt: "question".into(),
+            system: None,
+            model: None,
+            max_output_tokens: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let error = bridge
+            .complete_with_timeout(&scope, &request, Duration::from_secs(300))
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "budget reached transport");
     }
 
     #[tokio::test]

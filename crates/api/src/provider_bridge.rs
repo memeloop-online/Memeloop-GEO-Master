@@ -33,6 +33,17 @@ pub trait ModelProviderBridge: Send + Sync {
         scope: &TenantScope,
         request: &ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError>;
+
+    /// Server-owned per-call budget. Worker requests cannot select this value.
+    /// The default preserves compatibility with injected model implementations.
+    async fn complete_with_timeout(
+        &self,
+        scope: &TenantScope,
+        request: &ModelCompletionRequest,
+        _timeout: Duration,
+    ) -> Result<ModelCompletion, HostOpError> {
+        self.complete(scope, request).await
+    }
 }
 
 /// A provider route selected by the API for one tenant/project scope.
@@ -80,12 +91,7 @@ where
         routes: Arc<R>,
         timeout: Duration,
     ) -> Result<Self, HostOpError> {
-        if timeout.is_zero() {
-            return Err(HostOpError::invalid_request(
-                HostOp::ModelComplete,
-                "provider timeout must be greater than zero",
-            ));
-        }
+        provider_deadline(timeout)?;
         Ok(Self {
             transport,
             token_center,
@@ -107,7 +113,17 @@ where
         scope: &TenantScope,
         request: &ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        self.complete_with_timeout(scope, request, self.timeout)
+            .await
+    }
+
+    async fn complete_with_timeout(
+        &self,
+        scope: &TenantScope,
+        request: &ModelCompletionRequest,
+        timeout: Duration,
+    ) -> Result<ModelCompletion, HostOpError> {
+        let deadline = provider_deadline(timeout)?;
         let phase = ModelPhaseTimer::start(ModelPhase::Route);
         let route = tokio::time::timeout_at(
             deadline,
@@ -116,14 +132,14 @@ where
         .await
         .unwrap_or(Err(ProviderError::Timeout));
         phase.finish(route.is_ok());
-        let route = route.map_err(|error| map_provider_error(error, self.timeout))?;
+        let route = route.map_err(|error| map_provider_error(error, timeout))?;
         let client = ProviderClient::new(
             route.base_url,
             route.secret_ref,
             Arc::clone(&self.transport),
             Arc::clone(&self.token_center),
         )
-        .map_err(|error| map_provider_error(error, self.timeout))?;
+        .map_err(|error| map_provider_error(error, timeout))?;
         let model = if route.model.trim().is_empty() {
             return Err(HostOpError::invalid_request(
                 HostOp::ModelComplete,
@@ -135,15 +151,15 @@ where
         let provider_request = provider_request(model, request);
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(map_provider_error(ProviderError::Timeout, self.timeout));
+            return Err(map_provider_error(ProviderError::Timeout, timeout));
         }
-        let control = RequestControl::new(remaining)
-            .map_err(|error| map_provider_error(error, self.timeout))?;
+        let control =
+            RequestControl::new(remaining).map_err(|error| map_provider_error(error, timeout))?;
         client
             .complete(provider_request, control)
             .await
             .map(map_completion)
-            .map_err(|error| map_provider_error(error, self.timeout))
+            .map_err(|error| map_provider_error(error, timeout))
     }
 }
 
@@ -175,12 +191,7 @@ where
                 "provider default model must not be empty",
             ));
         }
-        if timeout.is_zero() {
-            return Err(HostOpError::invalid_request(
-                HostOp::ModelComplete,
-                "provider timeout must be greater than zero",
-            ));
-        }
+        provider_deadline(timeout)?;
         let allowed_models = [default_model.clone()].into_iter().collect();
         Ok(Self {
             client,
@@ -223,9 +234,20 @@ where
 {
     async fn complete(
         &self,
-        _scope: &TenantScope,
+        scope: &TenantScope,
         request: &ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
+        self.complete_with_timeout(scope, request, self.timeout)
+            .await
+    }
+
+    async fn complete_with_timeout(
+        &self,
+        _scope: &TenantScope,
+        request: &ModelCompletionRequest,
+        timeout: Duration,
+    ) -> Result<ModelCompletion, HostOpError> {
+        provider_deadline(timeout)?;
         // Also covers the scoped-test runtime's exact-project injected bridge.
         let phase = ModelPhaseTimer::start(ModelPhase::DirectDispatch);
         let model = request
@@ -240,13 +262,25 @@ where
             ));
         }
         let provider_request = provider_request(model, request);
-        let control = RequestControl::new(self.timeout)
-            .map_err(|error| map_provider_error(error, self.timeout))?;
+        let control =
+            RequestControl::new(timeout).map_err(|error| map_provider_error(error, timeout))?;
         let completion = self.client.complete(provider_request, control).await;
         phase.finish(completion.is_ok());
-        let completion = completion.map_err(|error| map_provider_error(error, self.timeout))?;
+        let completion = completion.map_err(|error| map_provider_error(error, timeout))?;
         Ok(map_completion(completion))
     }
+}
+
+pub(crate) fn provider_deadline(timeout: Duration) -> Result<tokio::time::Instant, HostOpError> {
+    if !timeout.is_zero()
+        && let Some(deadline) = tokio::time::Instant::now().checked_add(timeout)
+    {
+        return Ok(deadline);
+    }
+    Err(HostOpError::invalid_request(
+        HostOp::ModelComplete,
+        "provider timeout must be positive and representable",
+    ))
 }
 
 fn provider_request(model: String, request: &ModelCompletionRequest) -> CompletionRequest {
@@ -434,6 +468,76 @@ mod tests {
     }
 
     struct HangingRoute;
+
+    struct DelayedTransport {
+        calls: Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait]
+    impl Transport for DelayedTransport {
+        async fn send(
+            &self,
+            _: TransportRequest,
+            control: RequestControl,
+        ) -> Result<TransportResponse, ProviderError> {
+            self.calls.lock().unwrap().push(control.timeout());
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            Ok(TransportResponse {
+                status: 200,
+                body: r#"{"id":"synthetic","model":"model","choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn routed_override_reaches_transport_and_preserves_scope_and_default_budget() {
+        let transport = Arc::new(DelayedTransport {
+            calls: Mutex::new(Vec::new()),
+        });
+        let routes = Arc::new(RouteStub {
+            seen: Mutex::new(None),
+        });
+        let bridge = RoutedProviderClientBridge::new(
+            Arc::clone(&transport),
+            Arc::new(Token),
+            Arc::clone(&routes),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let scope = scope();
+        let request = ModelCompletionRequest {
+            prompt: "question".into(),
+            system: None,
+            model: Some("model".into()),
+            max_output_tokens: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let start = tokio::time::Instant::now();
+        bridge
+            .complete_with_timeout(&scope, &request, Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(61));
+        assert_eq!(
+            *routes.seen.lock().unwrap(),
+            Some((scope.clone(), Some("model".into())))
+        );
+        assert_eq!(*transport.calls.lock().unwrap(), [Duration::from_secs(300)]);
+        let error = bridge.complete(&scope, &request).await.unwrap_err();
+        assert_eq!(error.code, geo_worker::HostOpErrorCode::DeadlineExceeded);
+        assert_eq!(
+            *transport.calls.lock().unwrap(),
+            [Duration::from_secs(300), Duration::from_secs(60)]
+        );
+        assert!(
+            bridge
+                .complete_with_timeout(&scope, &request, Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert_eq!(transport.calls.lock().unwrap().len(), 2);
+    }
 
     #[async_trait]
     impl ProviderRouteResolver for HangingRoute {

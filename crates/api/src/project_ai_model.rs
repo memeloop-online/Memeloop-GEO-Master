@@ -19,6 +19,7 @@ pub struct ProjectConfiguredModelBridge<T = HttpTransport> {
     settings: ProjectAiSettingsService,
     inherited: Option<SharedModelProvider>,
     transport: Arc<T>,
+    observation_timeout: Duration,
 }
 
 impl ProjectConfiguredModelBridge<HttpTransport> {
@@ -26,11 +27,16 @@ impl ProjectConfiguredModelBridge<HttpTransport> {
         settings: ProjectAiSettingsService,
         inherited: Option<SharedModelProvider>,
     ) -> Result<Self, ProviderError> {
-        Ok(Self::with_transport(
-            settings,
-            inherited,
-            Arc::new(HttpTransport::public_only()?),
-        ))
+        let configured = match std::env::var("GEO_OBSERVATION_MODEL_TIMEOUT_SECONDS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => return Err(invalid_observation_timeout()),
+        };
+        let observation_timeout = observation_timeout(configured.as_deref())?;
+        Ok(
+            Self::with_transport(settings, inherited, Arc::new(HttpTransport::public_only()?))
+                .with_observation_timeout(observation_timeout)?,
+        )
     }
 }
 
@@ -44,7 +50,15 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
             settings,
             inherited,
             transport,
+            observation_timeout: Duration::from_secs(300),
         }
+    }
+
+    pub fn with_observation_timeout(mut self, timeout: Duration) -> Result<Self, ProviderError> {
+        crate::provider_bridge::provider_deadline(timeout)
+            .map_err(|_| invalid_observation_timeout())?;
+        self.observation_timeout = timeout;
+        Ok(self)
     }
 
     pub async fn complete_for_usage(
@@ -107,10 +121,19 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
         let Some(config) = config else {
             let phase = ModelPhaseTimer::start(ModelPhase::InheritedDispatch);
             let result = match &self.inherited {
-                Some(inherited) => inherited
-                    .complete(scope, request)
-                    .await
-                    .map(|completion| (completion, revision)),
+                Some(inherited) => {
+                    let completion = match usage {
+                        ProjectAiUsage::ObservationAnalysis => {
+                            inherited
+                                .complete_with_timeout(scope, request, self.observation_timeout)
+                                .await
+                        }
+                        ProjectAiUsage::WorkbenchContent => {
+                            inherited.complete(scope, request).await
+                        }
+                    };
+                    completion.map(|completion| (completion, revision))
+                }
                 None => Err(HostOpError::capability_missing(
                     HostOp::ModelComplete,
                     "no inherited or project model is configured",
@@ -130,7 +153,11 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
             Arc::new(ProjectCredential { reference, token }),
         )
         .map_err(|_| custom_unavailable())?;
-        let bridge = ProviderClientBridge::new(client, config.model, Duration::from_secs(60))?;
+        let timeout = match usage {
+            ProjectAiUsage::ObservationAnalysis => self.observation_timeout,
+            ProjectAiUsage::WorkbenchContent => Duration::from_secs(60),
+        };
+        let bridge = ProviderClientBridge::new(client, config.model, timeout)?;
         // ProviderClientBridge's single-model allowlist rejects a worker
         // selecting any model other than the saved project configuration.
         let result = bridge
@@ -140,6 +167,26 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
         phase.finish(result.is_ok());
         result
     }
+}
+
+fn invalid_observation_timeout() -> ProviderError {
+    ProviderError::InvalidRequest(
+        "observation model timeout must be positive integer seconds with a representable deadline"
+            .into(),
+    )
+}
+
+fn observation_timeout(value: Option<&str>) -> Result<Duration, ProviderError> {
+    let seconds = match value {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| invalid_observation_timeout())?,
+        None => 300,
+    };
+    let timeout = Duration::from_secs(seconds);
+    crate::provider_bridge::provider_deadline(timeout)
+        .map_err(|_| invalid_observation_timeout())?;
+    Ok(timeout)
 }
 
 #[async_trait]
@@ -224,6 +271,95 @@ mod tests {
             max_output_tokens: Some(16),
             messages: Vec::new(),
             tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn observation_budget_configuration_rejects_invalid_values_without_capping_valid_seconds() {
+        assert_eq!(observation_timeout(None).unwrap(), Duration::from_secs(300));
+        assert_eq!(
+            observation_timeout(Some("1200")).unwrap(),
+            Duration::from_secs(1200)
+        );
+        for invalid in ["", "0", "-1", "abc", "1.5", "18446744073709551615"] {
+            assert!(observation_timeout(Some(invalid)).is_err());
+        }
+        let bridge = ProjectConfiguredModelBridge::with_transport(
+            ProjectAiSettingsService::development(),
+            None,
+            Arc::new(RecordingTransport::default()),
+        );
+        assert!(bridge.with_observation_timeout(Duration::ZERO).is_err());
+    }
+
+    #[derive(Default)]
+    struct DelayedTransport(Mutex<Vec<Duration>>);
+
+    #[async_trait]
+    impl Transport for DelayedTransport {
+        async fn send(
+            &self,
+            _: TransportRequest,
+            control: RequestControl,
+        ) -> Result<TransportResponse, ProviderError> {
+            self.0.lock().unwrap().push(control.timeout());
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            Ok(TransportResponse {
+                status: 200,
+                body: r#"{"id":"synthetic","model":"model","choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observation_budget_reaches_inherited_and_custom_transport_without_extending_workbench()
+    {
+        for custom in [false, true] {
+            let settings = ProjectAiSettingsService::development();
+            let scope = scope();
+            let transport = Arc::new(DelayedTransport::default());
+            let inherited = if custom {
+                for usage in ProjectAiUsage::ALL {
+                    save(&settings, &scope, usage, 0, Some("model")).await;
+                }
+                None
+            } else {
+                let reference = SecretRef::new("synthetic-reference").unwrap();
+                let client = ProviderClient::new(
+                    "https://provider.invalid/v1",
+                    reference.clone(),
+                    Arc::clone(&transport),
+                    Arc::new(ProjectCredential {
+                        reference,
+                        token: ResolvedToken::new("synthetic-token".into()).unwrap(),
+                    }),
+                )
+                .unwrap();
+                Some(Arc::new(
+                    ProviderClientBridge::new(client, "model", Duration::from_secs(60)).unwrap(),
+                ) as SharedModelProvider)
+            };
+            let bridge = ProjectConfiguredModelBridge::with_transport(
+                settings,
+                inherited,
+                Arc::clone(&transport),
+            );
+            let start = tokio::time::Instant::now();
+            let answer = bridge
+                .complete_for_usage(&scope, ProjectAiUsage::ObservationAnalysis, &request())
+                .await
+                .unwrap();
+            assert_eq!(answer.text, "answer");
+            assert_eq!(start.elapsed(), Duration::from_secs(61));
+            assert_eq!(*transport.0.lock().unwrap(), [Duration::from_secs(300)]);
+            let start = tokio::time::Instant::now();
+            let error = bridge.complete(&scope, &request()).await.unwrap_err();
+            assert_eq!(error.code, geo_worker::HostOpErrorCode::DeadlineExceeded);
+            assert_eq!(start.elapsed(), Duration::from_secs(60));
+            assert_eq!(
+                *transport.0.lock().unwrap(),
+                [Duration::from_secs(300), Duration::from_secs(60),]
+            );
         }
     }
 
