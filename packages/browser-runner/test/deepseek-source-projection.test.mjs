@@ -74,7 +74,7 @@ test("structural rejection categories cross only the closed diagnostic wire", ()
       [
         {
           event: "ready",
-          data: { "synthetic-private-key": "synthetic-private-value" },
+          data: "synthetic-private-value",
         },
       ],
       "source_event_rejected",
@@ -255,7 +255,7 @@ test("projects actual decoder transport IDs without interpreting auxiliary conte
   decoder.push(
     Buffer.from(
       "id: synthetic-transport\n" +
-        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n' +
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2,"future_metadata":{"nested":"synthetic-private-value"}}\n\n' +
         'event: debug\ndata: {"opaque":"synthetic-private-value"}\n\n',
     ),
   );
@@ -269,6 +269,7 @@ test("projects actual decoder transport IDs without interpreting auxiliary conte
   ]);
   assert.deepEqual(source.redaction.omitted_paths, [
     "/messages/0/id",
+    "/messages/0/data/future_metadata",
     "/messages/1/data",
   ]);
 });
@@ -307,6 +308,69 @@ test("omits transport IDs and opaque auxiliary payloads without changing delta s
     "/messages/5/id",
   ]);
   assert.equal(JSON.stringify(source).includes("synthetic-private"), false);
+  assert.deepEqual(input, before);
+});
+
+test("known named events omit unknown metadata without changing delta provenance", () => {
+  const known = [
+    ["ready", { request_message_id: 1, response_message_id: 2 }],
+    ["title", { content: "Public title" }],
+    ["toast", { content: "Public notice", type: "info" }],
+    ["hint", { content: "Public hint", clear_response: false }],
+    ["update_session", { updated_at: "2026-01-01" }],
+    ["close", { click_behavior: "none" }],
+    ["finish", {}],
+  ];
+  const input = [
+    snapshot([answer("Start"), think()]),
+    event({ p: "response/fragments/0/content", o: "APPEND", v: " next" }),
+    ...known.map(([name, data]) => ({
+      event: name,
+      data: {
+        ...data,
+        "future~/metadata": {
+          nested: { type: "THINK", content: "synthetic-private-thought" },
+          credentials: "synthetic-private-secret",
+        },
+        access_token: "synthetic-private-token",
+      },
+    })),
+    event({ v: " inherited" }),
+    event({
+      p: "response/fragments",
+      o: "BATCH",
+      v: [
+        { p: "1/content", o: "APPEND", v: "synthetic-private-thought" },
+        { p: "0/content", o: "APPEND", v: " public" },
+        { v: " continuation" },
+      ],
+    }),
+  ];
+  const before = structuredClone(input);
+  const projected = project(...input);
+  assert.ok(projected);
+  assert.deepEqual(
+    projected.exchange.messages.slice(2, 9),
+    known.map(([name, data]) => ({ event: name, data })),
+  );
+  assert.deepEqual(projected.exchange.messages[9], input[9]);
+  assert.deepEqual(projected.exchange.messages[10].data.v, [
+    { p: "1/content", o: "APPEND" },
+    ...input[10].data.v.slice(1),
+  ]);
+  assert.deepEqual(projected.redaction.omitted_paths, [
+    "/messages/0/data/v/response/fragments/1/content",
+    ...known.flatMap((_, index) => [
+      `/messages/${index + 2}/data/future~0~1metadata`,
+      `/messages/${index + 2}/data/access_token`,
+    ]),
+    "/messages/10/data/v/0/v",
+  ]);
+  assert.deepEqual(
+    sourceRedaction(projected.redaction, projected.exchange),
+    projected.redaction,
+  );
+  assert.doesNotMatch(JSON.stringify(projected), /synthetic-private/u);
   assert.deepEqual(input, before);
 });
 

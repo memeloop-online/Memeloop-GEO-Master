@@ -220,7 +220,13 @@ test("partial capture persists privacy-projected source without interpretation, 
         messages: [
           {
             event: "ready",
-            data: { request_message_id: 1, response_message_id: 2 },
+            data: {
+              request_message_id: 1,
+              response_message_id: 2,
+              future_metadata: {
+                nested: { content: "private-synthetic-event-metadata" },
+              },
+            },
           },
           {
             event: "message",
@@ -284,6 +290,12 @@ test("partial capture persists privacy-projected source without interpretation, 
     assert.ok(!record.source_json.includes("private-synthetic-credentials"));
     assert.ok(!record.source_json.includes("private-synthetic-unknown"));
     assert.ok(!record.source_json.includes("private-synthetic-shaped"));
+    assert.ok(!record.source_json.includes("private-synthetic-event-metadata"));
+    assert.ok(
+      JSON.parse(record.source_json).source_redaction.omitted_paths.includes(
+        "/messages/0/data/future_metadata",
+      ),
+    );
     assert.deepEqual(
       JSON.parse(record.source_json).messages[1].data.v.fragments.slice(2),
       [{}, { type: "RESPONSE" }],
@@ -303,6 +315,9 @@ test("partial capture persists privacy-projected source without interpretation, 
 
 test("full capture persists omitted fragment fields before extraction without shifting known evidence", async () => {
   const f = historyFixture();
+  f.exchange.messages[0].data.future_metadata = {
+    nested: { content: "private-synthetic-event-metadata" },
+  };
   const fragments = f.exchange.messages[1].data.v.fragments;
   fragments.push(
     { type: "FUTURE", content: "private-synthetic-unknown" },
@@ -320,6 +335,11 @@ test("full capture persists omitted fragment fields before extraction without sh
     { type: "RESPONSE" },
   ]);
   assert.doesNotMatch(f.evidence.source_json, /private-synthetic/u);
+  assert.ok(
+    saved.source_redaction.omitted_paths.includes(
+      "/messages/0/data/future_metadata",
+    ),
+  );
   assert.ok(
     saved.source_redaction.omitted_paths.includes(
       "/messages/1/data/v/fragments/3/type",
