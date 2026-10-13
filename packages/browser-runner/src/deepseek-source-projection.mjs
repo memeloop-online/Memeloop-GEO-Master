@@ -73,13 +73,11 @@ const validFragment = (value) =>
     ));
 const pointer = (path, key) =>
   `${path}/${String(key).replace(/~/gu, "~0").replace(/\//gu, "~1")}`;
-const reject = () => {
-  throw new Error("source_privacy_unverified");
-};
 
 /**
  * Project one complete captured SSE exchange before persistence or AI input.
  * Null means its privacy shape is unsupported, never that it is clean.
+ * Optional onDiagnostic receives only a fixed rejection code, without context.
  *
  * Delta p/o inherit independently, initially ""/SET. Each BATCH has a fresh
  * child inheritance scope, while its siblings share that scope. Fragment array
@@ -89,7 +87,13 @@ const reject = () => {
  * such paths fail closed, including nested discriminator changes.
  * No accumulated response text or semantic measurement result is constructed.
  */
-export function projectDeepseekSource(exchange) {
+export function projectDeepseekSource(exchange, onDiagnostic) {
+  // Only locally selected codes escape this boundary, never exception details.
+  let rejectionCode = "shape_rejected";
+  const reject = (code = "shape_rejected") => {
+    rejectionCode = code;
+    throw new Error("source_privacy_unverified");
+  };
   try {
     if (
       !object(exchange) ||
@@ -97,7 +101,7 @@ export function projectDeepseekSource(exchange) {
       exchange.messages.length > 10_000 ||
       Buffer.byteLength(JSON.stringify(exchange.messages)) > 750_000
     )
-      return null;
+      reject();
     const omitted = [];
     let visited = 0;
     let types = null;
@@ -185,16 +189,17 @@ export function projectDeepseekSource(exchange) {
           },
         };
       }
-      if (parts[0] !== "response") reject();
+      if (parts[0] !== "response") reject("path_rejected");
       if (parts.length === 1) {
         if (operation !== "SET") reject();
         return { keep: true, value: response(value, at, depth) };
       }
-      if (!responseFields.has(parts[1])) reject();
+      if (!responseFields.has(parts[1])) reject("path_rejected");
       if (parts[1] !== "fragments") {
         // Complete metadata field replacement is independent of prior nested
         // privacy state. Incremental or nested metadata updates are unverified.
-        if (parts.length !== 2 || operation !== "SET") reject();
+        if (parts.length !== 2) reject("path_rejected");
+        if (operation !== "SET") reject();
         return { keep: true, value: clean(value, at, depth) };
       }
       if (parts.length === 2) {
@@ -207,9 +212,9 @@ export function projectDeepseekSource(exchange) {
         if (types.length > 10_000) reject();
         return { keep: true, value: result.value };
       }
-      if (types === null || !/^-?\d+$/u.test(parts[2])) reject();
+      if (types === null || !/^-?\d+$/u.test(parts[2])) reject("path_rejected");
       const number = Number(parts[2]);
-      if (!Number.isSafeInteger(number)) reject();
+      if (!Number.isSafeInteger(number)) reject("path_rejected");
       const index = number < 0 ? types.length + number : number;
       if (parts.length === 3) {
         if (operation === "APPEND") {
@@ -220,22 +225,22 @@ export function projectDeepseekSource(exchange) {
           if (types.length > 10_000) reject();
           return { keep: true, value: result.value };
         }
-        if (index < 0 || index > types.length) reject();
+        if (index < 0 || index > types.length) reject("path_rejected");
         if (!validFragment(value)) reject();
         types[index] = value.type;
         return { keep: true, value: clean(value, at, depth) };
       }
-      if (index < 0 || index >= types.length) reject();
+      if (index < 0 || index >= types.length) reject("path_rejected");
       // Changing a discriminator independently could reinterpret earlier
       // retained text. Such shapes need a new reviewed privacy contract.
-      if (parts[3] === "type") reject();
+      if (parts[3] === "type") reject("path_rejected");
       if (types[index] === "THINK") {
         omit(at);
         return { keep: false };
       }
+      if (parts.length !== 4 || !Object.hasOwn(fragmentFieldShape, parts[3]))
+        reject("path_rejected");
       if (
-        parts.length !== 4 ||
-        !Object.hasOwn(fragmentFieldShape, parts[3]) ||
         !fragmentFieldShape[parts[3]](value) ||
         (operation === "APPEND" &&
           (parts[3] === "status" ||
@@ -254,12 +259,9 @@ export function projectDeepseekSource(exchange) {
         reject();
       const path = data.p ?? scope.path;
       const operation = data.o ?? scope.operation;
-      if (
-        typeof path !== "string" ||
-        path.length > 2_048 ||
-        !["SET", "APPEND", "BATCH"].includes(operation)
-      )
-        reject();
+      if (typeof path !== "string" || path.length > 2_048)
+        reject("path_rejected");
+      if (!["SET", "APPEND", "BATCH"].includes(operation)) reject();
       scope.path = path;
       scope.operation = operation;
       const absolute = prefix ? `${prefix}/${path}` : path;
@@ -303,7 +305,7 @@ export function projectDeepseekSource(exchange) {
       if (typeof event !== "string") reject();
       const result = { ...message };
       if (Object.hasOwn(message, "id")) {
-        if (typeof message.id !== "string") reject();
+        if (typeof message.id !== "string") reject("identifier_rejected");
         // SSE transport IDs are not provider message IDs. Omit them entirely;
         // they cannot establish ownership or contribute to semantic evidence.
         delete result.id;
@@ -372,6 +374,11 @@ export function projectDeepseekSource(exchange) {
       },
     };
   } catch {
+    try {
+      onDiagnostic?.(rejectionCode);
+    } catch {
+      // Diagnostics must not change the privacy decision or null contract.
+    }
     return null;
   }
 }

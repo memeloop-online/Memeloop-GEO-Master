@@ -71,7 +71,10 @@ export async function observeDeepSeekWebSearch(
     capture = captureDeepSeekExchange,
     submitQuestion = submitDeepSeekQuestion,
     readHistory = readDeepSeekFirstTurnHistory,
-    prepareSource = projectDeepseekSource,
+    prepareSource = (exchange) =>
+      projectDeepseekSource(exchange, (code) =>
+        reportObservationDiagnostic(onDiagnostic, "capture", code),
+      ),
     interpret = interpretObservation,
   } = {},
 ) {

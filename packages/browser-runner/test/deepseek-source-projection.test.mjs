@@ -10,6 +10,60 @@ const answer = (content = "Public answer.") => ({ type: "RESPONSE", content });
 const think = (content = "private-thought") => ({ type: "THINK", content });
 const project = (...messages) => projectDeepseekSource({ messages });
 
+test("rejection diagnostics contain only fixed codes and cannot change null outcomes", () => {
+  const throwing = {
+    get messages() {
+      throw new Error("synthetic-private-exception");
+    },
+  };
+  for (const [input, code] of [
+    [null, "shape_rejected"],
+    [throwing, "shape_rejected"],
+    [{ messages: [{ event: "synthetic-private-event" }] }, "shape_rejected"],
+    [
+      {
+        messages: [
+          event({ p: "synthetic-private-path", v: "synthetic-private-value" }),
+        ],
+      },
+      "path_rejected",
+    ],
+    [
+      {
+        messages: [{ event: "finish", id: { secret: "synthetic-private-id" } }],
+      },
+      "identifier_rejected",
+    ],
+  ]) {
+    const diagnostics = [];
+    assert.equal(
+      projectDeepseekSource(input, (...args) => diagnostics.push(args)),
+      null,
+    );
+    assert.deepEqual(diagnostics, [[code]]);
+    assert.equal(
+      projectDeepseekSource(input, () => {
+        throw new Error("synthetic-private-callback");
+      }),
+      null,
+    );
+  }
+});
+
+test("valid projection and empty capture compatibility are unchanged with diagnostics", () => {
+  for (const input of [
+    { messages: [snapshot([answer(), think()])] },
+    { messages: [] },
+  ]) {
+    const diagnostics = [];
+    assert.deepEqual(
+      projectDeepseekSource(input, (code) => diagnostics.push(code)),
+      projectDeepseekSource(input),
+    );
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
 test("projects actual decoder transport IDs without interpreting auxiliary content", () => {
   const decoder = createDeepSeekEvidenceDecoder({ model: "test" });
   decoder.push(
