@@ -327,7 +327,7 @@ pub struct ObservationExtractionBackfillItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutomaticExtractionAdmission {
-    Intent(ObservationExtractionIntent),
+    Intent(Box<ObservationExtractionIntent>),
     DeferredManual,
     DeferredHistoryChanged,
 }
@@ -540,7 +540,9 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
             })
             .min_by_key(|stored| (stored.intent.created_at, stored.intent.intent_id))
         {
-            return Ok(AutomaticExtractionAdmission::Intent(stored.intent.clone()));
+            return Ok(AutomaticExtractionAdmission::Intent(Box::new(
+                stored.intent.clone(),
+            )));
         }
         if !expected_history.is_empty()
             && analyses
@@ -565,7 +567,7 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
                 claim_token: None,
             },
         );
-        Ok(AutomaticExtractionAdmission::Intent(intent))
+        Ok(AutomaticExtractionAdmission::Intent(Box::new(intent)))
     }
     async fn scan_unqueued_sources(
         &self,

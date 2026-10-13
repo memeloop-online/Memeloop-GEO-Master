@@ -149,7 +149,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         if let Some(row) = existing {
             let intent = decode(&row)?;
             tx.commit().await.map_err(db)?;
-            return Ok(AutomaticExtractionAdmission::Intent(intent));
+            return Ok(AutomaticExtractionAdmission::Intent(Box::new(intent)));
         }
         if !expected_history.is_empty()
             && crate::observation_analysis::history_snapshot(
@@ -183,7 +183,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
             .bind(intent.request.source_capture_id).bind(&intent.intent_key).bind(created_at).bind(value(&intent)?)
             .execute(&mut *tx).await.map_err(db)?;
         tx.commit().await.map_err(db)?;
-        Ok(AutomaticExtractionAdmission::Intent(intent))
+        Ok(AutomaticExtractionAdmission::Intent(Box::new(intent)))
     }
     async fn scan_unqueued_sources(
         &self,
