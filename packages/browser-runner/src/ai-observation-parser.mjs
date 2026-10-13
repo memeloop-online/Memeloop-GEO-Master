@@ -8,7 +8,7 @@ import {
   validateAiObservation,
 } from "./ai-observation-grounding.mjs";
 
-const PROMPT_VERSION = "geo.observation.extract.v2";
+const PROMPT_VERSION = "geo.observation.extract.v3";
 const MAX_INPUT_BYTES = 750_000;
 const MAX_OUTPUT_BYTES = 150_000;
 const MAX_CANDIDATE_BYTES = 150_000;

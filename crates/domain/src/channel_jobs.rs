@@ -479,7 +479,10 @@ fn semantic_search_projection_valid(proof: &serde_json::Value, outcome: &Channel
         Some("geo.measure.official_search.v4") => {
             event["source"] == "browser_response_ai"
                 && event["search_used"] == "yes"
-                && event["extraction_prompt_version"] == "geo.observation.extract.v2"
+                && matches!(
+                    event["extraction_prompt_version"].as_str(),
+                    Some("geo.observation.extract.v2" | "geo.observation.extract.v3")
+                )
         }
         _ => false,
     };
@@ -2666,6 +2669,36 @@ mod tests {
                 1,
                 "{schema}"
             );
+            if schema.ends_with("v4") {
+                let mut compact = semantic_attempts.clone();
+                let evidence = &mut compact.get_mut(&targets[0].target_id).unwrap()[0]
+                    .outcome
+                    .as_mut()
+                    .unwrap()
+                    .runner_evidence;
+                evidence[0]["search_event"]["extraction_prompt_version"] =
+                    serde_json::json!("geo.observation.extract.v3");
+                // Updating only the event must never borrow the old audit.
+                assert!(
+                    optimization_eligible_projection(&scope, &plan, &compact, now)
+                        .unwrap()
+                        .observations
+                        .is_empty()
+                );
+                compact.get_mut(&targets[0].target_id).unwrap()[0]
+                    .outcome
+                    .as_mut()
+                    .unwrap()
+                    .runner_evidence[1]["prompt_version"] =
+                    serde_json::json!("geo.observation.extract.v3");
+                assert_eq!(
+                    optimization_eligible_projection(&scope, &plan, &compact, now)
+                        .unwrap()
+                        .observations
+                        .len(),
+                    1
+                );
+            }
             let mut mutations = vec![
                 ("request_model", "different"),
                 ("request_question_sha256", "different"),

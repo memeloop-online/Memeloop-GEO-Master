@@ -871,7 +871,7 @@ test("browser extraction succeeds first without API and records a document-bound
   assert.equal(result.audit.surface, "consumer_web");
   assert.equal(result.audit.kind, "observation_extraction");
   assert.equal(result.audit.method, "llm_grounded");
-  assert.equal(result.audit.prompt_version, "geo.observation.extract.v2");
+  assert.equal(result.audit.prompt_version, "geo.observation.extract.v3");
   assert.deepEqual(result.audit.attempts, [
     {
       route: "signed_in_browser",

@@ -143,10 +143,13 @@ before(async () => {
       interpretationCalls.push({ path: request.url, body });
       assert.deepEqual(Object.keys(body).sort(), [
         "capture_ticket",
+        ...(request.url.endsWith("/extract") ? ["prompt_version"] : []),
         "schema_version",
         "source_capture_id",
         "source_sha256",
       ]);
+      if (request.url.endsWith("/extract"))
+        assert.equal(body.prompt_version, "geo.observation.extract.v3");
       assert.equal(
         body.source_capture_id,
         "88888888-8888-4888-8888-888888888888",
