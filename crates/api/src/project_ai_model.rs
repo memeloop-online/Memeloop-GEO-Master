@@ -33,10 +33,8 @@ impl ProjectConfiguredModelBridge<HttpTransport> {
             Err(std::env::VarError::NotUnicode(_)) => return Err(invalid_observation_timeout()),
         };
         let observation_timeout = observation_timeout(configured.as_deref())?;
-        Ok(
-            Self::with_transport(settings, inherited, Arc::new(HttpTransport::public_only()?))
-                .with_observation_timeout(observation_timeout)?,
-        )
+        Self::with_transport(settings, inherited, Arc::new(HttpTransport::public_only()?))
+            .with_observation_timeout(observation_timeout)
     }
 }
 
