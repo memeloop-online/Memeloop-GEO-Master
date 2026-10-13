@@ -713,24 +713,25 @@ async fn browser_ai_search_requires_yes_and_bound_audit_without_provider_ids() {
         (
             "geo.observation.extract.v3",
             "geo.observation.extract.v2",
-            ChannelOutcomeStatus::Unknown,
+            ChannelOutcomeStatus::Missing,
         ),
         (
             "geo.observation.extract.v2",
             "geo.observation.extract.v3",
-            ChannelOutcomeStatus::Unknown,
+            ChannelOutcomeStatus::Missing,
         ),
         (
             "geo.observation.extract.v4",
             "geo.observation.extract.v4",
-            ChannelOutcomeStatus::Unknown,
+            ChannelOutcomeStatus::Missing,
         ),
     ] {
         assert_eq!(
             run(Receipt::AiBrowserVersions(event_version, audit_version))
                 .await
                 .status,
-            expected
+            expected,
+            "event {event_version}, audit {audit_version}"
         );
     }
     let outcome = run(Receipt::AiBrowser).await;
