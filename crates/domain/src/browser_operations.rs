@@ -35,6 +35,7 @@ pub enum BrowserOperationPurpose {
     Publish,
     Lookup,
     Cleanup,
+    CompletionRecovery,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BrowserOperationState {

@@ -3,12 +3,14 @@ use geo_domain::{
     CapturedConversation, CapturedConversationPurpose, ChannelJobRepository, ChannelTarget,
     ChannelTargetInput, ConversationCorrelation, ErrorCode, ObservationCaptureInput,
     ObservationCaptureRepository, ObservationCaptureSnapshot, ObservationCompletionRecoveryInput,
+    ObservationCompletionRecoveryJobOutcome, ObservationCompletionRecoveryJobRepository,
     ObservationCompletionRecoveryRepository, ObservationProviderIdentity,
     ProviderConversationCleanupRepository, StandaloneMeasurementPlan, TenantScope, sha256_hex,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgChannelJobRepository, PgObservationCaptureRepository,
-    PgObservationCompletionRecoveryRepository, PgProviderConversationCleanupRepository,
+    PgObservationCompletionRecoveryJobRepository, PgObservationCompletionRecoveryRepository,
+    PgProviderConversationCleanupRepository,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -148,6 +150,167 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
     };
     let captures = PgObservationCaptureRepository::from_database(&database);
     let original_receipt = captures.save(&scope, original.clone()).await.unwrap();
+    let jobs = PgObservationCompletionRecoveryJobRepository::from_database(&database);
+    assert!(jobs.scan_unqueued(Utc::now(), None, 0).await.is_err());
+    assert!(jobs.scan_due(Utc::now(), None, 101).await.is_err());
+    let as_of = Utc::now();
+    let mut cursor = None;
+    let mut found = false;
+    loop {
+        let page = jobs.scan_unqueued(as_of, cursor, 2).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        for item in &page {
+            assert!(cursor.is_none_or(|cursor| item.capture_id > cursor));
+            if item.capture_id == original.capture_id {
+                assert_eq!(item.scope, scope);
+                found = true;
+            }
+        }
+        cursor = page.last().map(|item| item.capture_id);
+    }
+    assert!(found);
+    let (first, second) = tokio::join!(
+        jobs.enqueue(&scope, original.capture_id),
+        jobs.enqueue(&scope, original.capture_id)
+    );
+    let job_id = first.unwrap();
+    assert_eq!(job_id, second.unwrap());
+    let due_as_of = Utc::now();
+    let mut due_cursor = None;
+    let mut due_found = false;
+    loop {
+        let page = jobs.scan_due(due_as_of, due_cursor, 2).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        due_found |= page
+            .iter()
+            .any(|item| item.job_id == job_id && item.scope == scope);
+        assert!(
+            page.iter()
+                .all(|item| due_cursor.is_none_or(|id| item.job_id > id))
+        );
+        due_cursor = page.last().map(|item| item.job_id);
+    }
+    assert!(due_found);
+    let wrong_scope = TenantScope::new(operator.into(), tenant.into(), Some(other_project.into()));
+    assert!(
+        jobs.enqueue(&wrong_scope, original.capture_id)
+            .await
+            .is_err()
+    );
+    assert!(jobs.claim(&wrong_scope, job_id).await.unwrap().is_none());
+    let (first, second) = tokio::join!(jobs.claim(&scope, job_id), jobs.claim(&scope, job_id));
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first.is_some(), second.is_some());
+    let recovery_claim = first.or(second).unwrap();
+    assert_eq!(recovery_claim.original.input, original);
+    assert_eq!(recovery_claim.request_binding.request_message_id, "1");
+    assert_eq!(recovery_claim.request_binding.response_message_id, "2");
+    assert!(
+        jobs.finish(
+            &scope,
+            job_id,
+            recovery_claim.lease_id,
+            ObservationCompletionRecoveryJobOutcome::Recovered
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        jobs.finish(
+            &wrong_scope,
+            job_id,
+            recovery_claim.lease_id,
+            ObservationCompletionRecoveryJobOutcome::Retry
+        )
+        .await
+        .is_err()
+    );
+    jobs.finish(
+        &scope,
+        job_id,
+        recovery_claim.lease_id,
+        ObservationCompletionRecoveryJobOutcome::Retry,
+    )
+    .await
+    .unwrap();
+    assert!(jobs.claim(&scope, job_id).await.unwrap().is_none());
+    sqlx::query(
+        "UPDATE observation_completion_recovery_jobs SET next_attempt_at=now() WHERE job_id=$1",
+    )
+    .bind(job_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let restarted_jobs = PgObservationCompletionRecoveryJobRepository::from_database(&database);
+    let renewed = restarted_jobs.claim(&scope, job_id).await.unwrap().unwrap();
+    assert_eq!(renewed.original, recovery_claim.original);
+    assert_eq!(renewed.request_binding, recovery_claim.request_binding);
+    assert_ne!(renewed.lease_id, recovery_claim.lease_id);
+    assert!(
+        jobs.finish(
+            &scope,
+            job_id,
+            recovery_claim.lease_id,
+            ObservationCompletionRecoveryJobOutcome::Retained
+        )
+        .await
+        .is_err()
+    );
+    jobs.finish(
+        &scope,
+        job_id,
+        renewed.lease_id,
+        ObservationCompletionRecoveryJobOutcome::NeedsLogin,
+    )
+    .await
+    .unwrap();
+    let login_delay: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM next_attempt_at-updated_at)::double precision \
+         FROM observation_completion_recovery_jobs WHERE job_id=$1",
+    )
+    .bind(job_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!((899.0..=3601.0).contains(&login_delay));
+    sqlx::query(
+        "UPDATE observation_completion_recovery_jobs SET next_attempt_at=now() WHERE job_id=$1",
+    )
+    .bind(job_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let renewed = restarted_jobs.claim(&scope, job_id).await.unwrap().unwrap();
+    // Expiration only permits another read-only claim; no browser/account state
+    // is touched. Late outcomes from the expired execution are fenced.
+    sqlx::query("UPDATE observation_completion_recovery_jobs SET lease_until=now()-interval '1 second' WHERE job_id=$1")
+        .bind(job_id).execute(database.pool()).await.unwrap();
+    let recovery_claim = restarted_jobs.claim(&scope, job_id).await.unwrap().unwrap();
+    assert!(
+        jobs.finish(
+            &scope,
+            job_id,
+            renewed.lease_id,
+            ObservationCompletionRecoveryJobOutcome::Retry
+        )
+        .await
+        .is_err()
+    );
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM observation_completion_recovery_job_attempts WHERE job_id=$1",
+    )
+    .bind(job_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 7);
+    assert!(sqlx::query("UPDATE observation_completion_recovery_job_attempts SET event='retained' WHERE job_id=$1")
+        .bind(job_id).execute(database.pool()).await.is_err());
     let input = ObservationCompletionRecoveryInput {
         recovery_id: Uuid::new_v4(),
         scope: scope.clone(),
@@ -190,6 +353,28 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
             .is_err()
     );
     let receipt = store.save(&scope, input.clone()).await.unwrap();
+    jobs.finish(
+        &scope,
+        job_id,
+        recovery_claim.lease_id,
+        ObservationCompletionRecoveryJobOutcome::Recovered,
+    )
+    .await
+    .unwrap();
+    assert!(jobs.claim(&scope, job_id).await.unwrap().is_none());
+    assert_eq!(
+        jobs.enqueue(&scope, original.capture_id).await.unwrap(),
+        job_id
+    );
+    assert_eq!(
+        captures
+            .get(&scope, original.capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .input,
+        original
+    );
     assert_eq!(
         store
             .get_by_source(&scope, original.capture_id)
@@ -401,4 +586,52 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
     assert_eq!(unchanged.input, original);
     assert_eq!(unchanged.receipt, original_receipt);
     assert!(!unchanged.has_complete_conversation_evidence(&scope));
+    // Missing immutable prerequisites are remembered once as retained and
+    // cannot enter a restore/retry loop, even after repository restart.
+    for missing_identity in [false, true] {
+        let mut ineligible = original.clone();
+        ineligible.capture_id = Uuid::new_v4();
+        ineligible.runner_session_id = Uuid::new_v4();
+        if missing_identity {
+            ineligible.original_identity = None;
+        } else {
+            let mut source: serde_json::Value = serde_json::from_str(&source_json).unwrap();
+            source["messages"].as_array_mut().unwrap().remove(0);
+            let source_json = source.to_string();
+            ineligible.snapshot = ObservationCaptureSnapshot::Source {
+                source_sha256: sha256_hex(source_json.as_bytes()),
+                source_json,
+            };
+        }
+        captures.save(&scope, ineligible.clone()).await.unwrap();
+        let retained = jobs.enqueue(&scope, ineligible.capture_id).await.unwrap();
+        assert_eq!(
+            jobs.enqueue(&scope, ineligible.capture_id).await.unwrap(),
+            retained
+        );
+        assert!(
+            restarted_jobs
+                .claim(&scope, retained)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM observation_completion_recovery_jobs WHERE job_id=$1",
+        )
+        .bind(retained)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "retained");
+        assert_eq!(
+            captures
+                .get(&scope, ineligible.capture_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .input,
+            ineligible
+        );
+    }
 }

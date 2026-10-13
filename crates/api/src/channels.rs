@@ -625,13 +625,14 @@ impl ChannelService {
         session_id: Uuid,
         original_session_id: Uuid,
     ) -> Result<(), AppError> {
-        self.resume_provider_cleanup_browser_inner(
+        self.resume_owned_conversation_browser(
             scope,
             account_id,
             identity,
             session_id,
             None,
             original_session_id,
+            geo_domain::BrowserOperationPurpose::Cleanup,
         )
         .await
     }
@@ -645,19 +646,42 @@ impl ChannelService {
         reservation_id: Uuid,
         original_session_id: Uuid,
     ) -> Result<(), AppError> {
-        self.resume_provider_cleanup_browser_inner(
+        self.resume_owned_conversation_browser(
             scope,
             account_id,
             identity,
             session_id,
             Some(reservation_id),
             original_session_id,
+            geo_domain::BrowserOperationPurpose::Cleanup,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn resume_provider_cleanup_browser_inner(
+    pub(crate) async fn resume_completion_recovery_browser_reserved(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        identity: &geo_domain::ObservationProviderIdentity,
+        session_id: Uuid,
+        reservation_id: Uuid,
+        original_session_id: Uuid,
+    ) -> Result<(), AppError> {
+        self.resume_owned_conversation_browser(
+            scope,
+            account_id,
+            identity,
+            session_id,
+            Some(reservation_id),
+            original_session_id,
+            geo_domain::BrowserOperationPurpose::CompletionRecovery,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_owned_conversation_browser(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
@@ -665,6 +689,7 @@ impl ChannelService {
         session_id: Uuid,
         reservation_id: Option<Uuid>,
         original_session_id: Uuid,
+        purpose: geo_domain::BrowserOperationPurpose,
     ) -> Result<(), AppError> {
         identity.validate()?;
         let current = self
@@ -673,7 +698,9 @@ impl ChannelService {
         if current.platform != identity.provider
             || current.platform_account_id != identity.platform_account_id
         {
-            return Err(AppError::conflict("cleanup browser identity has changed"));
+            return Err(AppError::conflict(
+                "historical browser identity has changed",
+            ));
         }
         let original = self
             .operations()?
@@ -682,13 +709,13 @@ impl ChannelService {
                 original_session_id,
             )
             .await?
-            .ok_or_else(|| AppError::conflict("original cleanup network is unavailable"))?;
+            .ok_or_else(|| AppError::conflict("original conversation network is unavailable"))?;
         if original.account_id != account_id
             || original.session_id != original_session_id
             || original.purpose != geo_domain::BrowserOperationPurpose::Measure
         {
             return Err(AppError::conflict(
-                "original cleanup network is unavailable",
+                "original conversation network is unavailable",
             ));
         }
         let network = match (&original.network_scope, original.network_binding_id) {
@@ -700,7 +727,9 @@ impl ChannelService {
                         current.owner_kind,
                     )
                 {
-                    return Err(AppError::conflict("original cleanup network scope differs"));
+                    return Err(AppError::conflict(
+                        "original conversation network scope differs",
+                    ));
                 }
                 crate::historical_browser_operations::HistoricalBrowserNetwork::Binding {
                     scope: network_scope.clone(),
@@ -712,7 +741,7 @@ impl ChannelService {
             ),
             _ => {
                 return Err(AppError::conflict(
-                    "original cleanup network is unavailable",
+                    "original conversation network is unavailable",
                 ));
             }
         };
@@ -720,7 +749,7 @@ impl ChannelService {
             scope,
             account_id,
             session_id,
-            geo_domain::BrowserOperationPurpose::Cleanup,
+            purpose,
             reservation_id,
             &current.platform,
             &current.storage_state,

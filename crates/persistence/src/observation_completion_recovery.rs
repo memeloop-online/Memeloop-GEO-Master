@@ -38,7 +38,7 @@ fn project(scope: &TenantScope) -> Result<Uuid, AppError> {
         .ok_or_else(|| AppError::forbidden("project scope required"))
 }
 
-async fn source(
+pub(crate) async fn source(
     tx: &mut Transaction<'_, Postgres>,
     scope: &TenantScope,
     capture_id: Uuid,

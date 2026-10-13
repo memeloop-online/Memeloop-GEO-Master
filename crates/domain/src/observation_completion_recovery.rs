@@ -345,6 +345,12 @@ mod tests {
     fn completion_recovery_is_replayable_without_mutating_original_or_authorizing_delete() {
         let (scope, original, recovery) = fixture();
         let before = original.clone();
+        let binding = original.recovery_request_binding(&scope).unwrap();
+        assert_eq!(binding.provider, "deepseek");
+        assert_eq!(binding.platform_account_id, "synthetic-account");
+        assert_eq!(binding.external_conversation_id, "synthetic-chat");
+        assert_eq!(binding.request_message_id, "1");
+        assert_eq!(binding.response_message_id, "2");
         let validated = recovery.validate(&scope, &original).unwrap();
         assert_eq!(validated, recovery.validate(&scope, &original).unwrap());
         assert_eq!(validated.completion().assistant_message_ids, ["2"]);
@@ -438,6 +444,10 @@ mod tests {
                 _ => invalid.input.original_identity = None,
             }
             assert!(recovery.validate(&scope, &invalid).is_err(), "{change}");
+            assert!(
+                invalid.recovery_request_binding(&scope).is_err(),
+                "{change}"
+            );
         }
         let mut missing_identity = original.clone();
         missing_identity.input.original_identity = None;
@@ -445,6 +455,7 @@ mod tests {
         let mut rebound = recovery;
         rebound.source_receipt_sha256 = missing_identity.receipt.digest_sha256.clone();
         assert!(rebound.validate(&scope, &missing_identity).is_err());
+        assert!(missing_identity.recovery_request_binding(&scope).is_err());
     }
 
     #[test]
@@ -480,6 +491,22 @@ mod tests {
             }
             replace_source(&scope, &mut original, &mut recovery, source);
             assert!(recovery.validate(&scope, &original).is_err(), "{change}");
+            if change == 5 {
+                // Original transport is authoritative for scheduling; the
+                // later history must match these IDs, not old fixture IDs.
+                assert_eq!(
+                    original
+                        .recovery_request_binding(&scope)
+                        .unwrap()
+                        .request_message_id,
+                    "3"
+                );
+            } else {
+                assert!(
+                    original.recovery_request_binding(&scope).is_err(),
+                    "{change}"
+                );
+            }
         }
     }
 
@@ -529,8 +556,10 @@ mod tests {
         });
         replace_source(&scope, &mut original, &mut recovery, source.clone());
         assert!(recovery.validate(&scope, &original).is_ok());
+        assert!(original.recovery_request_binding(&scope).is_ok());
         source["source_redaction"]["omitted_paths"] = json!([]);
         replace_source(&scope, &mut original, &mut recovery, source);
         assert!(recovery.validate(&scope, &original).is_err());
+        assert!(original.recovery_request_binding(&scope).is_err());
     }
 }

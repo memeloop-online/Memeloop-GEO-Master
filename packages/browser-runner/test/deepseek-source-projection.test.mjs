@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { projectDeepseekSource } from "../src/deepseek-source-projection.mjs";
+import { createDeepSeekEvidenceDecoder } from "../src/deepseek-web-measurement.mjs";
 
 const event = (data) => ({ event: "message", data });
 const snapshot = (fragments) =>
@@ -8,6 +9,77 @@ const snapshot = (fragments) =>
 const answer = (content = "Public answer.") => ({ type: "RESPONSE", content });
 const think = (content = "private-thought") => ({ type: "THINK", content });
 const project = (...messages) => projectDeepseekSource({ messages });
+
+test("projects actual decoder transport IDs without interpreting auxiliary content", () => {
+  const decoder = createDeepSeekEvidenceDecoder({ model: "test" });
+  decoder.push(
+    Buffer.from(
+      "id: synthetic-transport\n" +
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n' +
+        'event: debug\ndata: {"opaque":"synthetic-private-value"}\n\n',
+    ),
+  );
+  assert.throws(() => decoder.finish());
+  const source = projectDeepseekSource(decoder.snapshot());
+  assert.ok(source);
+  assert.equal(source.exchange.sse_terminal, false);
+  assert.deepEqual(source.exchange.messages, [
+    { event: "ready", data: { request_message_id: 1, response_message_id: 2 } },
+    { event: "debug" },
+  ]);
+  assert.deepEqual(source.redaction.omitted_paths, [
+    "/messages/0/id",
+    "/messages/1/data",
+  ]);
+});
+
+test("omits transport IDs and opaque auxiliary payloads without changing delta state", () => {
+  const input = [
+    snapshot([answer("First")]),
+    event({ p: "response/fragments/0/content", o: "APPEND", v: " second" }),
+    ...["debug", "update_parent_message", "update_file"].map((name) => ({
+      event: name,
+      id: "synthetic-private-transport-id",
+      data: {
+        signed_path: "synthetic-private-path",
+        chat_message: { type: "THINK", content: "synthetic-private-thought" },
+      },
+    })),
+    { ...event({ v: " third" }), id: "synthetic-id" },
+  ];
+  const before = structuredClone(input);
+  const source = project(...input);
+  assert.ok(source);
+  assert.deepEqual(source.exchange.messages.slice(0, 2), input.slice(0, 2));
+  assert.deepEqual(source.exchange.messages.slice(2, 5), [
+    { event: "debug" },
+    { event: "update_parent_message" },
+    { event: "update_file" },
+  ]);
+  assert.deepEqual(source.exchange.messages[5], event({ v: " third" }));
+  assert.deepEqual(source.redaction.omitted_paths, [
+    "/messages/2/id",
+    "/messages/2/data",
+    "/messages/3/id",
+    "/messages/3/data",
+    "/messages/4/id",
+    "/messages/4/data",
+    "/messages/5/id",
+  ]);
+  assert.equal(JSON.stringify(source).includes("synthetic-private"), false);
+  assert.deepEqual(input, before);
+});
+
+test("auxiliary omission does not accept unknown events, fields, or opaque wire data", () => {
+  for (const message of [
+    { event: "unknown", data: {} },
+    { event: "debug", data: {}, extra: "private" },
+    { event: "debug", raw_data: "private" },
+    { event: "debug", data: {}, id: {} },
+  ]) {
+    assert.equal(project(message), null);
+  }
+});
 
 test("retains answer and search raw fields without semantic extraction", () => {
   const messages = [
@@ -378,7 +450,7 @@ for (const [name, messages] of [
   ["unsupported operation", [event({ p: "response", o: "MERGE", v: {} })]],
   ["unknown root path", [event({ p: "future", v: "unknown" })]],
   ["unknown response field", [event({ p: "response/future", v: "unknown" })]],
-  ["unknown event", [{ event: "debug", data: { content: "unknown" } }]],
+  ["unknown event", [{ event: "unrecognized", data: { content: "unknown" } }]],
   ["opaque delta", [{ event: "message", raw_data: "unknown" }]],
   ["malformed batch", [event({ o: "BATCH", v: {} })]],
   [
