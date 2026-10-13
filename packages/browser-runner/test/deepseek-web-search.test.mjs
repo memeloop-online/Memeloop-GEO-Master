@@ -635,6 +635,73 @@ test("source checkpoint must resolve before extraction, and unsafe source cannot
   assert.equal(unsafe.calls.filter((call) => call === "send").length, 1);
 });
 
+test("default projection reports fixed capture diagnostics for full and partial sources", async () => {
+  for (const partial of [false, true]) {
+    for (const throws of [false, true]) {
+      const f = fixture();
+      const diagnostics = [];
+      delete f.options.prepareSource;
+      f.options.onDiagnostic = (record) => {
+        diagnostics.push(record);
+        if (throws) throw new Error("synthetic-private-callback");
+      };
+      const unsafe = {
+        ...source,
+        messages: [
+          {
+            event: "message",
+            data: {
+              p: "response",
+              v: { "synthetic-private-key": "synthetic-private-value" },
+            },
+          },
+        ],
+      };
+      f.options.capture = async (_page, options) => {
+        await options.submit(f.page, options.signal);
+        if (partial) await options.onPartialCapture(unsafe);
+        return unsafe;
+      };
+      const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+      assert.equal(result.reason, "source_privacy_unverified");
+      assert.deepEqual(diagnostics[0], {
+        kind: "observation_diagnostic",
+        schema_version: "geo.observation.diagnostic.v1",
+        stage: "capture",
+        code: "source_response_rejected",
+      });
+      assert.equal(
+        JSON.stringify(diagnostics).includes("synthetic-private"),
+        false,
+      );
+      assert.equal(f.calls.includes("source"), false);
+      assert.equal(f.calls.includes("ownership"), false);
+      assert.equal(f.calls.includes("extract"), false);
+      assert.equal(f.calls.filter((call) => call === "send").length, 1);
+    }
+  }
+});
+
+test("injected source preparation retains its one-argument API without default diagnostics", async () => {
+  const f = fixture();
+  const original = f.options.prepareSource;
+  const diagnostics = [];
+  let prepared = 0;
+  f.options.prepareSource = (...args) => {
+    assert.deepEqual(args, [source]);
+    prepared++;
+    return original(...args);
+  };
+  f.options.onDiagnostic = (record) => diagnostics.push(record);
+  const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+  assert.equal(result.raw_answer, "Synthetic answer.");
+  assert.equal(prepared, 1);
+  assert.equal(
+    diagnostics.some((record) => record.stage === "capture"),
+    false,
+  );
+});
+
 test("a hanging ownership hook leaves time for source persistence", async () => {
   const f = fixture();
   f.options.persistConversation = () => new Promise(() => {});
