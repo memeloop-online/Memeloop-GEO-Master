@@ -3,6 +3,7 @@ import test from "node:test";
 import { projectDeepseekSource } from "../src/deepseek-source-projection.mjs";
 import { createDeepSeekEvidenceDecoder } from "../src/deepseek-web-measurement.mjs";
 import { reportObservationDiagnostic } from "../src/ai-observation-parser.mjs";
+import { sourceRedaction } from "../src/observation-source-redaction.mjs";
 
 const event = (data) => ({ event: "message", data });
 const snapshot = (fragments) =>
@@ -64,7 +65,7 @@ test("structural rejection categories cross only the closed diagnostic wire", ()
       [
         event({
           p: "response",
-          v: { "synthetic-private-key": "synthetic-private-value" },
+          v: "synthetic-private-value",
         }),
       ],
       "source_response_rejected",
@@ -141,6 +142,97 @@ test("structural rejection categories cross only the closed diagnostic wire", ()
       `${code}:synthetic-private-detail`,
     );
     assert.equal(diagnostics.length, 1);
+  }
+});
+
+test("omits unknown response snapshot fields wholly with valid exact pointers", () => {
+  for (const root of [true, false]) {
+    const response = {
+      status: "WIP",
+      message_id: 2,
+      future_metadata: {
+        public_looking: "synthetic-private-value",
+        credentials: { token: "synthetic-private-token" },
+        nested: { type: "THINK", novel: "synthetic-private-thought" },
+        fragments: [{ type: "UNREVIEWED", content: {} }],
+      },
+      "future/~metadata": "synthetic-private-string",
+      authorization: "synthetic-private-authorization",
+      reasoning_content: "synthetic-private-reasoning",
+      fragments: [answer(), think("synthetic-private-fragment")],
+      feedback: { status: "known", email: "synthetic-private-email" },
+    };
+    const input = {
+      messages: [
+        root
+          ? event({ v: { response } })
+          : event({ p: "response", v: response }),
+        event({ p: "response/fragments/0/content", o: "APPEND", v: " More." }),
+        event({ v: " Again." }),
+        event({
+          p: "response/fragments/1/content",
+          v: "synthetic-private-delta",
+        }),
+        event({ v: "synthetic-private-inherited" }),
+      ],
+    };
+    const before = structuredClone(input);
+    const diagnostics = [];
+    const source = projectDeepseekSource(input, (code) =>
+      diagnostics.push(code),
+    );
+    assert.ok(source);
+    const at = `/messages/0/data/v${root ? "/response" : ""}`;
+    const projected = source.exchange.messages[0].data.v;
+    assert.deepEqual(root ? projected.response : projected, {
+      status: "WIP",
+      message_id: 2,
+      fragments: [answer(), { type: "THINK" }],
+      feedback: { status: "known" },
+    });
+    assert.deepEqual(
+      source.exchange.messages.slice(1, 3),
+      input.messages.slice(1, 3),
+    );
+    assert.deepEqual(source.exchange.messages[3].data, {
+      p: "response/fragments/1/content",
+    });
+    assert.deepEqual(source.exchange.messages[4].data, {});
+    assert.deepEqual(source.redaction.omitted_paths, [
+      `${at}/future_metadata`,
+      `${at}/future~1~0metadata`,
+      `${at}/fragments/1/content`,
+      `${at}/authorization`,
+      `${at}/reasoning_content`,
+      `${at}/feedback/email`,
+      "/messages/3/data/v",
+      "/messages/4/data/v",
+    ]);
+    assert.deepEqual(
+      sourceRedaction(source.redaction, source.exchange),
+      source.redaction,
+    );
+    assert.doesNotMatch(JSON.stringify(source), /synthetic-private/u);
+    assert.deepEqual(diagnostics, []);
+    assert.deepEqual(input, before);
+  }
+});
+
+test("nonobject response snapshots retain the fixed rejection diagnostic", () => {
+  for (const value of [null, [], "synthetic-private-value", 1, true]) {
+    for (const message of [
+      event({ v: { response: value } }),
+      event({ p: "response", v: value }),
+    ]) {
+      const diagnostics = [];
+      assert.equal(
+        projectDeepseekSource({ messages: [message] }, (code) =>
+          diagnostics.push(code),
+        ),
+        null,
+      );
+      assert.deepEqual(diagnostics, ["source_response_rejected"]);
+    }
   }
 });
 

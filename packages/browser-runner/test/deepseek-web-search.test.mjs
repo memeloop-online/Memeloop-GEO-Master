@@ -233,6 +233,13 @@ test("partial capture persists privacy-projected source without interpretation, 
                   { type: "THINK", content: "Private synthetic thought" },
                 ],
                 access_token: "private-synthetic-token",
+                future_metadata: {
+                  nested: {
+                    type: "THINK",
+                    content: "private-synthetic-metadata",
+                  },
+                  credentials: "private-synthetic-credentials",
+                },
               },
             },
           },
@@ -265,6 +272,13 @@ test("partial capture persists privacy-projected source without interpretation, 
     assert.ok(record.source_json.includes("Synthetic partial answer"));
     assert.ok(!record.source_json.includes("Private synthetic thought"));
     assert.ok(!record.source_json.includes("private-synthetic-token"));
+    assert.ok(!record.source_json.includes("private-synthetic-metadata"));
+    assert.ok(!record.source_json.includes("private-synthetic-credentials"));
+    assert.ok(
+      JSON.parse(record.source_json).source_redaction.omitted_paths.includes(
+        "/messages/1/data/v/future_metadata",
+      ),
+    );
     assert.equal(JSON.parse(record.source_json).ownership, undefined);
     assert.equal(f.calls.filter((call) => call === "send").length, 1);
     assert.ok(!f.calls.includes("extract"));
@@ -652,7 +666,7 @@ test("default projection reports fixed capture diagnostics for full and partial 
             event: "message",
             data: {
               p: "response",
-              v: { "synthetic-private-key": "synthetic-private-value" },
+              v: "synthetic-private-value",
             },
           },
         ],
@@ -847,6 +861,13 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
           },
         ],
         status: "FINISHED",
+        future_metadata: {
+          content: "Synthetic private metadata must not persist.",
+          nested: {
+            type: "THINK",
+            content: "Synthetic private nested metadata",
+          },
+        },
       },
     }) +
     "event: finish\ndata: [DONE]\n\n";
@@ -1079,6 +1100,19 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
     assert.equal(
       JSON.stringify(savedSource).includes("Synthetic private reasoning"),
       false,
+    );
+    assert.equal(
+      JSON.stringify(savedSource).includes("Synthetic private metadata"),
+      false,
+    );
+    assert.equal(
+      JSON.stringify(savedSource).includes("Synthetic private nested metadata"),
+      false,
+    );
+    assert.ok(
+      result.source_redaction.omitted_paths.includes(
+        "/messages/1/data/v/future_metadata",
+      ),
     );
     assert.ok(result.source_redaction.omitted_paths.length > 0);
     assert.deepEqual(savedSource.source_redaction, result.source_redaction);

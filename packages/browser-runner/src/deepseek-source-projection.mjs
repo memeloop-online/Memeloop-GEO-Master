@@ -148,13 +148,18 @@ export function projectDeepseekSource(exchange, onDiagnostic) {
     };
     const response = (value, path, depth) => {
       if (!object(value)) reject("source_response_rejected");
+      // Unknown snapshot metadata is conservatively private. Omit the whole
+      // value without interpreting it; field-path deltas remain fail-closed.
+      const retained = [];
       for (const key of Object.keys(value))
         if (
           !responseFields.has(key) &&
           !privateKey.test(key) &&
           !reasoningKey.test(key)
         )
-          reject("source_response_rejected");
+          omit(pointer(path, key));
+        else retained.push([key, value[key]]);
+      value = Object.fromEntries(retained);
       // Snapshots reset the type index; absence cannot inherit old fragments.
       types = null;
       if (Object.hasOwn(value, "fragments")) {

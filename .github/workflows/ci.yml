@@ -306,6 +306,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node for private local workspace checks
         uses: actions/setup-node@v4
@@ -316,13 +318,36 @@ jobs:
         shell: pwsh
         run: node --test scripts/local-workspace.test.mjs
 
+      - name: Test native scope classification
+        shell: pwsh
+        run: node --test scripts/ci-native-scope.test.mjs
+
+      - name: Determine Windows native scope
+        id: native-scope
+        shell: pwsh
+        run: node scripts/ci-native-scope.mjs
+
+      - name: Summarize non-native pull request checks
+        if: steps.native-scope.outputs.required == 'false'
+        shell: pwsh
+        run: |
+          @"
+          ## Windows native scope
+
+          - Scope classification and local workspace tests passed.
+          - The entire pull request changes only allowlisted browser JavaScript or Markdown documentation.
+          - Windows Rust/V8 setup, build, tests, and native artifacts were skipped; Linux checks remain unchanged.
+          "@ | Add-Content $env:GITHUB_STEP_SUMMARY
+
       - name: Set up Rust
+        if: steps.native-scope.outputs.required == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           target: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
       - name: Cache Cargo and rusty_v8
+        if: steps.native-scope.outputs.required == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -335,6 +360,7 @@ jobs:
             ${{ runner.os }}-msvc-cargo-
 
       - name: Download pinned rusty_v8 archive and metadata
+        if: steps.native-scope.outputs.required == 'true'
         id: collect-v8
         shell: pwsh
         run: |
@@ -390,6 +416,7 @@ jobs:
           $releaseUrl | Set-Content (Join-Path $artifactDirectory "source-url.txt")
 
       - name: Verify collected artifact restores into a clean Cargo cache
+        if: steps.native-scope.outputs.required == 'true'
         id: verify-v8
         shell: pwsh
         run: |
@@ -411,15 +438,17 @@ jobs:
             -CargoHome $cargoHome
 
       - name: Build Rust workspace
+        if: steps.native-scope.outputs.required == 'true'
         shell: pwsh
         run: cargo build --workspace --target x86_64-pc-windows-msvc
 
       - name: Test Rust workspace
+        if: steps.native-scope.outputs.required == 'true'
         shell: pwsh
         run: cargo test --workspace --all-targets --target x86_64-pc-windows-msvc
 
       - name: Write 5-minute milestone summary
-        if: always()
+        if: ${{ success() && steps.native-scope.outputs.required == 'true' }}
         shell: pwsh
         run: |
           @"
