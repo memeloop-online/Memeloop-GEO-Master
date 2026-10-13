@@ -385,6 +385,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ObservationExtractionRepository for LostCheckpointAck {
+        async fn scan_unqueued_sources(
+            &self,
+            at: chrono::DateTime<Utc>,
+            after: Option<Uuid>,
+            limit: usize,
+        ) -> Result<Vec<geo_domain::ObservationExtractionBackfillItem>, AppError> {
+            self.inner.scan_unqueued_sources(at, after, limit).await
+        }
         async fn enqueue(
             &self,
             scope: &TenantScope,
@@ -482,6 +490,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ObservationCaptureRepository for Captures {
+        async fn scan_sources(
+            &self,
+            _: chrono::DateTime<Utc>,
+            _: Option<Uuid>,
+            _: usize,
+        ) -> Result<Vec<geo_domain::ObservationCaptureSourceItem>, AppError> {
+            unreachable!("explicit-source extraction test store")
+        }
         async fn save(
             &self,
             _: &TenantScope,

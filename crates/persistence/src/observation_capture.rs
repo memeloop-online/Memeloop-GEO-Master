@@ -1,8 +1,9 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelTarget, ChannelTargetInput, ErrorCode, ObservationCapture,
     ObservationCaptureInput, ObservationCaptureReceipt, ObservationCaptureRepository,
-    ObservationCaptureSnapshot, TenantScope,
+    ObservationCaptureSnapshot, ObservationCaptureSourceItem, TenantScope,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -50,6 +51,36 @@ fn decode(row: sqlx::postgres::PgRow) -> Result<ObservationCapture, AppError> {
 
 #[async_trait]
 impl ObservationCaptureRepository for PgObservationCaptureRepository {
+    async fn scan_sources(
+        &self,
+        as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ObservationCaptureSourceItem>, AppError> {
+        geo_domain::validate_observation_extraction_page_size(limit)?;
+        let rows = sqlx::query(
+            "SELECT operator_id,tenant_id,project_id,capture_id FROM observation_captures \
+             WHERE phase='source' AND ordinal=0 AND stored_at<=$1 \
+             AND ($2::uuid IS NULL OR capture_id>$2) ORDER BY capture_id LIMIT $3",
+        )
+        .bind(as_of)
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ObservationCaptureSourceItem {
+                scope: TenantScope::new(
+                    row.get::<Uuid, _>("operator_id").into(),
+                    row.get::<Uuid, _>("tenant_id").into(),
+                    Some(row.get::<Uuid, _>("project_id").into()),
+                ),
+                capture_id: row.get("capture_id"),
+            })
+            .collect())
+    }
     async fn list_sources_for_attempt(
         &self,
         scope: &TenantScope,

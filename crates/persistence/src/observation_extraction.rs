@@ -3,10 +3,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ErrorCode, ObservationAnalysisResult, ObservationCaptureRepository,
-    ObservationExtractionClaim, ObservationExtractionIntent, ObservationExtractionInterruption,
-    ObservationExtractionReadyItem, ObservationExtractionRepository, ObservationExtractionRequest,
-    ObservationExtractionResponse, ObservationExtractionState, ObservationExtractionStatus,
-    TenantScope, validate_observation_extraction_page_size, validate_observation_extraction_scope,
+    ObservationExtractionBackfillItem, ObservationExtractionClaim, ObservationExtractionIntent,
+    ObservationExtractionInterruption, ObservationExtractionReadyItem,
+    ObservationExtractionRepository, ObservationExtractionRequest, ObservationExtractionResponse,
+    ObservationExtractionState, ObservationExtractionStatus, TenantScope,
+    validate_observation_extraction_page_size, validate_observation_extraction_scope,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
@@ -110,6 +111,41 @@ async fn write(
 
 #[async_trait]
 impl ObservationExtractionRepository for PgObservationExtractionRepository {
+    async fn scan_unqueued_sources(
+        &self,
+        as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ObservationExtractionBackfillItem>, AppError> {
+        validate_observation_extraction_page_size(limit)?;
+        let rows = sqlx::query(
+            "SELECT c.operator_id,c.tenant_id,c.project_id,c.capture_id \
+             FROM observation_captures c \
+             WHERE c.phase='source' AND c.ordinal=0 AND c.stored_at<=$1 \
+             AND ($2::uuid IS NULL OR c.capture_id>$2) \
+             AND NOT EXISTS (SELECT 1 FROM observation_extraction_intents e \
+                 WHERE e.operator_id=c.operator_id AND e.tenant_id=c.tenant_id \
+                 AND e.project_id=c.project_id AND e.source_capture_id=c.capture_id) \
+             ORDER BY c.capture_id LIMIT $3",
+        )
+        .bind(as_of)
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ObservationExtractionBackfillItem {
+                scope: TenantScope::new(
+                    row.get::<Uuid, _>("operator_id").into(),
+                    row.get::<Uuid, _>("tenant_id").into(),
+                    Some(row.get::<Uuid, _>("project_id").into()),
+                ),
+                capture_id: row.get("capture_id"),
+            })
+            .collect())
+    }
     async fn enqueue(
         &self,
         scope: &TenantScope,

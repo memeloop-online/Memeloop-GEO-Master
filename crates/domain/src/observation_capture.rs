@@ -529,8 +529,23 @@ impl ObservationCaptureInput {
     }
 }
 
+/// Service-only source discovery metadata; never includes captured content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationCaptureSourceItem {
+    pub scope: TenantScope,
+    pub capture_id: Uuid,
+}
+
 #[async_trait]
 pub trait ObservationCaptureRepository: Send + Sync {
+    /// Source phase, ordinal zero, ordered by UUID with an inclusive stored_at
+    /// cutoff fixed across pages. Does not decide interpretation eligibility.
+    async fn scan_sources(
+        &self,
+        as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ObservationCaptureSourceItem>, AppError>;
     /// Bounded discovery of immutable source checkpoints, including attempts
     /// whose runner response was lost after the checkpoint was saved.
     async fn list_sources_for_attempt(
@@ -571,6 +586,36 @@ impl MemoryObservationCaptureRepository {
 
 #[async_trait]
 impl ObservationCaptureRepository for MemoryObservationCaptureRepository {
+    async fn scan_sources(
+        &self,
+        as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ObservationCaptureSourceItem>, AppError> {
+        crate::validate_observation_extraction_page_size(limit)?;
+        let mut items: Vec<_> = self
+            .captures
+            .lock()
+            .await
+            .values()
+            .filter(|(_, capture)| {
+                capture.receipt.stored_at <= as_of
+                    && after.is_none_or(|id| capture.input.capture_id > id)
+                    && capture.input.ordinal == 0
+                    && matches!(
+                        capture.input.snapshot,
+                        ObservationCaptureSnapshot::Source { .. }
+                    )
+            })
+            .map(|(scope, capture)| ObservationCaptureSourceItem {
+                scope: scope.clone(),
+                capture_id: capture.input.capture_id,
+            })
+            .collect();
+        items.sort_by_key(|item| item.capture_id);
+        items.truncate(limit);
+        Ok(items)
+    }
     async fn list_sources_for_attempt(
         &self,
         scope: &TenantScope,
@@ -743,6 +788,83 @@ mod tests {
             },
             owned_conversation: None,
             completion: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_scan_uses_storage_cutoff_phase_ordinal_and_uuid_pages() {
+        let store = MemoryObservationCaptureRepository::new(Arc::new(
+            MemoryChannelJobRepository::default(),
+        ));
+        let now = Utc::now();
+        for id in 1..=6 {
+            let scope = TenantScope::new(
+                Uuid::new_v4().into(),
+                Uuid::new_v4().into(),
+                Some(Uuid::new_v4().into()),
+            );
+            let mut input = source(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            );
+            input.capture_id = Uuid::from_u128(id);
+            // Old observation time is not the discovery cutoff.
+            input.observed_at = now - chrono::Duration::days(1);
+            if id == 3 {
+                input.ordinal = 1;
+            }
+            if id == 4 {
+                input.snapshot = ObservationCaptureSnapshot::Extraction {
+                    source_capture_id: Uuid::new_v4(),
+                    source_json: "{}".into(),
+                    source_sha256: crate::sha256_hex(b"{}"),
+                };
+            }
+            let receipt = ObservationCaptureReceipt {
+                capture_id: input.capture_id,
+                schema_version: 1,
+                digest_sha256: "synthetic".into(),
+                stored_at: if id == 2 {
+                    now + chrono::Duration::seconds(1)
+                } else {
+                    now
+                },
+            };
+            store.captures.lock().await.insert(
+                input.capture_id,
+                (scope, ObservationCapture { input, receipt }),
+            );
+        }
+        let first = store.scan_sources(now, None, 2).await.unwrap();
+        assert_eq!(
+            first.iter().map(|item| item.capture_id).collect::<Vec<_>>(),
+            vec![Uuid::from_u128(1), Uuid::from_u128(5)]
+        );
+        assert_ne!(first[0].scope, first[1].scope);
+        let last = store
+            .scan_sources(now, Some(first[1].capture_id), 2)
+            .await
+            .unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].capture_id, Uuid::from_u128(6));
+        assert!(
+            store
+                .scan_sources(now, Some(last[0].capture_id), 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .scan_sources(now - chrono::Duration::seconds(1), None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for limit in [0, 101] {
+            assert!(store.scan_sources(now, None, limit).await.is_err());
         }
     }
 

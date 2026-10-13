@@ -35,6 +35,17 @@ const PROMPT_VERSION: &str = "geo.observation.extract.v3";
 const PARSER_VERSION: &str = "geo.observation.extract.v5";
 const AUTOMATIC_KEY_PREFIX: &str = "automatic:observation-extraction:";
 
+/// Read-only eligibility, not an enqueue reservation or permission to infer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HistoricalSourcePreparation {
+    Ready(ObservationAnalysisRequest),
+    GroundedAnalysis,
+    TrustedObservation,
+    MissingReceipt,
+    ActiveAnalysis,
+    RejectedSource,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzeSavedSource {
@@ -293,6 +304,110 @@ impl ObservationAnalysisService {
             }
         }
         Ok(sources)
+    }
+
+    /// Validate an exact historical attempt before automatic extraction. No
+    /// inference, stale-work interruption, or measurement mutation occurs here.
+    /// A caller must still atomically fence enqueue against existing intents
+    /// across policy versions and concurrent manual analysis submissions.
+    pub async fn prepare_historical_source(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        capture_id: Uuid,
+    ) -> Result<HistoricalSourcePreparation, AppError> {
+        use HistoricalSourcePreparation as Preparation;
+        let mut target = self.jobs.get_target(scope, target_id).await?;
+        let attempt = target
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == attempt_id)
+            .ok_or_else(|| AppError::not_found("measurement attempt not found"))?;
+        if attempt.outcome.is_none() || attempt.received_at.is_none() {
+            return Ok(Preparation::MissingReceipt);
+        }
+        let Some(capture) = self.captures.get(scope, capture_id).await? else {
+            return Ok(Preparation::RejectedSource);
+        };
+        let ObservationCaptureSnapshot::Source { source_sha256, .. } = &capture.input.snapshot
+        else {
+            return Ok(Preparation::RejectedSource);
+        };
+        let request = Self::request(
+            target_id,
+            attempt_id,
+            SavedSource {
+                source: ObservationAnalysisSource::Capture { capture_id },
+                source_sha256: source_sha256.clone(),
+                observed_at: capture.input.observed_at,
+            },
+        );
+        if observation_analysis_source_json(scope, &request, &target, Some(&capture)).is_err() {
+            return Ok(Preparation::RejectedSource);
+        }
+        // The shared effective-observation validator selects the last attempt;
+        // reduce this read-only view to the specifically requested historical one.
+        target
+            .attempts
+            .retain(|attempt| attempt.attempt_id == attempt_id);
+        let now = Utc::now();
+        if geo_domain::effective_observation(
+            &target,
+            &[],
+            now,
+            crate::citation_insights::accepted_live_search,
+        )
+        .is_some()
+        {
+            return Ok(Preparation::TrustedObservation);
+        }
+        let mut after = None;
+        let mut grounded = false;
+        // Bound each read, not total history: a later failure must never hide
+        // an older valid interpretation behind an arbitrary record cutoff.
+        loop {
+            let revisions = self
+                .repository
+                .list_for_attempt(scope, target_id, attempt_id, after, 100)
+                .await?;
+            for revision in &revisions {
+                if matches!(
+                    revision.state,
+                    ObservationAnalysisState::Queued | ObservationAnalysisState::Running
+                ) {
+                    return Ok(Preparation::ActiveAnalysis);
+                }
+                if revision.request.source_sha256 != request.source_sha256
+                    || observation_analysis_source_json(
+                        scope,
+                        &revision.request,
+                        &target,
+                        Some(&capture),
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                grounded |= geo_domain::effective_observation(
+                    &target,
+                    std::slice::from_ref(revision),
+                    now,
+                    |_, _| false,
+                )
+                .is_some();
+            }
+            if revisions.len() < 100 {
+                return Ok(if grounded {
+                    Preparation::GroundedAnalysis
+                } else {
+                    Preparation::Ready(request)
+                });
+            }
+            after = revisions
+                .last()
+                .map(|revision| revision.request.revision_id);
+        }
     }
 
     pub async fn submit(
@@ -1332,6 +1447,235 @@ mod tests {
         }
     }
 
+    async fn historical_capture(f: &Fixture) -> Uuid {
+        f.service
+            .captures
+            .list_sources_for_attempt(&f.scope, f.target_id, f.attempt_id)
+            .await
+            .unwrap()[0]
+            .input
+            .capture_id
+    }
+
+    async fn prepare_history(f: &Fixture) -> HistoricalSourcePreparation {
+        f.service
+            .prepare_historical_source(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                historical_capture(f).await,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn historical_preparation_accepts_unknown_but_defers_missing_receipt() {
+        let f = fixture(true, true, false).await;
+        assert!(matches!(
+            prepare_history(&f).await,
+            HistoricalSourcePreparation::Ready(_)
+        ));
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            f.original
+        );
+        let missing = fixture_with_terminal(true, true, false, "execution_deadline", false).await;
+        assert_eq!(
+            prepare_history(&missing).await,
+            HistoricalSourcePreparation::MissingReceipt
+        );
+        assert_eq!(missing.model.0.load(Ordering::SeqCst), 0);
+        let unbound = fixture(true, false, false).await;
+        assert_eq!(
+            prepare_history(&unbound).await,
+            HistoricalSourcePreparation::RejectedSource
+        );
+        assert_eq!(
+            f.service
+                .prepare_historical_source(
+                    &f.scope,
+                    f.target_id,
+                    f.attempt_id,
+                    historical_capture(&unbound).await,
+                )
+                .await
+                .unwrap(),
+            HistoricalSourcePreparation::RejectedSource,
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_preparation_never_interrupts_active_manual_analysis() {
+        let f = fixture(true, true, false).await;
+        let HistoricalSourcePreparation::Ready(request) = prepare_history(&f).await else {
+            panic!("valid saved source");
+        };
+        let queued = f
+            .service
+            .repository
+            .create(
+                &f.scope,
+                "historical-active",
+                &sha256_hex(b"synthetic"),
+                request,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepare_history(&f).await,
+            HistoricalSourcePreparation::ActiveAnalysis
+        );
+        let claim = f
+            .service
+            .repository
+            .claim(&f.scope, queued.request.revision_id, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepare_history(&f).await,
+            HistoricalSourcePreparation::ActiveAnalysis
+        );
+        let stored = f
+            .service
+            .repository
+            .get(&f.scope, claim.revision.request.revision_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, ObservationAnalysisState::Running);
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_preparation_reuses_older_grounded_analysis_without_inference() {
+        let f = fixture(true, true, false).await;
+        let HistoricalSourcePreparation::Ready(request) = prepare_history(&f).await else {
+            panic!("valid saved source");
+        };
+        let protocol = match &f.original.target.input {
+            ChannelTargetInput::Measure {
+                provider,
+                model,
+                surface,
+                search_mode,
+                protocol_version,
+                market,
+                language,
+                ..
+            } => {
+                json!({"provider":provider,"model":model,"surface":surface,"search_mode":search_mode,
+                    "protocol_version":protocol_version,"market":market,"language":language})
+            }
+            _ => unreachable!(),
+        };
+        let result = ObservationAnalysisResult {
+            config_revision: Some(0),
+            actual_model: Some("synthetic-model".into()),
+            candidate_json: Some("{}".into()),
+            outcome: ObservationAnalysisOutcome::Grounded {
+                raw_answer: "Synthetic saved answer".into(),
+                citations: vec![],
+                audit: json!({"kind":"observation_extraction","method":"llm_grounded",
+                    "source_sha256":request.source_sha256,"prompt_version":request.prompt_version,
+                    "protocol":protocol,"refs":[{"role":"completion"},{"role":"search_activity"},{"role":"answer_segment"}]}),
+            },
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+        f.service
+            .repository
+            .project_response(
+                &f.scope,
+                "historical-grounded",
+                &sha256_hex(b"synthetic-grounded"),
+                request.clone(),
+                result.clone(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepare_history(&f).await,
+            HistoricalSourcePreparation::GroundedAnalysis
+        );
+        let mut later = request.clone();
+        later.revision_id = Uuid::new_v4();
+        f.service
+            .repository
+            .project_response(
+                &f.scope,
+                "historical-failure",
+                &sha256_hex(b"synthetic-failure"),
+                later,
+                failed("model_timeout"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepare_history(&f).await,
+            HistoricalSourcePreparation::GroundedAnalysis
+        );
+        for index in 0..100 {
+            let mut later = request.clone();
+            later.revision_id = Uuid::new_v4();
+            f.service
+                .repository
+                .project_response(
+                    &f.scope,
+                    &format!("historical-failure-page-{index}"),
+                    &sha256_hex(b"synthetic-failure-page"),
+                    later,
+                    failed("model_timeout"),
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            prepare_history(&f).await,
+            HistoricalSourcePreparation::GroundedAnalysis
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+
+        // Completed is insufficient: reject a mismatched audit source binding.
+        let forged = fixture(true, true, false).await;
+        let HistoricalSourcePreparation::Ready(mut request) = prepare_history(&forged).await else {
+            panic!("valid saved source");
+        };
+        request.revision_id = Uuid::new_v4();
+        let mut result = result;
+        if let ObservationAnalysisOutcome::Grounded { audit, .. } = &mut result.outcome {
+            audit["source_sha256"] = json!("0".repeat(64));
+        }
+        forged
+            .service
+            .repository
+            .project_response(
+                &forged.scope,
+                "historical-forged",
+                &sha256_hex(b"synthetic-forged"),
+                request,
+                result,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            prepare_history(&forged).await,
+            HistoricalSourcePreparation::Ready(_)
+        ));
+        assert_eq!(forged.model.0.load(Ordering::SeqCst), 0);
+    }
+
     async fn received_intent(f: &Fixture) -> ObservationExtractionIntent {
         let capture = f
             .service
@@ -2012,6 +2356,16 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ObservationExtractionRepository for CompleteDuringStatusRead {
+        async fn scan_unqueued_sources(
+            &self,
+            at: DateTime<Utc>,
+            after: Option<Uuid>,
+            limit: usize,
+        ) -> Result<Vec<geo_domain::ObservationExtractionBackfillItem>, AppError> {
+            self.repository
+                .scan_unqueued_sources(at, after, limit)
+                .await
+        }
         async fn status_for_attempt(
             &self,
             scope: &TenantScope,
