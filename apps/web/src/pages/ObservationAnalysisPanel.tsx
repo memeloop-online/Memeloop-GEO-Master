@@ -13,6 +13,7 @@ import {
   listObservationAnalyses,
 } from "../api/observationAnalysis";
 import { useAuth } from "../auth/AuthProvider";
+import { ObservationAnswer } from "../components/ObservationAnswer";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import {
   analysisFailureMessageKey,
@@ -195,11 +196,7 @@ export function ObservationAnalysisPanel({
             {grounded && (
               <>
                 <h5>{t("answer")}</h5>
-                <div
-                  style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-                >
-                  {grounded.raw_answer}
-                </div>
+                <ObservationAnswer text={grounded.raw_answer} />
                 <h5>{t("citations")}</h5>
                 {citations.length ? (
                   <ul>

@@ -1,5 +1,9 @@
 # Third-party notices for the web client
 
+Saved observation answers use `react-markdown` version `10.1.0` from
+https://github.com/remarkjs/react-markdown under the MIT license. Its notice
+is distributed in `public/MARKDOWN_THIRD_PARTY_NOTICES.txt`.
+
 Account import CSV parsing uses Papa Parse `5.5.3` from
 https://github.com/mholt/PapaParse under the MIT license. Its copyright and
 license are distributed in `public/ACCOUNT_IMPORT_THIRD_PARTY_NOTICES.txt`.
