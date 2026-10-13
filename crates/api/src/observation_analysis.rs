@@ -15,8 +15,9 @@ use geo_domain::{
     ObservationAnalysisOutcome, ObservationAnalysisRepository, ObservationAnalysisRequest,
     ObservationAnalysisResult, ObservationAnalysisRevision, ObservationAnalysisSource,
     ObservationAnalysisState, ObservationCaptureRepository, ObservationCaptureSnapshot,
-    ObservationExtractionIntent, ObservationExtractionResponseDisposition,
-    ObservationExtractionState, ProjectAiUsage, ProjectId, TenantScope,
+    ObservationExtractionIntent, ObservationExtractionRepository,
+    ObservationExtractionResponseDisposition, ObservationExtractionState,
+    ObservationExtractionStatus, ProjectAiUsage, ProjectId, TenantScope,
     observation_analysis_source_json, sha256_hex,
 };
 use geo_provider::diagnostics::{ModelPhase, ModelPhaseTimer};
@@ -62,6 +63,7 @@ pub(crate) struct AnalysisPage {
     sources: Vec<SavedSource>,
     items: Vec<ObservationAnalysisRevision>,
     next_after: Option<Uuid>,
+    extraction: Option<ObservationExtractionStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +161,7 @@ impl SavedObservationGrounder for HttpSavedObservationGrounder {
 #[derive(Clone)]
 pub struct ObservationAnalysisService {
     repository: Arc<dyn ObservationAnalysisRepository>,
+    extraction_repository: Option<Arc<dyn ObservationExtractionRepository>>,
     jobs: Arc<dyn ChannelJobRepository>,
     captures: Arc<dyn ObservationCaptureRepository>,
     model: Arc<ProjectConfiguredModelBridge>,
@@ -192,11 +195,20 @@ impl ObservationAnalysisService {
     ) -> Self {
         Self {
             repository,
+            extraction_repository: None,
             jobs,
             captures,
             model: Arc::new(model),
             grounder,
         }
+    }
+
+    pub fn with_extraction_repository(
+        mut self,
+        repository: Arc<dyn ObservationExtractionRepository>,
+    ) -> Self {
+        self.extraction_repository = Some(repository);
+        self
     }
 
     fn request(
@@ -786,6 +798,16 @@ async fn list(
     if !(1..=99).contains(&limit) {
         return Err(map(AppError::invalid_request("limit must be 1 to 99")));
     }
+    // Projection is committed before an automatic task becomes completed.
+    // Read task status first, so a concurrent completion cannot stop polling
+    // while hiding the analysis version committed by that same completion.
+    let extraction = match &service.extraction_repository {
+        Some(repository) => repository
+            .status_for_attempt(&scope, target_id, attempt_id)
+            .await
+            .map_err(map)?,
+        None => None,
+    };
     let mut items = service
         .repository
         .list_for_attempt(&scope, target_id, attempt_id, query.after, limit + 1)
@@ -802,6 +824,7 @@ async fn list(
         sources,
         items,
         next_after,
+        extraction,
     }))
 }
 
@@ -827,9 +850,9 @@ mod tests {
     use geo_domain::{
         ChannelOutcome, ChannelOutcomeStatus, ChannelTarget, DEVELOPMENT_OPERATOR_ID,
         DEVELOPMENT_TENANT_ID, MemoryObservationAnalysisRepository,
-        MemoryObservationCaptureRepository, ObservationCaptureInput, ObservationExtractionRequest,
-        ObservationExtractionResponse, ObservationProviderIdentity, ProjectCreate, ProjectSettings,
-        StandaloneMeasurementPlan,
+        MemoryObservationCaptureRepository, MemoryObservationExtractionRepository,
+        ObservationCaptureInput, ObservationExtractionRequest, ObservationExtractionResponse,
+        ObservationProviderIdentity, ProjectCreate, ProjectSettings, StandaloneMeasurementPlan,
     };
     use geo_worker::{HostOpError, ModelCompletion};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1949,6 +1972,291 @@ mod tests {
     }
     async fn json_body(response: axum::response::Response) -> Value {
         serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap()).unwrap()
+    }
+
+    async fn analysis_test_auth(app: &Router) -> (String, String) {
+        let login = app
+            .clone()
+            .oneshot(http(
+                "POST",
+                "/api/v1/auth/login",
+                None,
+                json!({"login_name":"demo@localhost","password":"analysis-test"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        (
+            cookie,
+            json_body(login).await["csrf_token"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+    }
+
+    /// Finishes the persisted projection during GET's status read, so this test
+    /// fails if GET reads revision history first and then stops polling.
+    struct CompleteDuringStatusRead {
+        repository: Arc<MemoryObservationExtractionRepository>,
+        analysis: ObservationAnalysisService,
+        intent_id: Uuid,
+        token: Uuid,
+    }
+    #[async_trait::async_trait]
+    impl ObservationExtractionRepository for CompleteDuringStatusRead {
+        async fn status_for_attempt(
+            &self,
+            scope: &TenantScope,
+            target: Uuid,
+            attempt: Uuid,
+        ) -> Result<Option<ObservationExtractionStatus>, AppError> {
+            let intent = self.repository.get(scope, self.intent_id).await?.unwrap();
+            let revision = self
+                .analysis
+                .project_extraction_response(scope, &intent)
+                .await?
+                .unwrap();
+            self.repository
+                .complete(
+                    scope,
+                    intent.intent_id,
+                    self.token,
+                    revision.result.unwrap(),
+                    Utc::now(),
+                )
+                .await?;
+            self.repository
+                .status_for_attempt(scope, target, attempt)
+                .await
+        }
+        async fn enqueue(
+            &self,
+            _: &TenantScope,
+            _: ObservationExtractionRequest,
+            _: DateTime<Utc>,
+        ) -> Result<ObservationExtractionIntent, AppError> {
+            unreachable!("status-only test adapter")
+        }
+        async fn get(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+        ) -> Result<Option<ObservationExtractionIntent>, AppError> {
+            unreachable!("status-only test adapter")
+        }
+        async fn scan_ready(
+            &self,
+            _: DateTime<Utc>,
+            _: Option<Uuid>,
+            _: usize,
+        ) -> Result<Vec<geo_domain::ObservationExtractionReadyItem>, AppError> {
+            unreachable!("status-only test adapter")
+        }
+        async fn claim(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+            _: DateTime<Utc>,
+        ) -> Result<Option<geo_domain::ObservationExtractionClaim>, AppError> {
+            unreachable!("status-only test adapter")
+        }
+        async fn claim_response(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+        ) -> Result<Option<geo_domain::ObservationExtractionClaim>, AppError> {
+            unreachable!("status-only test adapter")
+        }
+        async fn record_response(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+            _: Uuid,
+            _: ObservationExtractionResponse,
+            _: DateTime<Utc>,
+        ) -> Result<ObservationExtractionIntent, AppError> {
+            unreachable!("status-only test adapter")
+        }
+        async fn complete(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+            _: Uuid,
+            _: ObservationAnalysisResult,
+            _: DateTime<Utc>,
+        ) -> Result<ObservationExtractionIntent, AppError> {
+            unreachable!("status-only test adapter")
+        }
+        async fn interrupt(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+            _: Uuid,
+            _: geo_domain::ObservationExtractionInterruption,
+            _: DateTime<Utc>,
+        ) -> Result<ObservationExtractionIntent, AppError> {
+            unreachable!("status-only test adapter")
+        }
+    }
+
+    #[tokio::test]
+    async fn http_completion_during_status_read_includes_projected_revision_in_same_page() {
+        let f = fixture(false, true, false).await;
+        let received = received_intent(&f).await;
+        let repository = Arc::new(MemoryObservationExtractionRepository::new(
+            f.service.captures.clone(),
+        ));
+        let queued = repository
+            .enqueue(&f.scope, received.request.clone(), received.created_at)
+            .await
+            .unwrap();
+        let claim = repository
+            .claim(&f.scope, queued.intent_id, received.created_at)
+            .await
+            .unwrap()
+            .unwrap();
+        repository
+            .record_response(
+                &f.scope,
+                queued.intent_id,
+                claim.claim_token,
+                received.response.unwrap(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let completion = Arc::new(CompleteDuringStatusRead {
+            repository,
+            analysis: f.service.clone(),
+            intent_id: queued.intent_id,
+            token: claim.claim_token,
+        });
+        let app =
+            crate::router(f.state.clone().with_observation_analysis(
+                f.service.clone().with_extraction_repository(completion),
+            ));
+        let auth = analysis_test_auth(&app).await;
+        let path = format!(
+            "/api/v1/projects/{}/channel-targets/{}/attempts/{}/analyses",
+            f.scope.project_id.unwrap(),
+            f.target_id,
+            f.attempt_id
+        );
+        let response = app
+            .oneshot(http("GET", &path, Some(&auth), json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["extraction"]["state"], "completed");
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["result"]["outcome"]["status"], "grounded");
+        assert_eq!(
+            body["items"][0]["result"]["outcome"]["raw_answer"],
+            "Synthetic saved answer"
+        );
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            f.original
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn http_extraction_status_is_scoped_minimal_and_preserves_original_receipt() {
+        let f = fixture(false, true, false).await;
+        let received = received_intent(&f).await;
+        let repository = Arc::new(MemoryObservationExtractionRepository::new(
+            f.service.captures.clone(),
+        ));
+        let queued = repository
+            .enqueue(&f.scope, received.request.clone(), received.created_at)
+            .await
+            .unwrap();
+        let state = f.state.clone().with_observation_analysis(
+            f.service
+                .clone()
+                .with_extraction_repository(repository.clone()),
+        );
+        let app = crate::router(state);
+        let auth = analysis_test_auth(&app).await;
+        let path = format!(
+            "/api/v1/projects/{}/channel-targets/{}/attempts/{}/analyses",
+            f.scope.project_id.unwrap(),
+            f.target_id,
+            f.attempt_id
+        );
+        let response = app
+            .clone()
+            .oneshot(http("GET", &path, Some(&auth), json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(body["extraction"]["state"], "queued");
+        assert_eq!(body["extraction"].as_object().unwrap().len(), 5);
+
+        for (project, target, attempt) in [
+            (Uuid::new_v4().into(), f.target_id, f.attempt_id),
+            (f.scope.project_id.unwrap(), Uuid::new_v4(), f.attempt_id),
+            (f.scope.project_id.unwrap(), f.target_id, Uuid::new_v4()),
+        ] {
+            let wrong = format!(
+                "/api/v1/projects/{project}/channel-targets/{target}/attempts/{attempt}/analyses"
+            );
+            let response = app
+                .clone()
+                .oneshot(http("GET", &wrong, Some(&auth), json!({})))
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::OK);
+            assert!(json_body(response).await.get("extraction").is_none());
+        }
+        let claim = repository
+            .claim(&f.scope, queued.intent_id, received.created_at)
+            .await
+            .unwrap()
+            .unwrap();
+        repository
+            .interrupt(
+                &f.scope,
+                queued.intent_id,
+                claim.claim_token,
+                geo_domain::ObservationExtractionInterruption::InferenceInterrupted,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(http("GET", &path, Some(&auth), json!({})))
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        assert_eq!(body["extraction"]["state"], "interrupted");
+        assert_eq!(body["extraction"]["interruption"], "inference_interrupted");
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            f.original
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

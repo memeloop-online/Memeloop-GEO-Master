@@ -5,8 +5,8 @@ use geo_domain::{
     AppError, ErrorCode, ObservationAnalysisResult, ObservationCaptureRepository,
     ObservationExtractionClaim, ObservationExtractionIntent, ObservationExtractionInterruption,
     ObservationExtractionReadyItem, ObservationExtractionRepository, ObservationExtractionRequest,
-    ObservationExtractionResponse, ObservationExtractionState, TenantScope,
-    validate_observation_extraction_page_size, validate_observation_extraction_scope,
+    ObservationExtractionResponse, ObservationExtractionState, ObservationExtractionStatus,
+    TenantScope, validate_observation_extraction_page_size, validate_observation_extraction_scope,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
@@ -183,6 +183,28 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
                 },
             })
             .collect())
+    }
+    async fn status_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Option<ObservationExtractionStatus>, AppError> {
+        let mut tx = self.transaction(scope).await?;
+        // Read only the public status fields. Large model responses and source
+        // identities never cross the database boundary for this lookup.
+        let row = sqlx::query("SELECT jsonb_build_object('state',e.state,'created_at',e.created_at,'started_at',e.intent->'started_at','finished_at',e.intent->'finished_at','interruption',e.intent->'interruption') AS status FROM observation_captures c JOIN observation_extraction_intents e ON e.operator_id=c.operator_id AND e.tenant_id=c.tenant_id AND e.project_id=c.project_id AND e.source_capture_id=c.capture_id WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 AND c.target_id=$4 AND c.attempt_id=$5 AND c.phase='source' ORDER BY (e.state IN ('queued','running','response_received')) DESC,e.created_at DESC,e.intent_id DESC LIMIT 1")
+            .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
+            .bind(target_id).bind(attempt_id).fetch_optional(&mut *tx).await.map_err(db)?;
+        let status = row
+            .map(|row| {
+                serde_json::from_value(row.get("status")).map_err(|_| {
+                    AppError::new(ErrorCode::Internal, "stored extraction status invalid")
+                })
+            })
+            .transpose()?;
+        tx.commit().await.map_err(db)?;
+        Ok(status)
     }
     async fn claim(
         &self,

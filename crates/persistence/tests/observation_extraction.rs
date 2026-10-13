@@ -124,6 +124,42 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
     let intent = store.enqueue(&scope, request.clone(), now).await.unwrap();
     assert_eq!(
         store
+            .status_for_attempt(&scope, target_id, attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ObservationExtractionState::Queued
+    );
+    for wrong_scope in [
+        other.clone(),
+        TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, scope.project_id),
+        TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id),
+    ] {
+        assert!(
+            store
+                .status_for_attempt(&wrong_scope, target_id, attempt_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        store
+            .status_for_attempt(&scope, Uuid::new_v4(), attempt_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .status_for_attempt(&scope, target_id, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
             .enqueue(&scope, request.clone(), now)
             .await
             .unwrap()
@@ -141,6 +177,15 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
     let claims: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
     assert_eq!(claims.len(), 1);
     let token = claims[0].claim_token;
+    assert_eq!(
+        store
+            .status_for_attempt(&scope, target_id, attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ObservationExtractionState::Running
+    );
     assert!(
         store
             .claim(&scope, intent.intent_id, now)
@@ -173,6 +218,20 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         .await
         .unwrap();
     let resumed = PgObservationExtractionRepository::from_database(&database);
+    let status = resumed
+        .status_for_attempt(&scope, target_id, attempt_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, ObservationExtractionState::ResponseReceived);
+    assert_eq!(
+        serde_json::to_value(status)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .len(),
+        5
+    );
     let claimed = resumed
         .claim_response(&scope, intent.intent_id)
         .await
@@ -204,6 +263,15 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
     assert_eq!(complete.state, ObservationExtractionState::Completed);
     assert_eq!(
         resumed
+            .status_for_attempt(&scope, target_id, attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ObservationExtractionState::Completed
+    );
+    assert_eq!(
+        resumed
             .complete(&scope, intent.intent_id, token, result, now)
             .await
             .unwrap(),
@@ -220,6 +288,15 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
     let mut second = request;
     second.policy_version = "automatic.v2".into();
     let second = store.enqueue(&scope, second, now).await.unwrap();
+    assert_eq!(
+        store
+            .status_for_attempt(&scope, target_id, attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ObservationExtractionState::Queued
+    );
     let token = store
         .claim(&scope, second.intent_id, now)
         .await

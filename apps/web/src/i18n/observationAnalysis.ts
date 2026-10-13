@@ -14,6 +14,9 @@ const translations = {
     noRevisions: "尚未解析已存记录。",
     queued: "等待解析",
     running: "正在解析",
+    response_received: "正在整理回答",
+    extractionInterrupted: "解析中断。你可以重新解析已存回答。",
+    extractionFailed: "解析未完成。请检查解析模型设置或稍后重新解析。",
     grounded: "已与原始记录核对",
     unverified: "解析内容未能与原文核对，暂不可用。请查看原文后重新解析。",
     failed: "这次解析未完成。请稍后重新解析。",
@@ -59,6 +62,11 @@ const translations = {
     noRevisions: "No saved-source analyses yet.",
     queued: "Waiting for analysis",
     running: "Analyzing",
+    response_received: "Organizing the response",
+    extractionInterrupted:
+      "Analysis was interrupted. You can reanalyze the saved response.",
+    extractionFailed:
+      "Analysis did not finish. Check the analysis model settings or try reanalyzing later.",
     grounded: "Checked against the source record",
     unverified:
       "The analysis could not be verified against the source. Review the source before reanalyzing.",
@@ -140,6 +148,21 @@ export function analysisUnverifiedMessageKey(reason: string): string {
       ? "failureResponse"
       : "unverified"
     : "unverified";
+}
+
+export function extractionInterruptionMessageKey(
+  reason: string | null,
+): string {
+  switch (reason) {
+    case "inference_failed":
+      return "extractionFailed";
+    case "grounding_interrupted":
+      return "failureGrounding";
+    case "response_not_persistable":
+      return "failureResponse";
+    default:
+      return "extractionInterrupted";
+  }
 }
 
 for (const [language, translation] of Object.entries(translations)) {

@@ -10,6 +10,7 @@ import { Link } from "react-router-dom";
 import { createIdempotencyKey } from "../api/client";
 import {
   createObservationAnalysis,
+  isExtractionActive,
   listObservationAnalyses,
 } from "../api/observationAnalysis";
 import { useAuth } from "../auth/AuthProvider";
@@ -18,6 +19,7 @@ import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import {
   analysisFailureMessageKey,
   analysisUnverifiedMessageKey,
+  extractionInterruptionMessageKey,
 } from "../i18n/observationAnalysis";
 
 export function ObservationAnalysisPanel({
@@ -62,6 +64,7 @@ export function ObservationAnalysisPanel({
     enabled: Boolean(session),
     retry: false,
     refetchInterval: (query) =>
+      isExtractionActive(query.state.data?.pages[0]?.extraction) ||
       query.state.data?.pages.some((page) =>
         page.items.some((item) => item.state !== "completed"),
       )
@@ -116,6 +119,7 @@ export function ObservationAnalysisPanel({
     ).values(),
   ];
   const hasSource = Boolean(history.data?.pages[0]?.sources.length);
+  const extraction = history.data?.pages[0]?.extraction;
   const active = revisions.some((item) => item.state !== "completed");
   const date = (value: string) =>
     new Date(value).toLocaleString(i18n.resolvedLanguage);
@@ -125,7 +129,18 @@ export function ObservationAnalysisPanel({
       {history.isPending && <Spinner size="tiny" label={t("loading")} />}
       {history.isError && <p role="alert">{t("loadFailed")}</p>}
       {history.data && !hasSource && <p>{t("noSource")}</p>}
-      {hasSource && !revisions.length && <p>{t("noRevisions")}</p>}
+      {hasSource && !revisions.length && !extraction && (
+        <p>{t("noRevisions")}</p>
+      )}
+      {extraction && extraction.state !== "completed" && (
+        <p role="status">
+          {t(
+            extraction.state === "interrupted"
+              ? extractionInterruptionMessageKey(extraction.interruption)
+              : extraction.state,
+          )}
+        </p>
+      )}
       {hasSource && canWrite && (
         <Button
           disabled={submission.isPending || active || history.isError}

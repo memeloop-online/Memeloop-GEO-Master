@@ -53,11 +53,35 @@ export interface ObservationAnalysisRevision {
 export interface ObservationAnalysisPage {
   items: ObservationAnalysisRevision[];
   next_after: string | null;
+  extraction?: ObservationExtractionStatus | null;
   sources: {
     source: AnalysisSource;
     source_sha256: string;
     observed_at: string;
   }[];
+}
+
+export interface ObservationExtractionStatus {
+  state:
+    "queued" | "running" | "response_received" | "completed" | "interrupted";
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  interruption:
+    | "inference_interrupted"
+    | "inference_failed"
+    | "grounding_interrupted"
+    | "response_not_persistable"
+    | null;
+}
+
+export function isExtractionActive(
+  status?: ObservationExtractionStatus | null,
+) {
+  return (
+    status != null &&
+    ["queued", "running", "response_received"].includes(status.state)
+  );
 }
 
 function path(projectId: string, targetId: string, attemptId: string) {

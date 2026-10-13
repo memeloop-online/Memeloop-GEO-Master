@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import * as api from "../api/observationAnalysis";
-import type { ObservationAnalysisRevision } from "../api/observationAnalysis";
+import type {
+  ObservationAnalysisPage,
+  ObservationAnalysisRevision,
+  ObservationExtractionStatus,
+} from "../api/observationAnalysis";
 import { ObservationAnalysisPanel } from "./ObservationAnalysisPanel";
 import i18n from "../i18n";
 import {
@@ -53,9 +57,11 @@ function setup(
   items: ObservationAnalysisRevision[] = [],
   eligible = true,
   canWrite = true,
+  extraction: ObservationExtractionStatus | null = null,
 ) {
-  const list = vi.spyOn(api, "listObservationAnalyses").mockResolvedValue({
+  const page: ObservationAnalysisPage = {
     items,
+    extraction,
     next_after: null,
     sources: eligible
       ? [
@@ -66,7 +72,8 @@ function setup(
           },
         ]
       : [],
-  });
+  };
+  const list = vi.spyOn(api, "listObservationAnalyses").mockResolvedValue(page);
   const create = vi
     .spyOn(api, "createObservationAnalysis")
     .mockResolvedValue(revision);
@@ -89,16 +96,171 @@ function setup(
       </QueryClientProvider>
     </FluentProvider>,
   );
-  return { list, create, client };
+  return { list, create, client, page };
 }
 
 afterEach(async () => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
   await i18n.changeLanguage("zh-CN");
 });
 
 describe("saved response analysis", () => {
+  it.each(["zh-CN", "en"])(
+    "shows interrupted automatic failure guidance and existing settings in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      const { create } = setup([], true, true, {
+        state: "interrupted",
+        created_at: revision.created_at,
+        started_at: revision.created_at,
+        finished_at: revision.created_at,
+        interruption: "inference_failed",
+      });
+      expect(
+        await screen.findByText(
+          i18n.t("extractionFailed", { ns: "observationAnalysis" }),
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("link", {
+          name: i18n.t("settings", { ns: "observationAnalysis" }),
+        }),
+      ).toHaveAttribute("href", "/app/tenant/project/settings?tab=ai");
+      expect(
+        screen.getByRole("button", {
+          name: i18n.t("parse", { ns: "observationAnalysis" }),
+        }),
+      ).toBeEnabled();
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps completed automatic analysis failure separate from verified answers", async () => {
+    setup(
+      [
+        {
+          ...revision,
+          state: "completed",
+          result: {
+            actual_model: "synthetic-model",
+            candidate_json: "untrusted candidate",
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            outcome: { status: "failed", code: "grounding_unavailable" },
+          },
+        },
+      ],
+      true,
+      true,
+      {
+        state: "completed",
+        created_at: revision.created_at,
+        started_at: revision.created_at,
+        finished_at: revision.created_at,
+        interruption: null,
+      },
+    );
+    expect(
+      await screen.findByText(
+        i18n.t("failureGrounding", { ns: "observationAnalysis" }),
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("已与原始记录核对")).not.toBeInTheDocument();
+    expect(screen.queryByText("untrusted candidate")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["queued", "等待解析"],
+    ["running", "正在解析"],
+    ["response_received", "正在整理回答"],
+  ] as const)(
+    "polls automatic %s without a revision and displays its completion",
+    async (state, label) => {
+      vi.useFakeTimers();
+      const { list, create, page } = setup([], true, true, {
+        state,
+        created_at: revision.created_at,
+        started_at: state === "queued" ? null : revision.created_at,
+        finished_at: null,
+        interruption: null,
+      });
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.queryByText("尚未解析已存记录。")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "重新解析" })).toBeEnabled();
+      list.mockResolvedValue({
+        ...page,
+        extraction: {
+          ...page.extraction!,
+          state: "completed",
+          finished_at: revision.created_at,
+        },
+        items: [
+          {
+            ...revision,
+            state: "completed",
+            result: {
+              actual_model: "synthetic-model",
+              candidate_json: null,
+              prompt_tokens: 1,
+              completion_tokens: 1,
+              outcome: {
+                status: "grounded",
+                raw_answer: "Automatically parsed answer",
+                citations: [],
+                audit: {},
+              },
+            },
+          },
+        ],
+      });
+      await act(() => vi.advanceTimersByTimeAsync(3000));
+      expect(
+        screen.getByText("Automatically parsed answer"),
+      ).toBeInTheDocument();
+      expect(screen.getByText("已与原始记录核对")).toBeInTheDocument();
+      const reads = list.mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(6000));
+      expect(list).toHaveBeenCalledTimes(reads);
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([null, "completed", "interrupted"] as const)(
+    "stops polling inactive automatic status %s",
+    async (state) => {
+      vi.useFakeTimers();
+      const { list, create } = setup(
+        [],
+        true,
+        true,
+        state
+          ? {
+              state,
+              created_at: revision.created_at,
+              started_at: revision.created_at,
+              finished_at: revision.created_at,
+              interruption:
+                state === "interrupted" ? "inference_interrupted" : null,
+            }
+          : null,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(list).toHaveBeenCalledOnce();
+      if (state === "interrupted") {
+        expect(
+          screen.getByText("解析中断。你可以重新解析已存回答。"),
+        ).toBeInTheDocument();
+      }
+      await act(() => vi.advanceTimersByTimeAsync(6000));
+      expect(list).toHaveBeenCalledOnce();
+      expect(create).not.toHaveBeenCalled();
+      expect(screen.queryByText("已与原始记录核对")).not.toBeInTheDocument();
+    },
+  );
+
   it.each([
     ["zh-CN", "配置解析模型", "重新解析"],
     ["en", "Configure analysis model", "Reanalyze"],
