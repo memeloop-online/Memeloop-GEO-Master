@@ -261,14 +261,14 @@ impl ObservationExtractionService {
             // retry only the exact obtained response, never infer or interrupt.
             self.checkpoint_response(scope, &claim, response).await?;
         }
-        if let Some(continuation) = &self.continuation {
-            if let Some(claim) = self.repository.claim_response(scope, intent_id).await? {
-                validate_versions(&claim.intent.request)?;
-                if let Some(result) = continuation.continue_response(scope, &claim.intent).await? {
-                    self.repository
-                        .complete(scope, intent_id, claim.claim_token, result, Utc::now())
-                        .await?;
-                }
+        if let Some(continuation) = &self.continuation
+            && let Some(claim) = self.repository.claim_response(scope, intent_id).await?
+        {
+            validate_versions(&claim.intent.request)?;
+            if let Some(result) = continuation.continue_response(scope, &claim.intent).await? {
+                self.repository
+                    .complete(scope, intent_id, claim.claim_token, result, Utc::now())
+                    .await?;
             }
         }
         Ok(())
@@ -321,6 +321,50 @@ impl ObservationExtractionService {
         }
         unreachable!("checkpoint retries terminate on their final attempt")
     }
+}
+
+/// One bounded dispatcher per application assembly. Startup scans immediately;
+/// enqueue wakes it, and periodic keyset scans recover queued/received checkpoints.
+pub fn spawn_observation_extraction_dispatcher(
+    service: ObservationExtractionService,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_secs(30));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! { _ = ticks.tick() => {}, _ = service.wake.notified() => {} }
+            let as_of = Utc::now();
+            let mut after = None;
+            let mut workers = JoinSet::new();
+            loop {
+                let items = match service.repository.scan_ready(as_of, after, 100).await {
+                    Ok(items) => items,
+                    Err(error) => {
+                        tracing::warn!(code = ?error.code, "observation extraction scan failed");
+                        break;
+                    }
+                };
+                let count = items.len();
+                for item in items {
+                    after = Some(item.intent_id);
+                    if workers.len() >= WORKERS {
+                        let _ = workers.join_next().await;
+                    }
+                    let service = service.clone();
+                    workers.spawn(async move {
+                        if let Err(error) = service.dispatch(&item.scope, item.intent_id).await {
+                            tracing::warn!(code = ?error.code, "observation extraction dispatch failed");
+                        }
+                    });
+                }
+                if count < 100 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            while workers.join_next().await.is_some() {}
+        }
+    })
 }
 
 #[cfg(test)]
@@ -881,48 +925,4 @@ mod tests {
             ObservationExtractionState::ResponseReceived
         );
     }
-}
-
-/// One bounded dispatcher per application assembly. Startup scans immediately;
-/// enqueue wakes it, and periodic keyset scans recover queued/received checkpoints.
-pub fn spawn_observation_extraction_dispatcher(
-    service: ObservationExtractionService,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(Duration::from_secs(30));
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! { _ = ticks.tick() => {}, _ = service.wake.notified() => {} }
-            let as_of = Utc::now();
-            let mut after = None;
-            let mut workers = JoinSet::new();
-            loop {
-                let items = match service.repository.scan_ready(as_of, after, 100).await {
-                    Ok(items) => items,
-                    Err(error) => {
-                        tracing::warn!(code = ?error.code, "observation extraction scan failed");
-                        break;
-                    }
-                };
-                let count = items.len();
-                for item in items {
-                    after = Some(item.intent_id);
-                    if workers.len() >= WORKERS {
-                        let _ = workers.join_next().await;
-                    }
-                    let service = service.clone();
-                    workers.spawn(async move {
-                        if let Err(error) = service.dispatch(&item.scope, item.intent_id).await {
-                            tracing::warn!(code = ?error.code, "observation extraction dispatch failed");
-                        }
-                    });
-                }
-                if count < 100 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            while workers.join_next().await.is_some() {}
-        }
-    })
 }
