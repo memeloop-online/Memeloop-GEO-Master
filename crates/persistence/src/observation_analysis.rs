@@ -64,11 +64,64 @@ fn decode(row: &sqlx::postgres::PgRow) -> Result<ObservationAnalysisRevision, Ap
         started_at: row.get("started_at"),
         analyzed_at: row.get("analyzed_at"),
         result,
+        inference_resolved: row.get("inference_resolved"),
     })
 }
 
 #[async_trait]
 impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
+    async fn admission_history_snapshot(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<String, AppError> {
+        let project = project(scope)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        let snapshot = history_snapshot(&mut tx, scope, project, target_id, attempt_id).await?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(snapshot)
+    }
+    async fn has_unresolved_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<bool, AppError> {
+        let project = project(scope)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        let blocked =
+            unresolved_for_attempt(&mut tx, scope, project, target_id, attempt_id).await?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(blocked)
+    }
+    async fn record_inference_resolved(
+        &self,
+        scope: &TenantScope,
+        revision_id: Uuid,
+        claim_token: Uuid,
+    ) -> Result<(), AppError> {
+        let project = project(scope)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        lock_revision_attempt(&mut tx, scope, project, revision_id).await?;
+        let changed = sqlx::query("UPDATE observation_analyses SET inference_resolved=TRUE WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND revision_id=$4 AND claim_token=$5 AND state='running'")
+            .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
+            .bind(revision_id).bind(claim_token).execute(&mut *tx).await.map_err(unavailable)?;
+        if claim_token.is_nil() || changed.rows_affected() != 1 {
+            return Err(AppError::conflict("analysis claim is not current"));
+        }
+        tx.commit().await.map_err(unavailable)?;
+        Ok(())
+    }
     async fn project_response(
         &self,
         scope: &TenantScope,
@@ -94,11 +147,19 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         crate::set_local_scope(&mut tx, scope)
             .await
             .map_err(unavailable)?;
+        lock_admission_sources(
+            &mut tx,
+            scope,
+            project,
+            request.target_id,
+            request.attempt_id,
+        )
+        .await?;
         let inserted = sqlx::query(
             "INSERT INTO observation_analyses \
              (revision_id,operator_id,tenant_id,project_id,target_id,attempt_id,idempotency_key_hash,\
-              request_digest,request,state,created_at,started_at,analyzed_at,claim_token,result) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$10,$10,$11,$12) \
+              request_digest,request,state,created_at,started_at,analyzed_at,claim_token,result,inference_resolved) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed',$10,$10,$10,$11,$12,TRUE) \
              ON CONFLICT DO NOTHING RETURNING *",
         )
         .bind(request.revision_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
@@ -209,6 +270,7 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         crate::set_local_scope(&mut tx, scope)
             .await
             .map_err(unavailable)?;
+        lock_admission_sources(&mut tx, scope, project, target_id, attempt_id).await?;
         // Rotate rather than clear the token to satisfy the completed-row
         // invariant while rejecting a late completion from the previous owner.
         sqlx::query(
@@ -249,6 +311,14 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         crate::set_local_scope(&mut tx, scope)
             .await
             .map_err(unavailable)?;
+        lock_admission_sources(
+            &mut tx,
+            scope,
+            project,
+            request.target_id,
+            request.attempt_id,
+        )
+        .await?;
         let inserted = sqlx::query(
             "INSERT INTO observation_analyses \
              (revision_id,operator_id,tenant_id,project_id,target_id,attempt_id,idempotency_key_hash,\
@@ -296,6 +366,7 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         crate::set_local_scope(&mut tx, scope)
             .await
             .map_err(unavailable)?;
+        lock_revision_attempt(&mut tx, scope, project, revision_id).await?;
         let row = sqlx::query(
             "SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 \
              AND project_id=$3 AND revision_id=$4 FOR UPDATE",
@@ -354,6 +425,7 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         crate::set_local_scope(&mut tx, scope)
             .await
             .map_err(unavailable)?;
+        lock_revision_attempt(&mut tx, scope, project, revision_id).await?;
         let row = sqlx::query(
             "SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 \
              AND project_id=$3 AND revision_id=$4 FOR UPDATE",
@@ -488,4 +560,85 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         tx.commit().await.map_err(unavailable)?;
         Ok(revisions)
     }
+}
+
+/// Shared order with automatic admission; lock all immutable source rows before
+/// inspecting either ledger, including manual legacy-evidence requests.
+pub(crate) async fn lock_admission_sources(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &TenantScope,
+    project: Uuid,
+    target_id: Uuid,
+    attempt_id: Uuid,
+) -> Result<(), AppError> {
+    // Stable parent exists even before a first source capture arrives.
+    sqlx::query("SELECT attempt_id FROM channel_execution_attempts WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND target_id=$4 AND attempt_id=$5 FOR UPDATE")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
+        .bind(target_id).bind(attempt_id).fetch_optional(&mut **tx).await.map_err(unavailable)?;
+    sqlx::query("SELECT capture_id FROM observation_captures WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND target_id=$4 AND attempt_id=$5 AND phase='source' ORDER BY capture_id FOR UPDATE")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
+        .bind(target_id).bind(attempt_id).fetch_all(&mut **tx).await.map_err(unavailable)?;
+    Ok(())
+}
+
+async fn lock_revision_attempt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &TenantScope,
+    project: Uuid,
+    revision_id: Uuid,
+) -> Result<(), AppError> {
+    let row = sqlx::query("SELECT target_id,attempt_id FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND revision_id=$4")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
+        .bind(revision_id).fetch_optional(&mut **tx).await.map_err(unavailable)?
+        .ok_or_else(|| AppError::not_found("analysis revision not found"))?;
+    lock_admission_sources(
+        tx,
+        scope,
+        project,
+        row.get("target_id"),
+        row.get("attempt_id"),
+    )
+    .await
+}
+
+pub(crate) async fn history_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &TenantScope,
+    project: Uuid,
+    target_id: Uuid,
+    attempt_id: Uuid,
+) -> Result<String, AppError> {
+    // Results are write-once with the completed-state transition. Hash only
+    // lifecycle metadata, not potentially large candidate/audit payloads.
+    let rows = sqlx::query("SELECT revision_id,state,created_at,started_at,analyzed_at,inference_resolved FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND target_id=$4 AND attempt_id=$5 ORDER BY revision_id")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
+        .bind(target_id).bind(attempt_id).fetch_all(&mut **tx).await.map_err(unavailable)?;
+    let versions: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<Uuid, _>("revision_id"),
+                row.get::<String, _>("state"),
+                row.get::<DateTime<Utc>, _>("created_at"),
+                row.get::<Option<DateTime<Utc>>, _>("started_at"),
+                row.get::<Option<DateTime<Utc>>, _>("analyzed_at"),
+                row.get::<bool, _>("inference_resolved"),
+            )
+        })
+        .collect();
+    Ok(sha256_hex(&serde_json::to_vec(&versions).map_err(
+        |_| AppError::conflict("analysis history snapshot invalid"),
+    )?))
+}
+
+pub(crate) async fn unresolved_for_attempt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &TenantScope,
+    project: Uuid,
+    target_id: Uuid,
+    attempt_id: Uuid,
+) -> Result<bool, AppError> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND target_id=$4 AND attempt_id=$5 AND (state <> 'completed' OR (NOT inference_resolved AND COALESCE(result->'outcome'->>'status','') NOT IN ('grounded','unverified'))))")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
+        .bind(target_id).bind(attempt_id).fetch_one(&mut **tx).await.map_err(unavailable)
 }

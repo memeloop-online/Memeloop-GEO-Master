@@ -400,4 +400,42 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
             .unwrap()
             .is_none()
     );
+    let mut automatic_v2 = second.request.clone();
+    automatic_v2.source_capture_id = equal_receipt.capture_id;
+    automatic_v2.prompt_version = "extract.v2".into();
+    let mut automatic_v3 = automatic_v2.clone();
+    automatic_v3.prompt_version = "extract.v3".into();
+    let (left, right) = tokio::join!(
+        store.admit_automatic(&scope, automatic_v2, now),
+        store.admit_automatic(&scope, automatic_v3.clone(), now),
+    );
+    let geo_domain::AutomaticExtractionAdmission::Intent(automatic) = left.unwrap() else {
+        panic!("unexpected manual deferral")
+    };
+    assert_eq!(
+        right.unwrap(),
+        geo_domain::AutomaticExtractionAdmission::Intent(automatic.clone())
+    );
+    let claim = store
+        .claim(&scope, automatic.intent_id, now)
+        .await
+        .unwrap()
+        .unwrap();
+    let terminal = store
+        .interrupt(
+            &scope,
+            automatic.intent_id,
+            claim.claim_token,
+            ObservationExtractionInterruption::InferenceInterrupted,
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .admit_automatic(&scope, automatic_v3, now)
+            .await
+            .unwrap(),
+        geo_domain::AutomaticExtractionAdmission::Intent(terminal)
+    );
 }

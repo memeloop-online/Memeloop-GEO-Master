@@ -2,9 +2,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ErrorCode, ObservationAnalysisResult, ObservationCaptureRepository,
-    ObservationExtractionBackfillItem, ObservationExtractionClaim, ObservationExtractionIntent,
-    ObservationExtractionInterruption, ObservationExtractionReadyItem,
+    AppError, AutomaticExtractionAdmission, ErrorCode, ObservationAnalysisResult,
+    ObservationCaptureRepository, ObservationExtractionBackfillItem, ObservationExtractionClaim,
+    ObservationExtractionIntent, ObservationExtractionInterruption, ObservationExtractionReadyItem,
     ObservationExtractionRepository, ObservationExtractionRequest, ObservationExtractionResponse,
     ObservationExtractionState, ObservationExtractionStatus, TenantScope,
     validate_observation_extraction_page_size, validate_observation_extraction_scope,
@@ -111,6 +111,80 @@ async fn write(
 
 #[async_trait]
 impl ObservationExtractionRepository for PgObservationExtractionRepository {
+    async fn admit_automatic(
+        &self,
+        scope: &TenantScope,
+        request: ObservationExtractionRequest,
+        created_at: DateTime<Utc>,
+    ) -> Result<AutomaticExtractionAdmission, AppError> {
+        self.admit_automatic_with_history(scope, request, created_at, "")
+            .await
+    }
+    async fn admit_automatic_with_history(
+        &self,
+        scope: &TenantScope,
+        request: ObservationExtractionRequest,
+        created_at: DateTime<Utc>,
+        expected_history: &str,
+    ) -> Result<AutomaticExtractionAdmission, AppError> {
+        let key = request.intent_key(scope)?;
+        let capture = self
+            .captures
+            .get(scope, request.source_capture_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("extraction source not found"))?;
+        request.validate_source(scope, &capture)?;
+        let mut tx = self.transaction(scope).await?;
+        crate::observation_analysis::lock_admission_sources(
+            &mut tx,
+            scope,
+            project(scope),
+            request.target_id,
+            request.attempt_id,
+        )
+        .await?;
+        let existing = sqlx::query("SELECT * FROM observation_extraction_intents WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND source_capture_id=$4 ORDER BY created_at,intent_id LIMIT 1")
+            .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
+            .bind(request.source_capture_id).fetch_optional(&mut *tx).await.map_err(db)?;
+        if let Some(row) = existing {
+            let intent = decode(&row)?;
+            tx.commit().await.map_err(db)?;
+            return Ok(AutomaticExtractionAdmission::Intent(intent));
+        }
+        if !expected_history.is_empty()
+            && crate::observation_analysis::history_snapshot(
+                &mut tx,
+                scope,
+                project(scope),
+                request.target_id,
+                request.attempt_id,
+            )
+            .await?
+                != expected_history
+        {
+            tx.commit().await.map_err(db)?;
+            return Ok(AutomaticExtractionAdmission::DeferredHistoryChanged);
+        }
+        if crate::observation_analysis::unresolved_for_attempt(
+            &mut tx,
+            scope,
+            project(scope),
+            request.target_id,
+            request.attempt_id,
+        )
+        .await?
+        {
+            tx.commit().await.map_err(db)?;
+            return Ok(AutomaticExtractionAdmission::DeferredManual);
+        }
+        let intent = ObservationExtractionIntent::queued(request, key, created_at);
+        sqlx::query("INSERT INTO observation_extraction_intents (intent_id,operator_id,tenant_id,project_id,source_capture_id,intent_key,state,created_at,intent) VALUES ($1,$2,$3,$4,$5,$6,'queued',$7,$8)")
+            .bind(intent.intent_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
+            .bind(intent.request.source_capture_id).bind(&intent.intent_key).bind(created_at).bind(value(&intent)?)
+            .execute(&mut *tx).await.map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(AutomaticExtractionAdmission::Intent(intent))
+    }
     async fn scan_unqueued_sources(
         &self,
         as_of: DateTime<Utc>,
@@ -161,6 +235,14 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         request.validate_source(scope, &capture)?;
         let intent = ObservationExtractionIntent::queued(request, key, created_at);
         let mut tx = self.transaction(scope).await?;
+        crate::observation_analysis::lock_admission_sources(
+            &mut tx,
+            scope,
+            project(scope),
+            intent.request.target_id,
+            intent.request.attempt_id,
+        )
+        .await?;
         let inserted = sqlx::query("INSERT INTO observation_extraction_intents (intent_id,operator_id,tenant_id,project_id,source_capture_id,intent_key,state,created_at,intent) VALUES ($1,$2,$3,$4,$5,$6,'queued',$7,$8) ON CONFLICT (operator_id,tenant_id,project_id,intent_key) DO NOTHING RETURNING *")
             .bind(intent.intent_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
             .bind(intent.request.source_capture_id).bind(&intent.intent_key).bind(created_at).bind(value(&intent)?)

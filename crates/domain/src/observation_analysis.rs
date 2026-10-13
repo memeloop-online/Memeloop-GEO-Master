@@ -227,7 +227,29 @@ pub struct ObservationAnalysisRevision {
     pub started_at: Option<DateTime<Utc>>,
     pub analyzed_at: Option<DateTime<Utc>>,
     pub result: Option<ObservationAnalysisResult>,
+    /// A completed response (or proof no request was sent), not lease expiry.
+    #[serde(default)]
+    pub inference_resolved: bool,
 }
+
+impl ObservationAnalysisRevision {
+    pub fn blocks_automatic_admission(&self) -> bool {
+        self.state != ObservationAnalysisState::Completed
+            || (!self.inference_resolved
+                && !self.result.as_ref().is_some_and(|result| {
+                    matches!(
+                        result.outcome,
+                        ObservationAnalysisOutcome::Grounded { .. }
+                            | ObservationAnalysisOutcome::Unverified { .. }
+                    )
+                }))
+    }
+}
+
+/// Explicitly shared by the two memory repositories. Lock before either
+/// repository's records; never hold this across inference.
+#[derive(Clone, Default)]
+pub struct MemoryObservationAdmissionGate(pub(crate) Arc<Mutex<()>>);
 
 /// Only the successful claimant receives this token. There is deliberately no
 /// lease expiry/reclaim: an interrupted external inference is not blindly sent
@@ -515,6 +537,30 @@ pub fn observation_analysis_source_json(
 
 #[async_trait]
 pub trait ObservationAnalysisRepository: Send + Sync {
+    /// Snapshot of all revision lifecycle metadata, including transitions of
+    /// existing rows. Results are immutable after their completed transition.
+    /// Called while the shared gate is already held during checked admission.
+    async fn admission_history_snapshot(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<String, AppError>;
+    fn memory_admission_gate(&self) -> Option<MemoryObservationAdmissionGate> {
+        None
+    }
+    async fn has_unresolved_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<bool, AppError>;
+    async fn record_inference_resolved(
+        &self,
+        scope: &TenantScope,
+        revision_id: Uuid,
+        claim_token: Uuid,
+    ) -> Result<(), AppError>;
     /// Atomically save a deterministic interpretation of an already persisted
     /// response. Retries must match the source request, digest and result; there
     /// is no inference claim or partially written running revision to recover.
@@ -597,6 +643,7 @@ pub struct MemoryObservationAnalysisRepository {
     jobs: Arc<dyn ChannelJobRepository>,
     captures: Arc<dyn ObservationCaptureRepository>,
     records: Mutex<HashMap<Uuid, StoredAnalysis>>,
+    admission_gate: MemoryObservationAdmissionGate,
 }
 
 impl MemoryObservationAnalysisRepository {
@@ -608,7 +655,12 @@ impl MemoryObservationAnalysisRepository {
             jobs,
             captures,
             records: Mutex::new(HashMap::new()),
+            admission_gate: MemoryObservationAdmissionGate::default(),
         }
+    }
+    pub fn with_admission_gate(mut self, gate: MemoryObservationAdmissionGate) -> Self {
+        self.admission_gate = gate;
+        self
     }
 }
 
@@ -622,6 +674,77 @@ fn require_project(scope: &TenantScope) -> Result<(), AppError> {
 
 #[async_trait]
 impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
+    async fn admission_history_snapshot(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<String, AppError> {
+        require_project(scope)?;
+        let records = self.records.lock().await;
+        let mut versions: Vec<_> = records
+            .values()
+            .filter(|stored| {
+                stored.scope == *scope
+                    && stored.revision.request.target_id == target_id
+                    && stored.revision.request.attempt_id == attempt_id
+            })
+            .map(|stored| {
+                let revision = &stored.revision;
+                (
+                    revision.request.revision_id,
+                    revision.state,
+                    revision.created_at,
+                    revision.started_at,
+                    revision.analyzed_at,
+                    revision.inference_resolved,
+                )
+            })
+            .collect();
+        versions.sort_by_key(|version| version.0);
+        Ok(sha256_hex(&serde_json::to_vec(&versions).map_err(
+            |_| AppError::conflict("analysis history snapshot invalid"),
+        )?))
+    }
+    fn memory_admission_gate(&self) -> Option<MemoryObservationAdmissionGate> {
+        Some(self.admission_gate.clone())
+    }
+    async fn has_unresolved_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<bool, AppError> {
+        require_project(scope)?;
+        Ok(self.records.lock().await.values().any(|stored| {
+            stored.scope == *scope
+                && stored.revision.request.target_id == target_id
+                && stored.revision.request.attempt_id == attempt_id
+                && stored.revision.blocks_automatic_admission()
+        }))
+    }
+    async fn record_inference_resolved(
+        &self,
+        scope: &TenantScope,
+        revision_id: Uuid,
+        claim_token: Uuid,
+    ) -> Result<(), AppError> {
+        let _admission = self.admission_gate.0.lock().await;
+        require_project(scope)?;
+        let mut records = self.records.lock().await;
+        let stored = records
+            .get_mut(&revision_id)
+            .filter(|stored| stored.scope == *scope)
+            .ok_or_else(|| AppError::not_found("analysis revision not found"))?;
+        if claim_token.is_nil()
+            || stored.claim_token != Some(claim_token)
+            || stored.revision.state != ObservationAnalysisState::Running
+        {
+            return Err(AppError::conflict("analysis claim is not current"));
+        }
+        stored.revision.inference_resolved = true;
+        Ok(())
+    }
     async fn project_response(
         &self,
         scope: &TenantScope,
@@ -631,6 +754,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         result: ObservationAnalysisResult,
         analyzed_at: DateTime<Utc>,
     ) -> Result<ObservationAnalysisRevision, AppError> {
+        let _admission = self.admission_gate.0.lock().await;
         request.validate(scope, idempotency_key, request_digest, analyzed_at)?;
         result.validate()?;
         let target = self.jobs.get_target(scope, request.target_id).await?;
@@ -670,6 +794,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
             started_at: Some(analyzed_at),
             analyzed_at: Some(analyzed_at),
             result: Some(result),
+            inference_resolved: true,
         };
         records.insert(
             revision.request.revision_id,
@@ -725,6 +850,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         cutoff: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
+        let _admission = self.admission_gate.0.lock().await;
         require_project(scope)?;
         if cutoff > now {
             return Err(AppError::invalid_request(
@@ -765,6 +891,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         request: ObservationAnalysisRequest,
         created_at: DateTime<Utc>,
     ) -> Result<ObservationAnalysisRevision, AppError> {
+        let _admission = self.admission_gate.0.lock().await;
         request.validate(scope, idempotency_key, request_digest, created_at)?;
         let target = self.jobs.get_target(scope, request.target_id).await?;
         let capture = match request.source {
@@ -801,6 +928,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
             started_at: None,
             analyzed_at: None,
             result: None,
+            inference_resolved: false,
         };
         records.insert(
             revision.request.revision_id,
@@ -820,6 +948,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         revision_id: Uuid,
         started_at: DateTime<Utc>,
     ) -> Result<Option<ObservationAnalysisClaim>, AppError> {
+        let _admission = self.admission_gate.0.lock().await;
         require_project(scope)?;
         let mut records = self.records.lock().await;
         let stored = records
@@ -852,6 +981,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         result: ObservationAnalysisResult,
         analyzed_at: DateTime<Utc>,
     ) -> Result<ObservationAnalysisRevision, AppError> {
+        let _admission = self.admission_gate.0.lock().await;
         require_project(scope)?;
         result.validate()?;
         let mut records = self.records.lock().await;
@@ -1086,6 +1216,306 @@ mod tests {
             prompt_tokens: 3,
             completion_tokens: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn known_failed_response_is_resolved_only_with_checkpoint() {
+        let f = fixture().await;
+        let mut revision = f
+            .store
+            .create(
+                &f.scope,
+                "classification",
+                &sha256_hex(b"classification"),
+                f.request,
+                f.now,
+            )
+            .await
+            .unwrap();
+        revision.state = ObservationAnalysisState::Completed;
+        for code in [
+            "grounding_unavailable",
+            "analysis_result_invalid",
+            "model_timeout",
+            "analysis_interrupted",
+        ] {
+            let mut failed = result();
+            failed.outcome = ObservationAnalysisOutcome::Failed { code: code.into() };
+            revision.result = Some(failed);
+            revision.inference_resolved = false;
+            assert!(revision.blocks_automatic_admission());
+            revision.inference_resolved = true;
+            assert!(!revision.blocks_automatic_admission());
+        }
+        revision.inference_resolved = false;
+        revision.result = Some(result());
+        assert!(!revision.blocks_automatic_admission());
+    }
+
+    fn automatic_request(f: &Fixture) -> crate::ObservationExtractionRequest {
+        crate::ObservationExtractionRequest {
+            target_id: f.request.target_id,
+            attempt_id: f.request.attempt_id,
+            source_capture_id: f.source_capture_id,
+            source_sha256: f.request.source_sha256.clone(),
+            prompt_version: "extract.v2".into(),
+            parser_version: "ground.v2".into(),
+            policy_version: "policy.v1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn history_snapshot_fences_new_and_transitioned_manual_results() {
+        use crate::{AutomaticExtractionAdmission as Admission, ObservationExtractionRepository};
+        let f = fixture().await;
+        let request = automatic_request(&f);
+        let gate = MemoryObservationAdmissionGate::default();
+        let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
+        let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
+            .with_automatic_admission(gate, analyses.clone());
+        let empty = analyses
+            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
+            .await
+            .unwrap();
+        analyses
+            .create(
+                &f.scope,
+                "changed-history",
+                &sha256_hex(b"history"),
+                f.request.clone(),
+                f.now,
+            )
+            .await
+            .unwrap();
+        let queued = analyses
+            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
+            .await
+            .unwrap();
+        assert_ne!(empty, queued);
+        let claim = analyses
+            .claim(&f.scope, f.request.revision_id, f.now)
+            .await
+            .unwrap()
+            .unwrap();
+        let running = analyses
+            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
+            .await
+            .unwrap();
+        assert_ne!(queued, running);
+        analyses
+            .record_inference_resolved(&f.scope, f.request.revision_id, claim.claim_token)
+            .await
+            .unwrap();
+        let received = analyses
+            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
+            .await
+            .unwrap();
+        assert_ne!(running, received);
+        analyses
+            .finish(
+                &f.scope,
+                f.request.revision_id,
+                claim.claim_token,
+                result(),
+                f.now,
+            )
+            .await
+            .unwrap();
+        let completed = analyses
+            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
+            .await
+            .unwrap();
+        assert_ne!(received, completed);
+        for snapshot in [empty, queued, running, received] {
+            assert_eq!(
+                extraction
+                    .admit_automatic_with_history(&f.scope, request.clone(), f.now, &snapshot)
+                    .await
+                    .unwrap(),
+                Admission::DeferredHistoryChanged
+            );
+        }
+        assert!(
+            extraction
+                .scan_ready(f.now, None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            extraction
+                .admit_automatic_with_history(&f.scope, request, f.now, &completed)
+                .await
+                .unwrap(),
+            Admission::Intent(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn automatic_admission_shares_versions_and_preserves_terminal_intent() {
+        use crate::{AutomaticExtractionAdmission as Admission, ObservationExtractionRepository};
+        let f = fixture().await;
+        let request = automatic_request(&f);
+        let gate = MemoryObservationAdmissionGate::default();
+        let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
+        let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
+            .with_automatic_admission(gate, analyses.clone());
+        let mut newer = request.clone();
+        newer.prompt_version = "extract.v3".into();
+        newer.parser_version = "ground.v3".into();
+        let (a, b) = tokio::join!(
+            extraction.admit_automatic(&f.scope, request.clone(), f.now),
+            extraction.admit_automatic(&f.scope, newer.clone(), f.now),
+        );
+        let Admission::Intent(intent) = a.unwrap() else {
+            panic!("unexpected deferral")
+        };
+        assert_eq!(b.unwrap(), Admission::Intent(intent.clone()));
+        // Explicit later manual work remains allowed.
+        analyses
+            .create(
+                &f.scope,
+                "later-manual",
+                &sha256_hex(b"manual"),
+                f.request,
+                f.now,
+            )
+            .await
+            .unwrap();
+        let claim = extraction
+            .claim(&f.scope, intent.intent_id, f.now)
+            .await
+            .unwrap()
+            .unwrap();
+        let terminal = extraction
+            .interrupt(
+                &f.scope,
+                intent.intent_id,
+                claim.claim_token,
+                crate::ObservationExtractionInterruption::InferenceInterrupted,
+                f.now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            extraction
+                .admit_automatic(&f.scope, newer, f.now)
+                .await
+                .unwrap(),
+            Admission::Intent(terminal)
+        );
+        assert!(
+            extraction
+                .claim(&f.scope, intent.intent_id, f.now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_first_and_ambiguous_stale_failure_defer_automatic() {
+        use crate::{AutomaticExtractionAdmission as Admission, ObservationExtractionRepository};
+        for checkpoint in [false, true] {
+            let f = fixture().await;
+            let request = automatic_request(&f);
+            let gate = MemoryObservationAdmissionGate::default();
+            let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
+            let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
+                .with_automatic_admission(gate, analyses.clone());
+            analyses
+                .create(
+                    &f.scope,
+                    "manual",
+                    &sha256_hex(b"manual"),
+                    f.request.clone(),
+                    f.now,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                extraction
+                    .admit_automatic(&f.scope, request.clone(), f.now)
+                    .await
+                    .unwrap(),
+                Admission::DeferredManual
+            );
+            let claim = analyses
+                .claim(&f.scope, f.request.revision_id, f.now)
+                .await
+                .unwrap()
+                .unwrap();
+            if checkpoint {
+                analyses
+                    .record_inference_resolved(&f.scope, f.request.revision_id, claim.claim_token)
+                    .await
+                    .unwrap();
+            }
+            // Even a received response does not permit overlapping grounding.
+            assert_eq!(
+                extraction
+                    .admit_automatic(&f.scope, request.clone(), f.now)
+                    .await
+                    .unwrap(),
+                Admission::DeferredManual
+            );
+            analyses
+                .interrupt_stale(
+                    &f.scope,
+                    request.target_id,
+                    request.attempt_id,
+                    f.now,
+                    f.now,
+                )
+                .await
+                .unwrap();
+            assert!(
+                analyses
+                    .record_inference_resolved(&f.scope, f.request.revision_id, claim.claim_token)
+                    .await
+                    .is_err()
+            );
+            let admission = extraction
+                .admit_automatic(&f.scope, request, f.now)
+                .await
+                .unwrap();
+            assert_eq!(matches!(admission, Admission::Intent(_)), checkpoint);
+            let revision = analyses
+                .get(&f.scope, f.request.revision_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut legacy = serde_json::to_value(revision).unwrap();
+            legacy.as_object_mut().unwrap().remove("inference_resolved");
+            let legacy: ObservationAnalysisRevision = serde_json::from_value(legacy).unwrap();
+            assert!(legacy.blocks_automatic_admission());
+            let foreign = TenantScope::new(
+                f.scope.operator_id,
+                Uuid::new_v4().into(),
+                f.scope.project_id,
+            );
+            assert!(
+                !analyses
+                    .has_unresolved_for_attempt(&foreign, f.request.target_id, f.request.attempt_id)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_admission_rejects_independent_memory_gates() {
+        use crate::ObservationExtractionRepository;
+        let f = fixture().await;
+        let request = automatic_request(&f);
+        let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
+            .with_automatic_admission(MemoryObservationAdmissionGate::default(), Arc::new(f.store));
+        assert!(
+            extraction
+                .admit_automatic(&f.scope, request, f.now)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
