@@ -1027,8 +1027,8 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
           url.searchParams.get("chat_session_id"),
           "fixture-selected",
         );
-        assert.equal(url.searchParams.get("cache_version"), "null");
-        assert.equal(url.searchParams.get("cache_reset_at"), "null");
+        assert.equal(url.searchParams.has("cache_version"), false);
+        assert.equal(url.searchParams.has("cache_reset_at"), false);
         await route.fulfill({
           json: {
             code: 0,

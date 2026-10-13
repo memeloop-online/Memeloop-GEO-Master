@@ -11,9 +11,7 @@ const ORIGIN = "https://chat.deepseek.com";
 const CHAT = "synthetic-cleanup-session";
 const ACCOUNT = "synthetic-account";
 const TOKEN = "synthetic-cleanup-token";
-const HISTORY =
-  `${ORIGIN}/api/v0/chat/history_messages?chat_session_id=${CHAT}` +
-  "&cache_version=null&cache_reset_at=null";
+const HISTORY = `${ORIGIN}/api/v0/chat/history_messages?chat_session_id=${CHAT}`;
 const SELF = `${ORIGIN}/api/v0/users/current`;
 const DELETE = `${ORIGIN}/api/v0/chat_session/delete`;
 const absent = () => ({ code: 0, data: { biz_code: 1 } });
