@@ -27,8 +27,8 @@ use crate::{
     ApiError, AppState, AuthContext, ProjectConfiguredModelBridge, RequestContext, api_error,
 };
 
-const PROMPT_VERSION: &str = "geo.observation.extract.v2";
-const PARSER_VERSION: &str = "geo.observation.extract.v4";
+const PROMPT_VERSION: &str = "geo.observation.extract.v3";
+const PARSER_VERSION: &str = "geo.observation.extract.v5";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +75,8 @@ pub trait SavedObservationGrounder: Send + Sync {
         digest: &str,
         candidate: &str,
         protocol: Value,
+        prompt_version: &str,
+        parser_version: &str,
     ) -> Result<GroundingResult, AppError>;
 }
 
@@ -127,11 +129,14 @@ impl SavedObservationGrounder for HttpSavedObservationGrounder {
         digest: &str,
         candidate: &str,
         protocol: Value,
+        prompt_version: &str,
+        parser_version: &str,
     ) -> Result<GroundingResult, AppError> {
         let unavailable =
             || AppError::capability_missing("saved observation grounding unavailable");
         let mut response = self.client.post(&self.endpoint).bearer_auth(&self.token)
-            .json(&json!({"source_json":source,"source_sha256":digest,"candidate_json":candidate,"protocol":protocol}))
+            .json(&json!({"source_json":source,"source_sha256":digest,"candidate_json":candidate,"protocol":protocol,
+                "prompt_version":prompt_version,"parser_version":parser_version}))
             .send().await.map_err(|_| unavailable())?;
         if response.status() != StatusCode::OK {
             return Err(unavailable());
@@ -337,6 +342,16 @@ impl ObservationAnalysisService {
         scope: &TenantScope,
         request: &ObservationAnalysisRequest,
     ) -> Result<ObservationAnalysisResult, AppError> {
+        if !matches!(
+            (
+                request.prompt_version.as_str(),
+                request.parser_version.as_str()
+            ),
+            ("geo.observation.extract.v2", "geo.observation.extract.v4")
+                | ("geo.observation.extract.v3", "geo.observation.extract.v5")
+        ) {
+            return Ok(failed("analysis_version_unsupported"));
+        }
         let target = self.jobs.get_target(scope, request.target_id).await?;
         let capture = match request.source {
             ObservationAnalysisSource::Capture { capture_id } => {
@@ -345,8 +360,11 @@ impl ObservationAnalysisService {
             ObservationAnalysisSource::AttemptEvidence { .. } => None,
         };
         let source = observation_analysis_source_json(scope, request, &target, capture.as_ref())?;
-        let prompt = crate::observation_ai_callback::extraction_prompt(&source)
-            .map_err(|_| AppError::invalid_request("invalid saved source"))?;
+        let prompt = crate::observation_ai_callback::extraction_prompt_versioned(
+            &source,
+            &request.prompt_version,
+        )
+        .map_err(|_| AppError::invalid_request("invalid saved source"))?;
         let completion = self
             .model
             .complete_for_usage_with_revision(
@@ -413,7 +431,8 @@ impl ObservationAnalysisService {
             let phase = ModelPhaseTimer::start(ModelPhase::Grounding);
             let grounded = self.grounder.ground(&source, &request.source_sha256, &completion.text,
                 json!({ "provider":provider,"model":model,"surface":surface,"search_mode":search_mode,
-                    "protocol_version":protocol_version,"market":market,"language":language })).await;
+                    "protocol_version":protocol_version,"market":market,"language":language }),
+                &request.prompt_version, &request.parser_version).await;
             phase.finish(grounded.is_ok());
             match grounded {
                 Ok(grounded) => {
@@ -657,6 +676,8 @@ mod tests {
             _: &str,
             candidate: &str,
             _: Value,
+            _: &str,
+            _: &str,
         ) -> Result<GroundingResult, AppError> {
             Ok(GroundingResult {
                 candidate_json: Some(candidate.into()),
@@ -667,6 +688,44 @@ mod tests {
                 },
             })
         }
+    }
+
+    #[tokio::test]
+    async fn queued_analysis_versions_dispatch_legacy_and_reject_mismatch_before_model() {
+        let f = fixture(false, true, false).await;
+        let queued = f
+            .service
+            .submit(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                AnalyzeSavedSource {
+                    idempotency_key: "version-dispatch".into(),
+                    capture_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.request.prompt_version, "geo.observation.extract.v3");
+        assert_eq!(queued.request.parser_version, "geo.observation.extract.v5");
+        let mut request = queued.request.clone();
+        request.prompt_version = "geo.observation.extract.v2".into();
+        request.parser_version = "geo.observation.extract.v4".into();
+        let legacy = f.service.interpret(&f.scope, &request).await.unwrap();
+        assert!(matches!(
+            legacy.outcome,
+            ObservationAnalysisOutcome::Grounded { .. }
+        ));
+        let calls = f.model.0.load(Ordering::SeqCst);
+        request.parser_version = "geo.observation.extract.v5".into();
+        let mismatch = f.service.interpret(&f.scope, &request).await.unwrap();
+        assert_eq!(
+            mismatch.outcome,
+            ObservationAnalysisOutcome::Failed {
+                code: "analysis_version_unsupported".into(),
+            }
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), calls);
     }
 
     #[tokio::test]
@@ -855,9 +914,16 @@ mod tests {
             digest: &str,
             candidate: &str,
             protocol: Value,
+            prompt_version: &str,
+            parser_version: &str,
         ) -> Result<GroundingResult, AppError> {
             assert_eq!(sha256_hex(source.as_bytes()), digest);
             assert_eq!(protocol["model"], "measured-model");
+            assert!(matches!(
+                (prompt_version, parser_version),
+                ("geo.observation.extract.v2", "geo.observation.extract.v4")
+                    | ("geo.observation.extract.v3", "geo.observation.extract.v5")
+            ));
             if self.unavailable {
                 return Err(AppError::capability_missing("unavailable"));
             }

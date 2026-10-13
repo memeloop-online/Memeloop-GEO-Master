@@ -763,7 +763,10 @@ impl SearchEvent {
                     && event.request_question_sha256 == question_sha256
                     && extraction_sha256(&event.request_question_sha256)
                     && extraction_label(&event.extraction_model)
-                    && event.extraction_prompt_version == "geo.observation.extract.v2"
+                    && matches!(
+                        event.extraction_prompt_version.as_str(),
+                        "geo.observation.extract.v2" | "geo.observation.extract.v3"
+                    )
                     && extraction_sha256(&event.source_sha256) =>
             {
                 Some(event.observed_at)

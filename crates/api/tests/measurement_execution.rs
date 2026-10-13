@@ -61,6 +61,7 @@ enum Receipt {
     AiFuture,
     AiFixture,
     AiBrowser,
+    AiBrowserVersions(&'static str, &'static str),
     AiBrowserEventValue(&'static str, &'static str),
     AiBrowserAuditMismatch(&'static str),
     AiBrowserFuture,
@@ -85,6 +86,7 @@ impl Receipt {
                 | Self::AiFuture
                 | Self::AiFixture
                 | Self::AiBrowser
+                | Self::AiBrowserVersions(_, _)
                 | Self::AiBrowserEventValue(_, _)
                 | Self::AiBrowserAuditMismatch(_)
                 | Self::AiBrowserFuture
@@ -95,6 +97,7 @@ impl Receipt {
         matches!(
             self,
             Self::AiBrowser
+                | Self::AiBrowserVersions(_, _)
                 | Self::AiBrowserEventValue(_, _)
                 | Self::AiBrowserAuditMismatch(_)
                 | Self::AiBrowserFuture
@@ -261,6 +264,9 @@ async fn runner(
                         "extraction_prompt_version".into(),
                         json!("geo.observation.extract.v2"),
                     );
+                    if let Receipt::AiBrowserVersions(event_version, _) = case {
+                        event.insert("extraction_prompt_version".into(), json!(event_version));
+                    }
                     if let Receipt::AiBrowserEventValue(field, value) = case {
                         event.insert(field.into(), json!(value));
                     }
@@ -302,6 +308,9 @@ async fn runner(
                 }
                 if case.is_ai_browser() {
                     audit["prompt_version"] = json!("geo.observation.extract.v2");
+                    if let Receipt::AiBrowserVersions(_, audit_version) = case {
+                        audit["prompt_version"] = json!(audit_version);
+                    }
                     if let Receipt::AiBrowserAuditMismatch(field) = case {
                         audit[field] = json!("invalid value");
                     }
@@ -690,6 +699,40 @@ async fn connect_search_uses_actual_stream_correlation_without_synthetic_request
 
 #[tokio::test]
 async fn browser_ai_search_requires_yes_and_bound_audit_without_provider_ids() {
+    for (event_version, audit_version, expected) in [
+        (
+            "geo.observation.extract.v2",
+            "geo.observation.extract.v2",
+            ChannelOutcomeStatus::Observed,
+        ),
+        (
+            "geo.observation.extract.v3",
+            "geo.observation.extract.v3",
+            ChannelOutcomeStatus::Observed,
+        ),
+        (
+            "geo.observation.extract.v3",
+            "geo.observation.extract.v2",
+            ChannelOutcomeStatus::Unknown,
+        ),
+        (
+            "geo.observation.extract.v2",
+            "geo.observation.extract.v3",
+            ChannelOutcomeStatus::Unknown,
+        ),
+        (
+            "geo.observation.extract.v4",
+            "geo.observation.extract.v4",
+            ChannelOutcomeStatus::Unknown,
+        ),
+    ] {
+        assert_eq!(
+            run(Receipt::AiBrowserVersions(event_version, audit_version))
+                .await
+                .status,
+            expected
+        );
+    }
     let outcome = run(Receipt::AiBrowser).await;
     assert_eq!(outcome.status, ChannelOutcomeStatus::Observed);
     assert_eq!(outcome.raw_answer.as_deref(), Some("Original answer"));

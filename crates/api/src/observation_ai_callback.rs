@@ -21,6 +21,8 @@ use crate::{
 
 const PROMPT: &str =
     include_str!("../../../packages/browser-runner/src/observation-extraction-prompt.txt");
+const LEGACY_PROMPT: &str =
+    include_str!("../../../packages/browser-runner/src/observation-extraction-prompt-v2.txt");
 const POLICY_PATH: &str = "/internal/v1/observation-ai/policy";
 const EXTRACT_PATH: &str = "/internal/v1/observation-ai/extract";
 
@@ -38,6 +40,7 @@ struct SourceRequest {
     capture_ticket: String,
     source_capture_id: Uuid,
     source_sha256: String,
+    prompt_version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -83,7 +86,20 @@ impl ObservationAiCallbackService {
     }
 }
 
-pub(crate) fn extraction_prompt(source: &str) -> Result<String, StatusCode> {
+#[cfg(test)]
+fn extraction_prompt(source: &str) -> Result<String, StatusCode> {
+    extraction_prompt_versioned(source, "geo.observation.extract.v3")
+}
+
+pub(crate) fn extraction_prompt_versioned(
+    source: &str,
+    version: &str,
+) -> Result<String, StatusCode> {
+    let template = match version {
+        "geo.observation.extract.v2" => LEGACY_PROMPT,
+        "geo.observation.extract.v3" => PROMPT,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
     if source.len() > 750_000 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -93,7 +109,7 @@ pub(crate) fn extraction_prompt(source: &str) -> Result<String, StatusCode> {
         .get("messages")
         .and_then(serde_json::Value::as_array)
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let mut prompt = PROMPT.replace("\r\n", "\n").trim_end().to_owned();
+    let mut prompt = template.replace("\r\n", "\n").trim_end().to_owned();
     for (index, message) in messages.iter().enumerate() {
         prompt.push_str(&format!("\n/messages/{index} = {message}"));
     }
@@ -153,7 +169,13 @@ async fn extract(
 ) -> Result<Json<Extraction>, StatusCode> {
     let (scope, source) = service.source(&request).await?;
     let request = ModelCompletionRequest {
-        prompt: extraction_prompt(&source)?,
+        prompt: extraction_prompt_versioned(
+            &source,
+            request
+                .prompt_version
+                .as_deref()
+                .unwrap_or("geo.observation.extract.v2"),
+        )?,
         system: None,
         model: None,
         max_output_tokens: Some(24_000),
@@ -430,5 +452,17 @@ mod tests {
         ));
         assert!(extraction_prompt(r#"{"prompt":"injected"}"#).is_err());
         assert!(extraction_prompt(r#"{"messages":[],"rendered_text":{}}"#).is_err());
+    }
+
+    #[test]
+    fn prompt_dispatch_preserves_legacy_and_rejects_unknown_versions() {
+        let source = r#"{"messages":[]}"#;
+        let legacy = extraction_prompt_versioned(source, "geo.observation.extract.v2").unwrap();
+        assert_eq!(legacy, LEGACY_PROMPT.replace("\r\n", "\n").trim_end());
+        assert!(!legacy.contains("array_path"));
+        let compact = extraction_prompt_versioned(source, "geo.observation.extract.v3").unwrap();
+        assert!(compact.contains("array_path"));
+        assert!(compact.contains("end_index exclusive"));
+        assert!(extraction_prompt_versioned(source, "geo.observation.extract.future").is_err());
     }
 }

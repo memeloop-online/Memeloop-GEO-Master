@@ -143,7 +143,7 @@ function validateObservation(
   document,
   extracted,
   reject,
-  { semanticOnly = false } = {},
+  { semanticOnly = false, allowRanges = true } = {},
 ) {
   // Historical v3 replay remains available, but live interpretation explicitly
   // requires the semantic schema and cannot accept the old identifier contract.
@@ -274,8 +274,51 @@ function validateObservation(
       return reject("owner_rejected");
   }
 
-  const segments = [];
+  const expanded = [];
   for (const segment of extracted.answer_segments) {
+    if (object(segment) && Object.hasOwn(segment, "array_path")) {
+      if (
+        !semantic ||
+        !allowRanges ||
+        Object.keys(segment).length !== 4 ||
+        !["array_path", "start_index", "end_index", "item_path"].every((key) =>
+          Object.hasOwn(segment, key),
+        )
+      )
+        return reject("shape_rejected");
+      const array = pointer(document, segment.array_path)?.value;
+      if (!Array.isArray(array)) return reject("path_rejected");
+      if (
+        !Number.isSafeInteger(segment.start_index) ||
+        !Number.isSafeInteger(segment.end_index) ||
+        segment.start_index < 0 ||
+        segment.start_index >= segment.end_index ||
+        segment.end_index > array.length
+      )
+        return reject("answer_bounds_rejected");
+      if (
+        typeof segment.item_path !== "string" ||
+        segment.item_path.length > 2048 ||
+        (segment.item_path !== "" && !segment.item_path.startsWith("/"))
+      )
+        return reject("path_rejected");
+      if (
+        expanded.length + segment.end_index - segment.start_index >
+        MAX_SEGMENTS
+      )
+        return reject("shape_rejected");
+      for (let index = segment.start_index; index < segment.end_index; index++)
+        expanded.push({
+          path: `${segment.array_path}/${index}${segment.item_path}`,
+        });
+    } else {
+      if (expanded.length >= MAX_SEGMENTS) return reject("shape_rejected");
+      expanded.push(segment);
+    }
+  }
+  const segments = [];
+  let answerBytes = 0;
+  for (const segment of expanded) {
     if (!object(segment)) return reject("shape_rejected");
     const source = resolve(
       segment,
@@ -318,6 +361,8 @@ function validateObservation(
       /[\uD800-\uDBFF]$/u.test(exact)
     )
       return reject("unicode_rejected");
+    answerBytes += Buffer.byteLength(exact, "utf8");
+    if (answerBytes > MAX_ANSWER_BYTES) return reject("answer_too_large");
     segments.push(exact);
     refs.push({
       role: "answer_segment",

@@ -18,7 +18,7 @@ use crate::{
 
 pub const MAX_ANALYSIS_CANDIDATE_BYTES: usize = 150_000;
 pub const MAX_ANALYSIS_ANSWER_BYTES: usize = 100_000;
-pub const MAX_ANALYSIS_AUDIT_BYTES: usize = 150_000;
+pub const MAX_ANALYSIS_AUDIT_BYTES: usize = 512_000;
 pub const MAX_ANALYSIS_PROJECTION_ATTEMPTS: usize = 1000;
 
 /// Interpretation provenance is supplementary evidence, never a live receipt.
@@ -1724,6 +1724,25 @@ mod tests {
             audit: json!({"refs":[{}]}),
         };
         assert!(too_large.validate().is_err());
+    }
+
+    #[test]
+    fn expanded_audit_budget_accepts_exact_boundary_without_truncation() {
+        let mut grounded = result();
+        let mut audit = json!({"refs":[{}],"padding":""});
+        let overhead = serde_json::to_vec(&audit).unwrap().len();
+        audit["padding"] = json!("x".repeat(MAX_ANALYSIS_AUDIT_BYTES - overhead));
+        assert_eq!(serde_json::to_vec(&audit).unwrap().len(), 512_000);
+        grounded.outcome = ObservationAnalysisOutcome::Grounded {
+            raw_answer: "Synthetic answer".into(),
+            citations: vec![],
+            audit,
+        };
+        assert!(grounded.validate().is_ok());
+        if let ObservationAnalysisOutcome::Grounded { audit, .. } = &mut grounded.outcome {
+            audit["padding"] = json!("x".repeat(MAX_ANALYSIS_AUDIT_BYTES - overhead + 1));
+        }
+        assert!(grounded.validate().is_err());
     }
 
     #[tokio::test]

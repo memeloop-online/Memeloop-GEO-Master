@@ -132,7 +132,7 @@ test("saved grounding bounds amplified audit references", () => {
       source_sha256: digest(source_json),
       candidate_json: JSON.stringify({
         ...candidate,
-        answer_segments: Array.from({ length: 1200 }, () => ({
+        answer_segments: Array.from({ length: 4000 }, () => ({
           path: "/messages/0/text",
         })),
       }),

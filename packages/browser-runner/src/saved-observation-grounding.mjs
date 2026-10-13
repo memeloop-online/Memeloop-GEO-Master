@@ -12,7 +12,7 @@ export const SAVED_GROUNDING_BODY_BYTES = 6_000_000;
 const MAX_SOURCE_BYTES = 750_000;
 const MAX_CANDIDATE_BYTES = 150_000;
 const MAX_PROTOCOL_BYTES = 8192;
-const MAX_AUDIT_BYTES = 150_000;
+const MAX_AUDIT_BYTES = 512_000;
 const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -36,6 +36,8 @@ export function groundSavedObservation(input) {
           "source_sha256",
           "candidate_json",
           "protocol",
+          "prompt_version",
+          "parser_version",
         ].includes(key),
     ) ||
     typeof input.source_json !== "string" ||
@@ -45,6 +47,23 @@ export function groundSavedObservation(input) {
     !/^[a-f0-9]{64}$/u.test(input.source_sha256)
   )
     return rejected("shape_rejected");
+  const promptVersion = input.prompt_version ?? "geo.observation.extract.v2";
+  const parserVersion = input.parser_version ?? "geo.observation.extract.v4";
+  const legacy =
+    promptVersion === "geo.observation.extract.v2" &&
+    parserVersion === "geo.observation.extract.v4";
+  const compact =
+    promptVersion === "geo.observation.extract.v3" &&
+    parserVersion === "geo.observation.extract.v5";
+  if (
+    (!legacy && !compact) ||
+    Object.hasOwn(input, "prompt_version") !==
+      Object.hasOwn(input, "parser_version") ||
+    (Object.hasOwn(input, "prompt_version") &&
+      (typeof input.prompt_version !== "string" ||
+        typeof input.parser_version !== "string"))
+  )
+    return rejected("version_rejected");
   if (Buffer.byteLength(input.source_json, "utf8") > MAX_SOURCE_BYTES)
     return rejected("source_too_large");
   if (Buffer.byteLength(input.candidate_json, "utf8") > MAX_CANDIDATE_BYTES)
@@ -84,10 +103,14 @@ export function groundSavedObservation(input) {
   try {
     const grounded = validateAiObservation(document, candidate, {
       semanticOnly: true,
+      allowRanges: compact,
     });
     if (!grounded)
       return rejected(
-        observationRejectionReason(document, candidate, { semanticOnly: true }),
+        observationRejectionReason(document, candidate, {
+          semanticOnly: true,
+          allowRanges: compact,
+        }),
       );
     const result = {
       candidate_json: candidateJson,
@@ -98,7 +121,7 @@ export function groundSavedObservation(input) {
         audit: {
           ...grounded.audit,
           kind: "observation_extraction",
-          prompt_version: "geo.observation.extract.v2",
+          prompt_version: promptVersion,
           source_sha256: input.source_sha256,
           protocol: input.protocol,
         },
