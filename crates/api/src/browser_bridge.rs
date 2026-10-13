@@ -742,6 +742,35 @@ pub enum CompletionRecoveryResult {
 pub struct CompletionRecoveryDiagnostic {
     pub stage: CompletionRecoveryStage,
     pub code: CompletionRecoveryCode,
+    pub reason: Option<CompletionRecoveryReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionRecoveryReason {
+    DocumentUnavailable,
+    ReadDeadlineExceeded,
+    TransportUnavailable,
+    ResponseEnvelopeUnverified,
+    HistoryEnvelopeUnverified,
+    HistoryBindingMismatch,
+    InventoryUnverified,
+    CompletionUnverified,
+}
+
+impl CompletionRecoveryReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DocumentUnavailable => "document_unavailable",
+            Self::ReadDeadlineExceeded => "read_deadline_exceeded",
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::ResponseEnvelopeUnverified => "response_envelope_unverified",
+            Self::HistoryEnvelopeUnverified => "history_envelope_unverified",
+            Self::HistoryBindingMismatch => "history_binding_mismatch",
+            Self::InventoryUnverified => "inventory_unverified",
+            Self::CompletionUnverified => "completion_unverified",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -821,7 +850,15 @@ impl CompletionRecoveryResult {
                             CompletionRecoveryStage::Runner,
                             CompletionRecoveryCode::TransportUnknown
                         )
-                    )
+                    ) || (diagnostic.reason.is_some()
+                        && (!matches!(self, Self::Retained { .. })
+                            || !matches!(
+                                (&diagnostic.stage, &diagnostic.code),
+                                (
+                                    CompletionRecoveryStage::History,
+                                    CompletionRecoveryCode::CompletionUnverified
+                                )
+                            )))
                 }) {
                     return Err(BrowserBridge::recovery_unavailable());
                 }
@@ -1356,12 +1393,38 @@ mod completion_recovery_tests {
                 value["diagnostic"] = serde_json::json!({"stage":stage,"code":code});
                 let result: CompletionRecoveryResult = serde_json::from_value(value).unwrap();
                 assert!(result.validate(&request).is_ok());
+                for reason in [
+                    "document_unavailable",
+                    "read_deadline_exceeded",
+                    "transport_unavailable",
+                    "response_envelope_unverified",
+                    "history_envelope_unverified",
+                    "history_binding_mismatch",
+                    "inventory_unverified",
+                    "completion_unverified",
+                ] {
+                    let mut value = base.clone();
+                    value["diagnostic"] =
+                        serde_json::json!({"stage":stage,"code":code,"reason":reason});
+                    let result: CompletionRecoveryResult = serde_json::from_value(value).unwrap();
+                    assert_eq!(
+                        result.validate(&request).is_ok(),
+                        status == "retained" && stage == "history"
+                    );
+                    let parsed: CompletionRecoveryReason =
+                        serde_json::from_value(reason.into()).unwrap();
+                    assert_eq!(parsed.as_str(), reason);
+                }
             }
             for diagnostic in [
                 serde_json::json!({"stage":"history","code":"arbitrary private text"}),
                 serde_json::json!({"stage":"history","code":"completion_unverified","raw":"private"}),
                 serde_json::json!({"stage":"arbitrary","code":"completion_unverified"}),
                 serde_json::json!({"stage":"identity","code":"completion_unverified"}),
+                serde_json::json!({"stage":"history","code":"completion_unverified","reason":"synthetic private detail"}),
+                serde_json::json!({"stage":"history","code":"completion_unverified","reason":7}),
+                serde_json::json!({"stage":"history","code":"completion_unverified","reason":{"reason":"completion_unverified"}}),
+                serde_json::json!({"stage":"history","code":"completion_unverified","reason":"inventory_unverified","raw":"synthetic excluded"}),
             ] {
                 let mut value = base.clone();
                 value["diagnostic"] = diagnostic;
