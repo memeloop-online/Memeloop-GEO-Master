@@ -30,7 +30,7 @@ export interface AuthSession {
   user: SessionUser;
   operator: SessionOperator;
   memberships: TenantMembership[];
-  expires_at: string;
+  expires_at: string | null;
   csrf_token: string;
 }
 

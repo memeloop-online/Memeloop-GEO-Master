@@ -121,13 +121,13 @@ use axum::{
 };
 use futures_util::StreamExt;
 use geo_domain::{
-    AgentRepository, AgentRuntime, AppError, ConnectorCapabilityRepository,
-    DEFAULT_SESSION_TTL_SECS, DistributionScope, DocumentScope, EventEnvelope, InitialSource,
-    KnowledgeRepository, Membership, MemoryAgentRepository, MemoryAuthRepository,
-    MemoryConnectorCapabilityRepository, MemoryKnowledgeRepository, MissingAgentRuntime, Operation,
-    Operator, Project, ProjectCreate, ProjectId, ProjectOverview, ProjectPage, ProjectPatch,
-    ProjectRepository, ProjectSettings, ProjectStartAcceptance, ReportRepository, ReportSchedule,
-    ResourceMode, Role, TenantId, TenantScope, User, settings_hash,
+    AgentRepository, AgentRuntime, AppError, ConnectorCapabilityRepository, DistributionScope,
+    DocumentScope, EventEnvelope, InitialSource, KnowledgeRepository, Membership,
+    MemoryAgentRepository, MemoryAuthRepository, MemoryConnectorCapabilityRepository,
+    MemoryKnowledgeRepository, MissingAgentRuntime, Operation, Operator, Project, ProjectCreate,
+    ProjectId, ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
+    ProjectStartAcceptance, ReportRepository, ReportSchedule, ResourceMode, Role,
+    SESSION_COOKIE_MAX_AGE_SECS, TenantId, TenantScope, User, settings_hash,
 };
 use geo_persistence::{
     Database, PgAuthRepository, PgIdempotencyStore, PgKnowledgeRepository, PgProjectRepository,
@@ -1076,7 +1076,7 @@ pub struct AuthConfigResponse {
     pub tenant_selector_query: &'static str,
     pub tenant_selector_header: &'static str,
     pub same_origin_required: bool,
-    pub session_ttl_seconds: i64,
+    pub session_ttl_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub development_login_name: Option<&'static str>,
 }
@@ -1108,7 +1108,7 @@ pub struct AuthSessionResponse {
     pub user: UserView,
     pub operator: OperatorView,
     pub memberships: Vec<MembershipView>,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub csrf_token: String,
 }
 
@@ -1392,7 +1392,7 @@ async fn auth_config(State(state): State<AppState>) -> Response {
         tenant_selector_query: "tenant_id",
         tenant_selector_header: TENANT_SELECTOR_HEADER,
         same_origin_required: true,
-        session_ttl_seconds: DEFAULT_SESSION_TTL_SECS,
+        session_ttl_seconds: None,
         development_login_name: (!state.durable_storage())
             .then_some(geo_domain::DEVELOPMENT_USER_EMAIL),
     })
@@ -1447,11 +1447,7 @@ async fn auth_login(
         })?;
     let credentials = state
         .auth_repository()
-        .create_session(
-            identity.operator.id,
-            identity.user.id,
-            chrono::Duration::seconds(DEFAULT_SESSION_TTL_SECS),
-        )
+        .create_persistent_session(identity.operator.id, identity.user.id)
         .await
         .map_err(|error| api_error(error, request_context.request_id))?;
     let cookie_name = if state.durable_storage() {
@@ -1461,7 +1457,7 @@ async fn auth_login(
     };
     let secure = state.durable_storage();
     let cookie = format!(
-        "{cookie_name}={}; Path=/; Max-Age={DEFAULT_SESSION_TTL_SECS}; HttpOnly; SameSite=Lax{}",
+        "{cookie_name}={}; Path=/; Max-Age={SESSION_COOKIE_MAX_AGE_SECS}; HttpOnly; SameSite=Lax{}",
         credentials.token,
         if secure { "; Secure" } else { "" }
     );

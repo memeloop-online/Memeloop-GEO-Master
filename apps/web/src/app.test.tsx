@@ -62,6 +62,11 @@ function LogoutControl() {
   return <button onClick={() => void logout()}>测试退出</button>;
 }
 
+function SessionStatus() {
+  const { status, session: currentSession } = useAuth();
+  return <output>{`${status}:${currentSession?.user.id ?? ""}`}</output>;
+}
+
 afterEach(() => {
   setCsrfToken(undefined);
   setUnauthorizedHandler(undefined);
@@ -70,6 +75,32 @@ afterEach(() => {
 });
 
 describe("authentication and workspace guards", () => {
+  it("restores a persistent session with no server expiry after remount", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(() =>
+        Promise.resolve(response({ ...session, expires_at: null })),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const mount = () =>
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <AuthProvider>
+            <SessionStatus />
+          </AuthProvider>
+        </QueryClientProvider>,
+      );
+    const first = mount();
+    expect(await screen.findByText("authenticated:user-a")).toBeInTheDocument();
+    first.unmount();
+    mount();
+    expect(await screen.findByText("authenticated:user-a")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      screen.queryByRole("heading", { name: "登录工作区" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("redirects an anonymous deep link to login without starting a project request", async () => {
     const fetchMock = vi
       .fn()

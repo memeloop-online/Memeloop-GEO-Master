@@ -26,6 +26,7 @@ use tower::ServiceExt;
 struct RevocableMembershipRepository {
     inner: MemoryAuthRepository,
     membership_active: AtomicBool,
+    user_active: AtomicBool,
 }
 
 impl RevocableMembershipRepository {
@@ -33,6 +34,7 @@ impl RevocableMembershipRepository {
         Self {
             inner: MemoryAuthRepository::development_with_password("test-password"),
             membership_active: AtomicBool::new(true),
+            user_active: AtomicBool::new(true),
         }
     }
 }
@@ -65,7 +67,11 @@ impl AuthRepository for RevocableMembershipRepository {
         operator_id: OperatorId,
         user_id: UserId,
     ) -> Result<Option<User>, AppError> {
-        self.inner.find_user(operator_id, user_id).await
+        let mut user = self.inner.find_user(operator_id, user_id).await?;
+        if let Some(user) = &mut user {
+            user.active = self.user_active.load(Ordering::Acquire);
+        }
+        Ok(user)
     }
 
     async fn memberships(
@@ -86,6 +92,16 @@ impl AuthRepository for RevocableMembershipRepository {
         ttl: chrono::Duration,
     ) -> Result<SessionCredentials, AppError> {
         self.inner.create_session(operator_id, user_id, ttl).await
+    }
+
+    async fn create_persistent_session(
+        &self,
+        operator_id: OperatorId,
+        user_id: UserId,
+    ) -> Result<SessionCredentials, AppError> {
+        self.inner
+            .create_persistent_session(operator_id, user_id)
+            .await
     }
 
     async fn revoke_session(
@@ -157,6 +173,86 @@ fn request(
         builder = builder.header("idempotency-key", key);
     }
     builder.body(Body::from(body.to_owned())).expect("request")
+}
+
+#[tokio::test]
+async fn persistent_cookie_renewal_revalidates_user_membership_and_tenant() {
+    let auth = Arc::new(RevocableMembershipRepository::new());
+    let app = router(AppState::with_stores_and_auth(
+        Arc::new(MemoryOperationStore::default()),
+        Arc::new(MemoryIdempotencyStore::default()),
+        auth.clone(),
+        EventBus::default(),
+        false,
+    ));
+    let (cookie, _) = login(&app).await;
+    let token = cookie.split_once('=').unwrap().1;
+    let session = auth
+        .find_session(DEVELOPMENT_OPERATOR_ID, token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(session.is_active_at(chrono::Utc::now() + chrono::Duration::days(400)));
+    let valid = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/api/v1/auth/session",
+            &cookie,
+            None,
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::OK);
+    assert!(valid.headers().contains_key(SET_COOKIE));
+
+    let cross_tenant = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/v1/projects?tenant_id={}", uuid::Uuid::new_v4()),
+            &cookie,
+            None,
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant.status(), StatusCode::FORBIDDEN);
+    assert!(!cross_tenant.headers().contains_key(SET_COOKIE));
+
+    auth.user_active.store(false, Ordering::Release);
+    let disabled = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/api/v1/auth/session",
+            &cookie,
+            None,
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::UNAUTHORIZED);
+    assert!(!disabled.headers().contains_key(SET_COOKIE));
+    auth.user_active.store(true, Ordering::Release);
+    auth.membership_active.store(false, Ordering::Release);
+    let removed = app
+        .oneshot(request(
+            "GET",
+            "/api/v1/auth/session",
+            &cookie,
+            None,
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::FORBIDDEN);
+    assert!(!removed.headers().contains_key(SET_COOKIE));
 }
 
 #[tokio::test]

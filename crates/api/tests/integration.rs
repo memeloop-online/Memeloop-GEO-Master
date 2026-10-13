@@ -50,6 +50,12 @@ async fn login_as(app: &Router, login_name: &str, password: &str) -> (String, St
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
+    let set_cookie = response.headers()[SET_COOKIE].to_str().unwrap();
+    assert!(set_cookie.contains(&format!(
+        "Max-Age={}",
+        geo_domain::SESSION_COOKIE_MAX_AGE_SECS
+    )));
+    assert!(set_cookie.contains("; HttpOnly; SameSite=Lax"));
     let cookie = response
         .headers()
         .get(SET_COOKIE)
@@ -1634,6 +1640,7 @@ async fn login_session_logout_and_cookie_scope_are_server_bound() {
     assert_eq!(body["user"].as_object().unwrap().len(), 3);
     assert_eq!(body["user"]["login_name"], DEVELOPMENT_USER_EMAIL);
     assert_eq!(body["operator"]["slug"], "memeloop");
+    assert!(body["expires_at"].is_null());
     assert_eq!(
         body["memberships"][0]["tenant_id"],
         DEVELOPMENT_TENANT_ID.to_string()
@@ -1651,6 +1658,19 @@ async fn login_session_logout_and_cookie_scope_are_server_bound() {
         .unwrap();
     assert_eq!(session.status(), StatusCode::OK);
     assert_eq!(session.headers()["cache-control"], "no-store");
+    let renewed_cookie = session.headers()[SET_COOKIE].to_str().unwrap();
+    assert!(renewed_cookie.starts_with(&format!("{cookie};")));
+    assert!(renewed_cookie.contains(&format!(
+        "Max-Age={}",
+        geo_domain::SESSION_COOKIE_MAX_AGE_SECS
+    )));
+    assert!(renewed_cookie.contains("; HttpOnly; SameSite=Lax"));
+    let session_body: Value =
+        serde_json::from_slice(&to_bytes(session.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        session_body, body,
+        "renewal does not rotate identity or CSRF token"
+    );
 
     let logout = app
         .clone()
@@ -1664,6 +1684,13 @@ async fn login_session_logout_and_cookie_scope_are_server_bound() {
         .unwrap();
     assert_eq!(logout.status(), StatusCode::NO_CONTENT);
     assert_eq!(logout.headers()["cache-control"], "no-store");
+    assert!(
+        logout
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .all(|value| { value.to_str().unwrap().contains("Max-Age=0;") })
+    );
 
     let revoked = app
         .clone()
@@ -1676,6 +1703,7 @@ async fn login_session_logout_and_cookie_scope_are_server_bound() {
         .await
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    assert!(!revoked.headers().contains_key(SET_COOKIE));
 
     let cross_host = app
         .oneshot(
@@ -1689,6 +1717,106 @@ async fn login_session_logout_and_cookie_scope_are_server_bound() {
         .await
         .unwrap();
     assert_eq!(cross_host.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn persistent_production_cookie_renewal_keeps_secure_host_scope() {
+    use geo_domain::AuthRepository;
+    let auth = Arc::new(MemoryAuthRepository::development_with_password(
+        "test-password",
+    ));
+    let identity = auth
+        .authenticate(
+            DEVELOPMENT_OPERATOR_ID,
+            DEVELOPMENT_USER_EMAIL,
+            "test-password",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let credentials = auth
+        .create_persistent_session(DEVELOPMENT_OPERATOR_ID, identity.user.id)
+        .await
+        .unwrap();
+    let app = router(AppState::with_stores_and_auth(
+        Arc::new(geo_api::MemoryOperationStore::default()),
+        Arc::new(MemoryIdempotencyStore::default()),
+        auth,
+        EventBus::default(),
+        true,
+    ));
+    let wrong_cookie = app
+        .clone()
+        .oneshot(authenticated_request(
+            "GET",
+            "/api/v1/auth/session",
+            &format!("geo_dev_session={}", credentials.token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_cookie.status(), StatusCode::UNAUTHORIZED);
+    assert!(!wrong_cookie.headers().contains_key(SET_COOKIE));
+    let response = app
+        .oneshot(authenticated_request(
+            "GET",
+            "/api/v1/auth/session",
+            &format!("__Host-geo_session={}", credentials.token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()[SET_COOKIE].to_str().unwrap();
+    assert!(cookie.starts_with("__Host-geo_session="));
+    assert!(cookie.contains("; Path=/;"));
+    assert!(cookie.ends_with("; HttpOnly; SameSite=Lax; Secure"));
+    assert!(!cookie.contains("Domain="));
+}
+
+#[tokio::test]
+async fn finite_sessions_are_never_renewed_or_revived() {
+    use geo_domain::AuthRepository;
+    let auth = Arc::new(MemoryAuthRepository::development_with_password(
+        "test-password",
+    ));
+    let identity = auth
+        .authenticate(
+            DEVELOPMENT_OPERATOR_ID,
+            DEVELOPMENT_USER_EMAIL,
+            "test-password",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let app = router(AppState::with_stores_and_auth(
+        Arc::new(geo_api::MemoryOperationStore::default()),
+        Arc::new(MemoryIdempotencyStore::default()),
+        auth.clone(),
+        EventBus::default(),
+        false,
+    ));
+    for (ttl, status) in [
+        (chrono::Duration::hours(1), StatusCode::OK),
+        (chrono::Duration::hours(-1), StatusCode::UNAUTHORIZED),
+    ] {
+        let credentials = auth
+            .create_session(DEVELOPMENT_OPERATOR_ID, identity.user.id, ttl)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/api/v1/auth/session",
+                &format!("geo_dev_session={}", credentials.token),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert!(!response.headers().contains_key(SET_COOKIE));
+    }
 }
 
 #[tokio::test]
