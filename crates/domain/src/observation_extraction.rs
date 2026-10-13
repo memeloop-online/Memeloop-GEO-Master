@@ -318,6 +318,13 @@ pub struct ObservationExtractionReadyItem {
     pub state: ObservationExtractionState,
 }
 
+/// Discovery is not authorization to enqueue or perform inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationExtractionBackfillItem {
+    pub scope: TenantScope,
+    pub capture_id: Uuid,
+}
+
 pub fn validate_observation_extraction_page_size(limit: usize) -> Result<(), AppError> {
     if !(1..=100).contains(&limit) {
         return Err(AppError::invalid_request(
@@ -329,6 +336,16 @@ pub fn validate_observation_extraction_page_size(limit: usize) -> Result<(), App
 
 #[async_trait]
 pub trait ObservationExtractionRepository: Send + Sync {
+    /// Service-only source metadata with no extraction intent in any state or
+    /// version for the exact scoped capture. Fix the stored_at cutoff across
+    /// pages; UUID ordering is exclusive of `after`. Eligibility is decided by
+    /// the caller, not by this scan, and concurrent enqueue remains possible.
+    async fn scan_unqueued_sources(
+        &self,
+        as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ObservationExtractionBackfillItem>, AppError>;
     async fn enqueue(
         &self,
         scope: &TenantScope,
@@ -444,6 +461,40 @@ impl MemoryObservationExtractionRepository {
 
 #[async_trait]
 impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
+    async fn scan_unqueued_sources(
+        &self,
+        as_of: DateTime<Utc>,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ObservationExtractionBackfillItem>, AppError> {
+        validate_observation_extraction_page_size(limit)?;
+        let mut items = Vec::with_capacity(limit);
+        let mut cursor = after;
+        loop {
+            let sources = self.captures.scan_sources(as_of, cursor, limit).await?;
+            let exhausted = sources.len() < limit;
+            let records = self.records.lock().await;
+            for source in sources {
+                cursor = Some(source.capture_id);
+                if records.values().any(|stored| {
+                    stored.scope == source.scope
+                        && stored.intent.request.source_capture_id == source.capture_id
+                }) {
+                    continue;
+                }
+                items.push(ObservationExtractionBackfillItem {
+                    scope: source.scope,
+                    capture_id: source.capture_id,
+                });
+                if items.len() == limit {
+                    return Ok(items);
+                }
+            }
+            if exhausted {
+                return Ok(items);
+            }
+        }
+    }
     async fn enqueue(
         &self,
         scope: &TenantScope,
@@ -696,6 +747,128 @@ mod tests {
             },
             prompt_tokens: response.prompt_tokens,
             completion_tokens: response.completion_tokens,
+        }
+    }
+
+    struct SourceMetadata(Vec<crate::ObservationCaptureSourceItem>);
+
+    #[async_trait]
+    impl ObservationCaptureRepository for SourceMetadata {
+        async fn scan_sources(
+            &self,
+            _as_of: DateTime<Utc>,
+            after: Option<Uuid>,
+            limit: usize,
+        ) -> Result<Vec<crate::ObservationCaptureSourceItem>, AppError> {
+            validate_observation_extraction_page_size(limit)?;
+            Ok(self
+                .0
+                .iter()
+                .filter(|item| after.is_none_or(|id| item.capture_id > id))
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn save(
+            &self,
+            _scope: &TenantScope,
+            _input: ObservationCaptureInput,
+        ) -> Result<ObservationCaptureReceipt, AppError> {
+            panic!("discovery must not write captures")
+        }
+        async fn get(
+            &self,
+            _scope: &TenantScope,
+            _id: Uuid,
+        ) -> Result<Option<ObservationCapture>, AppError> {
+            panic!("discovery must not load capture bodies")
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_skips_all_states_and_versions_without_short_pages() {
+        let now = Utc::now();
+        let scope = scope();
+        let other = super::tests::scope();
+        let sources = (1..=8)
+            .map(|id| crate::ObservationCaptureSourceItem {
+                scope: if id == 7 {
+                    other.clone()
+                } else {
+                    scope.clone()
+                },
+                capture_id: Uuid::from_u128(id),
+            })
+            .collect();
+        let store = MemoryObservationExtractionRepository::new(Arc::new(SourceMetadata(sources)));
+        for (index, state) in [
+            ObservationExtractionState::Queued,
+            ObservationExtractionState::Running,
+            ObservationExtractionState::ResponseReceived,
+            ObservationExtractionState::Completed,
+            ObservationExtractionState::Interrupted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = request();
+            request.source_capture_id = Uuid::from_u128(index as u128 + 1);
+            request.prompt_version = format!("old-prompt.{index}");
+            request.parser_version = format!("old-parser.{index}");
+            request.policy_version = format!("old-policy.{index}");
+            let mut intent = ObservationExtractionIntent::queued(
+                request.clone(),
+                request.intent_key(&scope).unwrap(),
+                now,
+            );
+            intent.state = state;
+            store.records.lock().await.insert(
+                intent.intent_id,
+                Stored {
+                    scope: scope.clone(),
+                    intent,
+                    claim_token: None,
+                },
+            );
+        }
+        // Equal digests and even a same-ID intent in another scope do not
+        // suppress the source. The exact scoped capture is the only identity.
+        let mut request = request();
+        request.source_capture_id = Uuid::from_u128(7);
+        let intent = ObservationExtractionIntent::queued(
+            request.clone(),
+            request.intent_key(&scope).unwrap(),
+            now,
+        );
+        store.records.lock().await.insert(
+            intent.intent_id,
+            Stored {
+                scope: scope.clone(),
+                intent,
+                claim_token: None,
+            },
+        );
+        let first = store.scan_unqueued_sources(now, None, 2).await.unwrap();
+        assert_eq!(
+            first.iter().map(|item| item.capture_id).collect::<Vec<_>>(),
+            vec![Uuid::from_u128(6), Uuid::from_u128(7)]
+        );
+        assert_eq!(first[1].scope, other);
+        let last = store
+            .scan_unqueued_sources(now, Some(first[1].capture_id), 2)
+            .await
+            .unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].capture_id, Uuid::from_u128(8));
+        assert!(
+            store
+                .scan_unqueued_sources(now, Some(last[0].capture_id), 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for limit in [0, 101] {
+            assert!(store.scan_unqueued_sources(now, None, limit).await.is_err());
         }
     }
     async fn seeded() -> (

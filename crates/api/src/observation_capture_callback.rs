@@ -391,6 +391,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ObservationCaptureRepository for Store {
+        async fn scan_sources(
+            &self,
+            _: chrono::DateTime<Utc>,
+            _: Option<Uuid>,
+            _: usize,
+        ) -> Result<Vec<geo_domain::ObservationCaptureSourceItem>, AppError> {
+            unreachable!("callback-only test store")
+        }
         async fn save(
             &self,
             scope: &TenantScope,

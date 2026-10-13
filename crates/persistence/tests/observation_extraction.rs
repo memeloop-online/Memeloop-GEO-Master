@@ -13,6 +13,19 @@ use geo_persistence::{
 };
 use uuid::Uuid;
 
+async fn source_is_discovered(
+    store: &PgObservationExtractionRepository,
+    as_of: chrono::DateTime<Utc>,
+    capture_id: Uuid,
+) -> bool {
+    store
+        .scan_unqueued_sources(as_of, Some(Uuid::from_u128(capture_id.as_u128() - 1)), 1)
+        .await
+        .unwrap()
+        .first()
+        .is_some_and(|item| item.capture_id == capture_id)
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
 async fn extraction_single_claim_response_recovery_fencing_and_scope() {
@@ -90,7 +103,7 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         .bind(attempt_id).bind(operator).bind(tenant).bind(project).bind(target_id).bind(account_id).bind(now).execute(database.pool()).await.unwrap();
     let source_json = r#"{"messages":[{"content":"Synthetic response"}]}"#.to_owned();
     let source_sha256 = sha256_hex(source_json.as_bytes());
-    captures
+    let receipt = captures
         .save(
             &scope,
             ObservationCaptureInput {
@@ -112,6 +125,45 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         )
         .await
         .unwrap();
+    assert!(source_is_discovered(&store, receipt.stored_at, capture_id).await);
+    assert!(
+        !source_is_discovered(
+            &store,
+            receipt.stored_at - chrono::Duration::microseconds(1),
+            capture_id,
+        )
+        .await
+    );
+    let before = Some(Uuid::from_u128(capture_id.as_u128() - 1));
+    let source_page = captures
+        .scan_sources(receipt.stored_at, before, 1)
+        .await
+        .unwrap();
+    assert_eq!(source_page.len(), 1);
+    assert_eq!(source_page[0].scope, scope);
+    assert_eq!(source_page[0].capture_id, capture_id);
+    assert!(
+        captures
+            .scan_sources(receipt.stored_at, Some(capture_id), 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.capture_id > capture_id)
+    );
+    for limit in [0, 101] {
+        assert!(
+            captures
+                .scan_sources(receipt.stored_at, None, limit)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .scan_unqueued_sources(receipt.stored_at, None, limit)
+                .await
+                .is_err()
+        );
+    }
     let request = ObservationExtractionRequest {
         target_id,
         attempt_id,
@@ -122,6 +174,18 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         policy_version: "automatic.v1".into(),
     };
     let intent = store.enqueue(&scope, request.clone(), now).await.unwrap();
+    assert!(!source_is_discovered(&store, receipt.stored_at, capture_id).await);
+    // Another capture of identical bytes is not the same extraction identity.
+    let mut equal_source = captures
+        .get(&scope, capture_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .input;
+    equal_source.capture_id = Uuid::new_v4();
+    equal_source.runner_session_id = Uuid::new_v4();
+    let equal_receipt = captures.save(&scope, equal_source).await.unwrap();
+    assert!(source_is_discovered(&store, equal_receipt.stored_at, equal_receipt.capture_id).await);
     assert_eq!(
         store
             .status_for_attempt(&scope, target_id, attempt_id)
@@ -177,6 +241,7 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
     let claims: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
     assert_eq!(claims.len(), 1);
     let token = claims[0].claim_token;
+    assert!(!source_is_discovered(&store, receipt.stored_at, capture_id).await);
     assert_eq!(
         store
             .status_for_attempt(&scope, target_id, attempt_id)
@@ -218,6 +283,7 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         .await
         .unwrap();
     let resumed = PgObservationExtractionRepository::from_database(&database);
+    assert!(!source_is_discovered(&resumed, receipt.stored_at, capture_id).await);
     let status = resumed
         .status_for_attempt(&scope, target_id, attempt_id)
         .await
@@ -261,6 +327,7 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         .await
         .unwrap();
     assert_eq!(complete.state, ObservationExtractionState::Completed);
+    assert!(!source_is_discovered(&resumed, receipt.stored_at, capture_id).await);
     assert_eq!(
         resumed
             .status_for_attempt(&scope, target_id, attempt_id)
@@ -288,6 +355,7 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
     let mut second = request;
     second.policy_version = "automatic.v2".into();
     let second = store.enqueue(&scope, second, now).await.unwrap();
+    assert!(!source_is_discovered(&store, receipt.stored_at, capture_id).await);
     assert_eq!(
         store
             .status_for_attempt(&scope, target_id, attempt_id)
@@ -318,6 +386,7 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         .await
         .unwrap();
     assert_eq!(interrupted.response, Some(response.clone()));
+    assert!(!source_is_discovered(&store, receipt.stored_at, capture_id).await);
     assert!(
         store
             .record_response(&scope, second.intent_id, token, response, now)
