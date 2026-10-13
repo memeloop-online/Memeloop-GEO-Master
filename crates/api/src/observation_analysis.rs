@@ -14,8 +14,10 @@ use geo_domain::{
     AppError, ChannelJobRepository, ChannelTargetInput, ChannelTargetView,
     ObservationAnalysisOutcome, ObservationAnalysisRepository, ObservationAnalysisRequest,
     ObservationAnalysisResult, ObservationAnalysisRevision, ObservationAnalysisSource,
-    ObservationCaptureRepository, ObservationCaptureSnapshot, ProjectAiUsage, ProjectId,
-    TenantScope, observation_analysis_source_json, sha256_hex,
+    ObservationAnalysisState, ObservationCaptureRepository, ObservationCaptureSnapshot,
+    ObservationExtractionIntent, ObservationExtractionResponseDisposition,
+    ObservationExtractionState, ProjectAiUsage, ProjectId, TenantScope,
+    observation_analysis_source_json, sha256_hex,
 };
 use geo_provider::diagnostics::{ModelPhase, ModelPhaseTimer};
 use geo_worker::{HostOpError, HostOpErrorCode, ModelCompletionRequest};
@@ -24,11 +26,13 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, AuthContext, ProjectConfiguredModelBridge, RequestContext, api_error,
+    ApiError, AppState, AuthContext, EXTRACTION_POLICY_VERSION, ProjectConfiguredModelBridge,
+    RequestContext, api_error,
 };
 
 const PROMPT_VERSION: &str = "geo.observation.extract.v3";
 const PARSER_VERSION: &str = "geo.observation.extract.v5";
+const AUTOMATIC_KEY_PREFIX: &str = "automatic:observation-extraction:";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -286,6 +290,11 @@ impl ObservationAnalysisService {
         attempt_id: Uuid,
         input: AnalyzeSavedSource,
     ) -> Result<ObservationAnalysisRevision, AppError> {
+        if input.idempotency_key.starts_with(AUTOMATIC_KEY_PREFIX) {
+            return Err(AppError::invalid_request(
+                "reserved analysis submission key",
+            ));
+        }
         let target = self.jobs.get_target(scope, target_id).await?;
         self.interrupt_stale(scope, target_id, attempt_id).await?;
         let source = self.sources(scope, &target, attempt_id).await?.into_iter()
@@ -307,6 +316,190 @@ impl ObservationAnalysisService {
         self.repository
             .create(scope, &input.idempotency_key, &digest, request, Utc::now())
             .await
+    }
+
+    /// Continue only a received durable response. This method never invokes the
+    /// model or changes measurement/cleanup evidence. A live attempt without its
+    /// terminal receipt is deferred so the saved response can be retried later.
+    pub async fn project_extraction_response(
+        &self,
+        scope: &TenantScope,
+        intent: &ObservationExtractionIntent,
+    ) -> Result<Option<ObservationAnalysisRevision>, AppError> {
+        if intent.intent_id.is_nil()
+            || intent.request.intent_key(scope)? != intent.intent_key
+            || intent.request.policy_version != EXTRACTION_POLICY_VERSION
+            || !matches!(
+                intent.state,
+                ObservationExtractionState::ResponseReceived
+                    | ObservationExtractionState::Completed
+            )
+            || !supported_versions(
+                &intent.request.prompt_version,
+                &intent.request.parser_version,
+            )
+        {
+            return Err(AppError::conflict("extraction projection binding differs"));
+        }
+        let response = intent
+            .response
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("extraction response required"))?;
+        response.validate()?;
+        let received_at = intent
+            .response_received_at
+            .filter(|at| {
+                intent
+                    .started_at
+                    .is_some_and(|started| started >= intent.created_at && *at >= started)
+                    && *at <= Utc::now()
+            })
+            .ok_or_else(|| AppError::conflict("extraction response time differs"))?;
+        let target = self
+            .jobs
+            .get_target(scope, intent.request.target_id)
+            .await?;
+        let capture = self
+            .captures
+            .get(scope, intent.request.source_capture_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("extraction source capture not found"))?;
+        intent.request.validate_source(scope, &capture)?;
+        let request = ObservationAnalysisRequest {
+            revision_id: intent.intent_id,
+            target_id: intent.request.target_id,
+            attempt_id: intent.request.attempt_id,
+            source: ObservationAnalysisSource::Capture {
+                capture_id: intent.request.source_capture_id,
+            },
+            source_sha256: intent.request.source_sha256.clone(),
+            observed_at: capture.input.observed_at,
+            prompt_version: intent.request.prompt_version.clone(),
+            parser_version: intent.request.parser_version.clone(),
+        };
+        let attempt = target
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == request.attempt_id)
+            .ok_or_else(|| AppError::not_found("measurement attempt not found"))?;
+        if attempt.outcome.is_none() || attempt.received_at.is_none() {
+            return Ok(None);
+        }
+        let source = observation_analysis_source_json(scope, &request, &target, Some(&capture))?;
+        let digest = sha256_hex(
+            &serde_json::to_vec(&(
+                "observation-extraction-projection.v1",
+                scope,
+                &intent.request,
+                &intent.intent_key,
+                response,
+                received_at,
+            ))
+            .map_err(|_| AppError::invalid_request("invalid extraction projection"))?,
+        );
+        if let Some(prior) = self.repository.get(scope, intent.intent_id).await? {
+            if prior.request_digest != digest
+                || !prior.request.same_input(&request)
+                || prior.state != ObservationAnalysisState::Completed
+                || prior.result.as_ref().is_none_or(|result| {
+                    result.actual_model.as_ref() != Some(&response.actual_model)
+                        || result.config_revision != response.config_revision
+                        || result.prompt_tokens != response.prompt_tokens
+                        || result.completion_tokens != response.completion_tokens
+                })
+            {
+                return Err(AppError::conflict("extraction projection already differs"));
+            }
+            return Ok(Some(prior));
+        }
+        let ChannelTargetInput::Measure {
+            provider,
+            model,
+            surface,
+            search_mode,
+            protocol_version,
+            market,
+            language,
+            ..
+        } = &target.target.input
+        else {
+            return Err(AppError::invalid_request("measurement required"));
+        };
+        let protocol = json!({"provider":provider,"model":model,"surface":surface,"search_mode":search_mode,
+            "protocol_version":protocol_version,"market":market,"language":language});
+        let reason = if response.model_text.len() > 150_000 {
+            Some("model_output_too_large")
+        } else {
+            match response.disposition {
+                ObservationExtractionResponseDisposition::Incomplete => {
+                    Some("model_output_incomplete")
+                }
+                ObservationExtractionResponseDisposition::ToolCalls => {
+                    Some("model_output_tool_calls")
+                }
+                ObservationExtractionResponseDisposition::UnexpectedFinish => {
+                    Some("model_output_invalid")
+                }
+                ObservationExtractionResponseDisposition::Complete => None,
+            }
+        };
+        let mut result = ObservationAnalysisResult {
+            config_revision: response.config_revision,
+            actual_model: Some(response.actual_model.clone()),
+            candidate_json: None,
+            outcome: ObservationAnalysisOutcome::Unverified {
+                reason: reason.unwrap_or("model_output_invalid").into(),
+            },
+            prompt_tokens: response.prompt_tokens,
+            completion_tokens: response.completion_tokens,
+        };
+        if reason.is_none() {
+            let phase = ModelPhaseTimer::start(ModelPhase::Grounding);
+            let grounded = self
+                .grounder
+                .ground(
+                    &source,
+                    &request.source_sha256,
+                    &response.model_text,
+                    protocol.clone(),
+                    &request.prompt_version,
+                    &request.parser_version,
+                )
+                .await;
+            phase.finish(grounded.is_ok());
+            // A transient grounding error leaves the durable response available
+            // and creates no partial analysis revision or new inference.
+            let grounded = grounded?;
+            result.candidate_json = grounded.candidate_json;
+            result.outcome = match grounded.outcome {
+                ObservationAnalysisOutcome::Failed { code } => {
+                    ObservationAnalysisOutcome::Unverified { reason: code }
+                }
+                outcome => outcome,
+            };
+            let audit_matches = match &result.outcome {
+                ObservationAnalysisOutcome::Grounded { audit, .. } => {
+                    audit["kind"] == "observation_extraction"
+                        && audit["method"] == "llm_grounded"
+                        && audit["source_sha256"] == request.source_sha256
+                        && audit["prompt_version"] == request.prompt_version
+                        && audit["protocol"] == protocol
+                }
+                _ => true,
+            };
+            if !audit_matches || result.validate().is_err() {
+                result.candidate_json = None;
+                result.outcome = ObservationAnalysisOutcome::Unverified {
+                    reason: "analysis_result_invalid".into(),
+                };
+            }
+        }
+        result.validate()?;
+        let key = format!("{AUTOMATIC_KEY_PREFIX}{}", intent.intent_key);
+        self.repository
+            .project_response(scope, &key, &digest, request, result, Utc::now())
+            .await
+            .map(Some)
     }
 
     #[tracing::instrument(name = "saved_observation_analysis", skip_all, fields(call_id = %Uuid::new_v4()))]
@@ -342,14 +535,7 @@ impl ObservationAnalysisService {
         scope: &TenantScope,
         request: &ObservationAnalysisRequest,
     ) -> Result<ObservationAnalysisResult, AppError> {
-        if !matches!(
-            (
-                request.prompt_version.as_str(),
-                request.parser_version.as_str()
-            ),
-            ("geo.observation.extract.v2", "geo.observation.extract.v4")
-                | ("geo.observation.extract.v3", "geo.observation.extract.v5")
-        ) {
+        if !supported_versions(&request.prompt_version, &request.parser_version) {
             return Ok(failed("analysis_version_unsupported"));
         }
         let target = self.jobs.get_target(scope, request.target_id).await?;
@@ -460,6 +646,14 @@ impl ObservationAnalysisService {
         }
         Ok(result)
     }
+}
+
+fn supported_versions(prompt: &str, parser: &str) -> bool {
+    matches!(
+        (prompt, parser),
+        ("geo.observation.extract.v2", "geo.observation.extract.v4")
+            | ("geo.observation.extract.v3", "geo.observation.extract.v5")
+    )
 }
 
 pub(crate) fn model_failure_code(error: &HostOpError) -> &'static str {
@@ -633,8 +827,9 @@ mod tests {
     use geo_domain::{
         ChannelOutcome, ChannelOutcomeStatus, ChannelTarget, DEVELOPMENT_OPERATOR_ID,
         DEVELOPMENT_TENANT_ID, MemoryObservationAnalysisRepository,
-        MemoryObservationCaptureRepository, ObservationCaptureInput, ObservationProviderIdentity,
-        ProjectCreate, ProjectSettings, StandaloneMeasurementPlan,
+        MemoryObservationCaptureRepository, ObservationCaptureInput, ObservationExtractionRequest,
+        ObservationExtractionResponse, ObservationProviderIdentity, ProjectCreate, ProjectSettings,
+        StandaloneMeasurementPlan,
     };
     use geo_worker::{HostOpError, ModelCompletion};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -932,7 +1127,8 @@ mod tests {
                 outcome: ObservationAnalysisOutcome::Grounded {
                     raw_answer: "Synthetic saved answer".into(),
                     citations: vec![],
-                    audit: json!({"refs":[{"path":"/messages/0/content","quote":"Synthetic saved answer"}],"source_sha256":digest}),
+                    audit: json!({"kind":"observation_extraction","method":"llm_grounded","prompt_version":prompt_version,
+                    "protocol":protocol,"refs":[{"path":"/messages/0/content","quote":"Synthetic saved answer"}],"source_sha256":digest}),
                 },
             })
         }
@@ -961,6 +1157,16 @@ mod tests {
         identity_bound: bool,
         unavailable: bool,
         detail: &str,
+    ) -> Fixture {
+        fixture_with_terminal(fixture_receipt, identity_bound, unavailable, detail, true).await
+    }
+
+    async fn fixture_with_terminal(
+        fixture_receipt: bool,
+        identity_bound: bool,
+        unavailable: bool,
+        detail: &str,
+        terminal: bool,
     ) -> Fixture {
         let state = AppState::development_with_password("analysis-test");
         let tenant = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
@@ -1047,8 +1253,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let original = jobs
-            .finish(
+        let original = if terminal {
+            jobs.finish(
                 &scope,
                 target_id,
                 attempt_id,
@@ -1074,7 +1280,10 @@ mod tests {
                 now + chrono::Duration::seconds(2),
             )
             .await
-            .unwrap();
+            .unwrap()
+        } else {
+            jobs.get_target(&scope, target_id).await.unwrap()
+        };
         let model = Arc::new(Model(AtomicUsize::new(0)));
         let bridge = ProjectConfiguredModelBridge::new(
             ProjectAiSettingsService::development(),
@@ -1098,6 +1307,414 @@ mod tests {
             model,
             original,
         }
+    }
+
+    async fn received_intent(f: &Fixture) -> ObservationExtractionIntent {
+        let capture = f
+            .service
+            .captures
+            .list_sources_for_attempt(&f.scope, f.target_id, f.attempt_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ObservationCaptureSnapshot::Source { source_sha256, .. } = &capture.input.snapshot
+        else {
+            panic!("source required")
+        };
+        let request = ObservationExtractionRequest {
+            target_id: f.target_id,
+            attempt_id: f.attempt_id,
+            source_capture_id: capture.input.capture_id,
+            source_sha256: source_sha256.clone(),
+            prompt_version: PROMPT_VERSION.into(),
+            parser_version: PARSER_VERSION.into(),
+            policy_version: EXTRACTION_POLICY_VERSION.into(),
+        };
+        let now = Utc::now() - chrono::Duration::seconds(1);
+        let mut intent = ObservationExtractionIntent::queued(
+            request.clone(),
+            request.intent_key(&f.scope).unwrap(),
+            now,
+        );
+        intent.state = ObservationExtractionState::Running;
+        intent.started_at = Some(now);
+        intent
+            .record_response(
+                ObservationExtractionResponse {
+                    model_text: "{\"complete\":true}".into(),
+                    disposition: ObservationExtractionResponseDisposition::Complete,
+                    actual_model: "durable-synthetic-model".into(),
+                    config_revision: Some(3),
+                    prompt_tokens: 21,
+                    completion_tokens: 7,
+                },
+                now,
+            )
+            .unwrap();
+        intent
+    }
+
+    #[tokio::test]
+    async fn durable_projection_is_atomic_idempotent_and_never_calls_model() {
+        let f = fixture(true, true, false).await;
+        let intent = received_intent(&f).await;
+        let (a, b) = tokio::join!(
+            f.service.project_extraction_response(&f.scope, &intent),
+            f.service.project_extraction_response(&f.scope, &intent)
+        );
+        let first = a.unwrap().unwrap();
+        assert_eq!(first, b.unwrap().unwrap());
+        assert_eq!(
+            first,
+            f.service
+                .project_extraction_response(&f.scope, &intent)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        let result = first.result.as_ref().unwrap();
+        assert!(matches!(
+            result.outcome,
+            ObservationAnalysisOutcome::Grounded { .. }
+        ));
+        assert_eq!(
+            result.actual_model.as_deref(),
+            Some("durable-synthetic-model")
+        );
+        assert_eq!(
+            (
+                result.config_revision,
+                result.prompt_tokens,
+                result.completion_tokens
+            ),
+            (Some(3), 21, 7)
+        );
+        assert_eq!(
+            f.service
+                .repository
+                .list_for_attempt(&f.scope, f.target_id, f.attempt_id, None, 20)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            f.original
+        );
+        let mut changed = intent.clone();
+        changed.response.as_mut().unwrap().completion_tokens += 1;
+        assert!(
+            f.service
+                .project_extraction_response(&f.scope, &changed)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_projection_rejects_unsupported_policy_before_write_or_completed_replay() {
+        let f = fixture(true, true, false).await;
+        let mut intent = received_intent(&f).await;
+        intent.request.policy_version = "geo.observation.automatic.unsupported".into();
+        intent.intent_key = intent.request.intent_key(&f.scope).unwrap();
+        assert!(
+            f.service
+                .project_extraction_response(&f.scope, &intent)
+                .await
+                .is_err()
+        );
+        assert!(
+            f.service
+                .repository
+                .list_for_attempt(&f.scope, f.target_id, f.attempt_id, None, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Reproduce a checkpoint projected by an older process: even a valid
+        // immutable completed analysis cannot make its unsupported policy run.
+        let capture = f
+            .service
+            .captures
+            .get(&f.scope, intent.request.source_capture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = ObservationAnalysisRequest {
+            revision_id: intent.intent_id,
+            target_id: intent.request.target_id,
+            attempt_id: intent.request.attempt_id,
+            source: ObservationAnalysisSource::Capture {
+                capture_id: intent.request.source_capture_id,
+            },
+            source_sha256: intent.request.source_sha256.clone(),
+            observed_at: capture.input.observed_at,
+            prompt_version: intent.request.prompt_version.clone(),
+            parser_version: intent.request.parser_version.clone(),
+        };
+        let response = intent.response.as_ref().unwrap();
+        let digest = sha256_hex(
+            &serde_json::to_vec(&(
+                "observation-extraction-projection.v1",
+                &f.scope,
+                &intent.request,
+                &intent.intent_key,
+                response,
+                intent.response_received_at.unwrap(),
+            ))
+            .unwrap(),
+        );
+        let result = ObservationAnalysisResult {
+            config_revision: response.config_revision,
+            actual_model: Some(response.actual_model.clone()),
+            candidate_json: None,
+            outcome: ObservationAnalysisOutcome::Unverified {
+                reason: "model_output_invalid".into(),
+            },
+            prompt_tokens: response.prompt_tokens,
+            completion_tokens: response.completion_tokens,
+        };
+        let prior = f
+            .service
+            .repository
+            .project_response(
+                &f.scope,
+                &format!("{AUTOMATIC_KEY_PREFIX}{}", intent.intent_key),
+                &digest,
+                request,
+                result.clone(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        intent.state = ObservationExtractionState::Completed;
+        intent.completion = Some(result);
+        intent.finished_at = prior.analyzed_at;
+        assert!(
+            f.service
+                .project_extraction_response(&f.scope, &intent)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.service
+                .repository
+                .get(&f.scope, intent.intent_id)
+                .await
+                .unwrap(),
+            Some(prior)
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_projection_defers_until_terminal_receipt_then_uses_same_response() {
+        let f = fixture_with_terminal(true, true, false, "execution_deadline", false).await;
+        let intent = received_intent(&f).await;
+        assert!(
+            f.service
+                .project_extraction_response(&f.scope, &intent)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.service
+                .repository
+                .list_for_attempt(&f.scope, f.target_id, f.attempt_id, None, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let terminal = fixture(true, true, false).await.original.attempts[0]
+            .outcome
+            .clone()
+            .unwrap();
+        f.service
+            .jobs
+            .finish(&f.scope, f.target_id, f.attempt_id, terminal, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            f.service
+                .project_extraction_response(&f.scope, &intent)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_projection_retries_grounding_without_creating_partial_revision() {
+        let mut f = fixture(true, true, true).await;
+        let intent = received_intent(&f).await;
+        assert!(
+            f.service
+                .project_extraction_response(&f.scope, &intent)
+                .await
+                .is_err()
+        );
+        assert!(
+            f.service
+                .repository
+                .list_for_attempt(&f.scope, f.target_id, f.attempt_id, None, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        f.service.grounder = Arc::new(Grounder { unavailable: false });
+        assert!(
+            f.service
+                .project_extraction_response(&f.scope, &intent)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_projection_rejects_wrong_scope_source_versions_and_response_metadata() {
+        let f = fixture(true, true, false).await;
+        let intent = received_intent(&f).await;
+        let wrong_scope = TenantScope::new(
+            f.scope.operator_id,
+            f.scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        assert!(
+            f.service
+                .project_extraction_response(&wrong_scope, &intent)
+                .await
+                .is_err()
+        );
+        for field in ["digest", "capture", "version", "model", "config"] {
+            let mut invalid = intent.clone();
+            match field {
+                "digest" => invalid.request.source_sha256 = "0".repeat(64),
+                "capture" => invalid.request.source_capture_id = Uuid::new_v4(),
+                "version" => invalid.request.parser_version = "geo.observation.extract.v4".into(),
+                "model" => invalid.response.as_mut().unwrap().actual_model.clear(),
+                "config" => invalid.response.as_mut().unwrap().config_revision = Some(-1),
+                _ => unreachable!(),
+            }
+            invalid.intent_key = invalid.request.intent_key(&f.scope).unwrap();
+            assert!(
+                f.service
+                    .project_extraction_response(&f.scope, &invalid)
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let unbound = fixture(true, false, false).await;
+        assert!(
+            unbound
+                .service
+                .project_extraction_response(&unbound.scope, &received_intent(&unbound).await)
+                .await
+                .is_err()
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_projection_preserves_received_provenance_for_unverified_outputs() {
+        for (disposition, reason) in [
+            (
+                ObservationExtractionResponseDisposition::Incomplete,
+                "model_output_incomplete",
+            ),
+            (
+                ObservationExtractionResponseDisposition::ToolCalls,
+                "model_output_tool_calls",
+            ),
+            (
+                ObservationExtractionResponseDisposition::UnexpectedFinish,
+                "model_output_invalid",
+            ),
+        ] {
+            let f = fixture(true, true, false).await;
+            let mut intent = received_intent(&f).await;
+            intent.response.as_mut().unwrap().disposition = disposition;
+            let revision = f
+                .service
+                .project_extraction_response(&f.scope, &intent)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = revision.result.unwrap();
+            assert_eq!(
+                result.outcome,
+                ObservationAnalysisOutcome::Unverified {
+                    reason: reason.into()
+                }
+            );
+            assert_eq!(
+                result.actual_model.as_deref(),
+                Some("durable-synthetic-model")
+            );
+            assert_eq!(
+                (
+                    result.config_revision,
+                    result.prompt_tokens,
+                    result.completion_tokens
+                ),
+                (Some(3), 21, 7)
+            );
+            assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+        }
+        let mut f = fixture(true, true, false).await;
+        f.service.grounder = Arc::new(InvalidAuditGrounder);
+        let intent = received_intent(&f).await;
+        let result = f
+            .service
+            .project_extraction_response(&f.scope, &intent)
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            ObservationAnalysisOutcome::Unverified {
+                reason: "analysis_result_invalid".into()
+            }
+        );
+        assert_eq!(
+            result.actual_model.as_deref(),
+            Some("durable-synthetic-model")
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn manual_submission_cannot_use_automatic_projection_namespace() {
+        let f = fixture(true, true, false).await;
+        assert!(
+            f.service
+                .submit(
+                    &f.scope,
+                    f.target_id,
+                    f.attempt_id,
+                    AnalyzeSavedSource {
+                        idempotency_key: format!("{AUTOMATIC_KEY_PREFIX}synthetic"),
+                        capture_id: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

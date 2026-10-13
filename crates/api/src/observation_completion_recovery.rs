@@ -18,6 +18,78 @@ use crate::{
     },
 };
 
+// Only fixed vocabulary crosses the logging boundary; recovery inputs and
+// dependency errors can contain private account or conversation information.
+#[derive(Clone, Copy)]
+enum RetryDiagnostic {
+    BrowserUnavailable,
+    LeaseBeforeReservation,
+    OwnershipLookupFailed,
+    ReservationContended,
+    ReservationFailed,
+    LeaseAfterReservation,
+    BrowserResumeFailed,
+    IdentityReadFailed,
+    LeaseBeforeHistory,
+    RecoveryReadFailed,
+    RecoveryBindingMismatch,
+    LeaseBeforeSave,
+    EvidenceSaveFailed,
+    EvidenceReadFailed,
+    EvidenceReadUnverified,
+    CompletionUnverified,
+    RunnerUnknown,
+    OperationTimeout,
+}
+
+impl RetryDiagnostic {
+    fn fields(self) -> (&'static str, &'static str) {
+        match self {
+            Self::BrowserUnavailable => ("browser", "unavailable"),
+            Self::LeaseBeforeReservation => ("reservation", "insufficient_lease"),
+            Self::OwnershipLookupFailed => ("ownership", "lookup_failed"),
+            Self::ReservationContended => ("reservation", "contended"),
+            Self::ReservationFailed => ("reservation", "failed"),
+            Self::LeaseAfterReservation => ("browser_resume", "insufficient_lease"),
+            Self::BrowserResumeFailed => ("browser_resume", "failed"),
+            Self::IdentityReadFailed => ("identity", "read_failed"),
+            Self::LeaseBeforeHistory => ("history", "insufficient_lease"),
+            Self::RecoveryReadFailed => ("history", "read_failed"),
+            Self::RecoveryBindingMismatch => ("history", "binding_mismatch"),
+            Self::LeaseBeforeSave => ("evidence_save", "insufficient_lease"),
+            Self::EvidenceSaveFailed => ("evidence_save", "failed"),
+            Self::EvidenceReadFailed => ("evidence_readback", "failed"),
+            Self::EvidenceReadUnverified => ("evidence_readback", "unverified"),
+            Self::CompletionUnverified => ("history", "completion_unverified"),
+            Self::RunnerUnknown => ("runner", "unknown"),
+            Self::OperationTimeout => ("operation", "deadline_exceeded"),
+        }
+    }
+
+    fn record(self) {
+        let (stage, code) = self.fields();
+        tracing::info!(
+            stage,
+            code,
+            outcome = "retry",
+            "completion recovery deferred"
+        );
+    }
+
+    fn retry(self) -> Outcome {
+        self.record();
+        Outcome::Retry
+    }
+}
+
+fn reservation_diagnostic(error: &AppError) -> RetryDiagnostic {
+    if error.code == geo_domain::ErrorCode::Conflict {
+        RetryDiagnostic::ReservationContended
+    } else {
+        RetryDiagnostic::ReservationFailed
+    }
+}
+
 /// Claim before detaching so caller cancellation cannot dispatch a second read.
 pub async fn dispatch_observation_completion_recovery(
     state: AppState,
@@ -51,10 +123,10 @@ async fn recover_once(
     claim: &ObservationCompletionRecoveryClaim,
 ) -> Outcome {
     let Some(bridge) = state.channel_service().browser.as_ref() else {
-        return Outcome::Retry;
+        return RetryDiagnostic::BrowserUnavailable.retry();
     };
     if Utc::now() + chrono::Duration::seconds(110) >= claim.lease_until {
-        return Outcome::Retry;
+        return RetryDiagnostic::LeaseBeforeReservation.retry();
     }
     let original = &claim.original;
     let binding = match original.recovery_request_binding(scope) {
@@ -76,10 +148,10 @@ async fn recover_once(
                 && operation.session_id == original_session
                 && operation.purpose == BrowserOperationPurpose::Measure => {}
         Ok(_) => return Outcome::Retained,
-        Err(_) => return Outcome::Retry,
+        Err(_) => return RetryDiagnostic::OwnershipLookupFailed.retry(),
     }
     let reservation_id = Uuid::new_v4();
-    if state
+    if let Err(error) = state
         .channel_job_repository()
         .reserve_account(
             scope,
@@ -89,16 +161,15 @@ async fn recover_once(
             claim.lease_until,
         )
         .await
-        .is_err()
     {
-        return Outcome::Retry;
+        return reservation_diagnostic(&error).retry();
     }
     if Utc::now() + chrono::Duration::seconds(110) >= claim.lease_until {
         let _ = state
             .channel_job_repository()
             .release_account(scope, account_id, reservation_id)
             .await;
-        return Outcome::Retry;
+        return RetryDiagnostic::LeaseAfterReservation.retry();
     }
     let session_id = Uuid::new_v4();
     let operation = async {
@@ -115,13 +186,17 @@ async fn recover_once(
                 reservation_id,
                 original_session,
             )
-            .await?;
-        let verified = bridge.complete(session_id).await?;
+            .await
+            .inspect_err(|_| RetryDiagnostic::BrowserResumeFailed.record())?;
+        let verified = bridge
+            .complete(session_id)
+            .await
+            .inspect_err(|_| RetryDiagnostic::IdentityReadFailed.record())?;
         if verified.identity.platform_account_id != binding.platform_account_id {
             return Ok::<_, AppError>(Outcome::NeedsLogin);
         }
         if Utc::now() + chrono::Duration::seconds(75) >= claim.lease_until {
-            return Ok(Outcome::Retry);
+            return Ok(RetryDiagnostic::LeaseBeforeHistory.retry());
         }
         let request = CompletionRecoveryRequest {
             execution_id: claim.lease_id,
@@ -135,7 +210,8 @@ async fn recover_once(
         };
         match bridge
             .recover_conversation_completion(session_id, &request)
-            .await?
+            .await
+            .inspect_err(|_| RetryDiagnostic::RecoveryReadFailed.record())?
         {
             CompletionRecoveryResult::Recovered {
                 execution_id,
@@ -147,9 +223,11 @@ async fn recover_once(
             } => {
                 if execution_id != claim.lease_id
                     || external_conversation_id != binding.external_conversation_id
-                    || Utc::now() + chrono::Duration::seconds(10) >= claim.lease_until
                 {
-                    return Ok(Outcome::Retry);
+                    return Ok(RetryDiagnostic::RecoveryBindingMismatch.retry());
+                }
+                if Utc::now() + chrono::Duration::seconds(10) >= claim.lease_until {
+                    return Ok(RetryDiagnostic::LeaseBeforeSave.retry());
                 }
                 let ObservationCaptureSnapshot::Source { source_sha256, .. } =
                     &original.input.snapshot
@@ -175,14 +253,20 @@ async fn recover_once(
                 if input.validate(scope, original).is_err() {
                     return Ok(Outcome::Retained);
                 }
-                evidence.save(scope, input).await?;
+                evidence
+                    .save(scope, input)
+                    .await
+                    .inspect_err(|_| RetryDiagnostic::EvidenceSaveFailed.record())?;
                 // A durable read-back, not a transport success, settles recovery.
-                let saved = evidence.get(scope, claim.lease_id).await?;
+                let saved = evidence
+                    .get(scope, claim.lease_id)
+                    .await
+                    .inspect_err(|_| RetryDiagnostic::EvidenceReadFailed.record())?;
                 match saved {
                     Some(saved) if saved.validate(scope, original).is_ok() => {
                         Ok(Outcome::Recovered)
                     }
-                    _ => Ok(Outcome::Retry),
+                    _ => Ok(RetryDiagnostic::EvidenceReadUnverified.retry()),
                 }
             }
             CompletionRecoveryResult::NeedsLogin { .. } => Ok(Outcome::NeedsLogin),
@@ -195,14 +279,15 @@ async fn recover_once(
                         code: CompletionRecoveryCode::CompletionUnverified,
                     }),
                 ..
-            } => Ok(Outcome::Retry),
+            } => Ok(RetryDiagnostic::CompletionUnverified.retry()),
             CompletionRecoveryResult::Retained { .. } => Ok(Outcome::Retained),
-            CompletionRecoveryResult::Unknown { .. } => Ok(Outcome::Retry),
+            CompletionRecoveryResult::Unknown { .. } => Ok(RetryDiagnostic::RunnerUnknown.retry()),
         }
     };
     let outcome = match tokio::time::timeout(Duration::from_secs(85), operation).await {
         Ok(Ok(outcome)) => outcome,
-        _ => Outcome::Retry,
+        Ok(Err(_)) => Outcome::Retry, // The failing boundary already recorded its stage.
+        Err(_) => RetryDiagnostic::OperationTimeout.retry(),
     };
     // Even after an uncertain start/response, close only this owned browser.
     // Durable ownership survives a lost close; expiry never proves disposal.
@@ -231,6 +316,76 @@ mod tests {
     use geo_domain::*;
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
+
+    #[test]
+    fn retry_diagnostics_distinguish_boundaries_with_fixed_vocabulary() {
+        let diagnostics = [
+            RetryDiagnostic::BrowserUnavailable,
+            RetryDiagnostic::LeaseBeforeReservation,
+            RetryDiagnostic::OwnershipLookupFailed,
+            RetryDiagnostic::ReservationContended,
+            RetryDiagnostic::ReservationFailed,
+            RetryDiagnostic::LeaseAfterReservation,
+            RetryDiagnostic::BrowserResumeFailed,
+            RetryDiagnostic::IdentityReadFailed,
+            RetryDiagnostic::LeaseBeforeHistory,
+            RetryDiagnostic::RecoveryReadFailed,
+            RetryDiagnostic::RecoveryBindingMismatch,
+            RetryDiagnostic::LeaseBeforeSave,
+            RetryDiagnostic::EvidenceSaveFailed,
+            RetryDiagnostic::EvidenceReadFailed,
+            RetryDiagnostic::EvidenceReadUnverified,
+            RetryDiagnostic::CompletionUnverified,
+            RetryDiagnostic::RunnerUnknown,
+            RetryDiagnostic::OperationTimeout,
+        ];
+        let mut fields = std::collections::HashSet::new();
+        for diagnostic in diagnostics {
+            let pair = diagnostic.fields();
+            assert!(fields.insert(pair), "retry boundaries must remain distinct");
+            for field in [pair.0, pair.1] {
+                assert!(
+                    field
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                );
+            }
+        }
+        assert_eq!(
+            RetryDiagnostic::CompletionUnverified.fields(),
+            ("history", "completion_unverified")
+        );
+        assert_eq!(
+            RetryDiagnostic::OperationTimeout.fields(),
+            ("operation", "deadline_exceeded")
+        );
+    }
+
+    #[test]
+    fn reservation_diagnostic_uses_error_class_without_message_or_details() {
+        for code in [
+            ErrorCode::InvalidRequest,
+            ErrorCode::Unauthorized,
+            ErrorCode::Forbidden,
+            ErrorCode::NotFound,
+            ErrorCode::Conflict,
+            ErrorCode::NotReady,
+            ErrorCode::CapabilityMissing,
+            ErrorCode::DependencyUnavailable,
+            ErrorCode::Internal,
+        ] {
+            let expected = if code == ErrorCode::Conflict {
+                ("reservation", "contended")
+            } else {
+                ("reservation", "failed")
+            };
+            for message in ["", "synthetic dependency message"] {
+                let error = AppError::new(code, message)
+                    .with_details(json!({"synthetic_context":"excluded"}));
+                assert_eq!(reservation_diagnostic(&error).fields(), expected);
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct Runner {

@@ -70,6 +70,11 @@ mod observation_capture_callback;
 pub use observation_capture_callback::ObservationCaptureCallbackService;
 mod observation_ai_callback;
 pub use observation_ai_callback::ObservationAiCallbackService;
+mod observation_extraction;
+pub use observation_extraction::{
+    EXTRACTION_POLICY_VERSION, ObservationExtractionContinuation, ObservationExtractionService,
+    spawn_observation_extraction_dispatcher,
+};
 mod observation_analysis;
 mod observation_evidence;
 pub use observation_analysis::{
@@ -961,6 +966,10 @@ impl AppState {
     pub fn with_observation_analysis(mut self, service: ObservationAnalysisService) -> Self {
         self.observation_analysis = Some(service);
         self
+    }
+
+    pub fn observation_analysis_service(&self) -> Option<&ObservationAnalysisService> {
+        self.observation_analysis.as_ref()
     }
 
     pub fn with_observation_evidence_resolver(

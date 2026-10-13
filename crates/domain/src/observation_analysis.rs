@@ -515,6 +515,18 @@ pub fn observation_analysis_source_json(
 
 #[async_trait]
 pub trait ObservationAnalysisRepository: Send + Sync {
+    /// Atomically save a deterministic interpretation of an already persisted
+    /// response. Retries must match the source request, digest and result; there
+    /// is no inference claim or partially written running revision to recover.
+    async fn project_response(
+        &self,
+        scope: &TenantScope,
+        idempotency_key: &str,
+        request_digest: &str,
+        request: ObservationAnalysisRequest,
+        result: ObservationAnalysisResult,
+        analyzed_at: DateTime<Utc>,
+    ) -> Result<ObservationAnalysisRevision, AppError>;
     /// At most one latest completed grounded revision per scoped target/attempt,
     /// selected by creation time and ID descending; returned in target/attempt
     /// order. Later failures never erase grounded work.
@@ -610,6 +622,66 @@ fn require_project(scope: &TenantScope) -> Result<(), AppError> {
 
 #[async_trait]
 impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
+    async fn project_response(
+        &self,
+        scope: &TenantScope,
+        idempotency_key: &str,
+        request_digest: &str,
+        request: ObservationAnalysisRequest,
+        result: ObservationAnalysisResult,
+        analyzed_at: DateTime<Utc>,
+    ) -> Result<ObservationAnalysisRevision, AppError> {
+        request.validate(scope, idempotency_key, request_digest, analyzed_at)?;
+        result.validate()?;
+        let target = self.jobs.get_target(scope, request.target_id).await?;
+        let capture = match request.source {
+            ObservationAnalysisSource::Capture { capture_id } => {
+                self.captures.get(scope, capture_id).await?
+            }
+            ObservationAnalysisSource::AttemptEvidence { .. } => None,
+        };
+        observation_analysis_source_json(scope, &request, &target, capture.as_ref())?;
+        let key_hash = sha256_hex(idempotency_key.as_bytes());
+        let mut records = self.records.lock().await;
+        if let Some(prior) = records
+            .values()
+            .find(|stored| stored.scope == *scope && stored.key_hash == key_hash)
+        {
+            return if prior.revision.request_digest == request_digest
+                && prior.revision.request.same_input(&request)
+                && prior.revision.state == ObservationAnalysisState::Completed
+                && prior.revision.result.as_ref() == Some(&result)
+            {
+                Ok(prior.revision.clone())
+            } else {
+                Err(AppError::conflict("analysis projection already differs"))
+            };
+        }
+        if records.contains_key(&request.revision_id) {
+            return Err(AppError::conflict(
+                "analysis revision identity already exists",
+            ));
+        }
+        let revision = ObservationAnalysisRevision {
+            request,
+            request_digest: request_digest.into(),
+            state: ObservationAnalysisState::Completed,
+            created_at: analyzed_at,
+            started_at: Some(analyzed_at),
+            analyzed_at: Some(analyzed_at),
+            result: Some(result),
+        };
+        records.insert(
+            revision.request.revision_id,
+            StoredAnalysis {
+                scope: scope.clone(),
+                key_hash,
+                revision: revision.clone(),
+                claim_token: None,
+            },
+        );
+        Ok(revision)
+    }
     async fn latest_grounded_for_attempts(
         &self,
         scope: &TenantScope,
@@ -1014,6 +1086,90 @@ mod tests {
             prompt_tokens: 3,
             completion_tokens: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn received_response_projection_is_atomic_write_once_and_source_scoped() {
+        let f = fixture().await;
+        let digest = sha256_hex(b"received-response");
+        let key = "automatic:observation-extraction:synthetic";
+        let (a, b) = tokio::join!(
+            f.store
+                .project_response(&f.scope, key, &digest, f.request.clone(), result(), f.now),
+            f.store.project_response(
+                &f.scope,
+                key,
+                &digest,
+                f.request.clone(),
+                result(),
+                f.now + Duration::seconds(1)
+            )
+        );
+        let saved = a.unwrap();
+        assert_eq!(saved, b.unwrap());
+        assert_eq!(saved.state, ObservationAnalysisState::Completed);
+        assert_eq!(saved.result, Some(result()));
+        assert!(
+            f.store
+                .claim(&f.scope, saved.request.revision_id, f.now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            f.store
+                .list_for_attempt(
+                    &f.scope,
+                    f.request.target_id,
+                    f.request.attempt_id,
+                    None,
+                    20
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut changed = result();
+        changed.completion_tokens += 1;
+        assert!(
+            f.store
+                .project_response(&f.scope, key, &digest, f.request.clone(), changed, f.now)
+                .await
+                .is_err()
+        );
+        assert!(
+            f.store
+                .project_response(
+                    &f.scope,
+                    key,
+                    &sha256_hex(b"different"),
+                    f.request.clone(),
+                    result(),
+                    f.now
+                )
+                .await
+                .is_err()
+        );
+        let other = TenantScope::new(
+            f.scope.operator_id,
+            f.scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        assert!(
+            f.store
+                .project_response(&other, key, &digest, f.request.clone(), result(), f.now)
+                .await
+                .is_err()
+        );
+        let mut invalid = f.request.clone();
+        invalid.source_sha256 = sha256_hex(b"wrong-source");
+        assert!(
+            f.store
+                .project_response(&f.scope, "other", &digest, invalid, result(), f.now)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
