@@ -21,6 +21,11 @@ import {
   analysisUnverifiedMessageKey,
   extractionInterruptionMessageKey,
 } from "../i18n/observationAnalysis";
+import {
+  analysisRevisions,
+  availableAnalysis,
+  observationAnalysisKey,
+} from "./observationAnalysisResult";
 
 export function ObservationAnalysisPanel({
   tenantId,
@@ -39,15 +44,13 @@ export function ObservationAnalysisPanel({
   const { t, i18n } = useTranslation("observationAnalysis");
   const client = useQueryClient();
   const pendingKey = useRef<string | null>(null);
-  const key = [
-    "observation-analyses",
-    session?.user.id,
-    session?.operator.id,
+  const key = observationAnalysisKey(
+    session,
     tenantId,
     projectId,
     targetId,
     attemptId,
-  ];
+  );
   const history = useInfiniteQuery({
     queryKey: key,
     initialPageParam: undefined as string | undefined,
@@ -110,21 +113,83 @@ export function ObservationAnalysisPanel({
       void client.invalidateQueries({ queryKey: key });
     },
   });
-  const revisions = [
-    ...new Map(
-      (history.data?.pages.flatMap((page) => page.items) ?? []).map((item) => [
-        item.request.revision_id,
-        item,
-      ]),
-    ).values(),
-  ];
+  const revisions = analysisRevisions(history.data);
+  const primary = availableAnalysis(revisions);
   const hasSource = Boolean(history.data?.pages[0]?.sources.length);
   const extraction = history.data?.pages[0]?.extraction;
   const active = revisions.some((item) => item.state !== "completed");
   const date = (value: string) =>
     new Date(value).toLocaleString(i18n.resolvedLanguage);
-  return (
-    <section aria-label={t("title")}>
+  const renderRevision = (revision: (typeof revisions)[number]) => {
+    const outcome = revision.result?.outcome;
+    const grounded =
+      revision.state === "completed" && outcome?.status === "grounded"
+        ? outcome
+        : null;
+    const citations = [
+      ...new Set(
+        (grounded?.citations ?? [])
+          .map(safeOriginalPublicUrl)
+          .filter((url): url is string => url !== null),
+      ),
+    ];
+    return (
+      <article key={revision.request.revision_id}>
+        <p role="status">
+          {t(
+            revision.state !== "completed"
+              ? revision.state
+              : outcome?.status === "failed"
+                ? analysisFailureMessageKey(outcome.code)
+                : outcome?.status === "unverified"
+                  ? analysisUnverifiedMessageKey(outcome.reason)
+                  : (outcome?.status ?? "incomplete"),
+          )}
+        </p>
+        <p>{t("requested", { value: date(revision.created_at) })}</p>
+        {revision.analyzed_at && (
+          <p>{t("analyzed", { value: date(revision.analyzed_at) })}</p>
+        )}
+        <p>
+          {revision.result?.actual_model
+            ? t("model", { value: revision.result.actual_model })
+            : t("modelMissing")}
+        </p>
+        <p>
+          {t("source")} ·{" "}
+          {t("observed", { value: date(revision.request.observed_at) })}
+        </p>
+        {grounded && (
+          <>
+            <h5>{t("answer")}</h5>
+            <ObservationAnswer text={grounded.raw_answer} />
+            <h5>{t("citations")}</h5>
+            {citations.length ? (
+              <ul>
+                {citations.map((url) => (
+                  <li key={url} style={{ overflowWrap: "anywhere" }}>
+                    <a href={url} target="_blank" rel="noopener noreferrer">
+                      {url}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>{t("noCitations")}</p>
+            )}
+            <details>
+              <summary>{t("evidence")}</summary>
+              <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                {JSON.stringify(grounded.audit, null, 2)}
+              </pre>
+            </details>
+          </>
+        )}
+      </article>
+    );
+  };
+  const controls = (
+    <>
       <h4>{t("title")}</h4>
       {history.isPending && <Spinner size="tiny" label={t("loading")} />}
       {history.isError && <p role="alert">{t("loadFailed")}</p>}
@@ -169,76 +234,7 @@ export function ObservationAnalysisPanel({
       >
         {t("settings")}
       </Link>
-      {revisions.map((revision) => {
-        const outcome = revision.result?.outcome;
-        const grounded =
-          revision.state === "completed" && outcome?.status === "grounded"
-            ? outcome
-            : null;
-        const citations = [
-          ...new Set(
-            (grounded?.citations ?? [])
-              .map(safeOriginalPublicUrl)
-              .filter((url): url is string => url !== null),
-          ),
-        ];
-        return (
-          <article key={revision.request.revision_id}>
-            <p role="status">
-              {t(
-                revision.state !== "completed"
-                  ? revision.state
-                  : outcome?.status === "failed"
-                    ? analysisFailureMessageKey(outcome.code)
-                    : outcome?.status === "unverified"
-                      ? analysisUnverifiedMessageKey(outcome.reason)
-                      : (outcome?.status ?? "incomplete"),
-              )}
-            </p>
-            <p>{t("requested", { value: date(revision.created_at) })}</p>
-            {revision.analyzed_at && (
-              <p>{t("analyzed", { value: date(revision.analyzed_at) })}</p>
-            )}
-            <p>
-              {revision.result?.actual_model
-                ? t("model", { value: revision.result.actual_model })
-                : t("modelMissing")}
-            </p>
-            <p>
-              {t("source")} ·{" "}
-              {t("observed", { value: date(revision.request.observed_at) })}
-            </p>
-            {grounded && (
-              <>
-                <h5>{t("answer")}</h5>
-                <ObservationAnswer text={grounded.raw_answer} />
-                <h5>{t("citations")}</h5>
-                {citations.length ? (
-                  <ul>
-                    {citations.map((url) => (
-                      <li key={url} style={{ overflowWrap: "anywhere" }}>
-                        <a href={url} target="_blank" rel="noopener noreferrer">
-                          {url}
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p>{t("noCitations")}</p>
-                )}
-                <details>
-                  <summary>{t("evidence")}</summary>
-                  <pre
-                    style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-                  >
-                    {JSON.stringify(grounded.audit, null, 2)}
-                  </pre>
-                </details>
-              </>
-            )}
-          </article>
-        );
-      })}
+      {revisions.filter((revision) => revision !== primary).map(renderRevision)}
       {history.hasNextPage && (
         <Button
           disabled={history.isFetching}
@@ -246,6 +242,22 @@ export function ObservationAnalysisPanel({
         >
           {t("more")}
         </Button>
+      )}
+    </>
+  );
+  return (
+    <section aria-label={t("title")}>
+      {primary ? (
+        <>
+          <h4>{t("availableAnswer")}</h4>
+          {renderRevision(primary)}
+          <details>
+            <summary>{t("history")}</summary>
+            {controls}
+          </details>
+        </>
+      ) : (
+        controls
       )}
     </section>
   );

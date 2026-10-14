@@ -14,6 +14,43 @@ import type {
 } from "../api/channelJobs";
 import { ChannelJobsPage, TargetCard } from "./ChannelJobsPage";
 import i18n from "../i18n";
+import type { ObservationAnalysisPage } from "../api/observationAnalysis";
+
+const savedAnalysisPage: ObservationAnalysisPage = {
+  next_after: null,
+  sources: [],
+  items: [
+    {
+      request: {
+        revision_id: "saved-revision",
+        target_id: "measurement-target",
+        attempt_id: "private-attempt-id",
+        source: { kind: "capture", capture_id: "saved-capture" },
+        source_sha256: "a".repeat(64),
+        observed_at: "2026-10-01T00:00:00Z",
+        prompt_version: "v1",
+        parser_version: "v1",
+      },
+      request_digest: "b".repeat(64),
+      state: "completed",
+      created_at: "2026-10-01T00:01:00Z",
+      started_at: "2026-10-01T00:01:00Z",
+      analyzed_at: "2026-10-01T00:02:00Z",
+      result: {
+        actual_model: "analysis-model",
+        candidate_json: null,
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        outcome: {
+          status: "grounded",
+          raw_answer: "Saved source answer",
+          citations: ["https://example.test/saved-source"],
+          audit: {},
+        },
+      },
+    },
+  ],
+};
 
 const automaticTarget: ChannelTarget = {
   target_id: "measurement-target",
@@ -37,14 +74,14 @@ const automaticTarget: ChannelTarget = {
 async function renderAutomaticResult(
   overrides: Partial<ChannelOutcome> = {},
   automatic = true,
+  analysisPage?: ObservationAnalysisPage,
 ) {
-  mockApi();
+  const requests = mockApi({ analysisPage });
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   const result = render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <FluentProvider theme={webLightTheme}>
         <AuthProvider>
           <MemoryRouter>
@@ -91,10 +128,101 @@ async function renderAutomaticResult(
     </QueryClientProvider>,
   );
   await screen.findByText(i18n.t("noSource", { ns: "observationAnalysis" }));
-  return result;
+  if (
+    analysisPage?.items.some(
+      (item) => item.result?.outcome.status === "grounded",
+    )
+  ) {
+    await screen.findByText("Saved source answer");
+  }
+  return { ...result, requests, client };
 }
 
 describe("automatic measurement results", () => {
+  it.each(["zh-CN", "en"])(
+    "makes a saved answer primary while preserving the unknown receipt in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      try {
+        const { requests, client } = await renderAutomaticResult(
+          { status: "unknown" },
+          true,
+          savedAnalysisPage,
+        );
+        expect(
+          await screen.findByText(
+            i18n.t("resultAnswerAvailable", { ns: "measurement" }),
+          ),
+        ).toBeVisible();
+        expect(screen.getAllByText("Saved source answer")).toHaveLength(1);
+        expect(
+          screen.getByRole("link", {
+            name: "https://example.test/saved-source",
+          }),
+        ).toBeVisible();
+        const receipt = screen
+          .getByText(
+            i18n.t("automaticOutcome.unknown", { ns: "measurement" }),
+            { exact: false },
+          )
+          .closest("details")!;
+        expect(receipt.open).toBe(false);
+        expect(
+          screen.getByText(
+            i18n.t("automaticUnknownDetail", { ns: "measurement" }),
+          ),
+        ).not.toBeVisible();
+        await userEvent.click(
+          within(receipt).getByText(
+            i18n.t("resultExecutionHistory", { ns: "measurement" }),
+          ),
+        );
+        expect(
+          screen.getByText(
+            i18n.t("automaticUnknownDetail", { ns: "measurement" }),
+          ),
+        ).toBeVisible();
+        const reads = requests.filter((request) =>
+          request.path.endsWith("/analyses"),
+        );
+        expect(reads).toHaveLength(1);
+        expect(reads[0].method).toBe("GET");
+        expect(reads[0].url.searchParams.get("tenant_id")).toBe("tenant-1");
+        expect(reads[0].url.searchParams.get("project_id")).toBe("project-1");
+        expect(
+          client.getQueryCache().find({
+            queryKey: [
+              "observation-analyses",
+              "user-1",
+              "operator-1",
+              "tenant-1",
+              "project-1",
+              "measurement-target",
+              "private-attempt-id",
+            ],
+            exact: true,
+          })?.state.data,
+        ).toMatchObject({ pages: [savedAnalysisPage] });
+        expect(
+          requests.filter((request) => request.method === "POST"),
+        ).toHaveLength(0);
+        expect(
+          screen.queryByText(/Deleted|已删除|清理成功/),
+        ).not.toBeInTheDocument();
+      } finally {
+        await act(async () => {
+          await i18n.changeLanguage("zh-CN");
+        });
+      }
+    },
+  );
+
+  it("keeps unknown primary when no saved answer is verified", async () => {
+    await renderAutomaticResult({ status: "unknown" });
+    expect(screen.queryByText("回答可查看")).not.toBeInTheDocument();
+    expect(screen.getByText("未能确认本次测量结果。")).toBeVisible();
+  });
+
   it("uses receipt time for a legacy measurement without changing its unknown outcome", async () => {
     await renderAutomaticResult(
       { status: "unknown", occurred_at: "2026-10-01T00:00:00Z" },
@@ -307,6 +435,7 @@ function mockApi({
   planConflict = false,
   questionSets = [],
   questionVersion = null,
+  analysisPage = { items: [], sources: [], next_after: null },
 }: {
   accounts?: unknown[];
   sources?: unknown[];
@@ -321,6 +450,7 @@ function mockApi({
   planConflict?: boolean;
   questionSets?: unknown[];
   questionVersion?: unknown;
+  analysisPage?: ObservationAnalysisPage;
 } = {}) {
   let plan = initialPlan;
   let detail: ChannelTargetView = { target, attempts: [] };
@@ -339,9 +469,7 @@ function mockApi({
       const body = init?.body ? JSON.parse(String(init.body)) : null;
       requests.push({ path, method, body, url });
       if (path.endsWith("/analyses"))
-        return Promise.resolve(
-          response({ items: [], sources: [], next_after: null }),
-        );
+        return Promise.resolve(response(analysisPage));
       if (path.endsWith("/auth/session"))
         return Promise.resolve(
           response({

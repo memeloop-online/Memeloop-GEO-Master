@@ -3,6 +3,8 @@ import i18n from "./index";
 const translations = {
   "zh-CN": {
     title: "已存回答解析",
+    availableAnswer: "已存回答",
+    history: "解析记录与操作",
     parse: "重新解析",
     submitting: "正在提交解析",
     retrySubmit: "重试提交解析",
@@ -50,6 +52,8 @@ const translations = {
   },
   en: {
     title: "Saved response analysis",
+    availableAnswer: "Saved answer",
+    history: "Analysis history and actions",
     parse: "Reanalyze",
     submitting: "Submitting analysis",
     retrySubmit: "Retry analysis submission",
