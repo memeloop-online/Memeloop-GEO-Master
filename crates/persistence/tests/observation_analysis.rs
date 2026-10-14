@@ -165,11 +165,44 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
             .is_empty()
     );
     let hash = sha256_hex(b"synthetic-request");
+    let empty_history = store
+        .admission_history_snapshot(&scope, target_id, attempt_id)
+        .await
+        .unwrap();
     let queued = store
         .create(&scope, "first-analysis", &hash, request.clone(), created_at)
         .await
         .unwrap();
     assert_eq!(queued.state, ObservationAnalysisState::Queued);
+    let queued_history = store
+        .admission_history_snapshot(&scope, target_id, attempt_id)
+        .await
+        .unwrap();
+    assert_ne!(empty_history, queued_history);
+    use geo_domain::{AutomaticExtractionAdmission, ObservationExtractionRepository};
+    let extraction = geo_persistence::PgObservationExtractionRepository::from_database(&database);
+    let automatic_request = geo_domain::ObservationExtractionRequest {
+        target_id,
+        attempt_id,
+        source_capture_id: capture_id,
+        source_sha256: request.source_sha256.clone(),
+        prompt_version: "extract.v2".into(),
+        parser_version: "ground.v2".into(),
+        policy_version: "automatic.v1".into(),
+    };
+    assert_eq!(
+        extraction
+            .admit_automatic(&scope, automatic_request.clone(), created_at)
+            .await
+            .unwrap(),
+        AutomaticExtractionAdmission::DeferredManual
+    );
+    assert!(
+        !store
+            .has_unresolved_for_attempt(&other, target_id, attempt_id)
+            .await
+            .unwrap()
+    );
     let mut duplicate = request.clone();
     duplicate.revision_id = Uuid::new_v4();
     assert_eq!(
@@ -226,6 +259,42 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
         .collect();
     assert_eq!(claims.len(), 1);
     let claim = &claims[0];
+    let running_history = store
+        .admission_history_snapshot(&scope, target_id, attempt_id)
+        .await
+        .unwrap();
+    assert_ne!(queued_history, running_history);
+    assert!(
+        store
+            .record_inference_resolved(&scope, request.revision_id, Uuid::new_v4())
+            .await
+            .is_err()
+    );
+    store
+        .record_inference_resolved(&scope, request.revision_id, claim.claim_token)
+        .await
+        .unwrap();
+    let reopened = PgObservationAnalysisRepository::from_database(&database);
+    let received_history = reopened
+        .admission_history_snapshot(&scope, target_id, attempt_id)
+        .await
+        .unwrap();
+    assert_ne!(running_history, received_history);
+    assert!(
+        reopened
+            .get(&scope, request.revision_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .inference_resolved
+    );
+    assert_eq!(
+        extraction
+            .admit_automatic(&scope, automatic_request.clone(), created_at)
+            .await
+            .unwrap(),
+        AutomaticExtractionAdmission::DeferredManual
+    );
     let result = ObservationAnalysisResult {
         config_revision: None,
         actual_model: Some("synthetic".into()),
@@ -278,6 +347,37 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
     assert_eq!(terminal.state, ObservationAnalysisState::Completed);
     assert_eq!(terminal.request.observed_at, observed_at);
     assert_eq!(terminal.analyzed_at, Some(analyzed_at));
+    let completed_history = reopened
+        .admission_history_snapshot(&scope, target_id, attempt_id)
+        .await
+        .unwrap();
+    assert_ne!(received_history, completed_history);
+    for snapshot in [
+        empty_history,
+        queued_history,
+        running_history,
+        received_history,
+    ] {
+        assert_eq!(
+            extraction
+                .admit_automatic_with_history(
+                    &scope,
+                    automatic_request.clone(),
+                    analyzed_at,
+                    &snapshot,
+                )
+                .await
+                .unwrap(),
+            AutomaticExtractionAdmission::DeferredHistoryChanged
+        );
+    }
+    assert!(matches!(
+        extraction
+            .admit_automatic(&scope, automatic_request.clone(), analyzed_at)
+            .await
+            .unwrap(),
+        AutomaticExtractionAdmission::Intent(_)
+    ));
     assert_eq!(
         terminal,
         store
@@ -395,10 +495,50 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
     for id in [legacy.revision_id, stale_queued.revision_id] {
         let interrupted = restarted.get(&scope, id).await.unwrap().unwrap();
         assert_eq!(interrupted.state, ObservationAnalysisState::Completed);
+        assert!(!interrupted.inference_resolved);
+        assert!(interrupted.blocks_automatic_admission());
         assert!(matches!(interrupted.result.unwrap().outcome,
             ObservationAnalysisOutcome::Failed { code } if code == "analysis_interrupted"));
         assert!(restarted.claim(&scope, id, cutoff).await.unwrap().is_none());
     }
+    assert!(
+        restarted
+            .has_unresolved_for_attempt(&scope, target_id, attempt_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        restarted
+            .record_inference_resolved(&scope, legacy.revision_id, stale_running.claim_token)
+            .await
+            .is_err()
+    );
+    // An existing automatic intent wins even with newer unresolved manual work.
+    assert!(matches!(
+        extraction
+            .admit_automatic(&scope, automatic_request.clone(), cutoff)
+            .await
+            .unwrap(),
+        AutomaticExtractionAdmission::Intent(_)
+    ));
+    let mut fresh_source = captures
+        .get(&scope, capture_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .input;
+    fresh_source.capture_id = Uuid::new_v4();
+    fresh_source.runner_session_id = Uuid::new_v4();
+    let fresh_receipt = captures.save(&scope, fresh_source).await.unwrap();
+    let mut fresh_request = automatic_request;
+    fresh_request.source_capture_id = fresh_receipt.capture_id;
+    assert_eq!(
+        extraction
+            .admit_automatic(&scope, fresh_request, cutoff)
+            .await
+            .unwrap(),
+        AutomaticExtractionAdmission::DeferredManual
+    );
     assert!(
         restarted
             .finish(

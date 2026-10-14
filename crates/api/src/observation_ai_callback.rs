@@ -396,10 +396,19 @@ mod tests {
         let model = Arc::new(Model::default());
         let bridge =
             ProjectConfiguredModelBridge::new(settings.clone(), Some(model.clone())).unwrap();
-        let extraction = ObservationExtractionService::new(
-            Arc::new(geo_domain::MemoryObservationExtractionRepository::new(
+        let gate = geo_domain::MemoryObservationAdmissionGate::default();
+        let analyses = Arc::new(
+            geo_domain::MemoryObservationAnalysisRepository::new(
+                Arc::new(geo_domain::MemoryChannelJobRepository::default()),
                 store.clone(),
-            )),
+            )
+            .with_admission_gate(gate.clone()),
+        );
+        let extraction = ObservationExtractionService::new(
+            Arc::new(
+                geo_domain::MemoryObservationExtractionRepository::new(store.clone())
+                    .with_automatic_admission(gate, analyses),
+            ),
             store,
             bridge,
         );

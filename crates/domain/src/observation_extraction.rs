@@ -325,6 +325,13 @@ pub struct ObservationExtractionBackfillItem {
     pub capture_id: Uuid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutomaticExtractionAdmission {
+    Intent(Box<ObservationExtractionIntent>),
+    DeferredManual,
+    DeferredHistoryChanged,
+}
+
 pub fn validate_observation_extraction_page_size(limit: usize) -> Result<(), AppError> {
     if !(1..=100).contains(&limit) {
         return Err(AppError::invalid_request(
@@ -336,6 +343,22 @@ pub fn validate_observation_extraction_page_size(limit: usize) -> Result<(), App
 
 #[async_trait]
 pub trait ObservationExtractionRepository: Send + Sync {
+    /// Historical callers retain this snapshot from before their first page.
+    /// A mismatch means restart preparation, never implicitly infer/retry.
+    /// Empty is reserved for the live admit_automatic path (no history scan).
+    async fn admit_automatic_with_history(
+        &self,
+        scope: &TenantScope,
+        request: ObservationExtractionRequest,
+        created_at: DateTime<Utc>,
+        expected_history: &str,
+    ) -> Result<AutomaticExtractionAdmission, AppError>;
+    async fn admit_automatic(
+        &self,
+        scope: &TenantScope,
+        request: ObservationExtractionRequest,
+        created_at: DateTime<Utc>,
+    ) -> Result<AutomaticExtractionAdmission, AppError>;
     /// Service-only source metadata with no extraction intent in any state or
     /// version for the exact scoped capture. Fix the stored_at cutoff across
     /// pages; UUID ordering is exclusive of `after`. Eligibility is decided by
@@ -425,6 +448,10 @@ struct Stored {
 pub struct MemoryObservationExtractionRepository {
     captures: Arc<dyn ObservationCaptureRepository>,
     records: Mutex<HashMap<Uuid, Stored>>,
+    automatic_admission: Option<(
+        crate::MemoryObservationAdmissionGate,
+        Arc<dyn crate::ObservationAnalysisRepository>,
+    )>,
 }
 
 impl MemoryObservationExtractionRepository {
@@ -432,7 +459,16 @@ impl MemoryObservationExtractionRepository {
         Self {
             captures,
             records: Mutex::new(HashMap::new()),
+            automatic_admission: None,
         }
+    }
+    pub fn with_automatic_admission(
+        mut self,
+        gate: crate::MemoryObservationAdmissionGate,
+        analyses: Arc<dyn crate::ObservationAnalysisRepository>,
+    ) -> Self {
+        self.automatic_admission = Some((gate, analyses));
+        self
     }
     async fn update(
         &self,
@@ -461,6 +497,78 @@ impl MemoryObservationExtractionRepository {
 
 #[async_trait]
 impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
+    async fn admit_automatic(
+        &self,
+        scope: &TenantScope,
+        request: ObservationExtractionRequest,
+        created_at: DateTime<Utc>,
+    ) -> Result<AutomaticExtractionAdmission, AppError> {
+        self.admit_automatic_with_history(scope, request, created_at, "")
+            .await
+    }
+    async fn admit_automatic_with_history(
+        &self,
+        scope: &TenantScope,
+        request: ObservationExtractionRequest,
+        created_at: DateTime<Utc>,
+        expected_history: &str,
+    ) -> Result<AutomaticExtractionAdmission, AppError> {
+        let (gate, analyses) = self
+            .automatic_admission
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("automatic admission is not configured"))?;
+        if !analyses
+            .memory_admission_gate()
+            .is_some_and(|other| Arc::ptr_eq(&gate.0, &other.0))
+        {
+            return Err(AppError::conflict("automatic admission gate differs"));
+        }
+        let _admission = gate.0.lock().await;
+        let key = request.intent_key(scope)?;
+        let capture = self
+            .captures
+            .get(scope, request.source_capture_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("extraction source not found"))?;
+        request.validate_source(scope, &capture)?;
+        let mut records = self.records.lock().await;
+        if let Some(stored) = records
+            .values()
+            .filter(|stored| {
+                stored.scope == *scope
+                    && stored.intent.request.source_capture_id == request.source_capture_id
+            })
+            .min_by_key(|stored| (stored.intent.created_at, stored.intent.intent_id))
+        {
+            return Ok(AutomaticExtractionAdmission::Intent(Box::new(
+                stored.intent.clone(),
+            )));
+        }
+        if !expected_history.is_empty()
+            && analyses
+                .admission_history_snapshot(scope, request.target_id, request.attempt_id)
+                .await?
+                != expected_history
+        {
+            return Ok(AutomaticExtractionAdmission::DeferredHistoryChanged);
+        }
+        if analyses
+            .has_unresolved_for_attempt(scope, request.target_id, request.attempt_id)
+            .await?
+        {
+            return Ok(AutomaticExtractionAdmission::DeferredManual);
+        }
+        let intent = ObservationExtractionIntent::queued(request, key, created_at);
+        records.insert(
+            intent.intent_id,
+            Stored {
+                scope: scope.clone(),
+                intent: intent.clone(),
+                claim_token: None,
+            },
+        );
+        Ok(AutomaticExtractionAdmission::Intent(Box::new(intent)))
+    }
     async fn scan_unqueued_sources(
         &self,
         as_of: DateTime<Utc>,
@@ -501,6 +609,10 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
         request: ObservationExtractionRequest,
         created_at: DateTime<Utc>,
     ) -> Result<ObservationExtractionIntent, AppError> {
+        let _admission = match &self.automatic_admission {
+            Some((gate, _)) => Some(gate.0.lock().await),
+            None => None,
+        };
         let key = request.intent_key(scope)?;
         let capture = self
             .captures

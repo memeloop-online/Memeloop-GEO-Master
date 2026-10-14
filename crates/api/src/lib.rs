@@ -73,7 +73,7 @@ pub use observation_ai_callback::ObservationAiCallbackService;
 mod observation_extraction;
 pub use observation_extraction::{
     EXTRACTION_POLICY_VERSION, ObservationExtractionContinuation, ObservationExtractionService,
-    spawn_observation_extraction_dispatcher,
+    spawn_observation_extraction_dispatcher, spawn_observation_history_scheduler,
 };
 mod observation_analysis;
 mod observation_evidence;

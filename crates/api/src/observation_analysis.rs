@@ -46,6 +46,14 @@ pub enum HistoricalSourcePreparation {
     RejectedSource,
 }
 
+/// In-memory read cursor; restart repeats validation, never inference.
+#[derive(Default)]
+pub(crate) struct HistoricalSourceCursor {
+    after: Option<Uuid>,
+    grounded: bool,
+    pub(crate) history_snapshot: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzeSavedSource {
@@ -317,7 +325,45 @@ impl ObservationAnalysisService {
         attempt_id: Uuid,
         capture_id: Uuid,
     ) -> Result<HistoricalSourcePreparation, AppError> {
+        let mut cursor = HistoricalSourceCursor::default();
+        loop {
+            if let Some(preparation) = self
+                .prepare_historical_source_page(
+                    scope,
+                    target_id,
+                    attempt_id,
+                    capture_id,
+                    &mut cursor,
+                )
+                .await?
+            {
+                return Ok(preparation);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Inspect at most one revision page, allowing background scheduling to
+    /// share work fairly without hiding old successful revisions.
+    pub(crate) async fn prepare_historical_source_page(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+        capture_id: Uuid,
+        cursor: &mut HistoricalSourceCursor,
+    ) -> Result<Option<HistoricalSourcePreparation>, AppError> {
         use HistoricalSourcePreparation as Preparation;
+        // Capture before the first page. Final admission compares under the
+        // same repository lock as every manual history mutation, so changes
+        // before an already-read cursor cannot authorize duplicate inference.
+        if cursor.history_snapshot.is_none() {
+            cursor.history_snapshot = Some(
+                self.repository
+                    .admission_history_snapshot(scope, target_id, attempt_id)
+                    .await?,
+            );
+        }
         let mut target = self.jobs.get_target(scope, target_id).await?;
         let attempt = target
             .attempts
@@ -325,14 +371,14 @@ impl ObservationAnalysisService {
             .find(|attempt| attempt.attempt_id == attempt_id)
             .ok_or_else(|| AppError::not_found("measurement attempt not found"))?;
         if attempt.outcome.is_none() || attempt.received_at.is_none() {
-            return Ok(Preparation::MissingReceipt);
+            return Ok(Some(Preparation::MissingReceipt));
         }
         let Some(capture) = self.captures.get(scope, capture_id).await? else {
-            return Ok(Preparation::RejectedSource);
+            return Ok(Some(Preparation::RejectedSource));
         };
         let ObservationCaptureSnapshot::Source { source_sha256, .. } = &capture.input.snapshot
         else {
-            return Ok(Preparation::RejectedSource);
+            return Ok(Some(Preparation::RejectedSource));
         };
         let request = Self::request(
             target_id,
@@ -344,7 +390,7 @@ impl ObservationAnalysisService {
             },
         );
         if observation_analysis_source_json(scope, &request, &target, Some(&capture)).is_err() {
-            return Ok(Preparation::RejectedSource);
+            return Ok(Some(Preparation::RejectedSource));
         }
         // The shared effective-observation validator selects the last attempt;
         // reduce this read-only view to the specifically requested historical one.
@@ -360,54 +406,51 @@ impl ObservationAnalysisService {
         )
         .is_some()
         {
-            return Ok(Preparation::TrustedObservation);
+            return Ok(Some(Preparation::TrustedObservation));
         }
-        let mut after = None;
-        let mut grounded = false;
         // Bound each read, not total history: a later failure must never hide
         // an older valid interpretation behind an arbitrary record cutoff.
-        loop {
-            let revisions = self
-                .repository
-                .list_for_attempt(scope, target_id, attempt_id, after, 100)
-                .await?;
-            for revision in &revisions {
-                if matches!(
-                    revision.state,
-                    ObservationAnalysisState::Queued | ObservationAnalysisState::Running
-                ) {
-                    return Ok(Preparation::ActiveAnalysis);
-                }
-                if revision.request.source_sha256 != request.source_sha256
-                    || observation_analysis_source_json(
-                        scope,
-                        &revision.request,
-                        &target,
-                        Some(&capture),
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-                grounded |= geo_domain::effective_observation(
+        let revisions = self
+            .repository
+            .list_for_attempt(scope, target_id, attempt_id, cursor.after, 100)
+            .await?;
+        for revision in &revisions {
+            if matches!(
+                revision.state,
+                ObservationAnalysisState::Queued | ObservationAnalysisState::Running
+            ) {
+                return Ok(Some(Preparation::ActiveAnalysis));
+            }
+            if revision.request.source_sha256 != request.source_sha256
+                || observation_analysis_source_json(
+                    scope,
+                    &revision.request,
                     &target,
-                    std::slice::from_ref(revision),
-                    now,
-                    |_, _| false,
+                    Some(&capture),
                 )
-                .is_some();
+                .is_err()
+            {
+                continue;
             }
-            if revisions.len() < 100 {
-                return Ok(if grounded {
-                    Preparation::GroundedAnalysis
-                } else {
-                    Preparation::Ready(request)
-                });
-            }
-            after = revisions
-                .last()
-                .map(|revision| revision.request.revision_id);
+            cursor.grounded |= geo_domain::effective_observation(
+                &target,
+                std::slice::from_ref(revision),
+                now,
+                |_, _| false,
+            )
+            .is_some();
         }
+        if revisions.len() < 100 {
+            return Ok(Some(if cursor.grounded {
+                Preparation::GroundedAnalysis
+            } else {
+                Preparation::Ready(request)
+            }));
+        }
+        cursor.after = revisions
+            .last()
+            .map(|revision| revision.request.revision_id);
+        Ok(None)
     }
 
     pub async fn submit(
@@ -640,7 +683,7 @@ impl ObservationAnalysisService {
         };
         let result = match tokio::time::timeout(
             Duration::from_secs(150),
-            self.interpret(scope, &claim.revision.request),
+            self.interpret_claimed(scope, &claim.revision.request, Some(claim.claim_token)),
         )
         .await
         {
@@ -657,27 +700,52 @@ impl ObservationAnalysisService {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn interpret(
         &self,
         scope: &TenantScope,
         request: &ObservationAnalysisRequest,
     ) -> Result<ObservationAnalysisResult, AppError> {
+        self.interpret_claimed(scope, request, None).await
+    }
+
+    async fn interpret_claimed(
+        &self,
+        scope: &TenantScope,
+        request: &ObservationAnalysisRequest,
+        claim_token: Option<Uuid>,
+    ) -> Result<ObservationAnalysisResult, AppError> {
         if !supported_versions(&request.prompt_version, &request.parser_version) {
+            self.mark_inference_resolved(scope, request, claim_token)
+                .await?;
             return Ok(failed("analysis_version_unsupported"));
         }
-        let target = self.jobs.get_target(scope, request.target_id).await?;
-        let capture = match request.source {
-            ObservationAnalysisSource::Capture { capture_id } => {
-                self.captures.get(scope, capture_id).await?
+        let prepared = async {
+            let target = self.jobs.get_target(scope, request.target_id).await?;
+            let capture = match request.source {
+                ObservationAnalysisSource::Capture { capture_id } => {
+                    self.captures.get(scope, capture_id).await?
+                }
+                ObservationAnalysisSource::AttemptEvidence { .. } => None,
+            };
+            let source =
+                observation_analysis_source_json(scope, request, &target, capture.as_ref())?;
+            let prompt = crate::observation_ai_callback::extraction_prompt_versioned(
+                &source,
+                &request.prompt_version,
+            )
+            .map_err(|_| AppError::invalid_request("invalid saved source"))?;
+            Ok::<_, AppError>((target, source, prompt))
+        }
+        .await;
+        let (target, source, prompt) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.mark_inference_resolved(scope, request, claim_token)
+                    .await?;
+                return Err(error);
             }
-            ObservationAnalysisSource::AttemptEvidence { .. } => None,
         };
-        let source = observation_analysis_source_json(scope, request, &target, capture.as_ref())?;
-        let prompt = crate::observation_ai_callback::extraction_prompt_versioned(
-            &source,
-            &request.prompt_version,
-        )
-        .map_err(|_| AppError::invalid_request("invalid saved source"))?;
         let completion = self
             .model
             .complete_for_usage_with_revision(
@@ -694,10 +762,25 @@ impl ObservationAnalysisService {
             )
             .await;
         let (completion, config_revision) = match completion {
-            Ok(completion) => completion,
+            Ok(completion) => {
+                self.mark_inference_resolved(scope, request, claim_token)
+                    .await?;
+                completion
+            }
             // Classify only bridge-owned vocabulary. Never persist an error
             // message, upstream body, request, endpoint or credential.
             Err(error) => {
+                // Only bridge-local configuration failures prove no outbound
+                // request occurred. Transport/timeouts remain unresolved.
+                if matches!(
+                    error.message.as_str(),
+                    "project model settings unavailable"
+                        | "project model unavailable"
+                        | "no inherited or project model is configured"
+                ) {
+                    self.mark_inference_resolved(scope, request, claim_token)
+                        .await?;
+                }
                 tracing::info!(
                     failure = model_failure_code(&error),
                     "observation model failed"
@@ -772,6 +855,20 @@ impl ObservationAnalysisService {
             }
         }
         Ok(result)
+    }
+
+    async fn mark_inference_resolved(
+        &self,
+        scope: &TenantScope,
+        request: &ObservationAnalysisRequest,
+        claim_token: Option<Uuid>,
+    ) -> Result<(), AppError> {
+        if let Some(token) = claim_token {
+            self.repository
+                .record_inference_resolved(scope, request.revision_id, token)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -1511,6 +1608,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_scheduler_revisits_late_receipt_and_admits_only_once() {
+        let f = fixture_with_terminal(true, true, false, "execution_deadline", false).await;
+        let repository = Arc::new(
+            MemoryObservationExtractionRepository::new(f.service.captures.clone())
+                .with_automatic_admission(
+                    f.service.repository.memory_admission_gate().unwrap(),
+                    f.service.repository.clone(),
+                ),
+        );
+        let bridge = ProjectConfiguredModelBridge::new(
+            ProjectAiSettingsService::development(),
+            Some(f.model.clone()),
+        )
+        .unwrap();
+        let extraction = crate::ObservationExtractionService::new(
+            repository.clone(),
+            f.service.captures.clone(),
+            bridge,
+        );
+        let mut scan = crate::observation_extraction::HistoricalScan::new();
+        scan.tick(&extraction, &f.service).await.unwrap();
+        assert!(
+            repository
+                .scan_ready(Utc::now(), None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reference = fixture(true, true, false).await;
+        let outcome = reference
+            .original
+            .attempts
+            .last()
+            .unwrap()
+            .outcome
+            .clone()
+            .unwrap();
+        let finished = f
+            .service
+            .jobs
+            .finish(&f.scope, f.target_id, f.attempt_id, outcome, Utc::now())
+            .await
+            .unwrap();
+        scan.tick(&extraction, &f.service).await.unwrap();
+        scan.tick(&extraction, &f.service).await.unwrap();
+        let items = repository.scan_ready(Utc::now(), None, 100).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            finished,
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_scheduler_restarts_when_manual_success_arrives_behind_page_cursor() {
+        struct CompleteGrounder;
+        #[async_trait::async_trait]
+        impl SavedObservationGrounder for CompleteGrounder {
+            async fn ground(
+                &self,
+                source: &str,
+                digest: &str,
+                candidate: &str,
+                protocol: Value,
+                prompt: &str,
+                parser: &str,
+            ) -> Result<GroundingResult, AppError> {
+                let mut result = Grounder { unavailable: false }
+                    .ground(source, digest, candidate, protocol, prompt, parser)
+                    .await?;
+                if let ObservationAnalysisOutcome::Grounded { audit, .. } = &mut result.outcome {
+                    audit["refs"] = json!([
+                        {"role":"completion"},
+                        {"role":"search_activity"},
+                        {"role":"answer_segment"}
+                    ]);
+                }
+                Ok(result)
+            }
+        }
+        let mut f = fixture(true, true, false).await;
+        f.service.grounder = Arc::new(CompleteGrounder);
+        let HistoricalSourcePreparation::Ready(request) = prepare_history(&f).await else {
+            panic!("valid saved source");
+        };
+        for index in 0..101 {
+            let mut failed_request = request.clone();
+            failed_request.revision_id = Uuid::new_v4();
+            f.service
+                .repository
+                .project_response(
+                    &f.scope,
+                    &format!("history-cursor-failed-{index}"),
+                    &sha256_hex(b"synthetic-resolved-failure"),
+                    failed_request,
+                    failed("analysis_result_invalid"),
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+        }
+        let repository = Arc::new(
+            MemoryObservationExtractionRepository::new(f.service.captures.clone())
+                .with_automatic_admission(
+                    f.service.repository.memory_admission_gate().unwrap(),
+                    f.service.repository.clone(),
+                ),
+        );
+        let bridge = ProjectConfiguredModelBridge::new(
+            ProjectAiSettingsService::development(),
+            Some(f.model.clone()),
+        )
+        .unwrap();
+        let extraction = crate::ObservationExtractionService::new(
+            repository.clone(),
+            f.service.captures.clone(),
+            bridge,
+        );
+        let mut scan = crate::observation_extraction::HistoricalScan::new();
+        // First 100 failed revisions have already been inspected.
+        scan.tick(&extraction, &f.service).await.unwrap();
+        let manual = f
+            .service
+            .submit(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                AnalyzeSavedSource {
+                    idempotency_key: "manual-during-history".into(),
+                    capture_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        f.service
+            .execute(&f.scope, manual.request.revision_id)
+            .await
+            .unwrap();
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            prepare_history(&f).await,
+            HistoricalSourcePreparation::GroundedAnalysis
+        );
+        // The new success sorts ahead of the cursor. Finishing page two must
+        // fail the history CAS and restart; the restarted pass reuses it.
+        for _ in 0..3 {
+            scan.tick(&extraction, &f.service).await.unwrap();
+            assert!(
+                repository
+                    .scan_ready(Utc::now(), None, 100)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            f.original
+        );
+    }
+
+    #[tokio::test]
     async fn historical_preparation_never_interrupts_active_manual_analysis() {
         let f = fixture(true, true, false).await;
         let HistoricalSourcePreparation::Ready(request) = prepare_history(&f).await else {
@@ -1645,6 +1914,34 @@ mod tests {
             HistoricalSourcePreparation::GroundedAnalysis
         );
         assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+        let mut cursor = HistoricalSourceCursor::default();
+        let capture_id = historical_capture(&f).await;
+        assert_eq!(
+            f.service
+                .prepare_historical_source_page(
+                    &f.scope,
+                    f.target_id,
+                    f.attempt_id,
+                    capture_id,
+                    &mut cursor,
+                )
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            f.service
+                .prepare_historical_source_page(
+                    &f.scope,
+                    f.target_id,
+                    f.attempt_id,
+                    capture_id,
+                    &mut cursor,
+                )
+                .await
+                .unwrap(),
+            Some(HistoricalSourcePreparation::GroundedAnalysis),
+        );
 
         // Completed is insufficient: reject a mismatched audit source binding.
         let forged = fixture(true, true, false).await;
@@ -2356,6 +2653,25 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ObservationExtractionRepository for CompleteDuringStatusRead {
+        async fn admit_automatic_with_history(
+            &self,
+            scope: &TenantScope,
+            request: geo_domain::ObservationExtractionRequest,
+            at: DateTime<Utc>,
+            expected_history: &str,
+        ) -> Result<geo_domain::AutomaticExtractionAdmission, AppError> {
+            self.repository
+                .admit_automatic_with_history(scope, request, at, expected_history)
+                .await
+        }
+        async fn admit_automatic(
+            &self,
+            scope: &TenantScope,
+            request: geo_domain::ObservationExtractionRequest,
+            at: DateTime<Utc>,
+        ) -> Result<geo_domain::AutomaticExtractionAdmission, AppError> {
+            self.repository.admit_automatic(scope, request, at).await
+        }
         async fn scan_unqueued_sources(
             &self,
             at: DateTime<Utc>,

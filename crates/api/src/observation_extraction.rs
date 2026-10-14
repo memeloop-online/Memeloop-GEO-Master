@@ -1,11 +1,12 @@
 //! Durable inference shared by live callbacks and saved-response continuation.
 //! HTTP waiters never own or cancel a model call. Running claims are not reclaimed.
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use chrono::Utc;
 use geo_domain::{
-    AppError, ObservationAnalysisResult, ObservationCaptureRepository, ObservationCaptureSnapshot,
-    ObservationExtractionClaim, ObservationExtractionIntent, ObservationExtractionInterruption,
+    AppError, AutomaticExtractionAdmission, ObservationAnalysisResult,
+    ObservationCaptureRepository, ObservationCaptureSnapshot, ObservationExtractionClaim,
+    ObservationExtractionIntent, ObservationExtractionInterruption,
     ObservationExtractionRepository, ObservationExtractionRequest, ObservationExtractionResponse,
     ObservationExtractionResponseDisposition, ObservationExtractionState, ProjectAiUsage,
     TenantScope,
@@ -126,7 +127,27 @@ impl ObservationExtractionService {
         };
         crate::observation_ai_callback::extraction_prompt_versioned(source_json, prompt_version)
             .map_err(|_| AppError::invalid_request("invalid extraction source"))?;
-        let intent = self.repository.enqueue(scope, request, Utc::now()).await?;
+        let intent = match self
+            .repository
+            .admit_automatic(scope, request.clone(), Utc::now())
+            .await?
+        {
+            AutomaticExtractionAdmission::Intent(intent) => *intent,
+            AutomaticExtractionAdmission::DeferredManual => {
+                return Err(AppError::conflict("extraction deferred by saved analysis"));
+            }
+            AutomaticExtractionAdmission::DeferredHistoryChanged => {
+                return Err(AppError::conflict("extraction history changed"));
+            }
+        };
+        if intent.request.prompt_version != request.prompt_version
+            || intent.request.parser_version != request.parser_version
+            || intent.request.policy_version != request.policy_version
+        {
+            // Reusing the durable task never licenses returning an incompatible
+            // raw model schema to a live callback, nor starting another call.
+            return Err(AppError::conflict("extraction response version conflict"));
+        }
         self.wake.notify_one();
         Ok(intent)
     }
@@ -323,6 +344,154 @@ impl ObservationExtractionService {
     }
 }
 
+struct HistoricalCandidate {
+    item: geo_domain::ObservationExtractionBackfillItem,
+    cursor: crate::observation_analysis::HistoricalSourceCursor,
+}
+
+/// A fixed-cutoff keyset pass survives ticks. Each pending source gets one
+/// revision page per tick; long histories cannot monopolize the scheduler.
+pub(crate) struct HistoricalScan {
+    cutoff: chrono::DateTime<Utc>,
+    after: Option<Uuid>,
+    exhausted: bool,
+    pending: VecDeque<HistoricalCandidate>,
+}
+
+impl HistoricalScan {
+    pub(crate) fn new() -> Self {
+        Self {
+            cutoff: Utc::now(),
+            after: None,
+            exhausted: false,
+            pending: VecDeque::new(),
+        }
+    }
+
+    pub(crate) async fn tick(
+        &mut self,
+        service: &ObservationExtractionService,
+        analysis: &ObservationAnalysisService,
+    ) -> Result<(), AppError> {
+        const PAGE: usize = 16;
+        // Keep memory bounded while allowing other candidates to advance next
+        // to a source with arbitrarily many historical revisions.
+        if !self.exhausted && self.pending.len() < PAGE {
+            let items = service
+                .repository
+                .scan_unqueued_sources(self.cutoff, self.after, PAGE - self.pending.len())
+                .await?;
+            self.exhausted = items.len() < PAGE - self.pending.len();
+            for item in items {
+                self.after = Some(item.capture_id);
+                self.pending.push_back(HistoricalCandidate {
+                    item,
+                    cursor: Default::default(),
+                });
+            }
+        }
+        let work = self.pending.len().min(PAGE);
+        for _ in 0..work {
+            let Some(mut candidate) = self.pending.pop_front() else {
+                break;
+            };
+            let outcome = async {
+                let Some(capture) = service
+                    .captures
+                    .get(&candidate.item.scope, candidate.item.capture_id)
+                    .await?
+                else {
+                    return Ok::<_, AppError>(true);
+                };
+                let preparation = analysis
+                    .prepare_historical_source_page(
+                        &candidate.item.scope,
+                        capture.input.target_id,
+                        capture.input.attempt_id,
+                        candidate.item.capture_id,
+                        &mut candidate.cursor,
+                    )
+                    .await?;
+                match preparation {
+                    None => Ok(false),
+                    Some(crate::observation_analysis::HistoricalSourcePreparation::Ready(
+                        request,
+                    )) => {
+                        let request = ObservationExtractionRequest {
+                            target_id: request.target_id,
+                            attempt_id: request.attempt_id,
+                            source_capture_id: candidate.item.capture_id,
+                            source_sha256: request.source_sha256,
+                            prompt_version: request.prompt_version,
+                            parser_version: request.parser_version,
+                            policy_version: EXTRACTION_POLICY_VERSION.into(),
+                        };
+                        request.validate_source(&candidate.item.scope, &capture)?;
+                        let admission = service
+                            .repository
+                            .admit_automatic_with_history(
+                                &candidate.item.scope,
+                                request,
+                                Utc::now(),
+                                candidate
+                                    .cursor
+                                    .history_snapshot
+                                    .as_deref()
+                                    .ok_or_else(|| {
+                                        AppError::conflict("extraction history snapshot missing")
+                                    })?,
+                            )
+                            .await?;
+                        if matches!(
+                            admission,
+                            AutomaticExtractionAdmission::DeferredHistoryChanged
+                        ) {
+                            candidate.cursor = Default::default();
+                            return Ok(false);
+                        }
+                        service.wake.notify_one();
+                        Ok(true)
+                    }
+                    // Missing receipts and manual work are reconsidered next
+                    // pass, without mutating or expiring that work.
+                    Some(_) => Ok(true),
+                }
+            }
+            .await;
+            match outcome {
+                Ok(false) => self.pending.push_back(candidate),
+                Ok(true) => {}
+                Err(error) => {
+                    tracing::warn!(code = ?error.code, "observation history preparation failed");
+                }
+            }
+        }
+        if self.exhausted && self.pending.is_empty() {
+            *self = Self::new();
+        }
+        Ok(())
+    }
+}
+
+/// Deployment cutover must explicitly enable this after legacy direct calls
+/// drain. Existing queued/received recovery is independent of this scheduler.
+pub fn spawn_observation_history_scheduler(
+    service: ObservationExtractionService,
+    analysis: ObservationAnalysisService,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut scan = HistoricalScan::new();
+        let mut ticks = tokio::time::interval(Duration::from_secs(30));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            if let Err(error) = scan.tick(&service, &analysis).await {
+                tracing::warn!(code = ?error.code, "observation history scan failed");
+            }
+        }
+    })
+}
+
 /// One bounded dispatcher per application assembly. Startup scans immediately;
 /// enqueue wakes it, and periodic keyset scans recover queued/received checkpoints.
 pub fn spawn_observation_extraction_dispatcher(
@@ -385,6 +554,25 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ObservationExtractionRepository for LostCheckpointAck {
+        async fn admit_automatic_with_history(
+            &self,
+            scope: &TenantScope,
+            request: ObservationExtractionRequest,
+            at: chrono::DateTime<Utc>,
+            expected_history: &str,
+        ) -> Result<AutomaticExtractionAdmission, AppError> {
+            self.inner
+                .admit_automatic_with_history(scope, request, at, expected_history)
+                .await
+        }
+        async fn admit_automatic(
+            &self,
+            scope: &TenantScope,
+            request: ObservationExtractionRequest,
+            at: chrono::DateTime<Utc>,
+        ) -> Result<AutomaticExtractionAdmission, AppError> {
+            self.inner.admit_automatic(scope, request, at).await
+        }
         async fn scan_unqueued_sources(
             &self,
             at: chrono::DateTime<Utc>,
@@ -587,7 +775,18 @@ mod tests {
                 input,
             },
         });
-        let repository = Arc::new(MemoryObservationExtractionRepository::new(captures.clone()));
+        let gate = geo_domain::MemoryObservationAdmissionGate::default();
+        let analyses = Arc::new(
+            geo_domain::MemoryObservationAnalysisRepository::new(
+                Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+                captures.clone(),
+            )
+            .with_admission_gate(gate.clone()),
+        );
+        let repository = Arc::new(
+            MemoryObservationExtractionRepository::new(captures.clone())
+                .with_automatic_admission(gate, analyses),
+        );
         let model = Arc::new(Model::default());
         let bridge = ProjectConfiguredModelBridge::new(
             ProjectAiSettingsService::development(),
@@ -761,9 +960,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_and_current_intents_keep_distinct_parser_bindings() {
-        let (scope, captures, _, _, service) = fixture();
+    async fn cross_version_callback_refuses_output_without_second_inference() {
+        let (scope, captures, repository, model, service) = fixture();
         let current = enqueue(&service, &scope, &captures).await;
+        model.release.notify_one();
+        service.dispatch(&scope, current.intent_id).await.unwrap();
         let legacy = service
             .enqueue_source(
                 &scope,
@@ -772,10 +973,19 @@ mod tests {
                 "geo.observation.extract.v2",
             )
             .await
-            .unwrap();
-        assert_ne!(current.intent_id, legacy.intent_id);
+            .unwrap_err();
+        assert_eq!(legacy.message, "extraction response version conflict");
         assert_eq!(current.request.parser_version, "geo.observation.extract.v5");
-        assert_eq!(legacy.request.parser_version, "geo.observation.extract.v4");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            repository
+                .get(&scope, current.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .response
+                .is_some()
+        );
         let foreign = TenantScope::new(
             Uuid::new_v4().into(),
             Uuid::new_v4().into(),

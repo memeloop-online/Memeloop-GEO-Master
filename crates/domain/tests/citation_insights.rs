@@ -42,6 +42,7 @@ fn analysis(
         created_at: at,
         started_at: Some(at),
         analyzed_at: Some(at),
+        inference_resolved: true,
         result: Some(ObservationAnalysisResult {
             config_revision: Some(2),
             actual_model: Some("analysis-model".into()),

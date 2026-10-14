@@ -85,18 +85,6 @@ fn callbacks_with_credentials(
     key: Option<&str>,
     extraction_repository: std::sync::Arc<dyn geo_domain::ObservationExtractionRepository>,
 ) -> Result<AppState, Box<dyn Error>> {
-    let Some(token) = token else {
-        return Ok(state);
-    };
-    let key = key.ok_or("browser callback configuration requires a persistent channel key")?;
-    let cipher = std::sync::Arc::new(geo_provider::SecretEnvelope::from_hex_key(key)?);
-    let captures = geo_api::ObservationCaptureCallbackService::new(
-        std::sync::Arc::new(
-            geo_persistence::PgObservationCaptureRepository::from_database(database),
-        ),
-        cipher.clone(),
-        token,
-    )?;
     let settings = state.project_ai_settings();
     let inherited = settings.inherited_provider(geo_domain::ProjectAiUsage::ObservationAnalysis);
     let mut extraction = geo_api::ObservationExtractionService::new(
@@ -111,6 +99,29 @@ fn callbacks_with_credentials(
     }
     let _extraction_dispatcher =
         geo_api::spawn_observation_extraction_dispatcher(extraction.clone());
+    // Deployment-only cutover switch, never a per-user approval. Enable only
+    // after proving old direct callback requests are no longer in flight.
+    let history_enabled = match env::var("GEO_OBSERVATION_HISTORY_ADMISSION") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "false" => false,
+        Ok(value) if value == "true" => true,
+        _ => return Err("GEO_OBSERVATION_HISTORY_ADMISSION must be true or false".into()),
+    };
+    if history_enabled && let Some(analysis) = state.observation_analysis_service() {
+        geo_api::spawn_observation_history_scheduler(extraction.clone(), analysis.clone());
+    }
+    let Some(token) = token else {
+        return Ok(state);
+    };
+    let key = key.ok_or("browser callback configuration requires a persistent channel key")?;
+    let cipher = std::sync::Arc::new(geo_provider::SecretEnvelope::from_hex_key(key)?);
+    let captures = geo_api::ObservationCaptureCallbackService::new(
+        std::sync::Arc::new(
+            geo_persistence::PgObservationCaptureRepository::from_database(database),
+        ),
+        cipher.clone(),
+        token,
+    )?;
     let observation_ai =
         geo_api::ObservationAiCallbackService::new(captures.clone(), settings.clone(), extraction);
     let publication = geo_api::PublicationSendCallbackService::new(

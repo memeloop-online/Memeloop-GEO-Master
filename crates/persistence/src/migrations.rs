@@ -248,6 +248,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 59,
         description: "observation extraction status",
     },
+    MigrationMetadata {
+        version: 60,
+        description: "observation analysis inference resolution",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {
