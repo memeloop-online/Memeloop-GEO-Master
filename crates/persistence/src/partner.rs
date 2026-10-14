@@ -593,7 +593,7 @@ async fn reserve_item(
             ..
         }
     );
-    let revoke = matches!(&item.action, PartnerSyncAction::Revoke);
+    let revoke = matches!(&item.action, PartnerSyncAction::Revoke {});
     scoped("INSERT INTO partner_source_mappings \
         (operator_id,tenant_id,project_id,connection_id,external_source_id,accepted_sequence,\
         reserved_sequence,internal_fence_sequence,revoke_fence_sequence,revoked) \
@@ -761,7 +761,7 @@ async fn apply_item(
             )
             .await
         }
-        PartnerSyncAction::Revoke => match source_id {
+        PartnerSyncAction::Revoke {} => match source_id {
             Some(source) => {
                 PgKnowledgeRepository::revoke_partner_source_in_transaction(tx, scope, source).await
             }
@@ -805,7 +805,7 @@ async fn apply_item(
         WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND connection_id=$4 AND external_source_id=$5", scope)?
         .bind(work.connection_id).bind(&item.external_source_id)
         .bind(resources.source_id.or(source_id)).bind(item.source_sequence)
-        .bind(matches!(item.action, PartnerSyncAction::Revoke) || pending_revoke)
+        .bind(matches!(item.action, PartnerSyncAction::Revoke {}) || pending_revoke)
         .execute(&mut **tx).await.map_err(db)?;
     scoped("INSERT INTO partner_source_events \
         (operator_id,tenant_id,project_id,connection_id,external_source_id,external_version,source_sequence,\

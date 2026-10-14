@@ -41,7 +41,7 @@ pub enum PartnerSyncAction {
         text: String,
         content_sha256: String,
     },
-    Revoke,
+    Revoke {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,7 +182,7 @@ pub fn validate_partner_sync_request(request: &PartnerSyncRequest) -> Result<(),
                 } => [name, media_type, text, content_sha256]
                     .iter()
                     .any(|value| value.contains('\0')),
-                PartnerSyncAction::Revoke => false,
+                PartnerSyncAction::Revoke {} => false,
             }
     }) {
         return Err(AppError::invalid_request(
@@ -309,6 +309,9 @@ mod tests {
 
     #[test]
     fn canonical_deserialization_rejects_scope_and_unknown_action_fields() {
+        let revoke = serde_json::json!({"operation": "revoke"});
+        let decoded: PartnerSyncAction = serde_json::from_value(revoke.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), revoke);
         let original = item();
         let mut value = serde_json::to_value(&original).unwrap();
         value["effective_at"] = serde_json::json!("2026-01-01T08:00:00+08:00");

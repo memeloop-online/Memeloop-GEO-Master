@@ -233,7 +233,7 @@ async fn partner_versions_revoke_restore_and_old_release_authorization() {
         text(KnowledgePurpose::Public, "# Synthetic\n\nThird content."),
     )
     .await;
-    let pending_revoke = accept(&repo, &principal, 4, PartnerSyncAction::Revoke).await;
+    let pending_revoke = accept(&repo, &principal, 4, PartnerSyncAction::Revoke {}).await;
     assert_eq!(
         knowledge
             .get_source(&scope, source_id)

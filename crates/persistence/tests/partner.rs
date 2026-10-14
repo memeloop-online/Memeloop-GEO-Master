@@ -1,4 +1,4 @@
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use geo_domain::{
     ErrorCode, KnowledgePurpose, KnowledgeRepository, KnowledgeSearchRequest, PartnerAdvance,
     PartnerDisposition, PartnerPrincipal, PartnerRepository, PartnerSyncAction, PartnerSyncItem,
@@ -159,7 +159,7 @@ async fn durable_acceptance_restart_idempotency_mixed_results_and_cursor() {
 async fn source_identity_replay_conflict_tombstone_and_newer_restore() {
     let (_, repo, principal) = setup().await;
     let mut tombstone = item("synthetic-a", "deleted", 5);
-    tombstone.action = PartnerSyncAction::Revoke;
+    tombstone.action = PartnerSyncAction::Revoke {};
     let mut collision = item("synthetic-a", "deleted", 5);
     collision.effective_at += Duration::seconds(1);
     let batch = repo
@@ -274,7 +274,7 @@ async fn intake_restrictions_are_immediate_and_conflicting_or_stale_items_cannot
         .await
         .unwrap();
     let mut revoke = item("synthetic-a", "v3", 3);
-    revoke.action = PartnerSyncAction::Revoke;
+    revoke.action = PartnerSyncAction::Revoke {};
     let revoked = repo
         .accept(&principal, "revoke", request(vec![revoke]))
         .await
@@ -325,9 +325,9 @@ async fn intake_restrictions_are_immediate_and_conflicting_or_stale_items_cannot
         .await
         .unwrap();
     let mut conflict = item("synthetic-a", "v4", 5);
-    conflict.action = PartnerSyncAction::Revoke;
+    conflict.action = PartnerSyncAction::Revoke {};
     let mut stale = item("synthetic-a", "older-unseen", 2);
-    stale.action = PartnerSyncAction::Revoke;
+    stale.action = PartnerSyncAction::Revoke {};
     let invalid = repo
         .accept(
             &principal,
@@ -365,7 +365,7 @@ async fn intake_restrictions_are_immediate_and_conflicting_or_stale_items_cannot
 async fn pending_fences_keep_earlier_valid_versions_nonpublic_without_discarding_receipts() {
     let (database, repo, principal) = setup().await;
     let mut revoke = item("synthetic-a", "v2", 2);
-    revoke.action = PartnerSyncAction::Revoke;
+    revoke.action = PartnerSyncAction::Revoke {};
     let receipt = repo
         .accept(
             &principal,
