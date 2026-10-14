@@ -828,7 +828,9 @@ test("source deadline bounds navigation, identity, configuration and capture wit
         timers.set(timer, { callback, at: now + delay });
         return timer;
       });
-      t.mock.method(globalThis, "clearTimeout", (timer) => timers.delete(timer));
+      t.mock.method(globalThis, "clearTimeout", (timer) =>
+        timers.delete(timer),
+      );
       const fireTimer = (at) => {
         assert.equal(timers.size, 1);
         const [timer, scheduled] = [...timers.entries()][0];
