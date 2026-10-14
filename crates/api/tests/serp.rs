@@ -551,9 +551,13 @@ async fn reparse_persisted_ahead_clock_receipt_preserves_provenance_without_prov
         original_raw
     );
     for wrong_scope in [
-        TenantScope::new(Uuid::new_v4(), scope.tenant_id, scope.project_id),
-        TenantScope::new(scope.operator_id, Uuid::new_v4(), scope.project_id),
-        TenantScope::new(scope.operator_id, scope.tenant_id, Some(Uuid::new_v4())),
+        TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, scope.project_id),
+        TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id),
+        TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        ),
     ] {
         assert!(service.reparse(&wrong_scope, id, request()).await.is_err());
     }

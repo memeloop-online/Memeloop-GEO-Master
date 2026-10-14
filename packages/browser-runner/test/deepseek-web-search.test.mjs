@@ -817,33 +817,73 @@ test("unknown capture, thrown send and repeated submit callbacks never resend", 
   }
 });
 
-test("source deadline bounds navigation, identity, configuration and capture with matching observer TTL", async () => {
+test("source deadline bounds navigation, identity, configuration and capture with matching observer TTL", async (t) => {
   for (const stage of ["goto", "identity", "configuration", "capture"]) {
-    const f = fixture();
-    const expires = performance.now() + 35;
-    const observedTtls = [];
-    for (const method of ["observeConfiguration", "observeCreatedSessions"]) {
-      const original = f.options[method];
-      f.options[method] = (page, limits) => {
-        observedTtls.push(limits.timeoutMs);
-        assert.ok(limits.timeoutMs <= expires - performance.now() + 2);
-        return original(page, limits);
+    await t.test(stage, async (t) => {
+      let now = 1000;
+      const timers = new Map();
+      t.mock.method(performance, "now", () => now);
+      t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+        const timer = {};
+        timers.set(timer, { callback, at: now + delay });
+        return timer;
+      });
+      t.mock.method(globalThis, "clearTimeout", (timer) => timers.delete(timer));
+      const fireTimer = (at) => {
+        assert.equal(timers.size, 1);
+        const [timer, scheduled] = [...timers.entries()][0];
+        assert.equal(scheduled.at, at);
+        timers.delete(timer);
+        scheduled.callback();
       };
-    }
-    const hang = () => new Promise(() => {});
-    if (stage === "goto") f.page.goto = hang;
-    if (stage === "identity") f.options.identify = hang;
-    if (stage === "configuration") f.options.configure = hang;
-    if (stage === "capture") f.options.capture = hang;
-    const result = await observeDeepSeekWebSearch(f.page, payload, {
-      ...f.options,
-      sourceDeadlineAt: expires,
-      deadlineAt: performance.now() + 5000,
+      const f = fixture();
+      const expires = now + 35;
+      const observedTtls = [];
+      for (const method of ["observeConfiguration", "observeCreatedSessions"]) {
+        const original = f.options[method];
+        f.options[method] = (page, limits) => {
+          observedTtls.push(limits.timeoutMs);
+          return original(page, limits);
+        };
+      }
+      let reached;
+      const started = new Promise((resolve) => {
+        reached = resolve;
+      });
+      const hang = () => {
+        reached();
+        return new Promise(() => {});
+      };
+      if (stage === "goto") f.page.goto = hang;
+      if (stage === "identity") f.options.identify = hang;
+      if (stage === "configuration") f.options.configure = hang;
+      if (stage === "capture") f.options.capture = hang;
+      const pending = observeDeepSeekWebSearch(f.page, payload, {
+        ...f.options,
+        sourceDeadlineAt: expires,
+        deadlineAt: now + 5000,
+      });
+      await started;
+      // Check the shared TTL against its calculation time, not a later wall
+      // clock reading that can drift when CI suspends an observer callback.
+      assert.deepEqual(observedTtls, [35, 35]);
+      // An early timer wakeup must rearm; only the source deadline expires it.
+      now = expires - 1;
+      fireTimer(expires);
+      now = expires;
+      fireTimer(expires);
+      if (stage === "capture") {
+        // Capture gets the bounded checkpoint reserve before rejecting.
+        now += 1250;
+        fireTimer(now);
+      }
+      const result = await pending;
+      assert.equal(result.reason, "budget_exhausted");
+      assert.equal(f.calls.includes("send"), false);
+      assert.ok(f.calls.includes("dispose-config"));
+      assert.ok(f.calls.includes("dispose-create"));
+      assert.equal(timers.size, 0);
     });
-    assert.equal(result.reason, "budget_exhausted", stage);
-    assert.equal(observedTtls[0], observedTtls[1], stage);
-    assert.equal(f.calls.includes("send"), false, stage);
-    assert.ok(f.calls.includes("dispose-create"), stage);
   }
 });
 
