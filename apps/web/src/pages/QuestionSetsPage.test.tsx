@@ -62,6 +62,7 @@ function mockApi({
   role = "tenant_admin",
   conflict = false,
   listError = false,
+  listReady,
   createErrorOnce = false,
   sourceKinds,
 }: {
@@ -69,6 +70,7 @@ function mockApi({
   role?: string;
   conflict?: boolean;
   listError?: boolean;
+  listReady?: Promise<void>;
   createErrorOnce?: boolean;
   sourceKinds?: string[];
 } = {}) {
@@ -162,7 +164,7 @@ function mockApi({
           return Promise.resolve(
             reply({ code: "internal", message: "Unavailable" }, 503),
           );
-        return Promise.resolve(
+        return Promise.resolve(listReady).then(() =>
           reply({
             items: exists
               ? [
@@ -529,7 +531,9 @@ describe("P13 versioned question sets", () => {
       "/app/tenant-1/project-1/measurement?tab=sets&set=set-1&version=version-1",
     );
     await screen.findByRole("heading", { name: "基础问题 · v1" });
-    await user.click(screen.getByRole("button", { name: "基于当前版本修订" }));
+    await user.click(
+      await screen.findByRole("button", { name: "基于当前版本修订" }),
+    );
     await user.clear(screen.getByLabelText("问题 1"));
     await user.type(screen.getByLabelText("问题 1"), "未保存的修订");
     await user.click(screen.getByRole("tab", { name: "信源洞察" }));
@@ -544,6 +548,59 @@ describe("P13 versioned question sets", () => {
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
       "set=set-1",
     );
+  });
+
+  it("waits for the set list after version detail loads before editing and preserves the revision draft", async () => {
+    let releaseList!: () => void;
+    const listReady = new Promise<void>((resolve) => {
+      releaseList = resolve;
+    });
+    const calls = mockApi({ existing: true, listReady });
+    const user = userEvent.setup();
+    renderPage(
+      "/app/tenant-1/project-1/measurement?tab=sets&set=set-1&version=version-1",
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "基础问题 · v1" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "基于当前版本修订" }),
+    ).not.toBeInTheDocument();
+    expect(
+      calls.filter(
+        ({ path, method }) =>
+          method === "GET" &&
+          path.endsWith("/projects/project-1/question-sets"),
+      ),
+    ).toHaveLength(1);
+
+    releaseList();
+    await user.click(
+      await screen.findByRole("button", { name: "基于当前版本修订" }),
+    );
+    expect(screen.getByLabelText("问题 1")).toHaveValue("怎样选型？");
+    await user.clear(screen.getByLabelText("问题 1"));
+    await user.type(screen.getByLabelText("问题 1"), "延迟加载后保留的修订");
+    await user.click(screen.getByRole("tab", { name: "信源洞察" }));
+    await user.click(screen.getByRole("button", { name: "浏览器返回" }));
+    expect(screen.getByLabelText("问题 1")).toHaveValue("延迟加载后保留的修订");
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "version=version-1",
+    );
+    expect(calls.filter(({ method }) => method === "POST")).toHaveLength(0);
+
+    await user.click(screen.getByRole("button", { name: "保存为新版本" }));
+    await screen.findByRole("heading", { name: "基础问题 · v2" });
+    const revisions = calls.filter(
+      ({ path, method }) =>
+        method === "POST" && path.endsWith("/question-sets/set-1/versions"),
+    );
+    expect(revisions).toHaveLength(1);
+    expect(revisions[0].body).toMatchObject({
+      base_version_id: "version-1",
+      questions: [{ question_id: "question-1", text: "延迟加载后保留的修订" }],
+    });
   });
 
   it("holds a new-set draft when tabs switch and opens creation only on request", async () => {
