@@ -34,6 +34,8 @@ mod idempotency;
 mod knowledge;
 mod partner;
 pub use partner::PgPartnerRepository;
+mod partner_admin;
+pub use partner_admin::PgPartnerAdminRepository;
 mod migrations;
 mod model_routes;
 pub use model_routes::PgModelRouteRepository;

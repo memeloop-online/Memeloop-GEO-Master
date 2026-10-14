@@ -78,6 +78,7 @@ import { OperatorProxyPools } from "../components/OperatorProxyPools";
 import { OperatorAccountNetwork } from "../components/OperatorAccountNetwork";
 import { ProjectAiSettingsPanel } from "./ProjectAiSettingsPanel";
 import { ProjectSerpSettingsPanel } from "./ProjectSerpSettingsPanel";
+import { PartnerConnectionsPanel } from "./PartnerConnectionsPanel";
 import "../i18n/projectSerp";
 import "../i18n/projectAi";
 import "./ChannelAccountsPage.css";
@@ -452,6 +453,8 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const aiTab = view === "settings" && searchParams.get("tab") === "ai";
   const searchTab = view === "settings" && searchParams.get("tab") === "search";
+  const partnerTab =
+    view === "settings" && searchParams.get("tab") === "partners";
   const { session } = useAuth();
   const client = useQueryClient();
   const { accounts, groups, platforms } = useChannelData(tenantId, projectId);
@@ -661,7 +664,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
             )}
           </p>
         </div>
-        {view !== "connect" && !aiTab && !searchTab && (
+        {view !== "connect" && !aiTab && !searchTab && !partnerTab && (
           <Button
             onClick={() => navigate("../channels/connect")}
             appearance="primary"
@@ -673,7 +676,15 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
       {view === "settings" && (
         <TabList
           aria-label={t("projectAi.tabs")}
-          selectedValue={aiTab ? "ai" : searchTab ? "search" : "accounts"}
+          selectedValue={
+            aiTab
+              ? "ai"
+              : searchTab
+                ? "search"
+                : partnerTab
+                  ? "partners"
+                  : "accounts"
+          }
           onTabSelect={(_, data) =>
             setSearchParams((previous) => {
               const next = new URLSearchParams(previous);
@@ -685,9 +696,16 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
           <Tab value="accounts">{t("projectAi.accounts")}</Tab>
           <Tab value="ai">{t("projectAi.tab")}</Tab>
           <Tab value="search">{t("tab", { ns: "projectSerp" })}</Tab>
+          <Tab value="partners">{t("tab", { ns: "partnerConnections" })}</Tab>
         </TabList>
       )}
-      {searchTab && tenantId && projectId ? (
+      {partnerTab && tenantId && projectId ? (
+        <PartnerConnectionsPanel
+          key={`${tenantId}:${projectId}`}
+          tenantId={tenantId}
+          projectId={projectId}
+        />
+      ) : searchTab && tenantId && projectId ? (
         <ProjectSerpSettingsPanel
           key={`${tenantId}:${projectId}`}
           tenantId={tenantId}
