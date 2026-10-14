@@ -184,7 +184,9 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
     let automatic_request = geo_domain::ObservationExtractionRequest {
         target_id,
         attempt_id,
-        source_capture_id: capture_id,
+        source_capture_id: Some(capture_id),
+        source_evidence_index: None,
+        manual_revision_id: None,
         source_sha256: request.source_sha256.clone(),
         prompt_version: "extract.v2".into(),
         parser_version: "ground.v2".into(),
@@ -531,7 +533,7 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
     fresh_source.runner_session_id = Uuid::new_v4();
     let fresh_receipt = captures.save(&scope, fresh_source).await.unwrap();
     let mut fresh_request = automatic_request;
-    fresh_request.source_capture_id = fresh_receipt.capture_id;
+    fresh_request.source_capture_id = Some(fresh_receipt.capture_id);
     assert_eq!(
         extraction
             .admit_automatic(&scope, fresh_request, cutoff)
@@ -568,6 +570,7 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
             .await
             .is_err()
     );
+    assert_manual_durable(&database, &scope, &other, &request, created_at).await;
     assert_grounded_projection(&database, &scope, &other, &request, created_at).await;
     let saved = jobs.get_target(&scope, target_id).await.unwrap();
     assert_eq!(saved.attempts.len(), 1);
@@ -576,6 +579,331 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
         "SELECT count(*) FROM provider_conversation_cleanup WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3",
     ).bind(operator).bind(tenant).bind(project).fetch_one(database.pool()).await.unwrap();
     assert_eq!(cleanup_count, 0);
+}
+
+async fn assert_manual_durable(
+    database: &Database,
+    scope: &TenantScope,
+    other: &TenantScope,
+    source: &ObservationAnalysisRequest,
+    at: chrono::DateTime<Utc>,
+) {
+    use geo_domain::{
+        ObservationExtractionInterruption, ObservationExtractionRepository,
+        ObservationExtractionResponse, ObservationExtractionResponseDisposition,
+        ObservationExtractionState,
+    };
+    let analyses = PgObservationAnalysisRepository::from_database(database);
+    let extraction = geo_persistence::PgObservationExtractionRepository::from_database(database);
+    let digest = sha256_hex(b"manual-durable");
+    for evidence_only in [false, true] {
+        let key = format!("manual-durable-{evidence_only}");
+        let mut request = source.clone();
+        request.revision_id = Uuid::new_v4();
+        if evidence_only {
+            request.source = ObservationAnalysisSource::AttemptEvidence { evidence_index: 0 };
+        }
+        let (left, right) = tokio::join!(
+            extraction.admit_manual(scope, &key, &digest, request.clone(), at),
+            extraction.admit_manual(scope, &key, &digest, request.clone(), at)
+        );
+        let admitted = left.unwrap();
+        assert_eq!(admitted, right.unwrap());
+        let intent = admitted.intent.unwrap();
+        assert_eq!(intent.request.manual_revision_id, Some(request.revision_id));
+        assert_eq!(
+            intent.request.source_evidence_index,
+            evidence_only.then_some(0)
+        );
+        assert!(sqlx::query("UPDATE observation_extraction_intents SET manual_revision_id=NULL WHERE intent_id=$1")
+            .bind(intent.intent_id).execute(database.pool()).await.is_err());
+        assert!(sqlx::query("UPDATE observation_extraction_intents SET intent=intent #- '{request,manual_revision_id}' WHERE intent_id=$1")
+            .bind(intent.intent_id).execute(database.pool()).await.is_err());
+        assert!(
+            extraction
+                .admit_manual(other, &key, &digest, request.clone(), at)
+                .await
+                .is_err()
+        );
+        assert!(
+            extraction
+                .admit_manual(scope, &key, &sha256_hex(b"different"), request.clone(), at)
+                .await
+                .is_err()
+        );
+        let late = at + Duration::seconds(400);
+        analyses
+            .interrupt_stale(scope, request.target_id, request.attempt_id, late, late)
+            .await
+            .unwrap();
+        assert_eq!(
+            analyses
+                .get(scope, request.revision_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ObservationAnalysisState::Queued
+        );
+        assert!(
+            analyses
+                .claim(scope, request.revision_id, late)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (left, right) = tokio::join!(
+            extraction.claim(scope, intent.intent_id, late),
+            extraction.claim(scope, intent.intent_id, late)
+        );
+        let claims: Vec<_> = [left.unwrap(), right.unwrap()]
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(claims.len(), 1);
+        let token = claims[0].claim_token;
+        assert!(
+            !analyses
+                .get(scope, request.revision_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .inference_resolved
+        );
+        assert!(
+            analyses
+                .record_inference_resolved(scope, request.revision_id, token)
+                .await
+                .is_err()
+        );
+        let response = ObservationExtractionResponse {
+            model_text: "synthetic completion".into(),
+            disposition: ObservationExtractionResponseDisposition::Complete,
+            actual_model: "synthetic-model".into(),
+            config_revision: Some(12),
+            prompt_tokens: 7,
+            completion_tokens: 9,
+        };
+        extraction
+            .record_response(scope, intent.intent_id, token, response.clone(), late)
+            .await
+            .unwrap();
+        assert!(
+            analyses
+                .get(scope, request.revision_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .inference_resolved
+        );
+        let restarted = geo_persistence::PgObservationExtractionRepository::from_database(database);
+        assert!(
+            restarted
+                .claim(scope, intent.intent_id, late)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            restarted
+                .claim_response(scope, intent.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .intent
+                .response,
+            Some(response)
+        );
+        let result = ObservationAnalysisResult {
+            config_revision: Some(12),
+            actual_model: Some("synthetic-model".into()),
+            candidate_json: None,
+            outcome: ObservationAnalysisOutcome::Failed {
+                code: "invalid_model_response".into(),
+            },
+            prompt_tokens: 7,
+            completion_tokens: 9,
+        };
+        assert!(
+            analyses
+                .finish(scope, request.revision_id, token, result.clone(), late)
+                .await
+                .is_err()
+        );
+        restarted
+            .complete(scope, intent.intent_id, token, result.clone(), late)
+            .await
+            .unwrap();
+        let finished = analyses
+            .get(scope, request.revision_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.request, request);
+        assert_eq!(finished.created_at, at);
+        assert_eq!(finished.request_digest, digest);
+        assert_eq!(finished.result, Some(result.clone()));
+        assert_eq!(finished.state, ObservationAnalysisState::Completed);
+        assert!(finished.inference_resolved);
+        assert_eq!(
+            restarted
+                .admit_manual(scope, &key, &digest, request.clone(), late)
+                .await
+                .unwrap()
+                .revision,
+            finished
+        );
+        let mut next = request.clone();
+        next.revision_id = Uuid::new_v4();
+        let next = restarted
+            .admit_manual(scope, &format!("{key}-new"), &digest, next, late)
+            .await
+            .unwrap();
+        let next_intent = next.intent.unwrap();
+        assert_ne!(next_intent.intent_key, intent.intent_key);
+        let claim = restarted
+            .claim(scope, next_intent.intent_id, late)
+            .await
+            .unwrap()
+            .unwrap();
+        restarted
+            .interrupt_with_result(
+                scope,
+                next_intent.intent_id,
+                claim.claim_token,
+                ObservationExtractionInterruption::InferenceInterrupted,
+                result.clone(),
+                false,
+                late,
+            )
+            .await
+            .unwrap();
+        let interrupted = analyses
+            .get(scope, next.revision.request.revision_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!interrupted.inference_resolved);
+        assert!(interrupted.blocks_automatic_admission());
+        assert!(
+            restarted
+                .record_response(
+                    scope,
+                    next_intent.intent_id,
+                    claim.claim_token,
+                    ObservationExtractionResponse {
+                        model_text: "late".into(),
+                        disposition: ObservationExtractionResponseDisposition::Complete,
+                        actual_model: "synthetic-model".into(),
+                        config_revision: Some(12),
+                        prompt_tokens: 7,
+                        completion_tokens: 9
+                    },
+                    late
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            restarted
+                .get(scope, next_intent.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ObservationExtractionState::Interrupted
+        );
+        // Local pre-call proof and response checkpoint proof both settle inference.
+        for checkpoint in [false, true] {
+            let mut proven = request.clone();
+            proven.revision_id = Uuid::new_v4();
+            let admission = restarted
+                .admit_manual(
+                    scope,
+                    &format!("{key}-proof-{checkpoint}"),
+                    &digest,
+                    proven,
+                    late + Duration::seconds(1),
+                )
+                .await
+                .unwrap();
+            let intent = admission.intent.unwrap();
+            assert_eq!(
+                restarted
+                    .status_for_attempt(scope, source.target_id, source.attempt_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ObservationExtractionState::Queued
+            );
+            let claim = restarted
+                .claim(scope, intent.intent_id, late + Duration::seconds(1))
+                .await
+                .unwrap()
+                .unwrap();
+            if checkpoint {
+                restarted
+                    .record_response(
+                        scope,
+                        intent.intent_id,
+                        claim.claim_token,
+                        ObservationExtractionResponse {
+                            model_text: "checkpoint".into(),
+                            disposition: ObservationExtractionResponseDisposition::Complete,
+                            actual_model: "synthetic-proof-model".into(),
+                            config_revision: Some(33),
+                            prompt_tokens: 17,
+                            completion_tokens: 19,
+                        },
+                        late + Duration::seconds(1),
+                    )
+                    .await
+                    .unwrap();
+            }
+            restarted
+                .interrupt_with_result(
+                    scope,
+                    intent.intent_id,
+                    claim.claim_token,
+                    ObservationExtractionInterruption::InferenceFailed,
+                    result.clone(),
+                    !checkpoint,
+                    late + Duration::seconds(1),
+                )
+                .await
+                .unwrap();
+            let revision = analyses
+                .get(scope, admission.revision.request.revision_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(revision.inference_resolved);
+            if checkpoint {
+                let result = revision.result.unwrap();
+                assert_eq!(
+                    result.actual_model.as_deref(),
+                    Some("synthetic-proof-model")
+                );
+                assert_eq!(result.config_revision, Some(33));
+                assert_eq!((result.prompt_tokens, result.completion_tokens), (17, 19));
+            }
+        }
+        // Replay of a pre-migration analysis must not attach or schedule an intent.
+        let mut legacy = request;
+        legacy.revision_id = Uuid::new_v4();
+        let legacy_key = format!("{key}-legacy");
+        let prior = analyses
+            .create(scope, &legacy_key, &digest, legacy.clone(), late)
+            .await
+            .unwrap();
+        let replay = restarted
+            .admit_manual(scope, &legacy_key, &digest, legacy, late)
+            .await
+            .unwrap();
+        assert_eq!(replay.revision, prior);
+        assert!(replay.intent.is_none());
+    }
 }
 
 async fn assert_grounded_projection(

@@ -42,7 +42,7 @@ fn project(scope: &TenantScope) -> Result<Uuid, AppError> {
         .ok_or_else(|| AppError::forbidden("project scope required"))
 }
 
-fn decode(row: &sqlx::postgres::PgRow) -> Result<ObservationAnalysisRevision, AppError> {
+pub(crate) fn decode(row: &sqlx::postgres::PgRow) -> Result<ObservationAnalysisRevision, AppError> {
     let invalid = || AppError::new(ErrorCode::Internal, "stored observation analysis invalid");
     let request = serde_json::from_value(row.get("request")).map_err(|_| invalid())?;
     let state = match row.get::<String, _>("state").as_str() {
@@ -113,7 +113,7 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
             .await
             .map_err(unavailable)?;
         lock_revision_attempt(&mut tx, scope, project, revision_id).await?;
-        let changed = sqlx::query("UPDATE observation_analyses SET inference_resolved=TRUE WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND revision_id=$4 AND claim_token=$5 AND state='running'")
+        let changed = sqlx::query("UPDATE observation_analyses SET inference_resolved=TRUE WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND revision_id=$4 AND claim_token=$5 AND state='running' AND NOT EXISTS (SELECT 1 FROM observation_extraction_intents e WHERE e.manual_revision_id=observation_analyses.revision_id)")
             .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
             .bind(revision_id).bind(claim_token).execute(&mut *tx).await.map_err(unavailable)?;
         if claim_token.is_nil() || changed.rows_affected() != 1 {
@@ -279,7 +279,8 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
              result='{\"actual_model\":null,\"candidate_json\":null,\"outcome\":{\"status\":\"failed\",\"code\":\"analysis_interrupted\"},\"prompt_tokens\":0,\"completion_tokens\":0}'::jsonb \
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND target_id=$4 \
              AND attempt_id=$5 AND state IN ('queued','running') \
-             AND COALESCE(started_at,created_at)<=$6",
+             AND COALESCE(started_at,created_at)<=$6 \
+             AND NOT EXISTS (SELECT 1 FROM observation_extraction_intents e WHERE e.manual_revision_id=observation_analyses.revision_id)",
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project)
             .bind(target_id).bind(attempt_id).bind(cutoff).bind(now).bind(Uuid::new_v4())
             .execute(&mut *tx).await.map_err(unavailable)?;
@@ -367,6 +368,9 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
             .await
             .map_err(unavailable)?;
         lock_revision_attempt(&mut tx, scope, project, revision_id).await?;
+        if is_durable(&mut tx, scope, revision_id).await? {
+            return Ok(None);
+        }
         let row = sqlx::query(
             "SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 \
              AND project_id=$3 AND revision_id=$4 FOR UPDATE",
@@ -426,6 +430,11 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
             .await
             .map_err(unavailable)?;
         lock_revision_attempt(&mut tx, scope, project, revision_id).await?;
+        if is_durable(&mut tx, scope, revision_id).await? {
+            return Err(AppError::conflict(
+                "analysis is owned by durable extraction",
+            ));
+        }
         let row = sqlx::query(
             "SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 \
              AND project_id=$3 AND revision_id=$4 FOR UPDATE",
@@ -560,6 +569,16 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         tx.commit().await.map_err(unavailable)?;
         Ok(revisions)
     }
+}
+
+async fn is_durable(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &TenantScope,
+    revision_id: Uuid,
+) -> Result<bool, AppError> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM observation_extraction_intents WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND manual_revision_id=$4)")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
+        .bind(revision_id).fetch_one(&mut **tx).await.map_err(unavailable)
 }
 
 /// Shared order with automatic admission; lock all immutable source rows before
