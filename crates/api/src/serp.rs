@@ -471,6 +471,8 @@ impl SerpService {
             ));
         }
         let measurement = self.measurement(scope, id).await?;
+        // Loading the scoped persisted source establishes provenance. Its receipt
+        // clock may lead this host's analysis clock; preserve both timestamps.
         let raw = self.raw(scope, id, input.evidence_id).await?;
         let intent = self
             .repository

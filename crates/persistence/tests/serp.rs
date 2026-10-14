@@ -479,6 +479,70 @@ async fn contract(
     changed.parser_version = "synthetic.v2".into();
     assert!(store.append_observation(scope, changed).await.is_err());
     assert!(store.append_observation(other, analysis).await.is_err());
+
+    // Capture and analysis may run on different application hosts. Persisted
+    // source identity, not relative wall-clock order, binds the interpretation.
+    let ahead_raw = raw(
+        &intent,
+        SerpEvidenceOperation::ResultRead,
+        now + Duration::seconds(20),
+    );
+    let ahead = store
+        .append_raw(scope, &intent, ahead_raw.clone())
+        .await
+        .unwrap();
+    let mut independent_clock = observation(&ahead, now);
+    independent_clock.analyzed_at = now;
+    assert_eq!(
+        independent_clock.received_at - independent_clock.analyzed_at,
+        Duration::seconds(20)
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .append_observation(scope, independent_clock.clone())
+                .await
+                .unwrap(),
+            independent_clock
+        );
+        assert_eq!(
+            store
+                .get_observation(scope, id, independent_clock.observation_id)
+                .await
+                .unwrap(),
+            Some(independent_clock.clone())
+        );
+        assert_eq!(
+            store.get_raw(scope, ahead_raw.evidence_id).await.unwrap(),
+            Some(ahead.clone())
+        );
+    }
+    assert_eq!(ahead.evidence, ahead_raw);
+    for mismatch in 0..4 {
+        let mut wrong_source = independent_clock.clone();
+        wrong_source.observation_id = Uuid::new_v4();
+        match mismatch {
+            0 => wrong_source.received_at += Duration::seconds(1),
+            1 => wrong_source.raw_sha256 = sha256_hex(b"different-source"),
+            2 => wrong_source.attempt_id = Uuid::new_v4(),
+            3 => wrong_source.raw_evidence_id = Uuid::new_v4(),
+            _ => unreachable!(),
+        }
+        assert!(
+            store
+                .append_observation(scope, wrong_source.clone())
+                .await
+                .is_err(),
+            "clock independence must not admit source mismatch {mismatch}"
+        );
+        assert!(
+            store
+                .get_observation(scope, id, wrong_source.observation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
     assert!(
         store
             .finish(scope, &renewed, SerpTaskState::Completed, now)

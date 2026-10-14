@@ -151,7 +151,6 @@ impl SerpSource for InjectedSource {
         raw: &SerpStoredRaw,
         intent: &SerpSendingIntent,
     ) -> Result<String, AppError> {
-        assert!(raw.stored_at >= raw.evidence.captured_at);
         self.mapping.decode_submission(measurement, raw, intent)
     }
     fn decode_result(
@@ -163,7 +162,6 @@ impl SerpSource for InjectedSource {
         observation_id: Uuid,
         analyzed_at: DateTime<Utc>,
     ) -> Result<SerpReadOutcome, AppError> {
-        assert!(raw.stored_at >= raw.evidence.captured_at);
         self.mapping.decode_result(
             measurement,
             raw,
@@ -483,6 +481,127 @@ async fn accepts_exact_query_and_posts_once_after_persisted_intent() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn reparse_persisted_ahead_clock_receipt_preserves_provenance_without_provider_calls() {
+    let (state, service, repository, source, scope) = fixture().await;
+    let measurement = service
+        .accept(&scope, input(Utc::now() - Duration::minutes(45)))
+        .await
+        .unwrap();
+    let id = measurement.measurement_id;
+    service.submit_once(&scope, id).await.unwrap();
+    service.poll_once(&scope, id).await.unwrap();
+    let original = service.detail(&scope, id, None, 20).await.unwrap();
+    let original_observation = &original.observations[0];
+    let original_raw = service
+        .raw(&scope, id, original_observation.raw_evidence_id)
+        .await
+        .unwrap();
+    let intent = repository
+        .get_sending_intent(&scope, id, original_raw.evidence.attempt_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Archive another receipt stamped by a host twenty seconds ahead. Neither
+    // its bytes nor its capture time may be rewritten to suit the parsing host.
+    let mut evidence = original_raw.evidence.clone();
+    evidence.evidence_id = Uuid::new_v4();
+    evidence.captured_at = Utc::now() + Duration::seconds(20);
+    let raw = repository
+        .append_raw(&scope, &intent, evidence)
+        .await
+        .unwrap();
+    assert!(raw.stored_at < raw.evidence.captured_at);
+    let request = || ReparseSerpSource {
+        evidence_id: raw.evidence.evidence_id,
+        idempotency_key: "ahead-clock-analysis".into(),
+    };
+    let parsed = service.reparse(&scope, id, request()).await.unwrap();
+    assert!(parsed.analyzed_at < parsed.received_at);
+    assert_eq!(parsed.received_at, raw.evidence.captured_at);
+    assert_eq!(parsed.raw_sha256, raw.evidence.response_sha256);
+    assert_eq!(parsed.results, original_observation.results);
+    assert_eq!(parsed.coverage, original_observation.coverage);
+    assert_eq!(parsed.status, original_observation.status);
+    assert_eq!(
+        service.reparse(&scope, id, request()).await.unwrap(),
+        parsed
+    );
+    assert_eq!(
+        repository
+            .get_observation(&scope, id, parsed.observation_id)
+            .await
+            .unwrap(),
+        Some(parsed.clone())
+    );
+    assert_eq!(
+        service
+            .raw(&scope, id, raw.evidence.evidence_id)
+            .await
+            .unwrap(),
+        raw
+    );
+    assert_eq!(
+        service
+            .raw(&scope, id, original_raw.evidence.evidence_id)
+            .await
+            .unwrap(),
+        original_raw
+    );
+    for wrong_scope in [
+        TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, scope.project_id),
+        TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id),
+        TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        ),
+    ] {
+        assert!(service.reparse(&wrong_scope, id, request()).await.is_err());
+    }
+    for evidence_id in [Uuid::new_v4(), original_raw.evidence.evidence_id] {
+        assert!(
+            service
+                .reparse(
+                    &scope,
+                    id,
+                    ReparseSerpSource {
+                        evidence_id,
+                        idempotency_key: "ahead-clock-analysis".into(),
+                    },
+                )
+                .await
+                .is_err()
+        );
+    }
+    let mut other_input = input(Utc::now() - Duration::minutes(45));
+    other_input.idempotency_key = "different-measurement".into();
+    let other = service.accept(&scope, other_input).await.unwrap();
+    assert!(
+        service
+            .reparse(&scope, other.measurement_id, request())
+            .await
+            .is_err()
+    );
+    let without_source = SerpService::new(
+        repository.clone(),
+        state.project_repository(),
+        state.question_repository(),
+    );
+    assert!(without_source.reparse(&scope, id, request()).await.is_err());
+    let wrong_source = without_source
+        .with_source(scope.clone(), "different-source".into(), source.clone())
+        .unwrap();
+    assert!(wrong_source.reparse(&scope, id, request()).await.is_err());
+    let after = service.detail(&scope, id, None, 20).await.unwrap();
+    assert_eq!(after.measurement, original.measurement);
+    assert_eq!(after.observations.len(), 2);
+    assert!(after.observations.contains(original_observation));
+    assert!(after.observations.contains(&parsed));
+    assert_eq!(source.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
