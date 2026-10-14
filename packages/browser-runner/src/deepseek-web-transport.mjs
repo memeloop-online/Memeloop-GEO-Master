@@ -3,6 +3,23 @@ export const validDeepSeekSessionId = (value) =>
   typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 const MAX_BYTES = 750_000;
 const DELETE_CLOSE_MARGIN_MS = 2_000;
+const HISTORY_RESPONSE_CATEGORIES = new Set([
+  "http_unauthorized",
+  "http_forbidden",
+  "http_not_found",
+  "http_rate_limited",
+  "http_server_error",
+  "http_other",
+  "redirect_unverified",
+  "url_unverified",
+  "content_type_unverified",
+  "content_length_invalid",
+  "content_length_exceeded",
+  "body_unavailable",
+  "body_read_failed",
+  "byte_limit_exceeded",
+  "utf8_invalid",
+]);
 
 /**
  * One bounded operation in one actual authenticated Document. This is a thin
@@ -173,10 +190,11 @@ export async function withDeepSeekDocument(
           }) => {
             let reader;
             let failureReason = "transport_unavailable";
+            let responseCategory;
             // The carrier is consumed below; request() still returns null.
             // Delete operations retain their existing null-only failure shape.
-            const failure = (reason) =>
-              kind === "history" ? [null, reason] : null;
+            const failure = (reason, category = null) =>
+              kind === "history" ? [null, reason, category] : null;
             try {
               const valid = () =>
                 !!state &&
@@ -232,28 +250,70 @@ export async function withDeepSeekDocument(
                 signal: state.controller.signal,
               });
               const length = response.headers.get("content-length");
+              if (response.status !== 200) {
+                const category =
+                  response.status === 401
+                    ? "http_unauthorized"
+                    : response.status === 403
+                      ? "http_forbidden"
+                      : response.status === 404
+                        ? "http_not_found"
+                        : response.status === 429
+                          ? "http_rate_limited"
+                          : response.status >= 500 && response.status <= 599
+                            ? "http_server_error"
+                            : "http_other";
+                return failure("response_envelope_unverified", category);
+              }
+              if (response.redirected)
+                return failure(
+                  "response_envelope_unverified",
+                  "redirect_unverified",
+                );
+              if (response.url !== url)
+                return failure(
+                  "response_envelope_unverified",
+                  "url_unverified",
+                );
               if (
-                response.status !== 200 ||
-                response.redirected ||
-                response.url !== url ||
                 !/^application\/json(?:\s*;|$)/iu.test(
                   response.headers.get("content-type") ?? "",
-                ) ||
-                (length !== null &&
-                  (!/^\d+$/u.test(length) || Number(length) > maxBytes))
+                )
               )
-                return failure("response_envelope_unverified");
+                return failure(
+                  "response_envelope_unverified",
+                  "content_type_unverified",
+                );
+              if (length !== null && !/^\d+$/u.test(length))
+                return failure(
+                  "response_envelope_unverified",
+                  "content_length_invalid",
+                );
+              if (length !== null && Number(length) > maxBytes)
+                return failure(
+                  "response_envelope_unverified",
+                  "content_length_exceeded",
+                );
+              responseCategory = "body_unavailable";
               reader = response.body?.getReader();
-              if (!reader) return failure("response_envelope_unverified");
+              if (!reader)
+                return failure(
+                  "response_envelope_unverified",
+                  "body_unavailable",
+                );
               const decoder = new TextDecoder("utf-8", { fatal: true });
               let bytes = 0;
               let body = "";
               for (;;) {
+                responseCategory = "body_read_failed";
                 const { done, value } = await reader.read();
                 if (done) break;
                 bytes += value.byteLength;
                 if (bytes > maxBytes)
-                  return failure("response_envelope_unverified");
+                  return failure(
+                    "response_envelope_unverified",
+                    "byte_limit_exceeded",
+                  );
                 if (!valid())
                   return failure(
                     Date.now() >= deadline
@@ -261,10 +321,12 @@ export async function withDeepSeekDocument(
                       : "document_unavailable",
                   );
                 failureReason = "response_envelope_unverified";
+                responseCategory = "utf8_invalid";
                 body += decoder.decode(value, { stream: true });
                 failureReason = "transport_unavailable";
               }
               failureReason = "response_envelope_unverified";
+              responseCategory = "utf8_invalid";
               body += decoder.decode();
               if (!valid())
                 return failure(
@@ -278,6 +340,7 @@ export async function withDeepSeekDocument(
                 Date.now() >= deadline
                   ? "read_deadline_exceeded"
                   : failureReason,
+                Date.now() >= deadline ? null : responseCategory,
               );
             } finally {
               if (reader) void reader.cancel().catch(() => {});
@@ -312,6 +375,18 @@ export async function withDeepSeekDocument(
           ].includes(envelope[1])
         )
           note(envelope[1]);
+        if (active() && HISTORY_RESPONSE_CATEGORIES.has(envelope[2])) {
+          try {
+            console.info(
+              JSON.stringify({
+                stage: "history_response",
+                category: envelope[2],
+              }),
+            );
+          } catch {
+            /* Response diagnostics cannot affect evidence or cleanup. */
+          }
+        }
         return null;
       }
       return active() ? envelope : null;

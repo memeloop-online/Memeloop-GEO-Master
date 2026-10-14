@@ -262,6 +262,113 @@ test("byte bounds include UTF-8 bytes, accepting exact cap and rejecting excess"
   assert.equal(await readDeepSeekFirstTurnHistory(page, expected), null);
 });
 
+test("response diagnostics are bounded Node categories without response payload or extra requests", async (t) => {
+  const { page, requests } = await synthetic(t);
+  const logs = [];
+  t.mock.method(console, "info", (entry) => logs.push(entry));
+  const cases = [
+    [{ status: 401 }, "http_unauthorized"],
+    [{ status: 403 }, "http_forbidden"],
+    [{ status: 404 }, "http_not_found"],
+    [{ status: 429 }, "http_rate_limited"],
+    [{ status: 500 }, "http_server_error"],
+    [{ status: 599 }, "http_server_error"],
+    [{ status: 204 }, "http_other"],
+    [{ status: 302 }, "http_other"],
+    [{ redirected: true }, "redirect_unverified"],
+    [{ url: "https://example.invalid/synthetic-private" }, "url_unverified"],
+    [
+      { contentType: "text/html; synthetic-private" },
+      "content_type_unverified",
+    ],
+    [{ contentType: "" }, "content_type_unverified"],
+    [{ contentLength: "synthetic-private" }, "content_length_invalid"],
+    [{ contentLength: "750001" }, "content_length_exceeded"],
+    [{ kind: "no-body" }, "body_unavailable"],
+    [{ kind: "locked-body" }, "body_unavailable", "transport_unavailable"],
+    [{ kind: "read-error" }, "body_read_failed", "transport_unavailable"],
+    [{ kind: "oversize" }, "byte_limit_exceeded"],
+    [{ kind: "invalid-utf8" }, "utf8_invalid"],
+    [{ kind: "incomplete-utf8" }, "utf8_invalid"],
+  ];
+  for (const [
+    reply,
+    category,
+    reason = "response_envelope_unverified",
+  ] of cases) {
+    await page.evaluate(
+      ({ reply, body }) => {
+        globalThis.syntheticHistoryFetches = 0;
+        globalThis.syntheticHistoryReads = 0;
+        globalThis.fetch = async (url) => {
+          globalThis.syntheticHistoryFetches++;
+          const stream = new ReadableStream({
+            start(controller) {
+              if (reply.kind === "read-error") {
+                controller.error(new Error("synthetic-private-body-error"));
+                return;
+              }
+              const bytes =
+                reply.kind === "oversize"
+                  ? new Uint8Array(750_001)
+                  : reply.kind === "invalid-utf8"
+                    ? new Uint8Array([0xff])
+                    : reply.kind === "incomplete-utf8"
+                      ? new Uint8Array([0xc3])
+                      : new TextEncoder().encode(body);
+              controller.enqueue(bytes);
+              controller.close();
+            },
+          });
+          const reader = stream.getReader.bind(stream);
+          stream.getReader = () => {
+            globalThis.syntheticHistoryReads++;
+            if (reply.kind === "locked-body")
+              throw new Error("synthetic-private-reader-error");
+            return reader();
+          };
+          return {
+            status: reply.status ?? 200,
+            redirected: reply.redirected ?? false,
+            url: reply.url ?? url,
+            headers: new Headers({
+              "content-type": reply.contentType ?? "application/json",
+              ...(reply.contentLength !== undefined
+                ? { "content-length": reply.contentLength }
+                : {}),
+              "x-synthetic-private": "synthetic-private-header",
+            }),
+            body: reply.kind === "no-body" ? null : stream,
+          };
+        };
+      },
+      { reply, body: JSON.stringify(fixture()) },
+    );
+    logs.length = 0;
+    const reasons = [];
+    assert.equal(
+      await readDeepSeekFirstTurnHistory(page, {
+        ...expected,
+        onFailureReason: (value) => reasons.push(value),
+      }),
+      null,
+    );
+    assert.deepEqual(reasons, [reason]);
+    assert.deepEqual(logs, [
+      JSON.stringify({ stage: "history_response", category }),
+    ]);
+    assert.equal(
+      await page.evaluate(() => globalThis.syntheticHistoryFetches),
+      1,
+    );
+    assert.equal(
+      await page.evaluate(() => globalThis.syntheticHistoryReads),
+      reply.kind && reply.kind !== "no-body" ? 1 : 0,
+    );
+  }
+  assert.equal(requests.length, 0);
+});
+
 test("native browser streams enforce actual byte cap and fatal UTF-8 without a content length", async (t) => {
   const { page, requests } = await synthetic(t);
   for (const kind of ["oversize", "invalid-utf8", "hanging"]) {
@@ -457,6 +564,52 @@ const clean = (page) => {
   assert.equal(page.listenerCount("framenavigated"), 0);
   assert.equal(page.listenerCount("close"), 0);
 };
+
+test("unknown diagnostic carriers and logger failure cannot change history failure", async (t) => {
+  const logs = [];
+  const logger = t.mock.method(console, "info", (entry) => logs.push(entry));
+  for (const category of [
+    undefined,
+    null,
+    { secret: "synthetic-private" },
+    "synthetic-private",
+  ]) {
+    const page = new FakePage();
+    page.evaluate = async () => [
+      null,
+      "response_envelope_unverified",
+      category,
+    ];
+    const reasons = [];
+    assert.equal(
+      await readDeepSeekFirstTurnHistory(page, {
+        ...expected,
+        onFailureReason: (reason) => reasons.push(reason),
+      }),
+      null,
+    );
+    assert.deepEqual(reasons, ["response_envelope_unverified"]);
+  }
+  assert.deepEqual(logs, []);
+  logger.mock.mockImplementation(() => {
+    throw new Error("synthetic-private-log-error");
+  });
+  const page = new FakePage();
+  page.evaluate = async () => [
+    null,
+    "response_envelope_unverified",
+    "url_unverified",
+  ];
+  const reasons = [];
+  assert.equal(
+    await readDeepSeekFirstTurnHistory(page, {
+      ...expected,
+      onFailureReason: (reason) => reasons.push(reason),
+    }),
+    null,
+  );
+  assert.deepEqual(reasons, ["response_envelope_unverified"]);
+});
 
 test("hung evaluate and handle acquisition settle by outer deadline without awaiting cleanup", async () => {
   for (const stage of ["evaluate", "handle", "cleanup"]) {
