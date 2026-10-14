@@ -20,7 +20,12 @@ pub const MAX_EXTRACTION_MODEL_TEXT_BYTES: usize = 2_000_000;
 pub struct ObservationExtractionRequest {
     pub target_id: Uuid,
     pub attempt_id: Uuid,
-    pub source_capture_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_capture_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_evidence_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_revision_id: Option<Uuid>,
     pub source_sha256: String,
     pub prompt_version: String,
     pub parser_version: String,
@@ -42,13 +47,35 @@ pub fn validate_observation_extraction_scope(scope: &TenantScope) -> Result<(), 
 }
 
 impl ObservationExtractionRequest {
+    pub fn for_manual(request: &crate::ObservationAnalysisRequest) -> Self {
+        let (source_capture_id, source_evidence_index) = match request.source {
+            crate::ObservationAnalysisSource::Capture { capture_id } => (Some(capture_id), None),
+            crate::ObservationAnalysisSource::AttemptEvidence { evidence_index } => {
+                (None, Some(evidence_index))
+            }
+        };
+        Self {
+            target_id: request.target_id,
+            attempt_id: request.attempt_id,
+            source_capture_id,
+            source_evidence_index,
+            manual_revision_id: Some(request.revision_id),
+            source_sha256: request.source_sha256.clone(),
+            prompt_version: request.prompt_version.clone(),
+            parser_version: request.parser_version.clone(),
+            policy_version: "geo.observation.automatic.v1".into(),
+        }
+    }
     /// Canonical versioned identity includes the full tenant and source binding,
     /// so equal source bytes from different attempts never share an inference.
     pub fn intent_key(&self, scope: &TenantScope) -> Result<String, AppError> {
         validate_observation_extraction_scope(scope)?;
         if self.target_id.is_nil()
             || self.attempt_id.is_nil()
-            || self.source_capture_id.is_nil()
+            || self.source_capture_id.is_some_and(|id| id.is_nil())
+            || self.source_capture_id.is_some() == self.source_evidence_index.is_some()
+            || self.manual_revision_id.is_some_and(|id| id.is_nil())
+            || (self.manual_revision_id.is_none() && self.source_capture_id.is_none())
             || self.source_sha256.len() != 64
             || !self
                 .source_sha256
@@ -64,8 +91,36 @@ impl ObservationExtractionRequest {
         {
             return Err(AppError::invalid_request("invalid extraction binding"));
         }
-        let bytes = serde_json::to_vec(&("observation-extraction-intent.v1", scope, self))
-            .map_err(|_| AppError::invalid_request("invalid extraction binding"))?;
+        // Do not change the v1 serializer: persisted automatic keys depend on
+        // this exact field order and its non-optional capture field.
+        #[derive(Serialize)]
+        struct LegacyRequest<'a> {
+            target_id: Uuid,
+            attempt_id: Uuid,
+            source_capture_id: Uuid,
+            source_sha256: &'a str,
+            prompt_version: &'a str,
+            parser_version: &'a str,
+            policy_version: &'a str,
+        }
+        let bytes = if self.manual_revision_id.is_some() {
+            serde_json::to_vec(&("observation-extraction-manual-intent.v1", scope, self))
+        } else {
+            serde_json::to_vec(&(
+                "observation-extraction-intent.v1",
+                scope,
+                LegacyRequest {
+                    target_id: self.target_id,
+                    attempt_id: self.attempt_id,
+                    source_capture_id: self.source_capture_id.expect("validated capture"),
+                    source_sha256: &self.source_sha256,
+                    prompt_version: &self.prompt_version,
+                    parser_version: &self.parser_version,
+                    policy_version: &self.policy_version,
+                },
+            ))
+        }
+        .map_err(|_| AppError::invalid_request("invalid extraction binding"))?;
         Ok(sha256_hex(&bytes))
     }
 
@@ -85,8 +140,8 @@ impl ObservationExtractionRequest {
         else {
             return Err(AppError::conflict("extraction requires source capture"));
         };
-        if capture.input.capture_id != self.source_capture_id
-            || capture.receipt.capture_id != self.source_capture_id
+        if Some(capture.input.capture_id) != self.source_capture_id
+            || Some(capture.receipt.capture_id) != self.source_capture_id
             || capture.input.target_id != self.target_id
             || capture.input.attempt_id != self.attempt_id
             || capture.receipt.schema_version != 1
@@ -332,6 +387,13 @@ pub enum AutomaticExtractionAdmission {
     DeferredHistoryChanged,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualExtractionAdmission {
+    pub revision: crate::ObservationAnalysisRevision,
+    /// None means a replay of a legacy revision, never permission to schedule.
+    pub intent: Option<ObservationExtractionIntent>,
+}
+
 pub fn validate_observation_extraction_page_size(limit: usize) -> Result<(), AppError> {
     if !(1..=100).contains(&limit) {
         return Err(AppError::invalid_request(
@@ -343,6 +405,14 @@ pub fn validate_observation_extraction_page_size(limit: usize) -> Result<(), App
 
 #[async_trait]
 pub trait ObservationExtractionRepository: Send + Sync {
+    async fn admit_manual(
+        &self,
+        scope: &TenantScope,
+        idempotency_key: &str,
+        request_digest: &str,
+        request: crate::ObservationAnalysisRequest,
+        created_at: DateTime<Utc>,
+    ) -> Result<ManualExtractionAdmission, AppError>;
     /// Historical callers retain this snapshot from before their first page.
     /// A mismatch means restart preparation, never implicitly infer/retry.
     /// Empty is reserved for the live admit_automatic path (no history scan).
@@ -437,6 +507,17 @@ pub trait ObservationExtractionRepository: Send + Sync {
         reason: ObservationExtractionInterruption,
         finished_at: DateTime<Utc>,
     ) -> Result<ObservationExtractionIntent, AppError>;
+    #[allow(clippy::too_many_arguments)] // Failure provenance and completion proof are independent.
+    async fn interrupt_with_result(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+        claim_token: Uuid,
+        reason: ObservationExtractionInterruption,
+        result: ObservationAnalysisResult,
+        inference_resolved: bool,
+        finished_at: DateTime<Utc>,
+    ) -> Result<ObservationExtractionIntent, AppError>;
 }
 
 struct Stored {
@@ -477,7 +558,12 @@ impl MemoryObservationExtractionRepository {
         token: Uuid,
         apply: impl FnOnce(&mut ObservationExtractionIntent) -> Result<(), AppError>,
         fence: bool,
+        failure: Option<(ObservationAnalysisResult, bool)>,
     ) -> Result<ObservationExtractionIntent, AppError> {
+        let _admission = match &self.automatic_admission {
+            Some((gate, _)) => Some(gate.0.lock().await),
+            None => None,
+        };
         validate_observation_extraction_scope(scope)?;
         let mut records = self.records.lock().await;
         let stored = records
@@ -487,7 +573,17 @@ impl MemoryObservationExtractionRepository {
         if token.is_nil() || stored.claim_token != Some(token) {
             return Err(AppError::conflict("extraction claim is not current"));
         }
-        apply(&mut stored.intent)?;
+        let mut next = stored.intent.clone();
+        apply(&mut next)?;
+        if next.request.manual_revision_id.is_some() {
+            self.automatic_admission
+                .as_ref()
+                .and_then(|(_, analyses)| analyses.memory_repository())
+                .ok_or_else(|| AppError::conflict("manual admission is not configured"))?
+                .sync_linked_gate_held(scope, &next, token, failure)
+                .await?;
+        }
+        stored.intent = next;
         if fence {
             stored.claim_token = Some(Uuid::new_v4());
         }
@@ -497,6 +593,68 @@ impl MemoryObservationExtractionRepository {
 
 #[async_trait]
 impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
+    async fn admit_manual(
+        &self,
+        scope: &TenantScope,
+        idempotency_key: &str,
+        request_digest: &str,
+        request: crate::ObservationAnalysisRequest,
+        created_at: DateTime<Utc>,
+    ) -> Result<ManualExtractionAdmission, AppError> {
+        let (gate, analyses) = self
+            .automatic_admission
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("manual admission is not configured"))?;
+        if !analyses
+            .memory_admission_gate()
+            .is_some_and(|other| Arc::ptr_eq(&gate.0, &other.0))
+        {
+            return Err(AppError::conflict("manual admission gate differs"));
+        }
+        let analyses = analyses
+            .memory_repository()
+            .ok_or_else(|| AppError::conflict("manual memory admission is not configured"))?;
+        let _admission = gate.0.lock().await;
+        let extraction_request = ObservationExtractionRequest::for_manual(&request);
+        let key = extraction_request.intent_key(scope)?;
+        // Acquire both stores before the first mutation. There is no await
+        // between publishing the revision and its intent, including replay.
+        let mut records = self.records.lock().await;
+        let (revision, inserted) = analyses
+            .create_gate_held(
+                scope,
+                idempotency_key,
+                request_digest,
+                request,
+                created_at,
+                true,
+            )
+            .await?;
+        if !inserted {
+            let intent = records
+                .values()
+                .find(|stored| {
+                    stored.scope == *scope
+                        && stored.intent.request.manual_revision_id
+                            == Some(revision.request.revision_id)
+                })
+                .map(|stored| stored.intent.clone());
+            return Ok(ManualExtractionAdmission { revision, intent });
+        }
+        let intent = ObservationExtractionIntent::queued(extraction_request, key, created_at);
+        records.insert(
+            intent.intent_id,
+            Stored {
+                scope: scope.clone(),
+                intent: intent.clone(),
+                claim_token: None,
+            },
+        );
+        Ok(ManualExtractionAdmission {
+            revision,
+            intent: Some(intent),
+        })
+    }
     async fn admit_automatic(
         &self,
         scope: &TenantScope,
@@ -524,10 +682,20 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
             return Err(AppError::conflict("automatic admission gate differs"));
         }
         let _admission = gate.0.lock().await;
+        if request.manual_revision_id.is_some() || request.source_evidence_index.is_some() {
+            return Err(AppError::invalid_request(
+                "automatic extraction requires capture",
+            ));
+        }
         let key = request.intent_key(scope)?;
         let capture = self
             .captures
-            .get(scope, request.source_capture_id)
+            .get(
+                scope,
+                request
+                    .source_capture_id
+                    .ok_or_else(|| AppError::invalid_request("capture required"))?,
+            )
             .await?
             .ok_or_else(|| AppError::not_found("extraction source not found"))?;
         request.validate_source(scope, &capture)?;
@@ -586,7 +754,7 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
                 cursor = Some(source.capture_id);
                 if records.values().any(|stored| {
                     stored.scope == source.scope
-                        && stored.intent.request.source_capture_id == source.capture_id
+                        && stored.intent.request.source_capture_id == Some(source.capture_id)
                 }) {
                     continue;
                 }
@@ -614,9 +782,19 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
             None => None,
         };
         let key = request.intent_key(scope)?;
+        if request.manual_revision_id.is_some() {
+            return Err(AppError::invalid_request(
+                "manual extraction requires atomic admission",
+            ));
+        }
         let capture = self
             .captures
-            .get(scope, request.source_capture_id)
+            .get(
+                scope,
+                request
+                    .source_capture_id
+                    .ok_or_else(|| AppError::invalid_request("capture required"))?,
+            )
             .await?
             .ok_or_else(|| AppError::not_found("extraction source not found"))?;
         request.validate_source(scope, &capture)?;
@@ -718,6 +896,10 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
         intent_id: Uuid,
         started_at: DateTime<Utc>,
     ) -> Result<Option<ObservationExtractionClaim>, AppError> {
+        let _admission = match &self.automatic_admission {
+            Some((gate, _)) => Some(gate.0.lock().await),
+            None => None,
+        };
         validate_observation_extraction_scope(scope)?;
         let mut records = self.records.lock().await;
         let stored = records
@@ -730,9 +912,19 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
         if started_at < stored.intent.created_at {
             return Err(AppError::invalid_request("invalid extraction start time"));
         }
-        stored.intent.state = ObservationExtractionState::Running;
-        stored.intent.started_at = Some(started_at);
+        let mut next = stored.intent.clone();
+        next.state = ObservationExtractionState::Running;
+        next.started_at = Some(started_at);
         let token = Uuid::new_v4();
+        if next.request.manual_revision_id.is_some() {
+            self.automatic_admission
+                .as_ref()
+                .and_then(|(_, analyses)| analyses.memory_repository())
+                .ok_or_else(|| AppError::conflict("manual admission is not configured"))?
+                .sync_linked_gate_held(scope, &next, token, None)
+                .await?;
+        }
+        stored.intent = next;
         stored.claim_token = Some(token);
         Ok(Some(ObservationExtractionClaim {
             intent: stored.intent.clone(),
@@ -773,6 +965,7 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
             claim_token,
             |intent| intent.record_response(response, received_at),
             false,
+            None,
         )
         .await
     }
@@ -790,6 +983,7 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
             claim_token,
             |intent| intent.complete(result, finished_at),
             false,
+            None,
         )
         .await
     }
@@ -801,12 +995,51 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
         reason: ObservationExtractionInterruption,
         finished_at: DateTime<Utc>,
     ) -> Result<ObservationExtractionIntent, AppError> {
+        let result = ObservationAnalysisResult {
+            config_revision: None,
+            actual_model: None,
+            candidate_json: None,
+            outcome: crate::ObservationAnalysisOutcome::Failed {
+                code: "analysis_interrupted".into(),
+            },
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        };
+        self.interrupt_with_result(
+            scope,
+            intent_id,
+            claim_token,
+            reason,
+            result,
+            false,
+            finished_at,
+        )
+        .await
+    }
+    async fn interrupt_with_result(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+        claim_token: Uuid,
+        reason: ObservationExtractionInterruption,
+        result: ObservationAnalysisResult,
+        inference_resolved: bool,
+        finished_at: DateTime<Utc>,
+    ) -> Result<ObservationExtractionIntent, AppError> {
+        result.validate()?;
+        if !matches!(
+            result.outcome,
+            crate::ObservationAnalysisOutcome::Failed { .. }
+        ) {
+            return Err(AppError::invalid_request("interruption requires failure"));
+        }
         self.update(
             scope,
             intent_id,
             claim_token,
             |intent| intent.interrupt(reason, finished_at),
             true,
+            Some((result, inference_resolved)),
         )
         .await
     }
@@ -831,7 +1064,9 @@ mod tests {
         ObservationExtractionRequest {
             target_id: Uuid::new_v4(),
             attempt_id: Uuid::new_v4(),
-            source_capture_id: Uuid::new_v4(),
+            source_capture_id: Some(Uuid::new_v4()),
+            source_evidence_index: None,
+            manual_revision_id: None,
             source_sha256: sha256_hex(b"source"),
             prompt_version: "extract.v1".into(),
             parser_version: "ground.v1".into(),
@@ -924,7 +1159,7 @@ mod tests {
         .enumerate()
         {
             let mut request = request();
-            request.source_capture_id = Uuid::from_u128(index as u128 + 1);
+            request.source_capture_id = Some(Uuid::from_u128(index as u128 + 1));
             request.prompt_version = format!("old-prompt.{index}");
             request.parser_version = format!("old-parser.{index}");
             request.policy_version = format!("old-policy.{index}");
@@ -946,7 +1181,7 @@ mod tests {
         // Equal digests and even a same-ID intent in another scope do not
         // suppress the source. The exact scoped capture is the only identity.
         let mut request = request();
-        request.source_capture_id = Uuid::from_u128(7);
+        request.source_capture_id = Some(Uuid::from_u128(7));
         let intent = ObservationExtractionIntent::queued(
             request.clone(),
             request.intent_key(&scope).unwrap(),
@@ -1010,6 +1245,49 @@ mod tests {
         (store, scope, intent)
     }
     #[test]
+    fn legacy_identity_golden_and_manual_source_selectors() {
+        let scope = TenantScope::new(
+            Uuid::from_u128(1).into(),
+            Uuid::from_u128(2).into(),
+            Some(Uuid::from_u128(3).into()),
+        );
+        let mut request = ObservationExtractionRequest {
+            target_id: Uuid::from_u128(4),
+            attempt_id: Uuid::from_u128(5),
+            source_capture_id: Some(Uuid::from_u128(6)),
+            source_evidence_index: None,
+            manual_revision_id: None,
+            source_sha256: "0".repeat(64),
+            prompt_version: "extract.v1".into(),
+            parser_version: "ground.v1".into(),
+            policy_version: "automatic.v1".into(),
+        };
+        let legacy = request.intent_key(&scope).unwrap();
+        assert_eq!(
+            legacy,
+            "2152b83ea5c2d8359e93602d13a363386a1783c3bbba07eb1ae2cb12a66afbae"
+        );
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("manual_revision_id").is_none());
+        assert!(json.get("source_evidence_index").is_none());
+        assert_eq!(
+            serde_json::from_value::<ObservationExtractionRequest>(json).unwrap(),
+            request
+        );
+        request.manual_revision_id = Some(Uuid::from_u128(7));
+        let manual = request.intent_key(&scope).unwrap();
+        assert_ne!(manual, legacy);
+        request.source_evidence_index = Some(0);
+        assert!(request.intent_key(&scope).is_err());
+        request.source_capture_id = None;
+        assert_ne!(request.intent_key(&scope).unwrap(), manual);
+        request.manual_revision_id = None;
+        assert!(request.intent_key(&scope).is_err());
+        request.source_evidence_index = None;
+        assert!(request.intent_key(&scope).is_err());
+    }
+
+    #[test]
     fn identity_binds_scope_attempt_capture_and_all_versions() {
         let scope = scope();
         let request = request();
@@ -1021,7 +1299,7 @@ mod tests {
             match field {
                 0 => changed.target_id = Uuid::new_v4(),
                 1 => changed.attempt_id = Uuid::new_v4(),
-                2 => changed.source_capture_id = Uuid::new_v4(),
+                2 => changed.source_capture_id = Some(Uuid::new_v4()),
                 3 => changed.source_sha256 = sha256_hex(b"other"),
                 4 => changed.prompt_version = "extract.v2".into(),
                 5 => changed.parser_version = "ground.v2".into(),
@@ -1191,7 +1469,7 @@ mod tests {
         let source_json = r#"{"messages":[{"content":"Synthetic response"}]}"#.to_owned();
         request.source_sha256 = sha256_hex(source_json.as_bytes());
         let input = ObservationCaptureInput {
-            capture_id: request.source_capture_id,
+            capture_id: request.source_capture_id.unwrap(),
             target_id: request.target_id,
             attempt_id: request.attempt_id,
             account_id: Uuid::new_v4(),

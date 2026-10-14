@@ -256,6 +256,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 61,
         description: "partner knowledge sync",
     },
+    MigrationMetadata {
+        version: 62,
+        description: "manual observation extraction",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

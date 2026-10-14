@@ -549,6 +549,11 @@ pub trait ObservationAnalysisRepository: Send + Sync {
     fn memory_admission_gate(&self) -> Option<MemoryObservationAdmissionGate> {
         None
     }
+    /// Internal integration hook; persistent repositories implement their own
+    /// transaction rather than attempting a cross-repository memory operation.
+    fn memory_repository(&self) -> Option<&MemoryObservationAnalysisRepository> {
+        None
+    }
     async fn has_unresolved_for_attempt(
         &self,
         scope: &TenantScope,
@@ -637,6 +642,7 @@ struct StoredAnalysis {
     key_hash: String,
     revision: ObservationAnalysisRevision,
     claim_token: Option<Uuid>,
+    durable_linked: bool,
 }
 
 pub struct MemoryObservationAnalysisRepository {
@@ -662,6 +668,170 @@ impl MemoryObservationAnalysisRepository {
         self.admission_gate = gate;
         self
     }
+
+    /// Caller owns the shared admission gate for the entire admission.
+    pub(crate) async fn create_gate_held(
+        &self,
+        scope: &TenantScope,
+        idempotency_key: &str,
+        request_digest: &str,
+        request: ObservationAnalysisRequest,
+        created_at: DateTime<Utc>,
+        durable_linked: bool,
+    ) -> Result<(ObservationAnalysisRevision, bool), AppError> {
+        request.validate(scope, idempotency_key, request_digest, created_at)?;
+        let target = self.jobs.get_target(scope, request.target_id).await?;
+        let capture = match request.source {
+            ObservationAnalysisSource::Capture { capture_id } => {
+                self.captures.get(scope, capture_id).await?
+            }
+            ObservationAnalysisSource::AttemptEvidence { .. } => None,
+        };
+        observation_analysis_source_json(scope, &request, &target, capture.as_ref())?;
+        let key_hash = sha256_hex(idempotency_key.as_bytes());
+        let mut records = self.records.lock().await;
+        if let Some(prior) = records
+            .values()
+            .find(|stored| stored.scope == *scope && stored.key_hash == key_hash)
+        {
+            return if prior.revision.request_digest == request_digest
+                && prior.revision.request.same_input(&request)
+            {
+                Ok((prior.revision.clone(), false))
+            } else {
+                Err(AppError::conflict("analysis idempotency request differs"))
+            };
+        }
+        if records.contains_key(&request.revision_id) {
+            return Err(AppError::conflict(
+                "analysis revision identity already exists",
+            ));
+        }
+        let revision = ObservationAnalysisRevision {
+            request,
+            request_digest: request_digest.into(),
+            state: ObservationAnalysisState::Queued,
+            created_at,
+            started_at: None,
+            analyzed_at: None,
+            result: None,
+            inference_resolved: false,
+        };
+        records.insert(
+            revision.request.revision_id,
+            StoredAnalysis {
+                scope: scope.clone(),
+                key_hash,
+                revision: revision.clone(),
+                claim_token: None,
+                durable_linked,
+            },
+        );
+        Ok((revision, true))
+    }
+
+    /// Called only after the extraction transition has been validated on a
+    /// clone, while the common admission gate remains held.
+    pub(crate) async fn sync_linked_gate_held(
+        &self,
+        scope: &TenantScope,
+        intent: &crate::ObservationExtractionIntent,
+        token: Uuid,
+        failure: Option<(ObservationAnalysisResult, bool)>,
+    ) -> Result<(), AppError> {
+        use crate::ObservationExtractionState as State;
+        let Some(id) = intent.request.manual_revision_id else {
+            return Ok(());
+        };
+        let mut records = self.records.lock().await;
+        let stored = records
+            .get_mut(&id)
+            .filter(|stored| stored.scope == *scope && stored.durable_linked)
+            .ok_or_else(|| AppError::conflict("linked analysis revision missing"))?;
+        if crate::ObservationExtractionRequest::for_manual(&stored.revision.request)
+            != intent.request
+        {
+            return Err(AppError::conflict("linked analysis binding differs"));
+        }
+        if stored.claim_token.is_some_and(|prior| prior != token) || token.is_nil() {
+            return Err(AppError::conflict("linked analysis claim differs"));
+        }
+        let revision = &mut stored.revision;
+        match intent.state {
+            State::Running => {
+                if revision.state != ObservationAnalysisState::Queued {
+                    return Err(AppError::conflict("linked analysis not queued"));
+                }
+                revision.state = ObservationAnalysisState::Running;
+                revision.started_at = intent.started_at;
+                stored.claim_token = Some(token);
+            }
+            State::ResponseReceived => {
+                if revision.state != ObservationAnalysisState::Running {
+                    return Err(AppError::conflict("linked analysis not running"));
+                }
+                revision.inference_resolved = true;
+            }
+            State::Completed | State::Interrupted => {
+                let (mut result, resolved) = if intent.state == State::Completed {
+                    (
+                        intent
+                            .completion
+                            .clone()
+                            .ok_or_else(|| AppError::conflict("extraction completion missing"))?,
+                        true,
+                    )
+                } else {
+                    failure.ok_or_else(|| AppError::conflict("extraction failure missing"))?
+                };
+                if intent.state == State::Interrupted
+                    && let Some(response) = &intent.response
+                {
+                    result.actual_model = Some(response.actual_model.clone());
+                    result.config_revision = response.config_revision;
+                    result.prompt_tokens = response.prompt_tokens;
+                    result.completion_tokens = response.completion_tokens;
+                }
+                result.validate()?;
+                if revision.state == ObservationAnalysisState::Completed {
+                    if revision.result.as_ref() == Some(&result) {
+                        return Ok(());
+                    }
+                    return Err(AppError::conflict("linked analysis result differs"));
+                }
+                if revision.state != ObservationAnalysisState::Running {
+                    return Err(AppError::conflict("linked analysis not running"));
+                }
+                if intent.state == State::Completed {
+                    let target = self
+                        .jobs
+                        .get_target(scope, revision.request.target_id)
+                        .await?;
+                    let capture = match revision.request.source {
+                        ObservationAnalysisSource::Capture { capture_id } => {
+                            self.captures.get(scope, capture_id).await?
+                        }
+                        ObservationAnalysisSource::AttemptEvidence { .. } => None,
+                    };
+                    observation_analysis_source_json(
+                        scope,
+                        &revision.request,
+                        &target,
+                        capture.as_ref(),
+                    )?;
+                }
+                revision.result = Some(result);
+                revision.state = ObservationAnalysisState::Completed;
+                revision.analyzed_at = intent.finished_at;
+                revision.inference_resolved |= resolved || intent.response.is_some();
+                if intent.state == State::Interrupted {
+                    stored.claim_token = Some(Uuid::new_v4());
+                }
+            }
+            State::Queued => return Err(AppError::conflict("invalid linked analysis transition")),
+        }
+        Ok(())
+    }
 }
 
 fn require_project(scope: &TenantScope) -> Result<(), AppError> {
@@ -674,6 +844,9 @@ fn require_project(scope: &TenantScope) -> Result<(), AppError> {
 
 #[async_trait]
 impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
+    fn memory_repository(&self) -> Option<&MemoryObservationAnalysisRepository> {
+        Some(self)
+    }
     async fn admission_history_snapshot(
         &self,
         scope: &TenantScope,
@@ -736,7 +909,8 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
             .get_mut(&revision_id)
             .filter(|stored| stored.scope == *scope)
             .ok_or_else(|| AppError::not_found("analysis revision not found"))?;
-        if claim_token.is_nil()
+        if stored.durable_linked
+            || claim_token.is_nil()
             || stored.claim_token != Some(claim_token)
             || stored.revision.state != ObservationAnalysisState::Running
         {
@@ -803,6 +977,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
                 key_hash,
                 revision: revision.clone(),
                 claim_token: None,
+                durable_linked: false,
             },
         );
         Ok(revision)
@@ -860,6 +1035,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         for stored in self.records.lock().await.values_mut() {
             let revision = &mut stored.revision;
             if stored.scope == *scope
+                && !stored.durable_linked
                 && revision.request.target_id == target_id
                 && revision.request.attempt_id == attempt_id
                 && revision.state != ObservationAnalysisState::Completed
@@ -892,54 +1068,16 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         created_at: DateTime<Utc>,
     ) -> Result<ObservationAnalysisRevision, AppError> {
         let _admission = self.admission_gate.0.lock().await;
-        request.validate(scope, idempotency_key, request_digest, created_at)?;
-        let target = self.jobs.get_target(scope, request.target_id).await?;
-        let capture = match request.source {
-            ObservationAnalysisSource::Capture { capture_id } => {
-                self.captures.get(scope, capture_id).await?
-            }
-            ObservationAnalysisSource::AttemptEvidence { .. } => None,
-        };
-        observation_analysis_source_json(scope, &request, &target, capture.as_ref())?;
-        let key_hash = sha256_hex(idempotency_key.as_bytes());
-        let mut records = self.records.lock().await;
-        if let Some(prior) = records
-            .values()
-            .find(|stored| stored.scope == *scope && stored.key_hash == key_hash)
-        {
-            return if prior.revision.request_digest == request_digest
-                && prior.revision.request.same_input(&request)
-            {
-                Ok(prior.revision.clone())
-            } else {
-                Err(AppError::conflict("analysis idempotency request differs"))
-            };
-        }
-        if records.contains_key(&request.revision_id) {
-            return Err(AppError::conflict(
-                "analysis revision identity already exists",
-            ));
-        }
-        let revision = ObservationAnalysisRevision {
+        self.create_gate_held(
+            scope,
+            idempotency_key,
+            request_digest,
             request,
-            request_digest: request_digest.to_owned(),
-            state: ObservationAnalysisState::Queued,
             created_at,
-            started_at: None,
-            analyzed_at: None,
-            result: None,
-            inference_resolved: false,
-        };
-        records.insert(
-            revision.request.revision_id,
-            StoredAnalysis {
-                scope: scope.clone(),
-                key_hash,
-                revision: revision.clone(),
-                claim_token: None,
-            },
-        );
-        Ok(revision)
+            false,
+        )
+        .await
+        .map(|(revision, _)| revision)
     }
 
     async fn claim(
@@ -955,7 +1093,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
             .get_mut(&revision_id)
             .filter(|stored| stored.scope == *scope)
             .ok_or_else(|| AppError::not_found("analysis revision not found"))?;
-        if stored.revision.state != ObservationAnalysisState::Queued {
+        if stored.durable_linked || stored.revision.state != ObservationAnalysisState::Queued {
             return Ok(None);
         }
         if started_at < stored.revision.created_at {
@@ -989,7 +1127,8 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
             .get_mut(&revision_id)
             .filter(|stored| stored.scope == *scope)
             .ok_or_else(|| AppError::not_found("analysis revision not found"))?;
-        if stored.claim_token != Some(claim_token)
+        if stored.durable_linked
+            || stored.claim_token != Some(claim_token)
             || stored
                 .revision
                 .started_at
@@ -1256,11 +1395,429 @@ mod tests {
         crate::ObservationExtractionRequest {
             target_id: f.request.target_id,
             attempt_id: f.request.attempt_id,
-            source_capture_id: f.source_capture_id,
+            source_capture_id: Some(f.source_capture_id),
+            source_evidence_index: None,
+            manual_revision_id: None,
             source_sha256: f.request.source_sha256.clone(),
             prompt_version: "extract.v2".into(),
             parser_version: "ground.v2".into(),
             policy_version: "policy.v1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_manual_sources_replay_lifecycle_and_late_write_fencing() {
+        use crate::{
+            ObservationExtractionRepository, ObservationExtractionResponse,
+            ObservationExtractionResponseDisposition, ObservationExtractionState,
+        };
+        for capture_source in [false, true] {
+            let f = fixture().await;
+            let gate = MemoryObservationAdmissionGate::default();
+            let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
+            let extraction = crate::MemoryObservationExtractionRepository::new(f.captures.clone())
+                .with_automatic_admission(gate, analyses.clone());
+            let mut request = f.request.clone();
+            if capture_source {
+                request.source = ObservationAnalysisSource::Capture {
+                    capture_id: f.source_capture_id,
+                };
+            }
+            let digest = sha256_hex(b"manual-source");
+            let admitted = extraction
+                .admit_manual(&f.scope, "manual", &digest, request.clone(), f.now)
+                .await
+                .unwrap();
+            let intent = admitted.intent.unwrap();
+            assert_eq!(intent.request.manual_revision_id, Some(request.revision_id));
+            let mut replay_request = request.clone();
+            replay_request.revision_id = Uuid::new_v4();
+            let replay = extraction
+                .admit_manual(&f.scope, "manual", &digest, replay_request.clone(), f.now)
+                .await
+                .unwrap();
+            assert_eq!(replay.intent.unwrap(), intent);
+            assert_eq!(replay.revision, admitted.revision);
+            assert!(
+                extraction
+                    .admit_manual(
+                        &f.scope,
+                        "manual",
+                        &sha256_hex(b"different"),
+                        replay_request.clone(),
+                        f.now
+                    )
+                    .await
+                    .is_err()
+            );
+            let later = f.now + Duration::seconds(600);
+            analyses
+                .interrupt_stale(
+                    &f.scope,
+                    request.target_id,
+                    request.attempt_id,
+                    later,
+                    later,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                analyses
+                    .get(&f.scope, request.revision_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ObservationAnalysisState::Queued
+            );
+            assert!(
+                analyses
+                    .claim(&f.scope, request.revision_id, later)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let claim = extraction
+                .claim(&f.scope, intent.intent_id, later)
+                .await
+                .unwrap()
+                .unwrap();
+            analyses
+                .interrupt_stale(
+                    &f.scope,
+                    request.target_id,
+                    request.attempt_id,
+                    later + Duration::seconds(600),
+                    later + Duration::seconds(600),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                analyses
+                    .get(&f.scope, request.revision_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ObservationAnalysisState::Running
+            );
+            assert!(
+                analyses
+                    .finish(
+                        &f.scope,
+                        request.revision_id,
+                        claim.claim_token,
+                        result(),
+                        later
+                    )
+                    .await
+                    .is_err()
+            );
+            extraction
+                .record_response(
+                    &f.scope,
+                    intent.intent_id,
+                    claim.claim_token,
+                    ObservationExtractionResponse {
+                        model_text: "{}".into(),
+                        disposition: ObservationExtractionResponseDisposition::Complete,
+                        actual_model: "synthetic".into(),
+                        config_revision: None,
+                        prompt_tokens: 3,
+                        completion_tokens: 1,
+                    },
+                    later,
+                )
+                .await
+                .unwrap();
+            assert!(
+                analyses
+                    .get(&f.scope, request.revision_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .inference_resolved
+            );
+            let checkpoint = extraction
+                .claim_response(&f.scope, intent.intent_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(checkpoint.claim_token, claim.claim_token);
+            assert!(
+                extraction
+                    .claim(&f.scope, intent.intent_id, later)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let completed = extraction
+                .complete(
+                    &f.scope,
+                    intent.intent_id,
+                    checkpoint.claim_token,
+                    result(),
+                    later,
+                )
+                .await
+                .unwrap();
+            assert_eq!(completed.state, ObservationExtractionState::Completed);
+            let revision = analyses
+                .get(&f.scope, request.revision_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(revision.result, Some(result()));
+            assert_eq!(revision.state, ObservationAnalysisState::Completed);
+            assert_eq!(
+                analyses
+                    .list_for_attempt(&f.scope, request.target_id, request.attempt_id, None, 100)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let next = extraction
+                .admit_manual(&f.scope, "explicit-next", &digest, replay_request, later)
+                .await
+                .unwrap();
+            assert_ne!(next.intent.unwrap().intent_id, intent.intent_id);
+            let foreign = TenantScope::new(
+                f.scope.operator_id,
+                Uuid::new_v4().into(),
+                f.scope.project_id,
+            );
+            assert!(
+                extraction
+                    .get(&foreign, intent.intent_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                extraction
+                    .admit_manual(&foreign, "manual", &digest, request, later)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_manual_legacy_replay_and_automatic_admission_race() {
+        use crate::{AutomaticExtractionAdmission, ObservationExtractionRepository};
+        let f = fixture().await;
+        let auto = automatic_request(&f);
+        let gate = MemoryObservationAdmissionGate::default();
+        let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
+        let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
+            .with_automatic_admission(gate, analyses.clone());
+        let digest = sha256_hex(b"legacy");
+        let legacy = analyses
+            .create(&f.scope, "legacy", &digest, f.request.clone(), f.now)
+            .await
+            .unwrap();
+        let replay = extraction
+            .admit_manual(&f.scope, "legacy", &digest, f.request.clone(), f.now)
+            .await
+            .unwrap();
+        assert_eq!(replay.revision, legacy);
+        assert!(replay.intent.is_none());
+        assert!(
+            extraction
+                .scan_ready(f.now, None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            extraction
+                .admit_automatic(&f.scope, auto.clone(), f.now)
+                .await
+                .unwrap(),
+            AutomaticExtractionAdmission::DeferredManual
+        );
+        let mut request = f.request.clone();
+        request.revision_id = Uuid::new_v4();
+        request.source = ObservationAnalysisSource::Capture {
+            capture_id: f.source_capture_id,
+        };
+        let (manual, automatic) = tokio::join!(
+            extraction.admit_manual(&f.scope, "explicit", &digest, request.clone(), f.now),
+            extraction.admit_automatic(&f.scope, auto.clone(), f.now),
+        );
+        let manual = manual.unwrap().intent.unwrap();
+        match automatic.unwrap() {
+            AutomaticExtractionAdmission::Intent(intent) => {
+                assert_eq!(intent.intent_id, manual.intent_id)
+            }
+            AutomaticExtractionAdmission::DeferredManual => {}
+            other => panic!("unexpected race result {other:?}"),
+        }
+        // Once admitted, automatic history reuses the earliest intent even if
+        // an older legacy analysis remains unresolved.
+        let AutomaticExtractionAdmission::Intent(reused) = extraction
+            .admit_automatic(&f.scope, auto, f.now)
+            .await
+            .unwrap()
+        else {
+            panic!("expected reuse")
+        };
+        assert_eq!(reused.intent_id, manual.intent_id);
+    }
+
+    #[tokio::test]
+    async fn durable_manual_generation_does_not_adopt_existing_automatic_work() {
+        use crate::{AutomaticExtractionAdmission, ObservationExtractionRepository};
+        let f = fixture().await;
+        let auto_request = automatic_request(&f);
+        let gate = MemoryObservationAdmissionGate::default();
+        let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
+        let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
+            .with_automatic_admission(gate, analyses);
+        let AutomaticExtractionAdmission::Intent(auto) = extraction
+            .admit_automatic(&f.scope, auto_request.clone(), f.now)
+            .await
+            .unwrap()
+        else {
+            panic!("expected automatic intent")
+        };
+        let mut request = f.request;
+        request.source = ObservationAnalysisSource::Capture {
+            capture_id: f.source_capture_id,
+        };
+        let manual = extraction
+            .admit_manual(
+                &f.scope,
+                "explicit-generation",
+                &sha256_hex(b"explicit"),
+                request,
+                f.now + Duration::seconds(1),
+            )
+            .await
+            .unwrap()
+            .intent
+            .unwrap();
+        assert_ne!(manual.intent_id, auto.intent_id);
+        assert_ne!(manual.intent_key, auto.intent_key);
+        let AutomaticExtractionAdmission::Intent(reused) = extraction
+            .admit_automatic(&f.scope, auto_request, f.now + Duration::seconds(2))
+            .await
+            .unwrap()
+        else {
+            panic!("expected earliest reuse")
+        };
+        assert_eq!(reused.intent_id, auto.intent_id);
+    }
+
+    #[tokio::test]
+    async fn durable_manual_interruption_preserves_reason_and_completion_evidence() {
+        use crate::{
+            ObservationExtractionInterruption, ObservationExtractionRepository,
+            ObservationExtractionResponse, ObservationExtractionResponseDisposition,
+        };
+        for (response_received, known_finished) in [(false, false), (false, true), (true, false)] {
+            let f = fixture().await;
+            let gate = MemoryObservationAdmissionGate::default();
+            let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
+            let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
+                .with_automatic_admission(gate, analyses.clone());
+            let admitted = extraction
+                .admit_manual(
+                    &f.scope,
+                    "manual",
+                    &sha256_hex(b"manual"),
+                    f.request.clone(),
+                    f.now,
+                )
+                .await
+                .unwrap();
+            let intent = admitted.intent.unwrap();
+            let claim = extraction
+                .claim(&f.scope, intent.intent_id, f.now)
+                .await
+                .unwrap()
+                .unwrap();
+            if response_received {
+                extraction
+                    .record_response(
+                        &f.scope,
+                        intent.intent_id,
+                        claim.claim_token,
+                        ObservationExtractionResponse {
+                            model_text: "{}".into(),
+                            disposition: ObservationExtractionResponseDisposition::Complete,
+                            actual_model: "synthetic".into(),
+                            config_revision: Some(2),
+                            prompt_tokens: 5,
+                            completion_tokens: 2,
+                        },
+                        f.now,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let failure = ObservationAnalysisResult {
+                config_revision: None,
+                actual_model: None,
+                candidate_json: None,
+                outcome: ObservationAnalysisOutcome::Failed {
+                    code: "model_timeout".into(),
+                },
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            };
+            extraction
+                .interrupt_with_result(
+                    &f.scope,
+                    intent.intent_id,
+                    claim.claim_token,
+                    ObservationExtractionInterruption::InferenceInterrupted,
+                    failure,
+                    known_finished,
+                    f.now,
+                )
+                .await
+                .unwrap();
+            let revision = analyses
+                .get(&f.scope, f.request.revision_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                revision.inference_resolved,
+                response_received || known_finished
+            );
+            let recorded = revision.result.unwrap();
+            assert_eq!(
+                recorded.outcome,
+                ObservationAnalysisOutcome::Failed {
+                    code: "model_timeout".into()
+                }
+            );
+            assert_eq!(recorded.actual_model.is_some(), response_received);
+            if response_received {
+                assert_eq!((recorded.prompt_tokens, recorded.completion_tokens), (5, 2));
+            }
+            assert!(
+                extraction
+                    .complete(
+                        &f.scope,
+                        intent.intent_id,
+                        claim.claim_token,
+                        result(),
+                        f.now
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                extraction
+                    .claim_response(&f.scope, intent.intent_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 

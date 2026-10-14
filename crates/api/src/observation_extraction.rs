@@ -38,6 +38,15 @@ fn validate_versions(request: &ObservationExtractionRequest) -> Result<(), AppEr
 
 #[async_trait::async_trait]
 pub trait ObservationExtractionContinuation: Send + Sync {
+    async fn manual_source(
+        &self,
+        _scope: &TenantScope,
+        _intent: &ObservationExtractionIntent,
+    ) -> Result<String, AppError> {
+        Err(AppError::capability_missing(
+            "manual source resolver unavailable",
+        ))
+    }
     /// None defers projection until the original attempt has a terminal receipt.
     /// This continuation must never invoke inference or change browser ownership.
     async fn continue_response(
@@ -49,11 +58,28 @@ pub trait ObservationExtractionContinuation: Send + Sync {
 
 #[async_trait::async_trait]
 impl ObservationExtractionContinuation for ObservationAnalysisService {
+    async fn manual_source(
+        &self,
+        scope: &TenantScope,
+        intent: &ObservationExtractionIntent,
+    ) -> Result<String, AppError> {
+        Ok(
+            ObservationAnalysisService::manual_source(self, scope, intent)
+                .await?
+                .2,
+        )
+    }
     async fn continue_response(
         &self,
         scope: &TenantScope,
         intent: &ObservationExtractionIntent,
     ) -> Result<Option<ObservationAnalysisResult>, AppError> {
+        if intent.request.manual_revision_id.is_some() {
+            return self
+                .interpret_manual_response(scope, intent)
+                .await
+                .map(Some);
+        }
         Ok(self
             .project_extraction_response(scope, intent)
             .await?
@@ -74,12 +100,12 @@ impl ObservationExtractionService {
     pub fn new(
         repository: Arc<dyn ObservationExtractionRepository>,
         captures: Arc<dyn ObservationCaptureRepository>,
-        model: ProjectConfiguredModelBridge,
+        model: impl Into<Arc<ProjectConfiguredModelBridge>>,
     ) -> Self {
         Self {
             repository,
             captures,
-            model: Arc::new(model),
+            model: model.into(),
             continuation: None,
             wake: Arc::new(Notify::new()),
         }
@@ -114,7 +140,9 @@ impl ObservationExtractionService {
         let request = ObservationExtractionRequest {
             target_id: capture.input.target_id,
             attempt_id: capture.input.attempt_id,
-            source_capture_id: capture_id,
+            source_capture_id: Some(capture_id),
+            source_evidence_index: None,
+            manual_revision_id: None,
             source_sha256: source_sha256.into(),
             prompt_version: prompt_version.into(),
             parser_version: parser_version.into(),
@@ -183,26 +211,53 @@ impl ObservationExtractionService {
         }
     }
 
-    async fn dispatch(&self, scope: &TenantScope, intent_id: Uuid) -> Result<(), AppError> {
+    pub(crate) async fn dispatch(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+    ) -> Result<(), AppError> {
         if let Some(claim) = self.repository.claim(scope, intent_id, Utc::now()).await? {
+            let mut failure = crate::observation_analysis::failed("analysis_version_unsupported");
+            // Local validation fails before dispatch. Once the model future is
+            // entered, only a received response or known local configuration
+            // rejection establishes that inference is resolved.
+            let mut inference_resolved = true;
             let outcome = async {
                 validate_versions(&claim.intent.request)?;
-                let capture = self
-                    .captures
-                    .get(scope, claim.intent.request.source_capture_id)
-                    .await?
-                    .ok_or_else(|| AppError::not_found("extraction source not found"))?;
-                claim.intent.request.validate_source(scope, &capture)?;
-                let ObservationCaptureSnapshot::Source { source_json, .. } =
-                    &capture.input.snapshot
-                else {
-                    return Err(AppError::conflict("extraction requires source capture"));
+                failure = crate::observation_analysis::failed("analysis_source_unavailable");
+                let source_json = if claim.intent.request.manual_revision_id.is_some() {
+                    self.continuation
+                        .as_ref()
+                        .ok_or_else(|| {
+                            AppError::capability_missing("manual source resolver unavailable")
+                        })?
+                        .manual_source(scope, &claim.intent)
+                        .await?
+                } else {
+                    let capture =
+                        self.captures
+                            .get(
+                                scope,
+                                claim.intent.request.source_capture_id.ok_or_else(|| {
+                                    AppError::conflict("extraction capture required")
+                                })?,
+                            )
+                            .await?
+                            .ok_or_else(|| AppError::not_found("extraction source not found"))?;
+                    claim.intent.request.validate_source(scope, &capture)?;
+                    let ObservationCaptureSnapshot::Source { source_json, .. } =
+                        capture.input.snapshot
+                    else {
+                        return Err(AppError::conflict("extraction requires source capture"));
+                    };
+                    source_json
                 };
                 let prompt = crate::observation_ai_callback::extraction_prompt_versioned(
-                    source_json,
+                    &source_json,
                     &claim.intent.request.prompt_version,
                 )
                 .map_err(|_| AppError::invalid_request("invalid extraction source"))?;
+                inference_resolved = false;
                 let (completion, revision) = self
                     .model
                     .complete_for_usage_with_revision(
@@ -219,12 +274,22 @@ impl ObservationExtractionService {
                     )
                     .await
                     .map_err(|error| {
+                        failure = crate::observation_analysis::failed(
+                            crate::observation_analysis::model_failure_code(&error),
+                        );
+                        inference_resolved = matches!(
+                            error.message.as_str(),
+                            "project model settings unavailable"
+                                | "project model unavailable"
+                                | "no inherited or project model is configured"
+                        );
                         tracing::info!(
                             failure = crate::observation_analysis::model_failure_code(&error),
                             "durable observation inference failed"
                         );
                         AppError::capability_missing("extraction inference unavailable")
                     })?;
+                inference_resolved = true;
                 let disposition = if !completion.tool_calls.is_empty() {
                     ObservationExtractionResponseDisposition::ToolCalls
                 } else if completion.finish_reason == "stop" {
@@ -249,11 +314,13 @@ impl ObservationExtractionService {
                 Err(error) => {
                     // Only failures before obtaining a response terminate inference.
                     self.repository
-                        .interrupt(
+                        .interrupt_with_result(
                             scope,
                             intent_id,
                             claim.claim_token,
                             ObservationExtractionInterruption::InferenceFailed,
+                            failure,
+                            inference_resolved,
                             Utc::now(),
                         )
                         .await?;
@@ -264,11 +331,24 @@ impl ObservationExtractionService {
                 // NUL/unbounded responses cannot be represented faithfully by
                 // this checkpoint. Do not truncate, repair, or invoke again.
                 self.repository
-                    .interrupt(
+                    .interrupt_with_result(
                         scope,
                         intent_id,
                         claim.claim_token,
                         ObservationExtractionInterruption::ResponseNotPersistable,
+                        {
+                            let mut result =
+                                crate::observation_analysis::failed("analysis_result_invalid");
+                            result.config_revision = response.config_revision;
+                            result.actual_model = Some(response.actual_model.clone());
+                            result.prompt_tokens = response.prompt_tokens;
+                            result.completion_tokens = response.completion_tokens;
+                            if result.validate().is_err() {
+                                result.actual_model = None;
+                            }
+                            result
+                        },
+                        true,
                         Utc::now(),
                     )
                     .await?;
@@ -420,7 +500,9 @@ impl HistoricalScan {
                         let request = ObservationExtractionRequest {
                             target_id: request.target_id,
                             attempt_id: request.attempt_id,
-                            source_capture_id: candidate.item.capture_id,
+                            source_capture_id: Some(candidate.item.capture_id),
+                            source_evidence_index: None,
+                            manual_revision_id: None,
                             source_sha256: request.source_sha256,
                             prompt_version: request.prompt_version,
                             parser_version: request.parser_version,
@@ -554,6 +636,33 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ObservationExtractionRepository for LostCheckpointAck {
+        async fn interrupt_with_result(
+            &self,
+            scope: &TenantScope,
+            id: Uuid,
+            token: Uuid,
+            reason: ObservationExtractionInterruption,
+            result: ObservationAnalysisResult,
+            resolved: bool,
+            at: chrono::DateTime<Utc>,
+        ) -> Result<ObservationExtractionIntent, AppError> {
+            self.interruptions.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .interrupt_with_result(scope, id, token, reason, result, resolved, at)
+                .await
+        }
+        async fn admit_manual(
+            &self,
+            scope: &TenantScope,
+            key: &str,
+            digest: &str,
+            request: geo_domain::ObservationAnalysisRequest,
+            at: chrono::DateTime<Utc>,
+        ) -> Result<geo_domain::ManualExtractionAdmission, AppError> {
+            self.inner
+                .admit_manual(scope, key, digest, request, at)
+                .await
+        }
         async fn admit_automatic_with_history(
             &self,
             scope: &TenantScope,

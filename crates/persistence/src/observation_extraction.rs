@@ -2,12 +2,15 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, AutomaticExtractionAdmission, ErrorCode, ObservationAnalysisResult,
-    ObservationCaptureRepository, ObservationExtractionBackfillItem, ObservationExtractionClaim,
-    ObservationExtractionIntent, ObservationExtractionInterruption, ObservationExtractionReadyItem,
+    AppError, AutomaticExtractionAdmission, ChannelJobRepository, ErrorCode,
+    ManualExtractionAdmission, ObservationAnalysisOutcome, ObservationAnalysisRequest,
+    ObservationAnalysisResult, ObservationAnalysisSource, ObservationCaptureRepository,
+    ObservationExtractionBackfillItem, ObservationExtractionClaim, ObservationExtractionIntent,
+    ObservationExtractionInterruption, ObservationExtractionReadyItem,
     ObservationExtractionRepository, ObservationExtractionRequest, ObservationExtractionResponse,
     ObservationExtractionState, ObservationExtractionStatus, TenantScope,
-    validate_observation_extraction_page_size, validate_observation_extraction_scope,
+    observation_analysis_source_json, sha256_hex, validate_observation_extraction_page_size,
+    validate_observation_extraction_scope,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
@@ -16,6 +19,7 @@ use uuid::Uuid;
 pub struct PgObservationExtractionRepository {
     pool: PgPool,
     captures: crate::PgObservationCaptureRepository,
+    jobs: crate::PgChannelJobRepository,
 }
 
 impl PgObservationExtractionRepository {
@@ -23,6 +27,7 @@ impl PgObservationExtractionRepository {
         Self {
             pool: database.pool().clone(),
             captures: crate::PgObservationCaptureRepository::from_database(database),
+            jobs: crate::PgChannelJobRepository::from_database(database),
         }
     }
     async fn transaction(
@@ -40,6 +45,23 @@ impl PgObservationExtractionRepository {
         scope: &TenantScope,
         id: Uuid,
     ) -> Result<PgRow, AppError> {
+        let binding = sqlx::query("SELECT intent FROM observation_extraction_intents WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND intent_id=$4")
+            .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(id)
+            .fetch_optional(&mut **tx).await.map_err(db)?.ok_or_else(|| AppError::not_found("extraction intent not found"))?;
+        let intent = decode(&binding)?;
+        crate::observation_analysis::lock_admission_sources(
+            tx,
+            scope,
+            project(scope),
+            intent.request.target_id,
+            intent.request.attempt_id,
+        )
+        .await?;
+        if let Some(revision_id) = intent.request.manual_revision_id {
+            sqlx::query("SELECT revision_id FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND revision_id=$4 FOR UPDATE")
+                .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(revision_id)
+                .fetch_one(&mut **tx).await.map_err(db)?;
+        }
         sqlx::query("SELECT * FROM observation_extraction_intents WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND intent_id=$4 FOR UPDATE")
             .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(id)
             .fetch_optional(&mut **tx).await.map_err(db)?.ok_or_else(|| AppError::not_found("extraction intent not found"))
@@ -51,6 +73,7 @@ impl PgObservationExtractionRepository {
         token: Uuid,
         apply: impl FnOnce(&mut ObservationExtractionIntent) -> Result<(), AppError> + Send,
         fence: bool,
+        interruption_result: Option<(ObservationAnalysisResult, bool)>,
     ) -> Result<ObservationExtractionIntent, AppError> {
         let mut tx = self.transaction(scope).await?;
         let row = self.locked(&mut tx, scope, id).await?;
@@ -63,6 +86,7 @@ impl PgObservationExtractionRepository {
         // Idempotent terminal replay must not issue UPDATE: the database also
         // enforces terminal immutability for callers bypassing this repository.
         if intent != original {
+            sync_manual(&mut tx, scope, &intent, token, interruption_result).await?;
             write(&mut tx, &intent, if fence { Uuid::new_v4() } else { token }).await?;
         }
         tx.commit().await.map_err(db)?;
@@ -75,6 +99,61 @@ fn db(_: sqlx::Error) -> AppError {
         ErrorCode::DependencyUnavailable,
         "observation extraction store unavailable",
     )
+}
+fn automatic_capture(request: &ObservationExtractionRequest) -> Result<Uuid, AppError> {
+    if request.manual_revision_id.is_some() || request.source_evidence_index.is_some() {
+        return Err(AppError::invalid_request(
+            "automatic extraction requires capture",
+        ));
+    }
+    request
+        .source_capture_id
+        .ok_or_else(|| AppError::invalid_request("automatic extraction requires capture"))
+}
+
+async fn sync_manual(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    intent: &ObservationExtractionIntent,
+    token: Uuid,
+    interruption_result: Option<(ObservationAnalysisResult, bool)>,
+) -> Result<(), AppError> {
+    let Some(revision_id) = intent.request.manual_revision_id else {
+        return Ok(());
+    };
+    let (analysis_state, result, resolved) = match intent.state {
+        ObservationExtractionState::Running => ("running", None, false),
+        ObservationExtractionState::ResponseReceived => ("running", None, true),
+        ObservationExtractionState::Completed => ("completed", intent.completion.clone(), true),
+        ObservationExtractionState::Interrupted => {
+            let (mut result, proof) = interruption_result
+                .ok_or_else(|| AppError::conflict("interruption result required"))?;
+            if let Some(response) = &intent.response {
+                result.actual_model = Some(response.actual_model.clone());
+                result.config_revision = response.config_revision;
+                result.prompt_tokens = response.prompt_tokens;
+                result.completion_tokens = response.completion_tokens;
+            }
+            (
+                "completed",
+                Some(result),
+                proof || intent.response.is_some(),
+            )
+        }
+        ObservationExtractionState::Queued => return Ok(()),
+    };
+    let result = result
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| AppError::invalid_request("invalid analysis result"))?;
+    let updated = sqlx::query("UPDATE observation_analyses SET state=$5,started_at=$6,analyzed_at=$7,result=$8,inference_resolved=inference_resolved OR $9,claim_token=$10 WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND revision_id=$4 AND (state='queued' OR (state='running' AND claim_token=$10))")
+        .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(revision_id)
+        .bind(analysis_state).bind(intent.started_at).bind(intent.finished_at).bind(result).bind(resolved).bind(token)
+        .execute(&mut **tx).await.map_err(db)?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::conflict("linked analysis lifecycle differs"));
+    }
+    Ok(())
 }
 fn project(scope: &TenantScope) -> Uuid {
     scope
@@ -111,6 +190,70 @@ async fn write(
 
 #[async_trait]
 impl ObservationExtractionRepository for PgObservationExtractionRepository {
+    async fn admit_manual(
+        &self,
+        scope: &TenantScope,
+        idempotency_key: &str,
+        request_digest: &str,
+        request: ObservationAnalysisRequest,
+        created_at: DateTime<Utc>,
+    ) -> Result<ManualExtractionAdmission, AppError> {
+        request.validate(scope, idempotency_key, request_digest, created_at)?;
+        let target = self.jobs.get_target(scope, request.target_id).await?;
+        let capture = match request.source {
+            ObservationAnalysisSource::Capture { capture_id } => {
+                self.captures.get(scope, capture_id).await?
+            }
+            ObservationAnalysisSource::AttemptEvidence { .. } => None,
+        };
+        observation_analysis_source_json(scope, &request, &target, capture.as_ref())?;
+        let mut tx = self.transaction(scope).await?;
+        crate::observation_analysis::lock_admission_sources(
+            &mut tx,
+            scope,
+            project(scope),
+            request.target_id,
+            request.attempt_id,
+        )
+        .await?;
+        let key_hash = sha256_hex(idempotency_key.as_bytes());
+        let inserted = sqlx::query("INSERT INTO observation_analyses (revision_id,operator_id,tenant_id,project_id,target_id,attempt_id,idempotency_key_hash,request_digest,request,state,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'queued',$10) ON CONFLICT DO NOTHING RETURNING *")
+            .bind(request.revision_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
+            .bind(request.target_id).bind(request.attempt_id).bind(&key_hash).bind(request_digest)
+            .bind(serde_json::to_value(&request).map_err(|_| AppError::invalid_request("invalid analysis request"))?)
+            .bind(created_at).fetch_optional(&mut *tx).await.map_err(db)?;
+        let admission = if let Some(row) = inserted {
+            let revision = crate::observation_analysis::decode(&row)?;
+            let extraction = ObservationExtractionRequest::for_manual(&revision.request);
+            let key = extraction.intent_key(scope)?;
+            let intent = ObservationExtractionIntent::queued(extraction, key, created_at);
+            sqlx::query("INSERT INTO observation_extraction_intents (intent_id,operator_id,tenant_id,project_id,source_capture_id,source_evidence_index,manual_revision_id,intent_key,state,created_at,intent) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued',$9,$10)")
+                .bind(intent.intent_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
+                .bind(intent.request.source_capture_id).bind(intent.request.source_evidence_index.map(i64::from)).bind(intent.request.manual_revision_id)
+                .bind(&intent.intent_key).bind(created_at).bind(value(&intent)?).execute(&mut *tx).await.map_err(db)?;
+            ManualExtractionAdmission {
+                revision,
+                intent: Some(intent),
+            }
+        } else {
+            let row = sqlx::query("SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND idempotency_key_hash=$4")
+                .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(key_hash)
+                .fetch_optional(&mut *tx).await.map_err(db)?.ok_or_else(|| AppError::conflict("analysis revision identity already exists"))?;
+            let revision = crate::observation_analysis::decode(&row)?;
+            if revision.request_digest != request_digest || !revision.request.same_input(&request) {
+                return Err(AppError::conflict("analysis idempotency request differs"));
+            }
+            let row = sqlx::query("SELECT * FROM observation_extraction_intents WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND manual_revision_id=$4")
+                .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(revision.request.revision_id)
+                .fetch_optional(&mut *tx).await.map_err(db)?;
+            ManualExtractionAdmission {
+                revision,
+                intent: row.as_ref().map(decode).transpose()?,
+            }
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(admission)
+    }
     async fn admit_automatic(
         &self,
         scope: &TenantScope,
@@ -130,7 +273,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         let key = request.intent_key(scope)?;
         let capture = self
             .captures
-            .get(scope, request.source_capture_id)
+            .get(scope, automatic_capture(&request)?)
             .await?
             .ok_or_else(|| AppError::not_found("extraction source not found"))?;
         request.validate_source(scope, &capture)?;
@@ -229,7 +372,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         let key = request.intent_key(scope)?;
         let capture = self
             .captures
-            .get(scope, request.source_capture_id)
+            .get(scope, automatic_capture(&request)?)
             .await?
             .ok_or_else(|| AppError::not_found("extraction source not found"))?;
         request.validate_source(scope, &capture)?;
@@ -311,7 +454,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         let mut tx = self.transaction(scope).await?;
         // Read only the public status fields. Large model responses and source
         // identities never cross the database boundary for this lookup.
-        let row = sqlx::query("SELECT jsonb_build_object('state',e.state,'created_at',e.created_at,'started_at',e.intent->'started_at','finished_at',e.intent->'finished_at','interruption',e.intent->'interruption') AS status FROM observation_captures c JOIN observation_extraction_intents e ON e.operator_id=c.operator_id AND e.tenant_id=c.tenant_id AND e.project_id=c.project_id AND e.source_capture_id=c.capture_id WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 AND c.target_id=$4 AND c.attempt_id=$5 AND c.phase='source' ORDER BY (e.state IN ('queued','running','response_received')) DESC,e.created_at DESC,e.intent_id DESC LIMIT 1")
+        let row = sqlx::query("SELECT jsonb_build_object('state',e.state,'created_at',e.created_at,'started_at',e.intent->'started_at','finished_at',e.intent->'finished_at','interruption',e.intent->'interruption') AS status FROM observation_extraction_intents e WHERE e.operator_id=$1 AND e.tenant_id=$2 AND e.project_id=$3 AND e.intent->'request'->>'target_id'=$4::uuid::text AND e.intent->'request'->>'attempt_id'=$5::uuid::text ORDER BY (e.state IN ('queued','running','response_received')) DESC,e.created_at DESC,e.intent_id DESC LIMIT 1")
             .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
             .bind(target_id).bind(attempt_id).fetch_optional(&mut *tx).await.map_err(db)?;
         let status = row
@@ -342,6 +485,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         let token = Uuid::new_v4();
         intent.state = ObservationExtractionState::Running;
         intent.started_at = Some(started_at);
+        sync_manual(&mut tx, scope, &intent, token, None).await?;
         write(&mut tx, &intent, token).await?;
         tx.commit().await.map_err(db)?;
         Ok(Some(ObservationExtractionClaim {
@@ -380,6 +524,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
             claim_token,
             |intent| intent.record_response(response, received_at),
             false,
+            None,
         )
         .await
     }
@@ -397,6 +542,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
             claim_token,
             |intent| intent.complete(result, finished_at),
             false,
+            None,
         )
         .await
     }
@@ -408,12 +554,49 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         reason: ObservationExtractionInterruption,
         finished_at: DateTime<Utc>,
     ) -> Result<ObservationExtractionIntent, AppError> {
+        self.interrupt_with_result(
+            scope,
+            intent_id,
+            claim_token,
+            reason,
+            ObservationAnalysisResult {
+                config_revision: None,
+                actual_model: None,
+                candidate_json: None,
+                outcome: ObservationAnalysisOutcome::Failed {
+                    code: "analysis_interrupted".into(),
+                },
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            },
+            false,
+            finished_at,
+        )
+        .await
+    }
+    async fn interrupt_with_result(
+        &self,
+        scope: &TenantScope,
+        intent_id: Uuid,
+        claim_token: Uuid,
+        reason: ObservationExtractionInterruption,
+        result: ObservationAnalysisResult,
+        inference_resolved: bool,
+        finished_at: DateTime<Utc>,
+    ) -> Result<ObservationExtractionIntent, AppError> {
+        result.validate()?;
+        if !matches!(&result.outcome, ObservationAnalysisOutcome::Failed { .. }) {
+            return Err(AppError::invalid_request(
+                "interruption requires failure result",
+            ));
+        }
         self.update(
             scope,
             intent_id,
             claim_token,
             |intent| intent.interrupt(reason, finished_at),
             true,
+            Some((result, inference_resolved)),
         )
         .await
     }

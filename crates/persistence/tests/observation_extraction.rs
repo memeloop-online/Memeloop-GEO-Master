@@ -167,7 +167,9 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
     let request = ObservationExtractionRequest {
         target_id,
         attempt_id,
-        source_capture_id: capture_id,
+        source_capture_id: Some(capture_id),
+        source_evidence_index: None,
+        manual_revision_id: None,
         source_sha256,
         prompt_version: "extract.v1".into(),
         parser_version: "ground.v1".into(),
@@ -401,7 +403,7 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
             .is_none()
     );
     let mut automatic_v2 = second.request.clone();
-    automatic_v2.source_capture_id = equal_receipt.capture_id;
+    automatic_v2.source_capture_id = Some(equal_receipt.capture_id);
     automatic_v2.prompt_version = "extract.v2".into();
     let mut automatic_v3 = automatic_v2.clone();
     automatic_v3.prompt_version = "extract.v3".into();
