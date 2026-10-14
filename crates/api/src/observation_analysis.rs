@@ -3089,14 +3089,17 @@ mod tests {
         tokio::time::advance(Duration::from_secs(181)).await;
         // Exercise both normal GET reconciliation and an explicit old cutoff:
         // a linked durable task is never treated as an abandoned legacy claim.
+        // Tokio's paused clock does not advance Utc; use one consistent wall
+        // clock pair whose stale cutoff includes the newly started revision.
+        let reconciled_at = Utc::now() + chrono::Duration::seconds(181);
         f.service
             .repository
             .interrupt_stale(
                 &f.scope,
                 f.target_id,
                 f.attempt_id,
-                Utc::now() + chrono::Duration::seconds(1),
-                Utc::now(),
+                reconciled_at - chrono::Duration::seconds(180),
+                reconciled_at,
             )
             .await
             .unwrap();
