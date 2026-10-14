@@ -209,7 +209,7 @@ export async function withDeepSeekDocument(
                 return { kind: "authorization_expired" };
               const url =
                 kind === "history"
-                  ? `${origin}/api/v0/chat/history_messages?chat_session_id=${encodeURIComponent(conversationId)}&cache_version=null&cache_reset_at=null`
+                  ? `${origin}/api/v0/chat/history_messages?chat_session_id=${encodeURIComponent(conversationId)}`
                   : `${origin}/api/v0/chat_session/delete`;
               const response = await fetch(url, {
                 method: kind === "history" ? "GET" : "POST",

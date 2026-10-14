@@ -47,8 +47,8 @@ async function fixture(run, options = {}) {
               assert.equal(request.method(), "GET");
               assert.equal(url.pathname, "/api/v0/chat/history_messages");
               assert.equal(url.searchParams.get("chat_session_id"), chat);
-              assert.equal(url.searchParams.get("cache_version"), "null");
-              assert.equal(url.searchParams.get("cache_reset_at"), "null");
+              assert.equal(url.searchParams.has("cache_version"), false);
+              assert.equal(url.searchParams.has("cache_reset_at"), false);
               if (state.blocked) await state.blocked;
               if (state.drift) state.account = "other-account";
               await route.fulfill({

@@ -15,9 +15,7 @@ const expected = {
   requestMessageId: 1,
   responseMessageId: 2,
 };
-const historyUrl =
-  `${ORIGIN}/api/v0/chat/history_messages?chat_session_id=synthetic-session` +
-  "&cache_version=null&cache_reset_at=null";
+const historyUrl = `${ORIGIN}/api/v0/chat/history_messages?chat_session_id=synthetic-session`;
 const fixture = () => ({
   code: 0,
   data: {
@@ -94,7 +92,7 @@ async function synthetic(t, reply = {}) {
   return { context, page, requests, state };
 }
 
-test("actual Chromium GET uses fixed fresh query and returns only verified observed metadata", async (t) => {
+test("actual Chromium GET omits null cache query and returns only verified observed metadata", async (t) => {
   const { page, requests } = await synthetic(t);
   const href = page.url();
   const answer = await readDeepSeekFirstTurnHistory(page, expected);
@@ -108,6 +106,13 @@ test("actual Chromium GET uses fixed fresh query and returns only verified obser
   assert.equal(requests.length, 1);
   assert.equal(requests[0].method(), "GET");
   assert.equal(requests[0].url(), historyUrl);
+  const requestedUrl = new URL(requests[0].url());
+  assert.equal(
+    requestedUrl.search,
+    `?chat_session_id=${encodeURIComponent(expected.conversationId)}`,
+  );
+  assert.equal(requestedUrl.searchParams.has("cache_version"), false);
+  assert.equal(requestedUrl.searchParams.has("cache_reset_at"), false);
   assert.equal(
     requests[0].headers().authorization,
     "Bearer synthetic-history-token",

@@ -72,8 +72,8 @@ test("real runner dispatches DeepSeek cleanup, preserves authority and deduplica
                 };
               else if (url.pathname === "/api/v0/chat/history_messages") {
                 assert.equal(url.searchParams.get("chat_session_id"), chat);
-                assert.equal(url.searchParams.get("cache_version"), "null");
-                assert.equal(url.searchParams.get("cache_reset_at"), "null");
+                assert.equal(url.searchParams.has("cache_version"), false);
+                assert.equal(url.searchParams.has("cache_reset_at"), false);
                 body = deleted ? { code: 0, data: { biz_code: 1 } } : history;
               } else if (url.pathname === "/api/v0/chat_session/delete") {
                 assert.equal(request.method(), "POST");

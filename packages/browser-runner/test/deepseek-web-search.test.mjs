@@ -872,23 +872,52 @@ test("cancellation and expired budgets prevent all sends", async () => {
   assert.deepEqual(f.calls, []);
 });
 
-test("hanging durable source hook is bounded and cannot start late extraction", async () => {
-  const f = fixture();
-  let release;
-  f.options.onEvidence = () =>
-    new Promise((resolve) => {
-      release = resolve;
+for (const firstTimer of ["interpretation", "evidence"]) {
+  test(`hanging durable source hook fails closed when ${firstTimer} deadline fires first`, async (t) => {
+    let now = 1000;
+    const timers = new Map();
+    t.mock.method(performance, "now", () => now);
+    t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+      const timer = {};
+      timers.set(timer, { callback, at: now + delay });
+      return timer;
     });
-  const result = await observeDeepSeekWebSearch(f.page, payload, {
-    ...f.options,
-    deadlineAt: performance.now() + 40,
+    t.mock.method(globalThis, "clearTimeout", (timer) => timers.delete(timer));
+    const f = fixture();
+    let release;
+    let evidenceStarted;
+    const started = new Promise((resolve) => {
+      evidenceStarted = resolve;
+    });
+    f.options.onEvidence = () =>
+      new Promise((resolve) => {
+        release = resolve;
+        evidenceStarted();
+      });
+    const pending = observeDeepSeekWebSearch(f.page, payload, {
+      ...f.options,
+      deadlineAt: now + 40,
+    });
+    await started;
+    // Both nested deadlines are identical. Exercise each possible winner,
+    // without relying on wall-clock timer rounding or CI scheduling.
+    const deadlines = [...timers.values()];
+    assert.equal(deadlines.length, 2);
+    assert.deepEqual(
+      deadlines.map(({ at }) => at),
+      [1040, 1040],
+    );
+    now = 1040;
+    deadlines[firstTimer === "interpretation" ? 0 : 1].callback();
+    const result = await pending;
+    assert.equal(result.reason, "evidence_persist_failed");
+    release();
+    await new Promise(setImmediate);
+    assert.equal(f.calls.includes("extract"), false);
+    assert.equal(f.calls.filter((call) => call === "send").length, 1);
+    assert.equal(timers.size, 0);
   });
-  assert.equal(result.reason, "budget_exhausted");
-  release();
-  await new Promise(setImmediate);
-  assert.equal(f.calls.includes("extract"), false);
-  assert.equal(f.calls.filter((call) => call === "send").length, 1);
-});
+}
 
 test("real Chrome runs fresh navigation, dynamic controls, exact prefetched session, capture and source-first AI parsing", async () => {
   const browser = await chromium.launch({
@@ -1027,8 +1056,8 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
           url.searchParams.get("chat_session_id"),
           "fixture-selected",
         );
-        assert.equal(url.searchParams.get("cache_version"), "null");
-        assert.equal(url.searchParams.get("cache_reset_at"), "null");
+        assert.equal(url.searchParams.has("cache_version"), false);
+        assert.equal(url.searchParams.has("cache_reset_at"), false);
         await route.fulfill({
           json: {
             code: 0,
