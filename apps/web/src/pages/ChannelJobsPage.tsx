@@ -12,7 +12,15 @@ import {
   Spinner,
   Textarea,
 } from "@fluentui/react-components";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  skipToken,
+  queryOptions,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+  type InfiniteData,
+} from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 import { membershipForTenant, queryScopeFor } from "../auth/types";
@@ -40,6 +48,12 @@ import { useSourceQuery, useSourcesQuery } from "../api/knowledge";
 import { EmptyState, ErrorState, LoadingState } from "../components/AsyncState";
 import { DistributionPanel } from "./DistributionPanel";
 import { ObservationAnalysisPanel } from "./ObservationAnalysisPanel";
+import type { ObservationAnalysisPage } from "../api/observationAnalysis";
+import {
+  analysisRevisions,
+  availableAnalysis,
+  observationAnalysisKey,
+} from "./observationAnalysisResult";
 import "./measurementMessages";
 import {
   PublicationLookupPanel,
@@ -111,8 +125,28 @@ export function TargetCard({
   accountDisplayName?: string | null;
 }) {
   const { t, i18n } = useTranslation("measurement");
+  const { session } = useAuth();
   const [showTechnicalDetails, setShowTechnicalDetails] = useState(false);
   const input = target.input;
+  // Observe the panels' scoped infinite-query cache without issuing another read.
+  const savedResults = useQueries({
+    queries: (input.kind === "measure" ? (view?.attempts ?? []) : []).map(
+      (attempt) =>
+        queryOptions<InfiniteData<ObservationAnalysisPage>>({
+          queryKey: observationAnalysisKey(
+            session,
+            tenantId,
+            projectId,
+            target.target_id,
+            attempt.attempt_id,
+          ),
+          queryFn: skipToken,
+        }),
+    ),
+  });
+  const hasSavedAnswer = savedResults.some((result) =>
+    Boolean(availableAnalysis(analysisRevisions(result.data))),
+  );
   const classification =
     input.kind === "measure"
       ? input.question_binding?.purpose === "optimization"
@@ -123,15 +157,17 @@ export function TargetCard({
       : null;
   const status = resultStatus(view);
   const attempted = Boolean(view?.attempts.length);
-  const automaticLabel = loading
-    ? t("automaticLoading")
-    : loadError
-      ? t("automaticUnavailable")
-      : !attempted
-        ? t("automaticQueued")
-        : status === "in_flight"
-          ? t("automaticInFlight")
-          : t(`automaticOutcome.${status}`, { defaultValue: status });
+  const automaticLabel = hasSavedAnswer
+    ? t("resultAnswerAvailable")
+    : loading
+      ? t("automaticLoading")
+      : loadError
+        ? t("automaticUnavailable")
+        : !attempted
+          ? t("automaticQueued")
+          : status === "in_flight"
+            ? t("automaticInFlight")
+            : t(`automaticOutcome.${status}`, { defaultValue: status });
   if (automatic && input.kind === "measure") {
     const measurementDate = (value?: string | null) =>
       value
@@ -168,8 +204,11 @@ export function TargetCard({
         {!loading && !loadError && !attempted && (
           <p role="status">{t("automaticQueuedDetail")}</p>
         )}
-        {view?.attempts.map((attempt) => {
+        {view?.attempts.map((attempt, index) => {
           const outcome = attempt.outcome;
+          const savedAnswer = Boolean(
+            availableAnalysis(analysisRevisions(savedResults[index]?.data)),
+          );
           const observed = outcome?.status === "observed" && !outcome.fixture;
           const citations = [
             ...new Set(
@@ -178,28 +217,53 @@ export function TargetCard({
                 .filter((url): url is string => url !== null),
             ),
           ];
+          const receipt = (
+            <p>
+              {outcome ? (
+                outcome.fixture && outcome.status === "observed" ? (
+                  t("resultFixture")
+                ) : (
+                  t(`automaticOutcome.${outcome.status}`, {
+                    defaultValue: outcome.status,
+                  })
+                )
+              ) : (
+                <span>{t("automaticInFlightDetail")}</span>
+              )}
+              {" · "}
+              {t(outcome ? "resultReceivedAt" : "resultStartedAt", {
+                value: measurementDate(
+                  outcome ? attempt.received_at : attempt.claimed_at,
+                ),
+              })}
+            </p>
+          );
+          const analysis = outcome && (
+            <ObservationAnalysisPanel
+              tenantId={tenantId}
+              projectId={projectId}
+              targetId={target.target_id}
+              attemptId={attempt.attempt_id}
+              canWrite={canWrite}
+            />
+          );
           return (
             <div className="channel-job-attempt" key={attempt.attempt_id}>
-              <p>
-                {outcome ? (
-                  outcome.fixture && outcome.status === "observed" ? (
-                    t("resultFixture")
-                  ) : (
-                    t(`automaticOutcome.${outcome.status}`, {
-                      defaultValue: outcome.status,
-                    })
-                  )
-                ) : (
-                  <span>{t("automaticInFlightDetail")}</span>
-                )}
-                {" · "}
-                {t(outcome ? "resultReceivedAt" : "resultStartedAt", {
-                  value: measurementDate(
-                    outcome ? attempt.received_at : attempt.claimed_at,
-                  ),
-                })}
-              </p>
-              {observed && (
+              {analysis}
+              {savedAnswer ? (
+                <>
+                  <details>
+                    <summary>{t("resultExecutionHistory")}</summary>
+                    {receipt}
+                    {outcome?.status === "unknown" && (
+                      <p>{t("automaticUnknownDetail")}</p>
+                    )}
+                  </details>
+                </>
+              ) : (
+                receipt
+              )}
+              {observed && !savedAnswer && (
                 <>
                   <h4>{t("resultAnswer")}</h4>
                   <div
@@ -235,19 +299,10 @@ export function TargetCard({
                   )}
                 </>
               )}
-              {outcome && (
-                <ObservationAnalysisPanel
-                  tenantId={tenantId}
-                  projectId={projectId}
-                  targetId={target.target_id}
-                  attemptId={attempt.attempt_id}
-                  canWrite={canWrite}
-                />
-              )}
             </div>
           );
         })}
-        {attempted && status === "unknown" && (
+        {attempted && status === "unknown" && !hasSavedAnswer && (
           <p role="status">{t("automaticUnknownDetail")}</p>
         )}
         <details

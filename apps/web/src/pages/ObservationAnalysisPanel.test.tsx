@@ -58,11 +58,12 @@ function setup(
   eligible = true,
   canWrite = true,
   extraction: ObservationExtractionStatus | null = null,
+  nextAfter: string | null = null,
 ) {
   const page: ObservationAnalysisPage = {
     items,
     extraction,
-    next_after: null,
+    next_after: nextAfter,
     sources: eligible
       ? [
           {
@@ -107,6 +108,115 @@ afterEach(async () => {
 });
 
 describe("saved response analysis", () => {
+  it.each(["failed", "running"] as const)(
+    "keeps an available answer ahead of a newer %s analysis",
+    async (state) => {
+      const grounded: ObservationAnalysisRevision = {
+        ...revision,
+        request: { ...revision.request, revision_id: "grounded-revision" },
+        state: "completed",
+        result: {
+          actual_model: "saved-model",
+          candidate_json: null,
+          prompt_tokens: 1,
+          completion_tokens: 1,
+          outcome: {
+            status: "grounded",
+            raw_answer: "Available saved answer",
+            citations: [],
+            audit: {},
+          },
+        },
+      };
+      const newer: ObservationAnalysisRevision =
+        state === "running"
+          ? { ...revision, state: "running" }
+          : {
+              ...revision,
+              state: "completed",
+              result: {
+                ...grounded.result!,
+                outcome: { status: "failed", code: "model_timeout" },
+              },
+            };
+      const { create } = setup([newer, grounded]);
+      expect(await screen.findByText("Available saved answer")).toBeVisible();
+      expect(screen.getAllByText("Available saved answer")).toHaveLength(1);
+      const history = screen.getByText("解析记录与操作").closest("details")!;
+      expect(history.open).toBe(false);
+      const newerStatus = screen.getByText(
+        state === "running" ? "正在解析" : "解析超时。请稍后重新解析。",
+      );
+      expect(newerStatus).not.toBeVisible();
+      await userEvent.click(screen.getByText("解析记录与操作"));
+      expect(newerStatus).toBeVisible();
+      expect(screen.getByRole("button", { name: "重新解析" })).toHaveProperty(
+        "disabled",
+        state === "running",
+      );
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("promotes an earlier available answer through existing history pagination", async () => {
+    const { list, create, page } = setup(
+      [
+        {
+          ...revision,
+          state: "completed",
+          result: {
+            actual_model: "analysis-model",
+            candidate_json: null,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            outcome: { status: "failed", code: "model_timeout" },
+          },
+        },
+      ],
+      true,
+      true,
+      null,
+      "earlier-page",
+    );
+    await screen.findByText("解析超时。请稍后重新解析。");
+    list.mockResolvedValueOnce({
+      ...page,
+      next_after: null,
+      items: [
+        {
+          ...revision,
+          request: { ...revision.request, revision_id: "earlier-success" },
+          state: "completed",
+          result: {
+            actual_model: "saved-model",
+            candidate_json: null,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            outcome: {
+              status: "grounded",
+              raw_answer: "Earlier saved answer",
+              citations: [],
+              audit: {},
+            },
+          },
+        },
+      ],
+    });
+    await userEvent.click(
+      screen.getByRole("button", { name: "更早的解析记录" }),
+    );
+    expect(await screen.findByText("Earlier saved answer")).toBeVisible();
+    expect(screen.getAllByText("Earlier saved answer")).toHaveLength(1);
+    expect(list.mock.calls[1].slice(0, 5)).toEqual([
+      "tenant",
+      "project",
+      "target",
+      "attempt",
+      "earlier-page",
+    ]);
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it.each(["zh-CN", "en"])(
     "shows interrupted automatic failure guidance and existing settings in %s",
     async (language) => {
