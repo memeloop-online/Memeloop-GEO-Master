@@ -35,10 +35,20 @@ export class ApiError extends Error {
   }
 }
 
-type UnauthorizedHandler = () => void | Promise<void>;
+type UnauthorizedHandler = (generation: number) => void | Promise<void>;
 
 let csrfToken: string | undefined;
 let unauthorizedHandler: UnauthorizedHandler | undefined;
+let authGeneration = 0;
+
+export function getAuthGeneration() {
+  return authGeneration;
+}
+
+/** Invalidates authentication effects from requests belonging to an older session. */
+export function advanceAuthGeneration() {
+  return ++authGeneration;
+}
 
 /**
  * Session material only lives in memory. Cookies are HttpOnly and sent by the
@@ -132,6 +142,7 @@ export async function apiFetch<T>(
     ...init
   }: ApiRequestOptions = {},
 ): Promise<T> {
+  const generation = getAuthGeneration();
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
 
@@ -182,8 +193,12 @@ export async function apiFetch<T>(
       errorBody,
       `请求失败（HTTP ${response.status}）`,
     );
-    if (apiError.status === 401 && unauthorized === "handle") {
-      void unauthorizedHandler?.();
+    if (
+      apiError.status === 401 &&
+      unauthorized === "handle" &&
+      generation === getAuthGeneration()
+    ) {
+      void unauthorizedHandler?.(generation);
     }
     throw apiError;
   }
@@ -206,6 +221,7 @@ export async function apiFetchBlob(
     accept?: string;
   } = {},
 ): Promise<Blob> {
+  const generation = getAuthGeneration();
   let response: Response;
   try {
     response = await fetch(apiRequestUrl(path, { tenantId, projectId }), {
@@ -227,7 +243,9 @@ export async function apiFetchBlob(
       await readJson<ApiErrorBody>(response),
       `请求失败（HTTP ${response.status}）`,
     );
-    if (response.status === 401) void unauthorizedHandler?.();
+    if (response.status === 401 && generation === getAuthGeneration()) {
+      void unauthorizedHandler?.(generation);
+    }
     throw apiError;
   }
   return response.blob();
