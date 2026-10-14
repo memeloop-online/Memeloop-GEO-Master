@@ -83,6 +83,7 @@ export async function observeDeepSeekWebSearch(
   let sourceRedaction;
   let persistenceFailed = false;
   let checkpointInFlight = false;
+  let interpretationEvidenceInFlight = 0;
   const unknown = (reason) => ({
     reason,
     ...(ownershipReceiptStatus
@@ -461,11 +462,14 @@ export async function observeDeepSeekWebSearch(
             getExtractionPolicy,
             onDiagnostic,
             onEvidence: async (record) => {
+              interpretationEvidenceInFlight++;
               try {
                 await run(() => onEvidence(record), overallDeadline);
               } catch (error) {
                 persistenceFailed = true;
                 throw error;
+              } finally {
+                interpretationEvidenceInFlight--;
               }
             },
           },
@@ -498,8 +502,12 @@ export async function observeDeepSeekWebSearch(
       },
     };
   } catch (error) {
+    // The interpreter and its evidence hook share a deadline. An unacknowledged
+    // checkpoint is a persistence failure whichever timeout settles first.
     const reason =
-      persistenceFailed || error instanceof ObservationPersistenceError
+      persistenceFailed ||
+      interpretationEvidenceInFlight > 0 ||
+      error instanceof ObservationPersistenceError
         ? "evidence_persist_failed"
         : signal?.aborted
           ? observationAbortCode(signal)
