@@ -11,6 +11,8 @@ pub use appearance::{
 mod auth;
 mod partner;
 pub use partner::*;
+mod partner_admin;
+pub use partner_admin::*;
 mod channel_jobs;
 pub use channel_jobs::*;
 mod browser_operations;

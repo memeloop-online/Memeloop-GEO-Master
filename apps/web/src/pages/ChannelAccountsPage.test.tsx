@@ -717,6 +717,34 @@ describe("channel API scope", () => {
 });
 
 describe("account page", () => {
+  it("opens partner settings through the tab with scoped metadata and no channel login action", async () => {
+    const fixture = mockApi();
+    const original = fixture.fetchMock.getMockImplementation()!;
+    let metadataUrl: URL | undefined;
+    fixture.fetchMock.mockImplementation((request, init) => {
+      const url = new URL(String(request), "http://localhost");
+      if (url.pathname.endsWith("/partner-connections")) {
+        metadataUrl = url;
+        return Promise.resolve(response({ items: [], next_cursor: null }));
+      }
+      return original(request, init);
+    });
+    const user = userEvent.setup();
+    renderPage("settings");
+    await user.click(await screen.findByRole("tab", { name: "合作方连接" }));
+    expect(
+      await screen.findByRole("button", { name: "添加连接" }),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(metadataUrl?.searchParams.get("tenant_id")).toBe("tenant-1");
+      expect(metadataUrl?.searchParams.get("project_id")).toBe("project-1");
+    });
+    expect(
+      screen.queryByRole("button", {
+        name: i18n.t("account.channels.connect"),
+      }),
+    ).not.toBeInTheDocument();
+  });
   it.each([
     [false, false],
     [false, true],

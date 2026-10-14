@@ -100,6 +100,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .as_ref()
                 .map(|_| OFFICE_PARSER_PROFILE.to_owned()),
         );
+        let state = state.with_partner_admin_repository(Arc::new(
+            geo_persistence::PgPartnerAdminRepository::from_database(&database),
+        ));
         let state = match std::env::var("GEO_CHANNEL_SECRET_KEY") {
             Ok(key) => {
                 state.with_project_ai_settings(geo_api::ProjectAiSettingsService::persistent(

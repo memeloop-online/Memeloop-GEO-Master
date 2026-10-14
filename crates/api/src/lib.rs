@@ -22,6 +22,7 @@ mod channel_tools;
 mod channels;
 mod citation_insights;
 mod partner;
+mod partner_admin;
 pub use partner::partner_router;
 mod connector_capabilities;
 mod content;
@@ -218,6 +219,7 @@ pub struct AppState {
     observation_evidence_resolver: Option<ObservationEvidenceResolver>,
     serp_service: Option<SerpService>,
     project_serp_settings: Option<ProjectSerpSettingsService>,
+    partner_admin_repository: Option<Arc<dyn geo_domain::PartnerAdminRepository>>,
     provider_cleanup_callback: Option<ProviderCleanupCallbackService>,
     content_repository: Arc<dyn geo_domain::ContentRepository>,
     content_media_repository: Arc<dyn geo_domain::ContentMediaRepository>,
@@ -342,6 +344,7 @@ impl AppState {
             observation_evidence_resolver: None,
             serp_service: None,
             project_serp_settings: None,
+            partner_admin_repository: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -503,6 +506,7 @@ impl AppState {
             observation_evidence_resolver: None,
             serp_service: None,
             project_serp_settings: None,
+            partner_admin_repository: None,
             provider_cleanup_callback: None,
             content_repository: Arc::new(
                 geo_domain::MemoryContentRepository::with_media_repository(
@@ -1002,6 +1006,18 @@ impl AppState {
 
     pub fn project_serp_settings(&self) -> Option<&ProjectSerpSettingsService> {
         self.project_serp_settings.as_ref()
+    }
+
+    pub fn with_partner_admin_repository(
+        mut self,
+        repository: Arc<dyn geo_domain::PartnerAdminRepository>,
+    ) -> Self {
+        self.partner_admin_repository = Some(repository);
+        self
+    }
+
+    pub fn partner_admin_repository(&self) -> Option<Arc<dyn geo_domain::PartnerAdminRepository>> {
+        self.partner_admin_repository.clone()
     }
 
     pub fn with_provider_cleanup_callback(
@@ -2625,6 +2641,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(observation_analysis::routes())
                 .merge(serp::routes())
                 .merge(project_serp_settings::routes())
+                .merge(partner_admin::routes())
                 .merge(scoped),
         )
         .layer(Extension(middleware_state))

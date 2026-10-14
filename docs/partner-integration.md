@@ -36,7 +36,9 @@ AI 工作台发起导入、生成、分发和查询，详情页查看同一来�
   外部版本 → SourceVersion/ImportJob；外部发布 ID → 原 PublicationIntent/Attempt。
   唯一键含作用域和 connection_id，不用全局外部 ID 或正文摘要跨客户去重。
 - 加密保存需要出站使用的秘密；入站 API Key 只保存不可逆验证值及 key_id。
-  支持到期、轮换、撤销和操作审计；每次访问复核连接权限。密钥不进入聊天或前端。
+  支持可选到期、轮换、撤销和操作审计；每次访问复核连接权限。管理员签发或轮换时
+  可一次性查看并复制密钥；仅在当前组件暂存，关闭或切换身份／项目后清除。
+  密钥不进入聊天、浏览器持久存储、查询缓存、日志或服务端幂等响应存储。
 
 ## 3. 增量知识导入与撤销
 
@@ -133,8 +135,8 @@ connection_id；有限时钟窗口、key_id 轮换及 `(connection_id,event_id)`
 
 实现入口为 `crates/domain/src/partner.rs`、`crates/api/src/partner.rs`、
 `crates/persistence/src/partner.rs` 和迁移 `0061_partner_knowledge_sync.sql`。
-目前仅 PostgreSQL 模式装配；管理端连接创建、密钥签发和轮换的 HTTP/UI 入口尚未提供，
-不能直接作为已可自助接入的功能交付。
+目前仅 PostgreSQL 模式装配；管理端连接创建、密钥签发和轮换的 HTTP/UI 候选入口见下节。
+上线与实际接入尚未验收，不能直接作为已可自助接入的功能交付。
 
 请求使用 `Authorization: Bearer <key_id>.<secret>`，推送另带
 `Idempotency-Key` 和 `Content-Type: application/json`；凭据不经聊天传递。
@@ -173,3 +175,24 @@ connection_id；有限时钟窗口、key_id 轮换及 `(connection_id,event_id)`
 重试使用原幂等键及原输入，结果中的资源 ID 指向现有企业知识库。
 接入验收须覆盖受理后立即收紧公开用途、后台停机恢复、序号乱序、旧版重放、
 密钥撤销及跨项目拒绝；候选代码存在不能替代这些实库与上线验证。
+
+## 8. 项目设置中的连接管理
+
+工作区管理员在项目设置的“合作方连接”中创建连接、签发／轮换／撤销密钥。
+管理接口使用第一方会话、项目权限及 CSRF 校验，不接受合作方 Bearer 代替管理员身份。
+基础路径为 `/api/v1/projects/{project_id}/partner-connections`：
+
+- `GET`／`POST` 集合：分页元数据／创建项目连接，创建正文为 `{}`。
+- `GET`／`POST /{connection_id}/keys`：分页密钥元数据／一次性签发，
+  签发正文为 `{"expires_at":null}` 或未来 RFC3339 时间；没有强制到期。
+- `POST /{connection_id}/keys/{key_id}/rotate`：同签发正文，事务内使旧密钥失效。
+- `POST /{connection_id}/keys/{key_id}/revoke` 和
+  `POST /{connection_id}/revoke`：正文 `{}`，撤销成功返回 204。
+
+分页采用 `after` UUID 游标及 `limit`，返回 `{items,next_cursor}`；
+第一方客户端附带的项目／租户选择器须与服务端授权作用域一致。
+签发／轮换返回 `{key,bearer}`，仅当次显示；其余响应不包含密钥或验证摘要。
+管理命令不进入通用持久幂等响应缓存，客户端不自动重试签发／轮换。
+响应丢失时刷新元数据并显示结果尚未确认，不凭不完整历史列表猜测新密钥，
+不强迫撤销已有工作凭据。用户可明确选择重新签发或撤销不再需要的密钥。
+连接撤销不等于来源撤销，也不代表外部已发布文章已下线。

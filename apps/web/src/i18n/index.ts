@@ -1,6 +1,7 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import type { UiLocale } from "../api/appearance";
+import { partnerConnectionsResources } from "./partnerConnections";
 
 export const resources = {
   "zh-CN": {
@@ -655,6 +656,18 @@ void i18n.use(initReactI18next).init({
   returnNull: false,
   initAsync: false,
 });
+
+for (const [locale, translations] of Object.entries(
+  partnerConnectionsResources,
+)) {
+  i18n.addResourceBundle(
+    locale,
+    "partnerConnections",
+    translations,
+    true,
+    true,
+  );
+}
 
 export function formatUiDate(
   value: Date | string,
