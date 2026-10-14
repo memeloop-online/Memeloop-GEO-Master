@@ -30,6 +30,7 @@ use crate::{Database, set_local_scope};
 mod import_progress;
 #[path = "knowledge_revision.rs"]
 mod knowledge_revision;
+pub(crate) use knowledge_revision::PartnerTextSnapshot;
 #[path = "office_parse.rs"]
 mod office_parse;
 #[path = "pdf_parse.rs"]
@@ -2335,6 +2336,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
              JOIN knowledge_sources source ON source.source_id=version.source_id
              WHERE link.knowledge_release_id=$1 AND link.operator_id=$2
                AND link.tenant_id=$3 AND link.project_id=$4 AND source.purpose='public'
+               AND source.state='active'
              ORDER BY link.source_version_id",
         )
         .bind(request.knowledge_release_id)

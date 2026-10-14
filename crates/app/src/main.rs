@@ -9,6 +9,7 @@ mod content_request_dispatch;
 mod content_runtime_tests;
 mod dispatch;
 mod observation_completion_recovery_dispatch;
+mod partner_sync_dispatch;
 mod production_runtime;
 mod provider_conversation_cleanup_dispatch;
 mod publication_lookup_dispatch;
@@ -68,11 +69,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if production_ai.is_some() && !durable_storage {
         return Err("production model configuration requires PostgreSQL".into());
     }
+    let mut partner_repository: Option<(
+        Arc<dyn geo_domain::PartnerRepository>,
+        std::num::NonZeroUsize,
+    )> = None;
     let (state, durable_storage, content_scanner, agent_scanner) = if durable_storage {
         // A configured database is authoritative.  Connection or migration
         // failures terminate startup; the process never falls back to memory
         // authentication or idempotency state.
         let database = Database::connect_and_migrate_from_env().await?;
+        let auth_capacity =
+            std::num::NonZeroUsize::new(database.pool().options().get_max_connections() as usize)
+                .ok_or("database connection capacity must be positive")?;
+        partner_repository = Some((
+            Arc::new(geo_persistence::PgPartnerRepository::from_database(
+                &database,
+            )),
+            auth_capacity,
+        ));
         let report_scanner = PgReportRepository::from_database(&database);
         let agent_scanner = geo_persistence::PgAgentRepository::from_database(&database);
         let content_scanner = geo_persistence::PgContentRepository::from_database(&database);
@@ -224,7 +238,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     dispatch::spawn(state.clone());
     browser_operation_dispatch::spawn(state.clone());
     content_request_dispatch::spawn(state.clone());
-    let app: Router = router(state);
+    let mut app: Router = router(state);
+    if let Some((repository, auth_capacity)) = partner_repository {
+        partner_sync_dispatch::spawn(repository.clone());
+        app = app.merge(geo_api::partner_router(repository, auth_capacity));
+    }
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(
         address = %config.bind_addr,

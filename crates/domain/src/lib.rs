@@ -9,6 +9,8 @@ pub use appearance::{
     DEFAULT_LOCALE, DEFAULT_PRIMARY_COLOR, OperatorAppearance, UpdateOperatorAppearance,
 };
 mod auth;
+mod partner;
+pub use partner::*;
 mod channel_jobs;
 pub use channel_jobs::*;
 mod browser_operations;

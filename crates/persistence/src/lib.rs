@@ -32,6 +32,8 @@ pub use distribution::PgDistributionRepository;
 mod error;
 mod idempotency;
 mod knowledge;
+mod partner;
+pub use partner::PgPartnerRepository;
 mod migrations;
 mod model_routes;
 pub use model_routes::PgModelRouteRepository;
