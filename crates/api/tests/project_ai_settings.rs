@@ -3,14 +3,23 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::SET_COOKIE},
 };
-use geo_api::{AppState, CSRF_HEADER, ProjectAiSettingsService, router};
+use geo_api::{
+    AppState, CSRF_HEADER, ModelProviderBridge, ProjectAiSettingsService, SharedModelProvider,
+    router,
+};
 use geo_domain::{
     DEVELOPMENT_OPERATOR_ID, Membership, MemoryAuthRepository, MemoryProjectAiSettingsRepository,
     ProjectAiSettingsRepository, ProjectAiUsage, ProjectCreate, ProjectSettings, Role, TenantScope,
     UserId,
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -40,6 +49,9 @@ impl Fixture {
     }
 }
 async fn fixture(role: Role) -> Fixture {
+    fixture_with_provider(role, None).await
+}
+async fn fixture_with_provider(role: Role, provider: Option<SharedModelProvider>) -> Fixture {
     let auth = Arc::new(MemoryAuthRepository::development_with_password(
         "synthetic-password",
     ));
@@ -53,11 +65,13 @@ async fn fixture(role: Role) -> Fixture {
     .await
     .unwrap();
     let settings = Arc::new(MemoryProjectAiSettingsRepository::default());
+    let service = ProjectAiSettingsService::persistent(settings.clone(), &"12".repeat(32)).unwrap();
+    for usage in ProjectAiUsage::ALL {
+        service.with_inherited_provider(usage, provider.clone(), Some("synthetic-model".into()));
+    }
     let state = AppState::development_with_password("synthetic-password")
         .with_auth_repository(auth)
-        .with_project_ai_settings(
-            ProjectAiSettingsService::persistent(settings.clone(), &"12".repeat(32)).unwrap(),
-        );
+        .with_project_ai_settings(service);
     let project = state
         .project_repository()
         .create(
@@ -112,6 +126,58 @@ async fn body(response: axum::response::Response) -> Value {
 }
 fn custom() -> Value {
     json!({"expected_revision":0,"mode":"custom","model":"synthetic-model","base_url":"https://models.example.invalid/v1","api_key":"synthetic-key"})
+}
+
+struct DelayedProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelProviderBridge for DelayedProvider {
+    async fn complete(
+        &self,
+        _: &TenantScope,
+        request: &geo_worker::ModelCompletionRequest,
+    ) -> Result<geo_worker::ModelCompletion, geo_worker::HostOpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(request.prompt, "Reply with OK.");
+        assert_eq!(request.max_output_tokens, Some(8));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(geo_worker::ModelCompletion {
+            text: "OK".into(),
+            tool_calls: Vec::new(),
+            model: "synthetic-model".into(),
+            prompt_tokens: 4,
+            completion_tokens: 1,
+            finish_reason: "stop".into(),
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connection_probe_allows_inherited_completion_beyond_twenty_seconds_once() {
+    for usage in ["workbench_content", "observation_analysis"] {
+        let provider = Arc::new(DelayedProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let f = fixture_with_provider(Role::CustomerAdmin, Some(provider.clone())).await;
+        let started = tokio::time::Instant::now();
+        let response = f
+            .app
+            .clone()
+            .oneshot(f.request(
+                "POST",
+                &format!("/{usage}/test"),
+                json!({"expected_revision":0}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, json!({"success":true}));
+        assert!(started.elapsed() >= Duration::from_secs(30));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]

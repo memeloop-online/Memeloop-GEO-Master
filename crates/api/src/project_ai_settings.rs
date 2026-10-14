@@ -471,13 +471,11 @@ async fn test(
         messages: Vec::new(),
         tools: Vec::new(),
     };
-    tokio::time::timeout(
-        Duration::from_secs(20),
-        bridge.complete_for_usage_at_revision(&scope, usage, input.expected_revision, &request),
-    )
-    .await
-    .map_err(|_| api_error(diagnostic_error(), ctx.request_id))?
-    .map_err(|_| api_error(diagnostic_error(), ctx.request_id))?;
+    // The selected provider owns the purpose-specific request deadline.
+    bridge
+        .complete_for_usage_at_revision(&scope, usage, input.expected_revision, &request)
+        .await
+        .map_err(|_| api_error(diagnostic_error(), ctx.request_id))?;
     service
         .check_revision(&scope, usage, input.expected_revision)
         .await
