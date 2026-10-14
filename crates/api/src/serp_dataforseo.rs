@@ -577,6 +577,59 @@ mod tests {
     }
 
     #[test]
+    fn analysis_clock_skew_preserves_structured_rank_coverage_and_source_times() {
+        let source = source();
+        let (measurement, intent) = fixture(&source);
+        for ranks in [vec![1, 3], (1..=10).collect::<Vec<_>>()] {
+            let raw = stored(
+                &source,
+                &measurement,
+                &intent,
+                SerpEvidenceOperation::ResultRead,
+                20000,
+                items(&ranks),
+            );
+            let snapshot = raw.clone();
+            let observation_id = Uuid::new_v4();
+            let decode = |analyzed_at| {
+                let SerpReadOutcome::Observation(observation) = source
+                    .decode_result(
+                        &measurement,
+                        &raw,
+                        &intent,
+                        TASK_ID,
+                        observation_id,
+                        analyzed_at,
+                    )
+                    .unwrap()
+                else {
+                    panic!("observation");
+                };
+                *observation
+            };
+            let baseline = decode(raw.evidence.captured_at);
+            assert_eq!(baseline.results.len(), ranks.len());
+            assert_eq!(
+                baseline.coverage.observed_organic_depth,
+                if ranks.len() == 10 { 10 } else { 1 }
+            );
+            assert_eq!(
+                baseline.provider_observed_at,
+                Some("2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+            );
+            for skew in [-20, 20] {
+                let analyzed_at = raw.evidence.captured_at + chrono::Duration::seconds(skew);
+                let observation = decode(analyzed_at);
+                let mut expected = baseline.clone();
+                expected.analyzed_at = analyzed_at;
+                assert_eq!(observation, expected);
+                assert_eq!(observation.received_at, raw.evidence.captured_at);
+                assert_eq!(raw, snapshot);
+            }
+        }
+    }
+
+    #[test]
     fn full_rank_coverage_keeps_echoes_unknown_and_points_into_exact_saved_bytes() {
         let source = source();
         let (measurement, intent) = fixture(&source);

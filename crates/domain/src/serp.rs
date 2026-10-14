@@ -389,8 +389,9 @@ pub struct SerpObservation {
 }
 
 impl SerpObservation {
-    /// Validate receipt binding, not application/database clock ordering. Persistence
-    /// must load the scoped, already stored raw evidence before appending analysis.
+    /// Validate receipt binding, not ordering between application or database clocks.
+    /// Persistence must load the scoped, already stored raw evidence before appending
+    /// analysis; receipt and analysis may be timestamped by different hosts.
     pub fn validate_source(
         &self,
         measurement: &SerpMeasurement,
@@ -424,7 +425,6 @@ impl SerpObservation {
             || self.measurement_id != measurement.measurement_id
             || !digest(&self.raw_sha256)
             || !label(&self.parser_version, 128)
-            || self.received_at > self.analyzed_at
             || self
                 .provider_observed_at
                 .is_some_and(|at| at > self.received_at)
@@ -1553,18 +1553,25 @@ mod tests {
             value.validate_source(&measurement, &raw).unwrap();
             assert_eq!(value, original);
         }
-        for field in 0..4 {
+        for field in 0..5 {
             let mut mismatched = raw.clone();
             match field {
                 0 => mismatched.evidence.evidence_id = Uuid::new_v4(),
                 1 => mismatched.evidence.measurement_id = Uuid::new_v4(),
                 2 => mismatched.evidence.attempt_id = Uuid::new_v4(),
                 3 => mismatched.evidence.response_sha256 = "b".repeat(64),
+                4 => mismatched.evidence.captured_at += Duration::seconds(1),
                 _ => unreachable!(),
             }
             assert!(value.validate_source(&measurement, &mismatched).is_err());
         }
-        value.analyzed_at = value.received_at - Duration::seconds(1);
+        for skew in [-20, 20] {
+            value.analyzed_at = value.received_at + Duration::seconds(skew);
+            let snapshot = value.clone();
+            value.validate_source(&measurement, &raw).unwrap();
+            assert_eq!(value, snapshot);
+        }
+        value.provider_observed_at = Some(value.received_at + Duration::seconds(1));
         assert!(value.validate_source(&measurement, &raw).is_err());
         value = original;
         raw.evidence.body_complete = false;
