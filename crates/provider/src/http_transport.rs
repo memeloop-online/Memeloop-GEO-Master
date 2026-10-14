@@ -76,7 +76,7 @@ impl Transport for HttpTransport {
                 .json(&request.body)
                 .send()
                 .await
-                .map_err(|_| ProviderError::Transport("HTTP request failed".into()));
+                .map_err(|error| transport_failure(&error, ModelPhase::HttpHeaders));
             headers_phase.finish(response.is_ok());
             let mut response = response?;
             let status = response.status().as_u16();
@@ -92,7 +92,7 @@ impl Transport for HttpTransport {
             while let Some(chunk) = response
                 .chunk()
                 .await
-                .map_err(|_| ProviderError::Transport("HTTP response failed".into()))?
+                .map_err(|error| transport_failure(&error, ModelPhase::FullBody))?
             {
                 if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
                     return Err(response_too_large());
@@ -113,6 +113,25 @@ impl Transport for HttpTransport {
             result = timeout(control.timeout(), send) => result.unwrap_or(Err(ProviderError::Timeout)),
         }
     }
+}
+
+fn transport_failure(error: &reqwest::Error, phase: ModelPhase) -> ProviderError {
+    // reqwest error text and its source chain can contain URLs and credentials.
+    // Only fixed classification flags belong in operational diagnostics.
+    tracing::warn!(
+        phase = ?phase,
+        connect = error.is_connect(),
+        timeout = error.is_timeout(),
+        request = error.is_request(),
+        body = error.is_body(),
+        decode = error.is_decode(),
+        "model HTTP transport failed"
+    );
+    let message = match phase {
+        ModelPhase::FullBody => "HTTP response failed",
+        _ => "HTTP request failed",
+    };
+    ProviderError::Transport(message.into())
 }
 
 fn response_too_large() -> ProviderError {
@@ -340,6 +359,30 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn transport_failure_does_not_expose_request_url() {
+        let (listener, url) = listen().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_headers(&mut stream).await;
+            // Closing before the response is an actual request transport error.
+        });
+        let private_url = format!("{url}?credential=synthetic-private-value");
+        let error = HttpTransport::new()
+            .unwrap()
+            .send(
+                request(private_url),
+                RequestControl::new(Duration::from_secs(5)).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProviderError::Transport("HTTP request failed".into())
+        );
+        server.await.unwrap();
     }
 
     struct TestTokenCenter;
