@@ -21,6 +21,8 @@ pub use browser_operation_reconcile::reconcile_browser_operations;
 mod channel_tools;
 mod channels;
 mod citation_insights;
+mod partner;
+pub use partner::partner_router;
 mod connector_capabilities;
 mod content;
 mod content_distribution_requests;

@@ -1,6 +1,6 @@
 # 内容合作方接入契约
 
-状态：待实现的最小适配设计，不代表合作方 API 已存在、已接入或真实发布已验收。
+状态：文本同步已有未交付的候选实现，其余为适配设计；不代表合作方 API 已接入或真实发布已验收。
 本文件细化冻结产品规格，不修改 `product-plan-v1.md`。网页 AI 测量优先推进，
 合作方接入不成为任意话题测量的前置条件；发布成功也不等于被 AI 收录或引用。
 实际交付与缺口分别记入 `WORKLOG.md`、`TODO.md`。
@@ -105,7 +105,7 @@ AI 工作台发起导入、生成、分发和查询，详情页查看同一来�
 
 ## 6. 拟议 GEO 接口与安全验收
 
-下列路径全部是**待实现的 GEO 接口草案**，不是现有路由或合作方 API 声明：
+下列为 GEO 接口契约，不是合作方 API 声明。前两项已有候选实现，尚待组合 CI 与部署；其余路径待实现：
 
 | 路径 | 职责 |
 |---|---|
@@ -128,3 +128,48 @@ connection_id；有限时钟窗口、key_id 轮换及 `(connection_id,event_id)`
 最低待确认信息：伙伴鉴权/测试环境与限额、稳定企业/资料/版本标识及顺序语义、
 渠道/账号/格式能力、发布幂等与查回/回调协议、公开链接及更新/撤回能力。
 这些信息决定 transport 映射与真实验收，不阻塞上述内部契约和网页测量开发。
+
+## 7. 文本同步候选实现
+
+实现入口为 `crates/domain/src/partner.rs`、`crates/api/src/partner.rs`、
+`crates/persistence/src/partner.rs` 和迁移 `0061_partner_knowledge_sync.sql`。
+目前仅 PostgreSQL 模式装配；管理端连接创建、密钥签发和轮换的 HTTP/UI 入口尚未提供，
+不能直接作为已可自助接入的功能交付。
+
+请求使用 `Authorization: Bearer <key_id>.<secret>`，推送另带
+`Idempotency-Key` 和 `Content-Type: application/json`；凭据不经聊天传递。
+服务身份绑定一个项目，不接受调用方传入 tenant/operator/project 改变作用域。
+请求结构如下，尖括号内容由调用方实际输入计算或替换，不是可直接提交的测试数据：
+
+```json
+{
+  "schema_version": 1,
+  "items": [
+    {
+      "external_source_id": "<来源标识>",
+      "external_version": "<不透明版本标识>",
+      "source_sequence": 1,
+      "effective_at": "<RFC3339 时间>",
+      "action": {
+        "operation": "upsert",
+        "name": "<资料名称>",
+        "purpose": "public",
+        "media_type": "text/plain",
+        "text": "<完整文本>",
+        "content_sha256": "<文本 UTF-8 字节的 SHA-256 小写十六进制>"
+      }
+    }
+  ]
+}
+```
+
+撤销使用同样的外层来源、版本、序号及时间字段，`action` 为
+`{"operation":"revoke"}`。操作标签嵌套于 `action`，不是顶层字段。
+首包仅接收 UTF-8 TXT/Markdown 完整快照，不接收下载 URL 或本地路径。
+公开与内部用途分别为 `public`、`internal`。
+
+202 返回持久 operation 回执，不代表所有项已经完成。调用方用原 operation 查询
+逐项结果，分页参数为 `after_index`、`limit`；失败恢复不新建来源或丢弃前面的成功项。
+重试使用原幂等键及原输入，结果中的资源 ID 指向现有企业知识库。
+接入验收须覆盖受理后立即收紧公开用途、后台停机恢复、序号乱序、旧版重放、
+密钥撤销及跨项目拒绝；候选代码存在不能替代这些实库与上线验证。

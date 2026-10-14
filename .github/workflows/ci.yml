@@ -159,12 +159,15 @@ jobs:
         run: |
           set -o pipefail
           failed=0
-          for suite in postgres reports channels channel_imports proxy_pools browser_operations account_networks operator_login_queue operator_projects standalone_measurements channel_identity successor_cycles channel_dispatcher bootstrap model_routes operator_appearance content content_revision_lookup content_distribution_request rich_content content_reuse content_media content_media_authority media_export_snapshots questions distribution connector_capabilities publication_lookup publication_bindings publication_send_authorization observation_capture observation_analysis observation_extraction observation_completion_recovery provider_conversation_cleanup pdf_parse office_parse import_progress knowledge_text_revisions attachment_bytes; do
+          for suite in postgres reports channels channel_imports proxy_pools browser_operations account_networks operator_login_queue operator_projects standalone_measurements channel_identity successor_cycles channel_dispatcher bootstrap model_routes operator_appearance content content_revision_lookup content_distribution_request rich_content content_reuse content_media content_media_authority media_export_snapshots questions distribution connector_capabilities publication_lookup publication_bindings publication_send_authorization observation_capture observation_analysis observation_extraction observation_completion_recovery provider_conversation_cleanup pdf_parse office_parse import_progress knowledge_text_revisions attachment_bytes partner partner_knowledge; do
             if ! cargo test -p geo-persistence --test "$suite" -- --ignored 2>&1 | tee "logs/cargo-${suite}-postgres.log"; then
               failed=1
             fi
           done
           if ! cargo test -p geo-persistence --lib content_validation_holds_object_and_binding_until_caller_commits -- --ignored 2>&1 | tee "logs/cargo-media-lock-postgres.log"; then
+            failed=1
+          fi
+          if ! cargo test -p geo-persistence --lib caller_rollback_removes_all_partner_knowledge_writes -- --ignored 2>&1 | tee "logs/cargo-partner-rollback-postgres.log"; then
             failed=1
           fi
           if ! cargo test -p geo-api --test content_media_tools -- --ignored 2>&1 | tee "logs/cargo-media-tools-postgres.log"; then
