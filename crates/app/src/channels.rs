@@ -94,9 +94,13 @@ fn callbacks_with_credentials(
         ),
         geo_api::ProjectConfiguredModelBridge::new(settings.clone(), inherited)?,
     );
-    if let Some(analysis) = state.observation_analysis_service() {
+    let state = if let Some(analysis) = state.observation_analysis_service().cloned() {
+        let analysis = analysis.with_extraction_dispatcher(&extraction);
         extraction = extraction.with_continuation(std::sync::Arc::new(analysis.clone()));
-    }
+        state.with_observation_analysis(analysis)
+    } else {
+        state
+    };
     let _extraction_dispatcher =
         geo_api::spawn_observation_extraction_dispatcher(extraction.clone());
     // Deployment-only cutover switch, never a per-user approval. Enable only

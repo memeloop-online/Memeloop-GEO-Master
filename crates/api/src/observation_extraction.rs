@@ -97,6 +97,10 @@ pub struct ObservationExtractionService {
 }
 
 impl ObservationExtractionService {
+    pub(crate) fn wake_handle(&self) -> Arc<Notify> {
+        self.wake.clone()
+    }
+
     pub fn new(
         repository: Arc<dyn ObservationExtractionRepository>,
         captures: Arc<dyn ObservationCaptureRepository>,

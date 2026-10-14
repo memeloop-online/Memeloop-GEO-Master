@@ -185,6 +185,7 @@ impl SavedObservationGrounder for HttpSavedObservationGrounder {
 pub struct ObservationAnalysisService {
     repository: Arc<dyn ObservationAnalysisRepository>,
     extraction_repository: Option<Arc<dyn ObservationExtractionRepository>>,
+    extraction_wake: Option<Arc<tokio::sync::Notify>>,
     jobs: Arc<dyn ChannelJobRepository>,
     captures: Arc<dyn ObservationCaptureRepository>,
     #[cfg(test)]
@@ -220,6 +221,7 @@ impl ObservationAnalysisService {
         Self {
             repository,
             extraction_repository: None,
+            extraction_wake: None,
             jobs,
             captures,
             #[cfg(test)]
@@ -233,6 +235,16 @@ impl ObservationAnalysisService {
         repository: Arc<dyn ObservationExtractionRepository>,
     ) -> Self {
         self.extraction_repository = Some(repository);
+        self
+    }
+
+    /// Wake the existing dispatcher after durable admission. The periodic scan
+    /// remains the recovery path if this process exits before notification.
+    pub fn with_extraction_dispatcher(
+        mut self,
+        dispatcher: &crate::ObservationExtractionService,
+    ) -> Self {
+        self.extraction_wake = Some(dispatcher.wake_handle());
         self
     }
 
@@ -489,12 +501,18 @@ impl ObservationAnalysisService {
             ))
             .map_err(|_| AppError::invalid_request("invalid analysis request"))?,
         );
-        self.extraction_repository
+        let admission = self
+            .extraction_repository
             .as_ref()
             .ok_or_else(|| AppError::capability_missing("durable analysis unavailable"))?
             .admit_manual(scope, &input.idempotency_key, &digest, request, Utc::now())
-            .await
-            .map(|admission| admission.revision)
+            .await?;
+        if admission.intent.is_some()
+            && let Some(wake) = &self.extraction_wake
+        {
+            wake.notify_one();
+        }
+        Ok(admission.revision)
     }
 
     pub(crate) async fn manual_source(
@@ -2836,6 +2854,81 @@ mod tests {
         calls: AtomicUsize,
         started: tokio::sync::Notify,
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_admission_wakes_existing_dispatcher_after_persistence() {
+        let mut f = fixture(false, true, false).await;
+        let repository = f.service.extraction_repository.as_ref().unwrap().clone();
+        let dispatcher = crate::ObservationExtractionService::new(
+            repository.clone(),
+            f.service.captures.clone(),
+            f.service.model.clone(),
+        );
+        let wake = dispatcher.wake_handle();
+        f.service = f.service.with_extraction_dispatcher(&dispatcher);
+        let input = || AnalyzeSavedSource {
+            idempotency_key: "wake-durable-manual".into(),
+            capture_id: None,
+        };
+        let queued = f
+            .service
+            .submit(&f.scope, f.target_id, f.attempt_id, input())
+            .await
+            .unwrap();
+        // No worker has started; this permit comes from admission, not a scan.
+        tokio::time::timeout(Duration::from_millis(1), wake.notified())
+            .await
+            .unwrap();
+        let ready = repository.scan_ready(Utc::now(), None, 100).await.unwrap();
+        assert_eq!(ready.len(), 1);
+        let intent = repository
+            .get(&f.scope, ready[0].intent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent.request.manual_revision_id,
+            Some(queued.request.revision_id)
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+        let replay = f
+            .service
+            .submit(&f.scope, f.target_id, f.attempt_id, input())
+            .await
+            .unwrap();
+        assert_eq!(replay, queued);
+        tokio::time::timeout(Duration::from_millis(1), wake.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .scan_ready(Utc::now(), None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            f.service
+                .submit(
+                    &f.scope,
+                    f.target_id,
+                    f.attempt_id,
+                    AnalyzeSavedSource {
+                        idempotency_key: format!("{AUTOMATIC_KEY_PREFIX}reserved"),
+                        capture_id: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), wake.notified())
+                .await
+                .is_err()
+        );
+    }
+
     #[async_trait::async_trait]
     impl ModelProviderBridge for SlowModel {
         async fn complete(
