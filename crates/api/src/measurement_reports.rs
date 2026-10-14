@@ -11,7 +11,8 @@ use geo_domain::{
     AppError, ChannelOutcomeStatus, ChannelTargetInput, MeasurementPeriodPreview,
     MeasurementPeriodReport, MeasurementPeriodSample, MeasurementPeriodSearchSample,
     MeasurementPeriodWindow, ProjectId, TenantScope, build_measurement_period_search_sample,
-    effective_observation, freeze_measurement_period, preview_measurement_period_with_search,
+    effective_observation, freeze_measurement_period, preview_measurement_period_at_cutoff,
+    preview_measurement_period_with_search,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -93,14 +94,33 @@ pub async fn save_project_measurement_report(
     request: MeasurementPeriodRequest,
     now: DateTime<Utc>,
 ) -> Result<MeasurementPeriodReport, AppError> {
-    ensure_project(state, scope).await?;
-    let now = microseconds(now);
+    save_project_measurement_report_at_cutoff(state, scope, request, now, now).await
+}
+
+/// Trusted Rust callers may freeze evidence before the actual generation time.
+/// This is not an HTTP or P00 scheduling input; both public entry points retain
+/// the equal-clock manual-save behavior above.
+pub async fn save_project_measurement_report_at_cutoff(
+    state: &AppState,
+    scope: &TenantScope,
+    request: MeasurementPeriodRequest,
+    evidence_as_of: DateTime<Utc>,
+    generated_at: DateTime<Utc>,
+) -> Result<MeasurementPeriodReport, AppError> {
+    let evidence_as_of = microseconds(evidence_as_of);
+    let generated_at = microseconds(generated_at);
     let window = MeasurementPeriodWindow {
         start_at: microseconds(request.start_at),
         end_at: microseconds(request.end_at),
         report_timezone: request.report_timezone,
     };
-    window.validate(now)?;
+    window.validate(evidence_as_of)?;
+    if evidence_as_of > generated_at {
+        return Err(AppError::invalid_request(
+            "measurement report evidence cutoff exceeds generation time",
+        ));
+    }
+    ensure_project(state, scope).await?;
     let repository = state.report_repository();
     let rows = repository.list_measurement_periods(scope).await?;
     let matching: Vec<_> = rows.iter().filter(|row| row.window() == window).collect();
@@ -127,9 +147,11 @@ pub async fn save_project_measurement_report(
         }
         None
     };
-    let samples = collect_samples(state, scope, &window, now, parent).await?;
-    let search = collect_search_samples(state, scope, &window, now, parent).await?;
-    let preview = preview_measurement_period_with_search(scope, &window, samples, search, now)?;
+    let samples = collect_samples(state, scope, &window, evidence_as_of, parent).await?;
+    let search = collect_search_samples(state, scope, &window, evidence_as_of, parent).await?;
+    let preview = preview_measurement_period_at_cutoff(
+        scope, &window, samples, search, evidence_as_of, generated_at,
+    )?;
     let report = freeze_measurement_period(
         scope,
         preview,
