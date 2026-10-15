@@ -1,15 +1,41 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useNavigate } from "react-router-dom";
 import { AppRoutes } from "./app";
 import { AuthProvider } from "./auth/AuthProvider";
 import { useAuth } from "./auth/AuthProvider";
 import type { AuthSession } from "./auth/types";
 import { apiFetch, setCsrfToken, setUnauthorizedHandler } from "./api/client";
 import { projectQueryKeys } from "./api/projects";
+const reportsModule = vi.hoisted(() => {
+  let resolve!: () => void;
+  const ready = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { requested: vi.fn(), ready, resolve };
+});
+vi.mock("./pages/ReportsPage", async () => {
+  reportsModule.requested();
+  await reportsModule.ready;
+  return { ReportsPage: () => <h1>报告详情</h1> };
+});
+function ReportsNavigation() {
+  const navigate = useNavigate();
+  return (
+    <button onClick={() => navigate("/app/tenant-a/project-a/reports")}>
+      打开报告详情
+    </button>
+  );
+}
 
 const session: AuthSession = {
   user: {
@@ -75,6 +101,17 @@ afterEach(() => {
 });
 
 describe("authentication and workspace guards", () => {
+  it("opens anonymous report deep links without downloading the protected page", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(response({ message: "anonymous" }, 401)),
+    );
+    renderApp("/app/tenant-a/project-a/reports");
+    expect(
+      await screen.findByRole("heading", { name: "登录工作区" }),
+    ).toBeInTheDocument();
+    expect(reportsModule.requested).not.toHaveBeenCalled();
+  });
   it("restores a persistent session with no server expiry after remount", async () => {
     const fetchMock = vi
       .fn()
@@ -311,6 +348,57 @@ describe("authentication and workspace guards", () => {
           init?.method === "DELETE",
       ),
     ).toBe(true);
+  });
+});
+
+describe("lazy project navigation", () => {
+  it("keeps the shell and its state visible while a child page downloads", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((request: RequestInfo | URL) =>
+        Promise.resolve(
+          response(
+            String(request).endsWith("/auth/session")
+              ? session
+              : { items: [], next_cursor: null },
+          ),
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    render(
+      <FluentProvider theme={webLightTheme}>
+        <QueryClientProvider
+          client={
+            new QueryClient({ defaultOptions: { queries: { retry: false } } })
+          }
+        >
+          <AuthProvider>
+            <MemoryRouter
+              initialEntries={["/app/tenant-a/project-a/knowledge"]}
+            >
+              <ReportsNavigation />
+              <AppRoutes />
+            </MemoryRouter>
+          </AuthProvider>
+        </QueryClientProvider>
+      </FluentProvider>,
+    );
+    await screen.findByRole("heading", { name: "企业知识库" });
+    const sidebar = screen.getByRole("complementary", { name: "主导航" });
+    await user.click(screen.getByRole("button", { name: "折叠导航栏" }));
+    await user.click(screen.getByRole("button", { name: "打开报告详情" }));
+    await waitFor(() => expect(reportsModule.requested).toHaveBeenCalledOnce());
+    expect(screen.getByRole("complementary", { name: "主导航" })).toBe(sidebar);
+    expect(sidebar).toBeVisible();
+    expect(screen.getByRole("button", { name: "展开导航栏" })).toBeVisible();
+    expect(screen.getByText("正在加载")).toBeVisible();
+    await act(async () => reportsModule.resolve());
+    expect(
+      await screen.findByRole("heading", { name: "报告详情" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "主导航" })).toBe(sidebar);
+    expect(screen.getByRole("button", { name: "展开导航栏" })).toBeVisible();
   });
 });
 
