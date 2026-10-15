@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   isDeepSeekHistoryExplicitlyAbsent,
   verifyDeepSeekFirstTurnHistory,
+  verifyDeepSeekEmptyHistory,
 } from "../src/deepseek-history-evidence.mjs";
 
 const expected = {
@@ -60,6 +61,57 @@ const verify = (value, binding = expected) =>
   verifyDeepSeekFirstTurnHistory(envelope(value), binding);
 const history = (value) => value.data.biz_data;
 const messages = (value) => history(value).chat_messages;
+
+test("empty inventory requires exact complete history and proves no first-turn completion", () => {
+  const value = fixture();
+  history(value).chat_messages = [];
+  history(value).chat_session.current_message_id = null;
+  assert.deepEqual(
+    verifyDeepSeekEmptyHistory(envelope(value), expected.conversationId),
+    {
+      conversationId: expected.conversationId,
+      messages: [],
+    },
+  );
+  assert.equal(verify(value), null);
+  for (const mutate of [
+    (v) => {
+      v.code = 1;
+    },
+    (v) => {
+      v.data.biz_code = 1;
+    },
+    (v) => {
+      history(v).chat_session.id = "other-session";
+    },
+    (v) => {
+      delete history(v).chat_session.current_message_id;
+    },
+    (v) => {
+      history(v).chat_session.current_message_id = 0;
+    },
+    (v) => {
+      history(v).cache_control = "APPEND";
+    },
+    (v) => {
+      history(v).chat_messages = [messages(fixture())[0]];
+    },
+  ]) {
+    const invalid = structuredClone(value);
+    mutate(invalid);
+    assert.equal(
+      verifyDeepSeekEmptyHistory(envelope(invalid), expected.conversationId),
+      null,
+    );
+  }
+  assert.equal(
+    verifyDeepSeekEmptyHistory(
+      { ...envelope(value), status: 404 },
+      expected.conversationId,
+    ),
+    null,
+  );
+});
 
 test("returns only canonical first-turn inventory, independent of response order", () => {
   const value = fixture();

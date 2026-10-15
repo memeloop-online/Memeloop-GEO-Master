@@ -32,6 +32,7 @@ import {
   getCurrentCycle,
   submitChannelPlan,
   type ChannelPlan,
+  type ChannelOutcome,
   type ChannelTarget,
   type ChannelTargetView,
   type MeasurementRequest,
@@ -78,6 +79,12 @@ const statusLabels: Record<string, string> = {
 function resultStatus(view?: ChannelTargetView) {
   const last = view?.attempts.at(-1);
   return last?.outcome?.status ?? (last ? "in_flight" : "planned");
+}
+
+function providerUnavailable(outcome?: ChannelOutcome | null) {
+  return (
+    outcome?.status === "unknown" && outcome.detail === "provider_unavailable"
+  );
 }
 
 function errorText(error: unknown) {
@@ -156,6 +163,13 @@ export function TargetCard({
           : "自定义问题（不进入优化）"
       : null;
   const status = resultStatus(view);
+  const latestOutcome = view?.attempts.at(-1)?.outcome;
+  const unknownDetail = (outcome?: ChannelOutcome | null) =>
+    t(
+      providerUnavailable(outcome)
+        ? "automaticProviderUnavailableDetail"
+        : "automaticUnknownDetail",
+    );
   const attempted = Boolean(view?.attempts.length);
   const automaticLabel = hasSavedAnswer
     ? t("resultAnswerAvailable")
@@ -167,7 +181,9 @@ export function TargetCard({
           ? t("automaticQueued")
           : status === "in_flight"
             ? t("automaticInFlight")
-            : t(`automaticOutcome.${status}`, { defaultValue: status });
+            : providerUnavailable(latestOutcome)
+              ? t("automaticProviderUnavailable")
+              : t(`automaticOutcome.${status}`, { defaultValue: status });
   if (automatic && input.kind === "measure") {
     const measurementDate = (value?: string | null) =>
       value
@@ -223,9 +239,12 @@ export function TargetCard({
                 outcome.fixture && outcome.status === "observed" ? (
                   t("resultFixture")
                 ) : (
-                  t(`automaticOutcome.${outcome.status}`, {
-                    defaultValue: outcome.status,
-                  })
+                  t(
+                    providerUnavailable(outcome)
+                      ? "automaticProviderUnavailable"
+                      : `automaticOutcome.${outcome.status}`,
+                    { defaultValue: outcome.status },
+                  )
                 )
               ) : (
                 <span>{t("automaticInFlightDetail")}</span>
@@ -256,7 +275,7 @@ export function TargetCard({
                     <summary>{t("resultExecutionHistory")}</summary>
                     {receipt}
                     {outcome?.status === "unknown" && (
-                      <p>{t("automaticUnknownDetail")}</p>
+                      <p>{unknownDetail(outcome)}</p>
                     )}
                   </details>
                 </>
@@ -303,7 +322,7 @@ export function TargetCard({
           );
         })}
         {attempted && status === "unknown" && !hasSavedAnswer && (
-          <p role="status">{t("automaticUnknownDetail")}</p>
+          <p role="status">{unknownDetail(latestOutcome)}</p>
         )}
         <details
           onToggle={(event) =>
@@ -389,7 +408,10 @@ export function TargetCard({
                   : (statusLabels[attempt.outcome.status] ??
                     attempt.outcome.status)}
                 {" · "}
-                {attempt.outcome.detail ?? "无详细说明"}
+                {input.kind === "measure" &&
+                providerUnavailable(attempt.outcome)
+                  ? unknownDetail(attempt.outcome)
+                  : (attempt.outcome.detail ?? "无详细说明")}
               </p>
               <p>
                 {input.kind === "measure"

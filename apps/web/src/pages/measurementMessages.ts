@@ -62,6 +62,8 @@ const zh = {
   automaticInFlight: "执行中或等待结果",
   automaticInFlightDetail: "正在等待测量结果。",
   automaticUnknownDetail: "未能确认本次测量结果。",
+  automaticProviderUnavailable: "平台暂时无法回答",
+  automaticProviderUnavailableDetail: "平台暂时无法回答，请稍后再试。",
   automaticUnverifiedResult: "结果尚未验证",
   automaticReadError: "测量记录无法读取",
   resultAccount: "账号 {{value}}",
@@ -161,6 +163,9 @@ const en = {
   automaticInFlight: "Running or awaiting a result",
   automaticInFlightDetail: "Waiting for a measurement result.",
   automaticUnknownDetail: "This measurement result could not be confirmed.",
+  automaticProviderUnavailable: "Platform temporarily unavailable",
+  automaticProviderUnavailableDetail:
+    "The platform could not answer at this time. Please try again later.",
   automaticUnverifiedResult: "Result not verified",
   automaticReadError: "Unable to load measurement record",
   resultAccount: "Account {{value}}",

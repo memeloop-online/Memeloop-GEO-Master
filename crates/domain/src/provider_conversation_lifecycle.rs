@@ -471,6 +471,55 @@ pub(crate) fn deepseek_recovery_binding(source: &Value) -> Option<(&str, u64, u6
     Some((chat_id, request_id, response_id))
 }
 
+/// Cleanup-only proof for a first turn explicitly cleared by the provider.
+/// Fresh empty history cannot turn a failed response into answer completion.
+pub(crate) fn deepseek_failed_empty_inventory(
+    source: &Value,
+    history: &Value,
+) -> Option<MessageInventory<'static>> {
+    let (chat_id, _, _) = deepseek_recovery_binding(source)?;
+    let messages = source["messages"].as_array()?;
+    if messages.len() != 3
+        || messages[0]["event"] != "ready"
+        || messages[1]["event"] != "hint"
+        || messages[1]["data"]["type"] != "error"
+        || messages[1]["data"]["finish_reason"] != "backend_err"
+        || messages[1]["data"]["clear_response"] != true
+        || messages[2]["event"] != "close"
+        || source["capture_status"]["transport"] != "complete"
+        || source["capture_status"]["termination"] != "complete"
+        || !closed_fields(
+            history,
+            &[
+                "source",
+                "observed_at",
+                "cache_request",
+                "cache_control",
+                "chat_session_id",
+                "messages",
+                "current_message_id",
+            ],
+            &[],
+        )
+        || history["source"] != "browser_observed_history"
+        || history["chat_session_id"] != chat_id
+        || history["cache_control"] != "REPLACE"
+        || !history["current_message_id"].is_null()
+        || !history["messages"].as_array().is_some_and(Vec::is_empty)
+        || !closed_fields(
+            &history["cache_request"],
+            &["cache_version", "cache_reset_at"],
+            &[],
+        )
+        || !history["cache_request"]["cache_version"].is_null()
+        || !history["cache_request"]["cache_reset_at"].is_null()
+    {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(history["observed_at"].as_str()?).ok()?;
+    Some(vec![])
+}
+
 fn deepseek_completion_inventory<'a>(
     document: &'a Value,
     chat_id: &str,

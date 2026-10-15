@@ -42,6 +42,9 @@ struct Stub {
     complete_entered: Arc<tokio::sync::Notify>,
     complete_continue: Arc<tokio::sync::Notify>,
     close_stalled: Arc<AtomicBool>,
+    close_paused: Arc<AtomicBool>,
+    close_entered: Arc<tokio::sync::Notify>,
+    close_continue: Arc<tokio::sync::Notify>,
     close_failed: Arc<AtomicBool>,
     close_absent: Arc<AtomicBool>,
     close_wrong_generation: Arc<AtomicBool>,
@@ -130,6 +133,10 @@ async fn close(
     assert_eq!(input["expected_generation"], GENERATION);
     stub.closed.fetch_add(1, Ordering::SeqCst);
     stub.closed_ids.lock().await.push(session_id);
+    stub.close_entered.notify_one();
+    if stub.close_paused.load(Ordering::SeqCst) {
+        stub.close_continue.notified().await;
+    }
     if stub.close_stalled.load(Ordering::SeqCst) {
         std::future::pending::<()>().await;
     }
@@ -721,6 +728,81 @@ async fn concurrent_discovery_cannot_open_a_second_context_for_the_account() {
     first.await.unwrap().unwrap();
     reserve(&state, &scope, account_id).await.unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn cancelled_discovery_caller_keeps_cleanup_and_gate_until_confirmed_disposal() {
+    for cancel_during_close in [false, true] {
+        let stub = Stub::default();
+        stub.complete_paused
+            .store(!cancel_during_close, Ordering::SeqCst);
+        stub.close_paused.store(true, Ordering::SeqCst);
+        let (state, scope, account_id, server) = boundary_fixture(&stub).await;
+        let caller_state = state.clone();
+        let caller_scope = scope.clone();
+        let caller =
+            tokio::spawn(async move { discover(&caller_state, &caller_scope, account_id).await });
+        let entered = if cancel_during_close {
+            &stub.close_entered
+        } else {
+            &stub.complete_entered
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        if !cancel_during_close {
+            assert_eq!(stub.closed.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                reserve(&state, &scope, account_id).await.unwrap_err().code,
+                ErrorCode::Conflict
+            );
+            stub.complete_continue.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stub.close_entered.notified(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let session_id = stub.started_ids.lock().await[0];
+        let operation_scope = crate::browser_operations::execution_scope(&scope, session_id);
+        let repository = state.channel_job_repository();
+        let operation = repository
+            .get_browser_operation(&operation_scope, session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.state, geo_domain::BrowserOperationState::Closing);
+        assert_eq!(
+            reserve(&state, &scope, account_id).await.unwrap_err().code,
+            ErrorCode::Conflict,
+            "a disposal request alone cannot release the account"
+        );
+        stub.close_continue.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let operation = repository
+                    .get_browser_operation(&operation_scope, session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if operation.state == geo_domain::BrowserOperationState::Disposed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("caller cancellation must not skip disposal confirmation");
+        assert_eq!(stub.options_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.closed.load(Ordering::SeqCst), 1);
+        reserve(&state, &scope, account_id).await.unwrap();
+        server.abort();
+    }
 }
 
 #[tokio::test]

@@ -17,6 +17,9 @@ const providers = Object.freeze({
     read: (page, input, options) =>
       readDeepSeekFirstTurnHistory(page, {
         ...options,
+        // The ledger separately validates terminal error ownership before
+        // using an empty inventory; this never certifies answer completion.
+        allowEmptyHistory: true,
         conversationId: input.external_conversation_id,
         requestMessageId: input.request_message_id,
         responseMessageId: input.response_message_id,

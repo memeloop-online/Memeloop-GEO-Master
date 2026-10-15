@@ -8,6 +8,7 @@ import {
   projectDeepSeekCleanupHistory,
 } from "../src/deepseek-web-history.mjs";
 import { validDeepSeekLifecycle } from "../src/deepseek-conversation-evidence.mjs";
+import { providerCompletionRecoveryAdapter } from "../src/provider-completion-recovery.mjs";
 
 const ORIGIN = "https://chat.deepseek.com";
 const expected = {
@@ -171,6 +172,42 @@ test("absent optional current message remains absent rather than fabricated", as
   const { page } = await synthetic(t, { body: JSON.stringify(body) });
   const answer = await readDeepSeekFirstTurnHistory(page, expected);
   assert.equal(Object.hasOwn(answer.history, "current_message_id"), false);
+});
+
+test("empty history is available to recovery and cleanup without certifying a completed answer", async (t) => {
+  const body = fixture();
+  body.data.biz_data.chat_messages = [];
+  body.data.biz_data.chat_session.current_message_id = null;
+  const { page, requests } = await synthetic(t, { body: JSON.stringify(body) });
+  assert.equal(await readDeepSeekFirstTurnHistory(page, expected), null);
+  const recovered = await providerCompletionRecoveryAdapter("deepseek").read(
+    page,
+    {
+      external_conversation_id: expected.conversationId,
+      request_message_id: "1",
+      response_message_id: "2",
+    },
+    {},
+  );
+  assert.deepEqual(recovered.inventory, {
+    conversationId: expected.conversationId,
+    messages: [],
+  });
+  assert.deepEqual(recovered.history.messages, []);
+  assert.equal(recovered.history.current_message_id, null);
+  assert.deepEqual(
+    await readDeepSeekCleanupHistory(page, {
+      conversationId: expected.conversationId,
+    }),
+    {
+      status: "verified",
+      inventory: { conversationId: expected.conversationId, messages: [] },
+    },
+  );
+  assert.equal(
+    requests.every((request) => request.method() === "GET"),
+    true,
+  );
 });
 
 test("missing, malformed, blank and wrong-version auth never issue a request", async (t) => {
