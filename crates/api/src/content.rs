@@ -2149,9 +2149,8 @@ mod tests {
     use geo_domain::{
         ChunkLocator, ContentKnowledgeGuard, ContentProjectGuard, CurrentKnowledgeRelease,
         DocumentManifestPlanRequest, DocumentScope, Fact, ImportAcceptance, ImportBatchAcceptance,
-        ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgeAskResult,
-        KnowledgeCapability, KnowledgeOverview, KnowledgeRelease, KnowledgeSearchRequest,
-        KnowledgeSearchResult, MemoryContentRepository, MemoryKnowledgeRepository,
+        ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgeCapability,
+        KnowledgeOverview, KnowledgeRelease, MemoryContentRepository, MemoryKnowledgeRepository,
         MemoryProjectRepository, Product, Project, ProjectCreate, ProjectPatch, ProjectSettings,
         ProjectStartCommand, Source, SourceDetail, SourceKind, SourceVersion, StoredObject,
         UpdateProject, UploadSession, UploadSessionCommand, hash_idempotency_key, settings_hash,
@@ -2506,20 +2505,6 @@ mod tests {
             self.inner
                 .plan_document_manifest(scope, request, document_scope)
                 .await
-        }
-        async fn search(
-            &self,
-            scope: &TenantScope,
-            request: KnowledgeSearchRequest,
-        ) -> Result<KnowledgeSearchResult, AppError> {
-            self.inner.search(scope, request).await
-        }
-        async fn ask(
-            &self,
-            scope: &TenantScope,
-            request: KnowledgeSearchRequest,
-        ) -> Result<KnowledgeAskResult, AppError> {
-            self.inner.ask(scope, request).await
         }
         async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError> {
             self.inner.overview(scope).await
@@ -3046,22 +3031,6 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&original.text).unwrap()["values"][0],
             value
         );
-        let search = knowledge
-            .search(
-                &scope,
-                KnowledgeSearchRequest {
-                    query: "001.00 元".into(),
-                    purpose: KnowledgePurpose::Public,
-                    limit: 50,
-                    knowledge_release_id: Some(release.knowledge_release_id),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(search.evidence.len(), 1);
-        assert_eq!(search.evidence[0].chunk_id, original.chunk_id);
-        assert_eq!(search.evidence[0].text, original.text);
-
         let manifest = knowledge
             .plan_document_manifest(
                 &scope,

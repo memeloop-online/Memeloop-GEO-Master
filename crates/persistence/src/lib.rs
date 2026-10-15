@@ -49,8 +49,8 @@ pub use publication_lookup::{PgPublicationLookupRepository, PublicationLookupDis
 mod publication_send_authorization;
 pub use publication_send_authorization::PgPublicationSendAuthorizationRepository;
 mod questions;
-pub use questions::PgQuestionRepository;
 pub use geo_domain::MeasurementWeeklySchedule;
+pub use questions::PgQuestionRepository;
 mod scope;
 
 pub use agent::{PgAgentRepository, QueuedAgentRun};

@@ -2555,20 +2555,6 @@ fn chunk_from_row(
         confidence: row.get("confidence"),
     })
 }
-fn evidence_from_row(row: &sqlx::postgres::PgRow) -> Result<AppError> {
-    let text: String = row.get("text");
-    Ok(KnowledgeEvidence {
-        source_id: row.get("evidence_source_id"),
-        source_version_id: row.get("source_version_id"),
-        chunk_id: row.get("chunk_id"),
-        source_name: row.get("evidence_source_name"),
-        purpose: parse_purpose(&row.get::<String, _>("evidence_purpose"))?,
-        locator: serde_json::from_value(row.get::<Value, _>("locator"))
-            .map_err(serialization_error)?,
-        quote: text.clone(),
-        text,
-    })
-}
 fn job_from_row(
     row: &sqlx::postgres::PgRow,
     scope: &TenantScope,

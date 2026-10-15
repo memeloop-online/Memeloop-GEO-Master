@@ -5,9 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use geo_worker::{
     HostBridge, HostOp, HostOpBudgets, HostOpError, HostOpErrorCode, HostOpLimits, HostOps,
-    KnowledgeSearchRequest, KnowledgeSearchResult, ManifestPage, ManifestReadRequest,
-    MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
-    PublishRequest, PublishState, TenantScope, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder,
+    ManifestPage, ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion,
+    ModelCompletionRequest, PublishReceipt, PublishRequest, PublishState, TenantScope,
+    ToolCallIdentity, ToolCallOutcome, ToolCallRecorder,
 };
 use uuid::Uuid;
 
@@ -19,13 +19,6 @@ impl HostOps for NoCapabilities {
         _: &TenantScope,
         _: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
-        unreachable!()
-    }
-    async fn knowledge_search(
-        &self,
-        _: &TenantScope,
-        _: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
         unreachable!()
     }
     async fn manifest_read(

@@ -9,10 +9,9 @@ use axum::{
 use geo_domain::{
     AppError, CurrentKnowledgeRelease, DocumentManifest, DocumentManifestPlanRequest,
     ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, InitialSourceKind,
-    KnowledgeCapability, KnowledgeImportProgress, KnowledgePurpose,
-    MAX_UPLOAD_BYTES, Product, ProjectId,
-    ReviseSourceTextCommand, Source, SourceDetail, SourceTextRevisionReceipt, SourceVersion,
-    SourceVersionContent, TenantScope, UploadSession, UploadSessionCommand,
+    KnowledgeCapability, KnowledgeImportProgress, KnowledgePurpose, MAX_UPLOAD_BYTES, Product,
+    ProjectId, ReviseSourceTextCommand, Source, SourceDetail, SourceTextRevisionReceipt,
+    SourceVersion, SourceVersionContent, TenantScope, UploadSession, UploadSessionCommand,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;

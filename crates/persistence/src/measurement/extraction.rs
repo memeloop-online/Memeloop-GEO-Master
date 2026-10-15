@@ -231,10 +231,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
                 .bind(intent.intent_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
                 .bind(intent.request.source_capture_id).bind(intent.request.source_evidence_index.map(i64::from)).bind(intent.request.manual_revision_id)
                 .bind(&intent.intent_key).bind(created_at).bind(value(&intent)?).execute(&mut *tx).await.map_err(db)?;
-            ManualExtractionAdmission {
-                revision,
-                intent,
-            }
+            ManualExtractionAdmission { revision, intent }
         } else {
             let row = sqlx::query("SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND idempotency_key_hash=$4")
                 .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(key_hash)

@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use geo_domain::{
-    AttachmentId, AttachmentReference, KnowledgeSearchRequest, KnowledgeSearchResult,
-    MediaObjectKey, RunId, StructuredDocument, TenantScope, ToolCallIdentity, ToolCallOutcome,
+    AttachmentId, AttachmentReference, MediaObjectKey, RunId, StructuredDocument, TenantScope,
+    ToolCallIdentity, ToolCallOutcome,
 };
 use geo_worker::{
     ContentDocumentReadRequest, ContentDocumentSnapshot, ContentMediaBindRequest,
@@ -75,17 +75,6 @@ impl HostOps for FakeOps {
     ) -> Result<ModelCompletion, HostOpError> {
         Err(HostOpError::capability_missing(
             HostOp::ModelComplete,
-            "not configured",
-        ))
-    }
-
-    async fn knowledge_search(
-        &self,
-        _: &TenantScope,
-        _: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
-        Err(HostOpError::capability_missing(
-            HostOp::KnowledgeSearch,
             "not configured",
         ))
     }

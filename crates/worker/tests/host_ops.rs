@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use geo_domain::{
-    AttachmentId, AttachmentReference, ChunkLocator, ImportStatus, KnowledgeEvidence,
-    KnowledgeImportProgress, KnowledgeSearchRequest, KnowledgeSearchResult, ReportPreview,
+    AttachmentId, AttachmentReference, ImportStatus, KnowledgeImportProgress, ReportPreview,
     TenantScope,
 };
 use geo_worker::{
@@ -238,38 +237,6 @@ impl HostOps for FakeHostOps {
                 completion_tokens: 7,
                 finish_reason: "stop".to_owned(),
                 tool_calls: Vec::new(),
-            },
-        )
-        .await
-    }
-
-    async fn knowledge_search(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
-        let evidence = KnowledgeEvidence {
-            source_id: uuid::Uuid::new_v4(),
-            source_version_id: uuid::Uuid::new_v4(),
-            chunk_id: uuid::Uuid::new_v4(),
-            source_name: "warranty-policy.md".to_owned(),
-            purpose: request.purpose,
-            locator: ChunkLocator::Text {
-                start_line: 1,
-                end_line: 3,
-                start_char: 0,
-                end_char: 64,
-            },
-            text: "the warranty runs for twenty-four months".to_owned(),
-            quote: "twenty-four months".to_owned(),
-        };
-        self.answer(
-            HostOp::KnowledgeSearch,
-            scope,
-            KnowledgeSearchResult {
-                knowledge_release_id: Some(uuid::Uuid::new_v4()),
-                evidence: vec![evidence],
-                capability_missing: None,
             },
         )
         .await
@@ -654,7 +621,7 @@ async fn the_reference_bundle_declares_the_surface_it_expects() {
         .expect("capabilities must be a list");
     for capability in [
         "modelComplete",
-        "knowledgeSearch",
+        "knowledgeImportStatus",
         "manifestRead",
         "publishSubmit",
         "measureSample",
@@ -910,13 +877,6 @@ async fn import_status_returns_scoped_queued_state_but_missing_adapter_fails_clo
         ) -> Result<ModelCompletion, HostOpError> {
             unreachable!()
         }
-        async fn knowledge_search(
-            &self,
-            _: &TenantScope,
-            _: KnowledgeSearchRequest,
-        ) -> Result<KnowledgeSearchResult, HostOpError> {
-            unreachable!()
-        }
         async fn manifest_read(
             &self,
             _: &TenantScope,
@@ -1015,61 +975,6 @@ async fn model_completion_delegates_to_the_rust_bridge() {
     assert_eq!(value["finish_reason"], "stop");
     assert_eq!(ops.seen(), vec![HostOp::ModelComplete]);
     assert_eq!(runtime.op_calls(HostOp::ModelComplete), 1);
-}
-
-#[tokio::test]
-async fn knowledge_search_returns_evidence() {
-    let ops = Arc::new(FakeHostOps::new());
-    let mut runtime = runtime(
-        r#"
-        import { hostOps, attempt } from "./host-ops.js";
-        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty", limit: 3 }));
-        "#,
-        bridge(Arc::clone(&ops)),
-    );
-    runtime
-        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
-        .await
-        .expect("the scenario must evaluate");
-
-    let value = assert_success(&outcome(&runtime.host_state(), "search"));
-    assert_eq!(value["evidence"][0]["source_name"], "warranty-policy.md");
-    assert_eq!(value["evidence"][0]["quote"], "twenty-four months");
-    assert!(
-        value["capability_missing"].is_null(),
-        "a successful retrieval must not carry a capability gap: {value}"
-    );
-    assert_eq!(ops.seen(), vec![HostOp::KnowledgeSearch]);
-}
-
-/// An empty evidence list and a missing retrieval capability mean opposite
-/// things, so a missing capability must be an error, not an empty result.
-#[tokio::test]
-async fn knowledge_search_reports_a_missing_capability_as_a_typed_error() {
-    let ops = Arc::new(FakeHostOps::with(Behaviour {
-        failing: BTreeMap::from([(HostOp::KnowledgeSearch, HostOpErrorCode::CapabilityMissing)]),
-        failure_message: Some("vector retrieval is not configured".to_owned()),
-        ..Behaviour::default()
-    }));
-    let mut runtime = runtime(
-        r#"
-        import { hostOps, attempt } from "./host-ops.js";
-        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
-        "#,
-        bridge(ops),
-    );
-    runtime
-        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
-        .await
-        .expect("the scenario must evaluate");
-
-    let record = outcome(&runtime.host_state(), "search");
-    assert_typed_error(&record, "capability_missing", "knowledge_search");
-    assert_eq!(record["error"]["retryable"], false);
-    assert_eq!(
-        record["error"]["message"], "vector retrieval is not configured",
-        "the reason must survive: {record}"
-    );
 }
 
 #[tokio::test]
@@ -1312,8 +1217,8 @@ async fn undeclared_request_fields_are_refused() {
           base_url: "https://attacker.example/v1",
           api_key: "sk-live-abcdefghijklmnopqrstuvwxyz0123456789",
         }));
-        await attempt("foreign-scope", () => hostOps.knowledgeSearch({
-          query: "warranty",
+        await attempt("foreign-scope", () => hostOps.knowledgeImportStatus({
+          import_job_id: "00000000-0000-4000-8000-000000000001", purpose: "internal",
           tenant_id: "00000000-0000-4000-8000-00000000000f",
         }));
         await attempt("report-foreign-scope", () => hostOps.reportReduce({
@@ -1336,7 +1241,7 @@ async fn undeclared_request_fields_are_refused() {
     assert_typed_error(
         &outcome(&runtime.host_state(), "foreign-scope"),
         "invalid_request",
-        "knowledge_search",
+        "knowledge_import_status",
     );
     assert_typed_error(
         &outcome(&runtime.host_state(), "report-foreign-scope"),
@@ -1531,8 +1436,6 @@ async fn out_of_range_requests_are_refused() {
     let mut runtime = runtime(
         r#"
         import { hostOps, attempt } from "./host-ops.js";
-        await attempt("too-many", () => hostOps.knowledgeSearch({ query: "warranty", limit: 500 }));
-        await attempt("zero", () => hostOps.knowledgeSearch({ query: "warranty", limit: 0 }));
         await attempt("page", () => hostOps.manifestRead({ kind: "document", limit: 1000 }));
         "#,
         bridge(Arc::clone(&ops)),
@@ -1542,14 +1445,8 @@ async fn out_of_range_requests_are_refused() {
         .await
         .expect("the scenario must evaluate");
 
-    for topic in ["too-many", "zero", "page"] {
-        let record = outcome(&runtime.host_state(), topic);
-        assert_eq!(
-            record["ok"], false,
-            "expected a failure for `{topic}`: {record}"
-        );
-        assert_eq!(record["error"]["code"], "invalid_request", "for `{topic}`");
-    }
+    let record = outcome(&runtime.host_state(), "page");
+    assert_typed_error(&record, "invalid_request", "manifest_read");
     assert!(
         ops.seen().is_empty(),
         "no capability may be consulted: {:?}",
@@ -1705,7 +1602,7 @@ async fn the_tenant_scope_comes_from_the_bridge_not_from_the_script() {
         r#"
         import { hostOps, attempt } from "./host-ops.js";
         await attempt("model", () => hostOps.modelComplete({ prompt: "hello" }));
-        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        await attempt("search", () => hostOps.knowledgeImportStatus({ import_job_id: "00000000-0000-4000-8000-000000000001", purpose: "internal" }));
         "#,
         HostBridge::new(
             Arc::clone(&ops) as Arc<dyn HostOps>,
@@ -1733,13 +1630,13 @@ async fn the_call_budget_is_enforced_per_op() {
     let ops = Arc::new(FakeHostOps::new());
     let budgets = HostOpBudgets::default()
         .with_limits(HostOp::ModelComplete, HostOpLimits::new(5_000, 1))
-        .with_limits(HostOp::KnowledgeSearch, HostOpLimits::new(5_000, 3));
+        .with_limits(HostOp::KnowledgeImportStatus, HostOpLimits::new(5_000, 3));
     let mut runtime = runtime(
         r#"
         import { hostOps, attempt } from "./host-ops.js";
         await attempt("first", () => hostOps.modelComplete({ prompt: "hello" }));
         await attempt("second", () => hostOps.modelComplete({ prompt: "hello" }));
-        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        await attempt("search", () => hostOps.knowledgeImportStatus({ import_job_id: "00000000-0000-4000-8000-000000000001", purpose: "internal" }));
         "#,
         bridge(Arc::clone(&ops)).with_budgets(budgets),
     );
@@ -1753,11 +1650,11 @@ async fn the_call_budget_is_enforced_per_op() {
     assert_typed_error(&refused, "budget_exceeded", "model_complete");
     assert_eq!(refused["error"]["retryable"], true);
     assert_eq!(runtime.op_calls(HostOp::ModelComplete), 2);
-    assert_eq!(runtime.op_calls(HostOp::KnowledgeSearch), 1);
+    assert_eq!(runtime.op_calls(HostOp::KnowledgeImportStatus), 1);
     assert_success(&outcome(&runtime.host_state(), "search"));
     assert_eq!(
         ops.seen(),
-        vec![HostOp::ModelComplete, HostOp::KnowledgeSearch],
+        vec![HostOp::ModelComplete, HostOp::KnowledgeImportStatus],
         "the refused attempt must not reach the capability"
     );
 }
@@ -1776,7 +1673,7 @@ async fn the_op_deadline_is_enforced() {
         r#"
         import { hostOps, attempt } from "./host-ops.js";
         await attempt("model", () => hostOps.modelComplete({ prompt: "hello" }));
-        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        await attempt("search", () => hostOps.knowledgeImportStatus({ import_job_id: "00000000-0000-4000-8000-000000000001", purpose: "internal" }));
         "#,
         bridge(ops).with_budgets(budgets),
     );
@@ -1812,7 +1709,7 @@ async fn cancelling_the_run_fails_ops_with_a_typed_error() {
         r#"
         import { hostOps, attempt } from "./host-ops.js";
         await attempt("model", () => hostOps.modelComplete({ prompt: "hello" }));
-        await attempt("search", () => hostOps.knowledgeSearch({ query: "warranty" }));
+        await attempt("search", () => hostOps.knowledgeImportStatus({ import_job_id: "00000000-0000-4000-8000-000000000001", purpose: "internal" }));
         "#,
         bridge(Arc::clone(&ops)),
     );
@@ -1837,7 +1734,7 @@ async fn cancelling_the_run_fails_ops_with_a_typed_error() {
     assert_typed_error(
         &outcome(&runtime.host_state(), "search"),
         "cancelled",
-        "knowledge_search",
+        "knowledge_import_status",
     );
     // The stalling capability was entered once and never re-entered.
     assert_eq!(ops.seen(), vec![HostOp::ModelComplete]);
@@ -1975,8 +1872,8 @@ async fn calling_main_runs_one_turn_under_the_run_scope() {
 
     assert_eq!(
         ops.seen(),
-        vec![HostOp::KnowledgeSearch, HostOp::ModelComplete],
-        "a turn retrieves evidence before it asks the model"
+        vec![HostOp::ModelComplete],
+        "the reference turn calls the model"
     );
     assert!(
         ops.scopes().iter().all(|seen| *seen == run_scope),

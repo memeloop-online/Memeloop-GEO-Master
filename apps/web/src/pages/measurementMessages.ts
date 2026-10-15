@@ -152,7 +152,8 @@ const en = {
   questionsHeading: "Question sets and versions",
   questionsIntro:
     "Save recurring questions, inspect previous versions, or revise the current version.",
-  pageIntro: "Create a question set and follow its measurements, or measure a question temporarily.",
+  pageIntro:
+    "Create a question set and follow its measurements, or measure a question temporarily.",
   prediction: "Only have a topic? Ask AI for questions",
   optionalRegion: "Market and language (optional)",
   createSet: "Create question set",

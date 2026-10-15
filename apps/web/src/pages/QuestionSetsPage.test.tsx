@@ -619,14 +619,16 @@ describe("P13 versioned question sets", () => {
     expect(screen.getByLabelText("问题集名称")).toHaveValue("未保存的问题集");
   });
 
-  it("uses keyboard-accessible tabs and keeps the starting view focused on measuring", async () => {
+  it("starts with question sets and keeps temporary measurement and records keyboard-accessible", async () => {
     mockApi();
     const user = userEvent.setup();
     renderPage();
-    expect(screen.getByRole("tab", { name: "开始测量" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "问题集" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
+    screen.getByRole("tab", { name: "开始测量" }).focus();
+    await user.keyboard("{Enter}");
     expect(
       await screen.findByRole("textbox", { name: "要测量的问题" }),
     ).toBeInTheDocument();
@@ -648,9 +650,7 @@ describe("P13 versioned question sets", () => {
       "/app/tenant-1/project-1/measurement?tab=sets&set=set-1",
     );
     await screen.findByRole("heading", { name: "基础问题 · v1" });
-    await user.click(
-      screen.getByRole("button", { name: "基于当前版本修订" }),
-    );
+    await user.click(screen.getByRole("button", { name: "基于当前版本修订" }));
     await user.clear(screen.getByLabelText("问题 1"));
     await user.type(screen.getByLabelText("问题 1"), "返回后继续编辑");
     const stored = JSON.parse(

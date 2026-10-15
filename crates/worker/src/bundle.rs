@@ -29,8 +29,8 @@ import { runToolLoop } from "./loop-core.js";
 
 const tools = [
   {
-    name: "knowledge.search",
-    run: async () => "evidence: quoted evidence from the knowledge release",
+    name: "probe.echo",
+    run: async () => "probe tool completed",
   },
 ];
 
@@ -200,12 +200,6 @@ function parseHostOpError(error) {
 /// lands.  Evaluating this module does not run a turn: it declares the surface
 /// it expects through a `loop.ready` event, and the embedding host calls `main`
 /// once per turn with that turn's inputs.
-///
-/// `query` defaults to `prompt` so a host payload that omits it still runs the
-/// turn.  Without the default the omission survives `JSON.stringify` as a
-/// missing key, and the very first host op would reject with a typed
-/// `invalid_request` — a turn failing after doing real work, blaming the
-/// runtime for the host's own gap.
 pub const HOST_LOOP_JS: &str = r#"
 import { hostOps } from "./host-ops.js";
 

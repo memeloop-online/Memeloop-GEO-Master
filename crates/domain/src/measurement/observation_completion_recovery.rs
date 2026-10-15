@@ -255,7 +255,7 @@ pub trait ObservationCompletionRecoveryRepository: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::provider_conversation_lifecycle::synthetic_deepseek_source;
+    use crate::measurement::provider_conversation_lifecycle::synthetic_deepseek_source;
     use crate::{
         CapturedConversation, CapturedConversationPurpose, ObservationCaptureInput,
         ObservationCaptureReceipt,

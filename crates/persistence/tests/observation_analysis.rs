@@ -318,7 +318,13 @@ async fn assert_manual_durable(
         };
         assert!(
             restarted
-                .complete(scope, intent.intent_id, Uuid::new_v4(), result.clone(), late)
+                .complete(
+                    scope,
+                    intent.intent_id,
+                    Uuid::new_v4(),
+                    result.clone(),
+                    late
+                )
                 .await
                 .is_err()
         );
@@ -527,15 +533,28 @@ async fn assert_grounded_projection(
             .await
             .unwrap();
         let intent_id = admitted.intent.intent_id;
-        let claim = extraction.claim(scope, intent_id, accepted).await.unwrap().unwrap();
-        extraction.record_response(scope, intent_id, claim.claim_token, geo_domain::ObservationExtractionResponse {
-            model_text: "Synthetic saved response".into(),
-            disposition: geo_domain::ObservationExtractionResponseDisposition::Complete,
-            actual_model: "synthetic".into(),
-            config_revision: None,
-            prompt_tokens: 1,
-            completion_tokens: 1,
-        }, completed).await.unwrap();
+        let claim = extraction
+            .claim(scope, intent_id, accepted)
+            .await
+            .unwrap()
+            .unwrap();
+        extraction
+            .record_response(
+                scope,
+                intent_id,
+                claim.claim_token,
+                geo_domain::ObservationExtractionResponse {
+                    model_text: "Synthetic saved response".into(),
+                    disposition: geo_domain::ObservationExtractionResponseDisposition::Complete,
+                    actual_model: "synthetic".into(),
+                    config_revision: None,
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                },
+                completed,
+            )
+            .await
+            .unwrap();
         extraction.complete(scope, intent_id, claim.claim_token, ObservationAnalysisResult {
             config_revision: None,
             actual_model: Some("synthetic".into()),

@@ -1333,7 +1333,6 @@ mod tests {
         match automatic.unwrap() {
             AutomaticExtractionAdmission::Intent(_) => {}
             AutomaticExtractionAdmission::DeferredManual => {}
-            other => panic!("unexpected race result {other:?}"),
         }
         // Once admitted, automatic work reuses the earliest durable intent.
         let AutomaticExtractionAdmission::Intent(reused) = extraction

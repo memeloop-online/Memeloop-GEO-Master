@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use geo_domain::{ContentCoverage, ContentExecutionStatus, DistributionTargetStatus};
-use geo_domain::{ContentItemStatus, KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
+use geo_domain::{ContentItemStatus, TenantScope};
 use geo_worker::{
     ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef, ContentHandoffRef,
     ContentItemRef, ContentItemsPage, ContentItemsReadRequest, ContentStepRequest,
@@ -330,13 +330,6 @@ impl HostOps for Fixture {
             finish_reason: "stop".to_owned(),
             tool_calls: Vec::new(),
         })
-    }
-    async fn knowledge_search(
-        &self,
-        _scope: &TenantScope,
-        _request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
-        unreachable!()
     }
     async fn manifest_read(
         &self,

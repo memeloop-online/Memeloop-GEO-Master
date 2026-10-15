@@ -68,7 +68,7 @@ async fn drives_promises_and_top_level_await() {
     );
     // The tool ran after the awaited model call, so both promises resolved in
     // order rather than racing.
-    assert_eq!(payload["toolCalls"][0]["name"], "knowledge.search");
+    assert_eq!(payload["toolCalls"][0]["name"], "probe.echo");
 }
 
 /// Host ops: JavaScript can mutate Rust-owned state only through the ops, and

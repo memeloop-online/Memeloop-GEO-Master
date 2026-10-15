@@ -30,13 +30,13 @@ use uuid::Uuid;
 // implementation of [`HostOps`] needs one import path, and so the worker never
 // grows a parallel set of types for the same concepts.
 pub use geo_domain::ContentRequestDeferral;
+pub use geo_domain::TenantScope;
 use geo_domain::{
     AppError, AttachmentReference, ContentCoverage, ContentExecutionStatus, ContentItemStatus,
     DistributionTargetStatus, ImportStatus, KnowledgePurpose, PublicationLookupFinding,
     ReportPreview, ReportPreviewKind, ReportSnapshot,
 };
 pub use geo_domain::{CreateQuestionSet, QuestionReference, ReviseQuestionSet};
-pub use geo_domain::TenantScope;
 pub use geo_domain::{ToolCallIdentity, ToolCallOutcome};
 
 /// A scoped, durable sink installed by Rust for one authorised run. `begin`
@@ -944,7 +944,7 @@ Deno.core.registerErrorClass("GeoHostOpError", globalThis.GeoHostOpError);
 pub enum HostOp {
     /// One model completion through the Rust-side provider bridge.
     ModelComplete,
-    /// Evidence retrieval restricted to the run's frozen knowledge release.
+    /// Read stored text from an explicit source and version.
     KnowledgeTextRead,
     KnowledgeTextRevise,
     /// Explicitly import attachments bound to this run into project knowledge.
@@ -1003,7 +1003,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 48;
+    pub const COUNT: usize = 47;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -1547,7 +1547,6 @@ pub trait HostOps: Send + Sync {
         scope: &TenantScope,
         request: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError>;
-
 
     async fn knowledge_text_read(
         &self,
@@ -4532,8 +4531,8 @@ mod tests {
 
     #[test]
     fn budgets_are_addressed_per_op() {
-        let budgets =
-            HostOpBudgets::default().with_limits(HostOp::KnowledgeTextRead, HostOpLimits::new(25, 1));
+        let budgets = HostOpBudgets::default()
+            .with_limits(HostOp::KnowledgeTextRead, HostOpLimits::new(25, 1));
         assert_eq!(budgets.limits(HostOp::KnowledgeTextRead).timeout_ms, 25);
         assert_eq!(budgets.limits(HostOp::KnowledgeTextRead).max_calls, 1);
         assert_eq!(

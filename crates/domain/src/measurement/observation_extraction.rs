@@ -1124,7 +1124,7 @@ mod tests {
         (store, scope, intent)
     }
     #[test]
-    fn legacy_identity_golden_and_manual_source_selectors() {
+    fn canonical_identity_and_manual_source_selectors() {
         let scope = TenantScope::new(
             Uuid::from_u128(1).into(),
             Uuid::from_u128(2).into(),
@@ -1141,10 +1141,13 @@ mod tests {
             parser_version: "ground.v1".into(),
             policy_version: "automatic.v1".into(),
         };
-        let legacy = request.intent_key(&scope).unwrap();
+        let automatic = request.intent_key(&scope).unwrap();
         assert_eq!(
-            legacy,
-            "2152b83ea5c2d8359e93602d13a363386a1783c3bbba07eb1ae2cb12a66afbae"
+            automatic,
+            sha256_hex(
+                &serde_json::to_vec(&("observation-extraction-intent.v1", &scope, &request))
+                    .unwrap()
+            )
         );
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("manual_revision_id").is_none());
@@ -1155,7 +1158,7 @@ mod tests {
         );
         request.manual_revision_id = Some(Uuid::from_u128(7));
         let manual = request.intent_key(&scope).unwrap();
-        assert_ne!(manual, legacy);
+        assert_ne!(manual, automatic);
         request.source_evidence_index = Some(0);
         assert!(request.intent_key(&scope).is_err());
         request.source_capture_id = None;

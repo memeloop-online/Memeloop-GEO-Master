@@ -346,9 +346,11 @@ impl ObservationAnalysisService {
         target
             .attempts
             .retain(|attempt| attempt.attempt_id == capture.input.attempt_id);
-        if !target.attempts.first().is_some_and(|attempt| {
-            attempt.outcome.is_some() && attempt.received_at.is_some()
-        }) {
+        if !target
+            .attempts
+            .first()
+            .is_some_and(|attempt| attempt.outcome.is_some() && attempt.received_at.is_some())
+        {
             return Ok(false);
         }
         Ok(geo_domain::effective_observation(
@@ -2373,7 +2375,7 @@ mod tests {
     /// Finishes the persisted projection during GET's status read, so this test
     /// fails if GET reads revision history first and then stops polling.
     struct CompleteDuringStatusRead {
-        repository: Arc<MemoryObservationExtractionRepository>,
+        repository: Arc<dyn ObservationExtractionRepository>,
         analysis: ObservationAnalysisService,
         intent_id: Uuid,
         token: Uuid,
@@ -2449,14 +2451,6 @@ mod tests {
                 .status_for_attempt(scope, target, attempt)
                 .await
         }
-        async fn enqueue(
-            &self,
-            _: &TenantScope,
-            _: ObservationExtractionRequest,
-            _: DateTime<Utc>,
-        ) -> Result<ObservationExtractionIntent, AppError> {
-            unreachable!("status-only test adapter")
-        }
         async fn get(
             &self,
             _: &TenantScope,
@@ -2523,13 +2517,14 @@ mod tests {
     async fn http_completion_during_status_read_includes_projected_revision_in_same_page() {
         let f = fixture(false, true, false).await;
         let received = received_intent(&f).await;
-        let repository = Arc::new(MemoryObservationExtractionRepository::new(
-            f.service.captures.clone(),
-        ));
-        let queued = repository
-            .enqueue(&f.scope, received.request.clone(), received.created_at)
+        let repository = f.service.extraction_repository.as_ref().unwrap().clone();
+        let geo_domain::AutomaticExtractionAdmission::Intent(queued) = repository
+            .admit_automatic(&f.scope, received.request.clone(), received.created_at)
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("source admitted")
+        };
         let claim = repository
             .claim(&f.scope, queued.intent_id, received.created_at)
             .await
@@ -2590,13 +2585,14 @@ mod tests {
     async fn http_extraction_status_is_scoped_minimal_and_preserves_original_receipt() {
         let f = fixture(false, true, false).await;
         let received = received_intent(&f).await;
-        let repository = Arc::new(MemoryObservationExtractionRepository::new(
-            f.service.captures.clone(),
-        ));
-        let queued = repository
-            .enqueue(&f.scope, received.request.clone(), received.created_at)
+        let repository = f.service.extraction_repository.as_ref().unwrap().clone();
+        let geo_domain::AutomaticExtractionAdmission::Intent(queued) = repository
+            .admit_automatic(&f.scope, received.request.clone(), received.created_at)
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("source admitted")
+        };
         let state = f.state.clone().with_observation_analysis(
             f.service
                 .clone()

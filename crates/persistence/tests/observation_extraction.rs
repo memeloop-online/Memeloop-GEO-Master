@@ -1,9 +1,9 @@
 use chrono::Utc;
 use geo_domain::{
-    AutomaticExtractionAdmission, ChannelJobRepository, ChannelTarget, ChannelTargetInput, ObservationAnalysisOutcome,
-    ObservationAnalysisResult, ObservationCaptureInput, ObservationCaptureRepository,
-    ObservationCaptureSnapshot, ObservationExtractionInterruption, ObservationExtractionRepository,
-    ObservationExtractionRequest, ObservationExtractionResponse,
+    AutomaticExtractionAdmission, ChannelJobRepository, ChannelTarget, ChannelTargetInput,
+    ObservationAnalysisOutcome, ObservationAnalysisResult, ObservationCaptureInput,
+    ObservationCaptureRepository, ObservationCaptureSnapshot, ObservationExtractionInterruption,
+    ObservationExtractionRepository, ObservationExtractionRequest, ObservationExtractionResponse,
     ObservationExtractionResponseDisposition, ObservationExtractionState,
     StandaloneMeasurementPlan, TenantScope, sha256_hex,
 };
@@ -237,7 +237,12 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
             .unwrap(),
         AutomaticExtractionAdmission::Intent(intent.clone())
     );
-    assert!(store.admit_automatic(&other, request.clone(), now).await.is_err());
+    assert!(
+        store
+            .admit_automatic(&other, request.clone(), now)
+            .await
+            .is_err()
+    );
     let mut wrong = request.clone();
     wrong.attempt_id = Uuid::new_v4();
     assert!(store.admit_automatic(&scope, wrong, now).await.is_err());
@@ -359,13 +364,20 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
             .await
             .is_err()
     );
-    let mut second_source = captures.get(&scope, capture_id).await.unwrap().unwrap().input;
+    let mut second_source = captures
+        .get(&scope, capture_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .input;
     second_source.capture_id = Uuid::new_v4();
     second_source.runner_session_id = Uuid::new_v4();
     let second_receipt = captures.save(&scope, second_source).await.unwrap();
     let mut second = request;
     second.source_capture_id = Some(second_receipt.capture_id);
-    let AutomaticExtractionAdmission::Intent(second) = store.admit_automatic(&scope, second, now).await.unwrap() else {
+    let AutomaticExtractionAdmission::Intent(second) =
+        store.admit_automatic(&scope, second, now).await.unwrap()
+    else {
         panic!("distinct source must be admitted");
     };
     assert!(!source_is_discovered(&store, receipt.stored_at, capture_id).await);

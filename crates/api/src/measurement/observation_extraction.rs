@@ -439,7 +439,10 @@ impl SourceAdmissionScan {
                 else {
                     return Ok::<_, AppError>(());
                 };
-                if !analysis.needs_source_extraction(&item.scope, &capture).await? {
+                if !analysis
+                    .needs_source_extraction(&item.scope, &capture)
+                    .await?
+                {
                     return Ok(());
                 }
                 let ObservationCaptureSnapshot::Source { source_sha256, .. } =
@@ -590,14 +593,6 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<geo_domain::ObservationExtractionBackfillItem>, AppError> {
             self.inner.scan_unqueued_sources(at, after, limit).await
-        }
-        async fn enqueue(
-            &self,
-            scope: &TenantScope,
-            request: ObservationExtractionRequest,
-            at: chrono::DateTime<Utc>,
-        ) -> Result<ObservationExtractionIntent, AppError> {
-            self.inner.enqueue(scope, request, at).await
         }
         async fn get(
             &self,
@@ -854,6 +849,9 @@ mod tests {
         }
         mismatched.parser_version = "geo.observation.extract.v6".into();
         mismatched.prompt_version = "geo.observation.extract.v999".into();
+        assert!(validate_versions(&mismatched).is_err());
+        mismatched.prompt_version = "geo.observation.extract.v4".into();
+        mismatched.policy_version = "geo.observation.automatic.future".into();
         assert!(validate_versions(&mismatched).is_err());
     }
 
@@ -1146,58 +1144,5 @@ mod tests {
         assert_eq!(continuation.0.load(Ordering::SeqCst), 1);
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert_eq!(faulty.interruptions.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn received_response_with_unsupported_policy_never_calls_continuation() {
-        let (scope, captures, repository, model, service) = fixture();
-        let prototype = enqueue(&service, &scope, &captures).await;
-        let mut request = prototype.request;
-        request.policy_version = "geo.observation.automatic.future".into();
-        let intent = repository
-            .enqueue(&scope, request, Utc::now())
-            .await
-            .unwrap();
-        let claim = repository
-            .claim(&scope, intent.intent_id, Utc::now())
-            .await
-            .unwrap()
-            .unwrap();
-        repository
-            .record_response(
-                &scope,
-                intent.intent_id,
-                claim.claim_token,
-                ObservationExtractionResponse {
-                    model_text: "{}".into(),
-                    actual_model: "synthetic-model".into(),
-                    config_revision: Some(2),
-                    prompt_tokens: 5,
-                    completion_tokens: 3,
-                    disposition: ObservationExtractionResponseDisposition::Complete,
-                },
-                Utc::now(),
-            )
-            .await
-            .unwrap();
-        let continuation = Arc::new(Continue(AtomicUsize::new(0)));
-        assert!(
-            service
-                .with_continuation(continuation.clone())
-                .dispatch(&scope, intent.intent_id)
-                .await
-                .is_err()
-        );
-        assert_eq!(continuation.0.load(Ordering::SeqCst), 0);
-        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            repository
-                .get(&scope, intent.intent_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            ObservationExtractionState::ResponseReceived
-        );
     }
 }

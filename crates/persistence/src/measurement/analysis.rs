@@ -3,10 +3,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelJobRepository, ErrorCode, MAX_ANALYSIS_PROJECTION_ATTEMPTS,
-    ObservationAnalysisRepository, ObservationAnalysisRequest,
-    ObservationAnalysisResult, ObservationAnalysisRevision, ObservationAnalysisSource,
-    ObservationAnalysisState, ObservationCaptureRepository, TenantScope,
-    observation_analysis_source_json, sha256_hex,
+    ObservationAnalysisRepository, ObservationAnalysisRequest, ObservationAnalysisResult,
+    ObservationAnalysisRevision, ObservationAnalysisSource, ObservationAnalysisState,
+    ObservationCaptureRepository, TenantScope, observation_analysis_source_json, sha256_hex,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;

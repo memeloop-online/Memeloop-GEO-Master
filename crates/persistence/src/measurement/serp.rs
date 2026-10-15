@@ -671,10 +671,7 @@ impl SerpRepository for PgSerpRepository {
             let row = sqlx::query("SELECT * FROM project_serp_settings WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND source_key=$4 FOR SHARE")
                 .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?)
                 .bind(&stored.measurement.source_key).fetch_optional(&mut *tx).await.map_err(unavailable)?;
-            let settings = row
-                .as_ref()
-                .map(super::serp_settings::decode)
-                .transpose()?;
+            let settings = row.as_ref().map(super::serp_settings::decode).transpose()?;
             validate_project_serp_send(settings.as_ref(), &stored.measurement, revision)?;
         }
         validate_serp_task_transition(stored.measurement.state, SerpTaskState::Sending)?;

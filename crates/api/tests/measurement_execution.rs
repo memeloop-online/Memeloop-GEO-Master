@@ -41,12 +41,7 @@ enum Receipt {
     ForgedMarker,
     MismatchedExecution,
     Unknown,
-    Connect,
-    ConnectMismatch(&'static str),
-    ConnectWrongSchema,
-    ConnectFuture,
-    ConnectFixture,
-    AiConnect,
+    Schema(&'static str),
     AiApiExtraction,
     AiEventMismatch(&'static str),
     AiEventValue(&'static str, &'static str),
@@ -65,44 +60,6 @@ enum Receipt {
     AiBrowserEventValue(&'static str, &'static str),
     AiBrowserAuditMismatch(&'static str),
     AiBrowserFuture,
-}
-
-impl Receipt {
-    fn is_ai(self) -> bool {
-        matches!(
-            self,
-            Self::AiConnect
-                | Self::AiApiExtraction
-                | Self::AiEventMismatch(_)
-                | Self::AiEventValue(_, _)
-                | Self::AiAuditMismatch(_)
-                | Self::AiMissingSource
-                | Self::AiSource(_)
-                | Self::AiOversizedSource
-                | Self::AiMissingAudit
-                | Self::AiDuplicateAudit
-                | Self::AiEmptyRefs
-                | Self::AiWrongSchema
-                | Self::AiFuture
-                | Self::AiFixture
-                | Self::AiBrowser
-                | Self::AiBrowserVersions(_, _)
-                | Self::AiBrowserEventValue(_, _)
-                | Self::AiBrowserAuditMismatch(_)
-                | Self::AiBrowserFuture
-        )
-    }
-
-    fn is_ai_browser(self) -> bool {
-        matches!(
-            self,
-            Self::AiBrowser
-                | Self::AiBrowserVersions(_, _)
-                | Self::AiBrowserEventValue(_, _)
-                | Self::AiBrowserAuditMismatch(_)
-                | Self::AiBrowserFuture
-        )
-    }
 }
 
 #[derive(Clone)]
@@ -143,9 +100,24 @@ async fn runner(
             let frozen = &input["payload"];
             let completed_at = Utc::now();
             let target_id = frozen["target_id"].clone();
+            let answer = if matches!(case, Receipt::Refusal) {
+                "Cannot answer this request"
+            } else {
+                "Original answer"
+            };
+            let citations: Vec<&str> = if matches!(case, Receipt::Refusal) {
+                vec![]
+            } else {
+                vec!["http://example.org/source#section"]
+            };
+            let source = json!({"messages":[{"role":"assistant","text":answer}],
+                "completion":"complete","search_used":"yes",
+                "citations":citations})
+            .to_string();
+            let source_sha256 = sha256_hex(source.as_bytes());
             let mut proof = json!({
                 "kind":"official_search_observation",
-                "schema_version":"geo.measure.official_search.v1",
+                "schema_version":"geo.measure.official_search.v4",
                 "target_id":target_id,
                 "account_id":frozen["account_id"],
                 "provider":frozen["provider"],
@@ -162,47 +134,23 @@ async fn runner(
                 "connector_version":"official_search_verified.v1",
                 "provenance":"live",
                 "disposition":"observed",
-                "raw_answer":"Original answer",
-                "citations":["http://example.org/source#section"],
+                "raw_answer":answer,
+                "citations":citations,
                 "search_event":{
-                    "kind":"official_search_event","source":"provider_search_event",
-                    "provenance":"live","event_id":"event-1",
-                    "request_id":"request-1","occurred_at":completed_at
+                    "kind":"official_search_event","source":"browser_response_ai",
+                    "provenance":"live","search_used":"yes","observed_at":completed_at,
+                    "request_model":frozen["model"],
+                    "request_question_sha256":sha256_hex(frozen["question"].as_str().unwrap().as_bytes()),
+                    "extraction_model":"synthetic-extractor",
+                    "extraction_prompt_version":"geo.observation.extract.v4",
+                    "source_sha256":source_sha256
                 }
             });
             // The runner must echo the server-frozen sample identity.
             proof["target_id"] = frozen["target_id"].clone();
             proof["account_id"] = frozen["account_id"].clone();
-            if matches!(
-                case,
-                Receipt::Connect
-                    | Receipt::ConnectMismatch(_)
-                    | Receipt::ConnectWrongSchema
-                    | Receipt::ConnectFuture
-                    | Receipt::ConnectFixture
-            ) {
-                proof["schema_version"] = json!("geo.measure.official_search.v2");
-                proof["search_event"] = json!({
-                    "kind":"official_search_event",
-                    "source":"provider_connect_stream",
-                    "provenance":"live",
-                    "chat_id":"chat-1",
-                    "message_id":"message-1",
-                    "block_id":"block-1",
-                    "event_offset":"12",
-                    "observed_at":completed_at,
-                    "request_model":frozen["model"],
-                    "request_question_sha256":proof["question_sha256"]
-                });
-                if let Receipt::ConnectMismatch(field) = case {
-                    proof["search_event"][field] = json!("invalid value");
-                }
-                if matches!(case, Receipt::ConnectWrongSchema) {
-                    proof["schema_version"] = json!("geo.measure.official_search.v1");
-                }
-                if matches!(case, Receipt::ConnectFuture) {
-                    proof["search_event"]["observed_at"] = json!(completed_at + Duration::days(1));
-                }
+            if let Receipt::Schema(version) = case {
+                proof["schema_version"] = json!(version);
             }
             if let Receipt::Mismatch(field) = case {
                 proof[field] = json!("changed");
@@ -215,31 +163,14 @@ async fn runner(
             }
             if matches!(case, Receipt::Refusal) {
                 proof["disposition"] = json!("refused");
-                proof["raw_answer"] = json!("Cannot answer this request");
-                proof["citations"] = json!([]);
             }
             if matches!(case, Receipt::FutureTimestamp) {
-                proof["search_event"]["occurred_at"] = json!(completed_at + Duration::days(1));
+                proof["search_event"]["observed_at"] = json!(completed_at + Duration::days(1));
             }
             if matches!(case, Receipt::AttestedVersion) {
                 proof["connector_version"] = json!("attested-search.v2");
             }
-            if case.is_ai() {
-                proof["schema_version"] = json!("geo.measure.official_search.v3");
-                proof["search_event"] = json!({
-                    "kind":"official_search_event",
-                    "source":"provider_connect_stream_ai",
-                    "provenance":"live",
-                    "chat_id":"chat-1",
-                    "message_id":"message-1",
-                    "block_id":"block-1",
-                    "observed_at":completed_at,
-                    "request_model":frozen["model"],
-                    "request_question_sha256":proof["question_sha256"],
-                    "extraction_model":"synthetic-extractor",
-                    "extraction_prompt_version":"observation.v1",
-                    "source_sha256":sha256_hex(br#"{"messages":[]}"#)
-                });
+            {
                 if let Receipt::AiEventMismatch(field) = case {
                     proof["search_event"][field] = json!("invalid value");
                 }
@@ -252,18 +183,7 @@ async fn runner(
                 if matches!(case, Receipt::AiFuture) {
                     proof["search_event"]["observed_at"] = json!(completed_at + Duration::days(1));
                 }
-                if case.is_ai_browser() {
-                    proof["schema_version"] = json!("geo.measure.official_search.v4");
-                    let event = proof["search_event"].as_object_mut().unwrap();
-                    for field in ["chat_id", "message_id", "block_id"] {
-                        event.remove(field);
-                    }
-                    event.insert("source".into(), json!("browser_response_ai"));
-                    event.insert("search_used".into(), json!("yes"));
-                    event.insert(
-                        "extraction_prompt_version".into(),
-                        json!("geo.observation.extract.v2"),
-                    );
+                if let Some(event) = proof["search_event"].as_object_mut() {
                     if let Receipt::AiBrowserVersions(event_version, _) = case {
                         event.insert("extraction_prompt_version".into(), json!(event_version));
                     }
@@ -292,22 +212,32 @@ async fn runner(
             } else {
                 vec![proof]
             };
-            if case.is_ai() && !matches!(case, Receipt::AiMissingAudit) {
+            if !matches!(case, Receipt::AiMissingAudit) {
                 let mut audit = json!({
                     "kind":"observation_extraction",
                     "method":"llm_grounded",
                     "model":"synthetic-extractor",
-                    "prompt_version":"observation.v1",
-                    "source_sha256":sha256_hex(br#"{"messages":[]}"#),
-                    "source_json":r#"{"messages":[]}"#,
+                    "prompt_version":"geo.observation.extract.v4",
+                    "source_sha256":source_sha256,
+                    "source_json":source,
                     "surface":"signed_in_browser",
-                    "refs":[{"pointer":"/synthetic", "quote":"synthetic raw source"}]
+                    "refs":[
+                        {"role":"answer_segment","path":"/messages/0/text","quote":answer},
+                        {"role":"completion","path":"/completion","quote":"complete"},
+                        {"role":"search_activity","path":"/search_used","quote":"yes"}
+                    ]
                 });
+                for (index, citation) in citations.iter().enumerate() {
+                    audit["refs"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"role":"citation",
+                        "path":format!("/citations/{index}"),"quote":citation}));
+                }
                 if let Receipt::AiAuditMismatch(field) = case {
                     audit[field] = json!("invalid value");
                 }
-                if case.is_ai_browser() {
-                    audit["prompt_version"] = json!("geo.observation.extract.v2");
+                {
                     if let Receipt::AiBrowserVersions(_, audit_version) = case {
                         audit["prompt_version"] = json!(audit_version);
                     }
@@ -328,7 +258,12 @@ async fn runner(
                 };
                 if let Some(source) = replacement_source {
                     let digest = sha256_hex(source.as_bytes());
-                    evidence[0]["search_event"]["source_sha256"] = json!(digest);
+                    if let Some(proof) = evidence
+                        .iter_mut()
+                        .find(|proof| proof["kind"] == "official_search_observation")
+                    {
+                        proof["search_event"]["source_sha256"] = json!(digest);
+                    }
                     audit["source_sha256"] = json!(digest);
                     audit["source_json"] = json!(source);
                 }
@@ -363,7 +298,7 @@ async fn runner(
                 "stage":"official_search_observation",
                 "occurred_at":completed_at,
                 "connector_version":if matches!(case, Receipt::Fixture) {"fixture.v1"} else if matches!(case, Receipt::AttestedVersion) {"attested-search.v2"} else {"official_search_verified.v1"},
-                "provenance":if matches!(case, Receipt::Fixture | Receipt::RunnerFixtureProofLive | Receipt::ConnectFixture | Receipt::AiFixture) {"fixture"} else if matches!(case, Receipt::InvalidProvenance) {"untrusted"} else {"live"},
+                "provenance":if matches!(case, Receipt::Fixture | Receipt::RunnerFixtureProofLive | Receipt::AiFixture) {"fixture"} else if matches!(case, Receipt::InvalidProvenance) {"untrusted"} else {"live"},
                 "evidence":evidence,
             });
             if matches!(case, Receipt::MissingProvenance) {
@@ -633,19 +568,20 @@ async fn verified_search_retains_original_answer_and_citations() {
     assert_eq!(outcome.status, ChannelOutcomeStatus::Observed);
     assert_eq!(outcome.raw_answer.as_deref(), Some("Original answer"));
     assert_eq!(outcome.citations, ["http://example.org/source#section"]);
-    assert_eq!(outcome.runner_evidence.len(), 2);
+    assert_eq!(outcome.runner_evidence.len(), 3);
     assert!(!outcome.fixture);
-    assert_eq!(outcome.runner_evidence[1]["kind"], "runner_receipt");
-    assert_eq!(outcome.runner_evidence[1]["provenance"], "live");
+    assert_eq!(outcome.runner_evidence[1]["kind"], "observation_extraction");
+    assert_eq!(outcome.runner_evidence[2]["kind"], "runner_receipt");
+    assert_eq!(outcome.runner_evidence[2]["provenance"], "live");
     assert_eq!(
-        outcome.runner_evidence[1]["connector_version"],
+        outcome.runner_evidence[2]["connector_version"],
         outcome.connector_version.as_deref().unwrap()
     );
-    assert!(outcome.runner_evidence[1]["execution_id"].is_string());
-    assert!(outcome.runner_evidence[1]["occurred_at"].is_string());
+    assert!(outcome.runner_evidence[2]["execution_id"].is_string());
+    assert!(outcome.runner_evidence[2]["occurred_at"].is_string());
     let with_metadata = run(Receipt::AuxiliaryEvidence).await;
     assert_eq!(with_metadata.status, ChannelOutcomeStatus::Observed);
-    assert_eq!(with_metadata.runner_evidence.len(), 3);
+    assert_eq!(with_metadata.runner_evidence.len(), 4);
     assert_eq!(
         run(Receipt::AttestedVersion).await.status,
         ChannelOutcomeStatus::Observed
@@ -657,42 +593,14 @@ async fn verified_search_retains_original_answer_and_citations() {
 }
 
 #[tokio::test]
-async fn connect_search_uses_actual_stream_correlation_without_synthetic_request_ids() {
-    let outcome = run(Receipt::Connect).await;
-    assert_eq!(outcome.status, ChannelOutcomeStatus::Observed);
-    assert_eq!(outcome.raw_answer.as_deref(), Some("Original answer"));
-    let event = &outcome.runner_evidence[0]["search_event"];
-    assert_eq!(event["chat_id"], "chat-1");
-    assert_eq!(event["message_id"], "message-1");
-    assert_eq!(event["block_id"], "block-1");
-    assert_eq!(event["event_offset"], "12");
-    assert!(event.get("request_id").is_none());
-    assert!(event.get("event_id").is_none());
-    for field in [
-        "kind",
-        "source",
-        "provenance",
-        "chat_id",
-        "message_id",
-        "block_id",
-        "event_offset",
-        "observed_at",
-        "request_model",
-        "request_question_sha256",
+async fn unsupported_observation_schemas_are_rejected() {
+    for schema in [
+        "geo.measure.official_search.v1",
+        "geo.measure.official_search.v2",
+        "geo.measure.official_search.v3",
     ] {
-        assert_eq!(
-            run(Receipt::ConnectMismatch(field)).await.status,
-            ChannelOutcomeStatus::Missing,
-            "field {field}"
-        );
-    }
-    for case in [
-        Receipt::ConnectWrongSchema,
-        Receipt::ConnectFuture,
-        Receipt::ConnectFixture,
-    ] {
-        let outcome = run(case).await;
-        assert_eq!(outcome.status, ChannelOutcomeStatus::Missing, "{case:?}");
+        let outcome = run(Receipt::Schema(schema)).await;
+        assert_eq!(outcome.status, ChannelOutcomeStatus::Missing, "{schema}");
         assert!(outcome.raw_answer.is_none());
     }
 }
@@ -703,27 +611,27 @@ async fn browser_ai_search_requires_yes_and_bound_audit_without_provider_ids() {
         (
             "geo.observation.extract.v2",
             "geo.observation.extract.v2",
-            ChannelOutcomeStatus::Observed,
-        ),
-        (
-            "geo.observation.extract.v3",
-            "geo.observation.extract.v3",
-            ChannelOutcomeStatus::Observed,
-        ),
-        (
-            "geo.observation.extract.v3",
-            "geo.observation.extract.v2",
             ChannelOutcomeStatus::Missing,
         ),
         (
-            "geo.observation.extract.v2",
+            "geo.observation.extract.v3",
             "geo.observation.extract.v3",
             ChannelOutcomeStatus::Missing,
         ),
         (
             "geo.observation.extract.v4",
+            "geo.observation.extract.v3",
+            ChannelOutcomeStatus::Missing,
+        ),
+        (
+            "geo.observation.extract.v3",
             "geo.observation.extract.v4",
             ChannelOutcomeStatus::Missing,
+        ),
+        (
+            "geo.observation.extract.v4",
+            "geo.observation.extract.v4",
+            ChannelOutcomeStatus::Observed,
         ),
     ] {
         assert_eq!(
@@ -787,12 +695,12 @@ async fn browser_ai_search_requires_yes_and_bound_audit_without_provider_ids() {
 
 #[tokio::test]
 async fn ai_extracted_search_requires_bound_audit_and_live_runner() {
-    let outcome = run(Receipt::AiConnect).await;
+    let outcome = run(Receipt::Valid).await;
     assert_eq!(outcome.status, ChannelOutcomeStatus::Observed);
     assert_eq!(outcome.raw_answer.as_deref(), Some("Original answer"));
     assert_eq!(outcome.citations, ["http://example.org/source#section"]);
     let event = &outcome.runner_evidence[0]["search_event"];
-    assert_eq!(event["source"], "provider_connect_stream_ai");
+    assert_eq!(event["source"], "browser_response_ai");
     assert!(event.get("request_id").is_none());
     assert!(event.get("event_offset").is_none());
     assert_eq!(outcome.runner_evidence[1]["kind"], "observation_extraction");

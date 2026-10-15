@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use geo_domain::{
-    AttachmentId, AttachmentReference, ContentBlock, ContentBlockKind, KnowledgeSearchRequest,
-    KnowledgeSearchResult, MediaObjectKey, StructuredDocument, TenantScope,
+    AttachmentId, AttachmentReference, ContentBlock, ContentBlockKind, MediaObjectKey,
+    StructuredDocument, TenantScope,
 };
 use geo_worker::{
     ContentDocumentReadRequest, ContentDocumentSnapshot, ContentMediaBindRequest,
@@ -111,16 +111,6 @@ impl HostOps for MediaProvider {
         })
     }
 
-    async fn knowledge_search(
-        &self,
-        _: &TenantScope,
-        _: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
-        Err(HostOpError::capability_missing(
-            HostOp::KnowledgeSearch,
-            "not configured",
-        ))
-    }
     async fn manifest_read(
         &self,
         _: &TenantScope,
