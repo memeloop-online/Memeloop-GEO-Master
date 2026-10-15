@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, useLocation, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  MemoryRouter,
+  useLocation,
+  useSearchParams,
+} from "react-router-dom";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
 import {
@@ -88,7 +93,13 @@ const plan = {
 };
 function UrlState() {
   const location = useLocation();
-  return <output data-testid="measurement-url">{location.search}</output>;
+  return (
+    <>
+      <output data-testid="measurement-url">{location.search}</output>
+      <Link to="?tab=records&record=measurement-2">Open another record</Link>
+      <Link to="?tab=records">Clear selection</Link>
+    </>
+  );
 }
 function Panel({
   canWrite,
@@ -109,7 +120,12 @@ function Panel({
     />
   );
 }
-function renderPanel(canWrite = true, recordsOnly = false, followTabs = false) {
+function renderPanel(
+  canWrite = true,
+  recordsOnly = false,
+  followTabs = false,
+  initialEntry = "/",
+) {
   return render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider
@@ -122,7 +138,7 @@ function renderPanel(canWrite = true, recordsOnly = false, followTabs = false) {
           })
         }
       >
-        <MemoryRouter>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <Panel
             canWrite={canWrite}
             recordsOnly={recordsOnly}
@@ -178,6 +194,111 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it.each(["record", "planId"])(
+    "opens a %s deep link with history collapsed and the answer visible",
+    async (parameter) => {
+      const savedPlan = { ...plan, targets: [target] };
+      vi.mocked(listMeasurementPlans).mockResolvedValue({
+        items: [savedPlan],
+        next_after: null,
+      });
+      vi.mocked(getMeasurementPlan).mockResolvedValue(savedPlan);
+      vi.mocked(getChannelTarget).mockResolvedValue({
+        target,
+        attempts: [
+          {
+            attempt_id: "attempt-saved",
+            target_id: target.target_id,
+            claimed_at: "2026-10-01T00:00:01Z",
+            received_at: "2026-10-01T00:00:04Z",
+            outcome: {
+              status: "observed",
+              detail: "已收到搜索答案",
+              occurred_at: "2026-10-01T00:00:04Z",
+              raw_answer: "可在晴朗夜晚观测",
+              citations: [],
+              public_url: null,
+              screenshot_ref: null,
+              connector_version: "v1",
+              runner_evidence: [],
+              fixture: false,
+            },
+          },
+        ],
+      });
+      renderPanel(
+        false,
+        true,
+        false,
+        `/?tab=records&${parameter}=measurement-1`,
+      );
+      expect(await screen.findByText("可在晴朗夜晚观测")).toBeVisible();
+      expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(
+        screen.queryByRole("button", { name: /自定义问题测量/ }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("expands history without a selection, collapses on selection and allows reopening", async () => {
+    const savedPlan = { ...plan, targets: [target] };
+    vi.mocked(listMeasurementPlans).mockResolvedValue({
+      items: [savedPlan],
+      next_after: null,
+    });
+    vi.mocked(getMeasurementPlan).mockResolvedValue(savedPlan);
+    const user = userEvent.setup();
+    renderPanel(false, true);
+    const history = screen.getByRole("button", { name: "测量历史" });
+    expect(history).toHaveAttribute("aria-expanded", "true");
+    await user.click(
+      await screen.findByRole("button", { name: /自定义问题测量/ }),
+    );
+    expect(await screen.findByText(target.input.question)).toBeVisible();
+    expect(history).toHaveAttribute("aria-expanded", "false");
+    await user.click(history);
+    expect(history).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(target.input.question)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: /自定义问题测量/ }));
+    expect(history).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText(target.input.question)).toBeVisible();
+  });
+
+  it("follows URL selection changes after manually reopening history", async () => {
+    vi.mocked(listMeasurementPlans).mockResolvedValue({
+      items: [plan, { ...plan, plan_id: "measurement-2", title: "另一条测量" }],
+      next_after: null,
+    });
+    vi.mocked(getMeasurementPlan).mockImplementation(
+      async (_tenant, _project, id) => ({
+        ...plan,
+        plan_id: id,
+        title: id === "measurement-2" ? "另一条测量" : plan.title,
+      }),
+    );
+    const user = userEvent.setup();
+    renderPanel(false, true, false, "/?tab=records&record=measurement-1");
+    const history = screen.getByRole("button", { name: "测量历史" });
+    await user.click(history);
+    expect(history).toHaveAttribute("aria-expanded", "true");
+    await user.click(screen.getByRole("link", { name: "Open another record" }));
+    expect(await screen.findByText("另一条测量")).toBeVisible();
+    expect(history).toHaveAttribute("aria-expanded", "false");
+    expect(getMeasurementPlan).toHaveBeenCalledWith(
+      "tenant-1",
+      "project-1",
+      "measurement-2",
+    );
+    await user.click(screen.getByRole("link", { name: "Clear selection" }));
+    expect(history).toHaveAttribute("aria-expanded", "true");
+    expect(
+      await screen.findByRole("button", { name: /自定义问题测量/ }),
+    ).toBeVisible();
+  });
+
   it("submits the selected supported provider instead of a fixed provider", async () => {
     state.platforms = [
       {
@@ -584,6 +705,7 @@ describe("standalone arbitrary-topic measurement", () => {
         "measurement-1",
       ),
     );
+    await user.click(screen.getByRole("button", { name: "测量历史" }));
     await user.click(screen.getByRole("button", { name: "下一页测量" }));
     expect(
       await screen.findByRole("button", { name: /更早的测量/ }),

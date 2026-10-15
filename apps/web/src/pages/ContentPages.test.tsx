@@ -1104,9 +1104,13 @@ describe("P09 content revision", () => {
     renderPage(
       "/app/tenant-1/project-1/content/asset-1?reuse_execution_id=execution-1&reuse_item_id=item-1",
     );
-    const title = await screen.findByRole("textbox", { name: "标题" });
+    await screen.findByText("证据原文片段");
+    const title = screen.getByLabelText("标题");
+    const forkButton = screen.getByText("创建本轮修订", {
+      selector: "button",
+    });
     await userEvent.type(title, "本地改动");
-    await userEvent.click(screen.getByRole("button", { name: "创建本轮修订" }));
+    await userEvent.click(forkButton);
     expect(await screen.findByText(/本地输入仍保留/)).toBeInTheDocument();
     expect(title).toHaveValue("有来源的指南本地改动");
   });
@@ -1129,10 +1133,21 @@ describe("P09 content revision", () => {
     );
     await screen.findByText("证据原文片段");
     const title = screen.getByLabelText("标题");
-    await userEvent.type(title, "新");
-    await userEvent.click(
-      screen.getByText("创建本轮修订", { selector: "button" }),
+    const forkButton = screen.getByText("创建本轮修订", {
+      selector: "button",
+    });
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    // This case exercises manual retry. Hold the editor's autosave so it cannot
+    // consume the transient failure or retry while CI is resolving assertions.
+    vi.spyOn(window as Window, "setTimeout").mockImplementation(
+      (handler, delay, ...args) => {
+        if (delay === 1000 && typeof handler === "function")
+          return nativeSetTimeout(() => {}, 0);
+        return nativeSetTimeout(handler, delay, ...args);
+      },
     );
+    await userEvent.type(title, "新");
+    await userEvent.click(forkButton);
     await screen.findByText("暂时无法保存", { selector: "span" });
     expect(title).toHaveValue("有来源的指南新");
     await userEvent.click(screen.getByText("重试", { selector: "button" }));
