@@ -62,6 +62,11 @@ export function MeasurementPeriodReportPanel({
   });
   const current = selected ? detail : preview;
   const report = current.data;
+  const hasAnswer = (sample: MeasurementPeriodProjection["samples"][number]) =>
+    Boolean(sample.observation?.raw_answer.trim());
+  const available = report?.samples.filter(hasAnswer) ?? [];
+  const unavailable =
+    report?.samples.filter((sample) => !hasAnswer(sample)) ?? [];
   const canWrite = session?.memberships.some(
     (member) =>
       member.tenant_id === tenantId &&
@@ -156,41 +161,43 @@ export function MeasurementPeriodReportPanel({
             <p>{t("asOf", { time: at(report.evidence_as_of) })}</p>
             <h3>{t("aiTitle")}</h3>
             <p>
-              {t("planned", { count: report.coverage.planned })} ·{" "}
-              {t("live", { count: report.coverage.observed_live })} ·{" "}
-              {t("analysis", {
-                count: report.coverage.grounded_saved_analysis,
-              })}
+              {t("sampleTotal", { count: report.samples.length })} ·{" "}
+              {t("answersAvailable", { count: available.length })} ·{" "}
+              {t("answersUnavailable", { count: unavailable.length })}
             </p>
-            <ul>
-              {Object.entries(report.coverage.counts).map(([key, count]) => (
-                <li key={key}>
-                  {status(key)}: {count}
-                </li>
-              ))}
-            </ul>
+            <details>
+              <summary>{t("originalResults")}</summary>
+              <p>
+                {t("planned", { count: report.coverage.planned })} ·{" "}
+                {t("live", { count: report.coverage.observed_live })} ·{" "}
+                {t("analysis", {
+                  count: report.coverage.grounded_saved_analysis,
+                })}
+              </p>
+              <ul>
+                {Object.entries(report.coverage.counts).map(([key, count]) => (
+                  <li key={key}>
+                    {status(key)}: {count}
+                  </li>
+                ))}
+              </ul>
+            </details>
             {!selected && canWrite && (
               <Button disabled={saving} onClick={() => void save()}>
                 {t(saving ? "saving" : "save")}
               </Button>
             )}
             {!report.samples.length && <p>{t("empty")}</p>}
-            {report.samples.map((sample) => (
+            {[...available, ...unavailable].map((sample) => (
               <Card
                 className="report-panel"
                 key={`${sample.target_id}/${sample.attempt_id ?? ""}`}
               >
                 <h4>{reportMeasurementTitle(sample.comparison_key)}</h4>
-                <p>
-                  {t("original", { status: status(sample.original_status) })}
-                </p>
-                <p>{t("scheduled", { time: at(sample.scheduled_at) })}</p>
-                <a
-                  href={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/measurement?tab=records&record=${encodeURIComponent(sample.plan_id)}`}
-                >
-                  {t("record")}
-                </a>
-                {sample.observation?.provenance && sample.attempt_id ? (
+                <p>{t(hasAnswer(sample) ? "answerAvailable" : "noAnswer")}</p>
+                {sample.observation?.provenance &&
+                sample.attempt_id &&
+                hasAnswer(sample) ? (
                   <ReportSupplementaryMeasurements
                     embedded
                     timezone={report.report_timezone}
@@ -209,15 +216,19 @@ export function MeasurementPeriodReportPanel({
                         time: at(sample.observation.observed_at),
                       })}
                     </p>
-                    <h5>{t("answer")}</h5>
-                    <p
-                      style={{
-                        whiteSpace: "pre-wrap",
-                        overflowWrap: "anywhere",
-                      }}
-                    >
-                      {sample.observation.raw_answer}
-                    </p>
+                    {hasAnswer(sample) && (
+                      <>
+                        <h5>{t("answer")}</h5>
+                        <p
+                          style={{
+                            whiteSpace: "pre-wrap",
+                            overflowWrap: "anywhere",
+                          }}
+                        >
+                          {sample.observation.raw_answer}
+                        </p>
+                      </>
+                    )}
                     <h5>{t("citations")}</h5>
                     <ul>
                       {sample.observation.citations.map((url, index) => {
@@ -240,9 +251,29 @@ export function MeasurementPeriodReportPanel({
                       })}
                     </ul>
                   </>
-                ) : (
-                  <p>{t("noAnswer")}</p>
-                )}
+                ) : null}
+                <details>
+                  <summary>{t("originalReceipt")}</summary>
+                  <p>
+                    {t("original", { status: status(sample.original_status) })}
+                  </p>
+                  <p>{t("scheduled", { time: at(sample.scheduled_at) })}</p>
+                  {!hasAnswer(sample) && sample.observation && (
+                    <pre
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        overflowWrap: "anywhere",
+                      }}
+                    >
+                      {JSON.stringify(sample.observation, null, 2)}
+                    </pre>
+                  )}
+                </details>
+                <a
+                  href={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/measurement?tab=records&record=${encodeURIComponent(sample.plan_id)}`}
+                >
+                  {t("record")}
+                </a>
                 {!sample.observation?.provenance && (
                   <details>
                     <summary>

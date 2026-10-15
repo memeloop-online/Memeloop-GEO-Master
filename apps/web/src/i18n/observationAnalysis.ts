@@ -4,6 +4,7 @@ const translations = {
   "zh-CN": {
     title: "已存回答解析",
     availableAnswer: "已存回答",
+    answerDetails: "回答信息",
     history: "解析记录与操作",
     parse: "重新解析",
     submitting: "正在提交解析",
@@ -53,6 +54,7 @@ const translations = {
   en: {
     title: "Saved response analysis",
     availableAnswer: "Saved answer",
+    answerDetails: "Answer details",
     history: "Analysis history and actions",
     parse: "Reanalyze",
     submitting: "Submitting analysis",

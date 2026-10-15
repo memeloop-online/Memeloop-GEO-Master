@@ -133,19 +133,8 @@ export function ObservationAnalysisPanel({
           .filter((url): url is string => url !== null),
       ),
     ];
-    return (
-      <article key={revision.request.revision_id}>
-        <p role="status">
-          {t(
-            revision.state !== "completed"
-              ? revision.state
-              : outcome?.status === "failed"
-                ? analysisFailureMessageKey(outcome.code)
-                : outcome?.status === "unverified"
-                  ? analysisUnverifiedMessageKey(outcome.reason)
-                  : (outcome?.status ?? "incomplete"),
-          )}
-        </p>
+    const metadata = (
+      <>
         <p>{t("requested", { value: date(revision.created_at) })}</p>
         {revision.analyzed_at && (
           <p>{t("analyzed", { value: date(revision.analyzed_at) })}</p>
@@ -159,6 +148,22 @@ export function ObservationAnalysisPanel({
           {t("source")} ·{" "}
           {t("observed", { value: date(revision.request.observed_at) })}
         </p>
+      </>
+    );
+    return (
+      <article key={revision.request.revision_id}>
+        <p role="status">
+          {t(
+            revision.state !== "completed"
+              ? revision.state
+              : outcome?.status === "failed"
+                ? analysisFailureMessageKey(outcome.code)
+                : outcome?.status === "unverified"
+                  ? analysisUnverifiedMessageKey(outcome.reason)
+                  : (outcome?.status ?? "incomplete"),
+          )}
+        </p>
+        {!grounded && metadata}
         {grounded && (
           <>
             <h5>{t("answer")}</h5>
@@ -178,10 +183,16 @@ export function ObservationAnalysisPanel({
               <p>{t("noCitations")}</p>
             )}
             <details>
-              <summary>{t("evidence")}</summary>
-              <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-                {JSON.stringify(grounded.audit, null, 2)}
-              </pre>
+              <summary>{t("answerDetails")}</summary>
+              {metadata}
+              <details>
+                <summary>{t("evidence")}</summary>
+                <pre
+                  style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                >
+                  {JSON.stringify(grounded.audit, null, 2)}
+                </pre>
+              </details>
             </details>
           </>
         )}
