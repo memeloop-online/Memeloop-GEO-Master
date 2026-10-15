@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  Accordion,
+  AccordionHeader,
+  AccordionItem,
+  AccordionPanel,
   Button,
   Field,
   Select,
@@ -45,7 +49,12 @@ export function StandaloneMeasurementPanel({
   const { t } = useTranslation("measurement");
   const [params, setParams] = useSearchParams();
   const selectedId = params.get("record") ?? params.get("planId") ?? undefined;
-  const selectRecord = (id: string) =>
+  const [historyOpen, setHistoryOpen] = useState(!selectedId);
+  useEffect(() => {
+    setHistoryOpen(!selectedId);
+  }, [selectedId, tenantId, projectId]);
+  const selectRecord = (id: string) => {
+    setHistoryOpen(false);
     setParams((previous) => {
       const next = new URLSearchParams(previous);
       next.set("tab", "records");
@@ -53,6 +62,7 @@ export function StandaloneMeasurementPanel({
       next.set("record", id);
       return next;
     });
+  };
   const { session } = useAuth();
   const client = useQueryClient();
   const channels = useChannelData(tenantId, projectId);
@@ -595,49 +605,69 @@ export function StandaloneMeasurementPanel({
       {recordsOnly && (
         <>
           <h2>测量记录</h2>
-          <Button appearance="subtle" onClick={() => void history.refetch()}>
-            刷新测量历史
-          </Button>
-          {history.isPending && <LoadingState label="正在读取独立测量历史" />}
-          {history.isError && (
-            <ErrorState
-              title="测量历史无法读取"
-              detail={errorText(history.error)}
-              onRetry={() => void history.refetch()}
-            />
-          )}
-          {history.data?.items.length === 0 && <p>还没有独立测量计划。</p>}
-          {history.data?.items.map((plan) => (
-            <p key={plan.plan_id}>
-              <Button
-                appearance="subtle"
-                onClick={() => selectRecord(plan.plan_id)}
-              >
-                {plan.title} ·{" "}
-                {new Date(plan.created_at).toLocaleString("zh-CN")}
-              </Button>
-            </p>
-          ))}
-          {previous.length > 0 && (
-            <Button
-              onClick={() => {
-                setAfter(previous.at(-1));
-                setPrevious((items) => items.slice(0, -1));
-              }}
-            >
-              上一页测量
-            </Button>
-          )}
-          {history.data?.next_after && (
-            <Button
-              onClick={() => {
-                setPrevious((items) => [...items, after]);
-                setAfter(history.data!.next_after!);
-              }}
-            >
-              下一页测量
-            </Button>
-          )}
+          <Accordion
+            collapsible
+            openItems={historyOpen ? ["history"] : []}
+            onToggle={(_, data) =>
+              setHistoryOpen(data.openItems.includes("history"))
+            }
+          >
+            <AccordionItem value="history">
+              <AccordionHeader>{t("measurementHistory")}</AccordionHeader>
+              <AccordionPanel>
+                <Button
+                  appearance="subtle"
+                  onClick={() => void history.refetch()}
+                >
+                  刷新测量历史
+                </Button>
+                {history.isPending && (
+                  <LoadingState label="正在读取独立测量历史" />
+                )}
+                {history.isError && (
+                  <ErrorState
+                    title="测量历史无法读取"
+                    detail={errorText(history.error)}
+                    onRetry={() => void history.refetch()}
+                  />
+                )}
+                {history.data?.items.length === 0 && (
+                  <p>还没有独立测量计划。</p>
+                )}
+                {history.data?.items.map((plan) => (
+                  <p key={plan.plan_id}>
+                    <Button
+                      appearance="subtle"
+                      onClick={() => selectRecord(plan.plan_id)}
+                    >
+                      {plan.title} ·{" "}
+                      {new Date(plan.created_at).toLocaleString("zh-CN")}
+                    </Button>
+                  </p>
+                ))}
+                {previous.length > 0 && (
+                  <Button
+                    onClick={() => {
+                      setAfter(previous.at(-1));
+                      setPrevious((items) => items.slice(0, -1));
+                    }}
+                  >
+                    上一页测量
+                  </Button>
+                )}
+                {history.data?.next_after && (
+                  <Button
+                    onClick={() => {
+                      setPrevious((items) => [...items, after]);
+                      setAfter(history.data!.next_after!);
+                    }}
+                  >
+                    下一页测量
+                  </Button>
+                )}
+              </AccordionPanel>
+            </AccordionItem>
+          </Accordion>
           {selectedId && detail.isPending && (
             <LoadingState label="正在读取测量计划" />
           )}
