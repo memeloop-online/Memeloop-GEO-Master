@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -469,6 +469,9 @@ describe("project setup workflow", () => {
     await user.clear(screen.getByRole("textbox", { name: "月度预算" }));
     await user.type(screen.getByRole("textbox", { name: "月度预算" }), "60000");
     await user.click(screen.getByRole("button", { name: "启动项目" }));
+    await act(async () => {
+      await import("./AgentWorkbenchPage");
+    });
 
     expect(
       await screen.findByRole("heading", { name: "从你的资料或想法开始" }),

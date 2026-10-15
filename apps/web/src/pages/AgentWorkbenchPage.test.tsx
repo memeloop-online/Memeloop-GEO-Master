@@ -159,6 +159,9 @@ describe("P00 AI workbench routing", () => {
       );
       vi.stubGlobal("fetch", fetchMock);
       renderApp("/app/tenant-a/project-a/chat/conversation-a");
+      await act(async () => {
+        await import("./AgentWorkbenchPage");
+      });
       expect(await screen.findByText(notice)).toBeInTheDocument();
       expect(screen.getByText("Help with this task")).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "取消运行" })).toBeNull();
