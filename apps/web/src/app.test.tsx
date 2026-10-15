@@ -392,7 +392,7 @@ describe("lazy project navigation", () => {
     expect(screen.getByRole("complementary", { name: "主导航" })).toBe(sidebar);
     expect(sidebar).toBeVisible();
     expect(screen.getByRole("button", { name: "展开导航栏" })).toBeVisible();
-    expect(screen.getByText("正在加载")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "企业知识库" })).toBeVisible();
     await act(async () => reportsModule.resolve());
     expect(
       await screen.findByRole("heading", { name: "报告详情" }),
