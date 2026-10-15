@@ -648,9 +648,7 @@ describe("P13 versioned question sets", () => {
       "/app/tenant-1/project-1/measurement?tab=sets&set=set-1",
     );
     await screen.findByRole("heading", { name: "基础问题 · v1" });
-    await user.click(
-      screen.getByRole("button", { name: "基于当前版本修订" }),
-    );
+    await user.click(screen.getByRole("button", { name: "基于当前版本修订" }));
     await user.clear(screen.getByLabelText("问题 1"));
     await user.type(screen.getByLabelText("问题 1"), "返回后继续编辑");
     const stored = JSON.parse(
