@@ -461,3 +461,82 @@ fn correction_preserves_cohort_and_source_protocol_are_not_collapsed() {
         .is_err()
     );
 }
+
+#[test]
+fn delayed_generation_never_admits_search_evidence_after_fixed_cutoff() {
+    let (scope, window, cohort, original) = fixture();
+    let cutoff = window.end_at;
+    let generated_at = cutoff + Duration::hours(2);
+    for field in 0..4 {
+        let mut candidate = original.clone();
+        let late = cutoff + Duration::nanoseconds(1);
+        match field {
+            0 => {
+                candidate.observation.provider_observed_at = Some(original.observation.received_at);
+                candidate.observation.received_at = late;
+                candidate.observation.analyzed_at = late;
+                candidate.raw.captured_at = late;
+            }
+            1 => candidate.observation.analyzed_at = late,
+            2 => candidate.raw.stored_at = late,
+            3 => candidate.observation_stored_at = late,
+            _ => unreachable!(),
+        }
+        let sample = build_measurement_period_search_sample(
+            cohort.clone(),
+            vec![candidate.clone()],
+            &window,
+            cutoff,
+        )
+        .unwrap();
+        assert!(sample.evidence.is_none());
+        let projected = preview_measurement_period_at_cutoff(
+            &scope,
+            &window,
+            vec![],
+            Some(vec![sample]),
+            cutoff,
+            generated_at,
+        )
+        .unwrap();
+        let search = projected.search.unwrap();
+        assert_eq!(search.coverage.planned, 1);
+        assert_eq!(
+            search.coverage.counts[&MeasurementPeriodSearchStatus::NoEligibleObservation],
+            1
+        );
+        // Even a prebuilt sample selected using the later generation time must
+        // fail closed when the report validates its actual evidence cutoff.
+        let prematurely_selected = build_measurement_period_search_sample(
+            cohort.clone(),
+            vec![candidate],
+            &window,
+            generated_at,
+        )
+        .unwrap();
+        assert!(prematurely_selected.evidence.is_some());
+        assert!(
+            preview_measurement_period_at_cutoff(
+                &scope,
+                &window,
+                vec![],
+                Some(vec![prematurely_selected]),
+                cutoff,
+                generated_at,
+            )
+            .is_err()
+        );
+    }
+    let original_sample =
+        build_measurement_period_search_sample(cohort, vec![original], &window, cutoff).unwrap();
+    let projected = preview_measurement_period_at_cutoff(
+        &scope,
+        &window,
+        vec![],
+        Some(vec![original_sample.clone()]),
+        cutoff,
+        generated_at,
+    )
+    .unwrap();
+    assert_eq!(projected.search.unwrap().samples, vec![original_sample]);
+}

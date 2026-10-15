@@ -154,7 +154,7 @@ pub enum ReportWeekday {
 }
 
 impl ReportWeekday {
-    fn num_days_from_monday(self) -> u32 {
+    pub(crate) fn num_days_from_monday(self) -> u32 {
         match self {
             Self::Monday => 0,
             Self::Tuesday => 1,
@@ -856,7 +856,7 @@ pub fn next_calendar_week_window(
     Ok((start, end, cutoff))
 }
 
-fn cutoff_after(
+pub(crate) fn cutoff_after(
     timezone: Tz,
     weekday: ReportWeekday,
     time: NaiveTime,
@@ -875,7 +875,7 @@ fn cutoff_after(
     Ok(cutoff)
 }
 
-fn resolve_local_datetime(timezone: Tz, value: NaiveDateTime) -> DateTime<Utc> {
+pub(crate) fn resolve_local_datetime(timezone: Tz, value: NaiveDateTime) -> DateTime<Utc> {
     let mut candidate = value;
     loop {
         match timezone.from_local_datetime(&candidate) {

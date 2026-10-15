@@ -59,6 +59,8 @@ pub use publication_send_authorization::PgPublicationSendAuthorizationRepository
 mod questions;
 pub use questions::PgQuestionRepository;
 mod measurement_report;
+mod measurement_weekly;
+pub use geo_domain::MeasurementWeeklySchedule;
 mod report;
 mod serp;
 pub use serp::{MemorySerpRepository, PgSerpRepository};

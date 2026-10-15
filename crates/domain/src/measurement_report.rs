@@ -129,14 +129,27 @@ pub fn preview_measurement_period(
 pub fn preview_measurement_period_with_search(
     scope: &TenantScope,
     window: &MeasurementPeriodWindow,
-    mut samples: Vec<MeasurementPeriodSample>,
+    samples: Vec<MeasurementPeriodSample>,
     search_samples: Option<Vec<MeasurementPeriodSearchSample>>,
     now: DateTime<Utc>,
+) -> Result<MeasurementPeriodPreview, AppError> {
+    preview_measurement_period_at_cutoff(scope, window, samples, search_samples, now, now)
+}
+
+/// Project evidence at a fixed cutoff, independently of when the report is generated.
+/// Generation time is metadata, not an evidence eligibility or identity input.
+pub fn preview_measurement_period_at_cutoff(
+    scope: &TenantScope,
+    window: &MeasurementPeriodWindow,
+    mut samples: Vec<MeasurementPeriodSample>,
+    search_samples: Option<Vec<MeasurementPeriodSearchSample>>,
+    evidence_as_of: DateTime<Utc>,
+    generated_at: DateTime<Utc>,
 ) -> Result<MeasurementPeriodPreview, AppError> {
     let project_id = scope
         .project_id
         .ok_or_else(|| AppError::forbidden("project scope required"))?;
-    window.validate(now)?;
+    validate_measurement_period_clocks(window, evidence_as_of, generated_at)?;
     samples.sort_by_key(|sample| sample.target_id);
     let mut seen = BTreeSet::new();
     let mut coverage = MeasurementPeriodCoverage::default();
@@ -173,10 +186,10 @@ pub fn preview_measurement_period_with_search(
                 || observation.observed_at < window.start_at
                 || observation.observed_at >= window.end_at
                 || observation.observed_at > observation.received_at
-                || observation.received_at > now
+                || observation.received_at > evidence_as_of
                 || observation.provenance.as_ref().is_some_and(|source| {
                     source.observed_at != observation.observed_at
-                        || source.analyzed_at > now
+                        || source.analyzed_at > evidence_as_of
                         || source.analyzed_at < observation.observed_at
                         || source.actual_model.trim().is_empty()
                         || source.source_sha256.len() != 64
@@ -202,7 +215,9 @@ pub fn preview_measurement_period_with_search(
     let search = search_samples
         .map(|samples| {
             crate::measurement_report_search::measurement_period_search_section(
-                samples, window, now,
+                samples,
+                window,
+                evidence_as_of,
             )
         })
         .transpose()?;
@@ -218,13 +233,27 @@ pub fn preview_measurement_period_with_search(
         report_window_start_at: window.start_at,
         report_window_end_at: window.end_at,
         report_timezone: window.report_timezone.clone(),
-        evidence_as_of: now,
-        generated_at: now,
+        evidence_as_of,
+        generated_at,
         input_hash: hex::encode(Sha256::digest(bytes)),
         coverage,
         samples,
         search,
     })
+}
+
+fn validate_measurement_period_clocks(
+    window: &MeasurementPeriodWindow,
+    evidence_as_of: DateTime<Utc>,
+    generated_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    window.validate(evidence_as_of)?;
+    if evidence_as_of > generated_at {
+        return Err(AppError::invalid_request(
+            "measurement report evidence time exceeds generation time",
+        ));
+    }
+    Ok(())
 }
 
 pub fn freeze_measurement_period(
@@ -241,6 +270,15 @@ pub fn freeze_measurement_period(
             "invalid measurement report revision",
         ));
     }
+    validate_measurement_period_clocks(
+        &MeasurementPeriodWindow {
+            start_at: preview.report_window_start_at,
+            end_at: preview.report_window_end_at,
+            report_timezone: preview.report_timezone.clone(),
+        },
+        preview.evidence_as_of,
+        preview.generated_at,
+    )?;
     let digest = Sha256::digest(
         format!(
             "measurement-period-v1:{}:{}:{}:{}:{}:{}:{revision}",
@@ -279,12 +317,11 @@ pub fn validate_measurement_period_correction(
     existing: &[MeasurementPeriodReport],
     proposed: &MeasurementPeriodReport,
 ) -> Result<(), AppError> {
-    proposed.window().validate(proposed.generated_at)?;
-    if proposed.evidence_as_of != proposed.generated_at {
-        return Err(AppError::invalid_request(
-            "measurement report evidence time differs",
-        ));
-    }
+    validate_measurement_period_clocks(
+        &proposed.window(),
+        proposed.evidence_as_of,
+        proposed.generated_at,
+    )?;
     if proposed.revision == 1 && proposed.correction_of.is_none() {
         return Ok(());
     }

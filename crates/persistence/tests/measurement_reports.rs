@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use geo_domain::{
     EffectiveObservation, ErrorCode, MeasurementPeriodSample, MeasurementPeriodWindow,
     ObservationAnalysisSource, ReportRepository, SavedAnalysisProvenance, TenantScope,
-    freeze_measurement_period, preview_measurement_period,
+    freeze_measurement_period, preview_measurement_period, preview_measurement_period_at_cutoff,
 };
 use geo_persistence::{Database, DatabaseConfig, PgReportRepository};
 use uuid::Uuid;
@@ -100,7 +100,7 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
     });
     let proposed = freeze_measurement_period(
         &scope,
-        preview_measurement_period(&scope, &window, vec![interpreted], analyzed).unwrap(),
+        preview_measurement_period(&scope, &window, vec![interpreted.clone()], analyzed).unwrap(),
         2,
         Some(first.report_id),
     )
@@ -136,6 +136,95 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
             .unwrap()
             .len(),
         2
+    );
+    // A distinct delayed report keeps the cutoff independent of generation,
+    // even though the late interpretation is already present when assembled.
+    let delayed_window = MeasurementPeriodWindow {
+        report_timezone: "Asia/Shanghai".into(),
+        ..window
+    };
+    let generated = analyzed + Duration::hours(1);
+    let delayed = freeze_measurement_period(
+        &scope,
+        preview_measurement_period_at_cutoff(
+            &scope,
+            &delayed_window,
+            vec![interpreted.clone()],
+            None,
+            now,
+            generated,
+        )
+        .unwrap(),
+        1,
+        None,
+    )
+    .unwrap();
+    let delayed = restarted
+        .create_measurement_period(&scope, delayed)
+        .await
+        .unwrap();
+    assert_eq!(delayed.evidence_as_of, now);
+    assert_eq!(delayed.generated_at, generated);
+    assert_eq!(delayed.coverage.planned, 1);
+    assert_eq!(delayed.coverage.grounded_saved_analysis, 0);
+    assert!(delayed.samples[0].observation.is_none());
+    let corrected = freeze_measurement_period(
+        &scope,
+        preview_measurement_period_at_cutoff(
+            &scope,
+            &delayed_window,
+            vec![interpreted],
+            None,
+            analyzed,
+            generated + Duration::minutes(1),
+        )
+        .unwrap(),
+        2,
+        Some(delayed.report_id),
+    )
+    .unwrap();
+    let corrected = restarted
+        .create_measurement_period(&scope, corrected)
+        .await
+        .unwrap();
+    assert_eq!(corrected.coverage.planned, delayed.coverage.planned);
+    assert_eq!(corrected.coverage.grounded_saved_analysis, 1);
+    let replay = freeze_measurement_period(
+        &scope,
+        preview_measurement_period_at_cutoff(
+            &scope,
+            &delayed_window,
+            vec![sample],
+            None,
+            analyzed,
+            generated + Duration::minutes(2),
+        )
+        .unwrap(),
+        2,
+        Some(delayed.report_id),
+    )
+    .unwrap();
+    assert_eq!(
+        restarted
+            .create_measurement_period(&scope, replay)
+            .await
+            .unwrap(),
+        corrected
+    );
+    let reopened = PgReportRepository::from_database(&database);
+    assert_eq!(
+        reopened
+            .get_measurement_period(&scope, delayed.report_id)
+            .await
+            .unwrap(),
+        delayed
+    );
+    assert_eq!(
+        reopened
+            .get_measurement_period(&scope, corrected.report_id)
+            .await
+            .unwrap(),
+        corrected
     );
     assert_eq!(
         restarted

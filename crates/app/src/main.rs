@@ -8,6 +8,7 @@ mod content_request_dispatch;
 #[cfg(test)]
 mod content_runtime_tests;
 mod dispatch;
+mod measurement_weekly;
 mod observation_completion_recovery_dispatch;
 mod partner_sync_dispatch;
 mod production_runtime;
@@ -305,6 +306,7 @@ fn spawn_due_report_scanner(
         loop {
             ticks.tick().await;
             let now = chrono::Utc::now();
+            measurement_weekly::scan(&state, &scanner, now).await;
             let mut cursor = None;
             // A failed old cycle must not monopolize the bounded first page.
             // Keep moving through this due set, then begin at the oldest
