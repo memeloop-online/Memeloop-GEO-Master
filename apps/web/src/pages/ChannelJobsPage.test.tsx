@@ -223,6 +223,66 @@ describe("automatic measurement results", () => {
     expect(screen.getByText("未能确认本次测量结果。")).toBeVisible();
   });
 
+  it.each(["zh-CN", "en"])(
+    "explains a provider protocol error without changing the unknown receipt or resending in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      try {
+        const { requests } = await renderAutomaticResult({
+          status: "unknown",
+          detail: "provider_unavailable",
+          raw_answer: null,
+          citations: [],
+        });
+        expect(
+          screen.getByText(
+            i18n.t("automaticProviderUnavailableDetail", { ns: "measurement" }),
+          ),
+        ).toBeVisible();
+        expect(
+          screen.getAllByText(
+            i18n.t("automaticProviderUnavailable", { ns: "measurement" }),
+            { exact: false },
+          ).length,
+        ).toBeGreaterThan(0);
+        expect(
+          screen.queryByText(
+            i18n.t("automaticUnknownDetail", { ns: "measurement" }),
+          ),
+        ).not.toBeInTheDocument();
+        expect(
+          screen.queryByText("provider_unavailable"),
+        ).not.toBeInTheDocument();
+        await userEvent.click(
+          screen.getByText(
+            i18n.t("resultTechnicalDetails", { ns: "measurement" }),
+          ),
+        );
+        expect(
+          screen.getByText(/"detail": "provider_unavailable"/),
+        ).toHaveTextContent('"status": "unknown"');
+        expect(
+          requests.filter((request) => request.method === "POST"),
+        ).toHaveLength(0);
+      } finally {
+        await act(async () => {
+          await i18n.changeLanguage("zh-CN");
+        });
+      }
+    },
+  );
+
+  it("does not infer a provider outage from an AI rejection reason", async () => {
+    await renderAutomaticResult({
+      status: "unknown",
+      detail: "model_unverified",
+    });
+    expect(screen.getByText("未能确认本次测量结果。")).toBeVisible();
+    expect(
+      screen.queryByText("平台暂时无法回答，请稍后再试。"),
+    ).not.toBeInTheDocument();
+  });
+
   it("uses receipt time for a legacy measurement without changing its unknown outcome", async () => {
     await renderAutomaticResult(
       { status: "unknown", occurred_at: "2026-10-01T00:00:00Z" },

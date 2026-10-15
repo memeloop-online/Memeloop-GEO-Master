@@ -1,5 +1,6 @@
 import {
   isDeepSeekHistoryExplicitlyAbsent,
+  verifyDeepSeekEmptyHistory,
   verifyDeepSeekFirstTurnHistory,
 } from "./deepseek-history-evidence.mjs";
 import {
@@ -52,6 +53,7 @@ export async function readDeepSeekFirstTurnHistory(
     requestMessageId,
     responseMessageId,
     onFailureReason,
+    allowEmptyHistory = false,
     ...options
   } = {},
 ) {
@@ -83,19 +85,22 @@ export async function readDeepSeekFirstTurnHistory(
     async ({ request, active }) => {
       const envelope = await request("history", conversationId);
       if (!envelope || !active()) return null;
-      const inventory = verifyDeepSeekFirstTurnHistory(
-        envelope,
-        {
-          conversationId,
-          requestMessageId,
-          responseMessageId,
-        },
-        {
-          onFailureReason: (value) => {
-            if (active()) reason ??= value;
+      const inventory =
+        (allowEmptyHistory === true &&
+          verifyDeepSeekEmptyHistory(envelope, conversationId)) ||
+        verifyDeepSeekFirstTurnHistory(
+          envelope,
+          {
+            conversationId,
+            requestMessageId,
+            responseMessageId,
           },
-        },
-      );
+          {
+            onFailureReason: (value) => {
+              if (active()) reason ??= value;
+            },
+          },
+        );
       return inventory
         ? { inventory, history: observedHistory(envelope) }
         : null;
@@ -121,6 +126,8 @@ export function projectDeepSeekCleanupHistory(envelope, conversationId) {
   )
     return unknown;
   try {
+    const empty = verifyDeepSeekEmptyHistory(envelope, conversationId);
+    if (empty) return { status: "verified", inventory: empty };
     const messages = JSON.parse(envelope.body)?.data?.biz_data?.chat_messages;
     if (!Array.isArray(messages) || messages.length !== 2) return unknown;
     const user = messages.find((message) => message?.role === "USER");

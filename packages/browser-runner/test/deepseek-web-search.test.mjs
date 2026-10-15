@@ -617,6 +617,111 @@ test("arms both observers before fresh navigation, persists before shared AI ext
   assert.equal(result.source_redaction.omitted_paths.length, 0);
 });
 
+function terminalErrorFixture() {
+  const f = historyFixture();
+  f.exchange.messages = [
+    f.exchange.messages[0],
+    {
+      event: "hint",
+      data: {
+        type: "error",
+        finish_reason: "backend_err",
+        clear_response: true,
+        content: "Synthetic protocol notice",
+      },
+    },
+    { event: "close", data: {} },
+  ];
+  f.options.readHistory = async () => null;
+  f.options.apiExtract = async () => {
+    f.calls.push("extract");
+    return {
+      model: "fixture-parser",
+      surface: "model_api",
+      extracted: {
+        completion: "unknown",
+        completion_evidence: [],
+        search_used: "unknown",
+        search_evidence: [],
+        answer_segments: [],
+        citations: [],
+      },
+    };
+  };
+  return f;
+}
+
+test("terminal provider error uses only protocol metadata after source persistence and AI interpretation", async () => {
+  for (const notice of [
+    undefined,
+    "Synthetic protocol notice",
+    "Any notice text",
+  ]) {
+    const f = terminalErrorFixture();
+    if (notice === undefined) delete f.exchange.messages[1].data.content;
+    else f.exchange.messages[1].data.content = notice;
+    const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+    assert.equal(result.reason, "provider_unavailable");
+    assert.equal(result.raw_answer, undefined);
+    assert.equal(result.search_event, undefined);
+    assert.equal(f.evidence.completion, undefined);
+    assert.equal(
+      JSON.parse(f.evidence.source_json).messages[1].data.type,
+      "error",
+    );
+    assert.ok(f.calls.indexOf("source") < f.calls.indexOf("extract"));
+    assert.ok(f.calls.includes("candidate"));
+    assert.equal(f.calls.filter((call) => call === "send").length, 1);
+    assert.equal(JSON.stringify(result).includes("notice"), false);
+  }
+});
+
+test("notice prose and incomplete or nonterminal protocol errors keep the unverified result", async () => {
+  for (const change of [
+    (exchange) => {
+      exchange.sse_terminal = false;
+    },
+    (exchange) => {
+      exchange.messages.pop();
+    },
+    (exchange) => {
+      exchange.messages[1].data.type = "info";
+    },
+    (exchange) => {
+      exchange.messages[1].data.finish_reason = "other";
+    },
+    (exchange) => {
+      exchange.messages[1].data.clear_response = false;
+    },
+    (exchange) => {
+      exchange.messages[1].data.clear_response = "true";
+    },
+    (exchange) => {
+      exchange.messages.splice(2, 0, {
+        event: "title",
+        data: { content: "Later event" },
+      });
+    },
+  ]) {
+    const f = terminalErrorFixture();
+    change(f.exchange);
+    const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+    assert.equal(result.reason, "interpretation_unverified");
+    assert.equal(f.calls.filter((call) => call === "send").length, 1);
+  }
+});
+
+test("terminal provider error does not mask source persistence failure", async () => {
+  const f = terminalErrorFixture();
+  f.options.onEvidence = async () => {
+    throw new Error("Synthetic persistence failure");
+  };
+  const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+  assert.equal(result.reason, "evidence_persist_failed");
+  assert.equal(f.calls.includes("extract"), false);
+  assert.equal(f.calls.filter((call) => call === "send").length, 1);
+});
+
 test("unavailable ownership or evidence integration is rejected before navigation or sending", async () => {
   for (const [key, reason] of [
     ["persistConversation", "ownership_unavailable"],

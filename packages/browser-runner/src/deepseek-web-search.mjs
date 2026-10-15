@@ -31,6 +31,21 @@ class FlowError extends Error {
   }
 }
 
+function terminalProviderUnavailable(exchange) {
+  if (exchange?.sse_terminal !== true || !Array.isArray(exchange.messages))
+    return false;
+  const hint = exchange.messages.at(-2);
+  // This is a terminal protocol failure, independent of notice prose or the
+  // AI's interpretation of answer, search and citation content.
+  return (
+    exchange.messages.at(-1)?.event === "close" &&
+    hint?.event === "hint" &&
+    hint.data?.type === "error" &&
+    hint.data?.finish_reason === "backend_err" &&
+    hint.data?.clear_response === true
+  );
+}
+
 /**
  * Inactive integration entry point: the caller owns the page/context lifetime.
  * A provider-specific ownership staging adapter must be explicitly supplied
@@ -480,7 +495,9 @@ export async function observeDeepSeekWebSearch(
       return unknown(
         persistenceFailed
           ? "evidence_persist_failed"
-          : "interpretation_unverified",
+          : terminalProviderUnavailable(exchange)
+            ? "provider_unavailable"
+            : "interpretation_unverified",
       );
     return {
       raw_answer: observation.raw_answer,

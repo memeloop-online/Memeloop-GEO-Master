@@ -151,3 +151,23 @@ export function verifyDeepSeekFirstTurnHistory(
 export function isDeepSeekHistoryExplicitlyAbsent(envelope) {
   return parseEnvelope(envelope)?.data.biz_code === 1;
 }
+
+/** Exact full empty history, not absence or assistant completion evidence. */
+export function verifyDeepSeekEmptyHistory(envelope, conversationId) {
+  if (typeof conversationId !== "string" || !SESSION_ID.test(conversationId))
+    return null;
+  const parsed = parseEnvelope(envelope);
+  const history = parsed?.data?.biz_data;
+  if (
+    parsed?.data?.biz_code !== 0 ||
+    !object(history) ||
+    !object(history.chat_session) ||
+    history.chat_session.id !== conversationId ||
+    history.chat_session.current_message_id !== null ||
+    history.cache_control !== "REPLACE" ||
+    !Array.isArray(history.chat_messages) ||
+    history.chat_messages.length !== 0
+  )
+    return null;
+  return { conversationId, messages: [] };
+}

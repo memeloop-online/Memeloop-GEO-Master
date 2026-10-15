@@ -61,26 +61,32 @@ async function fixture(run, options = {}) {
                       cache_control: "REPLACE",
                       chat_session: {
                         id: chat,
-                        current_message_id: state.later ? 3 : 2,
+                        current_message_id: state.empty
+                          ? null
+                          : state.later
+                            ? 3
+                            : 2,
                       },
-                      chat_messages: [
-                        {
-                          message_id: 1,
-                          parent_id: null,
-                          role: "USER",
-                          status: "FINISHED",
-                          has_pending_fragment: false,
-                          fragments: [],
-                        },
-                        {
-                          message_id: 2,
-                          parent_id: 1,
-                          role: "ASSISTANT",
-                          status: state.incomplete ? "WIP" : "FINISHED",
-                          has_pending_fragment: false,
-                          fragments: [],
-                        },
-                      ],
+                      chat_messages: state.empty
+                        ? []
+                        : [
+                            {
+                              message_id: 1,
+                              parent_id: null,
+                              role: "USER",
+                              status: "FINISHED",
+                              has_pending_fragment: false,
+                              fragments: [],
+                            },
+                            {
+                              message_id: 2,
+                              parent_id: 1,
+                              role: "ASSISTANT",
+                              status: state.incomplete ? "WIP" : "FINISHED",
+                              has_pending_fragment: false,
+                              fragments: [],
+                            },
+                          ],
                     },
                   },
                 }),
@@ -165,6 +171,23 @@ test("completion recovery uses exact read-only history and caches same execution
     );
     assert.equal(calls.length, 1);
     assert.equal(JSON.stringify(result).includes("synthetic-token"), false);
+  });
+});
+
+test("recovery returns exact empty history for ledger validation without answer completion", async () => {
+  await fixture(async ({ runner, calls, state }) => {
+    state.empty = true;
+    const result = await runner.recoverConversationCompletion(
+      "session",
+      input(),
+    );
+    assert.equal(result.status, "recovered");
+    const history = JSON.parse(result.history_json);
+    assert.deepEqual(history.messages, []);
+    assert.equal(history.current_message_id, null);
+    assert.equal(history.chat_session_id, chat);
+    assert.equal(result.completion, undefined);
+    assert.equal(calls.length, 1);
   });
 });
 

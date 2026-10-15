@@ -201,6 +201,49 @@ test("passive recovery returns sanitized inventory and never calls authorization
   safe(result);
 });
 
+test("empty conversation uses retained empty inventory and exact deletion readback", async (t) => {
+  const { page, requests, state } = await synthetic(t);
+  state.history.data.biz_data.chat_messages = [];
+  state.history.data.biz_data.chat_session.current_message_id = null;
+  const result = await deleteDeepSeekConversation(page, {
+    ...options,
+    authorizeDeletion: async () => ({
+      ...grant(),
+      retained_message_inventory_sha256: createHash("sha256")
+        .update("[]")
+        .digest("hex"),
+    }),
+  });
+  assert.deepEqual(result, {
+    status: "deleted",
+    external_conversation_id: CHAT,
+  });
+  assert.equal(posts(requests).length, 1);
+  assert.equal(state.historyReads, 3);
+  safe(result);
+});
+
+test("empty grant cannot delete a conversation with newly present messages", async (t) => {
+  const { page, requests, state } = await synthetic(t);
+  state.history.data.biz_data.chat_messages = [];
+  state.history.data.biz_data.chat_session.current_message_id = null;
+  const result = await deleteDeepSeekConversation(page, {
+    ...options,
+    authorizeDeletion: async () => {
+      state.history = fixture();
+      return {
+        ...grant(),
+        retained_message_inventory_sha256: createHash("sha256")
+          .update("[]")
+          .digest("hex"),
+      };
+    },
+  });
+  assert.equal(result.status, "retained");
+  assert.equal(result.diagnostic.code, "message_inventory_mismatch");
+  assert.equal(posts(requests).length, 0);
+});
+
 test("strict absence only reaches reconciliation with explicit verifyAbsence policy", async (t) => {
   const { page, requests, state } = await synthetic(t);
   state.history = absent();

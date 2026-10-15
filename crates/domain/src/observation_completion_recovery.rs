@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::provider_conversation_lifecycle::{completion_inventory, deepseek_recovery_document};
+use crate::provider_conversation_lifecycle::{
+    completion_inventory, deepseek_failed_empty_inventory, deepseek_recovery_document,
+};
 use crate::{
     AppError, ConversationCorrelation, MAX_OBSERVATION_SOURCE_BYTES, ObservationCapture,
     ObservationCaptureCompletion, ObservationCaptureSnapshot, ObservationProviderIdentity,
@@ -40,7 +42,7 @@ pub struct ObservationCompletionRecoveryInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedObservationCompletionRecovery {
     digest_sha256: String,
-    completion: ObservationCaptureCompletion,
+    completion: Option<ObservationCaptureCompletion>,
     retained_message_inventory_sha256: String,
 }
 
@@ -49,8 +51,10 @@ impl ValidatedObservationCompletionRecovery {
         &self.digest_sha256
     }
 
-    pub fn completion(&self) -> &ObservationCaptureCompletion {
-        &self.completion
+    /// Empty history after a cleared provider error retains cleanup inventory
+    /// only; it does not establish assistant completion.
+    pub fn completion(&self) -> Option<&ObservationCaptureCompletion> {
+        self.completion.as_ref()
     }
 
     pub fn retained_message_inventory_sha256(&self) -> &str {
@@ -139,18 +143,26 @@ impl ObservationCompletionRecoveryInput {
         {
             return Err(invalid());
         }
-        let (document, completion) =
-            deepseek_recovery_document(&source, history).ok_or_else(invalid)?;
-        let inventory = completion_inventory(
-            &owned.provider,
-            &document,
-            &owned.external_conversation_id,
-            &completion,
-        )
-        .ok_or_else(invalid)?;
-        let retained_message_inventory_sha256 = hex::encode(Sha256::digest(
-            serde_json::to_vec(&inventory).map_err(|_| invalid())?,
-        ));
+        let (completion, retained_message_inventory_sha256) =
+            if deepseek_failed_empty_inventory(&source, &history).is_some() {
+                // A cleared, failed conversation has a complete empty inventory,
+                // but no assistant completion to recover.
+                (None, hex::encode(Sha256::digest(b"[]")))
+            } else {
+                let (document, completion) =
+                    deepseek_recovery_document(&source, history).ok_or_else(invalid)?;
+                let inventory = completion_inventory(
+                    &owned.provider,
+                    &document,
+                    &owned.external_conversation_id,
+                    &completion,
+                )
+                .ok_or_else(invalid)?;
+                let digest = hex::encode(Sha256::digest(
+                    serde_json::to_vec(&inventory).map_err(|_| invalid())?,
+                ));
+                (Some(completion), digest)
+            };
         Ok(ValidatedObservationCompletionRecovery {
             digest_sha256: hex::encode(Sha256::digest(
                 serde_json::to_vec(self).map_err(|_| invalid())?,
@@ -353,7 +365,7 @@ mod tests {
         assert_eq!(binding.response_message_id, "2");
         let validated = recovery.validate(&scope, &original).unwrap();
         assert_eq!(validated, recovery.validate(&scope, &original).unwrap());
-        assert_eq!(validated.completion().assistant_message_ids, ["2"]);
+        assert_eq!(validated.completion().unwrap().assistant_message_ids, ["2"]);
         assert_eq!(
             validated.retained_message_inventory_sha256(),
             digest(r#"[["1","user"],["2","assistant"]]"#)
@@ -362,6 +374,111 @@ mod tests {
         assert_eq!(original, before);
         assert!(!original.has_complete_conversation_evidence(&scope));
         assert!(original.retained_message_inventory_sha256(&scope).is_none());
+    }
+
+    fn empty_failed_fixture() -> (
+        TenantScope,
+        ObservationCapture,
+        ObservationCompletionRecoveryInput,
+    ) {
+        let (scope, mut original, mut recovery) = fixture();
+        let ObservationCaptureSnapshot::Source { source_json, .. } = &original.input.snapshot
+        else {
+            unreachable!()
+        };
+        let mut source: Value = serde_json::from_str(source_json).unwrap();
+        source["messages"] = json!([
+            source["messages"][0],
+            {"event":"hint","data":{"type":"error","finish_reason":"backend_err","clear_response":true}},
+            {"event":"close","data":{"click_behavior":"retry"}},
+        ]);
+        source["capture_status"] = json!({
+            "schema_version":"geo.observation.capture-status.v1","transport":"complete","termination":"complete"
+        });
+        replace_source(&scope, &mut original, &mut recovery, source);
+        let mut history: Value = serde_json::from_str(&recovery.history_json).unwrap();
+        history["messages"] = json!([]);
+        history["current_message_id"] = Value::Null;
+        recovery.history_json = history.to_string();
+        recovery.history_sha256 = digest(&recovery.history_json);
+        (scope, original, recovery)
+    }
+
+    #[test]
+    fn cleared_error_empty_inventory_does_not_invent_completion_or_change_source() {
+        let (scope, original, input) = empty_failed_fixture();
+        let before = original.clone();
+        let validated = input.validate(&scope, &original).unwrap();
+        assert!(validated.completion().is_none());
+        assert_eq!(validated.retained_message_inventory_sha256(), digest("[]"));
+        let recovery = ObservationCompletionRecovery {
+            receipt: ObservationCompletionRecoveryReceipt {
+                recovery_id: input.recovery_id,
+                schema_version: 1,
+                digest_sha256: validated.digest_sha256().into(),
+                stored_at: input.observed_at,
+            },
+            input,
+        };
+        assert_eq!(
+            original
+                .resolved_message_inventory_sha256(&scope, Some(&recovery))
+                .unwrap(),
+            Some(digest("[]"))
+        );
+        assert_eq!(original, before);
+        assert!(!original.has_complete_conversation_evidence(&scope));
+        assert!(original.input.completion.is_none());
+        assert!(original.recovery_request_binding(&scope).is_ok());
+    }
+
+    #[test]
+    fn empty_history_requires_original_cleared_error_and_exact_fresh_empty_graph() {
+        for mutation in 0..13 {
+            let (scope, mut original, mut recovery) = empty_failed_fixture();
+            let ObservationCaptureSnapshot::Source { source_json, .. } = &original.input.snapshot
+            else {
+                unreachable!()
+            };
+            let mut source: Value = serde_json::from_str(source_json).unwrap();
+            let mut history: Value = serde_json::from_str(&recovery.history_json).unwrap();
+            match mutation {
+                0 => source["messages"][1]["data"]["clear_response"] = json!(false),
+                1 => source["messages"][1]["data"]["finish_reason"] = json!("other"),
+                2 => source["messages"][1]["data"]["type"] = json!("notice"),
+                3 => {
+                    source["messages"].as_array_mut().unwrap().remove(1);
+                }
+                4 => source["capture_status"]["transport"] = json!("partial"),
+                5 => history["chat_session_id"] = json!("other-chat"),
+                6 => history["cache_control"] = json!("APPEND"),
+                7 => history["current_message_id"] = json!(1),
+                8 => {
+                    history
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("current_message_id");
+                }
+                9 => history["cache_request"]["cache_version"] = json!(1),
+                10 => history["messages"] = json!([{"message_id":1,"role":"USER"}]),
+                11 => source["messages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(1, json!({"event":"delta","data":{"v":"text"}})),
+                _ => {
+                    history["unexpected"] = json!(true);
+                }
+            }
+            replace_source(&scope, &mut original, &mut recovery, source);
+            recovery.history_json = history.to_string();
+            recovery.history_sha256 = digest(&recovery.history_json);
+            assert!(recovery.validate(&scope, &original).is_err(), "{mutation}");
+        }
+        let (scope, original, mut recovery) = fixture();
+        let (_, _, empty) = empty_failed_fixture();
+        recovery.history_json = empty.history_json;
+        recovery.history_sha256 = empty.history_sha256;
+        assert!(recovery.validate(&scope, &original).is_err());
     }
 
     #[test]
