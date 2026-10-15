@@ -260,6 +260,10 @@ const MIGRATION_METADATA: &[MigrationMetadata] = &[
         version: 62,
         description: "manual observation extraction",
     },
+    MigrationMetadata {
+        version: 63,
+        description: "measurement weekly schedules",
+    },
 ];
 
 pub fn embedded_migrations() -> &'static Migrator {

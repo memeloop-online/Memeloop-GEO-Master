@@ -106,7 +106,7 @@ mod questions_tools;
 mod reports;
 pub use measurement_reports::{
     MeasurementPeriodRequest, default_measurement_period_window, preview_project_measurements,
-    save_project_measurement_report,
+    save_project_measurement_report, save_project_measurement_report_at_cutoff,
 };
 mod run_executor;
 pub use run_executor::dispatch_queued;

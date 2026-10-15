@@ -147,12 +147,22 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
     let delayed = freeze_measurement_period(
         &scope,
         preview_measurement_period_at_cutoff(
-            &scope, &delayed_window, vec![interpreted.clone()], None, now, generated,
-        ).unwrap(),
+            &scope,
+            &delayed_window,
+            vec![interpreted.clone()],
+            None,
+            now,
+            generated,
+        )
+        .unwrap(),
         1,
         None,
-    ).unwrap();
-    let delayed = restarted.create_measurement_period(&scope, delayed).await.unwrap();
+    )
+    .unwrap();
+    let delayed = restarted
+        .create_measurement_period(&scope, delayed)
+        .await
+        .unwrap();
     assert_eq!(delayed.evidence_as_of, now);
     assert_eq!(delayed.generated_at, generated);
     assert_eq!(delayed.coverage.planned, 1);
@@ -161,28 +171,61 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
     let corrected = freeze_measurement_period(
         &scope,
         preview_measurement_period_at_cutoff(
-            &scope, &delayed_window, vec![interpreted], None, analyzed,
+            &scope,
+            &delayed_window,
+            vec![interpreted],
+            None,
+            analyzed,
             generated + Duration::minutes(1),
-        ).unwrap(),
+        )
+        .unwrap(),
         2,
         Some(delayed.report_id),
-    ).unwrap();
-    let corrected = restarted.create_measurement_period(&scope, corrected).await.unwrap();
+    )
+    .unwrap();
+    let corrected = restarted
+        .create_measurement_period(&scope, corrected)
+        .await
+        .unwrap();
     assert_eq!(corrected.coverage.planned, delayed.coverage.planned);
     assert_eq!(corrected.coverage.grounded_saved_analysis, 1);
     let replay = freeze_measurement_period(
         &scope,
         preview_measurement_period_at_cutoff(
-            &scope, &delayed_window, vec![sample], None, analyzed,
+            &scope,
+            &delayed_window,
+            vec![sample],
+            None,
+            analyzed,
             generated + Duration::minutes(2),
-        ).unwrap(),
+        )
+        .unwrap(),
         2,
         Some(delayed.report_id),
-    ).unwrap();
-    assert_eq!(restarted.create_measurement_period(&scope, replay).await.unwrap(), corrected);
+    )
+    .unwrap();
+    assert_eq!(
+        restarted
+            .create_measurement_period(&scope, replay)
+            .await
+            .unwrap(),
+        corrected
+    );
     let reopened = PgReportRepository::from_database(&database);
-    assert_eq!(reopened.get_measurement_period(&scope, delayed.report_id).await.unwrap(), delayed);
-    assert_eq!(reopened.get_measurement_period(&scope, corrected.report_id).await.unwrap(), corrected);
+    assert_eq!(
+        reopened
+            .get_measurement_period(&scope, delayed.report_id)
+            .await
+            .unwrap(),
+        delayed
+    );
+    assert_eq!(
+        reopened
+            .get_measurement_period(&scope, corrected.report_id)
+            .await
+            .unwrap(),
+        corrected
+    );
     assert_eq!(
         restarted
             .get_measurement_period(&other, first.report_id)

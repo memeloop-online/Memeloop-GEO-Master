@@ -196,12 +196,18 @@ async fn delayed_generation_uses_cutoff_for_search_ingestion_and_freezes_cohort(
     let at = Utc::now() - Duration::hours(1);
     let measurement = search_measurement(at, 0);
     let id = measurement.measurement_id;
-    repository.accept(&scope, "before-cutoff", measurement).await.unwrap();
+    repository
+        .accept(&scope, "before-cutoff", measurement)
+        .await
+        .unwrap();
     let cutoff = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
     // The source timestamp is historical, but raw bytes and interpretations
     // enter storage only after cutoff. Generation must not make them eligible.
     let useful = search_versions_at(repository.as_ref(), &scope, id, at).await;
-    repository.accept(&scope, "after-cutoff", search_measurement(at, 1)).await.unwrap();
+    repository
+        .accept(&scope, "after-cutoff", search_measurement(at, 1))
+        .await
+        .unwrap();
     let generated = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap()
         + Duration::seconds(1);
     let request = MeasurementPeriodRequest {
@@ -211,18 +217,33 @@ async fn delayed_generation_uses_cutoff_for_search_ingestion_and_freezes_cohort(
         correction_of: None,
     };
     let first = save_project_measurement_report_at_cutoff(
-        &state, &scope, request.clone(), cutoff, generated,
-    ).await.unwrap();
+        &state,
+        &scope,
+        request.clone(),
+        cutoff,
+        generated,
+    )
+    .await
+    .unwrap();
     assert_eq!(first.evidence_as_of, cutoff);
     assert_eq!(first.generated_at, generated);
     let search = first.search.as_ref().unwrap();
     assert_eq!(search.coverage.planned, 1);
-    assert_eq!(search.coverage.counts[&MeasurementPeriodSearchStatus::NoEligibleObservation], 1);
+    assert_eq!(
+        search.coverage.counts[&MeasurementPeriodSearchStatus::NoEligibleObservation],
+        1
+    );
     assert!(search.samples[0].evidence.is_none());
     assert_eq!(
         save_project_measurement_report_at_cutoff(
-            &base, &scope, request.clone(), generated, generated + Duration::seconds(1),
-        ).await.unwrap(),
+            &base,
+            &scope,
+            request.clone(),
+            generated,
+            generated + Duration::seconds(1),
+        )
+        .await
+        .unwrap(),
         first
     );
     let correction_request = MeasurementPeriodRequest {
@@ -230,20 +251,41 @@ async fn delayed_generation_uses_cutoff_for_search_ingestion_and_freezes_cohort(
         ..request
     };
     let correction = save_project_measurement_report_at_cutoff(
-        &state, &scope, correction_request.clone(), generated, generated + Duration::seconds(2),
-    ).await.unwrap();
+        &state,
+        &scope,
+        correction_request.clone(),
+        generated,
+        generated + Duration::seconds(2),
+    )
+    .await
+    .unwrap();
     let search = correction.search.as_ref().unwrap();
     assert_eq!(search.coverage.planned, 1);
-    assert_eq!(search.samples[0].evidence.as_ref().unwrap().observation.observation_id, useful);
+    assert_eq!(
+        search.samples[0]
+            .evidence
+            .as_ref()
+            .unwrap()
+            .observation
+            .observation_id,
+        useful
+    );
     assert_eq!(correction.generated_at, generated + Duration::seconds(2));
     assert_eq!(
         save_project_measurement_report_at_cutoff(
-            &base, &scope, correction_request, generated, generated + Duration::seconds(3),
-        ).await.unwrap(),
+            &base,
+            &scope,
+            correction_request,
+            generated,
+            generated + Duration::seconds(3),
+        )
+        .await
+        .unwrap(),
         correction
     );
     let fresh = preview_project_measurements(&state, &scope, Some(first.window()), generated)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(fresh.search.unwrap().coverage.planned, 2);
 }
 
@@ -606,7 +648,9 @@ async fn no_cycle_preview_save_and_correction_preserve_unknown_and_frozen_sample
         delayed_request.clone(),
         now,
         analyzed + Duration::seconds(1),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     assert_eq!(delayed.evidence_as_of, now);
     assert_eq!(delayed.generated_at, analyzed + Duration::seconds(1));
     assert_eq!(delayed.coverage.grounded_saved_analysis, 0);
@@ -624,7 +668,9 @@ async fn no_cycle_preview_save_and_correction_preserve_unknown_and_frozen_sample
         },
         analyzed,
         analyzed + Duration::seconds(2),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     assert_eq!(delayed_correction.coverage.planned, 1);
     assert_eq!(delayed_correction.coverage.grounded_saved_analysis, 1);
     assert_eq!(
@@ -752,7 +798,9 @@ async fn invalid_report_clocks_are_rejected_before_project_or_evidence_reads() {
     // No project exists: a project lookup would return NotFound rather than
     // InvalidRequest, proving the clock guard runs before evidence access.
     let scope = TenantScope::new(
-        DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, Some(Uuid::new_v4().into()),
+        DEVELOPMENT_OPERATOR_ID,
+        DEVELOPMENT_TENANT_ID,
+        Some(Uuid::new_v4().into()),
     );
     let cutoff = Utc::now();
     let request = MeasurementPeriodRequest {
@@ -852,9 +900,11 @@ async fn http_cycle_free_preview_save_list_and_detail_share_the_same_snapshot() 
     for field in ["evidence_as_of", "generated_at"] {
         let mut injected = body.clone();
         injected[field] = preview["report_window_end_at"].clone();
-        let response = app.clone()
+        let response = app
+            .clone()
             .oneshot(request("POST", &save_path, injected, true))
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
     let response = app

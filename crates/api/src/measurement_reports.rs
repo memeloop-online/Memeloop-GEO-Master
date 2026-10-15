@@ -150,7 +150,12 @@ pub async fn save_project_measurement_report_at_cutoff(
     let samples = collect_samples(state, scope, &window, evidence_as_of, parent).await?;
     let search = collect_search_samples(state, scope, &window, evidence_as_of, parent).await?;
     let preview = preview_measurement_period_at_cutoff(
-        scope, &window, samples, search, evidence_as_of, generated_at,
+        scope,
+        &window,
+        samples,
+        search,
+        evidence_as_of,
+        generated_at,
     )?;
     let report = freeze_measurement_period(
         scope,
