@@ -583,6 +583,9 @@ describe("P08 content assets", () => {
   it("offers the project AI workspace when no content cycle exists", async () => {
     mockApi({ noCycle: true });
     renderPage("/app/tenant-1/project-1/content");
+    await act(async () => {
+      await import("./ContentPages");
+    });
     expect(await screen.findByText("还没有内容资产")).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "前往 AI 工作台" }),
