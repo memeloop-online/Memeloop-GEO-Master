@@ -22,6 +22,7 @@ import {
   getMeasurementOptions,
   listMeasurementPlans,
   type StandaloneMeasurementRequest,
+  type StandaloneMeasurementPlan,
 } from "../api/channelJobs";
 import {
   getQuestionSetVersion,
@@ -30,6 +31,7 @@ import {
 } from "../api/questions";
 import { ErrorState, LoadingState } from "../components/AsyncState";
 import { PlannedTarget } from "./ChannelJobsPage";
+import { formatUiDate } from "../i18n";
 import "./measurementMessages";
 
 const errorText = (error: unknown) =>
@@ -48,18 +50,35 @@ export function StandaloneMeasurementPanel({
 }) {
   const { t } = useTranslation("measurement");
   const [params, setParams] = useSearchParams();
+  const requestedSetId = params.get("set") ?? params.get("questionSetId") ?? "";
+  const requestedVersionId =
+    params.get("version") ?? params.get("versionId") ?? "";
   const selectedId = params.get("record") ?? params.get("planId") ?? undefined;
   const [historyOpen, setHistoryOpen] = useState(!selectedId);
   useEffect(() => {
     setHistoryOpen(!selectedId);
   }, [selectedId, tenantId, projectId]);
-  const selectRecord = (id: string) => {
+  const selectRecord = (
+    id: string,
+    questionSetId?: string,
+    questionVersionId?: string,
+  ) => {
     setHistoryOpen(false);
     setParams((previous) => {
       const next = new URLSearchParams(previous);
       next.set("tab", "records");
       next.delete("planId");
       next.set("record", id);
+      if (questionSetId !== undefined) {
+        next.delete("questionSetId");
+        next.delete("versionId");
+        if (questionSetId) next.set("set", questionSetId);
+        else next.delete("set");
+        if (questionVersionId) next.set("version", questionVersionId);
+        else next.delete("version");
+        if (questionSetId) next.delete("folder");
+        else next.set("folder", "temporary");
+      }
       return next;
     });
   };
@@ -69,9 +88,18 @@ export function StandaloneMeasurementPanel({
   const [question, setQuestion] = useState("");
   const [accountId, setAccountId] = useState("");
   const [model, setModel] = useState("");
-  const [mode, setMode] = useState<"custom" | "bound">("custom");
-  const [setId, setSetId] = useState("");
-  const [versionId, setVersionId] = useState("");
+  const [mode, setMode] = useState<"custom" | "bound">(
+    requestedSetId ? "bound" : "custom",
+  );
+  const [setId, setSetId] = useState(requestedSetId);
+  const [versionId, setVersionId] = useState(requestedVersionId);
+  useEffect(() => {
+    if (recordsOnly || !requestedSetId) return;
+    setMode("bound");
+    setSetId(requestedSetId);
+    setVersionId(requestedVersionId);
+    setQuestionId("");
+  }, [recordsOnly, requestedSetId, requestedVersionId]);
   const [questionId, setQuestionId] = useState("");
   const [after, setAfter] = useState<string>();
   const [previous, setPrevious] = useState<(string | undefined)[]>([]);
@@ -150,11 +178,55 @@ export function StandaloneMeasurementPanel({
       projectId,
     ],
     queryFn: () => listAllQuestionSets(tenantId, projectId),
-    enabled: Boolean(session && canWrite && !recordsOnly),
+    enabled: Boolean(session && (recordsOnly || canWrite)),
     retry: false,
   });
   const selectedSet =
-    sets.data?.items.find((item) => item.id === setId) ?? sets.data?.items[0];
+    sets.data?.items.find((item) => item.id === setId) ??
+    (!setId ? sets.data?.items[0] : undefined);
+  const groups = new Map<string, Map<string, StandaloneMeasurementPlan[]>>();
+  for (const item of sets.data?.items ?? []) groups.set(item.id, new Map());
+  const temporaryPlans: StandaloneMeasurementPlan[] = [];
+  for (const plan of history.data?.items ?? []) {
+    const associations = new Map<string, Set<string>>();
+    let temporary = plan.targets.length === 0;
+    for (const target of plan.targets) {
+      if (target.input.kind !== "measure") continue;
+      const reference = target.input.question_binding?.reference;
+      if (!reference) {
+        temporary = true;
+        continue;
+      }
+      const versions =
+        associations.get(reference.question_set_id) ?? new Set<string>();
+      versions.add(reference.question_set_version_id);
+      associations.set(reference.question_set_id, versions);
+    }
+    if (temporary) temporaryPlans.push(plan);
+    for (const [setId, versionIds] of associations) {
+      const versions =
+        groups.get(setId) ?? new Map<string, StandaloneMeasurementPlan[]>();
+      for (const versionId of versionIds) {
+        versions.set(versionId, [...(versions.get(versionId) ?? []), plan]);
+      }
+      groups.set(setId, versions);
+    }
+  }
+  const recordButton = (
+    plan: StandaloneMeasurementPlan,
+    setId: string,
+    versionId?: string,
+  ) => (
+    <li key={plan.plan_id}>
+      <Button
+        appearance="subtle"
+        aria-current={selectedId === plan.plan_id ? "true" : undefined}
+        onClick={() => selectRecord(plan.plan_id, setId, versionId)}
+      >
+        {plan.title} · {formatUiDate(plan.created_at)}
+      </Button>
+    </li>
+  );
   const versions = useQuery({
     queryKey: [...key, "versions", selectedSet?.id],
     queryFn: () =>
@@ -186,6 +258,11 @@ export function StandaloneMeasurementPanel({
   const selectedQuestion =
     version.data?.questions.find((item) => item.question_id === questionId) ??
     version.data?.questions[0];
+  const selectedQuestions = questionId
+    ? (version.data?.questions.filter(
+        (item) => item.question_id === questionId,
+      ) ?? [])
+    : (version.data?.questions ?? []);
   const refreshAccounts = channels.accounts.refetch;
   useEffect(() => {
     if (recordsOnly) return;
@@ -204,7 +281,11 @@ export function StandaloneMeasurementPanel({
       createMeasurementPlan(tenantId, projectId, input),
     onSuccess: (plan) => {
       pendingRequest.current = null;
-      selectRecord(plan.plan_id);
+      selectRecord(
+        plan.plan_id,
+        mode === "bound" ? selectedSet?.id : "",
+        mode === "bound" ? version.data?.id : undefined,
+      );
       client.setQueryData([...key, "detail", plan.plan_id], plan);
       setAfter(undefined);
       setPrevious([]);
@@ -223,20 +304,21 @@ export function StandaloneMeasurementPanel({
       sample_ordinal: 0,
     };
     const values =
-      mode === "bound" && selectedSet && selectedQuestion && version.data
+      mode === "bound" &&
+      selectedSet &&
+      selectedQuestions.length &&
+      version.data
         ? {
             measurements: [],
-            bound_measurements: [
-              {
-                ...common,
-                question: {
-                  question_set_id: selectedSet.id,
-                  question_set_version_id: version.data.id,
-                  question_id: selectedQuestion.question_id,
-                  question_revision_id: selectedQuestion.id,
-                },
+            bound_measurements: selectedQuestions.map((item) => ({
+              ...common,
+              question: {
+                question_set_id: selectedSet.id,
+                question_set_version_id: version.data!.id,
+                question_id: item.question_id,
+                question_revision_id: item.id,
               },
-            ],
+            })),
           }
         : {
             measurements: [
@@ -277,7 +359,7 @@ export function StandaloneMeasurementPanel({
     accountReady &&
     Boolean(selectedModel) &&
     (mode === "bound"
-      ? Boolean(selectedQuestion && version.data)
+      ? Boolean(selectedQuestions.length && version.data)
       : Boolean(question.trim()) &&
         new TextEncoder().encode(question.trim()).length <= 4000);
   return (
@@ -395,10 +477,15 @@ export function StandaloneMeasurementPanel({
                   {version.data && (
                     <Field label="选择已有问题">
                       <Select
-                        value={selectedQuestion?.question_id ?? ""}
+                        value={questionId}
                         onChange={(_, data) => setQuestionId(data.value)}
                         disabled={submission.isPending}
                       >
+                        <option value="">
+                          {t("allSetQuestions", {
+                            count: version.data.questions.length,
+                          })}
+                        </option>
                         {version.data.questions.map((item) => (
                           <option
                             key={item.question_id}
@@ -410,12 +497,21 @@ export function StandaloneMeasurementPanel({
                       </Select>
                     </Field>
                   )}
-                  {selectedQuestion && (
+                  {selectedQuestion &&
+                    (questionId || selectedQuestions.length === 1) && (
+                      <p>
+                        {selectedQuestion.purpose === "frozen_evaluation"
+                          ? "冻结评估题 · 答案不进入内容优化"
+                          : "优化问题"}{" "}
+                        · {selectedQuestion.market} /{" "}
+                        {selectedQuestion.language}
+                      </p>
+                    )}
+                  {!questionId && selectedQuestions.length > 1 && (
                     <p>
-                      {selectedQuestion.purpose === "frozen_evaluation"
-                        ? "冻结评估题 · 答案不进入内容优化"
-                        : "优化问题"}{" "}
-                      · {selectedQuestion.market} / {selectedQuestion.language}
+                      {t("allQuestionsMeasurement", {
+                        count: selectedQuestions.length,
+                      })}
                     </p>
                   )}
                 </>
@@ -634,17 +730,73 @@ export function StandaloneMeasurementPanel({
                 {history.data?.items.length === 0 && (
                   <p>还没有独立测量计划。</p>
                 )}
-                {history.data?.items.map((plan) => (
-                  <p key={plan.plan_id}>
-                    <Button
-                      appearance="subtle"
-                      onClick={() => selectRecord(plan.plan_id)}
-                    >
-                      {plan.title} ·{" "}
-                      {new Date(plan.created_at).toLocaleString("zh-CN")}
-                    </Button>
-                  </p>
-                ))}
+                {sets.isError && (
+                  <ErrorState
+                    title={t("historySetsUnavailable")}
+                    detail={errorText(sets.error)}
+                    onRetry={() => void sets.refetch()}
+                  />
+                )}
+                <nav aria-label={t("measurementFolders")}>
+                  {[...groups].map(([groupId, versions]) => {
+                    const set = sets.data?.items.find(
+                      (item) => item.id === groupId,
+                    );
+                    const count = new Set(
+                      [...versions.values()].flat().map((plan) => plan.plan_id),
+                    ).size;
+                    return (
+                      <details key={groupId} open={requestedSetId === groupId}>
+                        <summary>
+                          {set?.name ?? t("unnamedQuestionSet")} ·{" "}
+                          {t("folderRecordCount", { count })}
+                        </summary>
+                        <Link
+                          to={`/app/${tenantId}/${projectId}/measurement?tab=sets&set=${encodeURIComponent(groupId)}`}
+                        >
+                          {t("viewQuestionSet")}
+                        </Link>{" "}
+                        {canWrite && (
+                          <Link
+                            to={`/app/${tenantId}/${projectId}/measurement?tab=measure&set=${encodeURIComponent(groupId)}`}
+                          >
+                            {t("measureQuestionSet")}
+                          </Link>
+                        )}
+                        {count === 0 && <p>{t("folderNoRecords")}</p>}
+                        {[...versions].map(([versionId, plans]) => (
+                          <details key={versionId} open>
+                            <summary>
+                              {set?.current_version_id === versionId
+                                ? t("currentSetVersion", {
+                                    revision: set.current_revision,
+                                  })
+                                : t("savedSetVersion", { value: versionId })}
+                            </summary>
+                            <ul>
+                              {plans.map((plan) =>
+                                recordButton(plan, groupId, versionId),
+                              )}
+                            </ul>
+                          </details>
+                        ))}
+                      </details>
+                    );
+                  })}
+                  <details open={!requestedSetId}>
+                    <summary>
+                      {t("temporaryMeasurements")} ·{" "}
+                      {t("folderRecordCount", { count: temporaryPlans.length })}
+                    </summary>
+                    {temporaryPlans.length ? (
+                      <ul>
+                        {temporaryPlans.map((plan) => recordButton(plan, ""))}
+                      </ul>
+                    ) : (
+                      <p>{t("folderNoRecords")}</p>
+                    )}
+                  </details>
+                </nav>
                 {previous.length > 0 && (
                   <Button
                     onClick={() => {
@@ -685,22 +837,36 @@ export function StandaloneMeasurementPanel({
                 <summary>{t("resultPlanDetails")}</summary>
                 <p>{t("resultPlanId", { value: detail.data.plan_id })}</p>
               </details>
-              {detail.data.targets.map((target) => (
-                <PlannedTarget
-                  key={target.target_id}
-                  target={target}
-                  tenantId={tenantId}
-                  projectId={projectId}
-                  canWrite={canWrite}
-                  accountDisplayName={
-                    channels.accounts.data?.items.find(
-                      (account) =>
-                        account.account_id === target.input.account_id,
-                    )?.display_name
-                  }
-                  automatic
-                />
-              ))}
+              {detail.data.targets
+                .filter((target) => {
+                  if (target.input.kind !== "measure") return true;
+                  const reference = target.input.question_binding?.reference;
+                  if (requestedSetId)
+                    return (
+                      reference?.question_set_id === requestedSetId &&
+                      (!requestedVersionId ||
+                        reference.question_set_version_id ===
+                          requestedVersionId)
+                    );
+                  if (params.get("folder") === "temporary") return !reference;
+                  return true;
+                })
+                .map((target) => (
+                  <PlannedTarget
+                    key={target.target_id}
+                    target={target}
+                    tenantId={tenantId}
+                    projectId={projectId}
+                    canWrite={canWrite}
+                    accountDisplayName={
+                      channels.accounts.data?.items.find(
+                        (account) =>
+                          account.account_id === target.input.account_id,
+                      )?.display_name
+                    }
+                    automatic
+                  />
+                ))}
             </div>
           )}
         </>

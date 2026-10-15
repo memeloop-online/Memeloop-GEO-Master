@@ -50,8 +50,6 @@ const capabilities: KnowledgeCapabilities = {
   docx_parser: { available: false },
   xlsx_parser: { available: true },
   ocr: { available: false },
-  vector: { available: true },
-  llm: { available: false },
   url_fetch: { available: false },
 };
 
@@ -60,10 +58,10 @@ function renderPage() {
     <FluentProvider theme={webLightTheme}>
       <MemoryRouter initialEntries={["/app/tenant-a/project-a/knowledge"]}>
         <Routes>
-          <Route
-            path="/app/:tenantId/:projectId/knowledge"
-            element={<KnowledgePage />}
-          />
+          <Route path="/app/:tenantId/:projectId">
+            <Route path="knowledge" element={<KnowledgePage />} />
+            <Route path="chat" element={<h1>Chat</h1>} />
+          </Route>
         </Routes>
       </MemoryRouter>
     </FluentProvider>,
@@ -81,6 +79,19 @@ afterEach(async () => {
 });
 
 describe("knowledge page user copy", () => {
+  it.each([
+    ["zh-CN", "前往 AI 工作台"],
+    ["en", "Open AI workspace"],
+  ])(
+    "opens the AI workbench from knowledge in %s",
+    async (language, action) => {
+      await act(() => i18n.changeLanguage(language));
+      renderPage();
+      await userEvent.click(screen.getByRole("button", { name: action }));
+      expect(screen.getByRole("heading", { name: "Chat" })).toBeInTheDocument();
+    },
+  );
+
   it.each([
     [
       "zh-CN",

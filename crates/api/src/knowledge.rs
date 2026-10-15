@@ -9,8 +9,8 @@ use axum::{
 use geo_domain::{
     AppError, CurrentKnowledgeRelease, DocumentManifest, DocumentManifestPlanRequest,
     ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, InitialSourceKind,
-    KnowledgeAskResult, KnowledgeCapability, KnowledgeImportProgress, KnowledgePurpose,
-    KnowledgeSearchRequest, KnowledgeSearchResult, MAX_UPLOAD_BYTES, Product, ProjectId,
+    KnowledgeCapability, KnowledgeImportProgress, KnowledgePurpose,
+    MAX_UPLOAD_BYTES, Product, ProjectId,
     ReviseSourceTextCommand, Source, SourceDetail, SourceTextRevisionReceipt, SourceVersion,
     SourceVersionContent, TenantScope, UploadSession, UploadSessionCommand,
 };
@@ -846,58 +846,6 @@ pub(crate) async fn plan_document_manifest(
         .map_err(|error| api_error(error, context.request_id))
 }
 
-#[utoipa::path(
-    post,
-    path = "/api/v1/knowledge/search",
-    security(("sessionCookie" = [])),
-    params(("project_id" = ProjectId, Query)),
-    request_body = KnowledgeSearchRequest,
-    responses((status = 200, body = KnowledgeSearchResult))
-)]
-pub(crate) async fn search(
-    State(state): State<AppState>,
-    Query(query): Query<KnowledgeProjectQuery>,
-    Extension(tenant_scope): Extension<TenantScope>,
-    Extension(context): Extension<RequestContext>,
-    Json(request): Json<KnowledgeSearchRequest>,
-) -> Result<Json<KnowledgeSearchResult>, ApiError> {
-    let scope = knowledge_scope(&state, &tenant_scope, query.project_id)
-        .await
-        .map_err(|error| api_error(error, context.request_id))?;
-    state
-        .knowledge_repository()
-        .search(&scope, request)
-        .await
-        .map(Json)
-        .map_err(|error| api_error(error, context.request_id))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/knowledge/ask",
-    security(("sessionCookie" = [])),
-    params(("project_id" = ProjectId, Query)),
-    request_body = KnowledgeSearchRequest,
-    responses((status = 200, body = KnowledgeAskResult))
-)]
-pub(crate) async fn ask(
-    State(state): State<AppState>,
-    Query(query): Query<KnowledgeProjectQuery>,
-    Extension(tenant_scope): Extension<TenantScope>,
-    Extension(context): Extension<RequestContext>,
-    Json(request): Json<KnowledgeSearchRequest>,
-) -> Result<Json<KnowledgeAskResult>, ApiError> {
-    let scope = knowledge_scope(&state, &tenant_scope, query.project_id)
-        .await
-        .map_err(|error| api_error(error, context.request_id))?;
-    state
-        .knowledge_repository()
-        .ask(&scope, request)
-        .await
-        .map(Json)
-        .map_err(|error| api_error(error, context.request_id))
-}
-
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/knowledge/capabilities", get(capabilities))
@@ -939,6 +887,4 @@ pub(crate) fn routes() -> Router<AppState> {
             "/knowledge/document-manifests/{manifest_id}",
             get(get_document_manifest),
         )
-        .route("/knowledge/search", post(search))
-        .route("/knowledge/ask", post(ask))
 }

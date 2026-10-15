@@ -171,7 +171,7 @@ export function QuestionSetsPage() {
       ? "records"
       : params.has("set") || params.has("questionSetId")
         ? "sets"
-        : "measure";
+        : "sets";
   const setId = params.get("set") ?? params.get("questionSetId") ?? "";
   const requestedVersionId =
     params.get("version") ?? params.get("versionId") ?? "";
@@ -473,6 +473,20 @@ export function QuestionSetsPage() {
                 ))}
               </Select>
             </Field>
+            {selectedSet && (
+              <p>
+                <Link to={`?tab=records&set=${encodeURIComponent(setId)}`}>
+                  {t("viewSetMeasurements")}
+                </Link>{" "}
+                {canWrite && (
+                  <Link
+                    to={`?tab=measure&set=${encodeURIComponent(setId)}&version=${encodeURIComponent(versionId)}`}
+                  >
+                    {t("measureQuestionSet")}
+                  </Link>
+                )}
+              </p>
+            )}
           </section>
         ) : null}
         {canWrite && (

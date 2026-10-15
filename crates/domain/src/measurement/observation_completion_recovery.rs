@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::provider_conversation_lifecycle::{
+use super::provider_conversation_lifecycle::{
     completion_inventory, deepseek_failed_empty_inventory, deepseek_recovery_document,
 };
 use crate::{
@@ -255,7 +255,7 @@ pub trait ObservationCompletionRecoveryRepository: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider_conversation_lifecycle::synthetic_deepseek_source;
+    use super::provider_conversation_lifecycle::synthetic_deepseek_source;
     use crate::{
         CapturedConversation, CapturedConversationPurpose, ObservationCaptureInput,
         ObservationCaptureReceipt,

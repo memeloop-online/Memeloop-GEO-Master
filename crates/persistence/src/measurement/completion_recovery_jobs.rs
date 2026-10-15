@@ -9,7 +9,7 @@ use geo_domain::{
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
 
-use crate::observation_completion_recovery::{read_by_source, source};
+use super::completion_recovery::{read_by_source, source};
 
 #[derive(Clone)]
 pub struct PgObservationCompletionRecoveryJobRepository {

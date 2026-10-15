@@ -214,19 +214,15 @@ pub fn preview_measurement_period_at_cutoff(
     }
     let search = search_samples
         .map(|samples| {
-            crate::measurement_report_search::measurement_period_search_section(
+            super::measurement_report_search::measurement_period_search_section(
                 samples,
                 window,
                 evidence_as_of,
             )
         })
         .transpose()?;
-    // Preserve legacy AI-only hashes. An included empty search section is distinct.
-    let bytes = match &search {
-        Some(search) => serde_json::to_vec(&(window, &samples, search)),
-        None => serde_json::to_vec(&(window, &samples)),
-    }
-    .map_err(|_| AppError::invalid_request("measurement report cannot be serialized"))?;
+    let bytes = serde_json::to_vec(&(window, &samples, &search))
+        .map_err(|_| AppError::invalid_request("measurement report cannot be serialized"))?;
     Ok(MeasurementPeriodPreview {
         kind: MeasurementPeriodPreviewKind::MeasurementPeriodPreview,
         project_id,

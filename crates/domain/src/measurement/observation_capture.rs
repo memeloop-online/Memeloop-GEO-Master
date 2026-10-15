@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::provider_conversation_lifecycle::{completion_inventory, deepseek_evidence_chat_id};
+use super::provider_conversation_lifecycle::{completion_inventory, deepseek_evidence_chat_id};
 use crate::{AppError, ChannelJobRepository, ChannelTargetInput, TenantScope};
 
 pub const MAX_OBSERVATION_SOURCE_BYTES: usize = 750_000;
@@ -1127,7 +1127,7 @@ mod tests {
         input.original_identity.as_mut().unwrap().provider = "deepseek".into();
         input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
         input.completion = None;
-        let full = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        let full = super::provider_conversation_lifecycle::synthetic_deepseek_source();
         let document = serde_json::json!({
             "messages": [],
             "ownership": {
@@ -1188,7 +1188,7 @@ mod tests {
         input.original_identity.as_mut().unwrap().provider = "deepseek".into();
         input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
         input.completion = None;
-        let mut document = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        let mut document = super::provider_conversation_lifecycle::synthetic_deepseek_source();
         document["ownership"] = serde_json::json!({
             "schema_version": "geo.deepseek.ownership.v1",
             "provider": "deepseek",
@@ -1277,7 +1277,7 @@ mod tests {
     #[test]
     fn deepseek_completion_binds_owned_source_and_canonical_inventory() {
         let (scope, mut input, _) = completed_capture();
-        let document = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        let document = super::provider_conversation_lifecycle::synthetic_deepseek_source();
         input.original_identity.as_mut().unwrap().provider = "deepseek".into();
         input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
         input.completion = Some(ObservationCaptureCompletion {
@@ -1353,7 +1353,7 @@ mod tests {
         input.original_identity.as_mut().unwrap().provider = "deepseek".into();
         input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
         input.completion = None;
-        let document = crate::provider_conversation_lifecycle::synthetic_deepseek_source();
+        let document = super::provider_conversation_lifecycle::synthetic_deepseek_source();
         assert!(valid_observation_source_document(&document));
         for value in [
             serde_json::Value::Null,

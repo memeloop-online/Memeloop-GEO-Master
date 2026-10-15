@@ -61,30 +61,29 @@ mod project_tools;
 mod provider_bridge;
 mod publication_lookup;
 pub use publication_lookup::dispatch_publication_lookup;
-mod observation_completion_recovery;
+mod measurement;
+pub(crate) use measurement::{
+    observation_ai_callback, observation_analysis, observation_capture_callback,
+    observation_completion_recovery, observation_evidence, observation_extraction,
+};
 mod provider_conversation_cleanup;
 pub use observation_completion_recovery::dispatch_observation_completion_recovery;
 pub use provider_conversation_cleanup::dispatch_provider_conversation_cleanup;
 mod provider_cleanup_callback;
 pub use provider_cleanup_callback::ProviderCleanupCallbackService;
 mod publication_send_callback;
-pub use publication_send_callback::PublicationSendCallbackService;
-mod observation_capture_callback;
-pub use observation_capture_callback::ObservationCaptureCallbackService;
-mod observation_ai_callback;
 pub use observation_ai_callback::ObservationAiCallbackService;
-mod observation_extraction;
-pub use observation_extraction::{
-    EXTRACTION_POLICY_VERSION, ObservationExtractionContinuation, ObservationExtractionService,
-    spawn_observation_extraction_dispatcher, spawn_observation_history_scheduler,
-};
-mod observation_analysis;
-mod observation_evidence;
 pub use observation_analysis::{
     GroundingResult, HttpSavedObservationGrounder, ObservationAnalysisService,
     SavedObservationGrounder,
 };
+pub use observation_capture_callback::ObservationCaptureCallbackService;
 pub use observation_evidence::ObservationEvidenceResolver;
+pub use observation_extraction::{
+    EXTRACTION_POLICY_VERSION, ObservationExtractionContinuation, ObservationExtractionService,
+    spawn_observation_extraction_dispatcher, spawn_observation_source_recovery,
+};
+pub use publication_send_callback::PublicationSendCallbackService;
 mod project_serp_settings;
 mod serp;
 pub use project_serp_settings::{
@@ -2149,8 +2148,6 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         knowledge::current_release,
         knowledge::get_document_manifest,
         knowledge::plan_document_manifest,
-        knowledge::search,
-        knowledge::ask,
         get_operation,
         events,
         agent::create_conversation,
@@ -2241,11 +2238,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         geo_domain::DocumentManifestItemState,
         geo_domain::DocumentManifestPlanRequest,
         geo_domain::DocumentManifestState,
-        geo_domain::KnowledgeSearchRequest,
         geo_domain::KnowledgeEvidence,
-        geo_domain::KnowledgeSearchResult,
-        geo_domain::KnowledgeAnswerStatus,
-        geo_domain::KnowledgeAskResult,
         ErrorResponse,
         Operation,
         geo_domain::OperationStatus,

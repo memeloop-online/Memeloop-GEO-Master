@@ -10,9 +10,9 @@ use geo_api::{AppState, PDF_PARSER_PROFILE, PdfParserClient, dispatch_pdf_parse_
 use geo_api::{CSRF_HEADER, EventBus, MemoryIdempotencyStore, MemoryOperationStore, router};
 use geo_domain::{
     ChunkLocator, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, ImportStatus, KnowledgePurpose,
-    KnowledgeRepository, KnowledgeSearchRequest, Membership, MemoryAuthRepository,
-    MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate, ProjectRepository,
-    ProjectSettings, Role, TenantScope, UploadSessionCommand, User, sha256_hex,
+    KnowledgeRepository, Membership, MemoryAuthRepository, MemoryKnowledgeRepository,
+    MemoryProjectRepository, ProjectCreate, ProjectRepository, ProjectSettings, Role, TenantScope,
+    UploadSessionCommand, User, sha256_hex,
 };
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -251,7 +251,7 @@ async fn retry_requires_project_writer_csrf_and_original_scope() {
 
 #[tokio::test]
 #[ignore = "requires the pinned Java parser running at GEO_TEST_PDF_PARSER_URL"]
-async fn actual_pdf_pages_are_imported_as_searchable_source_evidence() {
+async fn actual_pdf_pages_are_imported_with_source_version_text_and_locators() {
     let endpoint = std::env::var("GEO_TEST_PDF_PARSER_URL")
         .expect("set GEO_TEST_PDF_PARSER_URL to the real local Java parser");
     let parser = PdfParserClient::new(&endpoint).expect("trusted parser endpoint");
@@ -317,20 +317,12 @@ async fn actual_pdf_pages_are_imported_as_searchable_source_evidence() {
         matches!(chunk.locator, ChunkLocator::Pdf { page: 2, .. })
             && chunk.text.contains("Walnut on second page")
     }));
-    let search = repository
-        .search(
-            &scope,
-            KnowledgeSearchRequest {
-                query: "Walnut".into(),
-                purpose: KnowledgePurpose::Public,
-                limit: 10,
-                knowledge_release_id: None,
-            },
-        )
+    let version_id = detail.versions[0].source_version_id;
+    let content = repository
+        .get_source_version_content(&scope, source_id, version_id)
         .await
-        .expect("search generated evidence");
-    assert!(search.evidence.iter().any(|evidence| {
-        matches!(evidence.locator, ChunkLocator::Pdf { page: 2, .. })
-            && evidence.text.contains("Walnut")
-    }));
+        .expect("read parsed source version")
+        .expect("source version content exists");
+    assert_eq!(content.source_version_id, version_id);
+    assert!(content.text.contains("Walnut on second page"));
 }

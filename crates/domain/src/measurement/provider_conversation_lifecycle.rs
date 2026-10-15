@@ -564,7 +564,7 @@ fn deepseek_stream_complete(
     if document.get("source_redaction").is_some() {
         // This shared check validates the lifecycle shape, not completion,
         // so it cannot recursively enter this inventory verifier.
-        if !crate::observation_capture::valid_observation_source_document(document) {
+        if !super::observation_capture::valid_observation_source_document(document) {
             return None;
         }
         for path in document["source_redaction"]["omitted_paths"].as_array()? {

@@ -634,6 +634,29 @@ test("document removes nested private fields and reasoning without mutating sour
   );
 });
 
+test("live recommendation grounding uses the existing extraction call", async () => {
+  let calls = 0;
+  const result = await interpretObservation(exchange, {
+    browserExtract: async (prompt) => {
+      calls += 1;
+      assert.match(prompt, /ordinary numbered list is NOT proof of ranking/u);
+      assert.match(prompt, /"recommendations"/u);
+      return {
+        extracted: { ...extracted, recommendations: [] },
+        model: "synthetic-extractor",
+        surface: "consumer_web",
+      };
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.audit.prompt_version, "geo.observation.extract.v4");
+  assert.deepEqual(result.audit.recommendations, {
+    version: "geo.recommendations.v1",
+    status: "verified",
+    items: [],
+  });
+});
+
 test("prompt has explicit source indexes, grounding schema and untrusted-data boundary", () => {
   const document = observationDocument(exchange, "Displayed answer.");
   const prompt = extractionPrompt(document);
@@ -871,7 +894,7 @@ test("browser extraction succeeds first without API and records a document-bound
   assert.equal(result.audit.surface, "consumer_web");
   assert.equal(result.audit.kind, "observation_extraction");
   assert.equal(result.audit.method, "llm_grounded");
-  assert.equal(result.audit.prompt_version, "geo.observation.extract.v3");
+  assert.equal(result.audit.prompt_version, "geo.observation.extract.v4");
   assert.deepEqual(result.audit.attempts, [
     {
       route: "signed_in_browser",

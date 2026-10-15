@@ -376,17 +376,7 @@ pub fn optimization_eligible_projection(
                     && proof.get("provenance").and_then(serde_json::Value::as_str) == Some("live")
                     && proof.get("disposition").and_then(serde_json::Value::as_str)
                         == Some("observed")
-                    && matches!(
-                        proof
-                            .get("schema_version")
-                            .and_then(serde_json::Value::as_str),
-                        Some(
-                            "geo.measure.official_search.v1"
-                                | "geo.measure.official_search.v2"
-                                | "geo.measure.official_search.v3"
-                                | "geo.measure.official_search.v4"
-                        )
-                    )
+                    && proof["schema_version"] == "geo.measure.official_search.v4"
                     && proof
                         .get("search_event")
                         .and_then(serde_json::Value::as_object)
@@ -395,28 +385,11 @@ pub fn optimization_eligible_projection(
                                 == Some("official_search_event")
                                 && event.get("provenance").and_then(serde_json::Value::as_str)
                                     == Some("live")
-                                && match proof["schema_version"].as_str() {
-                                    Some("geo.measure.official_search.v1") => {
-                                        event.get("source").and_then(serde_json::Value::as_str)
-                                            == Some("provider_search_event")
-                                    }
-                                    Some("geo.measure.official_search.v2") => {
-                                        event.get("source").and_then(serde_json::Value::as_str)
-                                            == Some("provider_connect_stream")
-                                    }
-                                    Some(
-                                        "geo.measure.official_search.v3"
-                                        | "geo.measure.official_search.v4",
-                                    ) => {
-                                        surface == "consumer_web"
-                                            && search_mode == "web_search"
-                                            && semantic_search_projection_valid(proof, outcome)
-                                    }
-                                    _ => false,
-                                }
+                                && surface == "consumer_web"
+                                && search_mode == "web_search"
+                                && semantic_search_projection_valid(proof, outcome)
                                 && event
-                                    .get("occurred_at")
-                                    .or_else(|| event.get("observed_at"))
+                                    .get("observed_at")
                                     .and_then(|value| {
                                         serde_json::from_value::<DateTime<Utc>>(value.clone()).ok()
                                     })
@@ -462,31 +435,9 @@ fn semantic_search_projection_valid(proof: &serde_json::Value, outcome: &Channel
             text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
     };
-    let version_valid = match proof["schema_version"].as_str() {
-        Some("geo.measure.official_search.v3") => {
-            event["source"] == "provider_connect_stream_ai"
-                && ["chat_id", "message_id", "block_id"].iter().all(|field| {
-                    event[field].as_str().is_some_and(|text| {
-                        !text.is_empty()
-                            && text.len() <= 128
-                            && text.bytes().all(|byte| {
-                                byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
-                            })
-                    })
-                })
-                && label(&event["extraction_prompt_version"])
-        }
-        Some("geo.measure.official_search.v4") => {
-            event["source"] == "browser_response_ai"
-                && event["search_used"] == "yes"
-                && matches!(
-                    event["extraction_prompt_version"].as_str(),
-                    Some("geo.observation.extract.v2" | "geo.observation.extract.v3")
-                )
-        }
-        _ => false,
-    };
-    if !version_valid
+    if event["source"] != "browser_response_ai"
+        || event["search_used"] != "yes"
+        || event["extraction_prompt_version"] != "geo.observation.extract.v4"
         || event["request_model"] != proof["model"]
         || !label(&event["request_model"])
         || event["request_question_sha256"] != proof["question_sha256"]
@@ -2543,7 +2494,7 @@ mod tests {
             };
             let mut proof = serde_json::json!({
                 "kind":"official_search_observation",
-                "schema_version":"geo.measure.official_search.v1",
+                "schema_version":"geo.measure.official_search.v4",
                 "target_id":target.target_id,
                 "account_id":account_id,
                 "provider":provider,
@@ -2561,7 +2512,15 @@ mod tests {
                 "provenance":"live",
                 "disposition":"observed",
                 "raw_answer": if index == 1 { "HELDOUT_ANSWER_CANARY" } else { "observed answer" },
-                "search_event":{"kind":"official_search_event","provenance":"live","source":"provider_search_event","occurred_at":now},
+                "search_event":{
+                    "kind":"official_search_event","provenance":"live",
+                    "source":"browser_response_ai","observed_at":now,
+                    "search_used":"yes","request_model":model,
+                    "request_question_sha256":sha256_hex(question.as_bytes()),
+                    "extraction_model":"synthetic-extractor",
+                    "extraction_prompt_version":"geo.observation.extract.v4",
+                    "source_sha256":sha256_hex(br#"{"messages":[]}"#)
+                },
                 "nested_canary":"HELDOUT_NESTED_EVIDENCE_CANARY"
             });
             if index == 4 {
@@ -2589,7 +2548,18 @@ mod tests {
                         public_url: None,
                         screenshot_ref: Some("HELDOUT_SCREENSHOT_CANARY".into()),
                         connector_version: Some("official_search_verified.v1".into()),
-                        runner_evidence: vec![proof],
+                        runner_evidence: vec![
+                            proof,
+                            serde_json::json!({
+                                "kind":"observation_extraction","method":"llm_grounded",
+                                "model":"synthetic-extractor",
+                                "prompt_version":"geo.observation.extract.v4",
+                                "source_sha256":sha256_hex(br#"{"messages":[]}"#),
+                                "source_json":r#"{"messages":[]}"#,
+                                "surface":"model_api",
+                                "refs":[{"pointer":"/messages","quote":"synthetic"}]
+                            }),
+                        ],
                         fixture: index == 3,
                     }),
                     received_at: Some(now),
@@ -2614,12 +2584,8 @@ mod tests {
         for canary in ["HELDOUT", "CANARY", "observed answer", "eligible"] {
             assert!(!serialized.contains(canary));
         }
-        // Historical and provider-independent AI evidence both require their
-        // retained extraction audit, not merely a recognized schema name.
-        for schema in [
-            "geo.measure.official_search.v3",
-            "geo.measure.official_search.v4",
-        ] {
+        // Only the current evidence schema and matching extraction audit count.
+        for schema in ["geo.measure.official_search.v4"] {
             let mut semantic_attempts = attempts.clone();
             let outcome = semantic_attempts.get_mut(&targets[0].target_id).unwrap()[0]
                 .outcome
@@ -2638,29 +2604,19 @@ mod tests {
                 "request_model":proof["model"],
                 "request_question_sha256":proof["question_sha256"],
                 "extraction_model":"synthetic-extractor",
-                "extraction_prompt_version":"geo.observation.extract.v2",
+                "extraction_prompt_version":"geo.observation.extract.v4",
                 "source_sha256":digest
             });
-            if schema.ends_with("v3") {
-                proof["search_event"]["source"] = serde_json::json!("provider_connect_stream_ai");
-                for field in ["chat_id", "message_id", "block_id"] {
-                    proof["search_event"][field] = serde_json::json!("synthetic-id");
-                }
-                proof["search_event"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("search_used");
-            }
-            outcome.runner_evidence.push(serde_json::json!({
+            outcome.runner_evidence[1] = serde_json::json!({
                 "kind":"observation_extraction",
                 "method":"llm_grounded",
                 "model":"synthetic-extractor",
-                "prompt_version":"geo.observation.extract.v2",
+                "prompt_version":"geo.observation.extract.v4",
                 "source_sha256":digest,
                 "source_json":source,
                 "surface":"model_api",
                 "refs":[{"pointer":"/messages","quote":"synthetic"}]
-            }));
+            });
             assert_eq!(
                 optimization_eligible_projection(&scope, &plan, &semantic_attempts, now)
                     .unwrap()
@@ -2669,50 +2625,35 @@ mod tests {
                 1,
                 "{schema}"
             );
-            if schema.ends_with("v4") {
-                let mut compact = semantic_attempts.clone();
-                let evidence = &mut compact.get_mut(&targets[0].target_id).unwrap()[0]
+            for retired in [
+                "geo.measure.official_search.v1",
+                "geo.measure.official_search.v2",
+                "geo.measure.official_search.v3",
+            ] {
+                let mut invalid = semantic_attempts.clone();
+                invalid.get_mut(&targets[0].target_id).unwrap()[0]
                     .outcome
                     .as_mut()
                     .unwrap()
-                    .runner_evidence;
-                evidence[0]["search_event"]["extraction_prompt_version"] =
-                    serde_json::json!("geo.observation.extract.v3");
-                // Updating only the event must never borrow the old audit.
+                    .runner_evidence[0]["schema_version"] = serde_json::json!(retired);
                 assert!(
-                    optimization_eligible_projection(&scope, &plan, &compact, now)
+                    optimization_eligible_projection(&scope, &plan, &invalid, now)
                         .unwrap()
                         .observations
                         .is_empty()
                 );
-                compact.get_mut(&targets[0].target_id).unwrap()[0]
-                    .outcome
-                    .as_mut()
-                    .unwrap()
-                    .runner_evidence[1]["prompt_version"] =
-                    serde_json::json!("geo.observation.extract.v3");
-                assert_eq!(
-                    optimization_eligible_projection(&scope, &plan, &compact, now)
-                        .unwrap()
-                        .observations
-                        .len(),
-                    1
-                );
             }
-            let mut mutations = vec![
+            let mutations = [
                 ("request_model", "different"),
                 ("request_question_sha256", "different"),
                 ("source_sha256", "different"),
                 ("extraction_model", ""),
                 ("source", "different"),
+                ("search_used", "no"),
+                ("search_used", "unknown"),
+                ("extraction_prompt_version", "geo.observation.extract.v2"),
+                ("extraction_prompt_version", "geo.observation.extract.v3"),
             ];
-            if schema.ends_with("v4") {
-                mutations.extend([
-                    ("search_used", "no"),
-                    ("search_used", "unknown"),
-                    ("extraction_prompt_version", "old"),
-                ]);
-            }
             for (field, value) in mutations {
                 let mut invalid = semantic_attempts.clone();
                 invalid.get_mut(&targets[0].target_id).unwrap()[0]

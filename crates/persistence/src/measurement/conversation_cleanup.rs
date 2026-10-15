@@ -310,7 +310,7 @@ async fn decode_claim(
     original_identity.validate()?;
     let capture = decode_capture(row)?;
     let recovery = if capture.retained_message_inventory_sha256(scope).is_none() {
-        crate::observation_completion_recovery::read_by_source(
+        super::completion_recovery::read_by_source(
             tx,
             scope,
             capture.receipt.capture_id,

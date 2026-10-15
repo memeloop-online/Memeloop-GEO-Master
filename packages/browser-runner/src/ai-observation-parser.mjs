@@ -8,12 +8,12 @@ import {
   validateAiObservation,
 } from "./ai-observation-grounding.mjs";
 
-const PROMPT_VERSION = "geo.observation.extract.v3";
+const PROMPT_VERSION = "geo.observation.extract.v4";
 const MAX_INPUT_BYTES = 750_000;
 const MAX_OUTPUT_BYTES = 150_000;
 const MAX_CANDIDATE_BYTES = 150_000;
 const PROMPT_TEMPLATE = readFileSync(
-  new URL("./observation-extraction-prompt.txt", import.meta.url),
+  new URL("./observation-extraction-prompt-v3.txt", import.meta.url),
   "utf8",
 )
   .replace(/\r\n/gu, "\n")
@@ -613,6 +613,7 @@ export async function interpretObservation(
       grounded = result
         ? validateAiObservation(document, result.extracted, {
             semanticOnly: true,
+            allowRecommendations: true,
           })
         : null;
     } catch {
@@ -628,6 +629,7 @@ export async function interpretObservation(
     else if (result)
       groundingReason = observationRejectionReason(document, result.extracted, {
         semanticOnly: true,
+        allowRecommendations: true,
       });
     if (result) {
       const candidateEvidence = candidateRecord(result, route, groundingReason);

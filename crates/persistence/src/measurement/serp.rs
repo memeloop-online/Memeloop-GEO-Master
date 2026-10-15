@@ -673,7 +673,7 @@ impl SerpRepository for PgSerpRepository {
                 .bind(&stored.measurement.source_key).fetch_optional(&mut *tx).await.map_err(unavailable)?;
             let settings = row
                 .as_ref()
-                .map(crate::project_serp_settings::decode)
+                .map(super::serp_settings::decode)
                 .transpose()?;
             validate_project_serp_send(settings.as_ref(), &stored.measurement, revision)?;
         }

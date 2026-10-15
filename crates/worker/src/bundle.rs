@@ -70,7 +70,6 @@ export const HOST_OPS_VERSION = "geo.hostops.v19";
 
 const OPS = {
   modelComplete: "op_host_model_complete_v1",
-  knowledgeSearch: "op_host_knowledge_search_v1",
   knowledgeTextRead: "op_host_knowledge_text_read_v1",
   knowledgeTextRevise: "op_host_knowledge_text_revise_v1",
   knowledgeImportStatus: "op_host_knowledge_import_status_v1",
@@ -129,7 +128,6 @@ async function callOp(opName, payload) {
 export const hostOps = {
   version: HOST_OPS_VERSION,
   modelComplete: (request) => callOp(OPS.modelComplete, request),
-  knowledgeSearch: (request) => callOp(OPS.knowledgeSearch, request),
   knowledgeTextRead: (request) => callOp(OPS.knowledgeTextRead, request),
   knowledgeTextRevise: (request) => callOp(OPS.knowledgeTextRevise, request),
   knowledgeImportStatus: (request) => callOp(OPS.knowledgeImportStatus, request),
@@ -213,13 +211,11 @@ import { hostOps } from "./host-ops.js";
 
 export { hostOps, attempt } from "./host-ops.js";
 
-export async function main({ prompt, query = prompt }) {
-  const retrieval = await hostOps.knowledgeSearch({ query });
+export async function main({ prompt }) {
   const completion = await hostOps.modelComplete({ prompt });
   const result = {
     answer: completion.text,
     model: completion.model,
-    evidence: retrieval.evidence,
   };
   await Deno.core.ops.op_host_emit("loop.completed", JSON.stringify(result));
   return result;

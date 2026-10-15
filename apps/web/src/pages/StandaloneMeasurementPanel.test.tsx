@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -194,6 +200,83 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it("nests repeated measurements under their actual set and version and separates temporary records", async () => {
+    const binding = {
+      reference: {
+        question_set_id: "set-1",
+        question_set_version_id: "version-1",
+        question_id: "question-1",
+        question_revision_id: "revision-1",
+      },
+      purpose: "optimization" as const,
+      split_policy_version: "v1",
+    };
+    const bound = {
+      ...target,
+      input: { ...target.input, question_binding: binding },
+    };
+    vi.mocked(listAllQuestionSets).mockResolvedValue({
+      items: [
+        {
+          id: "set-1",
+          name: "观测问题",
+          current_version_id: "version-1",
+          current_revision: 1,
+          question_count: 1,
+          optimization_count: 1,
+          evaluation_count: 0,
+        },
+      ],
+      next_cursor: null,
+    });
+    vi.mocked(listMeasurementPlans).mockResolvedValue({
+      items: [
+        {
+          ...plan,
+          plan_id: "bound-1",
+          title: "第一次观测",
+          targets: [bound, { ...bound, target_id: "another-target" }],
+        },
+        { ...plan, plan_id: "bound-2", title: "第二次观测", targets: [bound] },
+        { ...plan, plan_id: "custom-1", title: "临时观测", targets: [target] },
+      ],
+      next_after: null,
+    });
+    vi.mocked(getMeasurementPlan).mockResolvedValue({
+      ...plan,
+      plan_id: "bound-2",
+      targets: [bound],
+    });
+    const user = userEvent.setup();
+    renderPanel(false, true);
+    const folder = (
+      await screen.findByText("观测问题 · 本页 2 条记录")
+    ).closest("details")!;
+    expect(folder).not.toHaveAttribute("open");
+    await user.click(within(folder).getByText("观测问题 · 本页 2 条记录"));
+    expect(folder).toHaveAttribute("open");
+    expect(within(folder).getByText("当前版本 v1")).toBeVisible();
+    expect(within(folder).getAllByRole("button")).toHaveLength(2);
+    expect(within(folder).queryByText(/临时观测/)).not.toBeInTheDocument();
+    const temporary = screen
+      .getByText("临时测量 · 本页 1 条记录")
+      .closest("details")!;
+    expect(
+      within(temporary).getByRole("button", { name: /临时观测/ }),
+    ).toBeVisible();
+    await user.click(
+      within(folder).getByRole("button", { name: /第二次观测/ }),
+    );
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "record=bound-2",
+    );
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "set=set-1",
+    );
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+      "version=version-1",
+    );
+  });
   it.each(["record", "planId"])(
     "opens a %s deep link with history collapsed and the answer visible",
     async (parameter) => {
@@ -760,7 +843,7 @@ describe("standalone arbitrary-topic measurement", () => {
       revision: 2,
       parent_version_id: "version-1",
       name: "已有问题",
-      question_count: 1,
+      question_count: 2,
       optimization_count: 0,
       evaluation_count: 1,
       split_policy_version: "v1",
@@ -780,6 +863,19 @@ describe("standalone arbitrary-topic measurement", () => {
           purpose: "frozen_evaluation",
           split_policy_version: "v1",
         },
+        {
+          id: "revision-3",
+          question_id: "question-2",
+          text: "如何选择观测地点？",
+          intent: "selection",
+          product_refs: [],
+          market: "CN",
+          language: "zh-CN",
+          source: { kind: "user_provided" },
+          weight: 1,
+          purpose: "optimization",
+          split_policy_version: "v1",
+        },
       ],
     };
     vi.mocked(getQuestionSetVersion).mockResolvedValue(frozenVersion);
@@ -794,12 +890,13 @@ describe("standalone arbitrary-topic measurement", () => {
       await screen.findByRole("option", { name: "如何选择观测时间？" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/冻结评估题 · 答案不进入内容优化/),
+      screen.getByRole("option", { name: "全部问题（2 题）" }),
     ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "开始测量" }));
     await waitFor(() => expect(createMeasurementPlan).toHaveBeenCalledOnce());
     const input = vi.mocked(createMeasurementPlan).mock.calls[0][2];
     expect(input.measurements).toEqual([]);
+    expect(input.bound_measurements).toHaveLength(2);
     expect(input.bound_measurements?.[0].question).toEqual({
       question_set_id: "set-1",
       question_set_version_id: "version-2",
@@ -808,6 +905,12 @@ describe("standalone arbitrary-topic measurement", () => {
     });
     expect(input.bound_measurements?.[0]).not.toHaveProperty("purpose");
     expect(input.bound_measurements?.[0]).not.toHaveProperty("market");
+    expect(input.bound_measurements?.[1].question).toEqual({
+      question_set_id: "set-1",
+      question_set_version_id: "version-2",
+      question_id: "question-2",
+      question_revision_id: "revision-3",
+    });
     expect(JSON.stringify(input)).not.toContain("如何选择观测时间");
   });
 });

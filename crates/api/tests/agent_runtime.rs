@@ -21,16 +21,15 @@ use axum::{
 use geo_api::{AppState, CSRF_HEADER, EmbeddedAgentRuntime, RepositoryHostOps, router};
 use geo_domain::{
     AgentRepository, AgentRuntime, AppendMessage, CreateConversation, DEVELOPMENT_TENANT_ID,
-    ImportItem, KnowledgePurpose, KnowledgeRepository, KnowledgeSearchRequest,
-    MemoryAgentRepository, MemoryKnowledgeRepository, RunStatus, RuntimeCapability, SourceKind,
-    TenantScope, ToolCallOutcome,
+    ImportItem, KnowledgePurpose, KnowledgeRepository, MemoryAgentRepository,
+    MemoryKnowledgeRepository, RunStatus, RuntimeCapability, SourceKind, TenantScope,
+    ToolCallOutcome,
 };
 use geo_worker::{
     HOST_LOOP_JS, HOST_MAIN_MODULE, HOST_OPS_JS, HOST_OPS_VERSION, HostOp, HostOpBudgets,
-    HostOpError, HostOpErrorCode, HostOps, KnowledgeSearchResult, KnowledgeTextReadRequest,
-    KnowledgeTextReviseRequest, ManifestKind, ManifestPage, ManifestReadRequest, MeasureRequest,
-    MeasureSample, MeasurementSurface, ModelCompletion, ModelCompletionRequest, PublishReceipt,
-    PublishRequest,
+    HostOpError, HostOpErrorCode, HostOps, KnowledgeTextReadRequest, KnowledgeTextReviseRequest,
+    ManifestKind, ManifestPage, ManifestReadRequest, MeasureRequest, MeasureSample,
+    MeasurementSurface, ModelCompletion, ModelCompletionRequest, PublishReceipt, PublishRequest,
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -57,7 +56,6 @@ import { main } from "./host-loop.js";
 
 export const result = await main({
   prompt: "how long is the warranty?",
-  query: "warranty",
 });
 "#;
 
@@ -172,19 +170,6 @@ impl HostOps for Recorder {
         })
     }
 
-    async fn knowledge_search(
-        &self,
-        scope: &TenantScope,
-        _request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
-        self.record(HostOp::KnowledgeSearch, scope);
-        Ok(KnowledgeSearchResult {
-            knowledge_release_id: None,
-            evidence: Vec::new(),
-            capability_missing: None,
-        })
-    }
-
     async fn manifest_read(
         &self,
         _scope: &TenantScope,
@@ -227,15 +212,6 @@ fn scope() -> TenantScope {
     )
 }
 
-fn search_request(query: &str) -> KnowledgeSearchRequest {
-    KnowledgeSearchRequest {
-        query: query.to_owned(),
-        purpose: KnowledgePurpose::Internal,
-        limit: 5,
-        knowledge_release_id: None,
-    }
-}
-
 /// Native host calls carry a real repository-owned run. A JavaScript event may
 /// claim arbitrary tool calls, but it cannot add them to this ledger.
 const LEDGER_MODULE: &str = "memeloop://bundle/ledger.js";
@@ -243,7 +219,6 @@ const LEDGER_JS: &str = r#"
 import { hostOps } from "./host-ops.js";
 export async function main({ prompt }) {
   const completion = await hostOps.modelComplete({ prompt });
-  await hostOps.knowledgeSearch({ query: "public example" });
   await Deno.core.ops.op_host_emit("loop.completed", JSON.stringify({
     answer: completion.text,
     tool_calls: [{ tool_call_id: "forged-by-script", outcome: "succeeded" }]
@@ -303,7 +278,7 @@ async fn accepted_ledger_turn(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_model_and_knowledge_invocations_are_scoped_and_recorded_once() {
+async fn native_model_invocations_are_scoped_and_recorded_once() {
     let repository = Arc::new(MemoryAgentRepository::default());
     let recorder = Arc::new(Recorder::new());
     let runtime = EmbeddedAgentRuntime::with_bundle(LEDGER_BUNDLE, LEDGER_MODULE, recorder.clone())
@@ -315,12 +290,12 @@ async fn native_model_and_knowledge_invocations_are_scoped_and_recorded_once() {
         .await
         .expect("real native host calls succeed");
     assert!(answer.content.starts_with("bridge:"));
-    assert_eq!(recorder.seen().len(), 2);
+    assert_eq!(recorder.seen().len(), 1);
     let entries = repository
         .list_tool_calls(&run_scope, input.run_id)
         .await
         .expect("scoped ledger");
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 1);
     for entry in &entries {
         assert_eq!(entry.run_id, input.run_id);
         assert_eq!(entry.scope(), run_scope);
@@ -342,11 +317,6 @@ async fn native_model_and_knowledge_invocations_are_scoped_and_recorded_once() {
             .any(|entry| entry.tool_name == "model.complete.v1")
     );
     assert!(
-        entries
-            .iter()
-            .any(|entry| entry.tool_name == "knowledge.search.v1")
-    );
-    assert!(
         repository
             .list_tool_calls(
                 &TenantScope::new(
@@ -365,7 +335,7 @@ async fn native_model_and_knowledge_invocations_are_scoped_and_recorded_once() {
     // repeating the first host invocation must be refused before dispatch.
     let duplicate = runtime.run_turn(&run_scope, input.clone()).await;
     assert!(duplicate.is_err(), "a claimed host call cannot be replayed");
-    assert_eq!(recorder.seen().len(), 2);
+    assert_eq!(recorder.seen().len(), 1);
     let entries_after = repository
         .list_tool_calls(&run_scope, input.run_id)
         .await
@@ -390,7 +360,7 @@ async fn native_model_and_knowledge_invocations_are_scoped_and_recorded_once() {
         runtime.run_turn(&other_scope, input).await.is_err(),
         "trusted run ID cannot be used in a different scope"
     );
-    assert_eq!(recorder.seen().len(), 2);
+    assert_eq!(recorder.seen().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -747,13 +717,9 @@ async fn a_started_run_reaches_the_injected_capability_under_the_run_scope() {
 
     assert_eq!(
         recorder.seen(),
-        vec![
-            (HostOp::KnowledgeSearch, run_scope.storage_key()),
-            (HostOp::ModelComplete, run_scope.storage_key()),
-        ],
+        vec![(HostOp::ModelComplete, run_scope.storage_key())],
         "every op must reach the bridge under the run's own scope"
     );
-    assert_eq!(run.op_calls(HostOp::KnowledgeSearch), 1);
     assert_eq!(run.op_calls(HostOp::ModelComplete), 1);
 
     let completed = run
@@ -971,36 +937,6 @@ async fn single_article_host_ops_fail_closed_without_scoped_business_service() {
         .unwrap_err();
     assert_eq!(refused.op, HostOp::ContentDistributeRead);
     assert_eq!(refused.code, HostOpErrorCode::CapabilityMissing);
-}
-
-/// The one op the process does honour is delegated to the repository, and a
-/// repository refusal arrives as a typed failure rather than a plausible empty
-/// result.
-#[tokio::test]
-async fn knowledge_search_delegates_to_the_repository_and_types_its_failures() {
-    let ops = RepositoryHostOps::new(Arc::new(MemoryKnowledgeRepository::default()));
-    let run_scope = scope();
-
-    let empty = ops
-        .knowledge_search(&run_scope, search_request("warranty"))
-        .await
-        .expect("a scoped search with no release is an empty result, not a failure");
-    assert!(empty.evidence.is_empty());
-    assert!(empty.capability_missing.is_none());
-
-    let refused = ops
-        .knowledge_search(&run_scope, search_request("  "))
-        .await
-        .expect_err("an empty query must be refused");
-    assert_eq!(refused.op, HostOp::KnowledgeSearch);
-    assert_eq!(refused.code, HostOpErrorCode::InvalidRequest, "{refused:?}");
-
-    let unscoped = TenantScope::new(run_scope.operator_id, run_scope.tenant_id, None);
-    let refused = ops
-        .knowledge_search(&unscoped, search_request("warranty"))
-        .await
-        .expect_err("a search without a project must be refused");
-    assert_eq!(refused.code, HostOpErrorCode::InvalidRequest, "{refused:?}");
 }
 
 #[tokio::test]

@@ -40,6 +40,115 @@ const request = (overrides = {}) => {
   };
 };
 
+const recommendationAnswer =
+  "First choice: Sample Air 300, because it is quiet. Also consider Example Bistro for dinner.";
+const recommendationItems = [
+  {
+    name: "Sample Air 300",
+    kind: "product",
+    mention_order: 1,
+    rank: 1,
+    reason: "because it is quiet",
+    evidence_quote: "First choice: Sample Air 300, because it is quiet.",
+    citation_urls: [source.messages[0].url],
+  },
+  {
+    name: "Example Bistro",
+    kind: "restaurant",
+    mention_order: 2,
+    rank: null,
+    reason: null,
+    evidence_quote: "Also consider Example Bistro for dinner.",
+    citation_urls: [],
+  },
+];
+function recommendationRequest(items = recommendationItems) {
+  const source_json = JSON.stringify({
+    messages: [{ ...source.messages[0], text: recommendationAnswer }],
+  });
+  return request({
+    source_json,
+    source_sha256: digest(source_json),
+    candidate_json: JSON.stringify({
+      ...candidate,
+      ...(items === undefined ? {} : { recommendations: items }),
+    }),
+    prompt_version: "geo.observation.extract.v4",
+    parser_version: "geo.observation.extract.v6",
+  });
+}
+
+test("new replay grounds recommended products and restaurants without inventing unranked positions", () => {
+  const result = groundSavedObservation(recommendationRequest());
+  assert.equal(result.outcome.status, "grounded");
+  assert.deepEqual(result.outcome.audit.recommendations, {
+    version: "geo.recommendations.v1",
+    status: "verified",
+    items: recommendationItems,
+  });
+});
+
+test("invalid recommendation proposals preserve the grounded answer and citations", () => {
+  const invalidItems = [
+    null,
+    [{ ...recommendationItems[0], name: "Invented product" }],
+    [{ ...recommendationItems[0], evidence_quote: "Invented source text" }],
+    [{ ...recommendationItems[0], reason: "an invented rationale" }],
+    [{ ...recommendationItems[0], rank: 0 }],
+    [{ ...recommendationItems[0], mention_order: 2 }],
+    [
+      {
+        ...recommendationItems[0],
+        citation_urls: ["https://example.org/unrelated"],
+      },
+    ],
+    [{ ...recommendationItems[0], kind: "unknown-kind" }],
+    [{ ...recommendationItems[0], private_field: "not allowed" }],
+    [recommendationItems[0], { ...recommendationItems[0], mention_order: 2 }],
+    Array.from({ length: 101 }, () => recommendationItems[0]),
+  ];
+  for (const items of invalidItems) {
+    const result = groundSavedObservation(recommendationRequest(items));
+    assert.equal(result.outcome.status, "grounded");
+    assert.equal(result.outcome.raw_answer, recommendationAnswer);
+    assert.deepEqual(result.outcome.citations, [source.messages[0].url]);
+    assert.deepEqual(result.outcome.audit.recommendations, {
+      version: "geo.recommendations.v1",
+      status: "unverified",
+      items: [],
+    });
+  }
+});
+
+test("empty, missing and historical recommendation analysis remain distinct", () => {
+  assert.equal(
+    groundSavedObservation(recommendationRequest([])).outcome.audit
+      .recommendations.status,
+    "verified",
+  );
+  const missing = recommendationRequest();
+  missing.candidate_json = JSON.stringify(candidate);
+  assert.equal(
+    groundSavedObservation(missing).outcome.audit.recommendations.status,
+    "unverified",
+  );
+  for (const [prompt_version, parser_version] of [
+    ["geo.observation.extract.v2", "geo.observation.extract.v4"],
+    ["geo.observation.extract.v3", "geo.observation.extract.v5"],
+  ]) {
+    const historical = request({ prompt_version, parser_version });
+    assert.equal(
+      groundSavedObservation(historical).outcome.audit.recommendations,
+      undefined,
+    );
+    historical.candidate_json = recommendationRequest().candidate_json;
+    assert.equal(
+      groundSavedObservation(historical).outcome.status,
+      "unverified",
+    );
+  }
+});
+
 test("saved grounding normalizes fenced candidates and binds exact source bytes", () => {
   const input = request({
     candidate_json: `\`\`\`json\n${JSON.stringify(candidate)}\n\`\`\``,

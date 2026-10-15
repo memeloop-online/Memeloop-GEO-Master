@@ -1,6 +1,6 @@
 //! Durable inference shared by live callbacks and saved-response continuation.
 //! HTTP waiters never own or cancel a model call. Running claims are not reclaimed.
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use chrono::Utc;
 use geo_domain::{
@@ -27,8 +27,7 @@ fn validate_versions(request: &ObservationExtractionRequest) -> Result<(), AppEr
                 request.prompt_version.as_str(),
                 request.parser_version.as_str()
             ),
-            ("geo.observation.extract.v3", "geo.observation.extract.v5")
-                | ("geo.observation.extract.v2", "geo.observation.extract.v4")
+            ("geo.observation.extract.v4", "geo.observation.extract.v6")
         )
     {
         return Err(AppError::invalid_request("extraction version unsupported"));
@@ -131,11 +130,9 @@ impl ObservationExtractionService {
         source_sha256: &str,
         prompt_version: &str,
     ) -> Result<ObservationExtractionIntent, AppError> {
-        let parser_version = match prompt_version {
-            "geo.observation.extract.v3" => "geo.observation.extract.v5",
-            "geo.observation.extract.v2" => "geo.observation.extract.v4",
-            _ => return Err(AppError::invalid_request("extraction version unsupported")),
-        };
+        if prompt_version != "geo.observation.extract.v4" {
+            return Err(AppError::invalid_request("extraction version unsupported"));
+        }
         let capture = self
             .captures
             .get(scope, capture_id)
@@ -149,37 +146,19 @@ impl ObservationExtractionService {
             manual_revision_id: None,
             source_sha256: source_sha256.into(),
             prompt_version: prompt_version.into(),
-            parser_version: parser_version.into(),
+            parser_version: "geo.observation.extract.v6".into(),
             policy_version: EXTRACTION_POLICY_VERSION.into(),
         };
-        request.validate_source(scope, &capture)?;
-        // Check the versioned prompt before enqueuing an inference intent.
-        let ObservationCaptureSnapshot::Source { source_json, .. } = &capture.input.snapshot else {
-            return Err(AppError::conflict("extraction requires source capture"));
-        };
-        crate::observation_ai_callback::extraction_prompt_versioned(source_json, prompt_version)
-            .map_err(|_| AppError::invalid_request("invalid extraction source"))?;
         let intent = match self
             .repository
-            .admit_automatic(scope, request.clone(), Utc::now())
+            .admit_automatic(scope, request, Utc::now())
             .await?
         {
             AutomaticExtractionAdmission::Intent(intent) => *intent,
             AutomaticExtractionAdmission::DeferredManual => {
                 return Err(AppError::conflict("extraction deferred by saved analysis"));
             }
-            AutomaticExtractionAdmission::DeferredHistoryChanged => {
-                return Err(AppError::conflict("extraction history changed"));
-            }
         };
-        if intent.request.prompt_version != request.prompt_version
-            || intent.request.parser_version != request.parser_version
-            || intent.request.policy_version != request.policy_version
-        {
-            // Reusing the durable task never licenses returning an incompatible
-            // raw model schema to a live callback, nor starting another call.
-            return Err(AppError::conflict("extraction response version conflict"));
-        }
         self.wake.notify_one();
         Ok(intent)
     }
@@ -428,27 +407,17 @@ impl ObservationExtractionService {
     }
 }
 
-struct HistoricalCandidate {
-    item: geo_domain::ObservationExtractionBackfillItem,
-    cursor: crate::observation_analysis::HistoricalSourceCursor,
-}
-
-/// A fixed-cutoff keyset pass survives ticks. Each pending source gets one
-/// revision page per tick; long histories cannot monopolize the scheduler.
-pub(crate) struct HistoricalScan {
+/// Recover captured sources whose process exited before durable admission.
+pub(crate) struct SourceAdmissionScan {
     cutoff: chrono::DateTime<Utc>,
     after: Option<Uuid>,
-    exhausted: bool,
-    pending: VecDeque<HistoricalCandidate>,
 }
 
-impl HistoricalScan {
+impl SourceAdmissionScan {
     pub(crate) fn new() -> Self {
         Self {
             cutoff: Utc::now(),
             after: None,
-            exhausted: false,
-            pending: VecDeque::new(),
         }
     }
 
@@ -458,121 +427,60 @@ impl HistoricalScan {
         analysis: &ObservationAnalysisService,
     ) -> Result<(), AppError> {
         const PAGE: usize = 16;
-        // Keep memory bounded while allowing other candidates to advance next
-        // to a source with arbitrarily many historical revisions.
-        if !self.exhausted && self.pending.len() < PAGE {
-            let items = service
-                .repository
-                .scan_unqueued_sources(self.cutoff, self.after, PAGE - self.pending.len())
-                .await?;
-            self.exhausted = items.len() < PAGE - self.pending.len();
-            for item in items {
-                self.after = Some(item.capture_id);
-                self.pending.push_back(HistoricalCandidate {
-                    item,
-                    cursor: Default::default(),
-                });
-            }
-        }
-        let work = self.pending.len().min(PAGE);
-        for _ in 0..work {
-            let Some(mut candidate) = self.pending.pop_front() else {
-                break;
-            };
+        let items = service
+            .repository
+            .scan_unqueued_sources(self.cutoff, self.after, PAGE)
+            .await?;
+        let exhausted = items.len() < PAGE;
+        for item in items {
+            self.after = Some(item.capture_id);
             let outcome = async {
-                let Some(capture) = service
-                    .captures
-                    .get(&candidate.item.scope, candidate.item.capture_id)
-                    .await?
+                let Some(capture) = service.captures.get(&item.scope, item.capture_id).await?
                 else {
-                    return Ok::<_, AppError>(true);
+                    return Ok::<_, AppError>(());
                 };
-                let preparation = analysis
-                    .prepare_historical_source_page(
-                        &candidate.item.scope,
-                        capture.input.target_id,
-                        capture.input.attempt_id,
-                        candidate.item.capture_id,
-                        &mut candidate.cursor,
+                if !analysis.needs_source_extraction(&item.scope, &capture).await? {
+                    return Ok(());
+                }
+                let ObservationCaptureSnapshot::Source { source_sha256, .. } =
+                    &capture.input.snapshot
+                else {
+                    return Ok(());
+                };
+                service
+                    .enqueue_source(
+                        &item.scope,
+                        item.capture_id,
+                        source_sha256,
+                        "geo.observation.extract.v4",
                     )
                     .await?;
-                match preparation {
-                    None => Ok(false),
-                    Some(crate::observation_analysis::HistoricalSourcePreparation::Ready(
-                        request,
-                    )) => {
-                        let request = ObservationExtractionRequest {
-                            target_id: request.target_id,
-                            attempt_id: request.attempt_id,
-                            source_capture_id: Some(candidate.item.capture_id),
-                            source_evidence_index: None,
-                            manual_revision_id: None,
-                            source_sha256: request.source_sha256,
-                            prompt_version: request.prompt_version,
-                            parser_version: request.parser_version,
-                            policy_version: EXTRACTION_POLICY_VERSION.into(),
-                        };
-                        request.validate_source(&candidate.item.scope, &capture)?;
-                        let admission = service
-                            .repository
-                            .admit_automatic_with_history(
-                                &candidate.item.scope,
-                                request,
-                                Utc::now(),
-                                candidate
-                                    .cursor
-                                    .history_snapshot
-                                    .as_deref()
-                                    .ok_or_else(|| {
-                                        AppError::conflict("extraction history snapshot missing")
-                                    })?,
-                            )
-                            .await?;
-                        if matches!(
-                            admission,
-                            AutomaticExtractionAdmission::DeferredHistoryChanged
-                        ) {
-                            candidate.cursor = Default::default();
-                            return Ok(false);
-                        }
-                        service.wake.notify_one();
-                        Ok(true)
-                    }
-                    // Missing receipts and manual work are reconsidered next
-                    // pass, without mutating or expiring that work.
-                    Some(_) => Ok(true),
-                }
+                Ok(())
             }
             .await;
-            match outcome {
-                Ok(false) => self.pending.push_back(candidate),
-                Ok(true) => {}
-                Err(error) => {
-                    tracing::warn!(code = ?error.code, "observation history preparation failed");
-                }
+            if let Err(error) = outcome {
+                tracing::warn!(code = ?error.code, "observation source admission failed");
             }
         }
-        if self.exhausted && self.pending.is_empty() {
+        if exhausted {
             *self = Self::new();
         }
         Ok(())
     }
 }
 
-/// Deployment cutover must explicitly enable this after legacy direct calls
-/// drain. Existing queued/received recovery is independent of this scheduler.
-pub fn spawn_observation_history_scheduler(
+pub fn spawn_observation_source_recovery(
     service: ObservationExtractionService,
     analysis: ObservationAnalysisService,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut scan = HistoricalScan::new();
+        let mut scan = SourceAdmissionScan::new();
         let mut ticks = tokio::time::interval(Duration::from_secs(30));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
             if let Err(error) = scan.tick(&service, &analysis).await {
-                tracing::warn!(code = ?error.code, "observation history scan failed");
+                tracing::warn!(code = ?error.code, "observation source recovery failed");
             }
         }
     })
@@ -665,17 +573,6 @@ mod tests {
         ) -> Result<geo_domain::ManualExtractionAdmission, AppError> {
             self.inner
                 .admit_manual(scope, key, digest, request, at)
-                .await
-        }
-        async fn admit_automatic_with_history(
-            &self,
-            scope: &TenantScope,
-            request: ObservationExtractionRequest,
-            at: chrono::DateTime<Utc>,
-            expected_history: &str,
-        ) -> Result<AutomaticExtractionAdmission, AppError> {
-            self.inner
-                .admit_automatic_with_history(scope, request, at, expected_history)
                 .await
         }
         async fn admit_automatic(
@@ -925,10 +822,39 @@ mod tests {
                 scope,
                 captures.capture.input.capture_id,
                 source_sha256,
-                "geo.observation.extract.v3",
+                "geo.observation.extract.v4",
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recommendation_prompt_uses_versioned_parser_and_rejects_mismatches() {
+        let (scope, captures, _, _, service) = fixture();
+        let ObservationCaptureSnapshot::Source { source_sha256, .. } =
+            &captures.capture.input.snapshot
+        else {
+            unreachable!()
+        };
+        let intent = service
+            .enqueue_source(
+                &scope,
+                captures.capture.input.capture_id,
+                source_sha256,
+                "geo.observation.extract.v4",
+            )
+            .await
+            .unwrap();
+        assert_eq!(intent.request.parser_version, "geo.observation.extract.v6");
+        assert!(validate_versions(&intent.request).is_ok());
+        let mut mismatched = intent.request;
+        for parser in ["geo.observation.extract.v4", "geo.observation.extract.v5"] {
+            mismatched.parser_version = parser.into();
+            assert!(validate_versions(&mismatched).is_err());
+        }
+        mismatched.parser_version = "geo.observation.extract.v6".into();
+        mismatched.prompt_version = "geo.observation.extract.v999".into();
+        assert!(validate_versions(&mismatched).is_err());
     }
 
     #[tokio::test]
@@ -1087,8 +1013,8 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(legacy.message, "extraction response version conflict");
-        assert_eq!(current.request.parser_version, "geo.observation.extract.v5");
+        assert_eq!(legacy.message, "extraction version unsupported");
+        assert_eq!(current.request.parser_version, "geo.observation.extract.v6");
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert!(
             repository
@@ -1110,7 +1036,7 @@ mod tests {
                     &foreign,
                     captures.capture.input.capture_id,
                     &current.request.source_sha256,
-                    "geo.observation.extract.v3"
+                    "geo.observation.extract.v4"
                 )
                 .await
                 .is_err()

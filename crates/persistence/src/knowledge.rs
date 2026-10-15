@@ -10,9 +10,9 @@ use geo_domain::{
     CurrentKnowledgeRelease, DocumentManifest, DocumentManifestCoverage, DocumentManifestItem,
     DocumentManifestItemState, DocumentManifestPlanRequest, DocumentManifestState, DocumentScope,
     Fact, ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, ImportStage,
-    ImportStatus, KnowledgeAnswerStatus, KnowledgeAskResult, KnowledgeCapability,
-    KnowledgeCoverage, KnowledgeEvidence, KnowledgeOverview, KnowledgePurpose, KnowledgeRelease,
-    KnowledgeRepository, KnowledgeSearchRequest, KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES,
+    ImportStatus, KnowledgeCapability,
+    KnowledgeCoverage, KnowledgeOverview, KnowledgePurpose, KnowledgeRelease,
+    KnowledgeRepository, MAX_INLINE_TEXT_BYTES,
     MAX_UPLOAD_BYTES, Operation, OperationStatus, Product, ReviseSourceTextCommand, Source,
     SourceDetail, SourceKind, SourceState, SourceTextRevisionReceipt, SourceVersion,
     SourceVersionContent, SourceVersionRepresentation, StoredObject, StoredObjectState,
@@ -2413,99 +2413,6 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         Ok(manifest)
     }
 
-    async fn search(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, AppError> {
-        let project_id = Self::project_id(scope)?;
-        if request.query.trim().is_empty() {
-            return Err(AppError::invalid_request("query must not be empty"));
-        }
-        let mut transaction = self.transaction(scope).await?;
-        let current = Self::current_release_in_transaction(&mut transaction, scope).await?;
-        let release_id = request
-            .knowledge_release_id
-            .or(current.knowledge_release_id);
-        let Some(release_id) = release_id else {
-            transaction.commit().await.map_err(database_error)?;
-            return Ok(KnowledgeSearchResult {
-                knowledge_release_id: None,
-                evidence: Vec::new(),
-                capability_missing: None,
-            });
-        };
-        if request.knowledge_release_id.is_some() {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM knowledge_releases WHERE knowledge_release_id=$1 AND operator_id=$2 AND tenant_id=$3 AND project_id=$4)",
-            )
-            .bind(release_id)
-            .bind(scope.operator_id.as_uuid())
-            .bind(scope.tenant_id.as_uuid())
-            .bind(project_id.as_uuid())
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            if !exists {
-                transaction.commit().await.map_err(database_error)?;
-                return Err(AppError::not_found("knowledge release not found"));
-            }
-        }
-        let count = request.limit.clamp(1, 50) as i64;
-        let rows=sqlx::query(
-            "SELECT source.source_id AS evidence_source_id,source.name AS evidence_source_name,source.purpose AS evidence_purpose,
-                    chunk.chunk_id,chunk.source_version_id,chunk.ordinal,chunk.kind,chunk.text,chunk.text_hash,chunk.locator,chunk.product_ids,chunk.market,chunk.language,chunk.extraction_method,chunk.confidence
-             FROM knowledge_release_source_versions member JOIN knowledge_source_versions version ON version.source_version_id=member.source_version_id
-             JOIN knowledge_sources source ON source.source_id=version.source_id JOIN knowledge_chunks chunk ON chunk.source_version_id=version.source_version_id
-             WHERE member.knowledge_release_id=$1 AND member.operator_id=$2 AND member.tenant_id=$3 AND member.project_id=$4
-               AND source.state='active' AND ($5='internal' OR source.purpose='public')
-               AND chunk.extraction_method <> 'deterministic_csv_evidence_v1'
-               AND strpos(lower(chunk.text), lower($6)) > 0
-             ORDER BY version.source_version_id,chunk.ordinal LIMIT $7",
-        ).bind(release_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project_id.as_uuid()).bind(purpose(request.purpose)).bind(request.query.trim()).bind(count)
-         .fetch_all(&mut *transaction).await.map_err(database_error)?;
-        transaction.commit().await.map_err(database_error)?;
-        Ok(KnowledgeSearchResult {
-            knowledge_release_id: Some(release_id),
-            evidence: rows
-                .into_iter()
-                .map(|row| evidence_from_row(&row))
-                .collect::<Result<_, _>>()?,
-            capability_missing: None,
-        })
-    }
-
-    async fn ask(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeAskResult, AppError> {
-        let search = self.search(scope, request).await?;
-        let answer = if search.evidence.is_empty() {
-            "当前资料没有这项信息".to_owned()
-        } else {
-            search
-                .evidence
-                .iter()
-                .map(|value| value.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
-        let answer_status = if search.evidence.is_empty() {
-            KnowledgeAnswerStatus::InsufficientEvidence
-        } else {
-            KnowledgeAnswerStatus::Answered
-        };
-        Ok(KnowledgeAskResult {
-            knowledge_release_id: search.knowledge_release_id,
-            mode: "evidence_only".to_owned(),
-            answer_status,
-            answer,
-            evidence: search.evidence,
-            capability_missing: Some("llm_answering".to_owned()),
-        })
-    }
-
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError> {
         let project_id = Self::project_id(scope)?;
         let mut transaction = self.transaction(scope).await?;
@@ -2648,7 +2555,7 @@ fn chunk_from_row(
         confidence: row.get("confidence"),
     })
 }
-fn evidence_from_row(row: &sqlx::postgres::PgRow) -> Result<KnowledgeEvidence, AppError> {
+fn evidence_from_row(row: &sqlx::postgres::PgRow) -> Result<AppError> {
     let text: String = row.get("text");
     Ok(KnowledgeEvidence {
         source_id: row.get("evidence_source_id"),

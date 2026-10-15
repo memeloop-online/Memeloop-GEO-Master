@@ -17,9 +17,7 @@ use crate::{
 };
 
 const PROMPT: &str =
-    include_str!("../../../packages/browser-runner/src/observation-extraction-prompt.txt");
-const LEGACY_PROMPT: &str =
-    include_str!("../../../packages/browser-runner/src/observation-extraction-prompt-v2.txt");
+    include_str!("../../../../packages/browser-runner/src/observation-extraction-prompt-v3.txt");
 const POLICY_PATH: &str = "/internal/v1/observation-ai/policy";
 const EXTRACT_PATH: &str = "/internal/v1/observation-ai/extract";
 
@@ -85,18 +83,16 @@ impl ObservationAiCallbackService {
 
 #[cfg(test)]
 fn extraction_prompt(source: &str) -> Result<String, StatusCode> {
-    extraction_prompt_versioned(source, "geo.observation.extract.v3")
+    extraction_prompt_versioned(source, "geo.observation.extract.v4")
 }
 
 pub(crate) fn extraction_prompt_versioned(
     source: &str,
     version: &str,
 ) -> Result<String, StatusCode> {
-    let template = match version {
-        "geo.observation.extract.v2" => LEGACY_PROMPT,
-        "geo.observation.extract.v3" => PROMPT,
-        _ => return Err(StatusCode::BAD_REQUEST),
-    };
+    if version != "geo.observation.extract.v4" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if source.len() > 750_000 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -106,7 +102,7 @@ pub(crate) fn extraction_prompt_versioned(
         .get("messages")
         .and_then(serde_json::Value::as_array)
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let mut prompt = template.replace("\r\n", "\n").trim_end().to_owned();
+    let mut prompt = PROMPT.replace("\r\n", "\n").trim_end().to_owned();
     for (index, message) in messages.iter().enumerate() {
         prompt.push_str(&format!("\n/messages/{index} = {message}"));
     }
@@ -168,11 +164,8 @@ async fn extract(
     let version = request
         .prompt_version
         .as_deref()
-        .unwrap_or("geo.observation.extract.v2");
-    if !matches!(
-        version,
-        "geo.observation.extract.v2" | "geo.observation.extract.v3"
-    ) {
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if version != "geo.observation.extract.v4" {
         return Err(StatusCode::BAD_REQUEST);
     }
     let intent = service
@@ -414,7 +407,7 @@ mod tests {
         );
         let dispatcher = crate::spawn_observation_extraction_dispatcher(extraction.clone());
         let service = ObservationAiCallbackService::new(capture, settings, extraction);
-        let body = serde_json::json!({"schema_version":1,"capture_ticket":ticket,"source_capture_id":receipt.capture_id,"source_sha256":geo_domain::sha256_hex(source.as_bytes())});
+        let body = serde_json::json!({"schema_version":1,"capture_ticket":ticket,"source_capture_id":receipt.capture_id,"source_sha256":geo_domain::sha256_hex(source.as_bytes()),"prompt_version":"geo.observation.extract.v4"});
         for path in [POLICY_PATH, EXTRACT_PATH] {
             for bearer in [None, Some("wrong")] {
                 assert_eq!(
@@ -480,14 +473,15 @@ mod tests {
     }
 
     #[test]
-    fn prompt_dispatch_preserves_legacy_and_rejects_unknown_versions() {
+    fn prompt_requires_current_schema() {
         let source = r#"{"messages":[]}"#;
-        let legacy = extraction_prompt_versioned(source, "geo.observation.extract.v2").unwrap();
-        assert_eq!(legacy, LEGACY_PROMPT.replace("\r\n", "\n").trim_end());
-        assert!(!legacy.contains("array_path"));
-        let compact = extraction_prompt_versioned(source, "geo.observation.extract.v3").unwrap();
-        assert!(compact.contains("array_path"));
-        assert!(compact.contains("end_index exclusive"));
+        let recommendations =
+            extraction_prompt_versioned(source, "geo.observation.extract.v4").unwrap();
+        assert_eq!(recommendations, PROMPT.replace("\r\n", "\n").trim_end());
+        assert!(recommendations.contains("recommendations"));
+        assert!(recommendations.contains("array_path"));
+        assert!(extraction_prompt_versioned(source, "geo.observation.extract.v2").is_err());
+        assert!(extraction_prompt_versioned(source, "geo.observation.extract.v3").is_err());
         assert!(extraction_prompt_versioned(source, "geo.observation.extract.future").is_err());
     }
 }

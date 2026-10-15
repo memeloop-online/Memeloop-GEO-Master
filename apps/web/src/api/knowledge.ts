@@ -15,7 +15,6 @@ export type SourceKind =
 export type SourceState = "active" | "removed";
 export type ImportStatus =
   "queued" | "running" | "partial" | "succeeded" | "failed" | "cancelled";
-export type AnswerStatus = "answered" | "insufficient_evidence" | "conflicted";
 export type LocatorKind =
   "pdf" | "docx" | "xlsx" | "web" | "text" | "csv" | "manual";
 
@@ -26,21 +25,13 @@ export interface Capability {
 }
 
 export type CapabilityName =
-  | "pdf_parser"
-  | "docx_parser"
-  | "xlsx_parser"
-  | "ocr"
-  | "vector"
-  | "llm"
-  | "url_fetch";
+  "pdf_parser" | "docx_parser" | "xlsx_parser" | "ocr" | "url_fetch";
 
 export interface KnowledgeCapabilities {
   pdf_parser: Capability;
   docx_parser: Capability;
   xlsx_parser: Capability;
   ocr: Capability;
-  vector: Capability;
-  llm: Capability;
   url_fetch: Capability;
   max_upload_bytes?: number | null;
   max_batch_files?: number | null;
@@ -375,32 +366,6 @@ export interface ImportBatchResult {
   items: ImportItemResult[];
 }
 
-export interface SearchInput {
-  query: string;
-  knowledge_release_id?: string | null;
-  purpose: KnowledgePurpose;
-  limit: number;
-}
-
-export interface SearchResult {
-  evidence: EvidenceReference[];
-  status?: AnswerStatus;
-  missing?: string[];
-}
-
-export type AskInput = SearchInput;
-
-export interface AskResult {
-  status: AnswerStatus;
-  mode: "answer" | "evidence_only";
-  answer?: string | null;
-  evidence: EvidenceReference[];
-  missing: string[];
-  conflicts?: string[];
-  capability_missing?: string[] | null;
-  knowledge_release_id?: string | null;
-}
-
 export interface FileUploadProgress {
   file: File;
   state:
@@ -497,8 +462,6 @@ function normalizeCapabilities(value: unknown): KnowledgeCapabilities {
     docx_parser: capability(values.docx_parser),
     xlsx_parser: capability(values.xlsx_parser),
     ocr: capability(values.ocr),
-    vector: capability(values.vector ?? values.vector_search),
-    llm: capability(values.llm ?? values.llm_answering),
     url_fetch: capability(values.url_fetch ?? values.urlFetch),
     max_upload_bytes:
       typeof values.max_upload_bytes === "number"
@@ -611,39 +574,6 @@ function normalizeSourceDetail(value: unknown): SourceDetail {
         : typeof root.originalText === "string"
           ? root.originalText
           : null,
-  };
-}
-
-function normalizeAskResult(value: unknown): AskResult {
-  const root = asRecord(value);
-  const rawStatus = root.answer_status ?? root.status;
-  const status: AnswerStatus =
-    rawStatus === "conflicted"
-      ? "conflicted"
-      : rawStatus === "insufficient_evidence" || rawStatus === "insufficient"
-        ? "insufficient_evidence"
-        : "answered";
-  const evidence = asArray<EvidenceReference>(root.evidence).slice(0, 12);
-  const mode =
-    root.mode === "evidence_only" || root.answer_mode === "evidence_only"
-      ? "evidence_only"
-      : "answer";
-  return {
-    status,
-    mode,
-    answer: typeof root.answer === "string" ? root.answer : null,
-    evidence,
-    missing: asArray<string>(root.missing ?? root.gaps),
-    conflicts: asArray<string>(root.conflicts),
-    capability_missing: Array.isArray(root.capability_missing)
-      ? asArray<string>(root.capability_missing)
-      : root.capability_missing
-        ? [String(root.capability_missing)]
-        : null,
-    knowledge_release_id:
-      typeof root.knowledge_release_id === "string"
-        ? root.knowledge_release_id
-        : null,
   };
 }
 
@@ -991,32 +921,6 @@ export function materializeInitialSources(
   }).then(normalizeImportBatch);
 }
 
-export function searchKnowledge(
-  tenantId: string,
-  projectId: string,
-  input: SearchInput,
-): Promise<SearchResult> {
-  return apiFetch<SearchResult>("/knowledge/search", {
-    ...scopedOptions(tenantId, projectId),
-    method: "POST",
-    body: input,
-  });
-}
-
-export async function askKnowledge(
-  tenantId: string,
-  projectId: string,
-  input: AskInput,
-): Promise<AskResult> {
-  return normalizeAskResult(
-    await apiFetch<unknown>("/knowledge/ask", {
-      ...scopedOptions(tenantId, projectId),
-      method: "POST",
-      body: input,
-    }),
-  );
-}
-
 function useScope(tenantId: string | undefined, projectId: string | undefined) {
   const { session } = useAuth();
   return scopeFor(session, tenantId, projectId);
@@ -1267,17 +1171,5 @@ export function useRetryImportJobMutation(
       return retryImportJob(tenantId, projectId, importJobId);
     },
     onSuccess: () => invalidateKnowledge(queryClient, scope),
-  });
-}
-
-export function useAskKnowledgeMutation(
-  tenantId: string | undefined,
-  projectId: string | undefined,
-) {
-  return useMutation({
-    mutationFn: (input: AskInput) => {
-      if (!tenantId || !projectId) throw new Error("请先选择项目。");
-      return askKnowledge(tenantId, projectId, input);
-    },
   });
 }

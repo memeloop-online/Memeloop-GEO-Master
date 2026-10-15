@@ -49,7 +49,7 @@ impl PgObservationExtractionRepository {
             .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(id)
             .fetch_optional(&mut **tx).await.map_err(db)?.ok_or_else(|| AppError::not_found("extraction intent not found"))?;
         let intent = decode(&binding)?;
-        crate::observation_analysis::lock_admission_sources(
+        super::analysis::lock_admission_sources(
             tx,
             scope,
             project(scope),
@@ -208,7 +208,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         };
         observation_analysis_source_json(scope, &request, &target, capture.as_ref())?;
         let mut tx = self.transaction(scope).await?;
-        crate::observation_analysis::lock_admission_sources(
+        super::analysis::lock_admission_sources(
             &mut tx,
             scope,
             project(scope),
@@ -223,7 +223,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
             .bind(serde_json::to_value(&request).map_err(|_| AppError::invalid_request("invalid analysis request"))?)
             .bind(created_at).fetch_optional(&mut *tx).await.map_err(db)?;
         let admission = if let Some(row) = inserted {
-            let revision = crate::observation_analysis::decode(&row)?;
+            let revision = super::analysis::decode(&row)?;
             let extraction = ObservationExtractionRequest::for_manual(&revision.request);
             let key = extraction.intent_key(scope)?;
             let intent = ObservationExtractionIntent::queued(extraction, key, created_at);
@@ -233,13 +233,13 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
                 .bind(&intent.intent_key).bind(created_at).bind(value(&intent)?).execute(&mut *tx).await.map_err(db)?;
             ManualExtractionAdmission {
                 revision,
-                intent: Some(intent),
+                intent,
             }
         } else {
             let row = sqlx::query("SELECT * FROM observation_analyses WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND idempotency_key_hash=$4")
                 .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(key_hash)
                 .fetch_optional(&mut *tx).await.map_err(db)?.ok_or_else(|| AppError::conflict("analysis revision identity already exists"))?;
-            let revision = crate::observation_analysis::decode(&row)?;
+            let revision = super::analysis::decode(&row)?;
             if revision.request_digest != request_digest || !revision.request.same_input(&request) {
                 return Err(AppError::conflict("analysis idempotency request differs"));
             }
@@ -248,7 +248,9 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
                 .fetch_optional(&mut *tx).await.map_err(db)?;
             ManualExtractionAdmission {
                 revision,
-                intent: row.as_ref().map(decode).transpose()?,
+                intent: decode(&row.ok_or_else(|| {
+                    AppError::conflict("analysis has no linked extraction intent")
+                })?)?,
             }
         };
         tx.commit().await.map_err(db)?;
@@ -260,16 +262,6 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         request: ObservationExtractionRequest,
         created_at: DateTime<Utc>,
     ) -> Result<AutomaticExtractionAdmission, AppError> {
-        self.admit_automatic_with_history(scope, request, created_at, "")
-            .await
-    }
-    async fn admit_automatic_with_history(
-        &self,
-        scope: &TenantScope,
-        request: ObservationExtractionRequest,
-        created_at: DateTime<Utc>,
-        expected_history: &str,
-    ) -> Result<AutomaticExtractionAdmission, AppError> {
         let key = request.intent_key(scope)?;
         let capture = self
             .captures
@@ -278,7 +270,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
             .ok_or_else(|| AppError::not_found("extraction source not found"))?;
         request.validate_source(scope, &capture)?;
         let mut tx = self.transaction(scope).await?;
-        crate::observation_analysis::lock_admission_sources(
+        super::analysis::lock_admission_sources(
             &mut tx,
             scope,
             project(scope),
@@ -294,21 +286,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
             tx.commit().await.map_err(db)?;
             return Ok(AutomaticExtractionAdmission::Intent(Box::new(intent)));
         }
-        if !expected_history.is_empty()
-            && crate::observation_analysis::history_snapshot(
-                &mut tx,
-                scope,
-                project(scope),
-                request.target_id,
-                request.attempt_id,
-            )
-            .await?
-                != expected_history
-        {
-            tx.commit().await.map_err(db)?;
-            return Ok(AutomaticExtractionAdmission::DeferredHistoryChanged);
-        }
-        if crate::observation_analysis::unresolved_for_attempt(
+        if super::analysis::unresolved_for_attempt(
             &mut tx,
             scope,
             project(scope),
@@ -362,49 +340,6 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
                 capture_id: row.get("capture_id"),
             })
             .collect())
-    }
-    async fn enqueue(
-        &self,
-        scope: &TenantScope,
-        request: ObservationExtractionRequest,
-        created_at: DateTime<Utc>,
-    ) -> Result<ObservationExtractionIntent, AppError> {
-        let key = request.intent_key(scope)?;
-        let capture = self
-            .captures
-            .get(scope, automatic_capture(&request)?)
-            .await?
-            .ok_or_else(|| AppError::not_found("extraction source not found"))?;
-        request.validate_source(scope, &capture)?;
-        let intent = ObservationExtractionIntent::queued(request, key, created_at);
-        let mut tx = self.transaction(scope).await?;
-        crate::observation_analysis::lock_admission_sources(
-            &mut tx,
-            scope,
-            project(scope),
-            intent.request.target_id,
-            intent.request.attempt_id,
-        )
-        .await?;
-        let inserted = sqlx::query("INSERT INTO observation_extraction_intents (intent_id,operator_id,tenant_id,project_id,source_capture_id,intent_key,state,created_at,intent) VALUES ($1,$2,$3,$4,$5,$6,'queued',$7,$8) ON CONFLICT (operator_id,tenant_id,project_id,intent_key) DO NOTHING RETURNING *")
-            .bind(intent.intent_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope))
-            .bind(intent.request.source_capture_id).bind(&intent.intent_key).bind(created_at).bind(value(&intent)?)
-            .fetch_optional(&mut *tx).await.map_err(db)?;
-        let stored = match inserted {
-            Some(row) => decode(&row)?,
-            None => {
-                let row = sqlx::query("SELECT * FROM observation_extraction_intents WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND intent_key=$4")
-                .bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)).bind(&intent.intent_key)
-                .fetch_one(&mut *tx).await.map_err(db)?;
-                let prior = decode(&row)?;
-                if prior.request != intent.request {
-                    return Err(AppError::conflict("extraction intent binding differs"));
-                }
-                prior
-            }
-        };
-        tx.commit().await.map_err(db)?;
-        Ok(stored)
     }
     async fn get(
         &self,

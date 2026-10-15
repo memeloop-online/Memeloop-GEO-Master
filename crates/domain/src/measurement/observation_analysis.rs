@@ -228,7 +228,6 @@ pub struct ObservationAnalysisRevision {
     pub analyzed_at: Option<DateTime<Utc>>,
     pub result: Option<ObservationAnalysisResult>,
     /// A completed response (or proof no request was sent), not lease expiry.
-    #[serde(default)]
     pub inference_resolved: bool,
 }
 
@@ -250,15 +249,6 @@ impl ObservationAnalysisRevision {
 /// repository's records; never hold this across inference.
 #[derive(Clone, Default)]
 pub struct MemoryObservationAdmissionGate(pub(crate) Arc<Mutex<()>>);
-
-/// Only the successful claimant receives this token. There is deliberately no
-/// lease expiry/reclaim: an interrupted external inference is not blindly sent
-/// again. The owning claimant may record a terminal interruption failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservationAnalysisClaim {
-    pub revision: ObservationAnalysisRevision,
-    pub claim_token: Uuid,
-}
 
 fn bounded_label(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
@@ -527,7 +517,7 @@ pub fn observation_analysis_source_json(
     }
     let document: Value = serde_json::from_str(&source_json)
         .map_err(|_| AppError::invalid_request("saved observation document invalid"))?;
-    if !crate::observation_capture::valid_observation_source_document(&document) {
+    if !super::observation_capture::valid_observation_source_document(&document) {
         return Err(AppError::invalid_request(
             "saved observation document invalid",
         ));
@@ -537,15 +527,6 @@ pub fn observation_analysis_source_json(
 
 #[async_trait]
 pub trait ObservationAnalysisRepository: Send + Sync {
-    /// Snapshot of all revision lifecycle metadata, including transitions of
-    /// existing rows. Results are immutable after their completed transition.
-    /// Called while the shared gate is already held during checked admission.
-    async fn admission_history_snapshot(
-        &self,
-        scope: &TenantScope,
-        target_id: Uuid,
-        attempt_id: Uuid,
-    ) -> Result<String, AppError>;
     fn memory_admission_gate(&self) -> Option<MemoryObservationAdmissionGate> {
         None
     }
@@ -560,12 +541,6 @@ pub trait ObservationAnalysisRepository: Send + Sync {
         target_id: Uuid,
         attempt_id: Uuid,
     ) -> Result<bool, AppError>;
-    async fn record_inference_resolved(
-        &self,
-        scope: &TenantScope,
-        revision_id: Uuid,
-        claim_token: Uuid,
-    ) -> Result<(), AppError>;
     /// Atomically save a deterministic interpretation of an already persisted
     /// response. Retries must match the source request, digest and result; there
     /// is no inference claim or partially written running revision to recover.
@@ -588,38 +563,6 @@ pub trait ObservationAnalysisRepository: Send + Sync {
         attempts: &[(Uuid, Uuid)],
         as_of: DateTime<Utc>,
     ) -> Result<Vec<ObservationAnalysisRevision>, AppError>;
-    /// Terminalize abandoned work without invoking inference or reclaiming it.
-    /// The old claim is fenced out; a user may request a separate new revision.
-    async fn interrupt_stale(
-        &self,
-        scope: &TenantScope,
-        target_id: Uuid,
-        attempt_id: Uuid,
-        cutoff: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) -> Result<(), AppError>;
-    async fn create(
-        &self,
-        scope: &TenantScope,
-        idempotency_key: &str,
-        request_digest: &str,
-        request: ObservationAnalysisRequest,
-        created_at: DateTime<Utc>,
-    ) -> Result<ObservationAnalysisRevision, AppError>;
-    async fn claim(
-        &self,
-        scope: &TenantScope,
-        revision_id: Uuid,
-        started_at: DateTime<Utc>,
-    ) -> Result<Option<ObservationAnalysisClaim>, AppError>;
-    async fn finish(
-        &self,
-        scope: &TenantScope,
-        revision_id: Uuid,
-        claim_token: Uuid,
-        result: ObservationAnalysisResult,
-        analyzed_at: DateTime<Utc>,
-    ) -> Result<ObservationAnalysisRevision, AppError>;
     async fn get(
         &self,
         scope: &TenantScope,
@@ -677,7 +620,6 @@ impl MemoryObservationAnalysisRepository {
         request_digest: &str,
         request: ObservationAnalysisRequest,
         created_at: DateTime<Utc>,
-        durable_linked: bool,
     ) -> Result<(ObservationAnalysisRevision, bool), AppError> {
         request.validate(scope, idempotency_key, request_digest, created_at)?;
         let target = self.jobs.get_target(scope, request.target_id).await?;
@@ -724,7 +666,7 @@ impl MemoryObservationAnalysisRepository {
                 key_hash,
                 revision: revision.clone(),
                 claim_token: None,
-                durable_linked,
+                durable_linked: true,
             },
         );
         Ok((revision, true))
@@ -847,38 +789,6 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
     fn memory_repository(&self) -> Option<&MemoryObservationAnalysisRepository> {
         Some(self)
     }
-    async fn admission_history_snapshot(
-        &self,
-        scope: &TenantScope,
-        target_id: Uuid,
-        attempt_id: Uuid,
-    ) -> Result<String, AppError> {
-        require_project(scope)?;
-        let records = self.records.lock().await;
-        let mut versions: Vec<_> = records
-            .values()
-            .filter(|stored| {
-                stored.scope == *scope
-                    && stored.revision.request.target_id == target_id
-                    && stored.revision.request.attempt_id == attempt_id
-            })
-            .map(|stored| {
-                let revision = &stored.revision;
-                (
-                    revision.request.revision_id,
-                    revision.state,
-                    revision.created_at,
-                    revision.started_at,
-                    revision.analyzed_at,
-                    revision.inference_resolved,
-                )
-            })
-            .collect();
-        versions.sort_by_key(|version| version.0);
-        Ok(sha256_hex(&serde_json::to_vec(&versions).map_err(
-            |_| AppError::conflict("analysis history snapshot invalid"),
-        )?))
-    }
     fn memory_admission_gate(&self) -> Option<MemoryObservationAdmissionGate> {
         Some(self.admission_gate.clone())
     }
@@ -895,29 +805,6 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
                 && stored.revision.request.attempt_id == attempt_id
                 && stored.revision.blocks_automatic_admission()
         }))
-    }
-    async fn record_inference_resolved(
-        &self,
-        scope: &TenantScope,
-        revision_id: Uuid,
-        claim_token: Uuid,
-    ) -> Result<(), AppError> {
-        let _admission = self.admission_gate.0.lock().await;
-        require_project(scope)?;
-        let mut records = self.records.lock().await;
-        let stored = records
-            .get_mut(&revision_id)
-            .filter(|stored| stored.scope == *scope)
-            .ok_or_else(|| AppError::not_found("analysis revision not found"))?;
-        if stored.durable_linked
-            || claim_token.is_nil()
-            || stored.claim_token != Some(claim_token)
-            || stored.revision.state != ObservationAnalysisState::Running
-        {
-            return Err(AppError::conflict("analysis claim is not current"));
-        }
-        stored.revision.inference_resolved = true;
-        Ok(())
     }
     async fn project_response(
         &self,
@@ -1017,148 +904,6 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         }
         Ok(selected.into_values().cloned().collect())
     }
-    async fn interrupt_stale(
-        &self,
-        scope: &TenantScope,
-        target_id: Uuid,
-        attempt_id: Uuid,
-        cutoff: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) -> Result<(), AppError> {
-        let _admission = self.admission_gate.0.lock().await;
-        require_project(scope)?;
-        if cutoff > now {
-            return Err(AppError::invalid_request(
-                "invalid analysis interruption time",
-            ));
-        }
-        for stored in self.records.lock().await.values_mut() {
-            let revision = &mut stored.revision;
-            if stored.scope == *scope
-                && !stored.durable_linked
-                && revision.request.target_id == target_id
-                && revision.request.attempt_id == attempt_id
-                && revision.state != ObservationAnalysisState::Completed
-                && revision.started_at.unwrap_or(revision.created_at) <= cutoff
-            {
-                stored.claim_token = Some(Uuid::new_v4());
-                revision.state = ObservationAnalysisState::Completed;
-                revision.started_at = Some(revision.started_at.unwrap_or(revision.created_at));
-                revision.analyzed_at = Some(now);
-                revision.result = Some(ObservationAnalysisResult {
-                    config_revision: None,
-                    actual_model: None,
-                    candidate_json: None,
-                    outcome: ObservationAnalysisOutcome::Failed {
-                        code: "analysis_interrupted".into(),
-                    },
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                });
-            }
-        }
-        Ok(())
-    }
-    async fn create(
-        &self,
-        scope: &TenantScope,
-        idempotency_key: &str,
-        request_digest: &str,
-        request: ObservationAnalysisRequest,
-        created_at: DateTime<Utc>,
-    ) -> Result<ObservationAnalysisRevision, AppError> {
-        let _admission = self.admission_gate.0.lock().await;
-        self.create_gate_held(
-            scope,
-            idempotency_key,
-            request_digest,
-            request,
-            created_at,
-            false,
-        )
-        .await
-        .map(|(revision, _)| revision)
-    }
-
-    async fn claim(
-        &self,
-        scope: &TenantScope,
-        revision_id: Uuid,
-        started_at: DateTime<Utc>,
-    ) -> Result<Option<ObservationAnalysisClaim>, AppError> {
-        let _admission = self.admission_gate.0.lock().await;
-        require_project(scope)?;
-        let mut records = self.records.lock().await;
-        let stored = records
-            .get_mut(&revision_id)
-            .filter(|stored| stored.scope == *scope)
-            .ok_or_else(|| AppError::not_found("analysis revision not found"))?;
-        if stored.durable_linked || stored.revision.state != ObservationAnalysisState::Queued {
-            return Ok(None);
-        }
-        if started_at < stored.revision.created_at {
-            return Err(AppError::invalid_request(
-                "analysis start precedes acceptance",
-            ));
-        }
-        let claim_token = Uuid::new_v4();
-        stored.claim_token = Some(claim_token);
-        stored.revision.state = ObservationAnalysisState::Running;
-        stored.revision.started_at = Some(started_at);
-        Ok(Some(ObservationAnalysisClaim {
-            revision: stored.revision.clone(),
-            claim_token,
-        }))
-    }
-
-    async fn finish(
-        &self,
-        scope: &TenantScope,
-        revision_id: Uuid,
-        claim_token: Uuid,
-        result: ObservationAnalysisResult,
-        analyzed_at: DateTime<Utc>,
-    ) -> Result<ObservationAnalysisRevision, AppError> {
-        let _admission = self.admission_gate.0.lock().await;
-        require_project(scope)?;
-        result.validate()?;
-        let mut records = self.records.lock().await;
-        let stored = records
-            .get_mut(&revision_id)
-            .filter(|stored| stored.scope == *scope)
-            .ok_or_else(|| AppError::not_found("analysis revision not found"))?;
-        if stored.durable_linked
-            || stored.claim_token != Some(claim_token)
-            || stored
-                .revision
-                .started_at
-                .is_none_or(|started| analyzed_at < started)
-        {
-            return Err(AppError::conflict(
-                "analysis claim or completion time differs",
-            ));
-        }
-        if stored.revision.state == ObservationAnalysisState::Completed {
-            return if stored.revision.result.as_ref() == Some(&result)
-                && stored
-                    .revision
-                    .analyzed_at
-                    .is_some_and(|at| at.timestamp_micros() == analyzed_at.timestamp_micros())
-            {
-                Ok(stored.revision.clone())
-            } else {
-                Err(AppError::conflict("analysis result already recorded"))
-            };
-        }
-        if stored.revision.state != ObservationAnalysisState::Running {
-            return Err(AppError::conflict("analysis revision not running"));
-        }
-        stored.revision.result = Some(result);
-        stored.revision.analyzed_at = Some(analyzed_at);
-        stored.revision.state = ObservationAnalysisState::Completed;
-        Ok(stored.revision.clone())
-    }
-
     async fn get(
         &self,
         scope: &TenantScope,
@@ -1362,11 +1107,12 @@ mod tests {
         let f = fixture().await;
         let mut revision = f
             .store
-            .create(
+            .project_response(
                 &f.scope,
                 "classification",
                 &sha256_hex(b"classification"),
                 f.request,
+                result(),
                 f.now,
             )
             .await
@@ -1428,7 +1174,7 @@ mod tests {
                 .admit_manual(&f.scope, "manual", &digest, request.clone(), f.now)
                 .await
                 .unwrap();
-            let intent = admitted.intent.unwrap();
+            let intent = admitted.intent;
             assert_eq!(intent.request.manual_revision_id, Some(request.revision_id));
             let mut replay_request = request.clone();
             replay_request.revision_id = Uuid::new_v4();
@@ -1436,7 +1182,7 @@ mod tests {
                 .admit_manual(&f.scope, "manual", &digest, replay_request.clone(), f.now)
                 .await
                 .unwrap();
-            assert_eq!(replay.intent.unwrap(), intent);
+            assert_eq!(replay.intent, intent);
             assert_eq!(replay.revision, admitted.revision);
             assert!(
                 extraction
@@ -1451,16 +1197,6 @@ mod tests {
                     .is_err()
             );
             let later = f.now + Duration::seconds(600);
-            analyses
-                .interrupt_stale(
-                    &f.scope,
-                    request.target_id,
-                    request.attempt_id,
-                    later,
-                    later,
-                )
-                .await
-                .unwrap();
             assert_eq!(
                 analyses
                     .get(&f.scope, request.revision_id)
@@ -1470,27 +1206,10 @@ mod tests {
                     .state,
                 ObservationAnalysisState::Queued
             );
-            assert!(
-                analyses
-                    .claim(&f.scope, request.revision_id, later)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
             let claim = extraction
                 .claim(&f.scope, intent.intent_id, later)
                 .await
                 .unwrap()
-                .unwrap();
-            analyses
-                .interrupt_stale(
-                    &f.scope,
-                    request.target_id,
-                    request.attempt_id,
-                    later + Duration::seconds(600),
-                    later + Duration::seconds(600),
-                )
-                .await
                 .unwrap();
             assert_eq!(
                 analyses
@@ -1500,18 +1219,6 @@ mod tests {
                     .unwrap()
                     .state,
                 ObservationAnalysisState::Running
-            );
-            assert!(
-                analyses
-                    .finish(
-                        &f.scope,
-                        request.revision_id,
-                        claim.claim_token,
-                        result(),
-                        later
-                    )
-                    .await
-                    .is_err()
             );
             extraction
                 .record_response(
@@ -1581,7 +1288,7 @@ mod tests {
                 .admit_manual(&f.scope, "explicit-next", &digest, replay_request, later)
                 .await
                 .unwrap();
-            assert_ne!(next.intent.unwrap().intent_id, intent.intent_id);
+            assert_ne!(next.intent.intent_id, intent.intent_id);
             let foreign = TenantScope::new(
                 f.scope.operator_id,
                 Uuid::new_v4().into(),
@@ -1604,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_manual_legacy_replay_and_automatic_admission_race() {
+    async fn durable_manual_and_automatic_admission_race() {
         use crate::{AutomaticExtractionAdmission, ObservationExtractionRepository};
         let f = fixture().await;
         let auto = automatic_request(&f);
@@ -1612,31 +1319,7 @@ mod tests {
         let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
         let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
             .with_automatic_admission(gate, analyses.clone());
-        let digest = sha256_hex(b"legacy");
-        let legacy = analyses
-            .create(&f.scope, "legacy", &digest, f.request.clone(), f.now)
-            .await
-            .unwrap();
-        let replay = extraction
-            .admit_manual(&f.scope, "legacy", &digest, f.request.clone(), f.now)
-            .await
-            .unwrap();
-        assert_eq!(replay.revision, legacy);
-        assert!(replay.intent.is_none());
-        assert!(
-            extraction
-                .scan_ready(f.now, None, 100)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            extraction
-                .admit_automatic(&f.scope, auto.clone(), f.now)
-                .await
-                .unwrap(),
-            AutomaticExtractionAdmission::DeferredManual
-        );
+        let digest = sha256_hex(b"manual");
         let mut request = f.request.clone();
         request.revision_id = Uuid::new_v4();
         request.source = ObservationAnalysisSource::Capture {
@@ -1646,16 +1329,13 @@ mod tests {
             extraction.admit_manual(&f.scope, "explicit", &digest, request.clone(), f.now),
             extraction.admit_automatic(&f.scope, auto.clone(), f.now),
         );
-        let manual = manual.unwrap().intent.unwrap();
+        let manual = manual.unwrap().intent;
         match automatic.unwrap() {
-            AutomaticExtractionAdmission::Intent(intent) => {
-                assert_eq!(intent.intent_id, manual.intent_id)
-            }
+            AutomaticExtractionAdmission::Intent(_) => {}
             AutomaticExtractionAdmission::DeferredManual => {}
             other => panic!("unexpected race result {other:?}"),
         }
-        // Once admitted, automatic history reuses the earliest intent even if
-        // an older legacy analysis remains unresolved.
+        // Once admitted, automatic work reuses the earliest durable intent.
         let AutomaticExtractionAdmission::Intent(reused) = extraction
             .admit_automatic(&f.scope, auto, f.now)
             .await
@@ -1663,7 +1343,9 @@ mod tests {
         else {
             panic!("expected reuse")
         };
-        assert_eq!(reused.intent_id, manual.intent_id);
+        assert!(
+            reused.intent_id == manual.intent_id || reused.request.manual_revision_id.is_none()
+        );
     }
 
     #[tokio::test]
@@ -1696,8 +1378,7 @@ mod tests {
             )
             .await
             .unwrap()
-            .intent
-            .unwrap();
+            .intent;
         assert_ne!(manual.intent_id, auto.intent_id);
         assert_ne!(manual.intent_key, auto.intent_key);
         let AutomaticExtractionAdmission::Intent(reused) = extraction
@@ -1732,7 +1413,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let intent = admitted.intent.unwrap();
+            let intent = admitted.intent;
             let claim = extraction
                 .claim(&f.scope, intent.intent_id, f.now)
                 .await
@@ -1822,93 +1503,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_snapshot_fences_new_and_transitioned_manual_results() {
-        use crate::{AutomaticExtractionAdmission as Admission, ObservationExtractionRepository};
-        let f = fixture().await;
-        let request = automatic_request(&f);
-        let gate = MemoryObservationAdmissionGate::default();
-        let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
-        let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
-            .with_automatic_admission(gate, analyses.clone());
-        let empty = analyses
-            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
-            .await
-            .unwrap();
-        analyses
-            .create(
-                &f.scope,
-                "changed-history",
-                &sha256_hex(b"history"),
-                f.request.clone(),
-                f.now,
-            )
-            .await
-            .unwrap();
-        let queued = analyses
-            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
-            .await
-            .unwrap();
-        assert_ne!(empty, queued);
-        let claim = analyses
-            .claim(&f.scope, f.request.revision_id, f.now)
-            .await
-            .unwrap()
-            .unwrap();
-        let running = analyses
-            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
-            .await
-            .unwrap();
-        assert_ne!(queued, running);
-        analyses
-            .record_inference_resolved(&f.scope, f.request.revision_id, claim.claim_token)
-            .await
-            .unwrap();
-        let received = analyses
-            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
-            .await
-            .unwrap();
-        assert_ne!(running, received);
-        analyses
-            .finish(
-                &f.scope,
-                f.request.revision_id,
-                claim.claim_token,
-                result(),
-                f.now,
-            )
-            .await
-            .unwrap();
-        let completed = analyses
-            .admission_history_snapshot(&f.scope, request.target_id, request.attempt_id)
-            .await
-            .unwrap();
-        assert_ne!(received, completed);
-        for snapshot in [empty, queued, running, received] {
-            assert_eq!(
-                extraction
-                    .admit_automatic_with_history(&f.scope, request.clone(), f.now, &snapshot)
-                    .await
-                    .unwrap(),
-                Admission::DeferredHistoryChanged
-            );
-        }
-        assert!(
-            extraction
-                .scan_ready(f.now, None, 100)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(matches!(
-            extraction
-                .admit_automatic_with_history(&f.scope, request, f.now, &completed)
-                .await
-                .unwrap(),
-            Admission::Intent(_)
-        ));
-    }
-
-    #[tokio::test]
     async fn automatic_admission_shares_versions_and_preserves_terminal_intent() {
         use crate::{AutomaticExtractionAdmission as Admission, ObservationExtractionRepository};
         let f = fixture().await;
@@ -1929,8 +1523,8 @@ mod tests {
         };
         assert_eq!(b.unwrap(), Admission::Intent(intent.clone()));
         // Explicit later manual work remains allowed.
-        analyses
-            .create(
+        extraction
+            .admit_manual(
                 &f.scope,
                 "later-manual",
                 &sha256_hex(b"manual"),
@@ -1971,96 +1565,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_first_and_ambiguous_stale_failure_defer_automatic() {
-        use crate::{AutomaticExtractionAdmission as Admission, ObservationExtractionRepository};
-        for checkpoint in [false, true] {
-            let f = fixture().await;
-            let request = automatic_request(&f);
-            let gate = MemoryObservationAdmissionGate::default();
-            let analyses = Arc::new(f.store.with_admission_gate(gate.clone()));
-            let extraction = crate::MemoryObservationExtractionRepository::new(f.captures)
-                .with_automatic_admission(gate, analyses.clone());
-            analyses
-                .create(
-                    &f.scope,
-                    "manual",
-                    &sha256_hex(b"manual"),
-                    f.request.clone(),
-                    f.now,
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                extraction
-                    .admit_automatic(&f.scope, request.clone(), f.now)
-                    .await
-                    .unwrap(),
-                Admission::DeferredManual
-            );
-            let claim = analyses
-                .claim(&f.scope, f.request.revision_id, f.now)
-                .await
-                .unwrap()
-                .unwrap();
-            if checkpoint {
-                analyses
-                    .record_inference_resolved(&f.scope, f.request.revision_id, claim.claim_token)
-                    .await
-                    .unwrap();
-            }
-            // Even a received response does not permit overlapping grounding.
-            assert_eq!(
-                extraction
-                    .admit_automatic(&f.scope, request.clone(), f.now)
-                    .await
-                    .unwrap(),
-                Admission::DeferredManual
-            );
-            analyses
-                .interrupt_stale(
-                    &f.scope,
-                    request.target_id,
-                    request.attempt_id,
-                    f.now,
-                    f.now,
-                )
-                .await
-                .unwrap();
-            assert!(
-                analyses
-                    .record_inference_resolved(&f.scope, f.request.revision_id, claim.claim_token)
-                    .await
-                    .is_err()
-            );
-            let admission = extraction
-                .admit_automatic(&f.scope, request, f.now)
-                .await
-                .unwrap();
-            assert_eq!(matches!(admission, Admission::Intent(_)), checkpoint);
-            let revision = analyses
-                .get(&f.scope, f.request.revision_id)
-                .await
-                .unwrap()
-                .unwrap();
-            let mut legacy = serde_json::to_value(revision).unwrap();
-            legacy.as_object_mut().unwrap().remove("inference_resolved");
-            let legacy: ObservationAnalysisRevision = serde_json::from_value(legacy).unwrap();
-            assert!(legacy.blocks_automatic_admission());
-            let foreign = TenantScope::new(
-                f.scope.operator_id,
-                Uuid::new_v4().into(),
-                f.scope.project_id,
-            );
-            assert!(
-                !analyses
-                    .has_unresolved_for_attempt(&foreign, f.request.target_id, f.request.attempt_id)
-                    .await
-                    .unwrap()
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn automatic_admission_rejects_independent_memory_gates() {
         use crate::ObservationExtractionRepository;
         let f = fixture().await;
@@ -2096,13 +1600,6 @@ mod tests {
         assert_eq!(saved, b.unwrap());
         assert_eq!(saved.state, ObservationAnalysisState::Completed);
         assert_eq!(saved.result, Some(result()));
-        assert!(
-            f.store
-                .claim(&f.scope, saved.request.revision_id, f.now)
-                .await
-                .unwrap()
-                .is_none()
-        );
         assert_eq!(
             f.store
                 .list_for_attempt(
@@ -2169,22 +1666,6 @@ mod tests {
             request.revision_id = Uuid::new_v4();
             ids.push(request.revision_id);
             let at = f.now + Duration::seconds(ordinal);
-            f.store
-                .create(
-                    &f.scope,
-                    &format!("projection-{ordinal}"),
-                    &hash,
-                    request.clone(),
-                    at,
-                )
-                .await
-                .unwrap();
-            let claim = f
-                .store
-                .claim(&f.scope, request.revision_id, at)
-                .await
-                .unwrap()
-                .unwrap();
             let mut completion = result();
             if ordinal < 2 {
                 completion.outcome = ObservationAnalysisOutcome::Grounded {
@@ -2194,10 +1675,11 @@ mod tests {
                 };
             }
             f.store
-                .finish(
+                .project_response(
                     &f.scope,
-                    request.revision_id,
-                    claim.claim_token,
+                    &format!("projection-{ordinal}"),
+                    &hash,
+                    request,
                     completion,
                     at,
                 )
@@ -2260,139 +1742,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn analysis_replay_atomic_claim_fencing_and_terminal_immutability() {
-        let f = fixture().await;
-        let request_digest = sha256_hex(b"synthetic-request");
-        let original = f
-            .jobs
-            .get_target(&f.scope, f.request.target_id)
-            .await
-            .unwrap();
-        let first = f
-            .store
-            .create(
-                &f.scope,
-                "analysis-key",
-                &request_digest,
-                f.request.clone(),
-                f.now,
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.state, ObservationAnalysisState::Queued);
-        let mut replay = f.request.clone();
-        replay.revision_id = Uuid::new_v4();
-        assert_eq!(
-            first,
-            f.store
-                .create(
-                    &f.scope,
-                    "analysis-key",
-                    &request_digest,
-                    replay.clone(),
-                    f.now
-                )
-                .await
-                .unwrap()
-        );
-        replay.parser_version = "ground.v2".into();
-        assert_eq!(
-            f.store
-                .create(&f.scope, "analysis-key", &request_digest, replay, f.now)
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::Conflict
-        );
-        let (left, right) = tokio::join!(
-            f.store.claim(&f.scope, f.request.revision_id, f.now),
-            f.store.claim(&f.scope, f.request.revision_id, f.now),
-        );
-        let claims: Vec<_> = [left.unwrap(), right.unwrap()]
-            .into_iter()
-            .flatten()
-            .collect();
-        assert_eq!(claims.len(), 1);
-        let claim = &claims[0];
-        assert_eq!(
-            f.store
-                .finish(
-                    &f.scope,
-                    f.request.revision_id,
-                    Uuid::new_v4(),
-                    result(),
-                    f.now
-                )
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::Conflict
-        );
-        let completed = f
-            .store
-            .finish(
-                &f.scope,
-                f.request.revision_id,
-                claim.claim_token,
-                result(),
-                f.now,
-            )
-            .await
-            .unwrap();
-        assert_eq!(completed.state, ObservationAnalysisState::Completed);
-        assert_eq!(completed.request.observed_at, f.request.observed_at);
-        assert_eq!(completed.analyzed_at, Some(f.now));
-        assert_eq!(
-            completed,
-            f.store
-                .finish(
-                    &f.scope,
-                    f.request.revision_id,
-                    claim.claim_token,
-                    result(),
-                    f.now
-                )
-                .await
-                .unwrap()
-        );
-        let mut different = result();
-        different.completion_tokens += 1;
-        assert_eq!(
-            f.store
-                .finish(
-                    &f.scope,
-                    f.request.revision_id,
-                    claim.claim_token,
-                    different,
-                    f.now
-                )
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::Conflict
-        );
-        assert!(
-            f.store
-                .claim(&f.scope, f.request.revision_id, f.now)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            original,
-            f.jobs
-                .get_target(&f.scope, f.request.target_id)
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
     async fn analysis_scoped_reads_writes_and_cursor_pages() {
         let f = fixture().await;
         let hash = sha256_hex(b"synthetic-request");
         f.store
-            .create(&f.scope, "first", &hash, f.request.clone(), f.now)
+            .project_response(&f.scope, "first", &hash, f.request.clone(), result(), f.now)
             .await
             .unwrap();
         let mut other = f.scope.clone();
@@ -2404,17 +1758,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(
-            f.store
-                .claim(&other, f.request.revision_id, f.now)
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::NotFound
-        );
         assert!(
             f.store
-                .create(&other, "first", &hash, f.request.clone(), f.now)
+                .project_response(&other, "first", &hash, f.request.clone(), result(), f.now)
                 .await
                 .is_err()
         );
@@ -2431,7 +1777,7 @@ mod tests {
         let mut next = f.request.clone();
         next.revision_id = Uuid::new_v4();
         f.store
-            .create(&f.scope, "second", &hash, next, f.now)
+            .project_response(&f.scope, "second", &hash, next, result(), f.now)
             .await
             .unwrap();
         let first_page = f
@@ -2557,7 +1903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn analysis_capture_and_legacy_sources_reject_missing_tampered_or_rebound_bytes() {
+    async fn analysis_sources_reject_missing_tampered_or_rebound_bytes() {
         let f = fixture().await;
         let hash = sha256_hex(b"synthetic-request");
         let mut capture_request = f.request.clone();
@@ -2565,7 +1911,14 @@ mod tests {
             capture_id: f.source_capture_id,
         };
         f.store
-            .create(&f.scope, "capture", &hash, capture_request.clone(), f.now)
+            .project_response(
+                &f.scope,
+                "capture",
+                &hash,
+                capture_request.clone(),
+                result(),
+                f.now,
+            )
             .await
             .unwrap();
         let target = f
@@ -2593,7 +1946,7 @@ mod tests {
         wrong_digest.source_sha256 = "0".repeat(64);
         assert!(
             f.store
-                .create(&f.scope, "tamper", &hash, wrong_digest, f.now)
+                .project_response(&f.scope, "tamper", &hash, wrong_digest, result(), f.now)
                 .await
                 .is_err()
         );
@@ -2601,7 +1954,7 @@ mod tests {
         missing.source = ObservationAnalysisSource::AttemptEvidence { evidence_index: 99 };
         assert!(
             f.store
-                .create(&f.scope, "missing", &hash, missing, f.now)
+                .project_response(&f.scope, "missing", &hash, missing, result(), f.now)
                 .await
                 .is_err()
         );
@@ -2808,11 +2161,12 @@ mod tests {
             // embed tenant IDs and their content digest is not a scope token.
             assert!(
                 f.store
-                    .create(
+                    .project_response(
                         &other,
                         "foreign-capture",
                         &sha256_hex(b"foreign"),
                         request.clone(),
+                        result(),
                         f.now
                     )
                     .await
@@ -2870,6 +2224,56 @@ mod tests {
     }
 
     #[test]
+    fn recommendation_audit_survives_result_round_trip() {
+        let recommendations = json!({
+            "version": "geo.recommendations.v1",
+            "status": "verified",
+            "items": [
+            {
+                "name": "Example Air 100",
+                "kind": "product",
+                "mention_order": 1,
+                "rank": 1,
+                "reason": "quiet operation",
+                "evidence_quote": "First choice: Example Air 100 for quiet operation.",
+                "citation_urls": ["https://example.org/product"]
+            },
+            {
+                "name": "Example Kitchen",
+                "kind": "restaurant",
+                "mention_order": 2,
+                "rank": null,
+                "reason": null,
+                "evidence_quote": "Also consider Example Kitchen.",
+                "citation_urls": []
+            }
+            ]
+        });
+        let mut grounded = result();
+        grounded.outcome = ObservationAnalysisOutcome::Grounded {
+            raw_answer:
+                "First choice: Example Air 100 for quiet operation. Also consider Example Kitchen."
+                    .into(),
+            citations: vec!["https://example.org/product".into()],
+            audit: json!({
+                "refs": [{"path": "/messages/0/content", "role": "answer_source"}],
+                "prompt_version": "geo.observation.extract.v4",
+                "recommendations": recommendations
+            }),
+        };
+        grounded.validate().unwrap();
+        let encoded = serde_json::to_vec(&grounded).unwrap();
+        let restored: ObservationAnalysisResult = serde_json::from_slice(&encoded).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, grounded);
+        let ObservationAnalysisOutcome::Grounded { audit, .. } = restored.outcome else {
+            panic!("grounded result was not preserved");
+        };
+        assert_eq!(audit["recommendations"], recommendations);
+        assert!(audit["recommendations"]["items"][1]["rank"].is_null());
+    }
+
+    #[test]
     fn expanded_audit_budget_accepts_exact_boundary_without_truncation() {
         let mut grounded = result();
         let mut audit = json!({"refs":[{}],"padding":""});
@@ -2886,141 +2290,5 @@ mod tests {
             audit["padding"] = json!("x".repeat(MAX_ANALYSIS_AUDIT_BYTES - overhead + 1));
         }
         assert!(grounded.validate().is_err());
-    }
-
-    #[tokio::test]
-    async fn stale_analysis_terminalizes_without_reclaim_and_fences_late_completion() {
-        let f = fixture().await;
-        let mut queued = f.request.clone();
-        queued.revision_id = Uuid::new_v4();
-        let hash = sha256_hex(b"interruption");
-        f.store
-            .create(&f.scope, "running", &hash, f.request.clone(), f.now)
-            .await
-            .unwrap();
-        f.store
-            .create(&f.scope, "queued", &hash, queued.clone(), f.now)
-            .await
-            .unwrap();
-        let claim = f
-            .store
-            .claim(&f.scope, f.request.revision_id, f.now)
-            .await
-            .unwrap()
-            .unwrap();
-        let cutoff = f.now + Duration::seconds(180);
-        f.store
-            .interrupt_stale(
-                &f.scope,
-                f.request.target_id,
-                f.request.attempt_id,
-                cutoff,
-                cutoff,
-            )
-            .await
-            .unwrap();
-        for id in [f.request.revision_id, queued.revision_id] {
-            let revision = f.store.get(&f.scope, id).await.unwrap().unwrap();
-            assert_eq!(revision.state, ObservationAnalysisState::Completed);
-            assert!(matches!(revision.result.unwrap().outcome,
-                ObservationAnalysisOutcome::Failed { code } if code == "analysis_interrupted"));
-            assert!(f.store.claim(&f.scope, id, cutoff).await.unwrap().is_none());
-        }
-        assert!(
-            f.store
-                .finish(
-                    &f.scope,
-                    f.request.revision_id,
-                    claim.claim_token,
-                    result(),
-                    cutoff
-                )
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn analysis_time_checks_and_interruption_do_not_allow_reclaim() {
-        let f = fixture().await;
-        let hash = sha256_hex(b"synthetic-request");
-        f.store
-            .create(&f.scope, "key", &hash, f.request.clone(), f.now)
-            .await
-            .unwrap();
-        assert!(
-            f.store
-                .finish(
-                    &f.scope,
-                    f.request.revision_id,
-                    Uuid::new_v4(),
-                    result(),
-                    f.now
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            f.store
-                .claim(
-                    &f.scope,
-                    f.request.revision_id,
-                    f.now - Duration::seconds(1)
-                )
-                .await
-                .is_err()
-        );
-        let claim = f
-            .store
-            .claim(&f.scope, f.request.revision_id, f.now)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            f.store
-                .claim(&f.scope, f.request.revision_id, f.now + Duration::days(1))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            f.store
-                .finish(
-                    &f.scope,
-                    f.request.revision_id,
-                    claim.claim_token,
-                    result(),
-                    f.now - Duration::seconds(1)
-                )
-                .await
-                .is_err()
-        );
-        let interrupted = ObservationAnalysisResult {
-            config_revision: None,
-            actual_model: None,
-            candidate_json: None,
-            outcome: ObservationAnalysisOutcome::Failed {
-                code: "interrupted".into(),
-            },
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        };
-        f.store
-            .finish(
-                &f.scope,
-                f.request.revision_id,
-                claim.claim_token,
-                interrupted,
-                f.now,
-            )
-            .await
-            .unwrap();
-        assert!(
-            f.store
-                .claim(&f.scope, f.request.revision_id, f.now)
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
 }

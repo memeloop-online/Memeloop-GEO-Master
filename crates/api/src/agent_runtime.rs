@@ -2078,17 +2078,6 @@ impl HostOps for RepositoryHostOps {
         provider.complete(scope, &request).await
     }
 
-    async fn knowledge_search(
-        &self,
-        scope: &TenantScope,
-        request: geo_worker::KnowledgeSearchRequest,
-    ) -> Result<geo_worker::KnowledgeSearchResult, HostOpError> {
-        self.knowledge
-            .search(scope, request)
-            .await
-            .map_err(|error| worker_error(HostOp::KnowledgeSearch, error))
-    }
-
     async fn knowledge_text_read(
         &self,
         scope: &TenantScope,
@@ -2482,8 +2471,8 @@ mod tests {
             ),
         ];
         for (error, expected) in cases {
-            let mapped = worker_error(HostOp::KnowledgeSearch, error);
-            assert_eq!(mapped.op, HostOp::KnowledgeSearch);
+            let mapped = worker_error(HostOp::KnowledgeTextRead, error);
+            assert_eq!(mapped.op, HostOp::KnowledgeTextRead);
             assert_eq!(mapped.code, expected, "{mapped:?}");
         }
     }

@@ -103,7 +103,7 @@ const childLabelKeys: Record<string, string> = {
 function groupForPath(pathname: string): string | undefined {
   const section = pathname.split("/")[4];
   if (!section || section === "chat" || section === "overview") return "chat";
-  if (section === "knowledge" || section === "ask") return "knowledge";
+  if (section === "knowledge") return "knowledge";
   if (section === "content" || section === "campaigns") return "content";
   if (section === "publications") return "content";
   if (section === "measurement" || section === "reports") return "measurement";

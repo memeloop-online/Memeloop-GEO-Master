@@ -1,9 +1,6 @@
 //! PostgreSQL persistence primitives shared by the API and background roles.
 //!
-//! The application currently uses development-only in-memory stores. This
-//! crate keeps the durable boundary explicit and can be adopted by a role when
-//! that role is ready to persist state. Database credentials are supplied at
-//! runtime through configuration; they are never embedded in this crate.
+//! Database credentials are supplied at runtime through configuration.
 
 mod account_networks;
 mod agent;
@@ -39,18 +36,13 @@ pub use partner_admin::PgPartnerAdminRepository;
 mod migrations;
 mod model_routes;
 pub use model_routes::PgModelRouteRepository;
-mod observation_capture;
-pub use observation_capture::PgObservationCaptureRepository;
-mod observation_completion_recovery;
-pub use observation_completion_recovery::PgObservationCompletionRecoveryRepository;
-mod observation_completion_recovery_jobs;
-pub use observation_completion_recovery_jobs::PgObservationCompletionRecoveryJobRepository;
-mod observation_analysis;
-pub use observation_analysis::PgObservationAnalysisRepository;
-mod observation_extraction;
-pub use observation_extraction::PgObservationExtractionRepository;
-mod provider_conversation_cleanup;
-pub use provider_conversation_cleanup::PgProviderConversationCleanupRepository;
+mod measurement;
+pub use measurement::{
+    MemorySerpRepository, PgObservationAnalysisRepository, PgObservationCaptureRepository,
+    PgObservationCompletionRecoveryJobRepository, PgObservationCompletionRecoveryRepository,
+    PgObservationExtractionRepository, PgProjectSerpSettingsRepository,
+    PgProviderConversationCleanupRepository, PgReportRepository, PgSerpRepository,
+};
 mod projects;
 mod publication_lookup;
 pub use publication_lookup::{PgPublicationLookupRepository, PublicationLookupDiscoveryCandidate};
@@ -58,12 +50,7 @@ mod publication_send_authorization;
 pub use publication_send_authorization::PgPublicationSendAuthorizationRepository;
 mod questions;
 pub use questions::PgQuestionRepository;
-mod measurement_report;
-mod measurement_weekly;
 pub use geo_domain::MeasurementWeeklySchedule;
-mod report;
-mod serp;
-pub use serp::{MemorySerpRepository, PgSerpRepository};
 mod scope;
 
 pub use agent::{PgAgentRepository, QueuedAgentRun};
@@ -73,11 +60,8 @@ pub use database::{Database, HealthCheck};
 pub use error::PersistenceError;
 pub use idempotency::PgIdempotencyStore;
 pub use knowledge::PgKnowledgeRepository;
-pub use migrations::{MIGRATOR, MigrationMetadata, embedded_migrations, migration_metadata};
+pub use migrations::MIGRATOR;
 pub use projects::{ContentBootstrapLease, PendingContentCycle, PgProjectRepository};
-pub use report::PgReportRepository;
 pub use scope::set_local_scope;
 mod project_ai_settings;
 pub use project_ai_settings::PgProjectAiSettingsRepository;
-mod project_serp_settings;
-pub use project_serp_settings::PgProjectSerpSettingsRepository;

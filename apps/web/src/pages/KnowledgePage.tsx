@@ -54,8 +54,6 @@ const capabilityNames: CapabilityName[] = [
   "docx_parser",
   "xlsx_parser",
   "ocr",
-  "vector",
-  "llm",
   "url_fetch",
 ];
 
@@ -632,9 +630,9 @@ export function KnowledgePage() {
           <Button
             appearance="secondary"
             icon={<SearchRegular />}
-            onClick={() => navigate("ask")}
+            onClick={() => navigate("../chat")}
           >
-            {t("ask")}
+            {t("entryState.openWorkbench", { ns: "translation" })}
           </Button>
         </div>
       </section>

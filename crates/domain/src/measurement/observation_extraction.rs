@@ -91,36 +91,8 @@ impl ObservationExtractionRequest {
         {
             return Err(AppError::invalid_request("invalid extraction binding"));
         }
-        // Do not change the v1 serializer: persisted automatic keys depend on
-        // this exact field order and its non-optional capture field.
-        #[derive(Serialize)]
-        struct LegacyRequest<'a> {
-            target_id: Uuid,
-            attempt_id: Uuid,
-            source_capture_id: Uuid,
-            source_sha256: &'a str,
-            prompt_version: &'a str,
-            parser_version: &'a str,
-            policy_version: &'a str,
-        }
-        let bytes = if self.manual_revision_id.is_some() {
-            serde_json::to_vec(&("observation-extraction-manual-intent.v1", scope, self))
-        } else {
-            serde_json::to_vec(&(
-                "observation-extraction-intent.v1",
-                scope,
-                LegacyRequest {
-                    target_id: self.target_id,
-                    attempt_id: self.attempt_id,
-                    source_capture_id: self.source_capture_id.expect("validated capture"),
-                    source_sha256: &self.source_sha256,
-                    prompt_version: &self.prompt_version,
-                    parser_version: &self.parser_version,
-                    policy_version: &self.policy_version,
-                },
-            ))
-        }
-        .map_err(|_| AppError::invalid_request("invalid extraction binding"))?;
+        let bytes = serde_json::to_vec(&("observation-extraction-intent.v1", scope, self))
+            .map_err(|_| AppError::invalid_request("invalid extraction binding"))?;
         Ok(sha256_hex(&bytes))
     }
 
@@ -384,14 +356,12 @@ pub struct ObservationExtractionBackfillItem {
 pub enum AutomaticExtractionAdmission {
     Intent(Box<ObservationExtractionIntent>),
     DeferredManual,
-    DeferredHistoryChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManualExtractionAdmission {
     pub revision: crate::ObservationAnalysisRevision,
-    /// None means a replay of a legacy revision, never permission to schedule.
-    pub intent: Option<ObservationExtractionIntent>,
+    pub intent: ObservationExtractionIntent,
 }
 
 pub fn validate_observation_extraction_page_size(limit: usize) -> Result<(), AppError> {
@@ -413,16 +383,6 @@ pub trait ObservationExtractionRepository: Send + Sync {
         request: crate::ObservationAnalysisRequest,
         created_at: DateTime<Utc>,
     ) -> Result<ManualExtractionAdmission, AppError>;
-    /// Historical callers retain this snapshot from before their first page.
-    /// A mismatch means restart preparation, never implicitly infer/retry.
-    /// Empty is reserved for the live admit_automatic path (no history scan).
-    async fn admit_automatic_with_history(
-        &self,
-        scope: &TenantScope,
-        request: ObservationExtractionRequest,
-        created_at: DateTime<Utc>,
-        expected_history: &str,
-    ) -> Result<AutomaticExtractionAdmission, AppError>;
     async fn admit_automatic(
         &self,
         scope: &TenantScope,
@@ -439,12 +399,6 @@ pub trait ObservationExtractionRepository: Send + Sync {
         after: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<ObservationExtractionBackfillItem>, AppError>;
-    async fn enqueue(
-        &self,
-        scope: &TenantScope,
-        request: ObservationExtractionRequest,
-        created_at: DateTime<Utc>,
-    ) -> Result<ObservationExtractionIntent, AppError>;
     async fn get(
         &self,
         scope: &TenantScope,
@@ -621,14 +575,7 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
         // between publishing the revision and its intent, including replay.
         let mut records = self.records.lock().await;
         let (revision, inserted) = analyses
-            .create_gate_held(
-                scope,
-                idempotency_key,
-                request_digest,
-                request,
-                created_at,
-                true,
-            )
+            .create_gate_held(scope, idempotency_key, request_digest, request, created_at)
             .await?;
         if !inserted {
             let intent = records
@@ -638,7 +585,8 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
                         && stored.intent.request.manual_revision_id
                             == Some(revision.request.revision_id)
                 })
-                .map(|stored| stored.intent.clone());
+                .map(|stored| stored.intent.clone())
+                .ok_or_else(|| AppError::conflict("manual extraction intent missing"))?;
             return Ok(ManualExtractionAdmission { revision, intent });
         }
         let intent = ObservationExtractionIntent::queued(extraction_request, key, created_at);
@@ -650,26 +598,13 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
                 claim_token: None,
             },
         );
-        Ok(ManualExtractionAdmission {
-            revision,
-            intent: Some(intent),
-        })
+        Ok(ManualExtractionAdmission { revision, intent })
     }
     async fn admit_automatic(
         &self,
         scope: &TenantScope,
         request: ObservationExtractionRequest,
         created_at: DateTime<Utc>,
-    ) -> Result<AutomaticExtractionAdmission, AppError> {
-        self.admit_automatic_with_history(scope, request, created_at, "")
-            .await
-    }
-    async fn admit_automatic_with_history(
-        &self,
-        scope: &TenantScope,
-        request: ObservationExtractionRequest,
-        created_at: DateTime<Utc>,
-        expected_history: &str,
     ) -> Result<AutomaticExtractionAdmission, AppError> {
         let (gate, analyses) = self
             .automatic_admission
@@ -711,14 +646,6 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
             return Ok(AutomaticExtractionAdmission::Intent(Box::new(
                 stored.intent.clone(),
             )));
-        }
-        if !expected_history.is_empty()
-            && analyses
-                .admission_history_snapshot(scope, request.target_id, request.attempt_id)
-                .await?
-                != expected_history
-        {
-            return Ok(AutomaticExtractionAdmission::DeferredHistoryChanged);
         }
         if analyses
             .has_unresolved_for_attempt(scope, request.target_id, request.attempt_id)
@@ -770,54 +697,6 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
                 return Ok(items);
             }
         }
-    }
-    async fn enqueue(
-        &self,
-        scope: &TenantScope,
-        request: ObservationExtractionRequest,
-        created_at: DateTime<Utc>,
-    ) -> Result<ObservationExtractionIntent, AppError> {
-        let _admission = match &self.automatic_admission {
-            Some((gate, _)) => Some(gate.0.lock().await),
-            None => None,
-        };
-        let key = request.intent_key(scope)?;
-        if request.manual_revision_id.is_some() {
-            return Err(AppError::invalid_request(
-                "manual extraction requires atomic admission",
-            ));
-        }
-        let capture = self
-            .captures
-            .get(
-                scope,
-                request
-                    .source_capture_id
-                    .ok_or_else(|| AppError::invalid_request("capture required"))?,
-            )
-            .await?
-            .ok_or_else(|| AppError::not_found("extraction source not found"))?;
-        request.validate_source(scope, &capture)?;
-        let mut records = self.records.lock().await;
-        if let Some(stored) = records
-            .values()
-            .find(|stored| stored.scope == *scope && stored.intent.intent_key == key)
-        {
-            if stored.intent.request != request {
-                return Err(AppError::conflict("extraction intent binding differs"));
-            }
-            return Ok(stored.intent.clone());
-        }
-        let intent = ObservationExtractionIntent::queued(request, key, created_at);
-        records.insert(
-            intent.intent_id,
-            Stored {
-                scope: scope.clone(),
-                intent: intent.clone(),
-                claim_token: None,
-            },
-        );
-        Ok(intent)
     }
     async fn get(
         &self,

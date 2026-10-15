@@ -58,6 +58,7 @@ COPY crates crates
 COPY migrations migrations
 COPY packages/browser-runner/src/observation-extraction-prompt.txt packages/browser-runner/src/observation-extraction-prompt.txt
 COPY packages/browser-runner/src/observation-extraction-prompt-v2.txt packages/browser-runner/src/observation-extraction-prompt-v2.txt
+COPY packages/browser-runner/src/observation-extraction-prompt-v3.txt packages/browser-runner/src/observation-extraction-prompt-v3.txt
 
 RUN cargo build --locked --release -p geo-app
 

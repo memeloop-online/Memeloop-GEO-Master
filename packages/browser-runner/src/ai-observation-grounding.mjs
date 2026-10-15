@@ -110,6 +110,63 @@ function auditValue(value) {
   };
 }
 
+function groundRecommendations(value, answer, citations) {
+  const unverified = {
+    version: "geo.recommendations.v1",
+    status: "unverified",
+    items: [],
+  };
+  if (!Array.isArray(value) || value.length > 100) return unverified;
+  const names = new Set();
+  const items = [];
+  const keys = [
+    "name",
+    "kind",
+    "mention_order",
+    "rank",
+    "reason",
+    "evidence_quote",
+    "citation_urls",
+  ];
+  for (const item of value) {
+    if (
+      !object(item) ||
+      Object.keys(item).length !== keys.length ||
+      keys.some((key) => !Object.hasOwn(item, key)) ||
+      typeof item.name !== "string" ||
+      !item.name.trim() ||
+      item.name.length > 500 ||
+      names.has(item.name) ||
+      !["product", "restaurant", "brand", "service", "other"].includes(
+        item.kind,
+      ) ||
+      item.mention_order !== items.length + 1 ||
+      !(
+        item.rank === null ||
+        (Number.isSafeInteger(item.rank) && item.rank > 0)
+      ) ||
+      typeof item.evidence_quote !== "string" ||
+      item.evidence_quote.length > 8000 ||
+      !item.evidence_quote.includes(item.name) ||
+      !answer.includes(item.evidence_quote) ||
+      !(
+        item.reason === null ||
+        (typeof item.reason === "string" &&
+          item.reason.length > 0 &&
+          item.reason.length <= 4000 &&
+          answer.includes(item.reason))
+      ) ||
+      !Array.isArray(item.citation_urls) ||
+      item.citation_urls.length > MAX_CITATIONS ||
+      item.citation_urls.some((url) => !citations.includes(url))
+    )
+      return unverified;
+    names.add(item.name);
+    items.push(Object.fromEntries(keys.map((key) => [key, item[key]])));
+  }
+  return { ...unverified, status: "verified", items };
+}
+
 /**
  * Fixed-vocabulary explanation of a rejected candidate. This is diagnostic
  * only: the validator below remains the sole authority for acceptance.
@@ -143,7 +200,11 @@ function validateObservation(
   document,
   extracted,
   reject,
-  { semanticOnly = false, allowRanges = true } = {},
+  {
+    semanticOnly = false,
+    allowRanges = true,
+    allowRecommendations = false,
+  } = {},
 ) {
   // Historical v3 replay remains available, but live interpretation explicitly
   // requires the semantic schema and cannot accept the old identifier contract.
@@ -170,6 +231,7 @@ function validateObservation(
       "search_evidence",
       "answer_segments",
       "citations",
+      ...(allowRecommendations ? ["recommendations"] : []),
     ]);
     if (
       Object.keys(extracted).some((key) => !keys.has(key)) ||
@@ -407,6 +469,18 @@ function validateObservation(
     ...(semantic
       ? { completion: "complete", search_used: "yes" }
       : { chat_id: chatId, message_id: messageId, block_id: blockId }),
-    audit: { method: "llm_grounded", refs },
+    audit: {
+      method: "llm_grounded",
+      refs,
+      ...(allowRecommendations
+        ? {
+            recommendations: groundRecommendations(
+              extracted.recommendations,
+              rawAnswer,
+              citations,
+            ),
+          }
+        : {}),
+    },
   };
 }

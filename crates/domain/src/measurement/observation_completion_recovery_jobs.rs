@@ -58,7 +58,7 @@ impl ObservationCapture {
         // Explicit supported-provider registry; never infer a provider from body text.
         let binding = match owned.provider.as_str() {
             "deepseek" => {
-                crate::provider_conversation_lifecycle::deepseek_recovery_binding(&source)
+                super::provider_conversation_lifecycle::deepseek_recovery_binding(&source)
             }
             _ => None,
         };

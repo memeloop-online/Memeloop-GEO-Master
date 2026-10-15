@@ -36,7 +36,7 @@ use geo_domain::{
     ReportPreview, ReportPreviewKind, ReportSnapshot,
 };
 pub use geo_domain::{CreateQuestionSet, QuestionReference, ReviseQuestionSet};
-pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
+pub use geo_domain::TenantScope;
 pub use geo_domain::{ToolCallIdentity, ToolCallOutcome};
 
 /// A scoped, durable sink installed by Rust for one authorised run. `begin`
@@ -196,15 +196,6 @@ fn validate_recorded_return(
                 return Err(HostOpError::internal(
                     op,
                     "project acceptance lacks durable references",
-                ));
-            }
-        }
-        HostOp::KnowledgeSearch => {
-            let response: KnowledgeSearchResult = typed(op, result)?;
-            if response.capability_missing.is_some() {
-                return Err(HostOpError::capability_missing(
-                    op,
-                    "knowledge retrieval capability is unavailable",
                 ));
             }
         }
@@ -954,7 +945,6 @@ pub enum HostOp {
     /// One model completion through the Rust-side provider bridge.
     ModelComplete,
     /// Evidence retrieval restricted to the run's frozen knowledge release.
-    KnowledgeSearch,
     KnowledgeTextRead,
     KnowledgeTextRevise,
     /// Explicitly import attachments bound to this run into project knowledge.
@@ -1018,7 +1008,6 @@ impl HostOp {
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::ModelComplete,
-        Self::KnowledgeSearch,
         Self::KnowledgeTextRead,
         Self::KnowledgeTextRevise,
         Self::KnowledgeImportAttachments,
@@ -1071,7 +1060,6 @@ impl HostOp {
     pub const fn name(self) -> &'static str {
         match self {
             Self::ModelComplete => "model.complete.v1",
-            Self::KnowledgeSearch => "knowledge.search.v1",
             Self::KnowledgeTextRead => "knowledge.text.read.v1",
             Self::KnowledgeTextRevise => "knowledge.text.revise.v1",
             Self::KnowledgeImportAttachments => "knowledge.import_attachments.v1",
@@ -1125,7 +1113,6 @@ impl HostOp {
     pub const fn op_name(self) -> &'static str {
         match self {
             Self::ModelComplete => "op_host_model_complete_v1",
-            Self::KnowledgeSearch => "op_host_knowledge_search_v1",
             Self::KnowledgeTextRead => "op_host_knowledge_text_read_v1",
             Self::KnowledgeTextRevise => "op_host_knowledge_text_revise_v1",
             Self::KnowledgeImportAttachments => "op_host_knowledge_import_attachments_v1",
@@ -1561,11 +1548,6 @@ pub trait HostOps: Send + Sync {
         request: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError>;
 
-    async fn knowledge_search(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError>;
 
     async fn knowledge_text_read(
         &self,
@@ -4551,9 +4533,9 @@ mod tests {
     #[test]
     fn budgets_are_addressed_per_op() {
         let budgets =
-            HostOpBudgets::default().with_limits(HostOp::KnowledgeSearch, HostOpLimits::new(25, 1));
-        assert_eq!(budgets.limits(HostOp::KnowledgeSearch).timeout_ms, 25);
-        assert_eq!(budgets.limits(HostOp::KnowledgeSearch).max_calls, 1);
+            HostOpBudgets::default().with_limits(HostOp::KnowledgeTextRead, HostOpLimits::new(25, 1));
+        assert_eq!(budgets.limits(HostOp::KnowledgeTextRead).timeout_ms, 25);
+        assert_eq!(budgets.limits(HostOp::KnowledgeTextRead).max_calls, 1);
         assert_eq!(
             budgets.limits(HostOp::ModelComplete),
             HostOpBudgets::default().limits(HostOp::ModelComplete)

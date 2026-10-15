@@ -108,6 +108,52 @@ afterEach(async () => {
 });
 
 describe("saved response analysis", () => {
+  it("shows saved recommendations ahead of the full answer without another analysis request", async () => {
+    const { create } = setup([
+      {
+        ...revision,
+        state: "completed",
+        result: {
+          actual_model: "analysis-model",
+          candidate_json: null,
+          prompt_tokens: 1,
+          completion_tokens: 1,
+          outcome: {
+            status: "grounded",
+            raw_answer: "Try Sample restaurant for lunch.",
+            citations: [],
+            audit: {
+              recommendations: {
+                version: "geo.recommendations.v1",
+                status: "verified",
+                items: [
+                  {
+                    name: "Sample restaurant",
+                    kind: "restaurant",
+                    mention_order: 1,
+                    rank: null,
+                    reason: null,
+                    evidence_quote: "Try Sample restaurant for lunch.",
+                    citation_urls: [],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    ]);
+    const table = await screen.findByRole("table", { name: "推荐结果" });
+    expect(table).toBeVisible();
+    expect(screen.getByText("未明确排名")).toBeVisible();
+    const answerHeading = screen.getByRole("heading", { name: "解析出的答案" });
+    expect(
+      table.compareDocumentPosition(answerHeading) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it.each(["failed", "running"] as const)(
     "keeps an available answer ahead of a newer %s analysis",
     async (state) => {

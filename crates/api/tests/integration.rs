@@ -417,7 +417,7 @@ fn authenticated_bytes_request(
 }
 
 #[tokio::test]
-async fn knowledge_upload_text_release_search_and_capability_contracts() {
+async fn knowledge_upload_text_release_read_and_capability_contracts() {
     let app = router(AppState::development_with_password("test-password"));
     let (cookie, csrf, _) = login(&app).await;
     let tenant_id = DEVELOPMENT_TENANT_ID.to_string();
@@ -547,25 +547,28 @@ async fn knowledge_upload_text_release_search_and_capability_contracts() {
     let detail: Value =
         serde_json::from_slice(&to_bytes(detail.into_body(), 64 * 1024).await.unwrap()).unwrap();
     assert_eq!(detail["chunks"].as_array().unwrap().len(), 2);
-    let ask = app
+    let source_version_id = accepted["source_version"]["source_version_id"]
+        .as_str()
+        .unwrap();
+    let content = app
         .clone()
-        .oneshot(authenticated_json_request(
-            "POST",
-            &format!("/api/v1/knowledge/ask?{selector}"),
+        .oneshot(authenticated_request(
+            "GET",
+            &format!(
+                "/api/v1/knowledge/sources/{source_id}/versions/{source_version_id}/content?{selector}"
+            ),
             &cookie,
-            Some(&csrf),
             None,
-            r#"{"query":"warranty"}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(ask.status(), StatusCode::OK);
-    let ask: Value =
-        serde_json::from_slice(&to_bytes(ask.into_body(), 64 * 1024).await.unwrap()).unwrap();
-    assert_eq!(ask["mode"], "evidence_only");
-    assert_eq!(ask["answer_status"], "answered");
-    assert_eq!(ask["evidence"][0]["source_id"], source_id);
-    assert_eq!(ask["evidence"][0]["purpose"], "public");
+    assert_eq!(content.status(), StatusCode::OK);
+    let content: Value =
+        serde_json::from_slice(&to_bytes(content.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(content["source_version_id"], source_version_id);
+    assert_eq!(content["text"], String::from_utf8(bytes).unwrap());
+    assert_eq!(detail["source"]["source_id"], source_id);
+    assert_eq!(detail["source"]["purpose"], "public");
 
     let internal = app
         .clone()
@@ -580,25 +583,10 @@ async fn knowledge_upload_text_release_search_and_capability_contracts() {
         .await
         .unwrap();
     assert_eq!(internal.status(), StatusCode::ACCEPTED);
-    let public_secret = app
-        .clone()
-        .oneshot(authenticated_json_request(
-            "POST",
-            &format!("/api/v1/knowledge/search?{selector}"),
-            &cookie,
-            Some(&csrf),
-            None,
-            r#"{"query":"secret"}"#,
-        ))
-        .await
-        .unwrap();
-    let public_secret: Value = serde_json::from_slice(
-        &to_bytes(public_secret.into_body(), 64 * 1024)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(public_secret["evidence"].as_array().unwrap().is_empty());
+    let internal: Value =
+        serde_json::from_slice(&to_bytes(internal.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(internal["items"][0]["source"]["purpose"], "internal");
+    assert!(internal["items"][0]["source_version"]["source_version_id"].is_string());
 
     let capabilities = app
         .clone()

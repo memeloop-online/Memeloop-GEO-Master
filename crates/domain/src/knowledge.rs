@@ -1118,26 +1118,6 @@ pub struct CurrentKnowledgeRelease {
     pub sequence: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct KnowledgeSearchRequest {
-    pub query: String,
-    #[serde(default = "default_search_purpose")]
-    pub purpose: KnowledgePurpose,
-    #[serde(default = "default_search_limit")]
-    pub limit: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub knowledge_release_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct KnowledgeSearchResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub knowledge_release_id: Option<Uuid>,
-    pub evidence: Vec<KnowledgeEvidence>,
-    pub capability_missing: Option<String>,
-}
-
 /// Navigation-ready evidence for the source detail view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct KnowledgeEvidence {
@@ -1149,25 +1129,6 @@ pub struct KnowledgeEvidence {
     pub locator: ChunkLocator,
     pub text: String,
     pub quote: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum KnowledgeAnswerStatus {
-    Answered,
-    InsufficientEvidence,
-    Conflicted,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct KnowledgeAskResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub knowledge_release_id: Option<Uuid>,
-    pub mode: String,
-    pub answer_status: KnowledgeAnswerStatus,
-    pub answer: String,
-    pub evidence: Vec<KnowledgeEvidence>,
-    pub capability_missing: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1537,16 +1498,6 @@ pub trait KnowledgeRepository: Send + Sync {
         request: DocumentManifestPlanRequest,
         document_scope: DocumentScope,
     ) -> Result<DocumentManifest, AppError>;
-    async fn search(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, AppError>;
-    async fn ask(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeAskResult, AppError>;
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError>;
 }
 
@@ -4854,105 +4805,6 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
         Ok(manifest)
     }
 
-    async fn search(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, AppError> {
-        Self::require_project(scope)?;
-        if request.query.trim().is_empty() {
-            return Err(AppError::invalid_request("query must not be empty"));
-        }
-        let limit = request.limit.clamp(1, 50) as usize;
-        let state = self.state.read().await;
-        let release_id = request
-            .knowledge_release_id
-            .or_else(|| state.current_release.get(&scope.storage_key()).copied());
-        let Some(release_id) = release_id else {
-            return Ok(KnowledgeSearchResult {
-                knowledge_release_id: None,
-                evidence: Vec::new(),
-                capability_missing: None,
-            });
-        };
-        let release = state
-            .releases
-            .get(&release_id)
-            .filter(|release| Self::in_scope(scope, *release))
-            .ok_or_else(|| AppError::not_found("knowledge release not found"))?;
-        let needle = request.query.to_lowercase();
-        let mut evidence = release
-            .source_version_refs
-            .iter()
-            .filter_map(|version_id| state.versions.get(version_id))
-            .filter_map(|version| {
-                state.sources.get(&version.source_id).and_then(|source| {
-                    (source.state == SourceState::Active
-                        && (request.purpose == KnowledgePurpose::Internal
-                            || source.purpose == KnowledgePurpose::Public))
-                        .then_some((version, source))
-                })
-            })
-            .flat_map(|(version, source)| {
-                let needle = needle.clone();
-                state
-                    .chunks
-                    .get(&version.source_version_id)
-                    .into_iter()
-                    .flatten()
-                    .filter(|chunk| chunk.extraction_method != "deterministic_csv_evidence_v1")
-                    .filter(move |chunk| chunk.text.to_lowercase().contains(&needle))
-                    .map(move |chunk| KnowledgeEvidence {
-                        source_id: source.source_id,
-                        source_version_id: version.source_version_id,
-                        chunk_id: chunk.chunk_id,
-                        source_name: source.name.clone(),
-                        purpose: source.purpose,
-                        locator: chunk.locator.clone(),
-                        text: chunk.text.clone(),
-                        quote: chunk.text.clone(),
-                    })
-            })
-            .collect::<Vec<_>>();
-        evidence.sort_by_key(|chunk| (chunk.source_version_id, chunk.chunk_id));
-        evidence.truncate(limit);
-        Ok(KnowledgeSearchResult {
-            knowledge_release_id: Some(release_id),
-            evidence,
-            capability_missing: None,
-        })
-    }
-
-    async fn ask(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeAskResult, AppError> {
-        let search = self.search(scope, request).await?;
-        let answer = if search.evidence.is_empty() {
-            "当前资料没有这项信息".to_owned()
-        } else {
-            search
-                .evidence
-                .iter()
-                .map(|chunk| chunk.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
-        Ok(KnowledgeAskResult {
-            knowledge_release_id: search.knowledge_release_id,
-            mode: "evidence_only".to_owned(),
-            answer_status: if search.evidence.is_empty() {
-                KnowledgeAnswerStatus::InsufficientEvidence
-            } else {
-                KnowledgeAnswerStatus::Answered
-            },
-            answer,
-            evidence: search.evidence,
-            capability_missing: Some("llm_answering".to_owned()),
-        })
-    }
-
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError> {
         Self::require_project(scope)?;
         let state = self.state.read().await;
@@ -5090,14 +4942,6 @@ pub fn deterministic_chunks(
     chunks
 }
 
-fn default_search_purpose() -> KnowledgePurpose {
-    KnowledgePurpose::Public
-}
-
-fn default_search_limit() -> u32 {
-    10
-}
-
 fn normalize_media_type(value: &str) -> String {
     value
         .split(';')
@@ -5144,8 +4988,8 @@ fn import_item_hash(item: &ImportItem) -> Result<String, AppError> {
 mod tests {
     use super::{
         DocumentManifestItemState, DocumentManifestPlanRequest, ImportItem, KnowledgePurpose,
-        KnowledgeRepository, KnowledgeSearchRequest, MemoryKnowledgeRepository, SourceKind,
-        UploadSessionCommand, sha256_hex,
+        KnowledgeRepository, MemoryKnowledgeRepository, SourceKind, UploadSessionCommand,
+        sha256_hex,
     };
     use crate::{
         DocumentScope, ImportStatus, PDF_PARSE_SCHEMA_VERSION, PdfDocumentManifest, PdfPageResult,
@@ -5495,66 +5339,45 @@ mod tests {
         );
         assert_ne!(new_version.source_version_id, old_version.source_version_id);
         let prior = repository
-            .search(
-                &scope,
-                super::KnowledgeSearchRequest {
-                    query: "Alpha".to_owned(),
-                    knowledge_release_id: Some(old_release.knowledge_release_id),
-                    purpose: KnowledgePurpose::Public,
-                    limit: 10,
-                },
-            )
+            .get_release(&scope, old_release.knowledge_release_id)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(prior.evidence.len(), 1);
         assert_eq!(
-            prior.evidence[0].source_version_id,
-            old_version.source_version_id
+            prior.source_version_refs,
+            vec![old_version.source_version_id]
         );
-        let old_search = repository
-            .search(
-                &scope,
-                super::KnowledgeSearchRequest {
-                    query: "Beta".to_owned(),
-                    knowledge_release_id: Some(old_release.knowledge_release_id),
-                    purpose: KnowledgePurpose::Public,
-                    limit: 10,
-                },
-            )
+        let detail = repository
+            .get_source_detail(&scope, first.source.unwrap().source_id)
             .await
+            .unwrap()
             .unwrap();
-        assert!(old_search.evidence.is_empty());
-        let new_search = repository
-            .search(
-                &scope,
-                super::KnowledgeSearchRequest {
-                    query: "Beta".to_owned(),
-                    knowledge_release_id: None,
-                    purpose: KnowledgePurpose::Public,
-                    limit: 10,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(new_search.evidence.len(), 1);
+        let old_chunks = detail
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.source_version_id == old_version.source_version_id)
+            .collect::<Vec<_>>();
+        assert_eq!(old_chunks.len(), 1);
+        assert!(old_chunks[0].text.contains("Alpha"));
+        assert!(!old_chunks[0].text.contains("Beta"));
+        let recovered = detail
+            .chunks
+            .iter()
+            .filter(|chunk| {
+                chunk.source_version_id == new_version.source_version_id
+                    && chunk.text.contains("Beta")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered.len(), 1);
         assert!(matches!(
-            new_search.evidence[0].locator,
+            recovered[0].locator,
             super::ChunkLocator::Pdf {
                 page: 2,
                 start_char: Some(0),
                 ..
             }
         ));
-        assert_eq!(
-            repository
-                .get_source_detail(&scope, first.source.unwrap().source_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .versions
-                .len(),
-            2
-        );
+        assert_eq!(detail.versions.len(), 2);
         assert!(
             repository
                 .get_source_detail(&other, second.source.unwrap().source_id)
@@ -5916,19 +5739,6 @@ mod tests {
                 assert_eq!(table["values"], expected);
             }
             assert_eq!(accepted.release.unwrap().coverage.chunk_count, 2);
-            let result = repository
-                .search(
-                    &scope,
-                    KnowledgeSearchRequest {
-                        query: "样品".to_owned(),
-                        purpose: KnowledgePurpose::Public,
-                        limit: 10,
-                        knowledge_release_id: None,
-                    },
-                )
-                .await
-                .unwrap();
-            assert_eq!(result.evidence.len(), 1);
         }
     }
 
@@ -6006,7 +5816,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_import_creates_chunks_release_and_evidence_only_answer() {
+    async fn text_import_creates_chunks_and_release() {
         let repository = MemoryKnowledgeRepository::default();
         let scope = scope();
         let accepted = repository
@@ -6029,27 +5839,24 @@ mod tests {
             .await
             .unwrap();
         assert!(accepted.items[0].release.is_some());
-        let answer = repository
-            .ask(
-                &scope,
-                KnowledgeSearchRequest {
-                    query: "warranty".to_owned(),
-                    purpose: KnowledgePurpose::Public,
-                    limit: 10,
-                    knowledge_release_id: None,
-                },
-            )
+        let detail = repository
+            .get_source_detail(&scope, accepted.items[0].source.as_ref().unwrap().source_id)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(answer.mode, "evidence_only");
-        assert_eq!(answer.evidence.len(), 1);
+        assert_eq!(detail.chunks.len(), 2);
+        assert_eq!(
+            detail.chunks[0].text,
+            "Acme Widget has a two year warranty."
+        );
+        assert_eq!(detail.chunks[1].text, "It is available in blue.");
     }
 
     #[tokio::test]
-    async fn internal_source_is_not_in_public_search() {
+    async fn internal_source_import_progress_is_not_public() {
         let repository = MemoryKnowledgeRepository::default();
         let scope = scope();
-        repository
+        let imported = repository
             .import_batch(
                 &scope,
                 vec![ImportItem {
@@ -6067,19 +5874,25 @@ mod tests {
             .unwrap();
         assert!(
             repository
-                .search(
+                .get_import_progress(
                     &scope,
-                    KnowledgeSearchRequest {
-                        query: "launch".to_owned(),
-                        purpose: KnowledgePurpose::Public,
-                        limit: 10,
-                        knowledge_release_id: None,
-                    },
+                    imported.items[0].import_job.as_ref().unwrap().import_job_id,
+                    KnowledgePurpose::Public,
                 )
                 .await
                 .unwrap()
-                .evidence
-                .is_empty()
+                .is_none()
+        );
+        assert!(
+            repository
+                .get_import_progress(
+                    &scope,
+                    imported.items[0].import_job.as_ref().unwrap().import_job_id,
+                    KnowledgePurpose::Internal,
+                )
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 

@@ -1,8 +1,8 @@
 use chrono::Duration;
 use geo_domain::{
-    ErrorCode, KnowledgePurpose, KnowledgeRepository, KnowledgeSearchRequest, PartnerAdvance,
-    PartnerDisposition, PartnerPrincipal, PartnerRepository, PartnerSyncAction, PartnerSyncItem,
-    PartnerSyncRequest, PartnerSyncStatus, PartnerSyncWork, TenantScope, sha256_hex,
+    ErrorCode, KnowledgePurpose, KnowledgeRepository, PartnerAdvance, PartnerDisposition,
+    PartnerPrincipal, PartnerRepository, PartnerSyncAction, PartnerSyncItem, PartnerSyncRequest,
+    PartnerSyncStatus, PartnerSyncWork, TenantScope, sha256_hex,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgKnowledgeRepository, PgPartnerRepository, set_local_scope,
@@ -255,20 +255,15 @@ async fn intake_restrictions_are_immediate_and_conflicting_or_stale_items_cannot
     );
     assert!(
         knowledge
-            .search(
+            .get_import_progress(
                 &principal.scope,
-                KnowledgeSearchRequest {
-                    query: "evidence".into(),
-                    purpose: KnowledgePurpose::Public,
-                    limit: 10,
-                    knowledge_release_id: resources.knowledge_release_id,
-                }
+                resources.import_job_id.unwrap(),
+                KnowledgePurpose::Public,
             )
             .await
             .unwrap()
-            .evidence
-            .is_empty(),
-        "old release cannot bypass intake restriction"
+            .is_none(),
+        "old import receipt cannot bypass intake restriction"
     );
     repo.advance_one(&work(&principal, restricted.operation_id))
         .await

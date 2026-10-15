@@ -20,12 +20,12 @@ use geo_domain::{
     ContentItemStatus, ContentRevision, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID,
     DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
     DocumentManifestPlanRequest, DocumentManifestState, DocumentScope, EvidenceRef, Fact,
-    FreezeDistribution, ImportAcceptance, ImportBatchAcceptance, ImportItem, KnowledgeAskResult,
-    KnowledgeCapability, KnowledgeOverview, KnowledgePurpose, KnowledgeRelease,
-    KnowledgeRepository, KnowledgeSearchRequest, KnowledgeSearchResult, MemoryAuthRepository,
-    MemoryKnowledgeRepository, MemoryProjectRepository, PlatformPlacement, PreparedDistribution,
-    Product, ProjectCreate, ProjectSettings, Source, SourceDetail, SourceKind, SourceVersion,
-    StoredObject, StructuredDocument, TenantScope, UploadSession, UploadSessionCommand, sha256_hex,
+    FreezeDistribution, ImportAcceptance, ImportBatchAcceptance, ImportItem, KnowledgeCapability,
+    KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
+    MemoryAuthRepository, MemoryKnowledgeRepository, MemoryProjectRepository, PlatformPlacement,
+    PreparedDistribution, Product, ProjectCreate, ProjectSettings, Source, SourceDetail,
+    SourceKind, SourceVersion, StoredObject, StructuredDocument, TenantScope, UploadSession,
+    UploadSessionCommand, sha256_hex,
 };
 use geo_provider::SecretEnvelope;
 use serde_json::json;
@@ -333,20 +333,6 @@ impl KnowledgeRepository for RevokingKnowledge {
         self.inner
             .plan_document_manifest(scope, request, document_scope)
             .await
-    }
-    async fn search(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, AppError> {
-        self.inner.search(scope, request).await
-    }
-    async fn ask(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeAskResult, AppError> {
-        self.inner.ask(scope, request).await
     }
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError> {
         self.inner.overview(scope).await

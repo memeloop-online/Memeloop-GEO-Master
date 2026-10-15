@@ -15,6 +15,7 @@ import {
 } from "../api/observationAnalysis";
 import { useAuth } from "../auth/AuthProvider";
 import { ObservationAnswer } from "../components/ObservationAnswer";
+import { RecommendationResults } from "../components/RecommendationResults";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import {
   analysisFailureMessageKey,
@@ -166,6 +167,7 @@ export function ObservationAnalysisPanel({
         {!grounded && metadata}
         {grounded && (
           <>
+            <RecommendationResults value={grounded.audit.recommendations} />
             <h5>{t("answer")}</h5>
             <ObservationAnswer text={grounded.raw_answer} />
             <h5>{t("citations")}</h5>

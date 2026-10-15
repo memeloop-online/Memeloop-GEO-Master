@@ -58,8 +58,6 @@ function routePath(request: RequestInfo | URL) {
 function defaultCapabilities(overrides: Record<string, boolean> = {}) {
   return {
     ocr: true,
-    vector_search: true,
-    llm_answering: true,
     url_fetch: true,
     ...overrides,
   };
@@ -69,16 +67,13 @@ function requestHandler({
   capabilities = defaultCapabilities(),
   sourceItems = [source],
   sourceDetail,
-  ask,
 }: {
   capabilities?: Record<string, unknown>;
   sourceItems?: unknown[];
   sourceDetail?: unknown;
-  ask?: unknown;
 } = {}) {
-  return vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+  return vi.fn((request: RequestInfo | URL, _init?: RequestInit) => {
     const path = routePath(request);
-    const method = init?.method ?? "GET";
     if (path.endsWith("/auth/session"))
       return Promise.resolve(response(session));
     if (path.endsWith("/projects")) {
@@ -138,11 +133,6 @@ function requestHandler({
         response({ knowledge_release_id: "release-a", sequence: 3 }),
       );
     }
-    if (path.endsWith("/knowledge/ask") && method === "POST") {
-      return Promise.resolve(
-        response(ask ?? { status: "answered", evidence: [] }),
-      );
-    }
     return Promise.resolve(response({}));
   });
 }
@@ -183,8 +173,6 @@ describe("knowledge workbench", () => {
         sourceItems: [],
         capabilities: defaultCapabilities({
           ocr: false,
-          vector_search: false,
-          llm_answering: false,
           url_fetch: false,
         }),
       }),
@@ -198,8 +186,6 @@ describe("knowledge workbench", () => {
     expect(await screen.findByText("还没有资料")).toBeInTheDocument();
     expect(screen.getByText("部分功能暂不可用")).toBeInTheDocument();
     expect(screen.getByText(/扫描件识别/)).toBeInTheDocument();
-    expect(screen.getByText(/相似内容检索/)).toBeInTheDocument();
-    expect(screen.getAllByText(/知识问答/).length).toBeGreaterThan(0);
     expect(screen.getByText(/网页导入/)).toBeInTheDocument();
     expect(screen.getByText(/PDF 解析/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "导入资料" }));
@@ -370,83 +356,6 @@ describe("knowledge workbench", () => {
     expect(screen.getByText(/完整记录可在原始片段中查看/)).toBeInTheDocument();
     expect(screen.getAllByText(/单元格字符 4–8/)).toHaveLength(2);
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
-  });
-
-  it("uses evidence-only mode and reports insufficient evidence without invented prose", async () => {
-    vi.stubGlobal(
-      "fetch",
-      requestHandler({
-        capabilities: defaultCapabilities({ llm_answering: false }),
-        ask: {
-          answer_status: "insufficient_evidence",
-          mode: "evidence_only",
-          answer: null,
-          missing: ["当前价格表"],
-          evidence: [
-            {
-              source_id: "source-a",
-              source_name: "内部产品手册.pdf",
-              chunk_id: "chunk-a",
-              locator: { kind: "text", line_start: 5, line_end: 6 },
-            },
-          ],
-        },
-      }),
-    );
-    const user = userEvent.setup();
-    renderPath("/app/tenant-a/project-a/knowledge/ask");
-
-    expect(await screen.findByText("证据摘录模式")).toBeInTheDocument();
-    await user.type(
-      screen.getByRole("textbox", { name: "你的问题" }),
-      "当前价格是多少？",
-    );
-    await user.click(screen.getByRole("button", { name: "查找证据" }));
-
-    expect(await screen.findByText("当前资料没有这项信息")).toBeInTheDocument();
-    expect(screen.getByText("当前价格表")).toBeInTheDocument();
-    expect(screen.getByText(/第 5–6 行/)).toBeInTheDocument();
-    expect(screen.queryByText("基于当前资料的回答")).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("link", { name: /内部产品手册.pdf/ }),
-    ).toHaveAttribute(
-      "href",
-      "/app/tenant-a/project-a/knowledge/sources/source-a",
-    );
-  });
-
-  it("labels an evidence-only match as a quoted excerpt rather than an answer", async () => {
-    vi.stubGlobal(
-      "fetch",
-      requestHandler({
-        capabilities: defaultCapabilities({ llm_answering: false }),
-        ask: {
-          answer_status: "answered",
-          mode: "evidence_only",
-          answer: "额定功率为 120W。",
-          evidence: [
-            {
-              source_id: "source-a",
-              source_name: "内部产品手册.pdf",
-              chunk_id: "chunk-a",
-              locator: { kind: "text", line_start: 5, line_end: 6 },
-            },
-          ],
-        },
-      }),
-    );
-    const user = userEvent.setup();
-    renderPath("/app/tenant-a/project-a/knowledge/ask");
-
-    await user.type(
-      await screen.findByRole("textbox", { name: "你的问题" }),
-      "额定功率是多少？",
-    );
-    await user.click(screen.getByRole("button", { name: "查找证据" }));
-
-    expect(await screen.findByText("已找到匹配证据")).toBeInTheDocument();
-    expect(screen.getByText("证据摘录：")).toBeInTheDocument();
-    expect(screen.queryByText("基于当前资料的回答")).not.toBeInTheDocument();
   });
 
   it("runs the actual file-upload request sequence and reports partial import results", async () => {

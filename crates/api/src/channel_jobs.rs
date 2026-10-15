@@ -765,7 +765,9 @@ impl SearchEvent {
                     && extraction_label(&event.extraction_model)
                     && matches!(
                         event.extraction_prompt_version.as_str(),
-                        "geo.observation.extract.v2" | "geo.observation.extract.v3"
+                        "geo.observation.extract.v2"
+                            | "geo.observation.extract.v3"
+                            | "geo.observation.extract.v4"
                     )
                     && extraction_sha256(&event.source_sha256) =>
             {
