@@ -14,12 +14,13 @@ import * as api from "../api/measurementReports";
 import { MeasurementPeriodReportPanel } from "./MeasurementPeriodReportPanel";
 import i18n from "../i18n";
 
+const auth = vi.hoisted(() => ({ role: "member" }));
 vi.mock("../auth/AuthProvider", () => ({
   useAuth: () => ({
     session: {
       user: { id: "user" },
       operator: { id: "operator" },
-      memberships: [{ tenant_id: "tenant", role: "member" }],
+      memberships: [{ tenant_id: "tenant", role: auth.role }],
     },
   }),
 }));
@@ -99,11 +100,133 @@ function setup(input: api.MeasurementPeriodPreview = preview) {
   return { load, list, detail, save };
 }
 afterEach(async () => {
+  auth.role = "member";
   cleanup();
   vi.restoreAllMocks();
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it.each(["zh-CN", "en"])(
+    "summarizes persisted answers and stably prioritizes them in %s without changing receipts",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      auth.role = "viewer";
+      const base = preview.samples[0];
+      const samples = [
+        {
+          ...base,
+          plan_id: "missing-plan",
+          target_id: "missing",
+          observation: null,
+        },
+        { ...base, plan_id: "first-plan", target_id: "first" },
+        {
+          ...base,
+          plan_id: "empty-plan",
+          target_id: "empty",
+          observation: { ...base.observation!, raw_answer: "  \n " },
+        },
+        {
+          ...base,
+          plan_id: "second-plan",
+          target_id: "second",
+          observation: {
+            ...base.observation!,
+            provenance: null,
+            raw_answer: "Second saved answer",
+          },
+        },
+        {
+          ...base,
+          plan_id: "unsupported-plan",
+          target_id: "unsupported",
+          original_status: "unsupported",
+          observation: null,
+        },
+      ];
+      const { save } = setup({
+        ...preview,
+        coverage: {
+          planned: 5,
+          counts: { unknown: 4, unsupported: 1 },
+          observed_live: 0,
+          grounded_saved_analysis: 2,
+        },
+        samples,
+      });
+      expect(
+        await screen.findByText(
+          language === "en" ? /Answers available: 2/ : /回答可查看 2 项/,
+        ),
+      ).toBeVisible();
+      expect(
+        screen.getByText(
+          language === "en" ? /Answers unavailable: 3/ : /暂无回答 3 项/,
+        ),
+      ).toBeVisible();
+      expect(
+        screen.getByText(
+          language === "en" ? /5 measurement samples/ : /测量样本 5 项/,
+        ),
+      ).toBeVisible();
+      const links = screen.getAllByRole("link", {
+        name: language === "en" ? "View measurement record" : "查看测量记录",
+      });
+      expect(
+        links.map((link) => link.getAttribute("href")?.split("record=")[1]),
+      ).toEqual([
+        "first-plan",
+        "second-plan",
+        "missing-plan",
+        "empty-plan",
+        "unsupported-plan",
+      ]);
+      expect(screen.getAllByText("Saved response answer")).toHaveLength(1);
+      expect(screen.getByText("Second saved answer")).toBeVisible();
+      expect(
+        screen.getAllByRole("link", { name: "https://example.org/evidence" }),
+      ).toHaveLength(3);
+      const originalCounts = screen.getByText(
+        language === "en" ? "Unknown: 4" : "结果未知: 4",
+      );
+      expect(originalCounts).not.toBeVisible();
+      await userEvent.click(
+        screen.getByText(
+          language === "en" ? "Original measurement results" : "原始测量结果",
+        ),
+      );
+      expect(originalCounts).toBeVisible();
+      expect(
+        screen.getByText(language === "en" ? "Unsupported: 1" : "暂不支持: 1"),
+      ).toBeVisible();
+      const unsupportedReceipt = screen.getByText(
+        language === "en"
+          ? "Original measurement: Unsupported"
+          : "原测量结果：暂不支持",
+      );
+      expect(unsupportedReceipt).not.toBeVisible();
+      await userEvent.click(
+        unsupportedReceipt.closest("details")!.querySelector("summary")!,
+      );
+      expect(unsupportedReceipt).toBeVisible();
+      expect(
+        screen.queryByRole("button", {
+          name:
+            language === "en"
+              ? "Save report for this period"
+              : "保存此范围的报告",
+        }),
+      ).not.toBeInTheDocument();
+      expect(save).not.toHaveBeenCalled();
+      expect(samples.map((sample) => sample.target_id)).toEqual([
+        "missing",
+        "first",
+        "empty",
+        "second",
+        "unsupported",
+      ]);
+    },
+  );
   it.each(["hit", "not_found_within_depth"] as const)(
     "shows the frozen %s target match for complete search evidence",
     async (matchStatus) => {

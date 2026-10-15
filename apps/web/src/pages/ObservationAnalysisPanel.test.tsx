@@ -139,7 +139,23 @@ describe("saved response analysis", () => {
                 outcome: { status: "failed", code: "model_timeout" },
               },
             };
-      const { create } = setup([newer, grounded]);
+      const older: ObservationAnalysisRevision = {
+        ...grounded,
+        request: {
+          ...grounded.request,
+          revision_id: "older-grounded-revision",
+        },
+        result: {
+          ...grounded.result!,
+          outcome: {
+            status: "grounded",
+            raw_answer: "Older saved answer",
+            citations: [],
+            audit: {},
+          },
+        },
+      };
+      const { create } = setup([newer, grounded, older]);
       expect(await screen.findByText("Available saved answer")).toBeVisible();
       expect(screen.getAllByText("Available saved answer")).toHaveLength(1);
       const history = screen.getByText("解析记录与操作").closest("details")!;
@@ -148,8 +164,10 @@ describe("saved response analysis", () => {
         state === "running" ? "正在解析" : "解析超时。请稍后重新解析。",
       );
       expect(newerStatus).not.toBeVisible();
+      expect(screen.getByText("Older saved answer")).not.toBeVisible();
       await userEvent.click(screen.getByText("解析记录与操作"));
       expect(newerStatus).toBeVisible();
+      expect(screen.getByText("Older saved answer")).toBeVisible();
       expect(screen.getByRole("button", { name: "重新解析" })).toHaveProperty(
         "disabled",
         state === "running",
@@ -563,44 +581,65 @@ describe("saved response analysis", () => {
   });
 
   it("renders only verified answer text and safe citations with actual model and source provenance", async () => {
-    setup([
-      {
-        ...revision,
-        state: "completed",
-        analyzed_at: "2026-01-02T00:01:00Z",
-        result: {
-          actual_model: "example-analysis-model",
-          candidate_json: null,
-          prompt_tokens: 1,
-          completion_tokens: 1,
-          outcome: {
-            status: "grounded",
-            raw_answer: "Line one\n<script>unsafe()</script>",
-            citations: [
-              "javascript:unsafe()",
-              "https://example.test/evidence",
-              "https://example.test/evidence",
-            ],
-            audit: {
-              refs: [{ quote: "Original evidence quote", pointer: "/text" }],
+    const { create } = setup(
+      [
+        {
+          ...revision,
+          state: "completed",
+          analyzed_at: "2026-01-02T00:01:00Z",
+          result: {
+            actual_model: "example-analysis-model",
+            candidate_json: null,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            outcome: {
+              status: "grounded",
+              raw_answer: "Line one\n<script>unsafe()</script>",
+              citations: [
+                "javascript:unsafe()",
+                "https://example.test/evidence",
+                "https://example.test/evidence",
+              ],
+              audit: {
+                refs: [{ quote: "Original evidence quote", pointer: "/text" }],
+              },
             },
           },
         },
-      },
-    ]);
+      ],
+      true,
+      false,
+    );
     expect(await screen.findByText("已与原始记录核对")).toBeInTheDocument();
     expect(
       screen.getByText("实际解析模型：example-analysis-model"),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/原始记录时间/)).toBeInTheDocument();
-    expect(screen.getByText(/解析时间/)).toBeInTheDocument();
+    ).not.toBeVisible();
+    expect(screen.getByText(/原始记录时间/)).not.toBeVisible();
+    expect(screen.getByText(/解析时间/)).not.toBeVisible();
     expect(screen.getByText(/<script>unsafe/)).toBeInTheDocument();
+    expect(screen.getAllByText(/<script>unsafe/)).toHaveLength(1);
+    expect(screen.getByText("回答信息").closest("details")).not.toHaveAttribute(
+      "open",
+    );
     expect(document.querySelector("script")).toBeNull();
     expect(
       screen.getAllByRole("link", { name: "https://example.test/evidence" }),
     ).toHaveLength(1);
     expect(document.querySelector('a[href^="javascript:"]')).toBeNull();
-    expect(screen.getByText(/Original evidence quote/)).toBeInTheDocument();
+    expect(screen.getByText(/Original evidence quote/)).not.toBeVisible();
+    await userEvent.click(screen.getByText("回答信息"));
+    expect(
+      screen.getByText("实际解析模型：example-analysis-model"),
+    ).toBeVisible();
+    expect(screen.getByText(/原始记录时间/)).toBeVisible();
+    expect(screen.getByText(/解析时间/)).toBeVisible();
+    await userEvent.click(screen.getByText("查看原文定位依据"));
+    expect(screen.getByText(/Original evidence quote/)).toBeVisible();
+    await userEvent.click(screen.getByText("解析记录与操作"));
+    expect(
+      screen.queryByRole("button", { name: "重新解析" }),
+    ).not.toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
   });
 
   it.each(["unverified", "failed"] as const)(
