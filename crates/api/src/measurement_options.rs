@@ -56,6 +56,30 @@ async fn discover_with_timeouts(
     operation_timeout: Duration,
     close_timeout: Duration,
 ) -> Result<MeasurementOptions, AppError> {
+    let state = state.clone();
+    let scope = scope.clone();
+    // A disconnected HTTP/agent caller drops its await, not this task. Keep
+    // the existing bounded inspection and exact-generation disposal together
+    // so cancellation cannot strand the account until lease reconciliation.
+    tokio::spawn(async move {
+        discover_owned(&state, &scope, account_id, operation_timeout, close_timeout).await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(AppError::new(
+            ErrorCode::DependencyUnavailable,
+            "website model discovery interrupted; retry later",
+        ))
+    })
+}
+
+async fn discover_owned(
+    state: &AppState,
+    scope: &TenantScope,
+    account_id: Uuid,
+    operation_timeout: Duration,
+    close_timeout: Duration,
+) -> Result<MeasurementOptions, AppError> {
     let service = state.channel_service();
     let account = service.resolve_available_account(scope, account_id).await?;
     if !account.enabled || account.status != ChannelStatus::Ready {

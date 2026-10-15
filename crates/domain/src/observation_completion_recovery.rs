@@ -449,7 +449,10 @@ mod tests {
                 3 => {
                     source["messages"].as_array_mut().unwrap().remove(1);
                 }
-                4 => source["capture_status"]["transport"] = json!("partial"),
+                4 => {
+                    source["capture_status"]["transport"] = json!("partial");
+                    source["capture_status"]["termination"] = json!("eof");
+                }
                 5 => history["chat_session_id"] = json!("other-chat"),
                 6 => history["cache_control"] = json!("APPEND"),
                 7 => history["current_message_id"] = json!(1),
