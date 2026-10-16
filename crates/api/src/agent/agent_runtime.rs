@@ -696,7 +696,7 @@ impl ReportService for AppState {
             if request.list {
                 let items = self
                     .report_repository()
-                    .list_measurement_periods(scope)
+                    .list_measurement_periods(scope, None)
                     .await?
                     .into_iter()
                     .map(Into::into)
@@ -712,7 +712,7 @@ impl ReportService for AppState {
                     .await?
             } else {
                 self.report_repository()
-                    .list_measurement_periods(scope)
+                    .list_measurement_periods(scope, None)
                     .await?
                     .into_iter()
                     .next()
@@ -749,8 +749,14 @@ impl ReportService for AppState {
     ) -> Result<ReportPreviewResult, AppError> {
         request.validate().map_err(AppError::invalid_request)?;
         if request.kind == ReportKind::MeasurementPeriod {
-            let preview =
-                crate::preview_project_measurements(self, scope, request.window, now).await?;
+            let preview = crate::preview_project_measurements(
+                self,
+                scope,
+                request.window,
+                request.question_set,
+                now,
+            )
+            .await?;
             return Ok(ReportPreviewResult::MeasurementPeriod(Box::new(
                 preview.into(),
             )));
@@ -792,6 +798,7 @@ impl ReportService for AppState {
                     end_at: window.end_at,
                     report_timezone: window.report_timezone,
                     correction_of: request.correction_of,
+                    question_set: request.question_set,
                 },
                 now,
             )

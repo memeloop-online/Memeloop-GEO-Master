@@ -1055,6 +1055,7 @@ test("report preview is independent of official read and reduce", async () => {
       "kind",
       "cycle_id",
       "window",
+      "question_set",
     ]);
     assert.equal(previewTool.function.parameters.additionalProperties, false);
     assert.match(previewTool.function.description, /temporary|unsaved/u);
@@ -1162,6 +1163,129 @@ test("cycle-free reports use existing tools and the exact preview window", async
     assert.ok(
       calls.every(([, request]) => !Object.hasOwn(request, "cycle_id")),
     );
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("question-set report tools preserve the selected version, frozen results and exact save retry", async () => {
+  const questionSet = {
+    question_set_id: "00000000-0000-4000-8000-000000000051",
+    question_set_version_id: "00000000-0000-4000-8000-000000000052",
+  };
+  const reportId = "00000000-0000-4000-8000-000000000053";
+  const window = {
+    start_at: "2026-10-01T00:00:00Z",
+    end_at: "2026-10-08T00:00:00Z",
+    report_timezone: "UTC",
+  };
+  const saveRequest = {
+    kind: "measurement_period",
+    window,
+    question_set: questionSet,
+  };
+  const steps = [
+    [
+      "report_preview",
+      { kind: "measurement_period", question_set: questionSet },
+    ],
+    ["report_reduce", saveRequest],
+    ["report_reduce", saveRequest],
+    ["report_get", { kind: "measurement_period", report_id: reportId }],
+  ];
+  const sample = {
+    conditions: {
+      question: "Synthetic buying question",
+      provider: "synthetic-provider",
+      model: "synthetic-model",
+      surface: "consumer_web",
+      search_mode: "official_search",
+      protocol_version: "synthetic.v1",
+      question_set_version: questionSet.question_set_version_id,
+      market: "generic",
+      language: "en",
+      sample_ordinal: 0,
+    },
+    recommendations: { items: [{ name: "Synthetic item", rank: 1 }] },
+  };
+  const report = {
+    kind: "measurement_period",
+    report_id: reportId,
+    question_set: questionSet,
+    report_window_start_at: window.start_at,
+    report_window_end_at: window.end_at,
+    report_timezone: window.report_timezone,
+    coverage: { planned: 2 },
+    omitted_sample_details: 1,
+    samples: [sample],
+  };
+  const calls = [];
+  const requests = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async reportPreview(request) {
+      calls.push(["report_preview", request]);
+      const { report_id: _, ...preview } = report;
+      return { ...preview, kind: "measurement_period_preview" };
+    },
+    async reportReduce(request) {
+      calls.push(["report_reduce", request]);
+      return report;
+    },
+    async reportGet(request) {
+      calls.push(["report_get", request]);
+      return report;
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      const step = steps[requests.length - 1];
+      return step
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `question-set-report-${requests.length}`,
+                type: "function",
+                function: { name: step[0], arguments: JSON.stringify(step[1]) },
+              },
+            ],
+          }
+        : finalModelAnswer("Saved the selected question-set report.");
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?questionSetReport=${Date.now()}`
+    );
+    const result = await main({
+      ...historyTurn,
+      prompt: "Save the report for this question-set version.",
+    });
+    assert.equal(result.answer, "Saved the selected question-set report.");
+    assert.deepEqual(calls, steps);
+    for (const name of ["report_preview", "report_reduce"]) {
+      const tool = requests[0].tools.find(
+        ({ function: entry }) => entry.name === name,
+      ).function;
+      const selector = tool.parameters.properties.question_set;
+      assert.deepEqual(selector.required, [
+        "question_set_id",
+        "question_set_version_id",
+      ]);
+      assert.equal(selector.additionalProperties, false);
+      assert.equal(selector.properties.question_set_id.format, "uuid");
+      assert.equal(selector.properties.question_set_version_id.format, "uuid");
+      assert.match(tool.description, /question_set/u);
+      assert.match(tool.description, /cycle.*accepts no question_set/u);
+    }
+    for (const request of requests.slice(1)) {
+      const receipt = JSON.parse(request.messages.at(-1).content);
+      assert.deepEqual(receipt.question_set, questionSet);
+      assert.deepEqual(receipt.samples, [sample]);
+      assert.equal(receipt.coverage.planned, 2);
+      assert.equal(receipt.omitted_sample_details, 1);
+    }
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

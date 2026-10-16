@@ -130,6 +130,7 @@ fn receipt_time_fallback_is_explicit_and_ai_denominator_is_independent() {
     let preview = preview_measurement_period_with_search(
         &scope,
         &window,
+        None,
         vec![],
         Some(vec![sample]),
         window.end_at,
@@ -172,6 +173,7 @@ fn application_and_database_clock_skew_does_not_permanently_exclude_saved_eviden
         let preview = preview_measurement_period_with_search(
             &scope,
             &window,
+            None,
             vec![],
             Some(vec![sample.clone()]),
             window.end_at,
@@ -234,6 +236,7 @@ fn each_event_and_storage_timestamp_must_independently_pass_fixed_cutoff() {
             preview_measurement_period_with_search(
                 &scope,
                 &window,
+                None,
                 vec![],
                 Some(vec![late_sample]),
                 cutoff,
@@ -372,9 +375,9 @@ fn later_failed_parse_never_hides_useful_evidence_and_partial_is_not_not_found()
 }
 
 #[test]
-fn legacy_snapshot_none_is_not_successful_empty_search_and_correction_cannot_add_it() {
+fn unavailable_search_section_is_not_successful_empty_search_and_correction_cannot_add_it() {
     let (scope, window, _, _) = fixture();
-    let preview = preview_measurement_period(&scope, &window, vec![], window.end_at).unwrap();
+    let preview = preview_measurement_period(&scope, &window, None, vec![], window.end_at).unwrap();
     let first = freeze_measurement_period(&scope, preview, 1, None).unwrap();
     let json = serde_json::to_value(&first).unwrap();
     assert!(json.get("search").is_none());
@@ -387,6 +390,7 @@ fn legacy_snapshot_none_is_not_successful_empty_search_and_correction_cannot_add
     let added = preview_measurement_period_with_search(
         &scope,
         &window,
+        None,
         vec![],
         Some(vec![]),
         window.end_at,
@@ -416,6 +420,7 @@ fn correction_preserves_cohort_and_source_protocol_are_not_collapsed() {
     let first_preview = preview_measurement_period_with_search(
         &scope,
         &window,
+        None,
         vec![],
         Some(samples.clone()),
         window.end_at,
@@ -432,6 +437,7 @@ fn correction_preserves_cohort_and_source_protocol_are_not_collapsed() {
     let reordered = preview_measurement_period_with_search(
         &scope,
         &window,
+        None,
         vec![],
         Some(reversed),
         window.end_at,
@@ -454,6 +460,7 @@ fn correction_preserves_cohort_and_source_protocol_are_not_collapsed() {
         preview_measurement_period_with_search(
             &scope,
             &window,
+            None,
             vec![],
             Some(duplicate),
             window.end_at,
@@ -493,6 +500,7 @@ fn delayed_generation_never_admits_search_evidence_after_fixed_cutoff() {
         let projected = preview_measurement_period_at_cutoff(
             &scope,
             &window,
+            None,
             vec![],
             Some(vec![sample]),
             cutoff,
@@ -519,6 +527,7 @@ fn delayed_generation_never_admits_search_evidence_after_fixed_cutoff() {
             preview_measurement_period_at_cutoff(
                 &scope,
                 &window,
+                None,
                 vec![],
                 Some(vec![prematurely_selected]),
                 cutoff,
@@ -532,6 +541,7 @@ fn delayed_generation_never_admits_search_evidence_after_fixed_cutoff() {
     let projected = preview_measurement_period_at_cutoff(
         &scope,
         &window,
+        None,
         vec![],
         Some(vec![original_sample.clone()]),
         cutoff,

@@ -117,10 +117,12 @@ impl ReportRepository for PgReportRepository {
             return Err(AppError::not_found("project not found"));
         }
         let values: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT snapshot FROM measurement_period_reports WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND report_window_start_at=$4 AND report_window_end_at=$5 AND report_timezone=$6 ORDER BY revision",
+            "SELECT snapshot FROM measurement_period_reports WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND report_window_start_at=$4 AND report_window_end_at=$5 AND report_timezone=$6 AND question_set_id IS NOT DISTINCT FROM $7 AND question_set_version_id IS NOT DISTINCT FROM $8 ORDER BY revision",
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
             .bind(snapshot.project_id.as_uuid()).bind(snapshot.report_window_start_at)
             .bind(snapshot.report_window_end_at).bind(&snapshot.report_timezone)
+            .bind(snapshot.question_set.as_ref().map(|selected| selected.question_set_id))
+            .bind(snapshot.question_set.as_ref().map(|selected| selected.question_set_version_id))
             .fetch_all(&mut *tx).await.map_err(database_error)?;
         let rows = values
             .into_iter()
@@ -136,11 +138,13 @@ impl ReportRepository for PgReportRepository {
             AppError::new(ErrorCode::Internal, "cannot serialize measurement report")
         })?;
         sqlx::query(
-            "INSERT INTO measurement_period_reports (report_id,operator_id,tenant_id,project_id,revision,correction_of,report_window_start_at,report_window_end_at,report_timezone,evidence_as_of,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "INSERT INTO measurement_period_reports (report_id,operator_id,tenant_id,project_id,revision,correction_of,report_window_start_at,report_window_end_at,report_timezone,evidence_as_of,snapshot,question_set_id,question_set_version_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         ).bind(snapshot.report_id).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
             .bind(snapshot.project_id.as_uuid()).bind(snapshot.revision as i32).bind(snapshot.correction_of)
             .bind(snapshot.report_window_start_at).bind(snapshot.report_window_end_at)
             .bind(&snapshot.report_timezone).bind(snapshot.evidence_as_of).bind(value)
+            .bind(snapshot.question_set.as_ref().map(|selected| selected.question_set_id))
+            .bind(snapshot.question_set.as_ref().map(|selected| selected.question_set_version_id))
             .execute(&mut *tx).await.map_err(database_error)?;
         tx.commit().await.map_err(database_error)?;
         Ok(snapshot)
@@ -149,6 +153,7 @@ impl ReportRepository for PgReportRepository {
     async fn list_measurement_periods(
         &self,
         scope: &TenantScope,
+        question_set: Option<geo_domain::MeasurementReportQuestionSet>,
     ) -> Result<Vec<MeasurementPeriodReport>, AppError> {
         let project = scope
             .project_id
@@ -158,11 +163,35 @@ impl ReportRepository for PgReportRepository {
             .await
             .map_err(database_error)?;
         let values: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT snapshot FROM measurement_period_reports WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 ORDER BY report_window_end_at DESC,revision DESC,report_id",
+            "SELECT snapshot FROM measurement_period_reports WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND question_set_id IS NOT DISTINCT FROM $4 AND question_set_version_id IS NOT DISTINCT FROM $5 ORDER BY report_window_end_at DESC,revision DESC,report_id",
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .bind(question_set.as_ref().map(|selected| selected.question_set_id))
+            .bind(question_set.as_ref().map(|selected| selected.question_set_version_id))
             .fetch_all(&mut *tx).await.map_err(database_error)?;
         tx.commit().await.map_err(database_error)?;
         values.into_iter().map(decode_measurement).collect()
+    }
+
+    async fn get_measurement_period(
+        &self,
+        scope: &TenantScope,
+        report_id: Uuid,
+    ) -> Result<MeasurementPeriodReport, AppError> {
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::forbidden("project scope required"))?;
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(database_error)?;
+        let value: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT snapshot FROM measurement_period_reports WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND report_id=$4",
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid()).bind(report_id)
+            .fetch_optional(&mut *tx).await.map_err(database_error)?;
+        tx.commit().await.map_err(database_error)?;
+        decode_measurement(
+            value.ok_or_else(|| AppError::not_found("measurement report not found"))?,
+        )
     }
 
     async fn create(

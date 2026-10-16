@@ -19,7 +19,7 @@
 
 ### 1. 持久回合输入
 
-`crates/domain/src/agent.rs` 的 `TurnInput` 增加真实 `message_id` 与
+`crates/domain/src/agent/mod.rs` 的 `TurnInput` 增加真实 `message_id` 与
 `attachments: Vec<AttachmentReference>`。`run_executor` 从 repository 已受理消息构造，
 不从 HTTP 原始请求重新取值。serialized input hash 自然包含附件版本。
 重入时从 Run → Turn.root_message_id → Message 重建相同输入。

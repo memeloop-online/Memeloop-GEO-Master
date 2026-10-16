@@ -111,6 +111,7 @@ fn report_request(candidate: &MeasurementWeeklySchedule) -> MeasurementPeriodReq
         end_at: candidate.window.end_at,
         report_timezone: candidate.window.report_timezone.clone(),
         correction_of: None,
+        question_set: None,
     }
 }
 
@@ -382,5 +383,6 @@ mod tests {
         assert_eq!(request.end_at, candidate.window.end_at);
         assert_eq!(request.report_timezone, candidate.window.report_timezone);
         assert_eq!(request.correction_of, None);
+        assert_eq!(request.question_set, None);
     }
 }

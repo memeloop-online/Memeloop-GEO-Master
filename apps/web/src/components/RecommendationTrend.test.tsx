@@ -121,7 +121,7 @@ describe("recommendation rank history", () => {
       />,
     );
     const cells = within(screen.getAllByRole("row")[1]).getAllByRole("cell");
-    expect(cells[2]).toHaveTextContent("尚未提取推荐结果");
+    expect(cells[2]).toHaveTextContent("推荐结果尚未分析");
     expect(cells[3]).toHaveTextContent("推荐结果暂不可用");
     expect(cells[4]).toHaveTextContent("未出现在推荐结果中");
     expect(screen.getByText("推荐结果可用 2 / 4 次")).toBeVisible();

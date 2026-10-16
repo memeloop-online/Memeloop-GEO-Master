@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Button, Card } from "@fluentui/react-components";
+import { Button, Card, Field, Input } from "@fluentui/react-components";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useAuth } from "../auth/AuthProvider";
@@ -9,7 +9,14 @@ import {
   listMeasurementReports,
   saveMeasurementReport,
   type MeasurementPeriodProjection,
+  type MeasurementPeriodSample,
+  type MeasurementReportQuestionSet,
+  type MeasurementReportWindow,
 } from "../api/measurementReports";
+import {
+  RecommendationTrend,
+  type RecommendationTrendSample,
+} from "../components/RecommendationTrend";
 import { ReportSupplementaryMeasurements } from "./ReportSupplementaryMeasurements";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import "../i18n/measurementReports";
@@ -30,27 +37,56 @@ const knownStatuses = new Set([
 export function MeasurementPeriodReportPanel({
   tenantId,
   projectId,
+  questionSet,
+  selectedReportId,
+  onSelectReport,
 }: {
   tenantId: string;
   projectId: string;
+  questionSet?: MeasurementReportQuestionSet;
+  selectedReportId?: string;
+  onSelectReport?: (reportId: string | undefined) => void;
 }) {
   const { session } = useAuth();
   const { t, i18n } = useTranslation("measurementReports");
-  const [selected, setSelected] = useState<string>();
+  const [localSelected, setLocalSelected] = useState<string>();
+  const selected = onSelectReport ? selectedReportId : localSelected;
+  const setSelected = (reportId: string | undefined) => {
+    if (onSelectReport) onSelectReport(reportId);
+    else setLocalSelected(reportId);
+  };
   const [saving, setSaving] = useState(false);
   const [saveState, setSaveState] = useState<"saved" | "saveFailed">();
+  const [window, setWindow] = useState<MeasurementReportWindow>();
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
+  const [invalidWindow, setInvalidWindow] = useState(false);
   const saveIntent = useRef<MeasurementPeriodProjection | undefined>(undefined);
-  const scope = [session?.user.id, session?.operator.id, tenantId, projectId];
+  const scope = [
+    session?.user.id,
+    session?.operator.id,
+    tenantId,
+    projectId,
+    questionSet?.question_set_id,
+    questionSet?.question_set_version_id,
+  ];
+  const matchesScope = (value: MeasurementPeriodProjection) =>
+    value.project_id === projectId &&
+    (value.question_set?.question_set_id ?? null) ===
+      (questionSet?.question_set_id ?? null) &&
+    (value.question_set?.question_set_version_id ?? null) ===
+      (questionSet?.question_set_version_id ?? null);
   const enabled = Boolean(session);
   const preview = useQuery({
-    queryKey: ["measurement-report-preview", ...scope],
-    queryFn: () => getMeasurementReportPreview(tenantId, projectId),
-    enabled,
+    queryKey: ["measurement-report-preview", ...scope, window],
+    queryFn: () =>
+      getMeasurementReportPreview(tenantId, projectId, questionSet, window),
+    enabled: enabled && !selected,
     retry: false,
   });
   const history = useQuery({
     queryKey: ["measurement-reports", ...scope],
-    queryFn: () => listMeasurementReports(tenantId, projectId),
+    queryFn: () => listMeasurementReports(tenantId, projectId, questionSet),
     enabled,
     retry: false,
   });
@@ -62,12 +98,40 @@ export function MeasurementPeriodReportPanel({
   });
   const current = selected ? detail : preview;
   const report = current.data;
+  const recordHref = (sample: MeasurementPeriodSample) => {
+    const query = new URLSearchParams({
+      tab: "records",
+      record: sample.plan_id,
+      target: sample.target_id,
+    });
+    const reference = sample.question_binding?.reference;
+    if (reference) {
+      query.set("set", reference.question_set_id);
+      query.set("version", reference.question_set_version_id);
+    }
+    if (sample.attempt_id) query.set("attempt", sample.attempt_id);
+    if (sample.observation?.provenance)
+      query.set("analysisRevision", sample.observation.provenance.revision_id);
+    return `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/measurement?${query}`;
+  };
+  const recommendations: RecommendationTrendSample[] =
+    report?.samples.map((sample) => ({
+      sampleId: sample.target_id,
+      recordHref: recordHref(sample),
+      observedAt: sample.observation?.observed_at ?? sample.scheduled_at,
+      measurement: {
+        ...sample.conditions,
+        question_binding: sample.question_binding ?? undefined,
+      },
+      analysisRevisionId: sample.observation?.provenance?.revision_id,
+      recommendations: sample.recommendations,
+    })) ?? [];
   const hasAnswer = (sample: MeasurementPeriodProjection["samples"][number]) =>
     Boolean(sample.observation?.raw_answer.trim());
   const available = report?.samples.filter(hasAnswer) ?? [];
   const unavailable =
     report?.samples.filter((sample) => !hasAnswer(sample)) ?? [];
-  const canWrite = session?.memberships.some(
+  const canWrite = session?.memberships?.some(
     (member) =>
       member.tenant_id === tenantId &&
       ["tenant_admin", "member"].includes(member.role),
@@ -86,7 +150,8 @@ export function MeasurementPeriodReportPanel({
   const status = (value: string) =>
     t(knownStatuses.has(value) ? `status_${value}` : "status_other");
   async function save() {
-    if (!preview.data || saving || !canWrite) return;
+    if (!preview.data || !matchesScope(preview.data) || saving || !canWrite)
+      return;
     saveIntent.current ??= preview.data;
     setSaving(true);
     setSaveState(undefined);
@@ -96,8 +161,7 @@ export function MeasurementPeriodReportPanel({
         projectId,
         saveIntent.current,
       );
-      if (saved.project_id !== projectId)
-        throw new Error("Report scope mismatch");
+      if (!matchesScope(saved)) throw new Error("Report scope mismatch");
       saveIntent.current = undefined;
       setSaveState("saved");
       setSelected(saved.report_id);
@@ -109,9 +173,73 @@ export function MeasurementPeriodReportPanel({
     }
   }
   return (
-    <section className="report-section" aria-label={t("title")}>
-      <h2>{t("title")}</h2>
-      <p>{t("description")}</p>
+    <section
+      className="report-section"
+      aria-label={t(questionSet ? "questionSetTitle" : "title")}
+    >
+      <h2>{t(questionSet ? "questionSetTitle" : "title")}</h2>
+      <p>{t(questionSet ? "questionSetDescription" : "description")}</p>
+      {questionSet && (
+        <details>
+          <summary>{t("chooseWindow")}</summary>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              const startAt = Date.parse(start);
+              const endAt = Date.parse(end);
+              if (
+                !Number.isFinite(startAt) ||
+                !Number.isFinite(endAt) ||
+                startAt >= endAt
+              ) {
+                setInvalidWindow(true);
+                return;
+              }
+              setInvalidWindow(false);
+              setSelected(undefined);
+              setSaveState(undefined);
+              saveIntent.current = undefined;
+              setWindow({
+                start_at: new Date(startAt).toISOString(),
+                end_at: new Date(endAt).toISOString(),
+              });
+            }}
+          >
+            <Field label={t("windowStart")}>
+              <Input
+                type="datetime-local"
+                value={start}
+                onChange={(_, data) => setStart(data.value)}
+                required
+              />
+            </Field>
+            <Field label={t("windowEnd")}>
+              <Input
+                type="datetime-local"
+                value={end}
+                onChange={(_, data) => setEnd(data.value)}
+                required
+              />
+            </Field>
+            <Button type="submit">{t("applyWindow")}</Button>
+            <Button
+              type="button"
+              onClick={() => {
+                setWindow(undefined);
+                setStart("");
+                setEnd("");
+                setSelected(undefined);
+                setSaveState(undefined);
+                setInvalidWindow(false);
+                saveIntent.current = undefined;
+              }}
+            >
+              {t("allHistory")}
+            </Button>
+            {invalidWindow && <p role="alert">{t("invalidWindow")}</p>}
+          </form>
+        </details>
+      )}
       <Button
         disabled={current.isFetching || saving}
         onClick={() => {
@@ -122,7 +250,9 @@ export function MeasurementPeriodReportPanel({
         {t("refresh")}
       </Button>
       {selected && (
-        <Button onClick={() => setSelected(undefined)}>{t("back")}</Button>
+        <Button onClick={() => setSelected(undefined)}>
+          {t(questionSet ? "questionSetBack" : "back")}
+        </Button>
       )}
       {saveState && (
         <p role={saveState === "saveFailed" ? "alert" : "status"}>
@@ -133,15 +263,17 @@ export function MeasurementPeriodReportPanel({
         <p role="status">{t("loading")}</p>
       ) : current.isError ? (
         <p role="alert">{t("unavailable")}</p>
-      ) : report?.project_id !== projectId ? (
-        <p role="alert">{t("scopeError")}</p>
+      ) : report && !matchesScope(report) ? (
+        <p role="alert">
+          {t(questionSet ? "questionSetScopeError" : "scopeError")}
+        </p>
       ) : (
         report && (
           <>
             <h3>
               {report.kind === "measurement_period"
                 ? t("version", { revision: report.revision })
-                : t("preview")}
+                : t(questionSet ? "questionSetPreview" : "preview")}
             </h3>
             <p>
               {report.kind === "measurement_period"
@@ -159,6 +291,9 @@ export function MeasurementPeriodReportPanel({
               · {report.report_timezone}
             </p>
             <p>{t("asOf", { time: at(report.evidence_as_of) })}</p>
+            {recommendations.length > 0 && (
+              <RecommendationTrend samples={recommendations} />
+            )}
             <h3>{t("aiTitle")}</h3>
             <p>
               {t("sampleTotal", { count: report.samples.length })} ·{" "}
@@ -269,11 +404,7 @@ export function MeasurementPeriodReportPanel({
                     </pre>
                   )}
                 </details>
-                <a
-                  href={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/measurement?tab=records&record=${encodeURIComponent(sample.plan_id)}`}
-                >
-                  {t("record")}
-                </a>
+                <a href={recordHref(sample)}>{t("record")}</a>
                 {!sample.observation?.provenance && (
                   <details>
                     <summary>
@@ -311,6 +442,10 @@ export function MeasurementPeriodReportPanel({
         <p>{t("loading")}</p>
       ) : history.isError ? (
         <p role="alert">{t("unavailable")}</p>
+      ) : history.data.items.some((item) => !matchesScope(item)) ? (
+        <p role="alert">
+          {t(questionSet ? "questionSetScopeError" : "scopeError")}
+        </p>
       ) : history.data.items.length ? (
         <ul>
           {history.data.items.map((item) => (

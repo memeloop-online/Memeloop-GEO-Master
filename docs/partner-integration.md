@@ -16,7 +16,7 @@ AI 工作台发起导入、生成、分发和查询，详情页查看同一来�
 
 | 范围 | 当前可复用接缝 | 本设计待实现 |
 |---|---|---|
-| 知识 | `knowledge.rs` 的上传、imports、source versions、解析任务和用途变更 | 服务身份、外部来源映射、增量游标与撤销桥 |
+| 知识 | `crates/api/src/knowledge/mod.rs` 的上传、imports、source versions、解析任务和用途变更 | 服务身份、外部来源映射、增量游标与撤销桥 |
 | 内容 | 已保存的 ContentRevision、ChannelVariant、版本级导出及媒体绑定 | 精确版本的合作方交付清单、能力映射 |
 | 发布 | 单篇分发请求、PublicationIntent、outbox、发送尝试及追加查回证据 | 合作方 API transport、回调 Inbox、轮询及状态映射 |
 | 展示 | P00、知识/内容详情、发布记录及报告 | 同资源投影及伙伴交付证据，不另起数据孤岛 |
@@ -133,8 +133,8 @@ connection_id；有限时钟窗口、key_id 轮换及 `(connection_id,event_id)`
 
 ## 7. 文本同步候选实现
 
-实现入口为 `crates/domain/src/partner.rs`、`crates/api/src/partner.rs`、
-`crates/persistence/src/partner.rs` 和迁移 `0061_partner_knowledge_sync.sql`。
+实现入口为 `crates/domain/src/partners/partner.rs`、`crates/api/src/partners/partner.rs`、
+`crates/persistence/src/partners/mod.rs` 和迁移 `0061_partner_knowledge_sync.sql`。
 目前仅 PostgreSQL 模式装配；管理端连接创建、密钥签发和轮换的 HTTP/UI 候选入口见下节。
 上线与实际接入尚未验收，不能直接作为已可自助接入的功能交付。
 

@@ -363,6 +363,7 @@ fn validate_recorded_return(
                     ReportKind::MeasurementPeriod,
                     ReportPreviewResult::MeasurementPeriod(response),
                 ) if scope.project_id == Some(response.preview.project_id)
+                    && requested.question_set == response.preview.question_set
                     && response.preview.evidence_as_of <= response.preview.generated_at
                     && report_projection_safe(
                         &response.preview.samples,
@@ -389,25 +390,37 @@ fn validate_recorded_return(
             }
         }
         HostOp::ReportGet | HostOp::ReportReduce => {
-            let (kind, report_id, list, window, correction) = if op == HostOp::ReportGet {
-                let request: ReportGetRequest = typed(op, request)?;
-                (request.kind, request.report_id, request.list, None, None)
-            } else {
-                let request: ReportReduceRequest = typed(op, request)?;
-                (
-                    request.kind,
-                    None,
-                    false,
-                    request.window,
-                    Some(request.correction_of),
-                )
-            };
+            let (kind, report_id, list, window, correction, question_set) =
+                if op == HostOp::ReportGet {
+                    let request: ReportGetRequest = typed(op, request)?;
+                    (
+                        request.kind,
+                        request.report_id,
+                        request.list,
+                        None,
+                        None,
+                        None,
+                    )
+                } else {
+                    let request: ReportReduceRequest = typed(op, request)?;
+                    (
+                        request.kind,
+                        None,
+                        false,
+                        request.window,
+                        Some(request.correction_of),
+                        Some(request.question_set),
+                    )
+                };
             let valid_report = |projection: &MeasurementPeriodReportProjection| {
                 let report = &projection.report;
                 scope.project_id == Some(report.project_id)
                     && !report.report_id.is_nil()
                     && report_id.is_none_or(|id| id == report.report_id)
                     && correction.is_none_or(|parent| parent == report.correction_of)
+                    && question_set
+                        .as_ref()
+                        .is_none_or(|selected| selected == &report.question_set)
                     && report_projection_safe(
                         &report.samples,
                         projection.omitted_sample_details,
@@ -3187,6 +3200,8 @@ pub struct ReportPreviewRequest {
     pub cycle_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<geo_domain::MeasurementPeriodWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_set: Option<geo_domain::MeasurementReportQuestionSet>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3200,6 +3215,8 @@ pub struct ReportReduceRequest {
     pub correction_of: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<geo_domain::MeasurementPeriodWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_set: Option<geo_domain::MeasurementReportQuestionSet>,
 }
 
 impl ReportGetRequest {
@@ -3216,13 +3233,23 @@ impl ReportGetRequest {
 
 impl ReportPreviewRequest {
     pub fn validate(&self) -> Result<(), String> {
-        validate_report_selection(self.kind, self.cycle_id, self.window.as_ref())
+        validate_report_selection(
+            self.kind,
+            self.cycle_id,
+            self.window.as_ref(),
+            self.question_set.as_ref(),
+        )
     }
 }
 
 impl ReportReduceRequest {
     pub fn validate(&self) -> Result<(), String> {
-        validate_report_selection(self.kind, self.cycle_id, self.window.as_ref())?;
+        validate_report_selection(
+            self.kind,
+            self.cycle_id,
+            self.window.as_ref(),
+            self.question_set.as_ref(),
+        )?;
         if self.correction_of.is_some_and(|id| id.is_nil())
             || (self.kind == ReportKind::MeasurementPeriod && self.window.is_none())
         {
@@ -3236,17 +3263,21 @@ fn validate_report_selection(
     kind: ReportKind,
     cycle_id: Option<Uuid>,
     window: Option<&geo_domain::MeasurementPeriodWindow>,
+    question_set: Option<&geo_domain::MeasurementReportQuestionSet>,
 ) -> Result<(), String> {
     if cycle_id.is_some_and(|id| id.is_nil())
-        || (kind == ReportKind::Cycle && window.is_some())
+        || (kind == ReportKind::Cycle && (window.is_some() || question_set.is_some()))
         || (kind == ReportKind::MeasurementPeriod && cycle_id.is_some())
+        || question_set.is_some_and(|selected| {
+            selected.question_set_id.is_nil() || selected.question_set_version_id.is_nil()
+        })
         || window.is_some_and(|window| {
             window.start_at >= window.end_at
                 || window.report_timezone.trim().is_empty()
                 || window.report_timezone.len() > 128
         })
     {
-        return Err("report kind, cycle or time window is invalid".into());
+        return Err("report kind, cycle, question set or time window is invalid".into());
     }
     Ok(())
 }
@@ -4252,6 +4283,218 @@ mod tests {
     }
 
     #[test]
+    fn report_question_set_selection_requires_a_period_and_two_nonzero_ids() {
+        let selected = geo_domain::MeasurementReportQuestionSet {
+            question_set_id: Uuid::new_v4(),
+            question_set_version_id: Uuid::new_v4(),
+        };
+        let preview = ReportPreviewRequest {
+            kind: ReportKind::MeasurementPeriod,
+            question_set: Some(selected.clone()),
+            ..Default::default()
+        };
+        assert!(preview.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&preview).unwrap()["question_set"],
+            serde_json::to_value(&selected).unwrap()
+        );
+        let now = Utc::now();
+        let save = ReportReduceRequest {
+            kind: ReportKind::MeasurementPeriod,
+            question_set: Some(selected.clone()),
+            window: Some(geo_domain::MeasurementPeriodWindow {
+                start_at: now - chrono::Duration::days(7),
+                end_at: now,
+                report_timezone: "UTC".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(save.validate().is_ok());
+        for (kind, question_set) in [
+            (ReportKind::Cycle, selected.clone()),
+            (
+                ReportKind::MeasurementPeriod,
+                geo_domain::MeasurementReportQuestionSet {
+                    question_set_id: Uuid::nil(),
+                    ..selected.clone()
+                },
+            ),
+            (
+                ReportKind::MeasurementPeriod,
+                geo_domain::MeasurementReportQuestionSet {
+                    question_set_version_id: Uuid::nil(),
+                    ..selected.clone()
+                },
+            ),
+        ] {
+            assert!(
+                ReportPreviewRequest {
+                    kind,
+                    question_set: Some(question_set.clone()),
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                ReportReduceRequest {
+                    kind,
+                    question_set: Some(question_set),
+                    ..save.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for invalid in [
+            serde_json::json!({"question_set_id": selected.question_set_id}),
+            serde_json::json!({"question_set_version_id": selected.question_set_version_id}),
+            serde_json::json!({
+                "question_set_id": selected.question_set_id,
+                "question_set_version_id": selected.question_set_version_id,
+                "project_id": Uuid::new_v4(),
+            }),
+        ] {
+            let request =
+                serde_json::json!({"kind": "measurement_period", "question_set": invalid});
+            assert!(serde_json::from_value::<ReportPreviewRequest>(request.clone()).is_err());
+            assert!(serde_json::from_value::<ReportReduceRequest>(request).is_err());
+        }
+    }
+
+    #[test]
+    fn period_question_set_projection_preserves_safe_results_and_binds_receipts() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let now = Utc::now();
+        let observed = now - chrono::Duration::hours(1);
+        let window = geo_domain::MeasurementPeriodWindow {
+            start_at: now - chrono::Duration::days(7),
+            end_at: now,
+            report_timezone: "UTC".into(),
+        };
+        let selected = geo_domain::MeasurementReportQuestionSet {
+            question_set_id: Uuid::new_v4(),
+            question_set_version_id: Uuid::new_v4(),
+        };
+        let sample = geo_domain::MeasurementPeriodSample {
+            plan_id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            attempt_id: Some(Uuid::new_v4()),
+            comparison_key: "synthetic-protocol".into(),
+            conditions: geo_domain::MeasurementReportConditions {
+                question: "Synthetic buying question".into(),
+                provider: "synthetic-provider".into(),
+                model: "synthetic-model".into(),
+                surface: "consumer_web".into(),
+                search_mode: "official_search".into(),
+                protocol_version: "synthetic.v1".into(),
+                question_set_version: selected.question_set_version_id.to_string(),
+                market: "generic".into(),
+                language: "en".into(),
+                sample_ordinal: 0,
+            },
+            question_binding: Some(geo_domain::FrozenQuestionBinding {
+                reference: geo_domain::QuestionReference {
+                    question_set_id: selected.question_set_id,
+                    question_set_version_id: selected.question_set_version_id,
+                    question_id: Uuid::new_v4(),
+                    question_revision_id: Uuid::new_v4(),
+                },
+                purpose: geo_domain::QuestionPurpose::Optimization,
+                split_policy_version: "synthetic.v1".into(),
+            }),
+            scheduled_at: observed,
+            original_status: "unknown".into(),
+            observed_live: false,
+            observation: Some(geo_domain::EffectiveObservation {
+                raw_answer: "Synthetic answer".into(),
+                citations: vec![],
+                observed_at: observed,
+                received_at: observed,
+                provenance: Some(geo_domain::SavedAnalysisProvenance {
+                    revision_id: Uuid::new_v4(),
+                    source: geo_domain::ObservationAnalysisSource::AttemptEvidence {
+                        evidence_index: 0,
+                    },
+                    source_sha256: "a".repeat(64),
+                    observed_at: observed,
+                    analyzed_at: now,
+                    actual_model: "synthetic-parser".into(),
+                    config_revision: None,
+                    prompt_version: "synthetic.v1".into(),
+                    parser_version: "synthetic.v1".into(),
+                }),
+            }),
+            recommendations: Some(serde_json::json!({"items": [{"name": "Synthetic item"}]})),
+        };
+        let mut heldout = sample.clone();
+        heldout.target_id = Uuid::new_v4();
+        heldout.question_binding.as_mut().unwrap().purpose =
+            geo_domain::QuestionPurpose::FrozenEvaluation;
+        heldout.conditions.question = "heldout-report-canary".into();
+        heldout.recommendations = Some(serde_json::json!({"name": "heldout-report-canary"}));
+        let preview = geo_domain::preview_measurement_period(
+            &scope,
+            &window,
+            Some(selected.clone()),
+            vec![sample.clone(), heldout],
+            now,
+        )
+        .unwrap();
+        let report =
+            geo_domain::freeze_measurement_period(&scope, preview.clone(), 1, None).unwrap();
+        let preview_result = serde_json::to_value(ReportPreviewResult::MeasurementPeriod(
+            Box::new(preview.into()),
+        ))
+        .unwrap();
+        let report_result =
+            serde_json::to_value(ReportResult::MeasurementPeriod(Box::new(report.into()))).unwrap();
+        let request = serde_json::json!({"kind": "measurement_period", "window": window, "question_set": selected});
+        for (op, result) in [
+            (HostOp::ReportPreview, preview_result),
+            (HostOp::ReportReduce, report_result),
+        ] {
+            validate_recorded_return(op, &scope, &request, &result).unwrap();
+            assert_eq!(
+                result["question_set"],
+                serde_json::to_value(&selected).unwrap()
+            );
+            assert_eq!(
+                result["samples"][0]["conditions"],
+                serde_json::to_value(&sample.conditions).unwrap()
+            );
+            assert_eq!(
+                result["samples"][0]["recommendations"],
+                serde_json::to_value(&sample.recommendations).unwrap()
+            );
+            assert_eq!(result["omitted_sample_details"], 1);
+            assert_eq!(result["coverage"]["planned"], 2);
+            assert!(!result.to_string().contains("heldout-report-canary"));
+            for question_set in [
+                serde_json::Value::Null,
+                serde_json::json!({
+                    "question_set_id": selected.question_set_id,
+                    "question_set_version_id": Uuid::new_v4(),
+                }),
+            ] {
+                let mut forged = result.clone();
+                forged["question_set"] = question_set;
+                assert!(validate_recorded_return(op, &scope, &request, &forged).is_err());
+            }
+            let mut unscoped_request = request.clone();
+            unscoped_request
+                .as_object_mut()
+                .unwrap()
+                .remove("question_set");
+            assert!(validate_recorded_return(op, &scope, &unscoped_request, &result).is_err());
+        }
+    }
+
+    #[test]
     fn period_preview_audit_rejects_kind_scope_and_snapshot_field_forgery() {
         let scope = TenantScope::new(
             Uuid::new_v4().into(),
@@ -4264,7 +4507,8 @@ mod tests {
             end_at: now,
             report_timezone: "UTC".into(),
         };
-        let preview = geo_domain::preview_measurement_period(&scope, &window, vec![], now).unwrap();
+        let preview =
+            geo_domain::preview_measurement_period(&scope, &window, None, vec![], now).unwrap();
         let response = serde_json::to_value(ReportPreviewResult::MeasurementPeriod(Box::new(
             preview.into(),
         )))
@@ -4333,6 +4577,7 @@ mod tests {
         let preview = geo_domain::preview_measurement_period_with_search(
             &scope,
             &window,
+            None,
             vec![],
             Some(vec![sample.clone()]),
             now,

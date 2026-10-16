@@ -17,7 +17,7 @@
 
 P00 沿用 `report_get`、`report_preview`、`report_reduce`，用 `kind: measurement_period` 选择新能力；默认仍为原周期行为。预览可默认最近七天，保存必须传预览返回的确切窗口。当前源码 Host Ops 为 `geo.hostops.v19`、48 项，包含下述三项搜索工具；API、bundle 与实际摘要必须成套部署。模型返回值省略非优化用途的问题、答案、引用和出处细节，保留报告身份与权威计数；授权用户界面仍可查看完整评估报告。
 
-主要入口为 `crates/domain/src/measurement_report.rs`、`crates/api/src/measurement_reports.rs`、`crates/persistence/src/measurement_report.rs`，迁移 `0048`。
+主要入口为 `crates/domain/src/measurement/measurement_report.rs`、`crates/api/src/measurement/measurement_reports.rs`、`crates/persistence/src/measurement/report.rs`，迁移 `0048`。
 
 ## 传统搜索观察
 
@@ -39,11 +39,11 @@ P00 的 `serp_create`、`serp_read`、`serp_reparse` 与页面共用持久资源
 
 主要入口：
 
-- `crates/domain/src/serp.rs`：协议、任务、证据与仓储契约。
+- `crates/domain/src/measurement/serp.rs`：协议、任务、证据与仓储契约。
 - `crates/provider/src/dataforseo.rs`：HTTP 薄适配与原始响应。
-- `crates/api/src/serp.rs`、`serp_dataforseo.rs`：作用域服务、恢复和结果映射。
-- `crates/persistence/src/serp.rs`、迁移 `0047`：内存与 PostgreSQL。
-- `crates/{domain,persistence,api}/src/project_serp_settings.rs`、迁移 `0049`：加密来源配置、凭据修订与动态绑定。
+- `crates/api/src/measurement/serp.rs`、`crates/api/src/measurement/serp_dataforseo.rs`：作用域服务、恢复和结果映射。
+- `crates/persistence/src/measurement/serp.rs`、迁移 `0047`：内存与 PostgreSQL。
+- `crates/domain/src/measurement/project_serp_settings.rs`、`crates/persistence/src/measurement/serp_settings.rs`、`crates/api/src/measurement/project_serp_settings.rs`、迁移 `0049`：加密来源配置、凭据修订与动态绑定。
 - `apps/web/src/pages/SerpMeasurementPanel.tsx`：搜索测量详情界面。
 - `apps/web/src/pages/ProjectSerpSettingsPanel.tsx`：项目搜索来源设置。
 

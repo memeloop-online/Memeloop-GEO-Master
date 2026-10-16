@@ -46,6 +46,19 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
         target_id: Uuid::new_v4(),
         attempt_id: Some(Uuid::new_v4()),
         comparison_key: "provider|model|consumer_web|web_search".into(),
+        conditions: geo_domain::MeasurementReportConditions {
+            question: "Synthetic question".into(),
+            provider: "provider".into(),
+            model: "model".into(),
+            surface: "consumer_web".into(),
+            search_mode: "web_search".into(),
+            protocol_version: "v1".into(),
+            question_set_version: "synthetic.v1".into(),
+            market: "generic".into(),
+            language: "en".into(),
+            sample_ordinal: 0,
+        },
+        recommendations: None,
         question_binding: None,
         scheduled_at: now - Duration::hours(1),
         original_status: "unknown".into(),
@@ -55,7 +68,7 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
     let repository = PgReportRepository::from_database(&database);
     let proposed = freeze_measurement_period(
         &scope,
-        preview_measurement_period(&scope, &window, vec![sample.clone()], now).unwrap(),
+        preview_measurement_period(&scope, &window, None, vec![sample.clone()], now).unwrap(),
         1,
         None,
     )
@@ -65,6 +78,7 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
         preview_measurement_period(
             &scope,
             &window,
+            None,
             vec![sample.clone()],
             now + Duration::seconds(1),
         )
@@ -98,9 +112,14 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
             parser_version: "v1".into(),
         }),
     });
+    interpreted.recommendations = Some(serde_json::json!({
+        "version":"geo.recommendations.v1","status":"verified",
+        "items":[{"name":"Synthetic product","mention_order":1,"rank":1,"citation_urls":["https://example.test/source"]}]
+    }));
     let proposed = freeze_measurement_period(
         &scope,
-        preview_measurement_period(&scope, &window, vec![interpreted.clone()], analyzed).unwrap(),
+        preview_measurement_period(&scope, &window, None, vec![interpreted.clone()], analyzed)
+            .unwrap(),
         2,
         Some(first.report_id),
     )
@@ -114,6 +133,10 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
     assert_eq!(correction.coverage.planned, 1);
     assert_eq!(correction.coverage.counts["unknown"], 1);
     assert_eq!(correction.coverage.grounded_saved_analysis, 1);
+    assert_eq!(
+        correction.samples[0].recommendations,
+        interpreted.recommendations
+    );
     let restarted = PgReportRepository::from_database(&database);
     assert_eq!(
         restarted
@@ -131,7 +154,7 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
     );
     assert_eq!(
         restarted
-            .list_measurement_periods(&scope)
+            .list_measurement_periods(&scope, None)
             .await
             .unwrap()
             .len(),
@@ -149,6 +172,7 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
         preview_measurement_period_at_cutoff(
             &scope,
             &delayed_window,
+            None,
             vec![interpreted.clone()],
             None,
             now,
@@ -168,11 +192,13 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
     assert_eq!(delayed.coverage.planned, 1);
     assert_eq!(delayed.coverage.grounded_saved_analysis, 0);
     assert!(delayed.samples[0].observation.is_none());
+    assert!(delayed.samples[0].recommendations.is_none());
     let corrected = freeze_measurement_period(
         &scope,
         preview_measurement_period_at_cutoff(
             &scope,
             &delayed_window,
+            None,
             vec![interpreted],
             None,
             analyzed,
@@ -194,6 +220,7 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
         preview_measurement_period_at_cutoff(
             &scope,
             &delayed_window,
+            None,
             vec![sample],
             None,
             analyzed,
@@ -255,5 +282,204 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
             .await
             .unwrap()
             .is_empty()
+    );
+    use geo_domain::QuestionRepository;
+    let questions = geo_persistence::PgQuestionRepository::from_database(&database);
+    let command = geo_domain::CreateQuestionSet {
+        idempotency_key: "scoped-report".into(),
+        name: "Synthetic report questions".into(),
+        questions: vec![geo_domain::QuestionDraft {
+            question_id: None,
+            text: "Synthetic question".into(),
+            intent: "learn".into(),
+            product_refs: vec![],
+            market: "generic".into(),
+            language: "en".into(),
+            weight: 1,
+            source: geo_domain::QuestionSource {
+                kind: geo_domain::QuestionSourceKind::UserProvided,
+                reference_id: None,
+            },
+        }],
+    };
+    let version = questions.create_set(&scope, command.clone()).await.unwrap();
+    let selected = geo_domain::MeasurementReportQuestionSet {
+        question_set_id: version.question_set_id,
+        question_set_version_id: version.id,
+    };
+    let binding = questions
+        .resolve_question(
+            &scope,
+            geo_domain::QuestionReference {
+                question_set_id: version.question_set_id,
+                question_set_version_id: version.id,
+                question_id: version.questions[0].question_id,
+                question_revision_id: version.questions[0].id,
+            },
+        )
+        .await
+        .unwrap()
+        .binding;
+    let mut scoped_sample = first.samples[0].clone();
+    scoped_sample.question_binding = Some(binding);
+    let scoped_preview = preview_measurement_period(
+        &scope,
+        &first.window(),
+        Some(selected.clone()),
+        vec![scoped_sample.clone()],
+        analyzed,
+    )
+    .unwrap();
+    let scoped = freeze_measurement_period(&scope, scoped_preview.clone(), 1, None).unwrap();
+    let (saved, replay) = tokio::join!(
+        restarted.create_measurement_period(&scope, scoped.clone()),
+        restarted.create_measurement_period(&scope, scoped.clone())
+    );
+    assert_eq!(saved.unwrap(), replay.unwrap());
+    assert_ne!(scoped.report_id, first.report_id);
+    let correction =
+        freeze_measurement_period(&scope, scoped_preview, 2, Some(scoped.report_id)).unwrap();
+    restarted
+        .create_measurement_period(&scope, correction)
+        .await
+        .unwrap();
+    let next = questions
+        .revise_set(
+            &scope,
+            version.question_set_id,
+            geo_domain::ReviseQuestionSet {
+                idempotency_key: "scoped-report-next".into(),
+                base_version_id: version.id,
+                name: command.name,
+                questions: command.questions,
+            },
+        )
+        .await
+        .unwrap();
+    let next_selected = geo_domain::MeasurementReportQuestionSet {
+        question_set_id: next.question_set_id,
+        question_set_version_id: next.id,
+    };
+    scoped_sample
+        .question_binding
+        .as_mut()
+        .unwrap()
+        .reference
+        .question_set_version_id = next.id;
+    scoped_sample
+        .question_binding
+        .as_mut()
+        .unwrap()
+        .reference
+        .question_revision_id = next.questions[0].id;
+    let next_preview = preview_measurement_period(
+        &scope,
+        &first.window(),
+        Some(next_selected.clone()),
+        vec![scoped_sample],
+        analyzed,
+    )
+    .unwrap();
+    let wrong_parent =
+        freeze_measurement_period(&scope, next_preview.clone(), 2, Some(scoped.report_id)).unwrap();
+    assert!(
+        restarted
+            .create_measurement_period(&scope, wrong_parent)
+            .await
+            .is_err()
+    );
+    let next_report = freeze_measurement_period(&scope, next_preview, 1, None).unwrap();
+    restarted
+        .create_measurement_period(&scope, next_report.clone())
+        .await
+        .unwrap();
+    let reopened = PgReportRepository::from_database(&database);
+    assert_eq!(
+        reopened
+            .get_measurement_period(&scope, scoped.report_id)
+            .await
+            .unwrap(),
+        scoped
+    );
+    assert_eq!(
+        reopened
+            .list_measurement_periods(&scope, Some(selected.clone()))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    // Invalid snapshots in other report series must not be decoded by this
+    // version's history query or by an exact-ID read of a valid snapshot.
+    for question_set in [None, Some(next_selected.clone())] {
+        let id = Uuid::new_v4();
+        let mut malformed = serde_json::to_value(&next_report).unwrap();
+        malformed["report_id"] = serde_json::json!(id);
+        malformed["question_set"] = serde_json::json!(question_set);
+        malformed["report_timezone"] = serde_json::json!("Etc/UTC");
+        malformed["samples"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("conditions");
+        sqlx::query(
+            "INSERT INTO measurement_period_reports (report_id,operator_id,tenant_id,project_id,revision,correction_of,report_window_start_at,report_window_end_at,report_timezone,evidence_as_of,snapshot,question_set_id,question_set_version_id) VALUES ($1,$2,$3,$4,1,NULL,$5,$6,'Etc/UTC',$7,$8,$9,$10)",
+        ).bind(id).bind(operator).bind(tenant).bind(project)
+            .bind(next_report.report_window_start_at).bind(next_report.report_window_end_at)
+            .bind(next_report.evidence_as_of).bind(malformed)
+            .bind(question_set.as_ref().map(|selected| selected.question_set_id))
+            .bind(question_set.as_ref().map(|selected| selected.question_set_version_id))
+            .execute(database.pool()).await.unwrap();
+        assert_eq!(
+            reopened
+                .list_measurement_periods(&scope, question_set)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+    }
+    let scoped_rows = reopened
+        .list_measurement_periods(&scope, Some(selected.clone()))
+        .await
+        .unwrap();
+    assert_eq!(scoped_rows.len(), 2);
+    assert!(
+        scoped_rows
+            .iter()
+            .all(|row| row.question_set.as_ref() == Some(&selected))
+    );
+    assert_eq!(
+        reopened
+            .get_measurement_period(&scope, scoped.report_id)
+            .await
+            .unwrap(),
+        scoped
+    );
+    assert_eq!(
+        reopened
+            .get_measurement_period(&scope, first.report_id)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        reopened
+            .create_measurement_period(&scope, scoped.clone())
+            .await
+            .unwrap(),
+        scoped
+    );
+    let mut invalid = next_report;
+    invalid.report_id = Uuid::new_v4();
+    invalid
+        .question_set
+        .as_mut()
+        .unwrap()
+        .question_set_version_id = Uuid::new_v4();
+    assert!(
+        reopened
+            .create_measurement_period(&scope, invalid)
+            .await
+            .is_err()
     );
 }

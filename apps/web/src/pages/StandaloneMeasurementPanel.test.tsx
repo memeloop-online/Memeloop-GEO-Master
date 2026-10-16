@@ -30,6 +30,11 @@ import {
   listAllQuestionSetVersions,
   type QuestionSetVersion,
 } from "../api/questions";
+import {
+  getMeasurementReport,
+  getMeasurementReportPreview,
+  listMeasurementReports,
+} from "../api/measurementReports";
 
 const state = vi.hoisted(() => ({
   accounts: [] as unknown[],
@@ -71,6 +76,12 @@ vi.mock("../api/questions", () => ({
   listAllQuestionSets: vi.fn(),
   listAllQuestionSetVersions: vi.fn(),
   getQuestionSetVersion: vi.fn(),
+}));
+vi.mock("../api/measurementReports", () => ({
+  getMeasurementReport: vi.fn(),
+  getMeasurementReportPreview: vi.fn(),
+  listMeasurementReports: vi.fn(),
+  saveMeasurementReport: vi.fn(),
 }));
 const target = {
   target_id: "target-1",
@@ -200,6 +211,91 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it.each([true, false])(
+    "opens a linked saved rank report on reload independently of the current history page (record listed: %s)",
+    async (listed) => {
+      const questionSet = {
+        question_set_id: "set-1",
+        question_set_version_id: "version-1",
+      };
+      const bound = {
+        ...target,
+        input: {
+          ...target.input,
+          question_binding: {
+            reference: {
+              ...questionSet,
+              question_id: "question-1",
+              question_revision_id: "revision-1",
+            },
+            purpose: "optimization" as const,
+            split_policy_version: "v1",
+          },
+        },
+      };
+      vi.mocked(listMeasurementPlans).mockResolvedValue({
+        items: listed ? [{ ...plan, targets: [bound] }] : [],
+        next_after: null,
+      });
+      vi.mocked(listMeasurementReports).mockResolvedValue({ items: [] });
+      vi.mocked(getMeasurementReport).mockResolvedValue({
+        kind: "measurement_period",
+        project_id: "project-1",
+        question_set: questionSet,
+        report_id: "report-1",
+        revision: 1,
+        correction_of: null,
+        report_window_start_at: "2026-09-01T00:00:00Z",
+        report_window_end_at: "2026-10-01T00:00:00Z",
+        report_timezone: "UTC",
+        evidence_as_of: "2026-10-01T00:00:00Z",
+        generated_at: "2026-10-01T00:00:00Z",
+        input_hash: "hash",
+        coverage: {
+          planned: 0,
+          counts: {},
+          observed_live: 0,
+          grounded_saved_analysis: 0,
+        },
+        samples: [],
+      });
+      renderPanel(
+        false,
+        true,
+        false,
+        "/?tab=records&record=measurement-1&set=set-1&version=version-1&rankReport=report-1",
+      );
+      expect(await screen.findByText("报告版本 1")).toBeVisible();
+      expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(getMeasurementReport).toHaveBeenCalledWith(
+        "tenant-1",
+        "project-1",
+        "report-1",
+      );
+      expect(getMeasurementReportPreview).not.toHaveBeenCalled();
+      expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+        "record=measurement-1",
+      );
+      if (listed) {
+        await userEvent.click(
+          screen.getByRole("button", { name: /自定义问题测量/ }),
+        );
+        expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
+          "rankReport=",
+        );
+        expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+          "set=set-1&version=version-1",
+        );
+        expect(
+          screen.getByRole("button", { name: "测量历史" }),
+        ).toHaveAttribute("aria-expanded", "false");
+      }
+    },
+  );
+
   it("nests repeated measurements under their actual set and version and separates temporary records", async () => {
     const binding = {
       reference: {

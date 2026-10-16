@@ -26,6 +26,21 @@ fn fixture() -> (
             target_id: Uuid::new_v4(),
             attempt_id: Some(Uuid::new_v4()),
             comparison_key: "synthetic-protocol".into(),
+            conditions: geo_domain::MeasurementReportConditions {
+                question: "Synthetic question".into(),
+                provider: "provider".into(),
+                model: "model".into(),
+                surface: "consumer_web".into(),
+                search_mode: "web_search".into(),
+                protocol_version: "v1".into(),
+                question_set_version: "synthetic.v1".into(),
+                market: "generic".into(),
+                language: "en".into(),
+                sample_ordinal: 0,
+            },
+            recommendations: Some(
+                serde_json::json!({"version":"geo.recommendations.v1","status":"verified","items":[{"name":"Synthetic product","rank":1}]}),
+            ),
             question_binding: None,
             scheduled_at: observed_at,
             original_status: "unknown".into(),
@@ -59,6 +74,7 @@ fn delayed_generation_uses_cutoff_without_mutating_evidence_or_frozen_reports() 
     let preview = preview_measurement_period_at_cutoff(
         &scope,
         &window,
+        None,
         vec![sample.clone()],
         None,
         cutoff,
@@ -83,6 +99,7 @@ fn delayed_generation_uses_cutoff_without_mutating_evidence_or_frozen_reports() 
         let projection = preview_measurement_period_at_cutoff(
             &scope,
             &window,
+            None,
             vec![late.clone()],
             None,
             cutoff,
@@ -90,6 +107,7 @@ fn delayed_generation_uses_cutoff_without_mutating_evidence_or_frozen_reports() 
         )
         .unwrap();
         assert!(projection.samples[0].observation.is_none());
+        assert!(projection.samples[0].recommendations.is_none());
         assert_eq!(projection.samples[0].original_status, "unknown");
         assert_eq!(projection.coverage.planned, 1);
         assert_eq!(projection.coverage.grounded_saved_analysis, 0);
@@ -103,11 +121,12 @@ fn preview_entry_points_use_current_hash_tuple_and_stable_report_id() {
     let (scope, window, sample) = fixture();
     let cutoff = window.end_at;
     let ai_only =
-        preview_measurement_period(&scope, &window, vec![sample.clone()], cutoff).unwrap();
+        preview_measurement_period(&scope, &window, None, vec![sample.clone()], cutoff).unwrap();
     for search in [None, Some(vec![])] {
         let wrapped = preview_measurement_period_with_search(
             &scope,
             &window,
+            None,
             vec![sample.clone()],
             search.clone(),
             cutoff,
@@ -116,6 +135,7 @@ fn preview_entry_points_use_current_hash_tuple_and_stable_report_id() {
         let explicit = preview_measurement_period_at_cutoff(
             &scope,
             &window,
+            None,
             vec![sample.clone()],
             search.clone(),
             cutoff,
@@ -136,8 +156,13 @@ fn preview_entry_points_use_current_hash_tuple_and_stable_report_id() {
                     .is_none()
             );
         }
-        let tuple_bytes =
-            serde_json::to_vec(&(&window, &explicit.samples, &explicit.search)).unwrap();
+        let tuple_bytes = serde_json::to_vec(&(
+            &window,
+            &explicit.question_set,
+            &explicit.samples,
+            &explicit.search,
+        ))
+        .unwrap();
         assert_eq!(
             explicit.input_hash,
             hex::encode(Sha256::digest(tuple_bytes))
@@ -145,6 +170,7 @@ fn preview_entry_points_use_current_hash_tuple_and_stable_report_id() {
         let delayed = preview_measurement_period_at_cutoff(
             &scope,
             &window,
+            None,
             vec![sample.clone()],
             search,
             cutoff,
@@ -156,16 +182,18 @@ fn preview_entry_points_use_current_hash_tuple_and_stable_report_id() {
         let later = freeze_measurement_period(&scope, delayed, 1, None).unwrap();
         assert_eq!(first.report_id, later.report_id);
         let digest = Sha256::digest(
-            format!(
-                "measurement-period-v1:{}:{}:{}:{}:{}:{}:1",
+            serde_json::to_vec(&(
+                "measurement-period-v1",
                 scope.operator_id,
                 scope.tenant_id,
                 first.project_id,
+                &first.question_set,
                 window.start_at,
                 window.end_at,
-                window.report_timezone,
-            )
-            .as_bytes(),
+                &window.report_timezone,
+                1u32,
+            ))
+            .unwrap(),
         );
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&digest[..16]);
@@ -183,6 +211,7 @@ fn preview_freeze_and_correction_reject_invalid_clocks() {
     let preview = preview_measurement_period_at_cutoff(
         &scope,
         &window,
+        None,
         vec![sample.clone()],
         None,
         cutoff,
@@ -199,6 +228,7 @@ fn preview_freeze_and_correction_reject_invalid_clocks() {
             preview_measurement_period_at_cutoff(
                 &scope,
                 &window,
+                None,
                 vec![sample.clone()],
                 None,
                 invalid_cutoff,
@@ -223,6 +253,7 @@ fn corrections_require_monotonic_cutoff_and_frozen_sample_identity() {
     let preview = preview_measurement_period_at_cutoff(
         &scope,
         &window,
+        None,
         vec![sample.clone()],
         None,
         cutoff,
@@ -239,6 +270,7 @@ fn corrections_require_monotonic_cutoff_and_frozen_sample_identity() {
         let preview = preview_measurement_period_at_cutoff(
             &scope,
             &window,
+            None,
             vec![sample.clone()],
             None,
             correction_cutoff,
@@ -260,4 +292,168 @@ fn corrections_require_monotonic_cutoff_and_frozen_sample_identity() {
         );
     }
     assert_eq!(serde_json::to_vec(&first).unwrap(), frozen);
+}
+
+#[tokio::test]
+async fn question_set_versions_have_independent_immutable_report_series() {
+    let (scope, window, mut sample) = fixture();
+    let selected = MeasurementReportQuestionSet {
+        question_set_id: Uuid::new_v4(),
+        question_set_version_id: Uuid::new_v4(),
+    };
+    sample.question_binding = Some(FrozenQuestionBinding {
+        reference: QuestionReference {
+            question_set_id: selected.question_set_id,
+            question_set_version_id: selected.question_set_version_id,
+            question_id: Uuid::new_v4(),
+            question_revision_id: Uuid::new_v4(),
+        },
+        purpose: QuestionPurpose::Optimization,
+        split_policy_version: "synthetic.v1".into(),
+    });
+    let repository = MemoryReportRepository::new();
+    let project_preview =
+        preview_measurement_period(&scope, &window, None, vec![sample.clone()], window.end_at)
+            .unwrap();
+    let scoped_preview = preview_measurement_period(
+        &scope,
+        &window,
+        Some(selected.clone()),
+        vec![sample.clone()],
+        window.end_at,
+    )
+    .unwrap();
+    assert_ne!(project_preview.input_hash, scoped_preview.input_hash);
+    let project_report = freeze_measurement_period(&scope, project_preview, 1, None).unwrap();
+    let scoped_report = freeze_measurement_period(&scope, scoped_preview, 1, None).unwrap();
+    assert_ne!(project_report.report_id, scoped_report.report_id);
+    let frozen = serde_json::to_vec(&scoped_report).unwrap();
+    repository
+        .create_measurement_period(&scope, project_report)
+        .await
+        .unwrap();
+    repository
+        .create_measurement_period(&scope, scoped_report.clone())
+        .await
+        .unwrap();
+    let mut changed = sample.clone();
+    changed.recommendations.as_mut().unwrap()["items"][0]["rank"] = serde_json::json!(2);
+    let preview = preview_measurement_period(
+        &scope,
+        &window,
+        Some(selected.clone()),
+        vec![changed],
+        window.end_at,
+    )
+    .unwrap();
+    assert_ne!(preview.input_hash, scoped_report.input_hash);
+    let replay = freeze_measurement_period(&scope, preview.clone(), 1, None).unwrap();
+    assert_eq!(
+        repository
+            .create_measurement_period(&scope, replay)
+            .await
+            .unwrap(),
+        scoped_report
+    );
+    let correction =
+        freeze_measurement_period(&scope, preview, 2, Some(scoped_report.report_id)).unwrap();
+    let correction = repository
+        .create_measurement_period(&scope, correction)
+        .await
+        .unwrap();
+    assert_eq!(
+        correction.samples[0].recommendations.as_ref().unwrap()["items"][0]["rank"],
+        2
+    );
+    let mut other = selected.clone();
+    other.question_set_version_id = Uuid::new_v4();
+    assert!(
+        preview_measurement_period(
+            &scope,
+            &window,
+            Some(other.clone()),
+            vec![sample.clone()],
+            window.end_at
+        )
+        .is_err()
+    );
+    let mut unbound = sample.clone();
+    unbound.question_binding = None;
+    assert!(
+        preview_measurement_period(
+            &scope,
+            &window,
+            Some(selected.clone()),
+            vec![unbound],
+            window.end_at
+        )
+        .is_err()
+    );
+    sample
+        .question_binding
+        .as_mut()
+        .unwrap()
+        .reference
+        .question_set_version_id = other.question_set_version_id;
+    let preview = preview_measurement_period(
+        &scope,
+        &window,
+        Some(other.clone()),
+        vec![sample],
+        window.end_at,
+    )
+    .unwrap();
+    let wrong_parent =
+        freeze_measurement_period(&scope, preview.clone(), 2, Some(scoped_report.report_id))
+            .unwrap();
+    assert!(
+        repository
+            .create_measurement_period(&scope, wrong_parent)
+            .await
+            .is_err()
+    );
+    let other_report = freeze_measurement_period(&scope, preview, 1, None).unwrap();
+    repository
+        .create_measurement_period(&scope, other_report.clone())
+        .await
+        .unwrap();
+    assert_ne!(other_report.report_id, scoped_report.report_id);
+    assert_eq!(
+        repository
+            .list_measurement_periods(&scope, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        repository
+            .list_measurement_periods(&scope, Some(selected))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        repository
+            .list_measurement_periods(&scope, Some(other))
+            .await
+            .unwrap(),
+        vec![other_report]
+    );
+    let mut changed_conditions = correction.clone();
+    changed_conditions.revision += 1;
+    changed_conditions.correction_of = Some(correction.report_id);
+    changed_conditions.samples[0].conditions.model = "different-model".into();
+    assert!(validate_measurement_period_correction(&[correction], &changed_conditions).is_err());
+    assert_eq!(
+        serde_json::to_vec(
+            &repository
+                .get_measurement_period(&scope, scoped_report.report_id)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        frozen
+    );
 }

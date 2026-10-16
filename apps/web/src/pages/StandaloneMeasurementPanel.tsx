@@ -55,10 +55,13 @@ export function StandaloneMeasurementPanel({
   const requestedVersionId =
     params.get("version") ?? params.get("versionId") ?? "";
   const selectedId = params.get("record") ?? params.get("planId") ?? undefined;
-  const [historyOpen, setHistoryOpen] = useState(!selectedId);
+  const selectedRankReport = params.get("rankReport");
+  const [historyOpen, setHistoryOpen] = useState(
+    !selectedId || Boolean(selectedRankReport),
+  );
   useEffect(() => {
-    setHistoryOpen(!selectedId);
-  }, [selectedId, tenantId, projectId]);
+    setHistoryOpen(!selectedId || Boolean(selectedRankReport));
+  }, [selectedId, selectedRankReport, tenantId, projectId]);
   const selectRecord = (
     id: string,
     questionSetId?: string,
@@ -72,6 +75,7 @@ export function StandaloneMeasurementPanel({
       next.delete("target");
       next.delete("attempt");
       next.delete("analysisRevision");
+      next.delete("rankReport");
       next.set("record", id);
       if (questionSetId !== undefined) {
         next.delete("questionSetId");
@@ -215,6 +219,13 @@ export function StandaloneMeasurementPanel({
       }
       groups.set(setId, versions);
     }
+  }
+  if (selectedRankReport && requestedSetId && requestedVersionId) {
+    const versions =
+      groups.get(requestedSetId) ??
+      new Map<string, StandaloneMeasurementPlan[]>();
+    if (!versions.has(requestedVersionId)) versions.set(requestedVersionId, []);
+    groups.set(requestedSetId, versions);
   }
   const recordButton = (
     plan: StandaloneMeasurementPlan,

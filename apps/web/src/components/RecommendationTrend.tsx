@@ -14,7 +14,12 @@ import {
 } from "../api/recommendations";
 import "../i18n/recommendationTrend";
 
-type MeasurementInput = Extract<ChannelTargetInput, { kind: "measure" }>;
+type FullMeasurementInput = Extract<ChannelTargetInput, { kind: "measure" }>;
+type MeasurementInput = Omit<
+  FullMeasurementInput,
+  "kind" | "account_id" | "scheduled_at" | "sample_ordinal"
+> &
+  Partial<FullMeasurementInput>;
 
 /** One persisted measurement sample, using one selected analysis revision. */
 export interface RecommendationTrendSample {

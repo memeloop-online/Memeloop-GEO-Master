@@ -287,18 +287,20 @@ impl SerpRepository for PgSerpRepository {
     async fn list_report_measurements(
         &self,
         scope: &TenantScope,
-        window: &MeasurementPeriodWindow,
+        window: Option<&MeasurementPeriodWindow>,
         evidence_as_of: DateTime<Utc>,
         after: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<MeasurementPeriodSearchIdentity>, AppError> {
-        window.validate(evidence_as_of)?;
+        if let Some(window) = window {
+            window.validate(evidence_as_of)?;
+        }
         let limit = page_limit(limit)?;
         let mut tx = self.tx(scope).await?;
         let rows = sqlx::query(
             "SELECT measurement,stored_at FROM serp_measurements \
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
-             AND scheduled_at >= $4 AND scheduled_at < $5 \
+             AND ($4::timestamptz IS NULL OR scheduled_at >= $4) AND scheduled_at < $5 \
              AND created_at <= $6 AND stored_at <= $6 \
              AND ($7::uuid IS NULL OR measurement_id > $7) \
              ORDER BY measurement_id ASC LIMIT $8",
@@ -306,8 +308,8 @@ impl SerpRepository for PgSerpRepository {
         .bind(scope.operator_id.as_uuid())
         .bind(scope.tenant_id.as_uuid())
         .bind(project(scope)?)
-        .bind(window.start_at)
-        .bind(window.end_at)
+        .bind(window.map(|window| window.start_at))
+        .bind(window.map_or(evidence_as_of, |window| window.end_at))
         .bind(evidence_as_of)
         .bind(after)
         .bind(limit)
@@ -1100,13 +1102,15 @@ impl SerpRepository for MemorySerpRepository {
     async fn list_report_measurements(
         &self,
         scope: &TenantScope,
-        window: &MeasurementPeriodWindow,
+        window: Option<&MeasurementPeriodWindow>,
         evidence_as_of: DateTime<Utc>,
         after: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<MeasurementPeriodSearchIdentity>, AppError> {
         project(scope)?;
-        window.validate(evidence_as_of)?;
+        if let Some(window) = window {
+            window.validate(evidence_as_of)?;
+        }
         page_limit(limit)?;
         let data = self.data.lock().await;
         let mut rows: Vec<_> = data
@@ -1114,8 +1118,10 @@ impl SerpRepository for MemorySerpRepository {
             .values()
             .filter(|(owner, _, stored)| {
                 owner == scope
-                    && stored.measurement.scheduled_at >= window.start_at
-                    && stored.measurement.scheduled_at < window.end_at
+                    && window
+                        .is_none_or(|window| stored.measurement.scheduled_at >= window.start_at)
+                    && stored.measurement.scheduled_at
+                        < window.map_or(evidence_as_of, |window| window.end_at)
                     && stored.measurement.created_at <= evidence_as_of
                     && stored.stored_at <= evidence_as_of
                     && after.is_none_or(|id| stored.measurement.measurement_id > id)

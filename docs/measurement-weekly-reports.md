@@ -21,10 +21,10 @@
 
 ## 实施入口
 
-- `crates/domain/src/measurement_weekly.rs`：独立自然周及排期时钟计算。
-- `crates/persistence/src/measurement_weekly.rs`、迁移 `0063`：持久发现、到期扫描及完成关联。
+- `crates/domain/src/measurement/measurement_weekly.rs`：独立自然周及排期时钟计算。
+- `crates/persistence/src/measurement/weekly.rs`、迁移 `0063`：持久发现、到期扫描及完成关联。
 - `crates/app/src/measurement_weekly.rs`：后台调度，复用现有报告保存服务。
-- `crates/api/src/measurement_reports.rs`：按冻结截止收集 AI／搜索证据，保持实际生成时间。
+- `crates/api/src/measurement/measurement_reports.rs`：按冻结截止收集 AI／搜索证据，保持实际生成时间。
 - 原报告 API 和页面保持不变，不新增强制设置或用户确认。
 
 ## 验证与剩余范围

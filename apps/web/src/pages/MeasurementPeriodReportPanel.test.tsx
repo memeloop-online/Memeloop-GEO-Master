@@ -46,6 +46,18 @@ const preview: api.MeasurementPeriodPreview = {
       attempt_id: "attempt",
       comparison_key:
         "provider-a|model-a|consumer_web|web_search|v1|ad_hoc.v1|US|en",
+      conditions: {
+        question: "Which lamp suits camping?",
+        provider: "provider-a",
+        model: "model-a",
+        surface: "consumer_web",
+        search_mode: "web_search",
+        protocol_version: "v1",
+        question_set_version: "ad_hoc.v1",
+        market: "US",
+        language: "en",
+        sample_ordinal: 1,
+      },
       scheduled_at: "2026-10-02T00:00:00Z",
       original_status: "unknown",
       observed_live: false,
@@ -173,7 +185,12 @@ describe("cycle-free measurement report", () => {
         name: language === "en" ? "View measurement record" : "查看测量记录",
       });
       expect(
-        links.map((link) => link.getAttribute("href")?.split("record=")[1]),
+        links.map((link) =>
+          new URL(
+            link.getAttribute("href")!,
+            "http://localhost",
+          ).searchParams.get("record"),
+        ),
       ).toEqual([
         "first-plan",
         "second-plan",
