@@ -1,0 +1,70 @@
+import i18n from "./index";
+
+const translations = {
+  "zh-CN": {
+    title: "推荐排名变化",
+    empty: "还没有可比较的推荐测量记录。",
+    description: "按相同问题与测量条件逐次对比。出现顺序不代表推荐排名。",
+    samples: "推荐结果可用 {{available}} / {{total}} 次",
+    singleSample: "当前只有一次测量，后续同条件测量可用于对比变化。",
+    entity: "推荐对象",
+    kind_product: "产品",
+    kind_restaurant: "餐馆",
+    kind_brand: "品牌",
+    kind_service: "服务",
+    kind_other: "其他对象",
+    rank: "第 {{value}} 位",
+    order: "出现顺序：{{value}}",
+    unranked: "未明确排名",
+    absent: "未出现在推荐结果中",
+    notAnalyzed: "尚未提取推荐结果",
+    unverified: "推荐结果暂不可用",
+    noEntities: "可用结果中未发现具体推荐对象。",
+    viewRecord: "查看测量记录",
+    timeUnknown: "时间未记录",
+    providerModel: "平台：{{provider}} · 模型：{{model}}",
+    conditions: "{{surface}} · {{market}} · {{language}} · {{searchMode}}",
+    evidence: "查看原文依据",
+    exactNames: "对象按提取出的名称与类型对应，别名尚未合并。",
+  },
+  en: {
+    title: "Recommendation rank history",
+    empty: "No recommendation measurements to compare yet.",
+    description:
+      "Compare each measurement of the same question and conditions. Mention order does not indicate recommendation rank.",
+    samples:
+      "Recommendation results available for {{available}} / {{total}} samples",
+    singleSample:
+      "Only one measurement is available. Further measurements with the same conditions can show changes.",
+    entity: "Recommended item",
+    kind_product: "Product",
+    kind_restaurant: "Restaurant",
+    kind_brand: "Brand",
+    kind_service: "Service",
+    kind_other: "Other item",
+    rank: "Rank {{value}}",
+    order: "Mention order: {{value}}",
+    unranked: "No explicit rank",
+    absent: "Absent from the recommendation results",
+    notAnalyzed: "Recommendations not extracted yet",
+    unverified: "Recommendation results unavailable",
+    noEntities: "No specific recommendations found in available results.",
+    viewRecord: "View measurement record",
+    timeUnknown: "Time not recorded",
+    providerModel: "Platform: {{provider}} · Model: {{model}}",
+    conditions: "{{surface}} · {{market}} · {{language}} · {{searchMode}}",
+    evidence: "View supporting excerpt",
+    exactNames:
+      "Items are matched by their extracted name and type. Aliases have not been combined.",
+  },
+};
+
+for (const [language, translation] of Object.entries(translations)) {
+  i18n.addResourceBundle(
+    language,
+    "recommendationTrend",
+    translation,
+    true,
+    true,
+  );
+}

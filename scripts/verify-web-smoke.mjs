@@ -1816,6 +1816,7 @@ async function main() {
     .waitFor();
   await page.reload();
   await page
+    .getByRole("region", { name: "已有问题集" })
     .getByLabel("选择问题集", { exact: true })
     .selectOption(questionVersion.question_set_id);
   await page
@@ -1828,6 +1829,7 @@ async function main() {
     .getByRole("heading", { name: "Synthetic questions · v1" })
     .waitFor();
   await page
+    .getByRole("region", { name: "问题集版本详情" })
     .getByText("Synthetic product question 1?", { exact: true })
     .waitFor();
   console.log(
