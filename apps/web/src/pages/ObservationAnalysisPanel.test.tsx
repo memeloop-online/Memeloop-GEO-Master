@@ -59,6 +59,7 @@ function setup(
   canWrite = true,
   extraction: ObservationExtractionStatus | null = null,
   nextAfter: string | null = null,
+  initialEntry = "/",
 ) {
   const page: ObservationAnalysisPage = {
     items,
@@ -84,7 +85,7 @@ function setup(
   render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider client={client}>
-        <MemoryRouter>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <CurrentRoute />
           <ObservationAnalysisPanel
             tenantId="tenant"
@@ -108,6 +109,140 @@ afterEach(async () => {
 });
 
 describe("saved response analysis", () => {
+  it("opens the exact linked revision from an older page instead of the current result", async () => {
+    const current: ObservationAnalysisRevision = {
+      ...revision,
+      state: "completed",
+      request: { ...revision.request, revision_id: "current" },
+      result: {
+        actual_model: "model",
+        candidate_json: null,
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        outcome: {
+          status: "grounded",
+          raw_answer: "Current answer",
+          citations: [],
+          audit: {},
+        },
+      },
+    };
+    const linked: ObservationAnalysisRevision = {
+      ...current,
+      request: { ...current.request, revision_id: "linked" },
+      result: {
+        ...current.result!,
+        outcome: {
+          status: "grounded",
+          raw_answer: "Linked historical answer",
+          citations: [],
+          audit: {},
+        },
+      },
+    };
+    const { list, page } = setup(
+      [current],
+      true,
+      false,
+      null,
+      "older",
+      "/?target=target&attempt=attempt&analysisRevision=linked",
+    );
+    list.mockImplementation(
+      async (_tenant, _project, _target, _attempt, after) =>
+        after ? { ...page, items: [linked], next_after: null } : page,
+    );
+    expect(await screen.findByText("Linked historical answer")).toBeVisible();
+    expect(screen.getByText("Current answer")).not.toBeVisible();
+    expect(list).toHaveBeenCalledWith(
+      "tenant",
+      "project",
+      "target",
+      "attempt",
+      "older",
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("reports a missing linked revision without substituting another saved answer", async () => {
+    setup(
+      [
+        {
+          ...revision,
+          state: "completed",
+          result: {
+            actual_model: "model",
+            candidate_json: null,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            outcome: {
+              status: "grounded",
+              raw_answer: "Different saved answer",
+              citations: [],
+              audit: {},
+            },
+          },
+        },
+      ],
+      true,
+      false,
+      null,
+      null,
+      "/?target=target&attempt=attempt&analysisRevision=missing",
+    );
+    expect(
+      await screen.findByText("找不到链接指定的解析版本，请返回测量记录查看。"),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("Different saved answer"),
+    ).not.toBeInTheDocument();
+  });
+  it("shows saved recommendations ahead of the full answer without another analysis request", async () => {
+    const { create } = setup([
+      {
+        ...revision,
+        state: "completed",
+        result: {
+          actual_model: "analysis-model",
+          candidate_json: null,
+          prompt_tokens: 1,
+          completion_tokens: 1,
+          outcome: {
+            status: "grounded",
+            raw_answer: "Try Sample restaurant for lunch.",
+            citations: [],
+            audit: {
+              recommendations: {
+                version: "geo.recommendations.v1",
+                status: "verified",
+                items: [
+                  {
+                    name: "Sample restaurant",
+                    kind: "restaurant",
+                    mention_order: 1,
+                    rank: null,
+                    reason: null,
+                    evidence_quote: "Try Sample restaurant for lunch.",
+                    citation_urls: [],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    ]);
+    const table = await screen.findByRole("table", { name: "推荐结果" });
+    expect(table).toBeVisible();
+    expect(screen.getByText("未明确排名")).toBeVisible();
+    const answerHeading = screen.getByRole("heading", { name: "解析出的答案" });
+    expect(
+      table.compareDocumentPosition(answerHeading) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it.each(["failed", "running"] as const)(
     "keeps an available answer ahead of a newer %s analysis",
     async (state) => {

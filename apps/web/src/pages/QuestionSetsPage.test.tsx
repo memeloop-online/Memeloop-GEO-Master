@@ -294,6 +294,80 @@ afterEach(async () => {
 });
 
 describe("P13 versioned question sets", () => {
+  it.each(["set", "version"])(
+    "clears a selected measurement when changing its %s through the question-set tab",
+    async (selection) => {
+      mockApi({ existing: true });
+      const baseFetch = globalThis.fetch;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(request), "http://localhost").pathname;
+          if (path.endsWith("/measurement-plans/measurement-1"))
+            return Promise.resolve(
+              reply({
+                plan_id: "measurement-1",
+                project_id: "project-1",
+                title: "原问题集的测量",
+                created_at: version.created_at,
+                targets: [],
+              }),
+            );
+          if (path.endsWith("/measurement-plans"))
+            return Promise.resolve(reply({ items: [], next_after: null }));
+          if (path.endsWith("/question-sets"))
+            return Promise.resolve(
+              reply({
+                items: [
+                  setSummary,
+                  { ...setSummary, id: "set-2", name: "另一组问题" },
+                ],
+                next_cursor: null,
+              }),
+            );
+          if (path.endsWith("/versions"))
+            return Promise.resolve(
+              reply({
+                items: [version, { ...version, id: "version-2", revision: 2 }],
+                next_cursor: null,
+              }),
+            );
+          return baseFetch(request, init);
+        }),
+      );
+      const user = userEvent.setup();
+      renderPage(
+        "/app/tenant-1/project-1/measurement?tab=records&record=measurement-1&planId=measurement-1&set=set-1&version=version-1&target=target-1&attempt=attempt-1&analysisRevision=analysis-1",
+      );
+      expect(await screen.findByText("原问题集的测量")).toBeVisible();
+      await user.click(screen.getByRole("tab", { name: "问题集" }));
+      await user.selectOptions(
+        await within(
+          screen.getByRole("tabpanel", { name: "问题集" }),
+        ).findByLabelText(
+          selection === "set" ? "选择问题集" : "选择不可变版本",
+        ),
+        selection === "set" ? "set-2" : "version-2",
+      );
+      expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
+        "record=",
+      );
+      expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
+        "planId=",
+      );
+      for (const parameter of ["target=", "attempt=", "analysisRevision="]) {
+        expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
+          parameter,
+        );
+      }
+      await user.click(screen.getByRole("tab", { name: "测量记录" }));
+      expect(screen.queryByText("原问题集的测量")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+    },
+  );
   it.each([
     ["zh-CN", "传统搜索"],
     ["en", "Web search"],
@@ -619,14 +693,16 @@ describe("P13 versioned question sets", () => {
     expect(screen.getByLabelText("问题集名称")).toHaveValue("未保存的问题集");
   });
 
-  it("uses keyboard-accessible tabs and keeps the starting view focused on measuring", async () => {
+  it("starts with question sets and keeps temporary measurement and records keyboard-accessible", async () => {
     mockApi();
     const user = userEvent.setup();
     renderPage();
-    expect(screen.getByRole("tab", { name: "开始测量" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "问题集" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
+    screen.getByRole("tab", { name: "开始测量" }).focus();
+    await user.keyboard("{Enter}");
     expect(
       await screen.findByRole("textbox", { name: "要测量的问题" }),
     ).toBeInTheDocument();
