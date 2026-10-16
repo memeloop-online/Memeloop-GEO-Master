@@ -686,7 +686,7 @@ impl ContentDocumentSnapshot {
             || request.revision_id.is_some_and(|id| id != self.revision_id)
             || self.document.title.trim().is_empty()
             || self.document.blocks.is_empty()
-            || !matches!(self.document.schema_version, None | Some(2))
+            || self.document.schema_version != 2
             || self
                 .document
                 .blocks

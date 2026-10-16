@@ -33,11 +33,8 @@ enum RetryDiagnostic {
     IdentityReadFailed,
     LeaseBeforeHistory,
     RecoveryReadFailed,
-    RecoveryBindingMismatch,
     LeaseBeforeSave,
     EvidenceSaveFailed,
-    EvidenceReadFailed,
-    EvidenceReadUnverified,
     CompletionUnverified,
     RunnerUnknown,
     OperationTimeout,
@@ -56,11 +53,8 @@ impl RetryDiagnostic {
             Self::IdentityReadFailed => ("identity", "read_failed"),
             Self::LeaseBeforeHistory => ("history", "insufficient_lease"),
             Self::RecoveryReadFailed => ("history", "read_failed"),
-            Self::RecoveryBindingMismatch => ("history", "binding_mismatch"),
             Self::LeaseBeforeSave => ("evidence_save", "insufficient_lease"),
             Self::EvidenceSaveFailed => ("evidence_save", "failed"),
-            Self::EvidenceReadFailed => ("evidence_readback", "failed"),
-            Self::EvidenceReadUnverified => ("evidence_readback", "unverified"),
             Self::CompletionUnverified => ("history", "completion_unverified"),
             Self::RunnerUnknown => ("runner", "unknown"),
             Self::OperationTimeout => ("operation", "deadline_exceeded"),
@@ -146,10 +140,7 @@ async fn recover_once(
         return RetryDiagnostic::LeaseBeforeReservation.retry();
     }
     let original = &claim.original;
-    let binding = match original.recovery_request_binding(scope) {
-        Ok(binding) if binding == claim.request_binding => binding,
-        _ => return Outcome::Retained,
-    };
+    let binding = &claim.request_binding;
     let account_id = original.input.account_id;
     let original_session = original.input.runner_session_id;
     match state
@@ -232,17 +223,12 @@ async fn recover_once(
         {
             CompletionRecoveryResult::Recovered {
                 execution_id,
-                external_conversation_id,
                 recovery_identity,
                 observed_at,
                 history_json,
                 history_sha256,
+                ..
             } => {
-                if execution_id != claim.lease_id
-                    || external_conversation_id != binding.external_conversation_id
-                {
-                    return Ok(RetryDiagnostic::RecoveryBindingMismatch.retry());
-                }
                 if Utc::now() + chrono::Duration::seconds(10) >= claim.lease_until {
                     return Ok(RetryDiagnostic::LeaseBeforeSave.retry());
                 }
@@ -267,23 +253,20 @@ async fn recover_once(
                     history_json,
                     history_sha256,
                 };
-                if input.validate(scope, original).is_err() {
-                    return Ok(Outcome::Retained);
-                }
-                evidence
-                    .save(scope, input)
-                    .await
-                    .inspect_err(|_| RetryDiagnostic::EvidenceSaveFailed.record())?;
-                // A durable read-back, not a transport success, settles recovery.
-                let saved = evidence
-                    .get(scope, claim.lease_id)
-                    .await
-                    .inspect_err(|_| RetryDiagnostic::EvidenceReadFailed.record())?;
-                match saved {
-                    Some(saved) if saved.validate(scope, original).is_ok() => {
-                        Ok(Outcome::Recovered)
+                // The repository validates against the scoped source, reads
+                // the saved evidence back, and commits before returning.
+                match evidence.save(scope, input).await {
+                    Ok(_) => Ok(Outcome::Recovered),
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            geo_domain::ErrorCode::InvalidRequest
+                                | geo_domain::ErrorCode::Forbidden
+                        ) =>
+                    {
+                        Ok(Outcome::Retained)
                     }
-                    _ => Ok(RetryDiagnostic::EvidenceReadUnverified.retry()),
+                    Err(_) => Ok(RetryDiagnostic::EvidenceSaveFailed.retry()),
                 }
             }
             CompletionRecoveryResult::NeedsLogin { .. } => Ok(Outcome::NeedsLogin),
@@ -348,11 +331,8 @@ mod tests {
             RetryDiagnostic::IdentityReadFailed,
             RetryDiagnostic::LeaseBeforeHistory,
             RetryDiagnostic::RecoveryReadFailed,
-            RetryDiagnostic::RecoveryBindingMismatch,
             RetryDiagnostic::LeaseBeforeSave,
             RetryDiagnostic::EvidenceSaveFailed,
-            RetryDiagnostic::EvidenceReadFailed,
-            RetryDiagnostic::EvidenceReadUnverified,
             RetryDiagnostic::CompletionUnverified,
             RetryDiagnostic::RunnerUnknown,
             RetryDiagnostic::OperationTimeout,
@@ -466,8 +446,12 @@ mod tests {
                     _ => Value::Null,
                 }})
             } else {
-                json!({"status":"recovered","execution_id":payload["execution_id"],
-                    "external_conversation_id":"synthetic-chat",
+                json!({"status":"recovered","execution_id":if stub.mode == "wrong-execution" {
+                        json!(Uuid::new_v4())
+                    } else {payload["execution_id"].clone()},
+                    "external_conversation_id":if stub.mode == "wrong-conversation" {
+                        "other-chat"
+                    } else {"synthetic-chat"},
                     "recovery_identity":{"provider":"deepseek","platform_account_id":"synthetic-account"},
                     "observed_at":"2026-01-01T00:00:00Z",
                     "history_json":stub.history,"history_sha256":sha256_hex(stub.history.as_bytes())})
@@ -514,14 +498,14 @@ mod tests {
             _: &TenantScope,
             _: Uuid,
         ) -> Result<Option<ObservationCompletionRecovery>, AppError> {
-            Ok(self.stored.lock().await.clone())
+            panic!("save already validates and commits the recovery evidence")
         }
         async fn get_by_source(
             &self,
-            scope: &TenantScope,
-            id: Uuid,
+            _: &TenantScope,
+            _: Uuid,
         ) -> Result<Option<ObservationCompletionRecovery>, AppError> {
-            self.get(scope, id).await
+            Ok(self.stored.lock().await.clone())
         }
     }
 
@@ -603,7 +587,12 @@ mod tests {
         );
         let account_id = Uuid::new_v4();
         let original_session = Uuid::new_v4();
-        let (original, history) = capture(&scope, account_id, original_session);
+        let (original, mut history) = capture(&scope, account_id, original_session);
+        if mode == "invalid-history" {
+            let mut value: Value = serde_json::from_str(&history).unwrap();
+            value["messages"][1]["status"] = json!("STREAMING");
+            history = value.to_string();
+        }
         let stub = Runner {
             events: Arc::new(Mutex::new(vec![])),
             mode,
@@ -746,6 +735,9 @@ mod tests {
         for (mode, expected, read) in [
             ("wrong-identity", Outcome::NeedsLogin, false),
             ("lost-response", Outcome::Retry, true),
+            ("wrong-execution", Outcome::Retry, true),
+            ("wrong-conversation", Outcome::Retry, true),
+            ("invalid-history", Outcome::Retained, true),
             ("retained", Outcome::Retained, true),
             ("incomplete-history", Outcome::Retry, true),
             ("unsupported", Outcome::Retained, true),
@@ -808,25 +800,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_lease_and_changed_binding_do_not_start_browser() {
-        for expired in [true, false] {
-            let (state, scope, mut claim, evidence, stub, server) = fixture("success").await;
-            if expired {
-                claim.lease_until = Utc::now();
-            } else {
-                claim.request_binding.external_conversation_id = "other-chat".into();
-            }
-            assert_eq!(
-                recover_once(&state, &evidence, &scope, &claim).await,
-                if expired {
-                    Outcome::Retry
-                } else {
-                    Outcome::Retained
-                }
-            );
-            assert!(stub.events.lock().await.is_empty());
-            server.abort();
-        }
+    async fn expired_lease_does_not_start_browser() {
+        let (state, scope, mut claim, evidence, stub, server) = fixture("success").await;
+        claim.lease_until = Utc::now();
+        assert_eq!(
+            recover_once(&state, &evidence, &scope, &claim).await,
+            Outcome::Retry
+        );
+        assert!(stub.events.lock().await.is_empty());
+        server.abort();
     }
 
     #[tokio::test]

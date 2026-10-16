@@ -1,42 +1,34 @@
 //! Axum HTTP boundary for the GEO modular monolith.
 
+mod accounts;
 mod agent;
-mod project_ai_settings;
+mod partners;
+mod projects;
+mod publishing;
+pub(crate) use accounts::{
+    account_network, browser_bridge, browser_operation_reconcile, browser_operations,
+    channel_imports, channel_tools, channels, desktop_gateway, historical_browser_operations,
+    operator_login_queue, provider_cleanup_callback, provider_conversation_cleanup, proxy_pools,
+};
+pub(crate) use agent::{agent_runtime, provider_bridge, run_executor};
+pub(crate) use content::{content_export, content_media, content_media_tools, content_tools};
+pub use content::content_runtime;
+pub(crate) use knowledge::{office_parse, pdf_parse};
+pub(crate) use partners::{partner, partner_admin};
+pub(crate) use projects::{appearance, cycles, project_ai_model, project_ai_settings, project_tools};
+pub(crate) use publishing::{
+    channel_jobs, connector_capabilities, content_distribution_requests, publication_lookup,
+    publication_send_callback,
+};
+pub use publishing::distribution;
 pub use project_ai_settings::{
     InheritedModelMetadata, ProjectAiSettingsService, ProjectAiSettingsView,
     ResolvedProjectAiConfig, UpdateProjectAiSettings,
 };
-mod project_ai_model;
 pub use project_ai_model::ProjectConfiguredModelBridge;
-mod account_network;
-mod agent_runtime;
-mod appearance;
-mod browser_bridge;
-mod browser_operation_reconcile;
-mod browser_operations;
-mod channel_imports;
-mod channel_jobs;
-mod historical_browser_operations;
 pub use browser_operation_reconcile::reconcile_browser_operations;
-mod channel_tools;
-mod channels;
-mod citation_insights;
-mod partner;
-mod partner_admin;
 pub use partner::partner_router;
-mod connector_capabilities;
 mod content;
-mod content_distribution_requests;
-mod content_export;
-mod content_media;
-mod content_media_tools;
-pub mod content_runtime;
-mod content_tools;
-mod desktop_gateway;
-pub mod distribution;
-mod operator_login_queue;
-mod proxy_pools;
-mod source_channel_recommendations;
 pub use content::ContentService;
 pub use content_distribution_requests::{
     SingleArticleDistributionRequest, SingleArticlePublication,
@@ -44,34 +36,28 @@ pub use content_distribution_requests::{
     read_content_distribution_request,
 };
 mod context;
-mod cycles;
 mod error;
 mod idempotency;
 mod knowledge;
-mod office_parse;
 pub use office_parse::{
     OFFICE_PARSER_PROFILE, OfficeParserClient, dispatch_office_parse_job,
     spawn_office_parse_scanner,
 };
-mod pdf_parse;
 pub use pdf_parse::{
     PDF_PARSER_PROFILE, PdfParserClient, dispatch_pdf_parse_job, spawn_pdf_parse_scanner,
 };
-mod project_tools;
-mod provider_bridge;
-mod publication_lookup;
 pub use publication_lookup::dispatch_publication_lookup;
 mod measurement;
 pub(crate) use measurement::{
+    citation_insights, measurement_options, measurement_reports, project_serp_settings,
     observation_ai_callback, observation_analysis, observation_capture_callback,
     observation_completion_recovery, observation_evidence, observation_extraction,
+    questions, questions_tools, reports, serp, serp_dataforseo,
+    source_channel_recommendations, standalone_measurements,
 };
-mod provider_conversation_cleanup;
 pub use observation_completion_recovery::dispatch_observation_completion_recovery;
 pub use provider_conversation_cleanup::dispatch_provider_conversation_cleanup;
-mod provider_cleanup_callback;
 pub use provider_cleanup_callback::ProviderCleanupCallbackService;
-mod publication_send_callback;
 pub use observation_ai_callback::ObservationAiCallbackService;
 pub use observation_analysis::{
     GroundingResult, HttpSavedObservationGrounder, ObservationAnalysisService,
@@ -84,14 +70,11 @@ pub use observation_extraction::{
     spawn_observation_extraction_dispatcher, spawn_observation_source_recovery,
 };
 pub use publication_send_callback::PublicationSendCallbackService;
-mod project_serp_settings;
-mod serp;
 pub use project_serp_settings::{
     ProjectSerpCredentials, ProjectSerpSettingsPage, ProjectSerpSettingsService,
     ProjectSerpSettingsView, ProjectSerpSourceFactory, ProjectSerpTestResult,
     TestProjectSerpSettings, UpdateProjectSerpSettings,
 };
-mod serp_dataforseo;
 pub use serp::{
     AcceptSerpMeasurement, ReparseSerpSource, ResolvedSerpSource, SerpCapability,
     SerpExecutionView, SerpMeasurementDetail, SerpMeasurementPage, SerpPreparedSubmission,
@@ -99,20 +82,13 @@ pub use serp::{
     spawn_serp_dispatcher,
 };
 pub use serp_dataforseo::{DataForSeoSerpConfig, DataForSeoSerpSource};
-mod measurement_reports;
-mod questions;
-mod questions_tools;
-mod reports;
 pub use measurement_reports::{
     MeasurementPeriodRequest, default_measurement_period_window, preview_project_measurements,
     save_project_measurement_report, save_project_measurement_report_at_cutoff,
 };
-mod run_executor;
 pub use run_executor::dispatch_queued;
-mod standalone_measurements;
 mod storage;
 pub use standalone_measurements::{MeasurementPlanRequest, create_measurement_plan};
-mod measurement_options;
 
 use axum::{
     Json, Router,

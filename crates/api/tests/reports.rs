@@ -958,7 +958,7 @@ async fn ready_and_reused_verified_intents_without_target_receipts_are_not_repor
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let revision = ContentRevision {
         revision_id: pending.content_revision_id.unwrap(),
@@ -1188,7 +1188,7 @@ async fn formal_reused_intent_maps_lookup_to_frozen_cell_not_original_send_id() 
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let revision = ContentRevision {
         revision_id: target.content_revision_id.unwrap(),
@@ -1343,7 +1343,7 @@ async fn formal_cell_reusing_independent_request_maps_lookup_to_real_command_id(
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let revision = ContentRevision {
         revision_id: target.content_revision_id.unwrap(),

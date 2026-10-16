@@ -6,9 +6,9 @@ use geo_domain::{
     EvidenceRef, ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility,
     KnowledgePurpose, KnowledgeRepository, LinkAttrs, MediaReference, OrderedListAttrs,
     ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand,
-    RICH_CHECK_POLICY_VERSION, RICH_REPAIR_POLICY_VERSION, RichContent, RichMark, RichNode,
-    SourceKind, StructuredDocument, TableCellAttrs, TenantScope, hash_idempotency_key,
-    settings_hash, start_request_hash,
+    RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION, RICH_REPAIR_POLICY_VERSION,
+    RichContent, RichMark, RichNode, SourceKind, StructuredDocument, TableCellAttrs, TenantScope,
+    hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgContentRepository, PgKnowledgeRepository, PgProjectRepository,
@@ -42,7 +42,7 @@ fn rich_block(node: RichNode, citation_id: Uuid) -> ContentBlock {
 fn rich_document(citation_id: Uuid) -> StructuredDocument {
     StructuredDocument {
         title: "Evidence-backed format".into(),
-        schema_version: Some(2),
+        schema_version: 2,
         blocks: vec![
             rich_block(
                 RichNode::Paragraph {
@@ -239,7 +239,12 @@ async fn rich_edit_survives_reconnect_and_versioned_repair_preserves_history() {
         .document_manifest_item_id;
     let repo = PgContentRepository::from_database(&database);
     let execution = repo
-        .start(&scope, started.cycle_id, manifest, "rich-test-policy")
+        .start(
+            &scope,
+            started.cycle_id,
+            manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let prepare = repo
@@ -290,7 +295,7 @@ async fn rich_edit_survives_reconnect_and_versioned_repair_preserves_history() {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let original = repo
         .complete_generate(&scope, &generate, old_document.clone())
@@ -298,7 +303,7 @@ async fn rich_edit_survives_reconnect_and_versioned_repair_preserves_history() {
         .unwrap();
     assert_eq!(
         original.markdown,
-        "# Original *title*\n\nOriginal literal *claim*."
+        "# Original \\*title\\*\n\nOriginal literal \\*claim\\*."
     );
     let old_check = repo
         .claim(
@@ -306,7 +311,7 @@ async fn rich_edit_survives_reconnect_and_versioned_repair_preserves_history() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "test",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             600,
         )
@@ -471,16 +476,16 @@ async fn rich_edit_survives_reconnect_and_versioned_repair_preserves_history() {
         ErrorCode::InvalidRequest,
         "repair cannot alter an unaffected table's identity"
     );
-    let mut downgrade = old_document.clone();
-    downgrade.title = document.title.clone();
+    let mut downgrade = repaired_document.clone();
+    downgrade.schema_version = 1;
     assert_eq!(
         loaded_repo
             .complete_repair(&scope, &repair, downgrade)
             .await
             .unwrap_err()
             .code,
-        ErrorCode::Conflict,
-        "automatic repair must not replace v2 with legacy content"
+        ErrorCode::InvalidRequest,
+        "automatic repair must not accept an unsupported document schema"
     );
     assert_eq!(
         loaded_repo

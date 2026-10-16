@@ -123,7 +123,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         document: StructuredDocument {
             title: "Example".into(),
             blocks: vec![],
-            schema_version: None,
+            schema_version: 2,
         },
         markdown: "# Example".into(),
         evidence: vec![],
@@ -544,7 +544,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let eligible = ContentRevision {
         revision_id: Uuid::new_v4(),
@@ -754,6 +754,9 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         .get_publication_bundle(&scope, first_intent)
         .await
         .unwrap();
+    assert_eq!(bundle.revision.document.schema_version, 2);
+    assert!(!bundle.revision.document.requires_rich_publication());
+    assert!(bundle.variant.rich_payload.is_none());
     assert_eq!(bundle.intent.channel_target_id, Uuid::nil());
     assert_eq!(bundle.command.target_id, Uuid::nil());
     assert!(
@@ -856,7 +859,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
     rich_revision.asset_id = Uuid::new_v4();
     rich_revision.document = StructuredDocument {
         title: "Structured article".into(),
-        schema_version: Some(2),
+        schema_version: 2,
         blocks: vec![ContentBlock {
             block_id: Uuid::new_v4(),
             kind: ContentBlockKind::Rich,

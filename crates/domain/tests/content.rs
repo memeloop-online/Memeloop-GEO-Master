@@ -3,8 +3,9 @@ use geo_domain::{
     ChunkLocator, ContentAttemptOutcome, ContentBlock, ContentBlockKind, ContentBrief,
     ContentEvidence, ContentFinding, ContentItemStatus, ContentRepository, ContentStep,
     DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
-    DocumentManifestState, ErrorCode, EvidenceRef, MemoryContentRepository, StructuredDocument,
-    TenantScope,
+    DocumentManifestState, ErrorCode, EvidenceRef, MemoryContentRepository,
+    RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION, RICH_REPAIR_POLICY_VERSION,
+    StructuredDocument, TenantScope,
 };
 use uuid::Uuid;
 
@@ -71,7 +72,7 @@ async fn transient_failure_releases_only_current_fence_and_preserves_completed_s
     let (scope, manifest, source, cycle) = fixture();
     let item_id = manifest.items[0].document_manifest_item_id;
     let execution = repo
-        .start(&scope, cycle, manifest, "retry-policy")
+        .start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let prepare = repo
@@ -163,7 +164,7 @@ async fn transient_failure_releases_only_current_fence_and_preserves_completed_s
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "first",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -178,7 +179,7 @@ async fn transient_failure_releases_only_current_fence_and_preserves_completed_s
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "second",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -219,7 +220,7 @@ async fn closed_content_can_be_edited_without_rewriting_earlier_handoff() {
     let (scope, manifest, source, cycle) = fixture();
     let item_id = manifest.items[0].document_manifest_item_id;
     let execution = repo
-        .start(&scope, cycle, manifest, "edit-policy")
+        .start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let reference = evidence(source);
@@ -271,7 +272,7 @@ async fn closed_content_can_be_edited_without_rewriting_earlier_handoff() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "worker",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -333,7 +334,7 @@ async fn closed_content_can_be_edited_without_rewriting_earlier_handoff() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "worker",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -383,18 +384,67 @@ fn document(citation: Uuid) -> StructuredDocument {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     }
 }
 
-#[tokio::test]
-async fn generation_policies_have_independent_asset_revision_chains() {
-    let repo = MemoryContentRepository::new();
+#[test]
+fn simple_generation_requires_the_current_policy_without_consuming_its_lease() {
     let (scope, manifest, source, cycle) = fixture();
     let item_id = manifest.items[0].document_manifest_item_id;
     let reference = evidence(source);
+    let mut state =
+        geo_domain::start_content_state(&scope, cycle, &manifest, RICH_GENERATION_POLICY_VERSION)
+            .unwrap();
+    let prepare = state
+        .claim(item_id, ContentStep::Prepare, "worker", Utc::now(), 60)
+        .unwrap();
+    state
+        .complete_prepare(
+            &prepare,
+            ContentBrief {
+                brief_id: Uuid::new_v4(),
+                title: "Brief".into(),
+                objective: "Evidence-based".into(),
+                evidence: vec![reference.clone()],
+                quotes: vec![],
+                created_at: Utc::now(),
+            },
+        )
+        .unwrap();
+    let generate = state
+        .claim(item_id, ContentStep::Generate, "worker", Utc::now(), 60)
+        .unwrap();
+    let document = document(reference.chunk_id.unwrap());
+    state.execution.policy_version = "superseded-content-policy".into();
+    assert_eq!(
+        state
+            .complete_generate(&generate, document.clone())
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    assert!(state.revisions.is_empty());
+    state.execution.policy_version = RICH_GENERATION_POLICY_VERSION.into();
+    assert_eq!(
+        state
+            .complete_generate(&generate, document.clone())
+            .unwrap()
+            .document,
+        document
+    );
+}
+
+#[tokio::test]
+async fn executions_have_independent_asset_revision_chains() {
+    let repo = MemoryContentRepository::new();
+    let (scope, manifest, source, _) = fixture();
+    let item_id = manifest.items[0].document_manifest_item_id;
+    let reference = evidence(source);
     let mut generated = Vec::new();
-    for policy in ["policy-a", "policy-b"] {
+    for _ in 0..2 {
+        let cycle = Uuid::new_v4();
+        let policy = RICH_GENERATION_POLICY_VERSION;
         let execution = repo
             .start(&scope, cycle, manifest.clone(), policy)
             .await
@@ -478,9 +528,6 @@ fn blocking_finding(block: Uuid, reference: &EvidenceRef) -> ContentFinding {
 }
 #[tokio::test]
 async fn rich_checks_and_repairs_require_versioned_owners_and_preserve_structure() {
-    use geo_domain::{
-        RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION, RICH_REPAIR_POLICY_VERSION,
-    };
     let repo = MemoryContentRepository::new();
     let (scope, manifest, source, cycle) = fixture();
     let item_id = manifest.items[0].document_manifest_item_id;
@@ -528,7 +575,7 @@ async fn rich_checks_and_repairs_require_versioned_owners_and_preserve_structure
         .await
         .unwrap();
     let mut original = document(reference.chunk_id.unwrap());
-    original.schema_version = Some(2);
+    original.schema_version = 2;
     original.blocks[0].kind = ContentBlockKind::Rich;
     original.blocks[0].text.clear();
     original.blocks[0].rich = Some(geo_domain::RichContent {
@@ -559,7 +606,7 @@ async fn rich_checks_and_repairs_require_versioned_owners_and_preserve_structure
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "worker",
+            "unversioned-check",
             Utc::now(),
             60
         )
@@ -590,7 +637,7 @@ async fn rich_checks_and_repairs_require_versioned_owners_and_preserve_structure
             execution.execution_id,
             item_id,
             ContentStep::Repair,
-            "worker",
+            "unversioned-repair",
             Utc::now(),
             60
         )
@@ -611,14 +658,14 @@ async fn rich_checks_and_repairs_require_versioned_owners_and_preserve_structure
         )
         .await
         .unwrap();
-    let mut downgraded = document(reference.chunk_id.unwrap());
-    downgraded.blocks[0].block_id = first.document.blocks[0].block_id;
+    let mut changed_kind = document(reference.chunk_id.unwrap());
+    changed_kind.blocks[0].block_id = first.document.blocks[0].block_id;
     assert_eq!(
-        repo.complete_repair(&scope, &repair, downgraded)
+        repo.complete_repair(&scope, &repair, changed_kind)
             .await
             .unwrap_err()
             .code,
-        ErrorCode::Conflict
+        ErrorCode::InvalidRequest
     );
     let mut stripped = original.clone();
     if let Some(geo_domain::RichContent {
@@ -654,7 +701,7 @@ async fn rich_checks_and_repairs_require_versioned_owners_and_preserve_structure
         .await
         .unwrap();
     assert_eq!(next.base_revision_id, Some(first.revision_id));
-    assert_eq!(next.document.schema_version, Some(2));
+    assert_eq!(next.document.schema_version, 2);
     assert_eq!(
         next.document.blocks[0].citation_ids,
         first.document.blocks[0].citation_ids
@@ -707,7 +754,7 @@ async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
     let (scope, manifest, source, cycle) = fixture();
     let item_id = manifest.items[0].document_manifest_item_id;
     let execution = repo
-        .start(&scope, cycle, manifest, "repair-policy")
+        .start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let reference = evidence(source);
@@ -758,6 +805,22 @@ async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
         .await
         .unwrap();
     assert_eq!(first.quotes, vec![quote.clone()]);
+    assert!(!first.document.requires_rich_publication());
+    assert_eq!(
+        repo.claim(
+            &scope,
+            execution.execution_id,
+            item_id,
+            ContentStep::Check,
+            "unversioned-check",
+            Utc::now(),
+            60
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
     let mut current = first.clone();
     for count in 0..=2 {
         let check = repo
@@ -766,7 +829,7 @@ async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
                 execution.execution_id,
                 item_id,
                 ContentStep::Check,
-                "worker",
+                RICH_CHECK_POLICY_VERSION,
                 Utc::now(),
                 60,
             )
@@ -791,7 +854,7 @@ async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
                     execution.execution_id,
                     item_id,
                     ContentStep::Repair,
-                    "worker",
+                    RICH_REPAIR_POLICY_VERSION,
                     Utc::now(),
                     60
                 )
@@ -816,7 +879,7 @@ async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
                 execution.execution_id,
                 item_id,
                 ContentStep::Check,
-                "worker",
+                RICH_CHECK_POLICY_VERSION,
                 Utc::now(),
                 60
             )
@@ -831,7 +894,7 @@ async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
                 execution.execution_id,
                 item_id,
                 ContentStep::Repair,
-                "worker",
+                RICH_REPAIR_POLICY_VERSION,
                 Utc::now(),
                 60,
             )
@@ -854,8 +917,10 @@ async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
                 .code,
             ErrorCode::InvalidRequest
         );
+        let mut corrected = current.document.clone();
+        corrected.blocks[0].text = format!("Evidence-based correction {count}");
         let next = repo
-            .complete_repair(&scope, &repair, document(reference.chunk_id.unwrap()))
+            .complete_repair(&scope, &repair, corrected)
             .await
             .unwrap();
         assert_eq!(next.asset_id, first.asset_id);
@@ -863,6 +928,14 @@ async fn factual_repair_is_fenced_bounded_and_preserves_immutable_evidence() {
         assert_eq!(next.base_revision_id, Some(current.revision_id));
         assert_eq!(next.evidence, first.evidence);
         assert_eq!(next.quotes, first.quotes);
+        assert_eq!(
+            next.document.blocks[0].block_id,
+            first.document.blocks[0].block_id
+        );
+        assert_eq!(
+            next.document.blocks[0].citation_ids,
+            first.document.blocks[0].citation_ids
+        );
         assert!(next.findings.is_empty());
         assert_eq!(
             repo.complete_repair(&scope, &repair, document(reference.chunk_id.unwrap()))
@@ -904,7 +977,7 @@ async fn manual_edits_do_not_consume_repair_budget_and_fence_pending_checks() {
     let (scope, manifest, source, cycle) = fixture();
     let item_id = manifest.items[0].document_manifest_item_id;
     let execution = repo
-        .start(&scope, cycle, manifest, "manual-policy")
+        .start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let reference = evidence(source);
@@ -956,7 +1029,7 @@ async fn manual_edits_do_not_consume_repair_budget_and_fence_pending_checks() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "worker",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -992,7 +1065,7 @@ async fn manual_edits_do_not_consume_repair_budget_and_fence_pending_checks() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "worker",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -1017,7 +1090,7 @@ async fn manual_edits_do_not_consume_repair_budget_and_fence_pending_checks() {
             execution.execution_id,
             item_id,
             ContentStep::Repair,
-            "worker",
+            RICH_REPAIR_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -1053,7 +1126,7 @@ async fn manual_edits_do_not_consume_repair_budget_and_fence_pending_checks() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "worker",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -1077,14 +1150,14 @@ async fn manual_edits_do_not_consume_repair_budget_and_fence_pending_checks() {
             execution.execution_id,
             item_id,
             ContentStep::Repair,
-            "worker",
+            RICH_REPAIR_POLICY_VERSION,
             Utc::now(),
             60,
         )
         .await
         .unwrap();
     let repaired = repo
-        .complete_repair(&scope, &repair, document(reference.chunk_id.unwrap()))
+        .complete_repair(&scope, &repair, manual.document.clone())
         .await
         .unwrap();
     assert_eq!(repaired.base_revision_id, Some(manual.revision_id));
@@ -1094,7 +1167,7 @@ async fn manual_edits_do_not_consume_repair_budget_and_fence_pending_checks() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "worker",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -1114,7 +1187,7 @@ async fn generic_blocked_results_never_enter_repair_and_old_records_default_to_z
     let (scope, manifest, _, cycle) = fixture();
     let first = manifest.items[0].document_manifest_item_id;
     let execution = repo
-        .start(&scope, cycle, manifest, "generic-failure")
+        .start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let lease = repo
@@ -1141,7 +1214,7 @@ async fn generic_blocked_results_never_enter_repair_and_old_records_default_to_z
             execution.execution_id,
             first,
             ContentStep::Repair,
-            "worker",
+            RICH_REPAIR_POLICY_VERSION,
             Utc::now(),
             60
         )
@@ -1161,7 +1234,7 @@ async fn generic_blocked_results_never_enter_repair_and_old_records_default_to_z
     let (scope, manifest, _, cycle) = fixture();
     let classified_item = manifest.items[0].document_manifest_item_id;
     let classified_execution = repo
-        .start(&scope, cycle, manifest, "generic-classification")
+        .start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let classified = repo
@@ -1182,7 +1255,7 @@ async fn generic_blocked_results_never_enter_repair_and_old_records_default_to_z
             classified_execution.execution_id,
             classified_item,
             ContentStep::Repair,
-            "worker",
+            RICH_REPAIR_POLICY_VERSION,
             Utc::now(),
             60
         )
@@ -1198,11 +1271,16 @@ async fn replay_scope_fencing_cancel_and_denominator() {
     let (scope, manifest, source, cycle) = fixture();
     let planning = manifest.clone();
     let execution = repo
-        .start(&scope, cycle, manifest.clone(), "policy-v1")
+        .start(
+            &scope,
+            cycle,
+            manifest.clone(),
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     assert_eq!(
-        repo.start(&scope, cycle, manifest, "policy-v1")
+        repo.start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
             .await
             .unwrap(),
         execution
@@ -1325,7 +1403,7 @@ async fn replay_scope_fencing_cancel_and_denominator() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "worker-a",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -1370,7 +1448,7 @@ async fn expired_owner_edit_invalidation_and_cancel_prevent_late_commit() {
     let (scope, manifest, source, cycle) = fixture();
     let item_id = manifest.items[0].document_manifest_item_id;
     let execution = repo
-        .start(&scope, cycle, manifest, "policy-v1")
+        .start(&scope, cycle, manifest, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let expired = repo
@@ -1436,7 +1514,7 @@ async fn expired_owner_edit_invalidation_and_cancel_prevent_late_commit() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "new",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             30,
         )
@@ -1479,7 +1557,7 @@ async fn expired_owner_edit_invalidation_and_cancel_prevent_late_commit() {
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "new",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             30,
         )

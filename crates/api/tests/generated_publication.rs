@@ -544,7 +544,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let revision = ContentRevision {
         revision_id: Uuid::new_v4(),
@@ -818,6 +818,8 @@ async fn fixture_command_never_opens_a_runner_context_or_claims() {
 #[tokio::test]
 async fn generated_publication_uses_frozen_revision_bytes_and_claims_once() {
     let fixture = frozen_fixture(false).await;
+    assert_eq!(fixture.revision.document.schema_version, 2);
+    assert!(!fixture.revision.document.requires_rich_publication());
     let expected = fixture.revision.markdown.clone();
     let result = execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
         .await

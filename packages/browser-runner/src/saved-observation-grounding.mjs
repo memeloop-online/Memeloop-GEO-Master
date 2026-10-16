@@ -132,6 +132,24 @@ export function groundSavedObservation(input) {
         },
       },
     };
+    // Optional recommendations must not displace grounded answer provenance.
+    // Retain the original proposal above; only the projected analysis is omitted.
+    if (
+      recommendations &&
+      Buffer.byteLength(JSON.stringify(result.outcome.audit), "utf8") >
+        MAX_AUDIT_BYTES
+    ) {
+      result.outcome.audit.recommendations = {
+        version: "geo.recommendations.v1",
+        status: "unverified",
+        items: [],
+      };
+      if (
+        Buffer.byteLength(JSON.stringify(result.outcome.audit), "utf8") >
+        MAX_AUDIT_BYTES
+      )
+        delete result.outcome.audit.recommendations;
+    }
     // Repeated references may amplify a small candidate into a large audit.
     if (
       Buffer.byteLength(JSON.stringify(result.outcome.audit), "utf8") >

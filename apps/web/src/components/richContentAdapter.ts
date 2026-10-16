@@ -312,7 +312,7 @@ export function fromRichNode(node: RichNode): JSONContent {
   return forEditor(verified);
 }
 
-export function isSimpleLegacy(node: JSONContent): boolean {
+export function isSimpleText(node: JSONContent): boolean {
   if (node.type === "paragraph" || node.type === "heading")
     return (node.content ?? []).every(
       (child) => child.type === "text" && !child.marks?.length,

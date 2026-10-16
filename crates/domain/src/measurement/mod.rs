@@ -12,6 +12,7 @@ mod observation_extraction;
 mod project_serp_settings;
 mod provider_conversation_cleanup;
 mod provider_conversation_lifecycle;
+pub(crate) mod questions;
 mod report;
 mod serp;
 mod source_channel_recommendations;

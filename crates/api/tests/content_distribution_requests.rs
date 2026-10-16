@@ -44,7 +44,7 @@ impl ModelProviderBridge for FixtureModel {
         let input: Value = serde_json::from_str(&request.prompt).unwrap();
         let citation = input["evidence"][0]["chunk_id"].as_str().unwrap();
         Ok(ModelCompletion {
-            text: json!({"title":"Generic article","blocks":[{
+            text: json!({"schema_version":2,"title":"Generic article","blocks":[{
                 "kind":"paragraph", "text":"Public example", "citation_ids":[citation], "items":[]
             }]})
             .to_string(),
@@ -270,7 +270,7 @@ async fn fixture() -> Fixture {
             execution.execution_id,
             item.item_id,
             ContentStep::Check,
-            "request-fixture",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -550,7 +550,7 @@ async fn image_backed_checked_revision(f: &Fixture) -> (Uuid, Uuid) {
             StructuredDocument {
                 title: prior.document.title,
                 blocks,
-                schema_version: Some(2),
+                schema_version: 2,
             },
         )
         .await
@@ -646,6 +646,53 @@ impl ConnectorCapabilityRepository for RichCapabilityTestDouble {
             "test double cannot save a publication proof",
         ))
     }
+}
+
+#[tokio::test]
+async fn formatted_text_requires_rich_transport_without_any_media() {
+    let f = fixture().await;
+    f.prove_text_connector().await;
+    let prior = f
+        .content
+        .get_revision(&f.scope, f.content_asset_id, f.content_revision_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut document = prior.document.clone();
+    let first = &mut document.blocks[0];
+    first.kind = ContentBlockKind::Rich;
+    first.rich = Some(RichContent {
+        version: 1,
+        node: serde_json::from_value(json!({"type":"paragraph","content":[
+            {"type":"text","text":first.text,"marks":[{"type":"bold"}]}
+        ]}))
+        .unwrap(),
+    });
+    first.text.clear();
+    let edited = f
+        .content
+        .edit(&f.scope, prior.asset_id, prior.revision_id, document)
+        .await
+        .unwrap();
+    assert!(edited.document.media_references().is_empty());
+    let mut body = f.body();
+    body["content_revision_id"] = json!(edited.revision_id);
+    let (status, rejected) = f.post(Some("formatted-plain"), body.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+    body["format"] = json!(RICH_MARKDOWN_FORMAT);
+    let (status, accepted) = f.post(Some("formatted-rich"), body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert!(accepted["publication_intent_id"].is_null());
+    assert_eq!(
+        accepted["materialization_deferral"]["reason"],
+        "connector_unavailable"
+    );
+    assert!(
+        f.distribution
+            .publication_commands(&f.scope)
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -846,6 +893,9 @@ async fn checked_single_article_materializes_one_origin_outbox_without_a_cycle()
         .get_publication_bundle(&f.scope, intent_id)
         .await
         .unwrap();
+    assert_eq!(bundle.revision.document.schema_version, 2);
+    assert!(!bundle.revision.document.requires_rich_publication());
+    assert!(bundle.variant.rich_payload.is_none());
     assert!(
         matches!(bundle.origin, geo_domain::PublicationOrigin::ContentRequest { request }
         if request.request_id == request_id)

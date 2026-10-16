@@ -146,6 +146,7 @@ const revision: ContentRevision = {
   base_revision_id: null,
   document: {
     title: "有来源的指南",
+    schema_version: 2,
     blocks: [
       {
         block_id: "block-1",
@@ -870,6 +871,7 @@ describe("P09 content revision", () => {
   it("round-trips list captions and citations without touching the source version", () => {
     const original: StructuredDocument = {
       title: "有来源的指南",
+      schema_version: 2,
       blocks: [
         revision.document.blocks[0],
         {
@@ -895,6 +897,7 @@ describe("P09 content revision", () => {
   it("merges separately cited paragraphs into one list with both source refs", () => {
     const original: StructuredDocument = {
       title: "有来源的指南",
+      schema_version: 2,
       blocks: [
         revision.document.blocks[0],
         {
@@ -1257,6 +1260,7 @@ describe("P09 content revision", () => {
     const requests = mockApi({
       documentOverride: {
         title: revision.document.title,
+        schema_version: 2,
         blocks: [
           ...revision.document.blocks,
           {
@@ -1330,6 +1334,7 @@ describe("P09 content revision", () => {
     const requests = mockApi({
       documentOverride: {
         title: revision.document.title,
+        schema_version: 2,
         blocks: [
           revision.document.blocks[0],
           {
@@ -1395,6 +1400,7 @@ describe("P09 content revision", () => {
     const requests = mockApi({
       documentOverride: {
         title: revision.document.title,
+        schema_version: 2,
         blocks: [
           revision.document.blocks[0],
           {

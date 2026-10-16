@@ -94,7 +94,7 @@ fn document(image: Option<&VerifiedImage>) -> StructuredDocument {
     };
     StructuredDocument {
         title: "Media authority".into(),
-        schema_version: Some(2),
+        schema_version: 2,
         blocks: vec![ContentBlock {
             block_id: Uuid::new_v4(),
             kind: ContentBlockKind::Rich,

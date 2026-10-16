@@ -1,5 +1,5 @@
 import { apiFetch } from "./client";
-import type { ContentRevision, RichNode } from "./content";
+import type { ContentRevision } from "./content";
 
 export type DistributionFormat = "markdown.v1" | "rich_markdown.v2";
 export type MaterializationDeferralReason =
@@ -62,26 +62,11 @@ export interface ContentDistributionPublication {
   fixture: boolean | null;
 }
 
-function hasRichNode(node: RichNode): boolean {
-  return (
-    node.type === "media" ||
-    node.type === "image" ||
-    node.type === "table" ||
-    node.type === "tableRow" ||
-    node.type === "tableCell" ||
-    node.type === "tableHeader" ||
-    (node.content?.some(hasRichNode) ?? false)
-  );
-}
-
 /** A rich or media revision must never be submitted under a plain-text proof. */
 export function distributionFormat(
   revision: ContentRevision,
 ): DistributionFormat {
-  return revision.document.schema_version === 2 ||
-    revision.document.blocks.some(
-      (block) => block.rich && hasRichNode(block.rich.node),
-    )
+  return revision.document.blocks.some((block) => block.kind === "rich")
     ? "rich_markdown.v2"
     : "markdown.v1";
 }

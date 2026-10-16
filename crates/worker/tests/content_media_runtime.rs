@@ -192,7 +192,7 @@ impl HostOps for MediaProvider {
                     items: vec![],
                     rich: None,
                 }],
-                schema_version: None,
+                schema_version: 2,
             },
         })
     }

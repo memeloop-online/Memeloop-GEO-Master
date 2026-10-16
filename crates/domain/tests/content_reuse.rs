@@ -4,8 +4,9 @@ use geo_domain::{
     ContentBrief, ContentEvidence, ContentItemStatus, ContentRepository, ContentReuseDecision,
     ContentReuseRequest, ContentSemanticDescriptor, ContentStep, DocumentManifest,
     DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
-    DocumentManifestState, ErrorCode, EvidenceRef, MemoryContentRepository, StructuredDocument,
-    TenantScope,
+    DocumentManifestState, ErrorCode, EvidenceRef, MemoryContentRepository,
+    RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION, RICH_REPAIR_POLICY_VERSION,
+    StructuredDocument, TenantScope,
 };
 use uuid::Uuid;
 
@@ -83,11 +84,11 @@ fn inputs() -> (TenantScope, DocumentManifest, ContentSemanticDescriptor) {
         question_clusters: vec!["general".into()],
         brief_title: "FAQ".into(),
         brief_objective: "Answer".into(),
-        generation_policy_version: "generate-1".into(),
+        generation_policy_version: RICH_GENERATION_POLICY_VERSION.into(),
         evidence_policy_version: "evidence-1".into(),
-        check_policy_version: "check-1".into(),
-        repair_policy_version: "repair-1".into(),
-        output_schema_version: "schema-1".into(),
+        check_policy_version: RICH_CHECK_POLICY_VERSION.into(),
+        repair_policy_version: RICH_REPAIR_POLICY_VERSION.into(),
+        output_schema_version: "structured-document-v2".into(),
         generation_policy_revision: "deliberate-1".into(),
     };
     (scope, manifest, descriptor)
@@ -114,7 +115,7 @@ fn document(citation: Uuid, text: &str) -> StructuredDocument {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     }
 }
 
@@ -139,7 +140,12 @@ async fn two_cycles_bind_the_same_checked_revision_and_edit_forks_without_changi
     let (scope, manifest, descriptor) = inputs();
     let origin_item_id = manifest.items[0].document_manifest_item_id;
     let origin = repo
-        .start(&scope, Uuid::new_v4(), manifest.clone(), "generate-1")
+        .start(
+            &scope,
+            Uuid::new_v4(),
+            manifest.clone(),
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let reserved = repo
@@ -193,7 +199,7 @@ async fn two_cycles_bind_the_same_checked_revision_and_edit_forks_without_changi
             origin.execution_id,
             origin_item_id,
             ContentStep::Check,
-            "test-worker",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -204,7 +210,7 @@ async fn two_cycles_bind_the_same_checked_revision_and_edit_forks_without_changi
     let next = next_manifest(&manifest);
     let next_item_id = next.items[0].document_manifest_item_id;
     let successor = repo
-        .start(&scope, Uuid::new_v4(), next, "generate-1")
+        .start(&scope, Uuid::new_v4(), next, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let reused = repo
@@ -268,7 +274,7 @@ async fn two_cycles_bind_the_same_checked_revision_and_edit_forks_without_changi
             origin.execution_id,
             origin_item_id,
             ContentStep::Check,
-            "edited-origin",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -280,7 +286,12 @@ async fn two_cycles_bind_the_same_checked_revision_and_edit_forks_without_changi
     let third = next_manifest(&manifest);
     let third_id = third.items[0].document_manifest_item_id;
     let third_execution = repo
-        .start(&scope, Uuid::new_v4(), third, "generate-1")
+        .start(
+            &scope,
+            Uuid::new_v4(),
+            third,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let ContentReuseDecision::Ready(third_item) = repo
@@ -344,7 +355,12 @@ async fn reservation_busy_and_stale_input_are_fenced() {
     let (scope, manifest, descriptor) = inputs();
     let item_id = manifest.items[0].document_manifest_item_id;
     let execution = repo
-        .start(&scope, Uuid::new_v4(), manifest, "generate-1")
+        .start(
+            &scope,
+            Uuid::new_v4(),
+            manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let first = repo
@@ -396,13 +412,18 @@ async fn two_executions_have_one_fenced_producer_and_expired_claim_is_taken_over
     let (scope, manifest, descriptor) = inputs();
     let first_id = manifest.items[0].document_manifest_item_id;
     let first = repo
-        .start(&scope, Uuid::new_v4(), manifest.clone(), "generate-1")
+        .start(
+            &scope,
+            Uuid::new_v4(),
+            manifest.clone(),
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let next = next_manifest(&manifest);
     let second_id = next.items[0].document_manifest_item_id;
     let second = repo
-        .start(&scope, Uuid::new_v4(), next, "generate-1")
+        .start(&scope, Uuid::new_v4(), next, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     let mut initial_request = request(first.execution_id, first_id, &descriptor);
@@ -461,7 +482,12 @@ async fn expired_prepare_retries_same_execution_without_blocking_its_own_item() 
     let (scope, manifest, descriptor) = inputs();
     let item_id = manifest.items[0].document_manifest_item_id;
     let execution = repo
-        .start(&scope, Uuid::new_v4(), manifest, "generate-1")
+        .start(
+            &scope,
+            Uuid::new_v4(),
+            manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let mut first = request(execution.execution_id, item_id, &descriptor);
@@ -495,7 +521,12 @@ async fn cancelled_producer_does_not_hold_a_successor_reservation() {
     let (scope, manifest, descriptor) = inputs();
     let item_id = manifest.items[0].document_manifest_item_id;
     let first = repo
-        .start(&scope, Uuid::new_v4(), manifest.clone(), "generate-1")
+        .start(
+            &scope,
+            Uuid::new_v4(),
+            manifest.clone(),
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -508,7 +539,7 @@ async fn cancelled_producer_does_not_hold_a_successor_reservation() {
     let next = next_manifest(&manifest);
     let next_id = next.items[0].document_manifest_item_id;
     let second = repo
-        .start(&scope, Uuid::new_v4(), next, "generate-1")
+        .start(&scope, Uuid::new_v4(), next, RICH_GENERATION_POLICY_VERSION)
         .await
         .unwrap();
     assert!(matches!(

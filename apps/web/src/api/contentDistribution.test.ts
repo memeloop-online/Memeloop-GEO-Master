@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ContentRevision } from "./content";
+import type { ContentRevision, RichNode } from "./content";
 import {
   distributionFormat,
   getContentDistributionPublication,
@@ -15,51 +15,63 @@ vi.mock("./client", () => ({
 
 import { apiFetch } from "./client";
 
-const revision = (rich: boolean): ContentRevision =>
+const revision = (node?: RichNode): ContentRevision =>
   ({
     revision_id: "rev-1",
     asset_id: "asset-1",
     document: {
       title: "Article",
-      ...(rich ? { schema_version: 2 } : {}),
+      schema_version: 2,
       blocks: [
         {
           block_id: "block-1",
-          kind: rich ? "rich" : "paragraph",
-          text: "",
+          kind: node ? "rich" : "paragraph",
+          text: node ? "" : "Plain text",
           citation_ids: [],
           items: [],
-          ...(rich ? { rich: { version: 1, node: { type: "media" } } } : {}),
+          ...(node ? { rich: { version: 1, node } } : {}),
         },
       ],
     },
   }) as unknown as ContentRevision;
 
 describe("single-article distribution API", () => {
-  it("keeps rich/media revisions rich and never turns them into text", () => {
-    expect(distributionFormat(revision(false))).toBe("markdown.v1");
-    expect(distributionFormat(revision(true))).toBe("rich_markdown.v2");
-    expect(
-      distributionFormat({
-        ...revision(false),
-        document: {
-          title: "Nested image",
-          blocks: [
-            {
-              block_id: "block-1",
-              kind: "rich",
-              text: "",
-              citation_ids: [],
-              items: [],
-              rich: {
-                version: 1,
-                node: { type: "doc", content: [{ type: "media" }] },
-              },
-            },
-          ],
+  it("keeps current plain documents on the Markdown path", () => {
+    const plain = revision();
+    plain.document.blocks.push(
+      { ...plain.document.blocks[0], block_id: "heading", kind: "heading" },
+      {
+        ...plain.document.blocks[0],
+        block_id: "list",
+        kind: "list",
+        text: "",
+        items: ["One"],
+      },
+    );
+    expect(distributionFormat(plain)).toBe("markdown.v1");
+  });
+
+  it.each<RichNode>([
+    { type: "media" },
+    { type: "table" },
+    { type: "codeBlock", content: [{ type: "text", text: "code" }] },
+    {
+      type: "paragraph",
+      content: [{ type: "text", text: "Bold", marks: [{ type: "bold" }] }],
+    },
+    {
+      type: "paragraph",
+      content: [
+        {
+          type: "text",
+          text: "Link",
+          marks: [{ type: "link", attrs: { href: "https://example.test" } }],
         },
-      }),
-    ).toBe("rich_markdown.v2");
+      ],
+    },
+    { type: "orderedList" },
+  ])("requires rich distribution for a rich $type block", (node) => {
+    expect(distributionFormat(revision(node))).toBe("rich_markdown.v2");
   });
 
   it("posts only the strict frozen input with a caller-owned retry key", async () => {

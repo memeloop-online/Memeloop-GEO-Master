@@ -35,7 +35,7 @@ fn document(citation: Uuid, image: Option<(Uuid, String)>) -> StructuredDocument
     };
     StructuredDocument {
         title: "Verified document".into(),
-        schema_version: Some(2),
+        schema_version: 2,
         blocks: vec![ContentBlock {
             block_id: Uuid::new_v4(),
             kind: ContentBlockKind::Rich,

@@ -7,6 +7,11 @@ const bundlePath = new URL(
   import.meta.url,
 );
 
+const manualReference = {
+  source_id: "00000000-0000-4000-8000-000000000091",
+  source_version_id: "00000000-0000-4000-8000-000000000092",
+};
+
 function priorHistory(count = 2, padding = "") {
   return Array.from({ length: count }, (_, index) => [
     {
@@ -49,9 +54,6 @@ test("native history is ordered exactly once in fresh and repeated invocations",
   const requests = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async modelComplete(request) {
       requests.push(request);
       return finalModelAnswer();
@@ -106,8 +108,8 @@ test("native history survives tool iterations crossing count and byte page bound
   const history = priorHistory(20, "x".repeat(2950));
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      return { evidence: [{ quote: "e".repeat(5000) }] };
+    async knowledgeTextRead() {
+      return { content: { text_basis: "exact", text: "e".repeat(5000) } };
     },
     async modelComplete(request) {
       requests.push(request);
@@ -118,11 +120,11 @@ test("native history survives tool iterations crossing count and byte page bound
             finish_reason: "tool_calls",
             tool_calls: [
               {
-                id: `history-search-${call}`,
+                id: `history-read-${call}`,
                 type: "function",
                 function: {
-                  name: "knowledge_search",
-                  arguments: '{"query":"guide"}',
+                  name: "knowledge_text_read",
+                  arguments: JSON.stringify(manualReference),
                 },
               },
             ],
@@ -290,9 +292,6 @@ test("the generated ESM bundle runs a real MemeLoop loop through the host comple
         text: "The warranty lasts two years.",
       };
     },
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
   };
 
   try {
@@ -326,20 +325,22 @@ test("the generated ESM bundle runs a real MemeLoop loop through the host comple
   }
 });
 
-test("native model call executes knowledge.search through the MemeLoop registry and returns evidence to the model", async () => {
+test("native model call reads an explicit knowledge version through the MemeLoop registry and returns evidence to the model", async () => {
   const requests = [];
-  const searches = [];
+  const reads = [];
   const emitted = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit(topic, payload) {
       emitted.push({ topic, payload });
     },
-    async knowledgeSearch(request) {
-      searches.push(request);
+    async knowledgeTextRead(request) {
+      reads.push(request);
       return {
-        knowledge_release_id: null,
-        evidence: [{ source_name: "Manual", quote: "Two years" }],
-        capability_missing: null,
+        source: { source_id: manualReference.source_id, name: "Manual" },
+        source_version: {
+          source_version_id: manualReference.source_version_id,
+        },
+        content: { text_basis: "exact", text: "Two years" },
       };
     },
     async modelComplete(request) {
@@ -352,8 +353,8 @@ test("native model call executes knowledge.search through the MemeLoop registry 
                 id: "call-1",
                 type: "function",
                 function: {
-                  name: "knowledge_search",
-                  arguments: '{"query":"warranty","limit":2}',
+                  name: "knowledge_text_read",
+                  arguments: JSON.stringify(manualReference),
                 },
               },
             ],
@@ -382,13 +383,135 @@ test("native model call executes knowledge.search through the MemeLoop registry 
       turn_id: "turn-tool-smoke-0001",
     });
     assert.equal(requests.length, 2);
-    assert.equal(requests[0].tools[0].function.name, "knowledge_search");
-    assert.deepEqual(searches, [{ query: "warranty", limit: 2 }]);
+    assert.equal(requests[0].tools[0].function.name, "knowledge_text_read");
+    assert.deepEqual(reads, [manualReference]);
     assert.deepEqual(requests[1].messages.at(-2).tool_calls[0].id, "call-1");
     assert.equal(requests[1].messages.at(-1).tool_call_id, "call-1");
     assert.match(requests[1].messages.at(-1).content, /Two years/u);
     assert.equal(completion.answer, "The warranty lasts two years (Manual).");
     assert.equal(emitted.length, 1);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("the current Rust op registration starts the bundle and serves explicit source and content reads", async () => {
+  const rustRuntime = await readFile(
+    new URL("../../../crates/worker/src/host_runtime.rs", import.meta.url),
+    "utf8",
+  );
+  const registeredOps = rustRuntime.match(/ops = \[([\s\S]*?)\]/u)?.[1];
+  assert.ok(registeredOps, "Rust must declare its production op registration");
+  const opNames = registeredOps.match(/op_host_\w+/gu);
+  assert.ok(opNames.includes("op_host_knowledge_text_read_v1"));
+  assert.ok(!opNames.includes("op_host_knowledge_search_v1"));
+  const ops = Object.fromEntries(
+    opNames.map((name) => [
+      name,
+      async () => {
+        throw new Error(`Unexpected Rust op: ${name}`);
+      },
+    ]),
+  );
+  const contentReference = {
+    execution_id: "00000000-0000-4000-8000-000000000093",
+    item_id: "00000000-0000-4000-8000-000000000094",
+  };
+  const calls = [];
+  const requests = [];
+  const emitted = [];
+  ops.op_host_knowledge_text_read_v1 = async (payload) => {
+    calls.push(["knowledge_text_read", JSON.parse(payload)]);
+    return JSON.stringify({
+      content: { text: "Two years", text_basis: "exact" },
+    });
+  };
+  ops.op_host_content_document_read_v1 = async (payload) => {
+    calls.push(["content_document_read", JSON.parse(payload)]);
+    return JSON.stringify({ ...contentReference, document: { blocks: [] } });
+  };
+  ops.op_host_model_complete_v1 = async (payload) => {
+    const request = JSON.parse(payload);
+    requests.push(request);
+    for (const name of ["knowledge_search", "knowledge_ask"]) {
+      assert.ok(
+        !request.tools.some(({ function: tool }) => tool.name === name),
+      );
+    }
+    const step = [
+      ["knowledge_text_read", manualReference],
+      ["content_document_read", contentReference],
+    ][requests.length - 1];
+    return JSON.stringify(
+      step
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `native-read-${requests.length}`,
+                type: "function",
+                function: { name: step[0], arguments: JSON.stringify(step[1]) },
+              },
+            ],
+          }
+        : finalModelAnswer("Read the source and content document."),
+    );
+  };
+  ops.op_host_emit = async (topic, payload) => emitted.push([topic, payload]);
+  const previousDeno = globalThis.Deno;
+  globalThis.Deno = { core: { ops } };
+  try {
+    const { main } = await import(`${bundlePath.href}?rustOps=${Date.now()}`);
+    const result = await main(historyTurn);
+    assert.equal(result.answer, "Read the source and content document.");
+    assert.deepEqual(calls, [
+      ["knowledge_text_read", manualReference],
+      ["content_document_read", contentReference],
+    ]);
+    assert.equal(requests.length, 3);
+    assert.match(requests[1].messages.at(-1).content, /Two years/u);
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0][0], "loop.completed");
+  } finally {
+    if (previousDeno === undefined) delete globalThis.Deno;
+    else globalThis.Deno = previousDeno;
+  }
+});
+
+test("removed knowledge search and ask tools are neither advertised nor callable", async () => {
+  const emitted = [];
+  let selectedTool;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(topic) {
+      emitted.push(topic);
+    },
+    async modelComplete(request) {
+      assert.ok(
+        !request.tools.some(({ function: tool }) => tool.name === selectedTool),
+      );
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          {
+            id: "removed-tool",
+            type: "function",
+            function: { name: selectedTool, arguments: "{}" },
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?removedTools=${Date.now()}`
+    );
+    for (const name of ["knowledge_search", "knowledge_ask"]) {
+      selectedTool = name;
+      await assert.rejects(main(historyTurn), /invalid result/u);
+    }
+    assert.deepEqual(emitted, []);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
@@ -412,9 +535,6 @@ test("knowledge text tools read a scoped exact version and return the persisted 
   };
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async knowledgeTextRead(request) {
       reads.push(request);
       return {
@@ -529,9 +649,6 @@ test("chat onboarding calls scoped project tools and preserves acceptance semant
   ];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async projectCurrent(request) {
       observed.push(["project_current", request]);
       return {
@@ -608,9 +725,6 @@ test("recommendations tool reads scoped optimization-safe channel suggestions", 
   let modelCalls = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async sourceRecommendations(request) {
       calls.push(request);
       return {
@@ -703,9 +817,6 @@ test("traditional search tools preserve scoped create, detail and local reparse 
   let iteration = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected knowledge search");
-    },
     async serpRead(request) {
       calls.push(["serp_read", request]);
       return request.mode
@@ -773,9 +884,6 @@ test("report reduction and immutable read are exposed as separate scoped host to
   const reads = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async reportReduce(request) {
       reductions.push(request);
       return { report_id: reportId, cycle_id: cycleId, status: "partial" };
@@ -838,7 +946,6 @@ test("report reduction and immutable read are exposed as separate scoped host to
     assert.deepEqual(
       requests[0].tools.map((tool) => tool.function.name),
       [
-        "knowledge_search",
         "knowledge_text_read",
         "knowledge_text_revise",
         "knowledge_import_status",
@@ -889,9 +996,6 @@ test("report preview is independent of official read and reduce", async () => {
   const requests = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async reportGet() {
       throw new Error("Preview must not read an official report");
     },
@@ -977,9 +1081,6 @@ test("cycle-free reports use existing tools and the exact preview window", async
   const requests = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Report does not need enterprise setup");
-    },
     async reportPreview(request) {
       calls.push(["report_preview", request]);
       return {
@@ -1066,13 +1167,15 @@ test("cycle-free reports use existing tools and the exact preview window", async
   }
 });
 
-test("attachment-only turn imports bound items, searches its release, and answers from evidence", async () => {
+test("attachment-only turn imports bound items, reads its exact source version, and answers from evidence", async () => {
   const textId = "00000000-0000-4000-8000-000000000001";
   const otherId = "00000000-0000-4000-8000-000000000002";
   const releaseId = "00000000-0000-4000-8000-000000000003";
+  const sourceId = "00000000-0000-4000-8000-000000000004";
+  const sourceVersionId = "00000000-0000-4000-8000-000000000005";
   const modelRequests = [];
   const imports = [];
-  const searches = [];
+  const reads = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
     async knowledgeImportAttachments(request) {
@@ -1082,8 +1185,8 @@ test("attachment-only turn imports bound items, searches its release, and answer
           {
             attachment_id: textId,
             status: "succeeded",
-            source_id: "00000000-0000-4000-8000-000000000004",
-            source_version_id: "00000000-0000-4000-8000-000000000005",
+            source_id: sourceId,
+            source_version_id: sourceVersionId,
             knowledge_release_id: releaseId,
           },
           {
@@ -1094,11 +1197,12 @@ test("attachment-only turn imports bound items, searches its release, and answer
         ],
       };
     },
-    async knowledgeSearch(request) {
-      searches.push(request);
+    async knowledgeTextRead(request) {
+      reads.push(request);
       return {
-        knowledge_release_id: releaseId,
-        evidence: [{ source_name: "Guide", quote: "Two years" }],
+        source: { source_id: sourceId, name: "Guide" },
+        source_version: { source_version_id: sourceVersionId },
+        content: { text_basis: "exact", text: "Two years" },
       };
     },
     async modelComplete(request) {
@@ -1131,10 +1235,10 @@ test("attachment-only turn imports bound items, searches its release, and answer
                     }),
                   }
                 : {
-                    name: "knowledge_search",
+                    name: "knowledge_text_read",
                     arguments: JSON.stringify({
-                      query: "warranty",
-                      knowledge_release_id: releaseId,
+                      source_id: sourceId,
+                      source_version_id: sourceVersionId,
                     }),
                   },
           },
@@ -1180,7 +1284,6 @@ test("attachment-only turn imports bound items, searches its release, and answer
       [
         "knowledge_import_attachments",
         "knowledge_import_status",
-        "knowledge_search",
         "knowledge_text_read",
         "knowledge_text_revise",
         "report_get",
@@ -1235,8 +1338,8 @@ test("attachment-only turn imports bound items, searches its release, and answer
         ],
       },
     ]);
-    assert.deepEqual(searches, [
-      { query: "warranty", knowledge_release_id: releaseId },
+    assert.deepEqual(reads, [
+      { source_id: sourceId, source_version_id: sourceVersionId },
     ]);
     assert.equal(modelRequests[0].messages.at(-1).content, "");
     assert.match(
@@ -1251,10 +1354,12 @@ test("attachment-only turn imports bound items, searches its release, and answer
   }
 });
 
-test("queued attachment uses a later exact job status and release before citing evidence", async () => {
+test("queued attachment uses a later exact job status and source version before citing evidence", async () => {
   const attachmentId = "00000000-0000-4000-8000-000000000011";
   const jobId = "00000000-0000-4000-8000-000000000012";
   const releaseId = "00000000-0000-4000-8000-000000000013";
+  const sourceId = "00000000-0000-4000-8000-000000000014";
+  const sourceVersionId = "00000000-0000-4000-8000-000000000015";
   const seen = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
@@ -1275,8 +1380,8 @@ test("queued attachment uses a later exact job status and release before citing 
         import_job_id: jobId,
         status: "partial",
         stage: "release",
-        source_id: "00000000-0000-4000-8000-000000000014",
-        source_version_id: "00000000-0000-4000-8000-000000000015",
+        source_id: sourceId,
+        source_version_id: sourceVersionId,
         knowledge_release_id: releaseId,
         completed_units: 1,
         failed_units: 1,
@@ -1284,11 +1389,15 @@ test("queued attachment uses a later exact job status and release before citing 
         errors: [{ code: "parse_failed", page: 2 }],
       };
     },
-    async knowledgeSearch(request) {
-      assert.equal(request.knowledge_release_id, releaseId);
+    async knowledgeTextRead(request) {
+      assert.deepEqual(request, {
+        source_id: sourceId,
+        source_version_id: sourceVersionId,
+      });
       return {
-        knowledge_release_id: releaseId,
-        evidence: [{ quote: "A scoped statement", page: 1 }],
+        source: { source_id: sourceId },
+        source_version: { source_version_id: sourceVersionId },
+        content: { text_basis: "extracted", text: "A scoped statement" },
       };
     },
     async modelComplete(request) {
@@ -1301,17 +1410,14 @@ test("queued attachment uses a later exact job status and release before citing 
         { items: [{ attachment_id: attachmentId, purpose: "internal" }] },
         { import_job_id: jobId, purpose: "internal" },
         {
-          query: "statement",
-          knowledge_release_id: releaseId,
-          purpose: "internal",
+          source_id: sourceId,
+          source_version_id: sourceVersionId,
         },
       ];
       const names = [
         "knowledge_import_attachments",
         "knowledge_import_status",
-        "knowledge_search",
         "knowledge_text_read",
-        "knowledge_text_revise",
       ];
       return {
         ...finalModelAnswer(""),
@@ -1410,9 +1516,6 @@ test("channel tools discover references, freeze a plan, read the manifest, and p
   ];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected knowledge search");
-    },
     async channelDiscover(request) {
       calls.push(["discover", request]);
       return request.kind === "public_sources"
@@ -1647,9 +1750,6 @@ test("native question-set tools return only safe references and freeze bound tar
   };
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("unexpected search");
-    },
     async questionCreate(request) {
       seen.push(["create", request]);
       return receipt;
@@ -1761,9 +1861,6 @@ test("standalone measurement discovers live models, accepts one ad-hoc question 
   const completions = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("unexpected search");
-    },
     async measurementOptions(input) {
       seen.push(["options", input]);
       return {
@@ -1895,9 +1992,6 @@ test("topic prediction offers real model tools and only a saved question-set rec
   };
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("unexpected knowledge search");
-    },
     async questionCreate(command) {
       calls.push(command);
       return {
@@ -1953,9 +2047,6 @@ test("a failed candidate-question write never completes as a saved prediction", 
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit(topic, payload) {
       events.push([topic, payload]);
-    },
-    async knowledgeSearch() {
-      throw new Error("unexpected knowledge search");
     },
     async questionCreate() {
       throw new Error("capability_missing: question sets unavailable");
@@ -2018,9 +2109,6 @@ test("content start accepts a reference-only current cycle and reads durable cov
   let modelCall = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("unexpected search");
-    },
     async contentStart(request) {
       calls.push(["start", request]);
       return {
@@ -2169,9 +2257,6 @@ test("media tools bind only current-turn attachments and return exact host docum
   ];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected knowledge search");
-    },
     async knowledgeImportAttachments() {
       throw new Error("Unexpected knowledge import");
     },
@@ -2352,9 +2437,6 @@ test("media insertion conflict fails without choosing a new base or completing t
     async emit(...event) {
       events.push(event);
     },
-    async knowledgeSearch() {
-      throw new Error("Unexpected knowledge search");
-    },
     async contentMediaInsert(request) {
       calls.push(request);
       throw new Error("revision_conflict: read current document");
@@ -2396,9 +2478,6 @@ test("formal distribution tools pass only scoped selectors and expose a paged co
   let next = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async distributionStart(request) {
       calls.push(["start", request]);
       return {
@@ -2534,9 +2613,6 @@ test("single-article distribution pins revision/account/key and reports only acc
   const writes = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async contentDistributeRequest(request) {
       writes.push(request);
       return {
@@ -2634,9 +2710,6 @@ test("unknown execution is returned without retry or invented publication succes
   let modelCalls = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async channelTargetExecute(request) {
       executions++;
       assert.deepEqual(request, { target_id: targetId });
@@ -2713,9 +2786,6 @@ test("replayed plan returns the same frozen receipt and completed fixture remain
   const messages = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit() {},
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async channelPlan(request) {
       plans.push(request);
       return receipt;
@@ -2788,9 +2858,6 @@ test("a channel capability failure aborts the loop without a completion event", 
     async emit(topic, payload) {
       emitted.push({ topic, payload });
     },
-    async knowledgeSearch() {
-      throw new Error("Unexpected search");
-    },
     async channelPlan() {
       throw new Error("capability_missing: channel planner unavailable");
     },
@@ -2839,8 +2906,8 @@ test("a missing knowledge capability fails without a success completion", async 
     async emit(topic, payload) {
       emitted.push({ topic, payload });
     },
-    async knowledgeSearch() {
-      throw new Error("capability_missing: knowledge retrieval is unavailable");
+    async knowledgeTextRead() {
+      throw new Error("capability_missing: knowledge text is unavailable");
     },
     async modelComplete() {
       return {
@@ -2850,8 +2917,8 @@ test("a missing knowledge capability fails without a success completion", async 
             id: "missing-1",
             type: "function",
             function: {
-              name: "knowledge_search",
-              arguments: '{"query":"warranty"}',
+              name: "knowledge_text_read",
+              arguments: JSON.stringify(manualReference),
             },
           },
         ],

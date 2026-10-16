@@ -120,6 +120,93 @@ test("invalid recommendation proposals preserve the grounded answer and citation
   }
 });
 
+test("optional recommendation audit overflow preserves bounded answer provenance", () => {
+  const text = `Sample Air 300 ${"中".repeat(2500)}`;
+  const items = [
+    {
+      ...recommendationItems[0],
+      rank: null,
+      reason: text,
+      evidence_quote: text,
+    },
+  ];
+  for (const [count, expected] of [
+    [2800, "verified"],
+    [2900, "unverified"],
+    [3000, "audit_too_large"],
+  ]) {
+    const source_json = JSON.stringify({
+      messages: [
+        {
+          ...source.messages[0],
+          text,
+          fragments: Array.from({ length: count }, () => ({ text: "x" })),
+        },
+      ],
+    });
+    const proposal = {
+      ...candidate,
+      answer_segments: [
+        ...candidate.answer_segments,
+        {
+          array_path: "/messages/0/fragments",
+          start_index: 0,
+          end_index: count,
+          item_path: "/text",
+        },
+      ],
+      recommendations: items,
+    };
+    const input = {
+      ...recommendationRequest(),
+      source_json,
+      source_sha256: digest(source_json),
+      candidate_json: JSON.stringify(proposal),
+    };
+    const base = groundSavedObservation({
+      ...input,
+      candidate_json: JSON.stringify({ ...proposal, recommendations: [] }),
+    });
+    const result = groundSavedObservation(input);
+    assert.equal(result.candidate_json, input.candidate_json);
+    if (expected === "audit_too_large") {
+      assert.equal(base.outcome.reason, expected);
+      assert.equal(result.outcome.reason, expected);
+      continue;
+    }
+    assert.equal(result.outcome.status, "grounded");
+    assert.equal(result.outcome.raw_answer, text + "x".repeat(count));
+    assert.deepEqual(result.outcome.citations, base.outcome.citations);
+    const { recommendations, ...audit } = result.outcome.audit;
+    const { recommendations: _, ...baseAudit } = base.outcome.audit;
+    assert.deepEqual(audit, baseAudit);
+    assert.deepEqual(recommendations, {
+      version: "geo.recommendations.v1",
+      status: expected,
+      items: expected === "verified" ? items : [],
+    });
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(result.outcome.audit)) <= 512_000,
+    );
+    if (expected === "unverified") {
+      // Even the empty analysis marker must not displace a valid base audit.
+      const protocol = { padding: "" };
+      const exactAudit = { ...audit, protocol };
+      protocol.padding = "x".repeat(
+        512_000 - Buffer.byteLength(JSON.stringify(exactAudit)),
+      );
+      const atLimit = groundSavedObservation({ ...input, protocol });
+      assert.equal(atLimit.outcome.status, "grounded");
+      assert.equal(atLimit.outcome.audit.recommendations, undefined);
+      assert.deepEqual(atLimit.outcome.audit, exactAudit);
+      assert.equal(
+        Buffer.byteLength(JSON.stringify(atLimit.outcome.audit)),
+        512_000,
+      );
+    }
+  }
+});
+
 test("empty, missing and historical recommendation analysis remain distinct", () => {
   assert.equal(
     groundSavedObservation(recommendationRequest([])).outcome.audit

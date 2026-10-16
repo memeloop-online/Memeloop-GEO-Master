@@ -136,7 +136,7 @@ impl ModelProviderBridge for GroundedModel {
                  "detail":"Verified from the public source"}]})
             .to_string()
         } else {
-            serde_json::json!({"title":"A documented answer","blocks":[{
+            serde_json::json!({"schema_version":2,"title":"A documented answer","blocks":[{
                 "kind":"paragraph","text":"Public description",
                 "citation_ids":[citation],"items":[]}]})
             .to_string()
