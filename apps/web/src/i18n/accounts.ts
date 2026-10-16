@@ -57,6 +57,9 @@ const accounts = {
         ended: "登录会话已结束。请关闭后重新连接。",
         connected: "账号已连接。",
         failed: "远程登录操作未完成",
+        runtimeMissingTitle: "远程登录运行时未部署",
+        runtimeMissingDetail:
+          "本部署未配置远程登录所需的浏览器桌面运行时，因此远程登录当前不可用。请让部署者在 Linux 容器、WSL2 或远程 runner 中启用后重试。",
       },
       channels: {
         eyebrow: "账号与资源",
@@ -190,6 +193,9 @@ const accounts = {
         ended: "Sign-in session ended. Close it and reconnect.",
         connected: "Account connected.",
         failed: "Remote sign-in did not finish",
+        runtimeMissingTitle: "Remote sign-in runtime is not deployed",
+        runtimeMissingDetail:
+          "This deployment has no browser desktop runtime, so remote sign-in is unavailable. Ask the deployer to enable one (Linux container, WSL2, or a remote runner) and retry.",
       },
       channels: {
         eyebrow: "Accounts & resources",

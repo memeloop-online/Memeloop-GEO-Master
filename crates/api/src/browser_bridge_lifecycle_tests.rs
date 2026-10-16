@@ -339,3 +339,72 @@ async fn legacy_start_and_close_keep_wire_compatibility() {
     bridge.close(session_id).await.unwrap();
     server.abort();
 }
+
+/// A runner with no interactive desktop runtime answers `409
+/// desktop_unavailable`. That is this deployment lacking a capability, not the
+/// account failing identity proof, and the two must not be reported alike.
+#[tokio::test]
+async fn a_runner_without_a_desktop_runtime_reports_a_missing_capability() {
+    let session_id = Uuid::new_v4();
+    let app = Router::new().route(
+        &format!("/v1/sessions/{session_id}/desktop-readiness"),
+        get(|| async {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(json!({"error": "desktop_unavailable"})),
+            )
+        }),
+    );
+    let (bridge, server) = serve(app).await;
+    let error = bridge.desktop_ready(session_id).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::CapabilityMissing);
+    server.abort();
+}
+
+/// The runner names the missing capability itself. Flattening that into a
+/// generic dependency failure discards the only actionable fact.
+#[tokio::test]
+async fn a_runner_capability_missing_survives_the_response_boundary() {
+    let session_id = Uuid::new_v4();
+    let app = Router::new()
+        .route(
+            "/v1/sessions",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({"error": "capability_missing"})),
+                )
+            }),
+        )
+        .route(
+            &format!("/v1/sessions/{session_id}"),
+            axum::routing::delete(|| async { StatusCode::NOT_FOUND }),
+        );
+    let (bridge, server) = serve(app).await;
+    let error = bridge
+        .start(session_id, "fixture", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::CapabilityMissing);
+    server.abort();
+}
+
+/// The control: a conflict that is genuinely about identity keeps its meaning.
+/// Narrowing the mapping must not reclassify every 409 as a missing capability.
+#[tokio::test]
+async fn an_identity_conflict_keeps_its_conflict_meaning() {
+    let session_id = Uuid::new_v4();
+    let app = Router::new().route(
+        &format!("/v1/sessions/{session_id}/desktop-readiness"),
+        get(|| async {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(json!({"error": "login_required"})),
+            )
+        }),
+    );
+    let (bridge, server) = serve(app).await;
+    let error = bridge.desktop_ready(session_id).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    server.abort();
+}

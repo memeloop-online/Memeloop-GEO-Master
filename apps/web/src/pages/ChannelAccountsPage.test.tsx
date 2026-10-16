@@ -1090,6 +1090,65 @@ describe("account page", () => {
     },
   );
 
+  it("names an undeployed login runtime instead of blaming the account identity", async () => {
+    const { fetchMock } = mockApi([]);
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((request, init) => {
+      const path = new URL(String(request), "http://localhost").pathname;
+      if (path.endsWith("/channel-login-sessions") && init?.method === "POST")
+        return Promise.resolve(
+          response(
+            {
+              code: "capability_missing",
+              message:
+                "browser login runtime is not configured on this deployment",
+            },
+            503,
+          ),
+        );
+      return original(request, init);
+    });
+    renderPage("connect");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "启动远程登录" }),
+    );
+    expect(await screen.findByText("远程登录运行时未部署")).toBeInTheDocument();
+    expect(
+      screen.getByText(/本部署未配置远程登录所需的浏览器桌面运行时/),
+    ).toBeInTheDocument();
+    // The reader must not be told the account failed to prove its identity, nor
+    // handed a generic "did not finish" that hides the one actionable fact.
+    expect(screen.queryByText("远程登录操作未完成")).toBeNull();
+    expect(screen.queryByText("操作未完成")).toBeNull();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+  });
+
+  it("keeps the generic remote sign-in copy for an unclassified runner failure", async () => {
+    const { fetchMock } = mockApi([]);
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((request, init) => {
+      const path = new URL(String(request), "http://localhost").pathname;
+      if (path.endsWith("/channel-login-sessions") && init?.method === "POST")
+        return Promise.resolve(
+          response(
+            {
+              code: "dependency_unavailable",
+              message: "browser runner offline",
+            },
+            503,
+          ),
+        );
+      return original(request, init);
+    });
+    renderPage("connect");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "启动远程登录" }),
+    );
+    expect(await screen.findByText("操作未完成")).toBeInTheDocument();
+    expect(screen.getByText("browser runner offline")).toBeInTheDocument();
+    expect(screen.queryByText("远程登录运行时未部署")).toBeNull();
+  });
+
   it("does not label a stored ready account connected when verification is unsupported", async () => {
     mockApi(
       [{ ...account, platform: "deepseek", status: "ready" }],
