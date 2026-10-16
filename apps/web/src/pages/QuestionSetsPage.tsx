@@ -178,6 +178,11 @@ export function QuestionSetsPage() {
   const updateSelection = (values: Record<string, string | null>) => {
     setParams((previous) => {
       const next = new URLSearchParams(previous);
+      if ("set" in values || "version" in values) {
+        next.delete("record");
+        next.delete("planId");
+        next.delete("folder");
+      }
       for (const [key, value] of Object.entries(values)) {
         if (key === "set") next.delete("questionSetId");
         if (key === "version") next.delete("versionId");

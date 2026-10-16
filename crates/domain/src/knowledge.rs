@@ -403,9 +403,6 @@ pub struct KnowledgeCapability {
     pub docx_parser: bool,
     pub xlsx_parser: bool,
     pub ocr: bool,
-    pub vector_search: bool,
-    pub llm_answering: bool,
-    pub evidence_only_answering: bool,
     pub max_inline_text_bytes: usize,
     pub max_upload_bytes: u64,
     pub max_batch_files: u32,
@@ -429,9 +426,6 @@ impl KnowledgeCapability {
             docx_parser: false,
             xlsx_parser: false,
             ocr: false,
-            vector_search: false,
-            llm_answering: false,
-            evidence_only_answering: true,
             max_inline_text_bytes: MAX_INLINE_TEXT_BYTES,
             max_upload_bytes: MAX_UPLOAD_BYTES,
             max_batch_files: 100,
@@ -451,7 +445,7 @@ impl KnowledgeCapability {
                 "only text/plain, text/markdown and UTF-8 comma-separated text/csv with a header are parsed".to_owned(),
                 "CSV limits: 256 columns, 10000 data records, 256 KiB per encoded cell, 32 MiB total chunk text".to_owned(),
                 "a text declaration is parsed only after UTF-8 validation; the declared media type is not content sniffing".to_owned(),
-                "URL acquisition, office/PDF parsing, OCR, vector search, and LLM answers require adapters".to_owned(),
+                "URL acquisition, office/PDF parsing and OCR require adapters".to_owned(),
             ],
         }
     }
@@ -2691,10 +2685,9 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             capability
                 .limitations
                 .retain(|line| !line.contains("office/PDF parsing"));
-            capability.limitations.push(
-                "URL acquisition, office parsing, vector search, and LLM answers require adapters"
-                    .to_owned(),
-            );
+            capability
+                .limitations
+                .push("URL acquisition and office parsing require adapters".to_owned());
             capability
                 .limitations
                 .push("OCR for scanned PDFs is not configured".to_owned());
@@ -2715,10 +2708,10 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
         }
         if capability.docx_parser || capability.xlsx_parser {
             capability.limitations.retain(|line| {
-                !line.contains("office/PDF parsing") && !line.contains("office parsing,")
+                !line.contains("office/PDF parsing") && !line.contains("office parsing")
             });
             capability.limitations.push(
-                "Office structural import does not execute formulas, fetch external resources, or infer headers; OCR, vector search and LLM answers are not configured"
+                "Office structural import does not execute formulas, fetch external resources, or infer headers; OCR is not configured"
                     .to_owned(),
             );
         }
@@ -5607,6 +5600,19 @@ mod tests {
         );
         let input = repo.pdf_parse_input(&scope, &replacement).await.unwrap();
         assert!(input.manifest.is_none());
+    }
+
+    #[test]
+    fn capabilities_do_not_advertise_removed_retrieval_or_answering() {
+        for capability in [
+            super::KnowledgeCapability::memory(),
+            super::KnowledgeCapability::durable_text_only(),
+        ] {
+            let value = serde_json::to_value(capability).unwrap();
+            for field in ["vector_search", "llm_answering", "evidence_only_answering"] {
+                assert!(value.get(field).is_none());
+            }
+        }
     }
 
     #[test]

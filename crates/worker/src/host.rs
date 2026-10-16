@@ -1226,7 +1226,6 @@ impl Default for HostOpBudgets {
         Self {
             limits: [
                 HostOpLimits::new(120_000, 32),
-                HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(15_000, 32), // scoped exact text read
                 HostOpLimits::new(60_000, 16), // durable optimistic text revision
                 HostOpLimits::new(120_000, 32),
@@ -4527,6 +4526,25 @@ mod tests {
         assert_eq!(restored.limits(HostOp::ProjectStart).max_calls, 4);
         value["limits"].as_array_mut().unwrap().pop();
         assert!(serde_json::from_value::<HostOpBudgets>(value).is_err());
+    }
+
+    #[test]
+    fn default_budgets_preserve_named_operation_limits() {
+        let budgets = HostOpBudgets::default();
+        for (op, timeout_ms, max_calls) in [
+            (HostOp::ModelComplete, 120_000, 32),
+            (HostOp::KnowledgeTextRead, 15_000, 32),
+            (HostOp::KnowledgeTextRevise, 60_000, 16),
+            (HostOp::KnowledgeImportAttachments, 120_000, 32),
+            (HostOp::KnowledgeImportStatus, 15_000, 16),
+            (HostOp::SerpReparse, 30_000, 8),
+        ] {
+            assert_eq!(
+                budgets.limits(op),
+                HostOpLimits::new(timeout_ms, max_calls),
+                "{op:?}"
+            );
+        }
     }
 
     #[test]

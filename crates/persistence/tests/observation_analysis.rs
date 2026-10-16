@@ -562,7 +562,11 @@ async fn assert_grounded_projection(
             outcome: ObservationAnalysisOutcome::Grounded {
                 raw_answer: "Synthetic saved response".into(),
                 citations: vec![],
-                audit: json!({"refs":[{"pointer":"/messages/0/content","quote":"Synthetic saved response"}]}),
+                audit: json!({
+                    "source_sha256": request.source_sha256,
+                    "prompt_version": request.prompt_version,
+                    "refs":[{"pointer":"/messages/0/content","quote":"Synthetic saved response"}]
+                }),
             },
             prompt_tokens: 1,
             completion_tokens: 1,
