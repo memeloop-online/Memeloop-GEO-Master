@@ -303,7 +303,7 @@ async fn rich_edit_survives_reconnect_and_versioned_repair_preserves_history() {
         .unwrap();
     assert_eq!(
         original.markdown,
-        "# Original \\*title\\*\n\nOriginal literal \\*claim\\*."
+        "# Original \\*title\\*\n\nOriginal literal \\*claim\\*\\."
     );
     let old_check = repo
         .claim(

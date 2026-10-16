@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, IDEMPOTENCY_KEY_HEADER, PROJECT_ID_HEADER, RequestContext, api_error,
-    context, error_response, require_project_writer, run_executor,
+    context, error_response, require_project_writer,
 };
 
 const SSE_AUTH_REVALIDATION_INTERVAL: Duration = Duration::from_secs(15);
