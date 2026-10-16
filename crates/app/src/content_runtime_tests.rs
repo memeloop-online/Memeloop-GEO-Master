@@ -76,6 +76,7 @@ impl ModelProviderBridge for GroundedModel {
             self.generated.fetch_add(1, Ordering::SeqCst);
             let quote = input["evidence"][0]["quote"].as_str().unwrap();
             serde_json::json!({
+                "schema_version":2,
                 "title":quote,
                 "blocks":[{"kind":"paragraph","text":quote,"citation_ids":[citation],"items":[]}]
             })
