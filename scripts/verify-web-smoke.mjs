@@ -1816,6 +1816,7 @@ async function main() {
     .waitFor();
   await page.reload();
   await page
+    .getByRole("region", { name: "已有问题集" })
     .getByLabel("选择问题集", { exact: true })
     .selectOption(questionVersion.question_set_id);
   await page
