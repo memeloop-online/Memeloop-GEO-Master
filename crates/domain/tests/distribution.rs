@@ -5,8 +5,8 @@ use geo_domain::{
     DistributionDeferralReason, DistributionRepository, DistributionTargetStatus, DocumentManifest,
     DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
     DocumentManifestState, ErrorCode, FreezeDistribution, IntentVerification,
-    MemoryDistributionRepository, PlatformPlacement, PreparedDistribution, StructuredDocument,
-    TenantScope,
+    MemoryDistributionRepository, PlatformPlacement, PreparedDistribution, RichContent, RichNode,
+    StructuredDocument, TenantScope,
 };
 use uuid::Uuid;
 
@@ -140,7 +140,7 @@ fn content_revision(id: Uuid) -> ContentRevision {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     ContentRevision {
         derived_from_revision_id: None,
@@ -163,6 +163,98 @@ fn scope() -> TenantScope {
         Uuid::new_v4().into(),
         Some(Uuid::new_v4().into()),
     )
+}
+
+#[test]
+fn simple_current_document_uses_plain_markdown_transport() {
+    let mut revision = content_revision(Uuid::new_v4());
+    revision.document.blocks.extend([
+        ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Heading,
+            text: "A heading".into(),
+            citation_ids: vec![],
+            items: vec![],
+            rich: None,
+        },
+        ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::List,
+            text: "Choices".into(),
+            citation_ids: vec![],
+            items: vec!["First".into(), "Second".into()],
+            rich: None,
+        },
+    ]);
+    revision.markdown = revision.document.markdown();
+    let variant = geo_domain::prepare_variant(
+        &revision,
+        &placement("a", vec![geo_domain::TEXT_DISTRIBUTION_FORMAT], None),
+    )
+    .unwrap();
+    assert!(variant.rich_payload.is_none());
+    assert_eq!(variant.policy_version, geo_domain::CHANNEL_VARIANT_POLICY);
+    assert_eq!(variant.markdown, revision.markdown);
+}
+
+#[test]
+fn rich_text_links_code_and_nested_lists_cannot_be_downgraded() {
+    let nodes = [
+        serde_json::json!({"type":"paragraph","content":[
+            {"type":"text","text":"Formatted","marks":[{"type":"bold"}]}
+        ]}),
+        serde_json::json!({"type":"paragraph","content":[
+            {"type":"text","text":"A link","marks":[
+                {"type":"link","attrs":{"href":"https://example.com/docs"}}
+            ]}
+        ]}),
+        serde_json::json!({"type":"codeBlock","content":[
+            {"type":"text","text":"let value = 2;"}
+        ]}),
+        serde_json::json!({"type":"bulletList","content":[
+            {"type":"listItem","content":[
+                {"type":"paragraph","content":[{"type":"text","text":"Parent"}]},
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[
+                        {"type":"paragraph","content":[{"type":"text","text":"Child"}]}
+                    ]}
+                ]}
+            ]}
+        ]}),
+    ];
+    for node in nodes {
+        let node: RichNode = serde_json::from_value(node).unwrap();
+        let mut revision = content_revision(Uuid::new_v4());
+        revision.document.blocks = vec![ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Rich,
+            text: String::new(),
+            citation_ids: vec![],
+            items: vec![],
+            rich: Some(RichContent { version: 1, node }),
+        }];
+        revision.markdown = revision.document.markdown();
+        assert_eq!(
+            geo_domain::prepare_variant(
+                &revision,
+                &placement("a", vec![geo_domain::TEXT_DISTRIBUTION_FORMAT], None),
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidRequest
+        );
+        let variant = geo_domain::prepare_rich_variant(
+            &revision,
+            &placement("a", vec![geo_domain::RICH_MARKDOWN_FORMAT], None),
+        )
+        .unwrap();
+        assert_eq!(
+            variant.rich_payload.as_ref().unwrap().document,
+            revision.document
+        );
+        assert_eq!(variant.markdown, revision.markdown);
+        geo_domain::validate_rich_publication_payload(&variant).unwrap();
+    }
 }
 
 async fn expand(repo: &MemoryDistributionRepository, scope: &TenantScope, id: Uuid) {
@@ -297,6 +389,7 @@ async fn materialization_binds_exact_revision_and_one_intent_and_outbox_command(
     };
     let first = repo.materialize(&scope, prepared.clone()).await.unwrap();
     assert_eq!(first.publication_commands.len(), 1);
+    assert!(first.variant.as_ref().unwrap().rich_payload.is_none());
     assert_eq!(first.variant.as_ref().unwrap().markdown, revision.markdown);
     assert_eq!(first.target.status, DistributionTargetStatus::Ready);
     let repeated = repo.materialize(&scope, prepared).await.unwrap();

@@ -11,15 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use geo_domain::{
-    AppError, AttachmentId, AttachmentReference, ImportStatus, KnowledgeSearchRequest,
-    KnowledgeSearchResult, TenantScope,
-};
+use geo_domain::{AppError, AttachmentId, AttachmentReference, ImportStatus, TenantScope};
 use geo_worker::{
     HostBridge, HostOp, HostOpError, HostOps, HostRuntime, KnowledgeImportAttachmentResultItem,
-    KnowledgeImportAttachmentsRequest, KnowledgeImportAttachmentsResult, ManifestPage,
-    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest, ReportGetRequest, ReportPreviewRequest, ReportReduceRequest,
+    KnowledgeImportAttachmentsRequest, KnowledgeImportAttachmentsResult, KnowledgeTextReadRequest,
+    KnowledgeTextReadResult, ManifestPage, ManifestReadRequest, MeasureRequest, MeasureSample,
+    ModelCompletion, ModelCompletionRequest, PublishReceipt, PublishRequest, ReportGetRequest,
+    ReportPreviewRequest, ReportReduceRequest,
 };
 
 const BUNDLE_SPECIFIER: &str = "memeloop://bundle/memeloop-agent-loop.bundle.mjs";
@@ -28,7 +26,7 @@ const TURN_DEADLINE: Duration = Duration::from_secs(30);
 #[derive(Debug, Default)]
 struct RecordingHostOps {
     model_calls: Mutex<Vec<(String, ModelCompletionRequest)>>,
-    search_calls: Mutex<Vec<(String, KnowledgeSearchRequest)>>,
+    read_calls: Mutex<Vec<(String, KnowledgeTextReadRequest)>>,
     import_calls: Mutex<Vec<(String, KnowledgeImportAttachmentsRequest)>>,
     report_calls: Mutex<Vec<(String, String)>>,
     tool_turn: bool,
@@ -45,10 +43,10 @@ impl RecordingHostOps {
             .clone()
     }
 
-    fn search_calls(&self) -> Vec<(String, KnowledgeSearchRequest)> {
-        self.search_calls
+    fn read_calls(&self) -> Vec<(String, KnowledgeTextReadRequest)> {
+        self.read_calls
             .lock()
-            .expect("search call recorder must not be poisoned")
+            .expect("read call recorder must not be poisoned")
             .clone()
     }
 
@@ -111,7 +109,7 @@ impl HostOps for RecordingHostOps {
             return Ok(serde_json::from_value(serde_json::json!({
                 "text": "",
                 "tool_calls": [{
-                    "id": if first { "import-call-1" } else { "search-call-2" },
+                    "id": if first { "import-call-1" } else { "read-call-2" },
                     "type": "function",
                     "function": if first {
                         serde_json::json!({
@@ -123,10 +121,10 @@ impl HostOps for RecordingHostOps {
                         })
                     } else {
                         serde_json::json!({
-                            "name": "knowledge_search",
+                            "name": "knowledge_text_read",
                             "arguments": format!(
-                                "{{\"query\":\"warranty\",\"knowledge_release_id\":\"{}\"}}",
-                                uuid::Uuid::from_u128(50)
+                                "{{\"source_id\":\"{}\",\"source_version_id\":\"{}\"}}",
+                                uuid::Uuid::from_u128(48), uuid::Uuid::from_u128(49)
                             )
                         })
                     }
@@ -142,11 +140,14 @@ impl HostOps for RecordingHostOps {
             return Ok(serde_json::from_value(serde_json::json!({
                 "text": "",
                 "tool_calls": [{
-                    "id": "search-call-1",
+                    "id": "read-call-1",
                     "type": "function",
                     "function": {
-                        "name": "knowledge_search",
-                        "arguments": "{\"query\":\"warranty\",\"limit\":2}"
+                        "name": "knowledge_text_read",
+                        "arguments": format!(
+                            "{{\"source_id\":\"{}\",\"source_version_id\":\"{}\"}}",
+                            uuid::Uuid::from_u128(48), uuid::Uuid::from_u128(49)
+                        )
                     }
                 }],
                 "model": "probe-model",
@@ -174,39 +175,57 @@ impl HostOps for RecordingHostOps {
         })
     }
 
-    async fn knowledge_search(
+    async fn knowledge_text_read(
         &self,
         scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
+        request: KnowledgeTextReadRequest,
+    ) -> Result<KnowledgeTextReadResult, HostOpError> {
         if !self.tool_turn && !self.import_turn {
-            return Err(Self::unavailable(HostOp::KnowledgeSearch));
+            return Err(Self::unavailable(HostOp::KnowledgeTextRead));
         }
-        self.search_calls
+        assert_eq!(request.source_id, uuid::Uuid::from_u128(48));
+        assert_eq!(request.source_version_id, uuid::Uuid::from_u128(49));
+        self.read_calls
             .lock()
-            .expect("search call recorder must not be poisoned")
+            .expect("read call recorder must not be poisoned")
             .push((scope.storage_key(), request));
         Ok(serde_json::from_value(serde_json::json!({
-            "knowledge_release_id": null,
-            "evidence": [{
-                "source_id": uuid::Uuid::from_u128(10),
-                "source_version_id": uuid::Uuid::from_u128(11),
-                "chunk_id": uuid::Uuid::from_u128(12),
-                "source_name": "Manual",
+            "source": {
+                "source_id": uuid::Uuid::from_u128(48),
+                "operator_id": scope.operator_id,
+                "tenant_id": scope.tenant_id,
+                "project_id": scope.project_id,
+                "revision": 1,
+                "kind": "text",
+                "name": "Manual",
                 "purpose": "public",
-                "locator": {
-                    "kind": "text",
-                    "start_line": 1,
-                    "end_line": 1,
-                    "start_char": 0,
-                    "end_char": 9
-                },
+                "state": "active",
+                "locator": {},
+                "current_version_id": uuid::Uuid::from_u128(49),
+                "sync_enabled": false
+            },
+            "source_version": {
+                "source_version_id": uuid::Uuid::from_u128(49),
+                "source_id": uuid::Uuid::from_u128(48),
+                "operator_id": scope.operator_id,
+                "tenant_id": scope.tenant_id,
+                "project_id": scope.project_id,
+                "version": 1,
+                "content_sha256": geo_domain::sha256_hex(b"Two years"),
+                "captured_at": "2026-09-01T00:00:00Z",
+                "created_at": "2026-09-01T00:00:00Z",
+                "parser_version": "fixture",
+                "extraction_version": "fixture"
+            },
+            "content": {
+                "source_version_id": uuid::Uuid::from_u128(49),
+                "representation": "original",
+                "media_type": "text/plain",
                 "text": "Two years",
-                "quote": "Two years"
-            }],
-            "capability_missing": null
+                "text_basis": "exact"
+            }
         }))
-        .expect("evidence fixture must match the domain DTO"))
+        .expect("source text fixture must match the host DTO"))
     }
 
     async fn knowledge_import_attachments(
@@ -588,7 +607,7 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
             TURN_DEADLINE,
         )
         .await
-        .expect("MemeLoop must perform model → search → model through the Rust host");
+        .expect("MemeLoop must perform model → source read → model through the Rust host");
 
     let calls = provider.model_calls();
     assert_eq!(calls.len(), 2);
@@ -597,8 +616,9 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
     assert!(
         tools
             .iter()
-            .any(|tool| tool.function.name == "knowledge_search"
-                && tool.function.parameters["required"][0] == "query")
+            .any(|tool| tool.function.name == "knowledge_text_read"
+                && tool.function.parameters["required"][0] == "source_id"
+                && tool.function.parameters["required"][1] == "source_version_id")
     );
     assert!(
         tools
@@ -633,7 +653,7 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
     assert_eq!(calls[1].1.messages.last().unwrap().role, "tool");
     assert_eq!(
         calls[1].1.messages.last().unwrap().tool_call_id.as_deref(),
-        Some("search-call-1")
+        Some("read-call-1")
     );
     assert!(
         calls[1]
@@ -646,11 +666,11 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
             .unwrap()
             .contains("Two years")
     );
-    let searches = provider.search_calls();
-    assert_eq!(searches.len(), 1);
-    assert_eq!(searches[0].0, expected_scope);
-    assert_eq!(searches[0].1.query, "warranty");
-    assert_eq!(searches[0].1.limit, 2);
+    let reads = provider.read_calls();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0].0, expected_scope);
+    assert_eq!(reads[0].1.source_id, uuid::Uuid::from_u128(48));
+    assert_eq!(reads[0].1.source_version_id, uuid::Uuid::from_u128(49));
     let state = runtime.host_state();
     let completed = state
         .events
@@ -666,7 +686,7 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires `pnpm agent:bundle`; run with `cargo test -p geo-worker --test memeloop_bundle -- --ignored`"]
-async fn generated_memeloop_bundle_imports_bound_attachments_then_searches_and_answers() {
+async fn generated_memeloop_bundle_imports_bound_attachments_then_reads_and_answers() {
     let source = generated_bundle();
     let bundle = [(BUNDLE_SPECIFIER, source.as_str())];
     let provider = Arc::new(RecordingHostOps {
@@ -720,7 +740,7 @@ async fn generated_memeloop_bundle_imports_bound_attachments_then_searches_and_a
             TURN_DEADLINE,
         )
         .await
-        .expect("MemeLoop must perform import → search → answer through Rust host ops");
+        .expect("MemeLoop must perform import → source read → answer through Rust host ops");
 
     let calls = provider.model_calls();
     assert_eq!(calls.len(), 3);
@@ -733,7 +753,7 @@ async fn generated_memeloop_bundle_imports_bound_attachments_then_searches_and_a
     assert!(
         tools
             .iter()
-            .any(|tool| tool.function.name == "knowledge_search")
+            .any(|tool| tool.function.name == "knowledge_text_read")
     );
     assert!(
         tools
@@ -773,12 +793,11 @@ async fn generated_memeloop_bundle_imports_bound_attachments_then_searches_and_a
             .unwrap()
             .contains("capability_missing")
     );
-    let searches = provider.search_calls();
-    assert_eq!(searches.len(), 1);
-    assert_eq!(
-        searches[0].1.knowledge_release_id.unwrap(),
-        uuid::Uuid::from_u128(50)
-    );
+    let reads = provider.read_calls();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0].0, expected_scope);
+    assert_eq!(reads[0].1.source_id, uuid::Uuid::from_u128(48));
+    assert_eq!(reads[0].1.source_version_id, uuid::Uuid::from_u128(49));
     assert_eq!(calls[2].1.messages.last().unwrap().role, "tool");
     assert!(
         calls[2]

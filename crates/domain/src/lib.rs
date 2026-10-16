@@ -3,91 +3,63 @@
 //! The types in this crate deliberately do not depend on a database or an HTTP
 //! framework.  They are the stable boundary used by the modular monolith.
 
+mod accounts;
 mod agent;
-mod appearance;
+mod partners;
+mod projects;
+mod publishing;
+
+use accounts::{
+    account_networks, auth, browser_operations, channel_imports, channels, operator_login_queue,
+    proxy_pools,
+};
+use content::{content_media, content_reuse, rich_content};
+use knowledge::{knowledge_csv, office_parse, pdf_parse};
+use measurement::questions;
+use partners::{partner, partner_admin};
+use projects::{appearance, model_routes, project, project_ai_settings, tenancy};
+use publishing::{
+    channel_jobs, connector_capabilities, content_distribution_request, distribution,
+    publication_lookup, publication_send_authorization,
+};
+
+pub use account_networks::*;
 pub use appearance::{
     DEFAULT_LOCALE, DEFAULT_PRIMARY_COLOR, OperatorAppearance, UpdateOperatorAppearance,
 };
-mod auth;
-mod partner;
-pub use partner::*;
-mod partner_admin;
-pub use partner_admin::*;
-mod channel_jobs;
-pub use channel_jobs::*;
-mod browser_operations;
 pub use browser_operations::*;
-mod account_networks;
-pub use account_networks::*;
-mod citation_insights;
-pub use citation_insights::*;
-mod serp;
-pub use serp::*;
-mod project_serp_settings;
-pub use project_serp_settings::*;
-mod source_channel_recommendations;
-pub use source_channel_recommendations::*;
-mod channel_imports;
-mod operator_login_queue;
-pub use operator_login_queue::*;
-mod proxy_pools;
-pub use proxy_pools::*;
-mod channels;
+pub use channel_jobs::*;
+pub use partner::*;
+pub use partner_admin::*;
+mod measurement;
 pub use channel_imports::*;
 pub use channels::*;
-mod connector_capabilities;
 pub use connector_capabilities::*;
+pub use measurement::*;
+pub use operator_login_queue::*;
+pub use proxy_pools::*;
 mod content;
 pub use content::*;
-mod content_distribution_request;
 pub use content_distribution_request::*;
-mod content_media;
 pub use content_media::*;
-mod rich_content;
-pub use rich_content::*;
-mod content_reuse;
 pub use content_reuse::*;
-mod distribution;
 pub use distribution::*;
+pub use rich_content::*;
 mod error;
 mod event;
 mod idempotency;
 mod knowledge;
-mod knowledge_csv;
-mod office_parse;
+pub use model_routes::ModelRouteGrant;
 pub use office_parse::*;
-mod pdf_parse;
 pub use pdf_parse::{
     PDF_MAX_DOCUMENT_TEXT_BYTES, PDF_MAX_PAGE_TEXT_BYTES, PDF_MAX_PAGES, PDF_PARSE_SCHEMA_VERSION,
     PdfDocumentManifest, PdfPageResult, PdfPageText, PdfParseCursor, PdfParseInput, PdfParseJobRef,
     PdfParseLease, pdf_page_chunks,
 };
-mod model_routes;
-pub use model_routes::ModelRouteGrant;
-mod observation_capture;
-pub use observation_capture::*;
-mod observation_completion_recovery;
-pub use observation_completion_recovery::*;
-mod observation_completion_recovery_jobs;
-pub use observation_completion_recovery_jobs::*;
-mod observation_analysis;
-pub use observation_analysis::*;
-mod observation_extraction;
-pub use observation_extraction::*;
-mod provider_conversation_cleanup;
-pub use provider_conversation_cleanup::*;
-mod provider_conversation_lifecycle;
-pub use provider_conversation_lifecycle::provider_conversation_cleanup_supported;
 mod operation;
-mod project;
-mod publication_lookup;
 pub use publication_lookup::*;
-mod publication_send_authorization;
 pub use publication_send_authorization::*;
-mod questions;
 pub use questions::*;
-mod report;
-mod tenancy;
 
 pub use agent::{
     AgentCheckpoint, AgentRepository, AgentRuntime, AppendMessage, AttachmentId,
@@ -116,10 +88,9 @@ pub use knowledge::{
     DOCUMENT_PLANNER_VERSION, DocumentManifest, DocumentManifestCoverage, DocumentManifestItem,
     DocumentManifestItemState, DocumentManifestPlanRequest, DocumentManifestState, EvidenceRef,
     Fact, FactStatus, ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, ImportStage,
-    ImportStatus, KnowledgeAnswerStatus, KnowledgeAskResult, KnowledgeCapability,
-    KnowledgeCoverage, KnowledgeEvidence, KnowledgeImportProgress, KnowledgeImportProgressError,
-    KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
-    KnowledgeSearchRequest, KnowledgeSearchResult, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES,
+    ImportStatus, KnowledgeCapability, KnowledgeCoverage, KnowledgeEvidence,
+    KnowledgeImportProgress, KnowledgeImportProgressError, KnowledgeOverview, KnowledgePurpose,
+    KnowledgeRelease, KnowledgeRepository, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES,
     MemoryKnowledgeRepository, Product, ProductState, ReviseSourceTextCommand, Source,
     SourceDetail, SourceKind, SourceState, SourceTextBasis, SourceTextRevisionReceipt,
     SourceVersion, SourceVersionContent, SourceVersionRepresentation, StoredObject,
@@ -143,21 +114,5 @@ pub use project::{
     hash_idempotency_key, next_calendar_week_window, previous_calendar_week_window, settings_hash,
     start_request_hash, validate_operator_project_page,
 };
-pub use report::{
-    MemoryReportRepository, REPORT_REDUCER_VERSION, ReportAvailability, ReportCoverage,
-    ReportEvidenceReference, ReportFinding, ReportManifestKind, ReportManifestRef,
-    ReportMeasurementGroup, ReportMeasurementStatus, ReportMeasurementTarget, ReportPreview,
-    ReportPreviewKind, ReportPublicationGroup, ReportPublicationStatus, ReportPublicationTarget,
-    ReportReduceInput, ReportRepository, ReportSnapshot, ReportStatus,
-    ReportSupplementaryMeasurement, preview_report, publication_lookup_asset_evidence,
-    reduce_report, validate_correction,
-};
-mod measurement_report;
-pub use measurement_report::*;
-mod measurement_weekly;
-pub use measurement_weekly::*;
-mod measurement_report_search;
-pub use measurement_report_search::*;
-pub use tenancy::{OperatorId, ProjectId, TenantId, TenantScope, TenantScopeId};
-mod project_ai_settings;
 pub use project_ai_settings::*;
+pub use tenancy::{OperatorId, ProjectId, TenantId, TenantScope, TenantScopeId};

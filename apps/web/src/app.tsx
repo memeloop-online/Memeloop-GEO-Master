@@ -15,11 +15,6 @@ const OverviewPage = lazy(() =>
     default: module.OverviewPage,
   })),
 );
-const KnowledgeAskPage = lazy(() =>
-  import("./pages/KnowledgeAskPage").then((module) => ({
-    default: module.KnowledgeAskPage,
-  })),
-);
 const KnowledgePage = lazy(() =>
   import("./pages/KnowledgePage").then((module) => ({
     default: module.KnowledgePage,
@@ -133,11 +128,6 @@ export function AppRoutes() {
                 <Route
                   path="knowledge/sources/:id"
                   element={<SourceDetailPage />}
-                />
-                <Route path="knowledge/ask" element={<KnowledgeAskPage />} />
-                <Route
-                  path="ask"
-                  element={<Navigate replace to="../knowledge/ask" />}
                 />
                 <Route
                   path="campaigns"

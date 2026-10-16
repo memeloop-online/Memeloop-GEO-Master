@@ -1,9 +1,9 @@
 use geo_domain::{
     ChunkLocator, DocxElement, DocxUnit, ImportStatus, KnowledgeImportProgress, KnowledgePurpose,
-    KnowledgeRepository, KnowledgeSearchRequest, MemoryKnowledgeRepository,
-    OFFICE_PARSE_SCHEMA_VERSION, OfficeDocumentManifest, OfficeDocumentStructure, OfficeFormat,
-    OfficeParseLease, OfficeUnitResult, SourceState, TenantScope, UploadSessionCommand, XlsxCell,
-    XlsxCellKind, XlsxRow, XlsxUnit, sha256_hex,
+    KnowledgeRepository, MemoryKnowledgeRepository, OFFICE_PARSE_SCHEMA_VERSION,
+    OfficeDocumentManifest, OfficeDocumentStructure, OfficeFormat, OfficeParseLease,
+    OfficeUnitResult, SourceState, TenantScope, UploadSessionCommand, XlsxCell, XlsxCellKind,
+    XlsxRow, XlsxUnit, sha256_hex,
 };
 use uuid::Uuid;
 
@@ -304,26 +304,20 @@ async fn docx_partial_release_retry_fences_old_worker_and_keeps_unicode_evidence
         progress(&repo, &scope, job).await.source_version_id,
         Some(first_version.source_version_id)
     );
-    let found = repo
-        .search(
-            &scope,
-            KnowledgeSearchRequest {
-                query: "可靠性 🦀".to_owned(),
-                purpose: KnowledgePurpose::Public,
-                knowledge_release_id: second.release.map(|release| release.knowledge_release_id),
-                limit: 10,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(found.evidence.len(), 2);
-    assert!(found.evidence.iter().all(|evidence| matches!(&evidence.locator,ChunkLocator::Docx {heading_path,..} if heading_path == &vec!["产品说明".to_owned()])));
     let source_detail = repo
         .get_source_detail(&scope, source)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(source_detail.source.state, SourceState::Active);
+    let chunks = source_detail
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.source_version_id == latest.source_version_id)
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks.iter().all(|chunk| chunk.text.contains("可靠性 🦀")));
+    assert!(chunks.iter().all(|chunk| matches!(&chunk.locator,ChunkLocator::Docx {heading_path,..} if heading_path == &vec!["产品说明".to_owned()])));
 }
 
 #[tokio::test]
@@ -331,7 +325,7 @@ async fn xlsx_zero_success_never_releases_and_retry_preserves_exact_coordinate()
     let repo =
         MemoryKnowledgeRepository::with_office_parser_profiles(None, Some(PROFILE.to_owned()));
     let scope = scope();
-    let (job, _source, bytes) = queued(&repo, &scope, OfficeFormat::Xlsx).await;
+    let (job, source, bytes) = queued(&repo, &scope, OfficeFormat::Xlsx).await;
     let held = lease(&repo, &scope, job).await;
     repo.record_office_manifest(&scope, &held, manifest(OfficeFormat::Xlsx, &bytes))
         .await
@@ -378,21 +372,15 @@ async fn xlsx_zero_success_never_releases_and_retry_preserves_exact_coordinate()
     .unwrap();
     let released = repo.finish_office_parse(&scope, &fresh).await.unwrap();
     assert_eq!(released.status, ImportStatus::Partial);
-    let evidence = repo
-        .search(
-            &scope,
-            KnowledgeSearchRequest {
-                query: "🦀".to_owned(),
-                purpose: KnowledgePurpose::Public,
-                knowledge_release_id: released.release.map(|release| release.knowledge_release_id),
-                limit: 5,
-            },
-        )
+    let detail = repo
+        .get_source_detail(&scope, source)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(evidence.evidence.len(), 1);
+    assert_eq!(detail.chunks.len(), 1);
+    assert!(detail.chunks[0].text.contains("🦀"));
     assert!(
-        matches!(&evidence.evidence[0].locator,ChunkLocator::Xlsx{sheet,range,header_range,..}
+        matches!(&detail.chunks[0].locator,ChunkLocator::Xlsx{sheet,range,header_range,..}
         if sheet == "数据" && range == "B2" && header_range.as_deref()==Some("A1:B1"))
     );
 }

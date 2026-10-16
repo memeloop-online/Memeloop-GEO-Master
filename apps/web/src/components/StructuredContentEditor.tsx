@@ -26,7 +26,7 @@ import type { MediaReference } from "../api/contentMedia";
 import { ContentMediaPicker } from "./ContentMediaPicker";
 import { ContentMediaNode, MediaContext } from "./ContentMediaNode";
 import { ReactNodeViewRenderer } from "@tiptap/react";
-import { fromRichNode, isSimpleLegacy, toRichNode } from "./richContentAdapter";
+import { fromRichNode, isSimpleText, toRichNode } from "./richContentAdapter";
 import "./StructuredContentEditor.css";
 
 const metadata = Extension.create({
@@ -301,9 +301,9 @@ export function editorToDocument(
     if (node.type === "paragraph" && node.attrs?.geoCaptionFor) {
       const next = nodes[index + 1];
       if (
-        isSimpleLegacy(node) &&
+        isSimpleText(node) &&
         next?.type === "bulletList" &&
-        isSimpleLegacy(next) &&
+        isSimpleText(next) &&
         previousById.get(next.attrs?.geoBlockId)?.kind === "list" &&
         node.attrs.geoCaptionFor === next.attrs?.geoBlockId
       ) {
@@ -341,7 +341,7 @@ export function editorToDocument(
       });
     else if (
       (node.type === "heading" || node.type === "paragraph") &&
-      isSimpleLegacy(node) &&
+      isSimpleText(node) &&
       !!nodeText(node).trim() &&
       (node.type !== "heading" || node.attrs?.level === 2) &&
       prior?.kind !== "rich"
@@ -354,7 +354,7 @@ export function editorToDocument(
       });
     else if (
       node.type === "bulletList" &&
-      isSimpleLegacy(node) &&
+      isSimpleText(node) &&
       prior?.kind !== "rich"
     )
       blocks.push({ ...attrs, kind: "list", text: "", items: listItems(node) });
@@ -381,10 +381,7 @@ export function editorToDocument(
   return {
     title: previous.title,
     blocks,
-    ...(previous.schema_version === 2 ||
-    blocks.some((block) => block.kind === "rich")
-      ? { schema_version: 2 as const }
-      : {}),
+    schema_version: 2,
   };
 }
 

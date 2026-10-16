@@ -50,6 +50,7 @@ describe("read-only content media preview", () => {
     const onChange = vi.fn();
     const previous: StructuredDocument = {
       title: "Guide",
+      schema_version: 2,
       blocks: [
         {
           block_id: "before",

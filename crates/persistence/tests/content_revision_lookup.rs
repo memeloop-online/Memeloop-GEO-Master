@@ -26,7 +26,7 @@ fn revision(asset_id: Uuid, revision: i32, base: Option<Uuid>, title: &str) -> C
                 items: vec![],
                 rich: None,
             }],
-            schema_version: None,
+            schema_version: 2,
         },
         markdown: title.into(),
         evidence: vec![],
@@ -179,18 +179,10 @@ async fn scoped_point_and_paged_exact_child_ignore_unrelated_history() {
 
     let wrong_document = revision(asset_id, 2, Some(base.revision_id), "Different document");
     let mut child = revision(asset_id, 90, Some(base.revision_id), "Exact document");
-    // Keep the same block identity across the one historical row and the
+    // Keep the same block identity across the stored row and the
     // requested document: matching is full structured equality, not title.
     child.document.blocks[0].block_id = wrong_document.document.blocks[0].block_id;
-    let mut legacy = serde_json::to_value(&child).unwrap();
-    let block = &mut legacy["document"]["blocks"][0];
-    block.as_object_mut().unwrap().remove("citation_ids");
-    block.as_object_mut().unwrap().remove("items");
-    block.as_object_mut().unwrap().remove("rich");
-    legacy["document"]
-        .as_object_mut()
-        .unwrap()
-        .remove("schema_version");
+    let child_body = serde_json::to_value(&child).unwrap();
     for revision_number in 2..=70 {
         let mut candidate = wrong_document.clone();
         candidate.revision_id = Uuid::new_v4();
@@ -217,7 +209,7 @@ async fn scoped_point_and_paged_exact_child_ignore_unrelated_history() {
         serde_json::to_value(&near).unwrap(),
     )
     .await;
-    insert_revision(&database, &scope, execution_id, &child, legacy).await;
+    insert_revision(&database, &scope, execution_id, &child, child_body).await;
     let later = revision(asset_id, 91, Some(base.revision_id), "Exact document");
     let mut later = later;
     later.document = child.document.clone();

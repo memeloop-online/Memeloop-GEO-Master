@@ -103,16 +103,8 @@ fn callbacks_with_credentials(
     };
     let _extraction_dispatcher =
         geo_api::spawn_observation_extraction_dispatcher(extraction.clone());
-    // Deployment-only cutover switch, never a per-user approval. Enable only
-    // after proving old direct callback requests are no longer in flight.
-    let history_enabled = match env::var("GEO_OBSERVATION_HISTORY_ADMISSION") {
-        Err(env::VarError::NotPresent) => false,
-        Ok(value) if value == "false" => false,
-        Ok(value) if value == "true" => true,
-        _ => return Err("GEO_OBSERVATION_HISTORY_ADMISSION must be true or false".into()),
-    };
-    if history_enabled && let Some(analysis) = state.observation_analysis_service() {
-        geo_api::spawn_observation_history_scheduler(extraction.clone(), analysis.clone());
+    if let Some(analysis) = state.observation_analysis_service() {
+        geo_api::spawn_observation_source_recovery(extraction.clone(), analysis.clone());
     }
     let Some(token) = token else {
         return Ok(state);

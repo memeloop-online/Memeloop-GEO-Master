@@ -6,7 +6,8 @@ use geo_domain::{
     DocumentManifestPlanRequest, ErrorCode, EvidenceRef, FreezeDistribution, ImportItem,
     InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
     KnowledgeRepository, PlatformPlacement, ProjectCreate, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, SourceKind, StructuredDocument, TenantScope, hash_idempotency_key,
+    ProjectStartCommand, RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION,
+    RICH_REPAIR_POLICY_VERSION, SourceKind, StructuredDocument, TenantScope, hash_idempotency_key,
     settings_hash, start_request_hash,
 };
 use geo_persistence::{
@@ -66,8 +67,8 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         )
         .await
         .unwrap();
-    let frozen = project.settings.clone().validate_start().unwrap();
-    let frozen_hash = settings_hash(&frozen).unwrap();
+    let frozen_settings = project.settings.clone().validate_start().unwrap();
+    let frozen_hash = settings_hash(&frozen_settings).unwrap();
     let accepted = projects
         .start(
             &tenant_scope,
@@ -121,9 +122,9 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         chunk_id: Some(chunk.chunk_id),
         locator: chunk.locator.clone(),
     };
-    let mut document_scope = frozen.document_scope.clone();
-    document_scope.markets = frozen.effective_markets();
-    document_scope.languages = frozen.effective_languages();
+    let mut document_scope = frozen_settings.document_scope.clone();
+    document_scope.markets = frozen_settings.effective_markets();
+    document_scope.languages = frozen_settings.effective_languages();
     let manifest = knowledge
         .plan_document_manifest(
             &scope,
@@ -242,7 +243,12 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .unwrap()
         .unwrap();
     let first = repository
-        .start(&scope, accepted.cycle_id, manifest.clone(), "test-policy")
+        .start(
+            &scope,
+            accepted.cycle_id,
+            manifest.clone(),
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     assert!(
@@ -275,7 +281,12 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
     assert_eq!(
         first,
         restarted
-            .start(&scope, accepted.cycle_id, manifest.clone(), "test-policy")
+            .start(
+                &scope,
+                accepted.cycle_id,
+                manifest.clone(),
+                RICH_GENERATION_POLICY_VERSION
+            )
             .await
             .unwrap()
     );
@@ -575,7 +586,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let revision = repository
         .complete_generate(&scope, &generated, document.clone())
@@ -595,7 +606,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             first.execution_id,
             item,
             ContentStep::Check,
-            "owner",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -632,7 +643,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             first.execution_id,
             item,
             ContentStep::Check,
-            "owner",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -730,7 +741,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
                     items: vec![],
                     rich: None,
                 }],
-                schema_version: None,
+                schema_version: 2,
             },
         )
         .await
@@ -763,7 +774,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             first.execution_id,
             item,
             ContentStep::Check,
-            "worker",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -995,10 +1006,44 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
         .unwrap_err();
     assert_eq!(rejected.code, ErrorCode::Conflict);
 
-    // Separate execution exercises a persisted factual repair across repository
-    // instances without disturbing the distribution handoff above.
+    // A real successor manifest gives the repair an independent execution while
+    // preserving the earlier distribution handoff and current generation policy.
+    let started = projects
+        .get_start(&tenant_scope, project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let repair_cycle = projects
+        .schedule_next_cycle(&scope, project.id, accepted.cycle_id, started.cutoff_at)
+        .await
+        .unwrap();
+    let mut repair_scope = frozen_settings.document_scope.clone();
+    repair_scope.markets = frozen_settings.effective_markets();
+    repair_scope.languages = frozen_settings.effective_languages();
+    let repair_manifest = knowledge
+        .plan_document_manifest(
+            &scope,
+            DocumentManifestPlanRequest {
+                manifest_id: repair_cycle.document_manifest.as_ref().unwrap().manifest_id,
+                knowledge_release_id: release,
+            },
+            repair_scope,
+        )
+        .await
+        .unwrap();
+    let item = repair_manifest
+        .items
+        .iter()
+        .find(|item| item.source_version_refs.contains(&chunk.source_version_id))
+        .unwrap()
+        .document_manifest_item_id;
     let repairing = repository
-        .start(&scope, accepted.cycle_id, manifest, "test-policy-repair")
+        .start(
+            &scope,
+            repair_cycle.cycle_id,
+            repair_manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let prep = repository
@@ -1054,7 +1099,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let original = repository
         .complete_generate(&scope, &generation, repaired_document.clone())
@@ -1068,7 +1113,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             repairing.execution_id,
             item,
             ContentStep::Check,
-            "owner",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -1109,7 +1154,7 @@ async fn content_fanout_replay_fence_and_immutable_outputs() {
             repairing.execution_id,
             item,
             ContentStep::Repair,
-            "owner",
+            RICH_REPAIR_POLICY_VERSION,
             Utc::now(),
             60,
         )

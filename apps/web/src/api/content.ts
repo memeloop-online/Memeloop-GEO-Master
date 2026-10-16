@@ -115,7 +115,7 @@ export interface RichNode {
 export interface StructuredDocument {
   title: string;
   blocks: ContentBlock[];
-  schema_version?: 2;
+  schema_version: 2;
 }
 
 export interface ContentRevisionExport {

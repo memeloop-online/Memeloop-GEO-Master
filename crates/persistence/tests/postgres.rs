@@ -365,7 +365,7 @@ async fn seed_project(pool: &PgPool, operator_id: Uuid, tenant_id: Uuid, label: 
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
-async fn csv_generation_slices_persist_without_duplicating_full_record_search() {
+async fn csv_generation_slices_persist_alongside_full_record() {
     let database = connect().await;
     let repository = PgKnowledgeRepository::from_database(&database);
     let scope = seed_scope(database.pool(), "csv-slices").await;
@@ -425,20 +425,6 @@ async fn csv_generation_slices_persist_without_duplicating_full_record_search() 
             2
         );
     }
-    let result = restarted
-        .search(
-            &scope,
-            geo_domain::KnowledgeSearchRequest {
-                query: "unique-slice-marker".to_owned(),
-                knowledge_release_id: Some(imported.release.unwrap().knowledge_release_id),
-                purpose: KnowledgePurpose::Public,
-                limit: 20,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.evidence.len(), 1);
-    assert_eq!(result.evidence[0].chunk_id, full.chunk_id);
     assert!(
         restarted
             .get_source_detail(&sibling, version.source_id)
@@ -561,27 +547,6 @@ async fn csv_upload_and_attachment_import_preserve_evidence_and_reject_partial_p
         assert_eq!(
             serde_json::from_str::<Value>(&detail.chunks[1].text).unwrap()["values"],
             json!(["Gadget", "9", "quoted \"text\""])
-        );
-        let search = repository
-            .search(
-                &scope,
-                geo_domain::KnowledgeSearchRequest {
-                    query: "Widget".to_owned(),
-                    knowledge_release_id: imported
-                        .release
-                        .as_ref()
-                        .map(|release| release.knowledge_release_id),
-                    purpose: KnowledgePurpose::Internal,
-                    limit: 10,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(
-            search
-                .evidence
-                .iter()
-                .any(|evidence| evidence.locator == detail.chunks[0].locator)
         );
         assert!(
             repository

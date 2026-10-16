@@ -149,7 +149,7 @@ before(async () => {
         "source_sha256",
       ]);
       if (request.url.endsWith("/extract"))
-        assert.equal(body.prompt_version, "geo.observation.extract.v3");
+        assert.equal(body.prompt_version, "geo.observation.extract.v4");
       assert.equal(
         body.source_capture_id,
         "88888888-8888-4888-8888-888888888888",

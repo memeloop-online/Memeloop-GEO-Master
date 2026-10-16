@@ -53,6 +53,7 @@ const revision: ContentRevision = {
   base_revision_id: null,
   document: {
     title: "Saved article",
+    schema_version: 2,
     blocks: [
       {
         block_id: "block-1",
@@ -68,6 +69,28 @@ const revision: ContentRevision = {
   quotes: [],
   findings: [],
   created_at: "2026-01-01T00:00:00Z",
+};
+const richRevision: ContentRevision = {
+  ...revision,
+  document: {
+    ...revision.document,
+    blocks: [
+      {
+        ...revision.document.blocks[0],
+        kind: "rich",
+        text: "",
+        rich: {
+          version: 1,
+          node: {
+            type: "paragraph",
+            content: [
+              { type: "text", text: "text", marks: [{ type: "bold" }] },
+            ],
+          },
+        },
+      },
+    ],
+  },
 };
 const accounts: ChannelAccount[] = [
   {
@@ -246,10 +269,12 @@ describe("ContentDistributionPanel", () => {
       ).map((account) => account.account_id),
     ).toEqual(["own-1", "shared-1"]);
     expect(
-      eligiblePublishingAccounts(accounts, platforms, capabilities, {
-        ...revision,
-        document: { ...revision.document, schema_version: 2 },
-      }),
+      eligiblePublishingAccounts(
+        accounts,
+        platforms,
+        capabilities,
+        richRevision,
+      ),
     ).toEqual([]);
   });
 
@@ -299,10 +324,9 @@ describe("ContentDistributionPanel", () => {
     original.unmount();
     mount({
       selectedRevision: {
-        ...revision,
+        ...richRevision,
         revision_id: "revision-2",
         revision: 2,
-        document: { ...revision.document, schema_version: 2 },
       },
     });
     expect(screen.queryByRole("button", { name: "发布所选版本" })).toBeNull();
@@ -421,11 +445,7 @@ describe("ContentDistributionPanel", () => {
   });
 
   it("blocks rich revisions without matching format capability", async () => {
-    const rich = {
-      ...revision,
-      document: { ...revision.document, schema_version: 2 as const },
-    };
-    mount({ selectedRevision: rich });
+    mount({ selectedRevision: richRevision });
     expect(
       await screen.findByText("此版本的格式尚不能发布到已连接账号。"),
     ).toBeTruthy();

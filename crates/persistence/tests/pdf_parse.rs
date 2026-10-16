@@ -1,7 +1,7 @@
 use geo_domain::{
-    ImportItem, ImportStatus, KnowledgePurpose, KnowledgeRepository, KnowledgeSearchRequest,
-    PDF_MAX_PAGE_TEXT_BYTES, PDF_PARSE_SCHEMA_VERSION, PdfDocumentManifest, PdfPageResult,
-    SourceKind, TenantScope, UploadSessionCommand, sha256_hex,
+    ImportItem, ImportStatus, KnowledgePurpose, KnowledgeRepository, PDF_MAX_PAGE_TEXT_BYTES,
+    PDF_PARSE_SCHEMA_VERSION, PdfDocumentManifest, PdfPageResult, SourceKind, TenantScope,
+    UploadSessionCommand, sha256_hex,
 };
 use geo_persistence::{Database, DatabaseConfig, PgKnowledgeRepository};
 use sqlx::PgPool;
@@ -311,19 +311,17 @@ async fn pdf_upload_is_fenced_partial_and_retries_only_missing_pages() {
             .await
             .is_err()
     );
-    let search = restarted
-        .search(
-            &scope,
-            KnowledgeSearchRequest {
-                query: "SECOND_MARKER".to_owned(),
-                purpose: KnowledgePurpose::Public,
-                knowledge_release_id: None,
-                limit: 10,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(search.evidence.len(), 1);
+    assert_eq!(
+        detail
+            .chunks
+            .iter()
+            .filter(|chunk| {
+                chunk.source_version_id == full.source_version.as_ref().unwrap().source_version_id
+                    && chunk.text.contains("SECOND_MARKER")
+            })
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -414,19 +412,18 @@ async fn committed_attachment_pdf_stays_unreleased_on_terminal_parse_failure() {
     .unwrap();
     let success = repo.finish_pdf_parse(&scope, &lease).await.unwrap();
     assert_eq!(success.status, ImportStatus::Succeeded);
-    let search = repo
-        .search(
-            &scope,
-            KnowledgeSearchRequest {
-                query: "Private internal PDF text".to_owned(),
-                purpose: KnowledgePurpose::Public,
-                knowledge_release_id: None,
-                limit: 10,
-            },
-        )
-        .await
-        .unwrap();
-    assert!(search.evidence.is_empty());
+    assert!(
+        repo.get_import_progress(&scope, next.import_job_id, KnowledgePurpose::Public)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.get_import_progress(&scope, next.import_job_id, KnowledgePurpose::Internal)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]

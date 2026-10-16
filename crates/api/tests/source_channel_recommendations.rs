@@ -86,7 +86,8 @@ async fn accepted_search(
         Some(QuestionPurpose::FrozenEvaluation) => "SYNTHETIC_EXCLUDED_FROZEN_ANSWER",
         None => "SYNTHETIC_EXCLUDED_UNKNOWN_ANSWER",
     };
-    let claimed = Utc::now();
+    let created_at = Utc::now();
+    let scheduled_at = created_at - Duration::seconds(2);
     let question_set_version_id = Uuid::new_v4();
     let target = ChannelTarget {
         target_id: Uuid::new_v4(),
@@ -101,7 +102,7 @@ async fn accepted_search(
             question: "How does a rain gauge work?".into(),
             market: "generic".into(),
             language: "en".into(),
-            scheduled_at: claimed,
+            scheduled_at,
             sample_ordinal: 0,
             question_binding: purpose.map(|purpose| FrozenQuestionBinding {
                 reference: QuestionReference {
@@ -146,7 +147,7 @@ async fn accepted_search(
                 title: "Synthetic topic".into(),
                 input_hash: plan_id.to_string(),
                 revision: 1,
-                created_at: claimed,
+                created_at,
                 targets,
             },
         )
@@ -203,9 +204,13 @@ async fn finish_accepted_search(
     // The exact same receipt acceptance checks are used by the recommendation
     // read; no external account, search, or publishing service is invoked.
     let citations = vec![citation.to_owned()];
+    let source_json = json!({"messages":[{"role":"assistant","text":answer,
+        "completion":"complete","search_used":"yes","citations":citations}]})
+    .to_string();
+    let source_sha256 = sha256_hex(source_json.as_bytes());
     let evidence = json!({
         "kind":"official_search_observation",
-        "schema_version":"geo.measure.official_search.v1",
+        "schema_version":"geo.measure.official_search.v4",
         "target_id":target.target_id,
         "account_id":account_id,
         "provider":provider,
@@ -226,13 +231,22 @@ async fn finish_accepted_search(
         "citations":citations,
         "search_event":{
             "kind":"official_search_event",
-            "event_id":"synthetic-event",
-            "request_id":"synthetic-request",
-            "occurred_at":observed,
-            "source":"provider_search_event",
-            "provenance":"live"
+            "observed_at":observed,"source":"browser_response_ai","provenance":"live",
+            "search_used":"yes","request_model":model,
+            "request_question_sha256":sha256_hex(question.as_bytes()),
+            "extraction_model":"synthetic-extractor","extraction_prompt_version":"geo.observation.extract.v4",
+            "source_sha256":source_sha256
         }
     });
+    let audit = json!({"kind":"observation_extraction","method":"llm_grounded",
+    "model":"synthetic-extractor","prompt_version":"geo.observation.extract.v4",
+    "source_json":source_json,"source_sha256":source_sha256,"surface":"model_api",
+    "refs":[
+        {"role":"answer_segment","path":"/messages/0/text","quote":answer},
+        {"role":"completion","path":"/messages/0/completion","quote":"complete"},
+        {"role":"search_activity","path":"/messages/0/search_used","quote":"yes"},
+        {"role":"citation","path":"/messages/0/citations/0","quote":citation}
+    ]});
     let receipt = json!({
         "kind":"runner_receipt",
         "schema_version":"geo.runner.receipt.v1",
@@ -256,7 +270,7 @@ async fn finish_accepted_search(
                 public_url: None,
                 screenshot_ref: None,
                 connector_version: Some("connector-v1".into()),
-                runner_evidence: vec![evidence, receipt],
+                runner_evidence: vec![evidence, audit, receipt],
                 fixture: false,
             },
             received,

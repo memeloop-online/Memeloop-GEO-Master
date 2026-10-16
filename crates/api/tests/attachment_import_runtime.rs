@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use geo_api::{EmbeddedAgentRuntime, ModelProviderBridge, RepositoryHostOps};
 use geo_domain::{
     AgentRuntime, AttachmentReference, ErrorCode, ImportStatus, KnowledgePurpose,
-    KnowledgeRepository, KnowledgeSearchRequest, MemoryKnowledgeRepository, StoredObject,
-    TenantScope, TurnInput, UploadSessionCommand, sha256_hex,
+    KnowledgeRepository, MemoryKnowledgeRepository, StoredObject, TenantScope, TurnInput,
+    UploadSessionCommand, sha256_hex,
 };
 use geo_worker::{
     HostOpError, HostOps, KnowledgeImportAttachmentItem, KnowledgeImportAttachmentsRequest,
@@ -97,13 +97,13 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> ModelToolCall {
 }
 
 #[derive(Debug)]
-struct ImportThenSearchModel {
+struct ImportThenReadModel {
     attachments: Vec<AttachmentReference>,
     calls: Mutex<usize>,
     receipts: Mutex<Vec<Value>>,
 }
 
-impl ImportThenSearchModel {
+impl ImportThenReadModel {
     fn new(attachments: Vec<AttachmentReference>) -> Self {
         Self {
             attachments,
@@ -114,7 +114,7 @@ impl ImportThenSearchModel {
 }
 
 #[async_trait]
-impl ModelProviderBridge for ImportThenSearchModel {
+impl ModelProviderBridge for ImportThenReadModel {
     async fn complete(
         &self,
         _scope: &TenantScope,
@@ -129,7 +129,7 @@ impl ModelProviderBridge for ImportThenSearchModel {
             .map(|t| t.function.name.as_str())
             .collect();
         assert!(tool_names.contains(&"knowledge_import_attachments"));
-        assert!(tool_names.contains(&"knowledge_search"));
+        assert!(tool_names.contains(&"knowledge_text_read"));
         let mut completion = ModelCompletion {
             text: String::new(),
             tool_calls: Vec::new(),
@@ -171,12 +171,15 @@ impl ModelProviderBridge for ImportThenSearchModel {
                     assert_eq!(items[1]["status"], "failed", "{receipt}");
                     assert_eq!(items[1]["error"]["code"], "capability_missing");
                 }
-                let release_id = items[0]["knowledge_release_id"].clone();
+                let read_request = json!({
+                    "source_id": items[0]["source_id"],
+                    "source_version_id": items[0]["source_version_id"],
+                });
                 self.receipts.lock().unwrap().push(receipt);
                 completion.tool_calls.push(tool_call(
-                    "search-call",
-                    "knowledge_search",
-                    json!({"query":"warranty", "purpose":"internal", "knowledge_release_id":release_id}),
+                    "read-call",
+                    "knowledge_text_read",
+                    read_request,
                 ));
             }
             _ => {
@@ -185,15 +188,25 @@ impl ModelProviderBridge for ImportThenSearchModel {
                     .iter()
                     .rev()
                     .find(|message| message.role == "tool")
-                    .expect("the model must see actual search evidence");
-                let search: Value = serde_json::from_str(tool.content.as_deref().unwrap()).unwrap();
-                let evidence = search["evidence"].as_array().expect("evidence");
-                assert!(!evidence.is_empty(), "{search}");
-                assert!(evidence[0]["text"].as_str().unwrap().contains(FACT));
-                assert!(evidence[0]["locator"].is_object(), "{search}");
+                    .expect("the model must see the imported source version text");
+                let read: Value = serde_json::from_str(tool.content.as_deref().unwrap()).unwrap();
+                let receipts = self.receipts.lock().unwrap();
+                let imported = &receipts.last().unwrap()["items"][0];
+                assert_eq!(read["source"]["source_id"], imported["source_id"]);
+                assert_eq!(
+                    read["source_version"]["source_version_id"],
+                    imported["source_version_id"]
+                );
+                assert_eq!(
+                    read["content"]["source_version_id"],
+                    imported["source_version_id"]
+                );
+                assert!(read["content"]["text"].as_str().unwrap().contains(FACT));
                 completion.text = format!(
                     "The warranty lasts twenty-four months. [source:{}]",
-                    evidence[0]["source_version_id"].as_str().unwrap()
+                    read["source_version"]["source_version_id"]
+                        .as_str()
+                        .unwrap()
                 );
                 completion.finish_reason = "stop".into();
             }
@@ -204,7 +217,7 @@ impl ModelProviderBridge for ImportThenSearchModel {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires `pnpm agent:bundle`; generated ESM is intentionally not tracked"]
-async fn generated_memeloop_imports_committed_attachment_then_searches_and_cites_it() {
+async fn generated_memeloop_imports_committed_attachment_then_reads_and_cites_it() {
     let repository = Arc::new(MemoryKnowledgeRepository::default());
     let run_scope = scope();
     let (text_ref, object) = upload(
@@ -230,25 +243,8 @@ async fn generated_memeloop_imports_committed_attachment_then_searches_and_cites
             .unwrap()
             .is_empty()
     );
-    assert!(
-        repository
-            .search(
-                &run_scope,
-                KnowledgeSearchRequest {
-                    query: "warranty".into(),
-                    purpose: KnowledgePurpose::Internal,
-                    limit: 5,
-                    knowledge_release_id: None,
-                },
-            )
-            .await
-            .unwrap()
-            .evidence
-            .is_empty()
-    );
-
     let attachments = vec![text_ref, unsupported_ref];
-    let model = Arc::new(ImportThenSearchModel::new(attachments.clone()));
+    let model = Arc::new(ImportThenReadModel::new(attachments.clone()));
     let ops = RepositoryHostOps::new(repository.clone()).with_model_provider(model.clone());
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../packages/agent-runtime/dist/memeloop-agent-loop.bundle.mjs");
@@ -277,7 +273,7 @@ async fn generated_memeloop_imports_committed_attachment_then_searches_and_cites
                 },
             )
             .await
-            .expect("the native MemeLoop import -> search -> answer loop must complete");
+            .expect("the native MemeLoop import -> read -> answer loop must complete");
         assert!(report.content.contains("twenty-four months"));
         assert_eq!(report.metadata["model"], "fixture-model");
     }

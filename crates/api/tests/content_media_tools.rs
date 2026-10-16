@@ -6,7 +6,8 @@ use geo_domain::{
     ContentSemanticDescriptor, ContentStep, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID,
     DocumentManifest, DocumentManifestPlanRequest, EvidenceRef, ImportItem, InitialSource,
     InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, ProjectCreate, ProjectSettings,
-    ProjectStartCommand, SourceKind, StructuredDocument, TenantScope, UploadSessionCommand,
+    ProjectStartCommand, RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION,
+    RICH_REPAIR_POLICY_VERSION, SourceKind, StructuredDocument, TenantScope, UploadSessionCommand,
     hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{Database, DatabaseConfig};
@@ -198,7 +199,12 @@ async fn drafted_content(
         .collect::<Vec<_>>();
     assert!(!quotes.is_empty());
     let execution = content
-        .start(scope, cycle.cycle_id, manifest.clone(), "fixture")
+        .start(
+            scope,
+            cycle.cycle_id,
+            manifest.clone(),
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let descriptor = ContentSemanticDescriptor {
@@ -219,12 +225,12 @@ async fn drafted_content(
         question_clusters: Vec::new(),
         brief_title: "Draft".into(),
         brief_objective: "Preserved source".into(),
-        generation_policy_version: "fixture".into(),
-        evidence_policy_version: "fixture".into(),
-        check_policy_version: "fixture".into(),
-        repair_policy_version: "fixture".into(),
-        output_schema_version: "fixture".into(),
-        generation_policy_revision: "fixture".into(),
+        generation_policy_version: RICH_GENERATION_POLICY_VERSION.into(),
+        evidence_policy_version: "located-public-evidence-v1".into(),
+        check_policy_version: RICH_CHECK_POLICY_VERSION.into(),
+        repair_policy_version: RICH_REPAIR_POLICY_VERSION.into(),
+        output_schema_version: "structured-document-v2".into(),
+        generation_policy_revision: "initial".into(),
     };
     let prepare = match content
         .prepare_or_reuse(
@@ -233,7 +239,7 @@ async fn drafted_content(
                 execution_id: execution.execution_id,
                 item_id,
                 descriptor: descriptor.clone(),
-                owner: "fixture".into(),
+                owner: RICH_GENERATION_POLICY_VERSION.into(),
                 now: Utc::now(),
                 ttl_seconds: 60,
             },
@@ -265,7 +271,7 @@ async fn drafted_content(
             execution.execution_id,
             item_id,
             ContentStep::Generate,
-            "fixture",
+            RICH_GENERATION_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -285,7 +291,7 @@ async fn drafted_content(
                     items: Vec::new(),
                     rich: None,
                 }],
-                schema_version: None,
+                schema_version: 2,
             },
         )
         .await
@@ -296,7 +302,7 @@ async fn drafted_content(
             execution.execution_id,
             item_id,
             ContentStep::Check,
-            "fixture",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -504,7 +510,12 @@ async fn reused_destination_forks_and_replays_without_changing_origin_asset() {
         .unwrap();
     let dest_item_id = manifest.items[0].document_manifest_item_id;
     let destination = content
-        .start(&scope, Uuid::new_v4(), manifest, "fixture")
+        .start(
+            &scope,
+            Uuid::new_v4(),
+            manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let reused = content
@@ -514,7 +525,7 @@ async fn reused_destination_forks_and_replays_without_changing_origin_asset() {
                 execution_id: destination.execution_id,
                 item_id: dest_item_id,
                 descriptor,
-                owner: "fixture".into(),
+                owner: RICH_GENERATION_POLICY_VERSION.into(),
                 now: Utc::now(),
                 ttl_seconds: 60,
             },
@@ -695,7 +706,12 @@ async fn postgres_host_media_insert_replay_and_reused_copy_on_write_survive_reco
     let destination_item = successor_manifest.items[0].document_manifest_item_id;
     let content = state.content_service().repository();
     let next = content
-        .start(&scope, successor.cycle_id, successor_manifest, "fixture")
+        .start(
+            &scope,
+            successor.cycle_id,
+            successor_manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -706,7 +722,7 @@ async fn postgres_host_media_insert_replay_and_reused_copy_on_write_survive_reco
                     execution_id: next.execution_id,
                     item_id: destination_item,
                     descriptor,
-                    owner: "fixture-successor".into(),
+                    owner: RICH_GENERATION_POLICY_VERSION.into(),
                     now: Utc::now(),
                     ttl_seconds: 600,
                 },

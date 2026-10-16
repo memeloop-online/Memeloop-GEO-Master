@@ -7,8 +7,8 @@ use geo_api::{
     spawn_office_parse_scanner,
 };
 use geo_domain::{
-    ChunkLocator, ImportStatus, KnowledgePurpose, KnowledgeRepository, KnowledgeSearchRequest,
-    OfficeFormat, TenantScope, UploadSessionCommand, sha256_hex,
+    ChunkLocator, ImportStatus, KnowledgePurpose, KnowledgeRepository, OfficeFormat, TenantScope,
+    UploadSessionCommand, sha256_hex,
 };
 use serde_json::{Value, json};
 use std::{
@@ -477,7 +477,7 @@ async fn scanner_reserves_capacity_before_claiming_or_loading_originals() {
 
 #[tokio::test]
 #[ignore = "requires pinned Java service running at GEO_TEST_OFFICE_PARSER_URL"]
-async fn real_java_docx_retains_structured_provenance_and_search() {
+async fn real_java_docx_retains_structured_provenance_and_text() {
     let endpoint = std::env::var("GEO_TEST_OFFICE_PARSER_URL")
         .expect("set GEO_TEST_OFFICE_PARSER_URL to the running Java parser");
     let parser = OfficeParserClient::new(&endpoint).unwrap();
@@ -512,22 +512,21 @@ async fn real_java_docx_retains_structured_provenance_and_search() {
             ..
         }
     ) && chunk.text.contains("42 USD")));
-    let search = repository
-        .search(
-            &scope,
-            KnowledgeSearchRequest {
-                query: "Almond".into(),
-                purpose: KnowledgePurpose::Public,
-                limit: 10,
-                knowledge_release_id: None,
-            },
-        )
+    assert!(
+        detail
+            .chunks
+            .iter()
+            .any(|chunk| matches!(chunk.locator, ChunkLocator::Docx { .. })
+                && chunk.text.contains("Almond"))
+    );
+    let version_id = detail.versions[0].source_version_id;
+    let content = repository
+        .get_source_version_content(&scope, source_id, version_id)
         .await
-        .unwrap();
-    assert!(search.evidence.iter().any(|evidence| matches!(
-        evidence.locator,
-        ChunkLocator::Docx { .. }
-    ) && evidence.text.contains("Almond")));
+        .unwrap()
+        .expect("parsed source version content");
+    assert_eq!(content.source_version_id, version_id);
+    assert!(content.text.contains("Almond"));
 }
 
 #[tokio::test]

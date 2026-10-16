@@ -177,7 +177,7 @@ async fn fixture() -> Fixture {
             execution.execution_id,
             item_id,
             ContentStep::Prepare,
-            "synthetic",
+            RICH_GENERATION_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -350,7 +350,7 @@ async fn generate(fixture: &Fixture, document: StructuredDocument) -> geo_domain
             fixture.execution_id,
             fixture.item_id,
             ContentStep::Generate,
-            "synthetic",
+            RICH_GENERATION_POLICY_VERSION,
             Utc::now(),
             60,
         )
@@ -448,7 +448,7 @@ async fn scoped_bundle_keeps_original_image_bytes_and_historical_revision() {
             first.revision_id,
             StructuredDocument {
                 title: "Without image".into(),
-                schema_version: None,
+                schema_version: 2,
                 blocks: vec![ContentBlock {
                     block_id: Uuid::new_v4(),
                     kind: ContentBlockKind::Paragraph,

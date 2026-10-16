@@ -245,7 +245,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let revision = ContentRevision {
         revision_id: Uuid::new_v4(),
@@ -460,7 +460,7 @@ async fn media_revision(db: &Database, fixture: &mut Fixture) -> (MediaObjectKey
     fixture.revision.revision_id = Uuid::new_v4();
     fixture.revision.asset_id = Uuid::new_v4();
     fixture.revision.created_at = Utc::now();
-    fixture.revision.document.schema_version = Some(2);
+    fixture.revision.document.schema_version = 2;
     fixture.revision.document.blocks = vec![
         ContentBlock {
             block_id: Uuid::new_v4(),
@@ -1572,7 +1572,10 @@ async fn outbox_bridge_is_atomic_replay_safe_and_coexists_with_legacy_plan() {
         assert!(view.attempts.is_empty());
         assert!(matches!(
             view.target.input,
-            ChannelTargetInput::GeneratedPublish { .. }
+            ChannelTargetInput::GeneratedPublish {
+                rich_payload: None,
+                ..
+            }
         ));
         assert_eq!(row.scope, first.scope);
     }

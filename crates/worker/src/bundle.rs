@@ -29,8 +29,8 @@ import { runToolLoop } from "./loop-core.js";
 
 const tools = [
   {
-    name: "knowledge.search",
-    run: async () => "evidence: quoted evidence from the knowledge release",
+    name: "probe.echo",
+    run: async () => "probe tool completed",
   },
 ];
 
@@ -70,7 +70,6 @@ export const HOST_OPS_VERSION = "geo.hostops.v19";
 
 const OPS = {
   modelComplete: "op_host_model_complete_v1",
-  knowledgeSearch: "op_host_knowledge_search_v1",
   knowledgeTextRead: "op_host_knowledge_text_read_v1",
   knowledgeTextRevise: "op_host_knowledge_text_revise_v1",
   knowledgeImportStatus: "op_host_knowledge_import_status_v1",
@@ -129,7 +128,6 @@ async function callOp(opName, payload) {
 export const hostOps = {
   version: HOST_OPS_VERSION,
   modelComplete: (request) => callOp(OPS.modelComplete, request),
-  knowledgeSearch: (request) => callOp(OPS.knowledgeSearch, request),
   knowledgeTextRead: (request) => callOp(OPS.knowledgeTextRead, request),
   knowledgeTextRevise: (request) => callOp(OPS.knowledgeTextRevise, request),
   knowledgeImportStatus: (request) => callOp(OPS.knowledgeImportStatus, request),
@@ -202,24 +200,16 @@ function parseHostOpError(error) {
 /// lands.  Evaluating this module does not run a turn: it declares the surface
 /// it expects through a `loop.ready` event, and the embedding host calls `main`
 /// once per turn with that turn's inputs.
-///
-/// `query` defaults to `prompt` so a host payload that omits it still runs the
-/// turn.  Without the default the omission survives `JSON.stringify` as a
-/// missing key, and the very first host op would reject with a typed
-/// `invalid_request` — a turn failing after doing real work, blaming the
-/// runtime for the host's own gap.
 pub const HOST_LOOP_JS: &str = r#"
 import { hostOps } from "./host-ops.js";
 
 export { hostOps, attempt } from "./host-ops.js";
 
-export async function main({ prompt, query = prompt }) {
-  const retrieval = await hostOps.knowledgeSearch({ query });
+export async function main({ prompt }) {
   const completion = await hostOps.modelComplete({ prompt });
   const result = {
     answer: completion.text,
     model: completion.model,
-    evidence: retrieval.evidence,
   };
   await Deno.core.ops.op_host_emit("loop.completed", JSON.stringify(result));
   return result;

@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use geo_domain::{
-    AttachmentId, AttachmentReference, KnowledgeSearchRequest, KnowledgeSearchResult,
-    MediaObjectKey, RunId, StructuredDocument, TenantScope, ToolCallIdentity, ToolCallOutcome,
+    AttachmentId, AttachmentReference, ContentBlock, ContentBlockKind, MediaObjectKey, RunId,
+    StructuredDocument, TenantScope, ToolCallIdentity, ToolCallOutcome,
 };
 use geo_worker::{
     ContentDocumentReadRequest, ContentDocumentSnapshot, ContentMediaBindRequest,
@@ -79,17 +79,6 @@ impl HostOps for FakeOps {
         ))
     }
 
-    async fn knowledge_search(
-        &self,
-        _: &TenantScope,
-        _: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
-        Err(HostOpError::capability_missing(
-            HostOp::KnowledgeSearch,
-            "not configured",
-        ))
-    }
-
     async fn manifest_read(
         &self,
         _: &TenantScope,
@@ -134,10 +123,14 @@ fn recorded_bridge(recorder: Arc<Recorder>) -> HostBridge {
 }
 
 #[test]
-fn v16_surface_and_strict_media_dtos() {
+fn current_surface_and_strict_media_dtos() {
     assert_eq!(HOST_OPS_VERSION, "geo.hostops.v19");
-    assert_eq!(HostOp::COUNT, 48);
     let names = HostRuntime::op_surface();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "op_host_knowledge_search_v1")
+    );
     for (op, js_name) in [
         (HostOp::ContentMediaList, "op_host_content_media_list_v1"),
         (HostOp::ContentMediaBind, "op_host_content_media_bind_v1"),
@@ -174,6 +167,53 @@ fn v16_surface_and_strict_media_dtos() {
         .validate()
         .is_err()
     );
+}
+
+#[test]
+fn document_snapshot_requires_current_schema_for_plain_content() {
+    let request = ContentDocumentReadRequest {
+        execution_id: Uuid::new_v4(),
+        item_id: Uuid::new_v4(),
+        revision_id: None,
+    };
+    let revision_id = Uuid::new_v4();
+    let snapshot = ContentDocumentSnapshot {
+        execution_id: request.execution_id,
+        item_id: request.item_id,
+        asset_id: Uuid::new_v4(),
+        revision_id,
+        current_revision_id: revision_id,
+        revision: 1,
+        is_reused: false,
+        document: StructuredDocument {
+            title: "Plain document".into(),
+            schema_version: 2,
+            blocks: vec![ContentBlock {
+                block_id: Uuid::new_v4(),
+                kind: ContentBlockKind::Paragraph,
+                text: "A paragraph.".into(),
+                citation_ids: vec![],
+                items: vec![],
+                rich: None,
+            }],
+        },
+    };
+    assert!(snapshot.validate_for(&request).is_ok());
+    let value = serde_json::to_value(&snapshot).unwrap();
+    let mut missing_version = value.clone();
+    missing_version["document"]
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    assert!(serde_json::from_value::<ContentDocumentSnapshot>(missing_version).is_err());
+    let mut null_version = value;
+    null_version["document"]["schema_version"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<ContentDocumentSnapshot>(null_version).is_err());
+    for schema_version in [0, 1, 3] {
+        let mut unsupported = snapshot.clone();
+        unsupported.document.schema_version = schema_version;
+        assert!(unsupported.validate_for(&request).is_err());
+    }
 }
 
 #[test]
@@ -342,7 +382,7 @@ async fn list_and_document_foreign_results_fail_before_ledger_success() {
                 document: StructuredDocument {
                     title: "Document".into(),
                     blocks: Vec::new(),
-                    schema_version: Some(2),
+                    schema_version: 2,
                 },
             })
         })

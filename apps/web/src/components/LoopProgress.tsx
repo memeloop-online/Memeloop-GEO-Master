@@ -14,7 +14,7 @@ export interface LoopStep {
 
 const targetByStep: Record<string, string> = {
   knowledge: "knowledge",
-  questions: "knowledge/ask",
+  questions: "chat",
   baseline: "measurement",
   strategy: "campaigns",
   content: "content",

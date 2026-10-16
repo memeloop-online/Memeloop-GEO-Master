@@ -55,8 +55,11 @@ export function groundSavedObservation(input) {
   const compact =
     promptVersion === "geo.observation.extract.v3" &&
     parserVersion === "geo.observation.extract.v5";
+  const recommendations =
+    promptVersion === "geo.observation.extract.v4" &&
+    parserVersion === "geo.observation.extract.v6";
   if (
-    (!legacy && !compact) ||
+    (!legacy && !compact && !recommendations) ||
     Object.hasOwn(input, "prompt_version") !==
       Object.hasOwn(input, "parser_version") ||
     (Object.hasOwn(input, "prompt_version") &&
@@ -103,13 +106,15 @@ export function groundSavedObservation(input) {
   try {
     const grounded = validateAiObservation(document, candidate, {
       semanticOnly: true,
-      allowRanges: compact,
+      allowRanges: compact || recommendations,
+      allowRecommendations: recommendations,
     });
     if (!grounded)
       return rejected(
         observationRejectionReason(document, candidate, {
           semanticOnly: true,
-          allowRanges: compact,
+          allowRanges: compact || recommendations,
+          allowRecommendations: recommendations,
         }),
       );
     const result = {
@@ -127,6 +132,24 @@ export function groundSavedObservation(input) {
         },
       },
     };
+    // Optional recommendations must not displace grounded answer provenance.
+    // Retain the original proposal above; only the projected analysis is omitted.
+    if (
+      recommendations &&
+      Buffer.byteLength(JSON.stringify(result.outcome.audit), "utf8") >
+        MAX_AUDIT_BYTES
+    ) {
+      result.outcome.audit.recommendations = {
+        version: "geo.recommendations.v1",
+        status: "unverified",
+        items: [],
+      };
+      if (
+        Buffer.byteLength(JSON.stringify(result.outcome.audit), "utf8") >
+        MAX_AUDIT_BYTES
+      )
+        delete result.outcome.audit.recommendations;
+    }
     // Repeated references may amplify a small candidate into a large audit.
     if (
       Buffer.byteLength(JSON.stringify(result.outcome.audit), "utf8") >

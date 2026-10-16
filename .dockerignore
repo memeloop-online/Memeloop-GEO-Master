@@ -29,6 +29,7 @@ packages/browser-runner/*
 packages/browser-runner/src/*
 !packages/browser-runner/src/observation-extraction-prompt.txt
 !packages/browser-runner/src/observation-extraction-prompt-v2.txt
+!packages/browser-runner/src/observation-extraction-prompt-v3.txt
 !crates/
 !crates/**
 !migrations/

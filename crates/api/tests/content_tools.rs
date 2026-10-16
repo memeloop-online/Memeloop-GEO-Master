@@ -61,7 +61,7 @@ impl ModelProviderBridge for GroundedModel {
                     "detail":"Source quote supports statement"}]})
             .to_string()
         } else {
-            serde_json::json!({"title":"A documented answer","blocks":[{"kind":"paragraph",
+            serde_json::json!({"schema_version":2,"title":"A documented answer","blocks":[{"kind":"paragraph",
                 "text":"Public description","citation_ids":[citation],"items":[]}]})
             .to_string()
         };

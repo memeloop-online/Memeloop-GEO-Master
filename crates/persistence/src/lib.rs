@@ -1,83 +1,49 @@
 //! PostgreSQL persistence primitives shared by the API and background roles.
 //!
-//! The application currently uses development-only in-memory stores. This
-//! crate keeps the durable boundary explicit and can be adopted by a role when
-//! that role is ready to persist state. Database credentials are supplied at
-//! runtime through configuration; they are never embedded in this crate.
+//! Database credentials are supplied at runtime through configuration.
 
-mod account_networks;
+mod accounts;
 mod agent;
-mod appearance;
-mod auth;
-pub mod bootstrap;
-mod browser_operations;
-mod channel_jobs;
-mod channels;
-mod operator_login_queue;
-mod proxy_pools;
-pub use channel_jobs::PgChannelJobRepository;
-pub use channels::PgChannelRepository;
-mod connector_capabilities;
-pub use connector_capabilities::PgConnectorCapabilityRepository;
 mod config;
 mod content;
-pub use content::{ContentDispatchCandidate, ContentDispatchLease, PgContentRepository};
-mod content_distribution_request;
-pub use content_distribution_request::PgContentDistributionRequestRepository;
-mod content_media;
-pub use content_media::PgContentMediaRepository;
 mod database;
-mod distribution;
-pub use distribution::PgDistributionRepository;
 mod error;
 mod idempotency;
 mod knowledge;
-mod partner;
-pub use partner::PgPartnerRepository;
-mod partner_admin;
-pub use partner_admin::PgPartnerAdminRepository;
+mod measurement;
 mod migrations;
-mod model_routes;
-pub use model_routes::PgModelRouteRepository;
-mod observation_capture;
-pub use observation_capture::PgObservationCaptureRepository;
-mod observation_completion_recovery;
-pub use observation_completion_recovery::PgObservationCompletionRecoveryRepository;
-mod observation_completion_recovery_jobs;
-pub use observation_completion_recovery_jobs::PgObservationCompletionRecoveryJobRepository;
-mod observation_analysis;
-pub use observation_analysis::PgObservationAnalysisRepository;
-mod observation_extraction;
-pub use observation_extraction::PgObservationExtractionRepository;
-mod provider_conversation_cleanup;
-pub use provider_conversation_cleanup::PgProviderConversationCleanupRepository;
+mod partners;
 mod projects;
-mod publication_lookup;
-pub use publication_lookup::{PgPublicationLookupRepository, PublicationLookupDiscoveryCandidate};
-mod publication_send_authorization;
-pub use publication_send_authorization::PgPublicationSendAuthorizationRepository;
-mod questions;
-pub use questions::PgQuestionRepository;
-mod measurement_report;
-mod measurement_weekly;
-pub use geo_domain::MeasurementWeeklySchedule;
-mod report;
-mod serp;
-pub use serp::{MemorySerpRepository, PgSerpRepository};
+mod publishing;
 mod scope;
 
+pub use accounts::{PgAuthRepository, PgChannelJobRepository, PgChannelRepository, bootstrap};
 pub use agent::{PgAgentRepository, QueuedAgentRun};
-pub use auth::PgAuthRepository;
 pub use config::{DatabaseConfig, DatabaseConfigError};
+pub use content::{
+    ContentDispatchCandidate, ContentDispatchLease, PgContentMediaRepository, PgContentRepository,
+};
 pub use database::{Database, HealthCheck};
 pub use error::PersistenceError;
+pub use geo_domain::MeasurementWeeklySchedule;
 pub use idempotency::PgIdempotencyStore;
 pub use knowledge::PgKnowledgeRepository;
-pub use migrations::{MIGRATOR, MigrationMetadata, embedded_migrations, migration_metadata};
-pub use projects::{ContentBootstrapLease, PendingContentCycle, PgProjectRepository};
-pub use report::PgReportRepository;
+pub use measurement::{
+    MemorySerpRepository, PgObservationAnalysisRepository, PgObservationCaptureRepository,
+    PgObservationCompletionRecoveryJobRepository, PgObservationCompletionRecoveryRepository,
+    PgObservationExtractionRepository, PgProjectSerpSettingsRepository,
+    PgProviderConversationCleanupRepository, PgQuestionRepository, PgReportRepository,
+    PgSerpRepository,
+};
+pub use migrations::MIGRATOR;
+pub use partners::{PgPartnerAdminRepository, PgPartnerRepository};
+pub use projects::{
+    ContentBootstrapLease, PendingContentCycle, PgModelRouteRepository,
+    PgProjectAiSettingsRepository, PgProjectRepository,
+};
+pub use publishing::{
+    PgConnectorCapabilityRepository, PgContentDistributionRequestRepository,
+    PgDistributionRepository, PgPublicationLookupRepository,
+    PgPublicationSendAuthorizationRepository, PublicationLookupDiscoveryCandidate,
+};
 pub use scope::set_local_scope;
-mod project_ai_settings;
-pub use project_ai_settings::PgProjectAiSettingsRepository;
-mod project_serp_settings;
-pub use project_serp_settings::PgProjectSerpSettingsRepository;

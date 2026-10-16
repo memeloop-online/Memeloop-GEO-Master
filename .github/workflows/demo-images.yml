@@ -27,6 +27,7 @@ on:
       - packages/browser-runner/package-lock.json
       - packages/browser-runner/src/observation-extraction-prompt.txt
       - packages/browser-runner/src/observation-extraction-prompt-v2.txt
+      - packages/browser-runner/src/observation-extraction-prompt-v3.txt
 
 permissions:
   contents: read
@@ -70,6 +71,7 @@ jobs:
               - 'packages/browser-runner/package.json'
               - 'packages/browser-runner/src/observation-extraction-prompt.txt'
               - 'packages/browser-runner/src/observation-extraction-prompt-v2.txt'
+              - 'packages/browser-runner/src/observation-extraction-prompt-v3.txt'
               - 'scripts/bundle-agent.mjs'
             web:
               - '.github/workflows/demo-images.yml'

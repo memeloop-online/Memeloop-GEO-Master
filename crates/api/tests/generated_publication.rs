@@ -20,12 +20,12 @@ use geo_domain::{
     ContentItemStatus, ContentRevision, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID,
     DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
     DocumentManifestPlanRequest, DocumentManifestState, DocumentScope, EvidenceRef, Fact,
-    FreezeDistribution, ImportAcceptance, ImportBatchAcceptance, ImportItem, KnowledgeAskResult,
-    KnowledgeCapability, KnowledgeOverview, KnowledgePurpose, KnowledgeRelease,
-    KnowledgeRepository, KnowledgeSearchRequest, KnowledgeSearchResult, MemoryAuthRepository,
-    MemoryKnowledgeRepository, MemoryProjectRepository, PlatformPlacement, PreparedDistribution,
-    Product, ProjectCreate, ProjectSettings, Source, SourceDetail, SourceKind, SourceVersion,
-    StoredObject, StructuredDocument, TenantScope, UploadSession, UploadSessionCommand, sha256_hex,
+    FreezeDistribution, ImportAcceptance, ImportBatchAcceptance, ImportItem, KnowledgeCapability,
+    KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
+    MemoryAuthRepository, MemoryKnowledgeRepository, MemoryProjectRepository, PlatformPlacement,
+    PreparedDistribution, Product, ProjectCreate, ProjectSettings, Source, SourceDetail,
+    SourceKind, SourceVersion, StoredObject, StructuredDocument, TenantScope, UploadSession,
+    UploadSessionCommand, sha256_hex,
 };
 use geo_provider::SecretEnvelope;
 use serde_json::json;
@@ -334,20 +334,6 @@ impl KnowledgeRepository for RevokingKnowledge {
             .plan_document_manifest(scope, request, document_scope)
             .await
     }
-    async fn search(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, AppError> {
-        self.inner.search(scope, request).await
-    }
-    async fn ask(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeAskResult, AppError> {
-        self.inner.ask(scope, request).await
-    }
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError> {
         self.inner.overview(scope).await
     }
@@ -558,7 +544,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     let revision = ContentRevision {
         revision_id: Uuid::new_v4(),
@@ -832,6 +818,8 @@ async fn fixture_command_never_opens_a_runner_context_or_claims() {
 #[tokio::test]
 async fn generated_publication_uses_frozen_revision_bytes_and_claims_once() {
     let fixture = frozen_fixture(false).await;
+    assert_eq!(fixture.revision.document.schema_version, 2);
+    assert!(!fixture.revision.document.requires_rich_publication());
     let expected = fixture.revision.markdown.clone();
     let result = execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
         .await

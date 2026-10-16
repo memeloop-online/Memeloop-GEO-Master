@@ -6,6 +6,7 @@ import { fromRichNode, toRichNode } from "./richContentAdapter";
 
 const prior: StructuredDocument = {
   title: "Guide",
+  schema_version: 2,
   blocks: [
     {
       block_id: "block-1",
@@ -75,11 +76,11 @@ describe("generated rich content adapter", () => {
     ).toThrow();
   });
 
-  it("keeps legacy documents exactly unchanged when opened and saved without a rich edit", () => {
+  it("roundtrips current plain documents with their schema version", () => {
     expect(editorToDocument(documentToEditor(prior), prior)).toEqual(prior);
   });
 
-  it("upgrades only an edited block and keeps its identity and citations", () => {
+  it("stores formatting in the edited rich block and keeps its identity and citations", () => {
     const edited = documentToEditor(prior);
     edited.content![0].content = [
       { type: "text", text: "Before", marks: [{ type: "bold" }] },
@@ -108,6 +109,7 @@ describe("generated rich content adapter", () => {
   it("does not flatten styled list captions or nested list items", () => {
     const original: StructuredDocument = {
       title: "Evidence list",
+      schema_version: 2,
       blocks: [
         {
           block_id: "list-1",

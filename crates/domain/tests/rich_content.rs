@@ -64,43 +64,31 @@ fn placement(formats: Vec<&str>) -> PlatformPlacement {
     }
 }
 #[test]
-fn legacy_serialization_markdown_and_variant_identity_are_frozen() {
+fn simple_v2_blocks_round_trip_escape_text_and_use_plain_publication() {
     let block_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-    let raw = json!({"title":"Old *title*","blocks":[
+    let raw = json!({"title":"A *title*","schema_version":2,"blocks":[
         {"block_id":block_id,"kind":"heading","text":"A&B","citation_ids":[],"items":[]},
-        {"block_id":Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),"kind":"list","text":"Lead","citation_ids":[],"items":["one","two"]}
+        {"block_id":Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),"kind":"list","text":"Lead","citation_ids":[],"items":["one","two"]},
+        {"block_id":Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),"kind":"paragraph","text":"Literal <em> & [text]","citation_ids":[],"items":[]}
     ]});
     let document: StructuredDocument = serde_json::from_value(raw.clone()).unwrap();
+    document.validate(&[]).unwrap();
+    assert!(!document.requires_rich_publication());
     assert_eq!(serde_json::to_value(&document).unwrap(), raw);
-    // Byte-level baseline from pre-v2 HEAD `StructuredDocument` and
-    // `ContentBlock` field order, including omitted optional fields.
-    assert_eq!(
-        serde_json::to_string(&document).unwrap(),
-        "{\"title\":\"Old *title*\",\"blocks\":[{\"block_id\":\"11111111-1111-1111-1111-111111111111\",\"kind\":\"heading\",\"text\":\"A&B\",\"citation_ids\":[],\"items\":[]},{\"block_id\":\"22222222-2222-2222-2222-222222222222\",\"kind\":\"list\",\"text\":\"Lead\",\"citation_ids\":[],\"items\":[\"one\",\"two\"]}]}"
-    );
     assert_eq!(
         document.markdown(),
-        "# Old *title*\n\n## A&B\n\nLead\n\n- one\n- two"
+        "# A \\*title\\*\n\n## A&amp;B\n\nLead\n\n- one\n- two\n\nLiteral &lt;em\\> &amp; \\[text\\]"
     );
     assert_eq!(
         document.html(&[]).unwrap(),
-        "<h1>Old *title*</h1><h2>A&amp;B</h2><p>Lead</p><ul><li><p>one</p></li><li><p>two</p></li></ul>"
+        "<h1>A *title*</h1><h2>A&amp;B</h2><p>Lead</p><ul><li><p>one</p></li><li><p>two</p></li></ul><p>Literal &lt;em&gt; &amp; [text]</p>"
     );
     let revision = revision(document);
-    let variant = prepare_variant(&revision, &placement(vec!["faq"])).unwrap();
+    let platform = placement(vec!["faq"]);
+    let variant = prepare_variant(&revision, &platform).unwrap();
     assert_eq!(variant.policy_version, CHANNEL_VARIANT_POLICY);
     assert_eq!(variant.markdown, revision.markdown);
-    // Independently derived from pre-v2 HEAD `distribution.rs` digest/identity:
-    // SHA-256 of length-prefixed old title/Markdown, then frozen revision ID,
-    // placement, policy and hash, with UUID v5 bits.
-    assert_eq!(
-        variant.payload_hash,
-        "11e0eb7085fd3153b55342394a3398a48d18c6e44814e336631b9147fbe2d0b7"
-    );
-    assert_eq!(
-        variant.variant_id.to_string(),
-        "c6afef61-ae57-5843-bae4-6e02accf4d24"
-    );
+    assert_eq!(prepare_variant(&revision, &platform).unwrap(), variant);
     assert!(variant.rich_payload.is_none());
     let saved = serde_json::to_value(&variant).unwrap();
     assert!(saved.get("rich_payload").is_none());
@@ -108,6 +96,43 @@ fn legacy_serialization_markdown_and_variant_identity_are_frozen() {
         serde_json::from_value::<geo_domain::ChannelVariant>(saved).unwrap(),
         variant
     );
+    let mut changed = revision.clone();
+    changed.document.blocks[2].text.push('!');
+    changed.markdown = changed.document.markdown();
+    let changed_variant = prepare_variant(&changed, &platform).unwrap();
+    assert_ne!(variant.payload_hash, changed_variant.payload_hash);
+    assert_ne!(variant.variant_id, changed_variant.variant_id);
+}
+
+#[test]
+fn documents_require_an_explicit_current_schema_and_known_fields() {
+    let document = valid(paragraph("Current"));
+    assert!(document.requires_rich_publication());
+    let raw = serde_json::to_value(&document).unwrap();
+    let mut missing = raw.clone();
+    missing.as_object_mut().unwrap().remove("schema_version");
+    assert!(serde_json::from_value::<StructuredDocument>(missing).is_err());
+    let mut null = raw.clone();
+    null["schema_version"] = Value::Null;
+    assert!(serde_json::from_value::<StructuredDocument>(null).is_err());
+    for version in [0, 1, 3] {
+        let mut unsupported = raw.clone();
+        unsupported["schema_version"] = json!(version);
+        assert_eq!(
+            serde_json::from_value::<StructuredDocument>(unsupported)
+                .unwrap()
+                .validate(&[])
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+    let mut unknown = raw.clone();
+    unknown["unknown"] = json!(true);
+    assert!(serde_json::from_value::<StructuredDocument>(unknown).is_err());
+    let mut unknown_block = raw;
+    unknown_block["blocks"][0]["unknown"] = json!(true);
+    assert!(serde_json::from_value::<StructuredDocument>(unknown_block).is_err());
 }
 
 fn media_scope() -> TenantScope {
@@ -543,7 +568,7 @@ fn markdown_ordered_list_continuations_follow_marker_width() {
     assert!(large.markdown().contains("<ol start=\"4294967295\">"));
 }
 #[test]
-fn markdown_encodes_literal_html_and_entity_text_without_affecting_legacy() {
+fn markdown_encodes_literal_html_and_entity_text() {
     let document = valid(paragraph(
         "Literal <script>alert(1)</script> & <em>x</em> &lt;",
     ));
@@ -589,7 +614,7 @@ fn media_references_are_structurally_valid_but_require_a_media_publication_adapt
         "object_id":object_id,"object_version":2,
         "sha256":"0123456789abcdef".repeat(4),"alt":"A < device","caption":"Caption & detail"
     }}));
-    doc.validate_structure(&[]).unwrap();
+    doc.validate(&[]).unwrap();
     assert_eq!(doc.media_references()[0].object_id, object_id);
     assert!(
         doc.blocks[0]
@@ -611,7 +636,7 @@ fn media_references_are_structurally_valid_but_require_a_media_publication_adapt
     );
 }
 #[test]
-fn bundle_rendering_resolves_only_typed_media_and_preserves_legacy_output() {
+fn bundle_rendering_resolves_only_typed_media_and_preserves_literal_text() {
     let object_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
     let sha256 = "0123456789abcdef".repeat(4);
     let media = json!({"type":"media","attrs":{
@@ -785,20 +810,20 @@ fn rich_distribution_requires_explicit_format_and_separate_policy() {
         prepare_rich_variant(&rich_revision, &placement(vec![RICH_MARKDOWN_FORMAT])).unwrap();
     assert_eq!(variant.policy_version, RICH_CHANNEL_VARIANT_POLICY);
     assert_eq!(variant.markdown, rich_revision.markdown);
-    let legacy = StructuredDocument {
-        title: "Legacy".into(),
+    let simple = StructuredDocument {
+        title: "Simple".into(),
         blocks: vec![ContentBlock {
             block_id: Uuid::new_v4(),
             kind: ContentBlockKind::Paragraph,
-            text: "old".into(),
+            text: "Current".into(),
             citation_ids: vec![],
             items: vec![],
             rich: None,
         }],
-        schema_version: None,
+        schema_version: 2,
     };
     assert_eq!(
-        prepare_variant(&revision(legacy), &placement(vec!["faq"]))
+        prepare_variant(&revision(simple), &placement(vec!["faq"]))
             .unwrap()
             .policy_version,
         CHANNEL_VARIANT_POLICY

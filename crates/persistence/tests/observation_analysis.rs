@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
-async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scoped() {
+async fn durable_analysis_and_original_evidence_remain_scoped() {
     let url = std::env::var("GEO_TEST_DATABASE_URL").expect("disposable PostgreSQL URL required");
     let config = DatabaseConfig::from_url(url).expect("valid database URL");
     let database = Database::connect_and_migrate(&config)
@@ -43,7 +43,6 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
     let other = TenantScope::new(operator.into(), tenant.into(), Some(other_project.into()));
     let jobs = PgChannelJobRepository::from_database(&database);
     let captures = PgObservationCaptureRepository::from_database(&database);
-    let store = PgObservationAnalysisRepository::from_database(&database);
     let (target_id, attempt_id, account_id, capture_id) = (
         Uuid::new_v4(),
         Uuid::new_v4(),
@@ -164,412 +163,6 @@ async fn analysis_intent_claim_terminal_replay_and_original_evidence_remain_scop
             .unwrap()
             .is_empty()
     );
-    let hash = sha256_hex(b"synthetic-request");
-    let empty_history = store
-        .admission_history_snapshot(&scope, target_id, attempt_id)
-        .await
-        .unwrap();
-    let queued = store
-        .create(&scope, "first-analysis", &hash, request.clone(), created_at)
-        .await
-        .unwrap();
-    assert_eq!(queued.state, ObservationAnalysisState::Queued);
-    let queued_history = store
-        .admission_history_snapshot(&scope, target_id, attempt_id)
-        .await
-        .unwrap();
-    assert_ne!(empty_history, queued_history);
-    use geo_domain::{AutomaticExtractionAdmission, ObservationExtractionRepository};
-    let extraction = geo_persistence::PgObservationExtractionRepository::from_database(&database);
-    let automatic_request = geo_domain::ObservationExtractionRequest {
-        target_id,
-        attempt_id,
-        source_capture_id: Some(capture_id),
-        source_evidence_index: None,
-        manual_revision_id: None,
-        source_sha256: request.source_sha256.clone(),
-        prompt_version: "extract.v2".into(),
-        parser_version: "ground.v2".into(),
-        policy_version: "automatic.v1".into(),
-    };
-    assert_eq!(
-        extraction
-            .admit_automatic(&scope, automatic_request.clone(), created_at)
-            .await
-            .unwrap(),
-        AutomaticExtractionAdmission::DeferredManual
-    );
-    assert!(
-        !store
-            .has_unresolved_for_attempt(&other, target_id, attempt_id)
-            .await
-            .unwrap()
-    );
-    let mut duplicate = request.clone();
-    duplicate.revision_id = Uuid::new_v4();
-    assert_eq!(
-        queued,
-        store
-            .create(
-                &scope,
-                "first-analysis",
-                &hash,
-                duplicate.clone(),
-                created_at
-            )
-            .await
-            .unwrap()
-    );
-    duplicate.parser_version = "ground.v2".into();
-    assert_eq!(
-        store
-            .create(&scope, "first-analysis", &hash, duplicate, created_at)
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::Conflict
-    );
-    assert!(
-        store
-            .get(&other, request.revision_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        store
-            .claim(&other, request.revision_id, created_at)
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::NotFound
-    );
-    assert!(
-        store
-            .create(&other, "first-analysis", &hash, request.clone(), created_at)
-            .await
-            .is_err()
-    );
-
-    let (left, right) = tokio::join!(
-        store.claim(&scope, request.revision_id, created_at),
-        store.claim(&scope, request.revision_id, created_at),
-    );
-    let claims: Vec<_> = [left.unwrap(), right.unwrap()]
-        .into_iter()
-        .flatten()
-        .collect();
-    assert_eq!(claims.len(), 1);
-    let claim = &claims[0];
-    let running_history = store
-        .admission_history_snapshot(&scope, target_id, attempt_id)
-        .await
-        .unwrap();
-    assert_ne!(queued_history, running_history);
-    assert!(
-        store
-            .record_inference_resolved(&scope, request.revision_id, Uuid::new_v4())
-            .await
-            .is_err()
-    );
-    store
-        .record_inference_resolved(&scope, request.revision_id, claim.claim_token)
-        .await
-        .unwrap();
-    let reopened = PgObservationAnalysisRepository::from_database(&database);
-    let received_history = reopened
-        .admission_history_snapshot(&scope, target_id, attempt_id)
-        .await
-        .unwrap();
-    assert_ne!(running_history, received_history);
-    assert!(
-        reopened
-            .get(&scope, request.revision_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .inference_resolved
-    );
-    assert_eq!(
-        extraction
-            .admit_automatic(&scope, automatic_request.clone(), created_at)
-            .await
-            .unwrap(),
-        AutomaticExtractionAdmission::DeferredManual
-    );
-    let result = ObservationAnalysisResult {
-        config_revision: None,
-        actual_model: Some("synthetic".into()),
-        candidate_json: Some(r#"{"decision":"unverified"}"#.into()),
-        outcome: ObservationAnalysisOutcome::Unverified {
-            reason: "model_unverified".into(),
-        },
-        prompt_tokens: 1,
-        completion_tokens: 1,
-    };
-    assert_eq!(
-        store
-            .finish(
-                &scope,
-                request.revision_id,
-                Uuid::new_v4(),
-                result.clone(),
-                created_at
-            )
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::Conflict
-    );
-    assert_eq!(
-        store
-            .finish(
-                &other,
-                request.revision_id,
-                claim.claim_token,
-                result.clone(),
-                created_at
-            )
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::NotFound
-    );
-    let analyzed_at = created_at + Duration::seconds(1);
-    let terminal = store
-        .finish(
-            &scope,
-            request.revision_id,
-            claim.claim_token,
-            result.clone(),
-            analyzed_at,
-        )
-        .await
-        .unwrap();
-    assert_eq!(terminal.state, ObservationAnalysisState::Completed);
-    assert_eq!(terminal.request.observed_at, observed_at);
-    assert_eq!(terminal.analyzed_at, Some(analyzed_at));
-    let completed_history = reopened
-        .admission_history_snapshot(&scope, target_id, attempt_id)
-        .await
-        .unwrap();
-    assert_ne!(received_history, completed_history);
-    for snapshot in [
-        empty_history,
-        queued_history,
-        running_history,
-        received_history,
-    ] {
-        assert_eq!(
-            extraction
-                .admit_automatic_with_history(
-                    &scope,
-                    automatic_request.clone(),
-                    analyzed_at,
-                    &snapshot,
-                )
-                .await
-                .unwrap(),
-            AutomaticExtractionAdmission::DeferredHistoryChanged
-        );
-    }
-    assert!(matches!(
-        extraction
-            .admit_automatic(&scope, automatic_request.clone(), analyzed_at)
-            .await
-            .unwrap(),
-        AutomaticExtractionAdmission::Intent(_)
-    ));
-    assert_eq!(
-        terminal,
-        store
-            .finish(
-                &scope,
-                request.revision_id,
-                claim.claim_token,
-                result.clone(),
-                analyzed_at
-            )
-            .await
-            .unwrap()
-    );
-    let mut changed = result;
-    changed.completion_tokens = 2;
-    assert_eq!(
-        store
-            .finish(
-                &scope,
-                request.revision_id,
-                claim.claim_token,
-                changed,
-                analyzed_at
-            )
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::Conflict
-    );
-    assert!(
-        store
-            .claim(&scope, request.revision_id, analyzed_at)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let restarted = PgObservationAnalysisRepository::from_database(&database);
-    assert_eq!(
-        restarted.get(&scope, request.revision_id).await.unwrap(),
-        Some(terminal)
-    );
-    let mut legacy = request.clone();
-    legacy.revision_id = Uuid::new_v4();
-    legacy.source = ObservationAnalysisSource::AttemptEvidence { evidence_index: 0 };
-    restarted
-        .create(&scope, "legacy-analysis", &hash, legacy.clone(), created_at)
-        .await
-        .unwrap();
-    let page = restarted
-        .list_for_attempt(&scope, target_id, attempt_id, None, 1)
-        .await
-        .unwrap();
-    assert_eq!(page.len(), 1);
-    assert_eq!(
-        restarted
-            .list_for_attempt(
-                &scope,
-                target_id,
-                attempt_id,
-                Some(page[0].request.revision_id),
-                1
-            )
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(
-        restarted
-            .list_for_attempt(
-                &other,
-                target_id,
-                attempt_id,
-                Some(page[0].request.revision_id),
-                1
-            )
-            .await
-            .is_err()
-    );
-    let stale_running = restarted
-        .claim(&scope, legacy.revision_id, created_at)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut stale_queued = request.clone();
-    stale_queued.revision_id = Uuid::new_v4();
-    restarted
-        .create(
-            &scope,
-            "stale-queued",
-            &hash,
-            stale_queued.clone(),
-            created_at,
-        )
-        .await
-        .unwrap();
-    let cutoff = created_at + chrono::Duration::seconds(180);
-    restarted
-        .interrupt_stale(&other, target_id, attempt_id, cutoff, cutoff)
-        .await
-        .unwrap();
-    assert_eq!(
-        restarted
-            .get(&scope, legacy.revision_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        ObservationAnalysisState::Running
-    );
-    restarted
-        .interrupt_stale(&scope, target_id, attempt_id, cutoff, cutoff)
-        .await
-        .unwrap();
-    for id in [legacy.revision_id, stale_queued.revision_id] {
-        let interrupted = restarted.get(&scope, id).await.unwrap().unwrap();
-        assert_eq!(interrupted.state, ObservationAnalysisState::Completed);
-        assert!(!interrupted.inference_resolved);
-        assert!(interrupted.blocks_automatic_admission());
-        assert!(matches!(interrupted.result.unwrap().outcome,
-            ObservationAnalysisOutcome::Failed { code } if code == "analysis_interrupted"));
-        assert!(restarted.claim(&scope, id, cutoff).await.unwrap().is_none());
-    }
-    assert!(
-        restarted
-            .has_unresolved_for_attempt(&scope, target_id, attempt_id)
-            .await
-            .unwrap()
-    );
-    assert!(
-        restarted
-            .record_inference_resolved(&scope, legacy.revision_id, stale_running.claim_token)
-            .await
-            .is_err()
-    );
-    // An existing automatic intent wins even with newer unresolved manual work.
-    assert!(matches!(
-        extraction
-            .admit_automatic(&scope, automatic_request.clone(), cutoff)
-            .await
-            .unwrap(),
-        AutomaticExtractionAdmission::Intent(_)
-    ));
-    let mut fresh_source = captures
-        .get(&scope, capture_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .input;
-    fresh_source.capture_id = Uuid::new_v4();
-    fresh_source.runner_session_id = Uuid::new_v4();
-    let fresh_receipt = captures.save(&scope, fresh_source).await.unwrap();
-    let mut fresh_request = automatic_request;
-    fresh_request.source_capture_id = Some(fresh_receipt.capture_id);
-    assert_eq!(
-        extraction
-            .admit_automatic(&scope, fresh_request, cutoff)
-            .await
-            .unwrap(),
-        AutomaticExtractionAdmission::DeferredManual
-    );
-    assert!(
-        restarted
-            .finish(
-                &scope,
-                legacy.revision_id,
-                stale_running.claim_token,
-                ObservationAnalysisResult {
-                    config_revision: None,
-                    actual_model: None,
-                    candidate_json: None,
-                    outcome: ObservationAnalysisOutcome::Failed {
-                        code: "late".into()
-                    },
-                    prompt_tokens: 0,
-                    completion_tokens: 0
-                },
-                cutoff
-            )
-            .await
-            .is_err()
-    );
-    legacy.revision_id = Uuid::new_v4();
-    legacy.source_sha256 = "0".repeat(64);
-    assert!(
-        restarted
-            .create(&scope, "tampered", &hash, legacy, created_at)
-            .await
-            .is_err()
-    );
     assert_manual_durable(&database, &scope, &other, &request, created_at).await;
     assert_grounded_projection(&database, &scope, &other, &request, created_at).await;
     let saved = jobs.get_target(&scope, target_id).await.unwrap();
@@ -609,7 +202,7 @@ async fn assert_manual_durable(
         );
         let admitted = left.unwrap();
         assert_eq!(admitted, right.unwrap());
-        let intent = admitted.intent.unwrap();
+        let intent = admitted.intent;
         assert_eq!(intent.request.manual_revision_id, Some(request.revision_id));
         assert_eq!(
             intent.request.source_evidence_index,
@@ -631,11 +224,23 @@ async fn assert_manual_durable(
                 .await
                 .is_err()
         );
+        let mut tampered = request.clone();
+        tampered.revision_id = Uuid::new_v4();
+        tampered.source_sha256 = "0".repeat(64);
+        assert!(
+            extraction
+                .admit_manual(scope, &format!("{key}-tampered"), &digest, tampered, at)
+                .await
+                .is_err()
+        );
+        assert!(
+            analyses
+                .get(other, request.revision_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let late = at + Duration::seconds(400);
-        analyses
-            .interrupt_stale(scope, request.target_id, request.attempt_id, late, late)
-            .await
-            .unwrap();
         assert_eq!(
             analyses
                 .get(scope, request.revision_id)
@@ -644,13 +249,6 @@ async fn assert_manual_durable(
                 .unwrap()
                 .state,
             ObservationAnalysisState::Queued
-        );
-        assert!(
-            analyses
-                .claim(scope, request.revision_id, late)
-                .await
-                .unwrap()
-                .is_none()
         );
         let (left, right) = tokio::join!(
             extraction.claim(scope, intent.intent_id, late),
@@ -669,12 +267,6 @@ async fn assert_manual_durable(
                 .unwrap()
                 .unwrap()
                 .inference_resolved
-        );
-        assert!(
-            analyses
-                .record_inference_resolved(scope, request.revision_id, token)
-                .await
-                .is_err()
         );
         let response = ObservationExtractionResponse {
             model_text: "synthetic completion".into(),
@@ -725,8 +317,20 @@ async fn assert_manual_durable(
             completion_tokens: 9,
         };
         assert!(
-            analyses
-                .finish(scope, request.revision_id, token, result.clone(), late)
+            restarted
+                .complete(
+                    scope,
+                    intent.intent_id,
+                    Uuid::new_v4(),
+                    result.clone(),
+                    late
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            restarted
+                .complete(other, intent.intent_id, token, result.clone(), late)
                 .await
                 .is_err()
         );
@@ -759,7 +363,7 @@ async fn assert_manual_durable(
             .admit_manual(scope, &format!("{key}-new"), &digest, next, late)
             .await
             .unwrap();
-        let next_intent = next.intent.unwrap();
+        let next_intent = next.intent;
         assert_ne!(next_intent.intent_key, intent.intent_key);
         let claim = restarted
             .claim(scope, next_intent.intent_id, late)
@@ -827,7 +431,7 @@ async fn assert_manual_durable(
                 )
                 .await
                 .unwrap();
-            let intent = admission.intent.unwrap();
+            let intent = admission.intent;
             assert_eq!(
                 restarted
                     .status_for_attempt(scope, source.target_id, source.attempt_id)
@@ -889,20 +493,6 @@ async fn assert_manual_durable(
                 assert_eq!((result.prompt_tokens, result.completion_tokens), (17, 19));
             }
         }
-        // Replay of a pre-migration analysis must not attach or schedule an intent.
-        let mut legacy = request;
-        legacy.revision_id = Uuid::new_v4();
-        let legacy_key = format!("{key}-legacy");
-        let prior = analyses
-            .create(scope, &legacy_key, &digest, legacy.clone(), late)
-            .await
-            .unwrap();
-        let replay = restarted
-            .admit_manual(scope, &legacy_key, &digest, legacy, late)
-            .await
-            .unwrap();
-        assert_eq!(replay.revision, prior);
-        assert!(replay.intent.is_none());
     }
 }
 
@@ -913,7 +503,9 @@ async fn assert_grounded_projection(
     request: &ObservationAnalysisRequest,
     created_at: chrono::DateTime<Utc>,
 ) {
+    use geo_domain::ObservationExtractionRepository;
     let store = PgObservationAnalysisRepository::from_database(database);
+    let extraction = geo_persistence::PgObservationExtractionRepository::from_database(database);
     let pair = (request.target_id, request.attempt_id);
     let first_at = created_at + Duration::seconds(300);
     let tied_at = first_at + Duration::seconds(1);
@@ -930,8 +522,8 @@ async fn assert_grounded_projection(
     ] {
         let mut revision_request = request.clone();
         revision_request.revision_id = id;
-        store
-            .create(
+        let admitted = extraction
+            .admit_manual(
                 scope,
                 &format!("projection-{id}"),
                 &sha256_hex(b"projection"),
@@ -940,15 +532,41 @@ async fn assert_grounded_projection(
             )
             .await
             .unwrap();
-        let claim = store.claim(scope, id, accepted).await.unwrap().unwrap();
-        store.finish(scope, id, claim.claim_token, ObservationAnalysisResult {
+        let intent_id = admitted.intent.intent_id;
+        let claim = extraction
+            .claim(scope, intent_id, accepted)
+            .await
+            .unwrap()
+            .unwrap();
+        extraction
+            .record_response(
+                scope,
+                intent_id,
+                claim.claim_token,
+                geo_domain::ObservationExtractionResponse {
+                    model_text: "Synthetic saved response".into(),
+                    disposition: geo_domain::ObservationExtractionResponseDisposition::Complete,
+                    actual_model: "synthetic".into(),
+                    config_revision: None,
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                },
+                completed,
+            )
+            .await
+            .unwrap();
+        extraction.complete(scope, intent_id, claim.claim_token, ObservationAnalysisResult {
             config_revision: None,
             actual_model: Some("synthetic".into()),
             candidate_json: Some(r#"{"decision":"answer"}"#.into()),
             outcome: ObservationAnalysisOutcome::Grounded {
                 raw_answer: "Synthetic saved response".into(),
                 citations: vec![],
-                audit: json!({"refs":[{"pointer":"/messages/0/content","quote":"Synthetic saved response"}]}),
+                audit: json!({
+                    "source_sha256": request.source_sha256,
+                    "prompt_version": request.prompt_version,
+                    "refs":[{"pointer":"/messages/0/content","quote":"Synthetic saved response"}]
+                }),
             },
             prompt_tokens: 1,
             completion_tokens: 1,

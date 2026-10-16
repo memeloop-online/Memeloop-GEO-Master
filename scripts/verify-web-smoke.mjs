@@ -171,6 +171,7 @@ function fixtureCompletion(body, model) {
       "Generated content must cite the imported public source quote",
     );
     content = {
+      schema_version: 2,
       title: evidenceTitle,
       blocks: [
         {
@@ -190,24 +191,29 @@ function fixtureCompletion(body, model) {
   } else if (system.includes("independent factual checker")) {
     const document = input.document;
     assert(
-      uuidPattern.test(input.title_check_id) && Array.isArray(document?.blocks),
+      document?.schema_version === 2 &&
+        uuidPattern.test(input.title_check_id) &&
+        Array.isArray(document.blocks) &&
+        Array.isArray(input.check_sections),
       "Checker needs the persisted title and blocks",
     );
-    const claims = [
-      {
-        block_id: input.title_check_id,
-        text: document.title,
-        citation_ids: quotes.map((entry) => entry.chunk_id),
-      },
-      ...document.blocks.map((block) => ({
-        block_id: block.block_id,
-        text: block.text,
-        citation_ids: block.citation_ids,
-      })),
-    ];
+    const claims = input.check_sections.map(([blockId, text]) => ({
+      block_id: blockId ?? input.title_check_id,
+      text,
+      citation_ids:
+        blockId === null
+          ? quotes.map((entry) => entry.chunk_id)
+          : document.blocks.find((block) => block.block_id === blockId)
+              ?.citation_ids,
+    }));
     assert(
-      claims.length >= 3 &&
-        claims.every((claim) => uuidPattern.test(claim.block_id)),
+      claims.length === document.blocks.length + 1 &&
+        claims.every(
+          (claim) =>
+            uuidPattern.test(claim.block_id) &&
+            typeof claim.text === "string" &&
+            Array.isArray(claim.citation_ids),
+        ),
       "Checker must receive title and every block",
     );
     content = {
@@ -231,6 +237,37 @@ function fixtureCompletion(body, model) {
       content.checks.every((entry) => entry.verdict === "supported"),
       "Fixture refuses claims absent from supplied evidence",
     );
+  } else if (system.includes("source-grounded factual repairer")) {
+    const previous = input.previous_document;
+    assert(
+      previous?.schema_version === 2 &&
+        Array.isArray(previous.blocks) &&
+        previous.blocks.every((block) => uuidPattern.test(block.block_id)) &&
+        Array.isArray(input.blocking_findings) &&
+        input.blocking_findings.length > 0,
+      "Repair needs a complete current document and factual findings",
+    );
+    const source = quotes.find((entry) =>
+      entry.quote.includes(evidenceSentence),
+    );
+    assert(source, "Repair must use the imported public source quote");
+    content = structuredClone(previous);
+    for (const finding of input.blocking_findings) {
+      if (finding.block_id === null) {
+        content.title = evidenceTitle;
+        continue;
+      }
+      const block = content.blocks.find(
+        (entry) => entry.block_id === finding.block_id,
+      );
+      assert(
+        block &&
+          ["heading", "paragraph"].includes(block.kind) &&
+          block.citation_ids.includes(source.chunk_id),
+        "Synthetic repair supports only its cited generated text blocks",
+      );
+      block.text = block.kind === "heading" ? evidenceTitle : evidenceSentence;
+    }
   } else {
     throw new Error("Fixture refuses non-content model requests");
   }
@@ -415,6 +452,7 @@ async function verifyGeneratedRichContent(
   ).find((revision) => revision.revision === 1);
   assert(
     original?.document?.title === evidenceTitle &&
+      original.document.schema_version === 2 &&
       original.document.blocks.length === 2 &&
       original.document.blocks.every(
         (block) =>

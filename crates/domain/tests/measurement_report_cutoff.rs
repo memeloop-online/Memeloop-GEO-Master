@@ -99,10 +99,11 @@ fn delayed_generation_uses_cutoff_without_mutating_evidence_or_frozen_reports() 
 }
 
 #[test]
-fn wrappers_hash_tuple_and_report_id_remain_compatible() {
+fn preview_entry_points_use_current_hash_tuple_and_stable_report_id() {
     let (scope, window, sample) = fixture();
     let cutoff = window.end_at;
-    let legacy = preview_measurement_period(&scope, &window, vec![sample.clone()], cutoff).unwrap();
+    let ai_only =
+        preview_measurement_period(&scope, &window, vec![sample.clone()], cutoff).unwrap();
     for search in [None, Some(vec![])] {
         let wrapped = preview_measurement_period_with_search(
             &scope,
@@ -125,19 +126,18 @@ fn wrappers_hash_tuple_and_report_id_remain_compatible() {
             serde_json::to_vec(&wrapped).unwrap(),
             serde_json::to_vec(&explicit).unwrap()
         );
-        let tuple_bytes = match &explicit.search {
-            Some(section) => serde_json::to_vec(&(&window, &explicit.samples, section)).unwrap(),
-            None => {
-                assert_eq!(legacy, explicit);
-                assert!(
-                    serde_json::to_value(&explicit)
-                        .unwrap()
-                        .get("search")
-                        .is_none()
-                );
-                serde_json::to_vec(&(&window, &explicit.samples)).unwrap()
-            }
-        };
+        assert_eq!(explicit.search.is_some(), search.is_some());
+        if explicit.search.is_none() {
+            assert_eq!(ai_only, explicit);
+            assert!(
+                serde_json::to_value(&explicit)
+                    .unwrap()
+                    .get("search")
+                    .is_none()
+            );
+        }
+        let tuple_bytes =
+            serde_json::to_vec(&(&window, &explicit.samples, &explicit.search)).unwrap();
         assert_eq!(
             explicit.input_hash,
             hex::encode(Sha256::digest(tuple_bytes))

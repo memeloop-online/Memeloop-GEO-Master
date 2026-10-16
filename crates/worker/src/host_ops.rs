@@ -29,13 +29,12 @@ use crate::host::{
     ContentMediaListRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
     DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
     DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
-    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeSearchRequest,
-    KnowledgeSearchResult, KnowledgeTextReadRequest, KnowledgeTextReviseRequest,
-    ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest, MeasurementPlanCreateRequest,
-    MeasurementPlanReadRequest, ModelCompletionRequest, ProjectCurrentRequest,
-    ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest, PublishRequest,
-    QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest, ReportPreviewRequest,
-    ReportReduceRequest, validate_question_create,
+    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeTextReadRequest,
+    KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
+    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
+    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
+    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
+    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -850,47 +849,6 @@ pub async fn op_host_knowledge_import_status_v1(
     Ok(encode(op, &progress)?)
 }
 
-/// Evidence retrieval restricted to the run's frozen knowledge release.
-///
-/// A bridge that reports the retrieval capability as missing fails the op: an
-/// empty evidence list must never be mistaken for "the knowledge base says
-/// nothing", because the two have opposite meanings for a sourced answer.
-#[op2]
-#[string]
-pub async fn op_host_knowledge_search_v1(
-    state: Rc<RefCell<OpState>>,
-    #[string] request: String,
-) -> Result<String, JsErrorBox> {
-    let op = HostOp::KnowledgeSearch;
-    let bridge = bridge(&state.borrow())?;
-    let request = parse_request::<KnowledgeSearchRequest>(op, &request)?;
-    if request.limit == 0 || request.limit > 50 {
-        return Err(js_error(HostOpError::invalid_request(
-            op,
-            "limit must be between 1 and 50",
-        )));
-    }
-    let result = bridge
-        .invoke_recorded(op, &request.clone(), |bridge| async move {
-            bridge
-                .capabilities()
-                .knowledge_search(bridge.scope(), request)
-                .await
-        })
-        .await?;
-    if let Some(reason) = result.capability_missing.clone() {
-        return Err(js_error(HostOpError::capability_missing(op, reason)));
-    }
-    Ok(encode(
-        op,
-        &KnowledgeSearchResult {
-            knowledge_release_id: result.knowledge_release_id,
-            evidence: result.evidence,
-            capability_missing: None,
-        },
-    )?)
-}
-
 #[op2]
 #[string]
 pub async fn op_host_knowledge_text_read_v1(
@@ -1109,7 +1067,6 @@ pub async fn op_host_report_reduce_v1(
 /// enumerating registered ops from JavaScript.
 pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ModelComplete.op_name(),
-    HostOp::KnowledgeSearch.op_name(),
     HostOp::KnowledgeTextRead.op_name(),
     HostOp::KnowledgeTextRevise.op_name(),
     HostOp::KnowledgeImportAttachments.op_name(),

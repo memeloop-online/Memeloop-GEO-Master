@@ -1,9 +1,9 @@
 use chrono::Utc;
 use geo_domain::{
-    ChannelJobRepository, ChannelTarget, ChannelTargetInput, ObservationAnalysisOutcome,
-    ObservationAnalysisResult, ObservationCaptureInput, ObservationCaptureRepository,
-    ObservationCaptureSnapshot, ObservationExtractionInterruption, ObservationExtractionRepository,
-    ObservationExtractionRequest, ObservationExtractionResponse,
+    AutomaticExtractionAdmission, ChannelJobRepository, ChannelTarget, ChannelTargetInput,
+    ObservationAnalysisOutcome, ObservationAnalysisResult, ObservationCaptureInput,
+    ObservationCaptureRepository, ObservationCaptureSnapshot, ObservationExtractionInterruption,
+    ObservationExtractionRepository, ObservationExtractionRequest, ObservationExtractionResponse,
     ObservationExtractionResponseDisposition, ObservationExtractionState,
     StandaloneMeasurementPlan, TenantScope, sha256_hex,
 };
@@ -175,7 +175,13 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         parser_version: "ground.v1".into(),
         policy_version: "automatic.v1".into(),
     };
-    let intent = store.enqueue(&scope, request.clone(), now).await.unwrap();
+    let AutomaticExtractionAdmission::Intent(intent) = store
+        .admit_automatic(&scope, request.clone(), now)
+        .await
+        .unwrap()
+    else {
+        panic!("fresh source must be admitted");
+    };
     assert!(!source_is_discovered(&store, receipt.stored_at, capture_id).await);
     // Another capture of identical bytes is not the same extraction identity.
     let mut equal_source = captures
@@ -226,16 +232,20 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
     );
     assert_eq!(
         store
-            .enqueue(&scope, request.clone(), now)
+            .admit_automatic(&scope, request.clone(), now)
             .await
-            .unwrap()
-            .intent_id,
-        intent.intent_id
+            .unwrap(),
+        AutomaticExtractionAdmission::Intent(intent.clone())
     );
-    assert!(store.enqueue(&other, request.clone(), now).await.is_err());
+    assert!(
+        store
+            .admit_automatic(&other, request.clone(), now)
+            .await
+            .is_err()
+    );
     let mut wrong = request.clone();
     wrong.attempt_id = Uuid::new_v4();
-    assert!(store.enqueue(&scope, wrong, now).await.is_err());
+    assert!(store.admit_automatic(&scope, wrong, now).await.is_err());
     let (a, b) = tokio::join!(
         store.claim(&scope, intent.intent_id, now),
         store.claim(&scope, intent.intent_id, now)
@@ -354,9 +364,22 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
             .await
             .is_err()
     );
+    let mut second_source = captures
+        .get(&scope, capture_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .input;
+    second_source.capture_id = Uuid::new_v4();
+    second_source.runner_session_id = Uuid::new_v4();
+    let second_receipt = captures.save(&scope, second_source).await.unwrap();
     let mut second = request;
-    second.policy_version = "automatic.v2".into();
-    let second = store.enqueue(&scope, second, now).await.unwrap();
+    second.source_capture_id = Some(second_receipt.capture_id);
+    let AutomaticExtractionAdmission::Intent(second) =
+        store.admit_automatic(&scope, second, now).await.unwrap()
+    else {
+        panic!("distinct source must be admitted");
+    };
     assert!(!source_is_discovered(&store, receipt.stored_at, capture_id).await);
     assert_eq!(
         store
@@ -402,14 +425,11 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
             .unwrap()
             .is_none()
     );
-    let mut automatic_v2 = second.request.clone();
-    automatic_v2.source_capture_id = Some(equal_receipt.capture_id);
-    automatic_v2.prompt_version = "extract.v2".into();
-    let mut automatic_v3 = automatic_v2.clone();
-    automatic_v3.prompt_version = "extract.v3".into();
+    let mut automatic_request = second.request.clone();
+    automatic_request.source_capture_id = Some(equal_receipt.capture_id);
     let (left, right) = tokio::join!(
-        store.admit_automatic(&scope, automatic_v2, now),
-        store.admit_automatic(&scope, automatic_v3.clone(), now),
+        store.admit_automatic(&scope, automatic_request.clone(), now),
+        store.admit_automatic(&scope, automatic_request.clone(), now),
     );
     let geo_domain::AutomaticExtractionAdmission::Intent(automatic) = left.unwrap() else {
         panic!("unexpected manual deferral")
@@ -435,7 +455,7 @@ async fn extraction_single_claim_response_recovery_fencing_and_scope() {
         .unwrap();
     assert_eq!(
         store
-            .admit_automatic(&scope, automatic_v3, now)
+            .admit_automatic(&scope, automatic_request, now)
             .await
             .unwrap(),
         geo_domain::AutomaticExtractionAdmission::Intent(Box::new(terminal))

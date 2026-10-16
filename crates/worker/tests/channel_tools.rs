@@ -8,9 +8,8 @@ use geo_worker::{
     ChannelPlanReceipt, ChannelPlanRequest, ChannelPublicationLookupObservation,
     ChannelPublicationLookupSummary, ChannelTargetExecuteRequest, ChannelTargetKind,
     ChannelTargetSummary, DistributionTargetRef, HostBridge, HostOp, HostOpError, HostOps,
-    HostRuntime, KnowledgeSearchRequest, KnowledgeSearchResult, ManifestPage, ManifestReadRequest,
-    MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt,
-    PublishRequest, TenantScope,
+    HostRuntime, ManifestPage, ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion,
+    ModelCompletionRequest, PublishReceipt, PublishRequest, TenantScope,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -25,13 +24,6 @@ impl HostOps for Missing {
         _: &TenantScope,
         _: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
-        unreachable!()
-    }
-    async fn knowledge_search(
-        &self,
-        _: &TenantScope,
-        _: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
         unreachable!()
     }
     async fn manifest_read(
@@ -66,13 +58,6 @@ impl HostOps for Available {
         _: &TenantScope,
         _: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
-        unreachable!()
-    }
-    async fn knowledge_search(
-        &self,
-        _: &TenantScope,
-        _: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError> {
         unreachable!()
     }
     async fn manifest_read(

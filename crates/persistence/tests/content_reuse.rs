@@ -5,7 +5,8 @@ use geo_domain::{
     ContentReuseDecision, ContentReuseRequest, ContentSemanticDescriptor, ContentStep,
     DocumentManifestPlanRequest, ImportItem, InitialSource, InitialSourceKind,
     InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, ProjectCreate,
-    ProjectRepository, ProjectSettings, ProjectStartCommand, SourceKind, StructuredDocument,
+    ProjectRepository, ProjectSettings, ProjectStartCommand, RICH_CHECK_POLICY_VERSION,
+    RICH_GENERATION_POLICY_VERSION, RICH_REPAIR_POLICY_VERSION, SourceKind, StructuredDocument,
     TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_persistence::{
@@ -133,7 +134,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             &scope,
             accepted.cycle_id,
             manifest.clone(),
-            "reuse-policy-v1",
+            RICH_GENERATION_POLICY_VERSION,
         )
         .await
         .unwrap();
@@ -169,11 +170,11 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
         question_clusters: vec![],
         brief_title: "Public capability".into(),
         brief_objective: "Describe documented capability".into(),
-        generation_policy_version: "reuse-policy-v1".into(),
+        generation_policy_version: RICH_GENERATION_POLICY_VERSION.into(),
         evidence_policy_version: "evidence-v1".into(),
-        check_policy_version: "check-v1".into(),
-        repair_policy_version: "repair-v1".into(),
-        output_schema_version: "document-v1".into(),
+        check_policy_version: RICH_CHECK_POLICY_VERSION.into(),
+        repair_policy_version: RICH_REPAIR_POLICY_VERSION.into(),
+        output_schema_version: "structured-document-v2".into(),
         generation_policy_revision: "revision-1".into(),
     };
     let request = ContentReuseRequest {
@@ -227,7 +228,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             &scope,
             successor.cycle_id,
             successor_manifest,
-            "reuse-policy-v1",
+            RICH_GENERATION_POLICY_VERSION,
         )
         .await
         .unwrap();
@@ -300,7 +301,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
                     items: vec![],
                     rich: None,
                 }],
-                schema_version: None,
+                schema_version: 2,
             },
         )
         .await
@@ -311,7 +312,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             execution.execution_id,
             item.item_id,
             ContentStep::Check,
-            "worker-one",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             600,
         )
@@ -366,7 +367,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
                     items: vec![],
                     rich: None,
                 }],
-                schema_version: None,
+                schema_version: 2,
             },
         )
         .await
@@ -404,7 +405,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             execution.execution_id,
             item.item_id,
             ContentStep::Check,
-            "editor",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             600,
         )
@@ -439,7 +440,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
                     items: vec![],
                     rich: None,
                 }],
-                schema_version: None,
+                schema_version: 2,
             },
         )
         .await
@@ -468,9 +469,9 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             .revision_id,
         original.revision_id
     );
-    // An old-style worker can still finish a descriptor-less branch after
-    // migration. The successful check must update the legacy sidecar in the
-    // same transaction, or the fourth cycle could mint a duplicate identity.
+    // A current worker can finish a descriptor-less branch. The successful
+    // check must update its provenance sidecar in the same transaction, or the
+    // fourth cycle could mint a duplicate identity.
     let third = project_repo
         .schedule_next_cycle(&scope, project.id, successor.cycle_id, successor.cutoff_at)
         .await
@@ -490,7 +491,12 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
         .await
         .unwrap();
     let old_execution = restarted
-        .start(&scope, third.cycle_id, third_manifest, "legacy-policy-v1")
+        .start(
+            &scope,
+            third.cycle_id,
+            third_manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let old_item = restarted
@@ -557,7 +563,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
                     items: vec![],
                     rich: None,
                 }],
-                schema_version: None,
+                schema_version: 2,
             },
         )
         .await
@@ -568,7 +574,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             old_execution.execution_id,
             old_item.item_id,
             ContentStep::Check,
-            "legacy",
+            RICH_CHECK_POLICY_VERSION,
             Utc::now(),
             600,
         )
@@ -621,7 +627,12 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
         .await
         .unwrap();
     let fourth_execution = restarted
-        .start(&scope, fourth.cycle_id, fourth_manifest, "legacy-policy-v1")
+        .start(
+            &scope,
+            fourth.cycle_id,
+            fourth_manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
         .await
         .unwrap();
     let fourth_item = restarted
@@ -632,7 +643,9 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
         .find(|i| i.document_key == planned.document_key)
         .unwrap();
     let mut uncertain = descriptor.clone();
-    uncertain.generation_policy_version = "legacy-policy-v1".into();
+    // A new semantic revision has no checked registry entry; the existing
+    // descriptor-less result must still prevent duplicate generation.
+    uncertain.generation_policy_revision = "revision-2".into();
     let uncertain = restarted
         .prepare_or_reuse(
             &scope,

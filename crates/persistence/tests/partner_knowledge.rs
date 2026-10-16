@@ -1,10 +1,10 @@
 use chrono::Utc;
 use geo_domain::{
     DocumentManifestPlanRequest, InitialSource, InitialSourceKind, InitialSourceVisibility,
-    KnowledgePurpose, KnowledgeRepository, KnowledgeSearchRequest, PartnerAdvance,
-    PartnerPrincipal, PartnerRepository, PartnerSyncAction, PartnerSyncItem, PartnerSyncRequest,
-    PartnerSyncWork, ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand,
-    SourceState, TenantScope, hash_idempotency_key, settings_hash, sha256_hex, start_request_hash,
+    KnowledgePurpose, KnowledgeRepository, PartnerAdvance, PartnerPrincipal, PartnerRepository,
+    PartnerSyncAction, PartnerSyncItem, PartnerSyncRequest, PartnerSyncWork, ProjectCreate,
+    ProjectRepository, ProjectSettings, ProjectStartCommand, SourceState, TenantScope,
+    hash_idempotency_key, settings_hash, sha256_hex, start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgKnowledgeRepository, PgPartnerRepository, PgProjectRepository,
@@ -163,19 +163,13 @@ async fn partner_versions_revoke_restore_and_old_release_authorization() {
     .await;
     let source_id = first.source_id.unwrap();
     let old_release = first.knowledge_release_id;
-    let search = |purpose| KnowledgeSearchRequest {
-        query: "content".into(),
-        purpose,
-        limit: 10,
-        knowledge_release_id: old_release,
-    };
+    let original_job = first.import_job_id.unwrap();
     assert!(
-        !knowledge
-            .search(&scope, search(KnowledgePurpose::Public))
+        knowledge
+            .get_import_progress(&scope, original_job, KnowledgePurpose::Public)
             .await
             .unwrap()
-            .evidence
-            .is_empty()
+            .is_some()
     );
     let pending_internal = accept(
         &repo,
@@ -186,11 +180,10 @@ async fn partner_versions_revoke_restore_and_old_release_authorization() {
     .await;
     assert!(
         knowledge
-            .search(&scope, search(KnowledgePurpose::Public))
+            .get_import_progress(&scope, original_job, KnowledgePurpose::Public)
             .await
             .unwrap()
-            .evidence
-            .is_empty()
+            .is_none()
     );
     let before_parse = knowledge
         .get_source_detail(&scope, source_id)
@@ -212,19 +205,17 @@ async fn partner_versions_revoke_restore_and_old_release_authorization() {
     assert_eq!(version.parent_version_id, first.source_version_id);
     assert!(
         knowledge
-            .search(&scope, search(KnowledgePurpose::Public))
+            .get_import_progress(&scope, original_job, KnowledgePurpose::Public)
             .await
             .unwrap()
-            .evidence
-            .is_empty()
+            .is_none()
     );
     assert!(
-        !knowledge
-            .search(&scope, search(KnowledgePurpose::Internal))
+        knowledge
+            .get_import_progress(&scope, original_job, KnowledgePurpose::Internal)
             .await
             .unwrap()
-            .evidence
-            .is_empty()
+            .is_some()
     );
     let third = sync(
         &repo,
@@ -245,19 +236,17 @@ async fn partner_versions_revoke_restore_and_old_release_authorization() {
     );
     assert!(
         knowledge
-            .search(&scope, search(KnowledgePurpose::Internal))
+            .get_import_progress(&scope, original_job, KnowledgePurpose::Internal)
             .await
             .unwrap()
-            .evidence
-            .is_empty()
+            .is_none()
     );
     assert!(
         knowledge
-            .search(&scope, search(KnowledgePurpose::Public))
+            .get_import_progress(&scope, original_job, KnowledgePurpose::Public)
             .await
             .unwrap()
-            .evidence
-            .is_empty()
+            .is_none()
     );
     assert!(
         knowledge

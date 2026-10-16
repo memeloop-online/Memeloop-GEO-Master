@@ -30,13 +30,13 @@ use uuid::Uuid;
 // implementation of [`HostOps`] needs one import path, and so the worker never
 // grows a parallel set of types for the same concepts.
 pub use geo_domain::ContentRequestDeferral;
+pub use geo_domain::TenantScope;
 use geo_domain::{
     AppError, AttachmentReference, ContentCoverage, ContentExecutionStatus, ContentItemStatus,
     DistributionTargetStatus, ImportStatus, KnowledgePurpose, PublicationLookupFinding,
     ReportPreview, ReportPreviewKind, ReportSnapshot,
 };
 pub use geo_domain::{CreateQuestionSet, QuestionReference, ReviseQuestionSet};
-pub use geo_domain::{KnowledgeSearchRequest, KnowledgeSearchResult, TenantScope};
 pub use geo_domain::{ToolCallIdentity, ToolCallOutcome};
 
 /// A scoped, durable sink installed by Rust for one authorised run. `begin`
@@ -196,15 +196,6 @@ fn validate_recorded_return(
                 return Err(HostOpError::internal(
                     op,
                     "project acceptance lacks durable references",
-                ));
-            }
-        }
-        HostOp::KnowledgeSearch => {
-            let response: KnowledgeSearchResult = typed(op, result)?;
-            if response.capability_missing.is_some() {
-                return Err(HostOpError::capability_missing(
-                    op,
-                    "knowledge retrieval capability is unavailable",
                 ));
             }
         }
@@ -695,7 +686,7 @@ impl ContentDocumentSnapshot {
             || request.revision_id.is_some_and(|id| id != self.revision_id)
             || self.document.title.trim().is_empty()
             || self.document.blocks.is_empty()
-            || !matches!(self.document.schema_version, None | Some(2))
+            || self.document.schema_version != 2
             || self
                 .document
                 .blocks
@@ -953,8 +944,7 @@ Deno.core.registerErrorClass("GeoHostOpError", globalThis.GeoHostOpError);
 pub enum HostOp {
     /// One model completion through the Rust-side provider bridge.
     ModelComplete,
-    /// Evidence retrieval restricted to the run's frozen knowledge release.
-    KnowledgeSearch,
+    /// Read stored text from an explicit source and version.
     KnowledgeTextRead,
     KnowledgeTextRevise,
     /// Explicitly import attachments bound to this run into project knowledge.
@@ -1013,12 +1003,11 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 48;
+    pub const COUNT: usize = 47;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::ModelComplete,
-        Self::KnowledgeSearch,
         Self::KnowledgeTextRead,
         Self::KnowledgeTextRevise,
         Self::KnowledgeImportAttachments,
@@ -1071,7 +1060,6 @@ impl HostOp {
     pub const fn name(self) -> &'static str {
         match self {
             Self::ModelComplete => "model.complete.v1",
-            Self::KnowledgeSearch => "knowledge.search.v1",
             Self::KnowledgeTextRead => "knowledge.text.read.v1",
             Self::KnowledgeTextRevise => "knowledge.text.revise.v1",
             Self::KnowledgeImportAttachments => "knowledge.import_attachments.v1",
@@ -1125,7 +1113,6 @@ impl HostOp {
     pub const fn op_name(self) -> &'static str {
         match self {
             Self::ModelComplete => "op_host_model_complete_v1",
-            Self::KnowledgeSearch => "op_host_knowledge_search_v1",
             Self::KnowledgeTextRead => "op_host_knowledge_text_read_v1",
             Self::KnowledgeTextRevise => "op_host_knowledge_text_revise_v1",
             Self::KnowledgeImportAttachments => "op_host_knowledge_import_attachments_v1",
@@ -1239,7 +1226,6 @@ impl Default for HostOpBudgets {
         Self {
             limits: [
                 HostOpLimits::new(120_000, 32),
-                HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(15_000, 32), // scoped exact text read
                 HostOpLimits::new(60_000, 16), // durable optimistic text revision
                 HostOpLimits::new(120_000, 32),
@@ -1560,12 +1546,6 @@ pub trait HostOps: Send + Sync {
         scope: &TenantScope,
         request: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError>;
-
-    async fn knowledge_search(
-        &self,
-        scope: &TenantScope,
-        request: KnowledgeSearchRequest,
-    ) -> Result<KnowledgeSearchResult, HostOpError>;
 
     async fn knowledge_text_read(
         &self,
@@ -4549,11 +4529,30 @@ mod tests {
     }
 
     #[test]
+    fn default_budgets_preserve_named_operation_limits() {
+        let budgets = HostOpBudgets::default();
+        for (op, timeout_ms, max_calls) in [
+            (HostOp::ModelComplete, 120_000, 32),
+            (HostOp::KnowledgeTextRead, 15_000, 32),
+            (HostOp::KnowledgeTextRevise, 60_000, 16),
+            (HostOp::KnowledgeImportAttachments, 120_000, 32),
+            (HostOp::KnowledgeImportStatus, 15_000, 16),
+            (HostOp::SerpReparse, 30_000, 8),
+        ] {
+            assert_eq!(
+                budgets.limits(op),
+                HostOpLimits::new(timeout_ms, max_calls),
+                "{op:?}"
+            );
+        }
+    }
+
+    #[test]
     fn budgets_are_addressed_per_op() {
-        let budgets =
-            HostOpBudgets::default().with_limits(HostOp::KnowledgeSearch, HostOpLimits::new(25, 1));
-        assert_eq!(budgets.limits(HostOp::KnowledgeSearch).timeout_ms, 25);
-        assert_eq!(budgets.limits(HostOp::KnowledgeSearch).max_calls, 1);
+        let budgets = HostOpBudgets::default()
+            .with_limits(HostOp::KnowledgeTextRead, HostOpLimits::new(25, 1));
+        assert_eq!(budgets.limits(HostOp::KnowledgeTextRead).timeout_ms, 25);
+        assert_eq!(budgets.limits(HostOp::KnowledgeTextRead).max_calls, 1);
         assert_eq!(
             budgets.limits(HostOp::ModelComplete),
             HostOpBudgets::default().limits(HostOp::ModelComplete)

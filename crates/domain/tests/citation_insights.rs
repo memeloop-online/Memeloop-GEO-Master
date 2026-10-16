@@ -26,16 +26,20 @@ fn analysis(
     else {
         unreachable!()
     };
+    let source = json!({"messages":[{"role":"assistant","text":"Saved answer"}],
+        "completion":"complete","search_used":"yes","citations":[url]})
+    .to_string();
+    let source_sha256 = sha256_hex(source.as_bytes());
     ObservationAnalysisRevision {
         request: ObservationAnalysisRequest {
             revision_id: Uuid::new_v4(),
             target_id: view.target.target_id,
             attempt_id: view.attempts[0].attempt_id,
             source: ObservationAnalysisSource::AttemptEvidence { evidence_index: 0 },
-            source_sha256: "a".repeat(64),
+            source_sha256: source_sha256.clone(),
             observed_at: view.attempts[0].outcome.as_ref().unwrap().occurred_at,
-            prompt_version: "geo.observation.extract.v2".into(),
-            parser_version: "ground.v1".into(),
+            prompt_version: "geo.observation.extract.v4".into(),
+            parser_version: "geo.observation.extract.v6".into(),
         },
         request_digest: "b".repeat(64),
         state: ObservationAnalysisState::Completed,
@@ -46,16 +50,22 @@ fn analysis(
         result: Some(ObservationAnalysisResult {
             config_revision: Some(2),
             actual_model: Some("analysis-model".into()),
-            candidate_json: Some("{}".into()),
+            candidate_json: Some(json!({"completion":"complete","search_used":"yes"}).to_string()),
             outcome: ObservationAnalysisOutcome::Grounded {
                 raw_answer: "Saved answer".into(),
                 citations: vec![url.into(), url.into()],
                 audit: json!({
                     "kind":"observation_extraction", "method":"llm_grounded",
-                    "prompt_version":"geo.observation.extract.v2", "source_sha256":"a".repeat(64),
+                    "prompt_version":"geo.observation.extract.v4", "source_sha256":source_sha256,
+                    "source_json":source,
                     "protocol":{"provider":provider,"model":model,"surface":surface,"search_mode":search_mode,
                         "protocol_version":protocol_version,"market":market,"language":language},
-                    "refs":[{"role":"completion"},{"role":"search_activity"},{"role":"answer_segment"}]
+                    "refs":[
+                        {"role":"answer_segment","path":"/messages/0/text","quote":"Saved answer"},
+                        {"role":"completion","path":"/completion","quote":"complete"},
+                        {"role":"search_activity","path":"/search_used","quote":"yes"},
+                        {"role":"citation","path":"/citations/0","quote":url}
+                    ]
                 }),
             },
             prompt_tokens: 1,
@@ -274,9 +284,13 @@ fn completed(
     let claimed_at = at - Duration::minutes(2);
     let observed_at = at - Duration::minutes(1);
     let citation_values: Vec<String> = citations.iter().map(|url| (*url).into()).collect();
+    let source_json = json!({"messages":[{"role":"assistant","text":"Answer."}],
+        "completion":"complete","search_used":"yes","citations":citation_values})
+    .to_string();
+    let source_sha256 = sha256_hex(source_json.as_bytes());
     let proof = json!({
         "kind":"official_search_observation",
-        "schema_version":"geo.measure.official_search.v1",
+        "schema_version":"geo.measure.official_search.v4",
         "target_id":target.target_id,
         "account_id":account_id,
         "provider":provider,
@@ -297,13 +311,28 @@ fn completed(
         "citations":citation_values,
         "search_event":{
             "kind":"official_search_event",
-            "source":"provider_search_event",
-            "provenance":"live",
-            "occurred_at":observed_at,
-            "event_id":"event-1",
-            "request_id":"request-1"
+            "observed_at":observed_at,"source":"browser_response_ai","provenance":"live",
+            "search_used":"yes","request_model":model,
+            "request_question_sha256":sha256_hex(question.as_bytes()),
+            "extraction_model":"synthetic-extractor","extraction_prompt_version":"geo.observation.extract.v4",
+            "source_sha256":source_sha256
         }
     });
+    let mut audit = json!({"kind":"observation_extraction","method":"llm_grounded",
+    "model":"synthetic-extractor","prompt_version":"geo.observation.extract.v4",
+    "source_json":source_json,"source_sha256":source_sha256,"surface":"model_api",
+    "refs":[
+        {"role":"answer_segment","path":"/messages/0/text","quote":"Answer."},
+        {"role":"completion","path":"/completion","quote":"complete"},
+        {"role":"search_activity","path":"/search_used","quote":"yes"}
+    ]});
+    for (index, citation) in citations.iter().enumerate() {
+        audit["refs"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"citation",
+            "path":format!("/citations/{index}"),"quote":citation}));
+    }
     let receipt = json!({
         "kind":"runner_receipt",
         "schema_version":"geo.runner.receipt.v1",
@@ -327,7 +356,7 @@ fn completed(
                 public_url: None,
                 screenshot_ref: None,
                 connector_version: Some("connector-v1".into()),
-                runner_evidence: vec![proof, receipt],
+                runner_evidence: vec![proof, audit, receipt],
                 fixture: false,
             }),
         }],

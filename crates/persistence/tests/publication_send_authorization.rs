@@ -180,7 +180,7 @@ async fn setup() -> Setup {
         .binding_id;
     let document = StructuredDocument {
         title: "Rich article".into(),
-        schema_version: Some(2),
+        schema_version: 2,
         blocks: vec![
             ContentBlock {
                 block_id: Uuid::new_v4(),

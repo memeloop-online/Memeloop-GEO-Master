@@ -159,6 +159,7 @@ mod tests {
             let quote = input["evidence"][0]["quote"].as_str().unwrap();
             let citation = input["evidence"][0]["chunk_id"].as_str().unwrap();
             let content = serde_json::json!({
+                "schema_version": 2,
                 "title": quote,
                 "blocks": [{"kind": "paragraph", "text": quote,
                     "citation_ids": [citation], "items": []}]

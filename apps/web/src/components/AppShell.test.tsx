@@ -86,7 +86,6 @@ describe("consolidated project navigation", () => {
     ["chat/conversation-a", "AI 工作台"],
     ["overview", "AI 工作台"],
     ["knowledge/sources/source-a", "企业知识"],
-    ["knowledge/ask", "企业知识"],
     ["content/asset-a", "内容与发布"],
     ["campaigns/current", "内容与发布"],
     ["measurement", "测量与洞察"],
