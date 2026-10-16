@@ -363,7 +363,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct FakeTransport(Mutex<usize>, bool);
+    struct FakeTransport(Mutex<usize>, Option<geo_worker::KnowledgeTextReadRequest>);
 
     #[async_trait]
     impl Transport for FakeTransport {
@@ -376,16 +376,30 @@ mod tests {
             assert_eq!(request.url, "http://127.0.0.1:1/v1/chat/completions");
             let mut calls = self.0.lock().unwrap();
             *calls += 1;
-            let model_asks_for_search = self.1 && *calls == 1;
-            Ok(TransportResponse {
-                status: 200,
-                body: (if model_asks_for_search {
-                    r#"{"id":"tool-request","model":"local-model","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"knowledge_search","arguments":"{\"query\":\"public example\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#
-                } else {
-                    r#"{"id":"local-request","model":"local-model","choices":[{"message":{"content":"local answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#
+            if self.1.is_some() && *calls == 2 {
+                let tool_result = request.body["messages"].as_array().unwrap().last().unwrap();
+                assert_eq!(tool_result["role"], "tool");
+                let result: serde_json::Value =
+                    serde_json::from_str(tool_result["content"].as_str().unwrap()).unwrap();
+                assert_eq!(result["content"]["text"], "Public example source text");
+            }
+            let body = if let Some(read) = self.1.as_ref().filter(|_| *calls == 1) {
+                serde_json::json!({
+                    "id": "tool-request", "model": "local-model",
+                    "choices": [{"message": {"content": null, "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {
+                            "name": "knowledge_text_read",
+                            "arguments": serde_json::to_string(read).unwrap(),
+                        },
+                    }]}, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
                 })
-                .into(),
-            })
+                .to_string()
+            } else {
+                r#"{"id":"local-request","model":"local-model","choices":[{"message":{"content":"local answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#.into()
+            };
+            Ok(TransportResponse { status: 200, body })
         }
     }
 
@@ -654,13 +668,41 @@ mod tests {
             bundle_path: path.to_string_lossy().into_owned(),
             bundle_sha256: hex::encode(Sha256::digest(source)),
         };
-        let transport = Arc::new(FakeTransport(Mutex::new(0), true));
         let state = AppState::development();
         let run_scope = TenantScope::new(
             uuid::Uuid::from_u128(1).into(),
             uuid::Uuid::from_u128(2).into(),
             Some(uuid::Uuid::from_u128(3).into()),
         );
+        let imported = state
+            .knowledge_repository()
+            .import_batch(
+                &run_scope,
+                vec![geo_domain::ImportItem {
+                    client_item_id: "native-turn-source".into(),
+                    kind: geo_domain::SourceKind::Text,
+                    name: "Public example".into(),
+                    purpose: geo_domain::KnowledgePurpose::Public,
+                    text: Some("Public example source text".into()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .expect("seed real source text");
+        let item = &imported.items[0];
+        let transport = Arc::new(FakeTransport(
+            Mutex::new(0),
+            Some(geo_worker::KnowledgeTextReadRequest {
+                source_id: item.source.as_ref().expect("imported source").source_id,
+                source_version_id: item
+                    .source_version
+                    .as_ref()
+                    .expect("imported version")
+                    .source_version_id,
+            }),
+        ));
         let runtime =
             assemble_persistent_with_transport(&state, &ai, &run_scope, Arc::clone(&transport))
                 .expect("generated bundle must pass size, encoding, and digest validation");
@@ -712,7 +754,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|entry| entry.tool_name == "knowledge.search.v1")
+                .any(|entry| entry.tool_name == "knowledge.text.read.v1")
         );
         assert!(entries.iter().all(|entry| {
             entry.outcome == geo_domain::ToolCallOutcome::Succeeded
