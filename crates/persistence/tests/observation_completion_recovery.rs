@@ -64,7 +64,7 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
                     target_id: target,
                     input: ChannelTargetInput::Measure {
                         account_id: account,
-                        provider: "deepseek".into(),
+                        provider: "synthetic".into(),
                         model: "synthetic-model".into(),
                         surface: "consumer_web".into(),
                         search_mode: "web_search".into(),
@@ -98,22 +98,7 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
     .await
     .unwrap();
     let observed_at = "2026-01-01T00:00:00Z".parse().unwrap();
-    let source_json = json!({
-        "messages": [
-            {"event": "ready", "data": {"request_message_id": 1, "response_message_id": 2, "model_type": "synthetic-model"}},
-            {"event": "delta", "data": {"v": "synthetic answer"}},
-            {"event": "finish", "raw_data": ""}
-        ],
-        "ownership": {
-            "schema_version": "geo.deepseek.ownership.v1", "provider": "deepseek",
-            "creation": {"source": "browser_observed_create", "chat_session_id": "synthetic-chat"},
-            "submission": {
-                "chat_session_id": "synthetic-chat", "parent_message_id": null,
-                "model_type": "synthetic-model", "prompt_sha256": "0".repeat(64),
-                "search_enabled": true, "thinking_enabled": false
-            }
-        }
-    }).to_string();
+    let source_json = json!({"messages":[{"text":"synthetic answer"}]}).to_string();
     let history_json = json!({
         "source": "browser_observed_history", "observed_at": "2026-01-01T00:00:00Z",
         "cache_request": {"cache_version": null, "cache_reset_at": null},
@@ -124,7 +109,7 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
         ], "current_message_id": 2
     }).to_string();
     let identity = ObservationProviderIdentity {
-        provider: "deepseek".into(),
+        provider: "synthetic".into(),
         platform_account_id: "synthetic-account".into(),
     };
     let original = ObservationCaptureInput {
@@ -141,7 +126,7 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
             source_json: source_json.clone(),
         },
         owned_conversation: Some(CapturedConversation {
-            provider: "deepseek".into(),
+            provider: "synthetic".into(),
             external_conversation_id: "synthetic-chat".into(),
             purpose: CapturedConversationPurpose::Measurement,
             correlation: ConversationCorrelation::CreateResponse,
@@ -208,8 +193,15 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
     assert_ne!(first.is_some(), second.is_some());
     let recovery_claim = first.or(second).unwrap();
     assert_eq!(recovery_claim.original.input, original);
-    assert_eq!(recovery_claim.request_binding.request_message_id, "1");
-    assert_eq!(recovery_claim.request_binding.response_message_id, "2");
+    assert_eq!(
+        recovery_claim.request_binding.source_capture_id,
+        original.capture_id
+    );
+    assert_eq!(recovery_claim.request_binding.source_json, source_json);
+    assert_eq!(
+        recovery_claim.request_binding.source_receipt_sha256,
+        original_receipt.digest_sha256
+    );
     assert!(
         jobs.finish(
             &scope,
@@ -321,6 +313,14 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
         runner_session_id: Uuid::new_v4(),
         observed_at,
         recovery_identity: identity,
+        external_conversation_id: "synthetic-chat".into(),
+        completion: geo_domain::ObservationCaptureCompletion {
+            outcome: geo_domain::ObservationCompletionOutcome::Complete,
+            message_inventory: vec![
+                ("1".into(), "user".into()),
+                ("2".into(), "assistant".into()),
+            ],
+        },
         history_sha256: sha256_hex(history_json.as_bytes()),
         history_json,
     };
@@ -586,6 +586,58 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
     assert_eq!(unchanged.input, original);
     assert_eq!(unchanged.receipt, original_receipt);
     assert!(!unchanged.has_complete_conversation_evidence(&scope));
+    // A permanent adapter/source rejection terminates a claimed generic job;
+    // advancing past its backoff cannot requeue the immutable source.
+    let mut terminal_source = original.clone();
+    terminal_source.capture_id = Uuid::new_v4();
+    terminal_source.runner_session_id = Uuid::new_v4();
+    captures
+        .save(&scope, terminal_source.clone())
+        .await
+        .unwrap();
+    let terminal_job = jobs
+        .enqueue(&scope, terminal_source.capture_id)
+        .await
+        .unwrap();
+    let terminal_claim = jobs.claim(&scope, terminal_job).await.unwrap().unwrap();
+    jobs.finish(
+        &scope,
+        terminal_job,
+        terminal_claim.lease_id,
+        ObservationCompletionRecoveryJobOutcome::Retained,
+    )
+    .await
+    .unwrap();
+    assert!(
+        restarted_jobs
+            .claim(&scope, terminal_job)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !jobs
+            .scan_due(Utc::now() + chrono::Duration::days(1), None, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|item| item.job_id == terminal_job)
+    );
+    assert_eq!(
+        jobs.enqueue(&scope, terminal_source.capture_id)
+            .await
+            .unwrap(),
+        terminal_job
+    );
+    assert_eq!(
+        captures
+            .get(&scope, terminal_source.capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .input,
+        terminal_source
+    );
     // Missing immutable prerequisites are remembered once as retained and
     // cannot enter a restore/retry loop, even after repository restart.
     for missing_identity in [false, true] {
@@ -595,13 +647,7 @@ async fn immutable_scoped_recovery_replay_restart_and_revalidation() {
         if missing_identity {
             ineligible.original_identity = None;
         } else {
-            let mut source: serde_json::Value = serde_json::from_str(&source_json).unwrap();
-            source["messages"].as_array_mut().unwrap().remove(0);
-            let source_json = source.to_string();
-            ineligible.snapshot = ObservationCaptureSnapshot::Source {
-                source_sha256: sha256_hex(source_json.as_bytes()),
-                source_json,
-            };
+            ineligible.owned_conversation = None;
         }
         captures.save(&scope, ineligible.clone()).await.unwrap();
         let retained = jobs.enqueue(&scope, ineligible.capture_id).await.unwrap();

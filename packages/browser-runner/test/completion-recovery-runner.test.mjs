@@ -8,15 +8,69 @@ import { providerCompletionRecoveryAdapter } from "../src/provider-completion-re
 
 const account = "synthetic-account";
 const chat = "synthetic-chat";
+const digest = (value) => createHash("sha256").update(value).digest("hex");
+const source = () => ({
+  messages: [
+    {
+      event: "ready",
+      data: {
+        request_message_id: 1,
+        response_message_id: 2,
+        model_type: "synthetic-model",
+      },
+    },
+    { event: "delta", data: { text: "synthetic answer" } },
+    { event: "finish", raw_data: "" },
+  ],
+  ownership: {
+    schema_version: "geo.deepseek.ownership.v1",
+    provider: "deepseek",
+    creation: { source: "browser_observed_create", chat_session_id: chat },
+    submission: {
+      chat_session_id: chat,
+      parent_message_id: null,
+      model_type: "synthetic-model",
+      prompt_sha256: "a".repeat(64),
+      search_enabled: true,
+      thinking_enabled: false,
+    },
+  },
+});
+const withSource = (value) => {
+  const source_json = typeof value === "string" ? value : JSON.stringify(value);
+  return { source_json, source_sha256: digest(source_json) };
+};
+const failedSource = () => ({
+  ...source(),
+  messages: [
+    source().messages[0],
+    {
+      event: "hint",
+      data: {
+        type: "error",
+        finish_reason: "backend_err",
+        clear_response: true,
+      },
+    },
+    { event: "close", data: {} },
+  ],
+  capture_status: {
+    schema_version: "geo.observation.capture-status.v1",
+    transport: "complete",
+    termination: "complete",
+  },
+});
 const input = () => ({
   execution_id: randomUUID(),
   expected_identity: { provider: "deepseek", platform_account_id: account },
   external_conversation_id: chat,
-  request_message_id: "1",
-  response_message_id: "2",
+  source_capture_id: randomUUID(),
+  source_receipt_sha256: "a".repeat(64),
+  ...withSource(source()),
 });
 
 async function fixture(run, options = {}) {
+  const { platform = "deepseek", ...runnerOptions } = options;
   const calls = [];
   const state = { account, incomplete: false, later: false, blocked: null };
   const runner = createRunner({
@@ -98,7 +152,7 @@ async function fixture(run, options = {}) {
       },
     },
     platformAdapters: {
-      deepseek: {
+      [platform]: {
         entry: "https://chat.deepseek.com",
         connectorVersion: "fixture.v1",
         operations: ["measure"],
@@ -110,11 +164,11 @@ async function fixture(run, options = {}) {
         },
       },
     },
-    ...options,
+    ...runnerOptions,
   });
   await runner.create({
     session_id: "session",
-    platform: "deepseek",
+    platform,
     storage_state: {
       cookies: [],
       origins: [
@@ -150,13 +204,23 @@ test("completion recovery uses exact read-only history and caches same execution
     );
     assert.equal(result.status, "recovered");
     assert.deepEqual(result.recovery_identity, request.expected_identity);
+    assert.deepEqual(result.completion, {
+      outcome: "complete",
+      message_inventory: [
+        ["1", "user"],
+        ["2", "assistant"],
+      ],
+    });
+    assert.equal(result.source_capture_id, request.source_capture_id);
+    assert.equal(result.source_sha256, request.source_sha256);
+    assert.equal(result.source_receipt_sha256, request.source_receipt_sha256);
+    assert.ok(Number.isFinite(Date.parse(result.observed_at)));
+    assert.equal(result.history_sha256, digest(result.history_json));
     assert.equal(
-      result.history_sha256,
-      createHash("sha256").update(result.history_json).digest("hex"),
+      JSON.parse(result.history_json).observed_at,
+      result.observed_at,
     );
-    const history = JSON.parse(result.history_json);
-    assert.equal(history.observed_at, result.observed_at);
-    assert.equal(history.chat_session_id, chat);
+    assert.equal(JSON.parse(result.history_json).chat_session_id, chat);
     assert.deepEqual(
       await runner.recoverConversationCompletion("session", request),
       result,
@@ -165,7 +229,7 @@ test("completion recovery uses exact read-only history and caches same execution
     await assert.rejects(
       runner.recoverConversationCompletion("session", {
         ...request,
-        response_message_id: "3",
+        source_receipt_sha256: "b".repeat(64),
       }),
       /execution_conflict/,
     );
@@ -174,32 +238,41 @@ test("completion recovery uses exact read-only history and caches same execution
   });
 });
 
-test("recovery returns exact empty history for ledger validation without answer completion", async () => {
+test("recovery returns an empty inventory only for a verified cleared failure", async () => {
   await fixture(async ({ runner, calls, state }) => {
     state.empty = true;
-    const result = await runner.recoverConversationCompletion(
+    const result = await runner.recoverConversationCompletion("session", {
+      ...input(),
+      ...withSource(failedSource()),
+    });
+    assert.equal(result.status, "recovered");
+    assert.deepEqual(result.completion, {
+      outcome: "cleared_failure",
+      message_inventory: [],
+    });
+    assert.equal(result.history_sha256, digest(result.history_json));
+    assert.deepEqual(JSON.parse(result.history_json).messages, []);
+    assert.equal(calls.length, 1);
+    const ordinary = await runner.recoverConversationCompletion(
       "session",
       input(),
     );
-    assert.equal(result.status, "recovered");
-    const history = JSON.parse(result.history_json);
-    assert.deepEqual(history.messages, []);
-    assert.equal(history.current_message_id, null);
-    assert.equal(history.chat_session_id, chat);
-    assert.equal(result.completion, undefined);
-    assert.equal(calls.length, 1);
+    assert.equal(ordinary.status, "retained");
+    assert.equal(ordinary.completion, undefined);
   });
 });
 
 test("completion recovery rejects changed IDs, later/incomplete history and account drift", async () => {
   await fixture(async ({ runner, state, calls }) => {
     for (const patch of [
-      { response_message_id: "3" },
-      { request_message_id: "3" },
+      { response_message_id: 3 },
+      { request_message_id: 3 },
     ]) {
+      const changed = source();
+      Object.assign(changed.messages[0].data, patch);
       const result = await runner.recoverConversationCompletion("session", {
         ...input(),
-        ...patch,
+        ...withSource(changed),
       });
       assert.equal(result.status, "retained");
       assert.equal(result.history_json, undefined);
@@ -264,6 +337,11 @@ test("completion recovery validates canonical scope before any provider read", a
       { request_message_id: "01" },
       { response_message_id: 2 },
       { request_message_id: "2" },
+      { source_capture_id: "bad" },
+      { source_sha256: "b".repeat(64) },
+      { source_receipt_sha256: "bad" },
+      { source_json: "" },
+      { source_json: "x".repeat(750_001) },
       { external_conversation_id: "../other" },
       { prompt: "not allowed" },
       { execution_id: "bad" },
@@ -277,6 +355,153 @@ test("completion recovery validates canonical scope before any provider read", a
       );
     assert.equal(calls.length, 0);
   });
+});
+
+test("unsupported recovery capability is retained through the authenticated HTTP route", async () => {
+  await fixture(
+    async ({ runner, calls }) => {
+      const server = createRunnerServer({
+        runner,
+        token: "synthetic-service-token",
+      });
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const request = {
+          ...input(),
+          expected_identity: { provider: "kimi", platform_account_id: account },
+        };
+        const response = await fetch(
+          `http://127.0.0.1:${server.address().port}/v1/sessions/session/recover-conversation-completion`,
+          {
+            method: "POST",
+            headers: {
+              authorization: "Bearer synthetic-service-token",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify(request),
+          },
+        );
+        assert.equal(response.status, 200);
+        const result = await response.json();
+        assert.equal(result.status, "retained");
+        assert.deepEqual(result.diagnostic, {
+          stage: "scope",
+          code: "unsupported_platform",
+        });
+        assert.equal(result.source_capture_id, request.source_capture_id);
+        assert.equal(result.source_sha256, request.source_sha256);
+        assert.equal(
+          result.source_receipt_sha256,
+          request.source_receipt_sha256,
+        );
+        assert.equal(calls.length, 0);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    },
+    { platform: "kimi" },
+  );
+});
+
+test("immutable original source ineligibility is distinct from recoverable live history", async () => {
+  await fixture(async ({ runner, calls, state }) => {
+    const invalidSources = [source(), source()];
+    delete invalidSources[0].ownership;
+    invalidSources[1].messages.pop();
+    for (const value of invalidSources) {
+      const request = { ...input(), ...withSource(value) };
+      const result = await runner.recoverConversationCompletion(
+        "session",
+        request,
+      );
+      assert.equal(result.status, "retained");
+      assert.deepEqual(result.diagnostic, {
+        stage: "source",
+        code: "source_ineligible",
+      });
+      assert.equal(result.history_json, undefined);
+      assert.equal(result.completion, undefined);
+      assert.deepEqual(
+        await runner.recoverConversationCompletion("session", request),
+        result,
+      );
+    }
+    assert.equal(calls.length, 0);
+    const request = input();
+    state.incomplete = true;
+    const pending = await runner.recoverConversationCompletion(
+      "session",
+      request,
+    );
+    assert.deepEqual(pending.diagnostic, {
+      stage: "history",
+      code: "completion_unverified",
+      reason: "completion_unverified",
+    });
+    state.incomplete = false;
+    const recovered = await runner.recoverConversationCompletion("session", {
+      ...request,
+      execution_id: randomUUID(),
+    });
+    assert.equal(recovered.status, "recovered");
+    assert.equal(calls.length, 2);
+  });
+});
+
+test("the provider strategy rejects missing or noncanonical original proof before any history request", async () => {
+  const adapter = providerCompletionRecoveryAdapter("deepseek");
+  const untouchedPage = new Proxy(
+    {},
+    {
+      get() {
+        assert.fail("invalid source must not reach the browser");
+      },
+    },
+  );
+  const invalidSources = [
+    "not JSON",
+    "null",
+    "[]",
+    ...["1e0", "1.0", "-0", '"1"', "9007199254740992"].map((id) =>
+      JSON.stringify(source()).replace(
+        '"request_message_id":1',
+        `"request_message_id":${id}`,
+      ),
+    ),
+  ];
+  for (const mutate of [
+    (v) => delete v.ownership,
+    (v) => v.messages.pop(),
+    (v) => v.messages.push(v.messages[0]),
+    (v) => (v.ownership.creation.chat_session_id = "other-chat"),
+    (v) => (v.messages[0].data.model_type = "other-model"),
+    (v) =>
+      (v.source_redaction = {
+        schema_version: "geo.observation.source-redaction.v1",
+        policy: "reasoning-and-private-fields",
+        omitted_paths: ["/messages/2/raw_data"],
+      }),
+  ]) {
+    const value = source();
+    mutate(value);
+    invalidSources.push(JSON.stringify(value));
+  }
+  for (const source_json of invalidSources) {
+    let reason;
+    assert.equal(
+      await adapter.read(
+        untouchedPage,
+        { ...input(), ...withSource(source_json) },
+        {
+          onFailureReason: (value) => {
+            reason = value;
+          },
+        },
+      ),
+      null,
+    );
+    assert.equal(reason, "source_ineligible");
+  }
 });
 
 test("deadline keeps blocked identity work fenced and prevents late history dispatch", async () => {

@@ -347,6 +347,7 @@ test("source and extraction checkpoints share lifecycle proof outside source JSO
     connect_json_terminal: true,
     messages: [
       { chat: { id: "synthetic-chat" } },
+      { message: { id: "synthetic-question", role: "user" } },
       {
         message: {
           id: "synthetic-answer",
@@ -371,9 +372,11 @@ test("source and extraction checkpoints share lifecycle proof outside source JSO
     assert.equal(Object.hasOwn(extraction, "completion"), terminal === true);
     if (terminal === true)
       assert.deepEqual(extraction.completion, {
-        protocol: "connect_json",
-        terminal: true,
-        assistant_message_ids: ["synthetic-answer"],
+        outcome: "complete",
+        message_inventory: [
+          ["synthetic-answer", "assistant"],
+          ["synthetic-question", "user"],
+        ],
       });
     assert.equal(records[0].source_json, extraction.source_json);
     assert.deepEqual(JSON.parse(extraction.source_json), {
@@ -387,9 +390,11 @@ test("unknown providers persist source without borrowing Kimi lifecycle proof", 
     provider: "kimi",
     connect_json_terminal: true,
     completion: {
-      protocol: "connect_json",
-      terminal: true,
-      assistant_message_ids: ["invented"],
+      outcome: "complete",
+      message_inventory: [
+        ["invented", "assistant"],
+        ["question", "user"],
+      ],
     },
     messages: [
       { chat: { id: "synthetic-chat" } },
@@ -433,9 +438,11 @@ test("model completion claims cannot upgrade raw lifecycle proof", async () => {
     apiExtract: async () =>
       extraction({
         completion: {
-          protocol: "connect_json",
-          terminal: true,
-          assistant_message_ids: ["invented"],
+          outcome: "complete",
+          message_inventory: [
+            ["invented", "assistant"],
+            ["question", "user"],
+          ],
         },
       }),
   });

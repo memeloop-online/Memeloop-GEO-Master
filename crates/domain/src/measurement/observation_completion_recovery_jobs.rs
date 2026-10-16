@@ -14,8 +14,10 @@ pub struct ObservationCompletionRecoveryRequestBinding {
     pub provider: String,
     pub platform_account_id: String,
     pub external_conversation_id: String,
-    pub request_message_id: String,
-    pub response_message_id: String,
+    pub source_capture_id: Uuid,
+    pub source_json: String,
+    pub source_sha256: String,
+    pub source_receipt_sha256: String,
 }
 
 impl ObservationCapture {
@@ -51,27 +53,21 @@ impl ObservationCapture {
         {
             return Err(invalid());
         }
-        let ObservationCaptureSnapshot::Source { source_json, .. } = &self.input.snapshot else {
+        let ObservationCaptureSnapshot::Source {
+            source_json,
+            source_sha256,
+        } = &self.input.snapshot
+        else {
             return Err(invalid());
         };
-        let source = serde_json::from_str(source_json).map_err(|_| invalid())?;
-        // Explicit supported-provider registry; never infer a provider from body text.
-        let binding = match owned.provider.as_str() {
-            "deepseek" => {
-                super::provider_conversation_lifecycle::deepseek_recovery_binding(&source)
-            }
-            _ => None,
-        };
-        let (chat, request, response) = binding.ok_or_else(invalid)?;
-        if chat != owned.external_conversation_id {
-            return Err(invalid());
-        }
         Ok(ObservationCompletionRecoveryRequestBinding {
             provider: identity.provider.clone(),
             platform_account_id: identity.platform_account_id.clone(),
-            external_conversation_id: chat.into(),
-            request_message_id: request.to_string(),
-            response_message_id: response.to_string(),
+            external_conversation_id: owned.external_conversation_id.clone(),
+            source_capture_id: self.input.capture_id,
+            source_json: source_json.clone(),
+            source_sha256: source_sha256.clone(),
+            source_receipt_sha256: self.receipt.digest_sha256.clone(),
         })
     }
 }

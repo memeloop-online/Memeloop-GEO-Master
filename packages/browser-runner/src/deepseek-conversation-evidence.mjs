@@ -12,7 +12,8 @@ const chatId = (value) =>
   typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 const model = (value) =>
   typeof value === "string" && /^[A-Za-z0-9_.-]{1,128}$/u.test(value);
-const messageId = (value) => Number.isSafeInteger(value) && value >= 0;
+const messageId = (value) =>
+  Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
 
 function timestamp(value) {
   if (typeof value !== "string" || value.length > 64) return false;
@@ -202,15 +203,9 @@ export function capturedNewConversationId(exchange) {
   return (exchange.ownership ?? exchange.lifecycle).creation.chat_session_id;
 }
 
-export function capturedConversationCompletion(exchange) {
-  if (
-    !validDeepSeekEvidence(exchange) ||
-    !validDeepSeekLifecycle(exchange?.lifecycle) ||
-    !Array.isArray(exchange.messages) ||
-    exchange.messages.length > 32_768
-  )
-    return null;
-  const { lifecycle } = exchange;
+function completeStream(exchange, readyIds, expectedModel) {
+  if (!Array.isArray(exchange.messages) || exchange.messages.length > 32_768)
+    return false;
   let omittedPaths = new Set();
   if (Object.hasOwn(exchange, "source_redaction")) {
     try {
@@ -237,13 +232,11 @@ export function capturedConversationCompletion(exchange) {
         finished ||
         closeSeen ||
         !object(envelope.data) ||
-        envelope.data.request_message_id !==
-          lifecycle.ready.request_message_id ||
-        envelope.data.response_message_id !==
-          lifecycle.ready.response_message_id ||
+        envelope.data.request_message_id !== readyIds.request_message_id ||
+        envelope.data.response_message_id !== readyIds.response_message_id ||
         (envelope.data.model_type !== undefined &&
           envelope.data.model_type !== null &&
-          envelope.data.model_type !== lifecycle.submission.model_type)
+          envelope.data.model_type !== expectedModel)
       )
         return null;
       ready = true;
@@ -287,11 +280,106 @@ export function capturedConversationCompletion(exchange) {
       "geo.observation.capture-status.v1" &&
     exchange.capture_status.transport === "complete" &&
     exchange.capture_status.termination === "complete";
-  return ready && (finished || completeClose)
-    ? {
-        protocol: "deepseek_history_json",
-        terminal: true,
-        assistant_message_ids: [String(lifecycle.ready.response_message_id)],
-      }
-    : null;
+  return ready && (finished || completeClose);
+}
+
+export function capturedConversationCompletion(exchange) {
+  if (
+    !validDeepSeekEvidence(exchange) ||
+    !validDeepSeekLifecycle(exchange?.lifecycle) ||
+    !completeStream(
+      exchange,
+      exchange.lifecycle.ready,
+      exchange.lifecycle.submission.model_type,
+    )
+  )
+    return null;
+  return {
+    outcome: "complete",
+    message_inventory: exchange.lifecycle.history.messages
+      .map((message) => [
+        String(message.message_id),
+        message.role === "USER" ? "user" : "assistant",
+      ])
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
+  };
+}
+
+/** Saved-source strategy binding. Fresh history cannot supply missing stream
+ * IDs, ownership or terminal events from the original request. */
+export function deepSeekRecoveryBinding(source, conversationId) {
+  if (
+    !validDeepSeekEvidence(source) ||
+    Object.hasOwn(source, "lifecycle") ||
+    source.ownership.creation.chat_session_id !== conversationId ||
+    !Array.isArray(source.messages)
+  )
+    return null;
+  const ready = source.messages.filter((message) => message?.event === "ready");
+  if (ready.length !== 1) return null;
+  const ids = ready[0].data;
+  if (
+    !object(ids) ||
+    !messageId(ids.request_message_id) ||
+    !messageId(ids.response_message_id) ||
+    ids.request_message_id === ids.response_message_id ||
+    !completeStream(source, ids, source.ownership.submission.model_type)
+  )
+    return null;
+  return {
+    requestMessageId: ids.request_message_id,
+    responseMessageId: ids.response_message_id,
+  };
+}
+
+export function recoveredDeepSeekCompletion(source, history, conversationId) {
+  const binding = deepSeekRecoveryBinding(source, conversationId);
+  if (!binding) return null;
+  const messages = source.messages;
+  if (
+    messages.length === 3 &&
+    messages[0].event === "ready" &&
+    messages[1].event === "hint" &&
+    messages[1].data?.type === "error" &&
+    messages[1].data?.finish_reason === "backend_err" &&
+    messages[1].data?.clear_response === true &&
+    messages[2].event === "close" &&
+    source.capture_status?.transport === "complete" &&
+    source.capture_status?.termination === "complete" &&
+    closed(history, [
+      "source",
+      "observed_at",
+      "cache_request",
+      "cache_control",
+      "chat_session_id",
+      "messages",
+      "current_message_id",
+    ]) &&
+    history.source === "browser_observed_history" &&
+    timestamp(history.observed_at) &&
+    closed(history.cache_request, ["cache_version", "cache_reset_at"]) &&
+    history.cache_request.cache_version === null &&
+    history.cache_request.cache_reset_at === null &&
+    history.cache_control === "REPLACE" &&
+    history.chat_session_id === conversationId &&
+    history.current_message_id === null &&
+    Array.isArray(history.messages) &&
+    history.messages.length === 0
+  )
+    return { outcome: "cleared_failure", message_inventory: [] };
+  return capturedConversationCompletion({
+    ...source,
+    lifecycle: {
+      schema_version: "geo.deepseek.lifecycle.v1",
+      provider: "deepseek",
+      creation: source.ownership.creation,
+      submission: source.ownership.submission,
+      ready: {
+        request_message_id: binding.requestMessageId,
+        response_message_id: binding.responseMessageId,
+      },
+      sse_terminal: true,
+      history,
+    },
+  });
 }

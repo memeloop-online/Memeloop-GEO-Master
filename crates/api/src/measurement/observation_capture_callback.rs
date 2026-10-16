@@ -690,14 +690,10 @@ mod tests {
                 "purpose": "measurement", "correlation": "create_response"
             });
             request["completion"] = serde_json::json!({
-                "protocol": "connect_json", "terminal": true,
-                "assistant_message_ids": ["synthetic-message"]
+                "outcome": "complete",
+                "message_inventory": [["1", "user"], ["2", "assistant"]]
             });
             let (status, body) = submit(&fixture.service, &request, Some(BEARER)).await;
-            if provider != "kimi" {
-                assert_eq!(status, StatusCode::BAD_REQUEST);
-                continue;
-            }
             assert_eq!(status, StatusCode::OK);
             let receipt: ObservationCaptureReceipt = serde_json::from_str(&body).unwrap();
             let stored = fixture
@@ -711,12 +707,12 @@ mod tests {
                 serde_json::to_value(stored.input.completion).unwrap(),
                 request["completion"]
             );
-            request["completion"]["terminal"] = serde_json::json!(false);
+            request["completion"]["message_inventory"] = serde_json::json!([]);
             assert_eq!(
                 submit(&fixture.service, &request, Some(BEARER)).await.0,
                 StatusCode::BAD_REQUEST
             );
-            request["completion"]["protocol"] = serde_json::json!("unknown");
+            request["completion"]["outcome"] = serde_json::json!("unknown");
             assert_eq!(
                 submit(&fixture.service, &request, Some(BEARER)).await.0,
                 StatusCode::UNPROCESSABLE_ENTITY

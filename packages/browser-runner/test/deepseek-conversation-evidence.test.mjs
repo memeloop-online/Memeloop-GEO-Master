@@ -15,6 +15,8 @@ import {
   capturedNewConversationId,
   validDeepSeekLifecycle,
   validDeepSeekOwnership,
+  deepSeekRecoveryBinding,
+  recoveredDeepSeekCompletion,
 } from "../src/deepseek-conversation-evidence.mjs";
 
 function exchange() {
@@ -348,8 +350,11 @@ test("shared source persistence retains lifecycle without exposing it as AI answ
     record.source_sha256,
     createHash("sha256").update(record.source_json).digest("hex"),
   );
-  assert.equal(record.completion.protocol, "deepseek_history_json");
-  assert.deepEqual(record.completion.assistant_message_ids, ["1"]);
+  assert.equal(record.completion.outcome, "complete");
+  assert.deepEqual(record.completion.message_inventory, [
+    ["0", "user"],
+    ["1", "assistant"],
+  ]);
   assert.equal(
     registeredConversation(source, { provider: "deepseek" }),
     "synthetic-chat",
@@ -376,9 +381,11 @@ test("full browser lifecycle and matching raw stream identify one finished graph
   assert.equal(validDeepSeekLifecycle(value.lifecycle), true);
   assert.equal(capturedNewConversationId(value), "synthetic-chat");
   assert.deepEqual(capturedConversationCompletion(value), {
-    protocol: "deepseek_history_json",
-    terminal: true,
-    assistant_message_ids: ["1"],
+    outcome: "complete",
+    message_inventory: [
+      ["0", "user"],
+      ["1", "assistant"],
+    ],
   });
   value.lifecycle.history.messages.reverse();
   value.lifecycle.history.current_message_id = 1;
@@ -514,10 +521,10 @@ test("safe numeric IDs are rendered as canonical decimal strings", () => {
   value.messages[0].data.response_message_id = id;
   value.lifecycle.ready.response_message_id = id;
   value.lifecycle.history.messages[1].message_id = id;
-  assert.deepEqual(
-    capturedConversationCompletion(value)?.assistant_message_ids,
-    ["9007199254740991"],
-  );
+  assert.deepEqual(capturedConversationCompletion(value)?.message_inventory, [
+    ["0", "user"],
+    ["9007199254740991", "assistant"],
+  ]);
 });
 
 test("history time is bounded RFC3339 and permits a timezone offset", () => {
@@ -549,4 +556,137 @@ test("raw envelopes retain the decoder's event and object-data contract", () => 
   const value = exchange();
   value.messages.unshift({ event: "unknown", data: {} });
   assert.notEqual(capturedConversationCompletion(value), null);
+});
+
+function recoverySource() {
+  const value = ownedExchange();
+  delete value.lifecycle;
+  return value;
+}
+
+test("recovery derives original IDs and verifies terminal source before joining fresh history", () => {
+  const source = recoverySource();
+  const history = exchange().lifecycle.history;
+  assert.deepEqual(deepSeekRecoveryBinding(source, "synthetic-chat"), {
+    requestMessageId: 0,
+    responseMessageId: 1,
+  });
+  assert.deepEqual(
+    recoveredDeepSeekCompletion(source, history, "synthetic-chat"),
+    {
+      outcome: "complete",
+      message_inventory: [
+        ["0", "user"],
+        ["1", "assistant"],
+      ],
+    },
+  );
+  assert.equal(Object.hasOwn(source, "lifecycle"), false);
+  for (const mutate of [
+    (v) => delete v.ownership,
+    (v) => (v.lifecycle = exchange().lifecycle),
+    (v) => v.messages.shift(),
+    (v) => v.messages.push(v.messages[0]),
+    (v) => v.messages.pop(),
+    (v) => (v.messages[0].data.response_message_id = 0),
+    (v) => (v.messages[0].data.response_message_id = "1"),
+    (v) => (v.messages[0].data.request_message_id = -0),
+    (v) => (v.messages[0].data.model_type = "other-model"),
+    (v) => {
+      v.messages[2] = { event: "close", data: {} };
+      v.capture_status = {
+        schema_version: "geo.observation.capture-status.v1",
+        transport: "partial",
+        termination: "eof",
+      };
+    },
+    (v) => {
+      v.messages[2] = { event: "close", data: { click_behavior: "unknown" } };
+    },
+  ]) {
+    const invalid = recoverySource();
+    mutate(invalid);
+    assert.equal(deepSeekRecoveryBinding(invalid, "synthetic-chat"), null);
+    assert.equal(
+      recoveredDeepSeekCompletion(invalid, history, "synthetic-chat"),
+      null,
+    );
+  }
+  assert.equal(deepSeekRecoveryBinding(source, "other-chat"), null);
+  for (const [, mutate] of Object.entries(mutations)) {
+    const invalid = exchange().lifecycle;
+    mutate(invalid);
+    if (JSON.stringify(invalid.history) === JSON.stringify(history)) continue;
+    assert.equal(
+      recoveredDeepSeekCompletion(source, invalid.history, "synthetic-chat"),
+      null,
+    );
+  }
+});
+
+test("cleared terminal failure permits only the exact fresh empty inventory", () => {
+  const source = recoverySource();
+  source.messages = [
+    source.messages[0],
+    {
+      event: "hint",
+      data: {
+        type: "error",
+        finish_reason: "backend_err",
+        clear_response: true,
+      },
+    },
+    { event: "close", data: {} },
+  ];
+  source.capture_status = {
+    schema_version: "geo.observation.capture-status.v1",
+    transport: "complete",
+    termination: "complete",
+  };
+  const history = {
+    ...exchange().lifecycle.history,
+    messages: [],
+    current_message_id: null,
+  };
+  assert.deepEqual(
+    recoveredDeepSeekCompletion(source, history, "synthetic-chat"),
+    { outcome: "cleared_failure", message_inventory: [] },
+  );
+  assert.equal(
+    recoveredDeepSeekCompletion(recoverySource(), history, "synthetic-chat"),
+    null,
+  );
+  for (const mutate of [
+    (v) => (v.messages[1].data.clear_response = false),
+    (v) => (v.messages[1].data.type = "notice"),
+    (v) => (v.messages[1].data.finish_reason = "unknown"),
+    (v) => v.messages.splice(1, 0, { event: "delta", data: {} }),
+    (v) => (v.capture_status.transport = "partial"),
+    (v) => (v.capture_status.termination = "eof"),
+  ]) {
+    const invalid = structuredClone(source);
+    mutate(invalid);
+    assert.equal(
+      recoveredDeepSeekCompletion(invalid, history, "synthetic-chat"),
+      null,
+    );
+  }
+  for (const mutate of [
+    (v) => (v.chat_session_id = "other-chat"),
+    (v) => (v.current_message_id = 1),
+    (v) => delete v.current_message_id,
+    (v) => (v.cache_control = "APPEND"),
+    (v) => (v.cache_request.cache_version = 1),
+    (v) => (v.cache_request.cache_reset_at = 1),
+    (v) => (v.source = "model_output"),
+    (v) => (v.observed_at = "2026-02-30T00:00:00Z"),
+    (v) => (v.extra = true),
+  ]) {
+    const invalid = structuredClone(history);
+    mutate(invalid);
+    assert.equal(
+      recoveredDeepSeekCompletion(source, invalid, "synthetic-chat"),
+      null,
+    );
+  }
 });

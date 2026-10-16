@@ -8,7 +8,6 @@ import {
   projectDeepSeekCleanupHistory,
 } from "../src/deepseek-web-history.mjs";
 import { validDeepSeekLifecycle } from "../src/deepseek-conversation-evidence.mjs";
-import { providerCompletionRecoveryAdapter } from "../src/provider-completion-recovery.mjs";
 
 const ORIGIN = "https://chat.deepseek.com";
 const expected = {
@@ -180,15 +179,10 @@ test("empty history is available to recovery and cleanup without certifying a co
   body.data.biz_data.chat_session.current_message_id = null;
   const { page, requests } = await synthetic(t, { body: JSON.stringify(body) });
   assert.equal(await readDeepSeekFirstTurnHistory(page, expected), null);
-  const recovered = await providerCompletionRecoveryAdapter("deepseek").read(
-    page,
-    {
-      external_conversation_id: expected.conversationId,
-      request_message_id: "1",
-      response_message_id: "2",
-    },
-    {},
-  );
+  const recovered = await readDeepSeekFirstTurnHistory(page, {
+    ...expected,
+    allowEmptyHistory: true,
+  });
   assert.deepEqual(recovered.inventory, {
     conversationId: expected.conversationId,
     messages: [],

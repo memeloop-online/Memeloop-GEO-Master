@@ -570,9 +570,12 @@ async fn persisted_ownership_fenced_claim_unknown_recovery_and_capture_retention
             correlation: ConversationCorrelation::CreateResponse,
         }),
         completion: Some(geo_domain::ObservationCaptureCompletion {
-            protocol: geo_domain::ObservationCompletionProtocol::ConnectJson,
-            terminal: true,
-            assistant_message_ids: vec!["synthetic-message".into()],
+            outcome: geo_domain::ObservationCompletionOutcome::Complete,
+            message_inventory: vec![
+                ("synthetic-message".into(), "assistant".into()),
+                ("synthetic-system".into(), "system".into()),
+                ("synthetic-user".into(), "user".into()),
+            ],
         }),
         ..input.clone()
     };

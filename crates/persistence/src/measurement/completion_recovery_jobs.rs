@@ -96,7 +96,6 @@ impl ObservationCompletionRecoveryJobRepository for PgObservationCompletionRecov
             "SELECT o.operator_id,o.tenant_id,o.project_id,o.capture_id FROM observation_captures o \
              WHERE o.phase='source' AND o.ordinal=0 AND o.stored_at<=$1 \
              AND ($2::uuid IS NULL OR o.capture_id>$2) \
-             AND o.input #>> '{owned_conversation,provider}'='deepseek' \
              AND o.input #>> '{owned_conversation,purpose}'='measurement' \
              AND o.input #>> '{owned_conversation,correlation}'='create_response' \
              AND (o.input->'completion' IS NULL OR o.input->'completion'='null'::jsonb) \

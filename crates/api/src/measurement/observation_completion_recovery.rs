@@ -213,8 +213,10 @@ async fn recover_once(
                 platform_account_id: binding.platform_account_id.clone(),
             },
             external_conversation_id: binding.external_conversation_id.clone(),
-            request_message_id: binding.request_message_id.clone(),
-            response_message_id: binding.response_message_id.clone(),
+            source_capture_id: binding.source_capture_id,
+            source_json: binding.source_json.clone(),
+            source_sha256: binding.source_sha256.clone(),
+            source_receipt_sha256: binding.source_receipt_sha256.clone(),
         };
         match bridge
             .recover_conversation_completion(session_id, &request)
@@ -225,6 +227,8 @@ async fn recover_once(
                 execution_id,
                 recovery_identity,
                 observed_at,
+                external_conversation_id,
+                completion,
                 history_json,
                 history_sha256,
                 ..
@@ -250,6 +254,8 @@ async fn recover_once(
                         provider: recovery_identity.provider,
                         platform_account_id: recovery_identity.platform_account_id,
                     },
+                    external_conversation_id,
+                    completion,
                     history_json,
                     history_sha256,
                 };
@@ -281,6 +287,8 @@ async fn recover_once(
                     }),
                 ..
             } => Ok(RetryDiagnostic::CompletionUnverified.retry_with_reason(reason)),
+            // Unsupported capabilities and immutable source failures are
+            // terminal; only the live-history diagnostic above can retry.
             CompletionRecoveryResult::Retained { .. } => Ok(Outcome::Retained),
             CompletionRecoveryResult::Unknown { .. } => Ok(RetryDiagnostic::RunnerUnknown.retry()),
         }
@@ -405,7 +413,7 @@ mod tests {
         let result = if path == "/v1/lifecycle" {
             json!({"generation":Uuid::from_u128(123)})
         } else if path == "/v1/sessions" {
-            assert_eq!(payload["platform"], "deepseek");
+            assert_eq!(payload["platform"], "synthetic");
             json!({"session_id":payload["session_id"],"generation":payload["expected_generation"]})
         } else if path.ends_with("/dispose") {
             if stub.mode == "lost-close" {
@@ -423,24 +431,33 @@ mod tests {
                 stub.entered.notify_one();
                 stub.release.notified().await;
             }
-            assert_eq!(payload.as_object().unwrap().len(), 5);
+            assert_eq!(payload.as_object().unwrap().len(), 7);
             assert_eq!(payload["external_conversation_id"], "synthetic-chat");
-            assert_eq!(payload["request_message_id"], "1");
-            assert_eq!(payload["response_message_id"], "2");
+            assert!(payload["source_capture_id"].as_str().is_some());
+            assert_eq!(
+                payload["source_sha256"],
+                sha256_hex(payload["source_json"].as_str().unwrap().as_bytes())
+            );
             if stub.mode == "lost-response" {
                 return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
             }
             if matches!(
                 stub.mode,
-                "retained" | "needs_login" | "incomplete-history" | "unsupported"
+                "retained"
+                    | "needs_login"
+                    | "incomplete-history"
+                    | "unsupported"
+                    | "source-ineligible"
             ) || serde_json::from_value::<CompletionRecoveryReason>(json!(stub.mode)).is_ok()
             {
                 json!({"status":if stub.mode == "needs_login" {"needs_login"} else {"retained"},
                 "execution_id":payload["execution_id"],
                 "external_conversation_id":"synthetic-chat",
+                "source_capture_id":payload["source_capture_id"],"source_sha256":payload["source_sha256"],"source_receipt_sha256":payload["source_receipt_sha256"],
                 "diagnostic":match stub.mode {
                     "incomplete-history" => json!({"stage":"history","code":"completion_unverified"}),
                     "unsupported" => json!({"stage":"scope","code":"unsupported_platform"}),
+                    "source-ineligible" => json!({"stage":"source","code":"source_ineligible"}),
                     _ if serde_json::from_value::<CompletionRecoveryReason>(json!(stub.mode)).is_ok() =>
                         json!({"stage":"history","code":"completion_unverified","reason":stub.mode}),
                     _ => Value::Null,
@@ -452,7 +469,9 @@ mod tests {
                     "external_conversation_id":if stub.mode == "wrong-conversation" {
                         "other-chat"
                     } else {"synthetic-chat"},
-                    "recovery_identity":{"provider":"deepseek","platform_account_id":"synthetic-account"},
+                    "source_capture_id":payload["source_capture_id"],"source_sha256":payload["source_sha256"],"source_receipt_sha256":payload["source_receipt_sha256"],
+                    "completion":if stub.mode == "cleared-failure" {json!({"outcome":"cleared_failure","message_inventory":[]})} else {json!({"outcome":"complete","message_inventory":[["1","user"],["2","assistant"]]})},
+                    "recovery_identity":{"provider":"synthetic","platform_account_id":"synthetic-account"},
                     "observed_at":"2026-01-01T00:00:00Z",
                     "history_json":stub.history,"history_sha256":sha256_hex(stub.history.as_bytes())})
             }
@@ -523,20 +542,7 @@ mod tests {
                 {"message_id":2,"parent_id":1,"role":"ASSISTANT","status":"FINISHED","has_pending_fragment":false}
             ],"current_message_id":2
         }).to_string();
-        let source = json!({
-            "messages":[
-                {"event":"ready","data":{"request_message_id":1,"response_message_id":2,"model_type":"synthetic-model"}},
-                {"event":"delta","data":{"v":"synthetic answer"}},
-                {"event":"finish","raw_data":""}
-            ],
-            "ownership":{
-                "schema_version":"geo.deepseek.ownership.v1","provider":"deepseek",
-                "creation":{"source":"browser_observed_create","chat_session_id":"synthetic-chat"},
-                "submission":{"chat_session_id":"synthetic-chat","parent_message_id":null,
-                    "model_type":"synthetic-model","prompt_sha256":"0".repeat(64),
-                    "search_enabled":true,"thinking_enabled":false}
-            }
-        }).to_string();
+        let source = json!({"messages":[{"text":"synthetic answer"}]}).to_string();
         let input = ObservationCaptureInput {
             capture_id: Uuid::new_v4(),
             target_id: Uuid::new_v4(),
@@ -546,7 +552,7 @@ mod tests {
             ordinal: 0,
             observed_at: Utc::now(),
             original_identity: Some(ObservationProviderIdentity {
-                provider: "deepseek".into(),
+                provider: "synthetic".into(),
                 platform_account_id: "synthetic-account".into(),
             }),
             snapshot: ObservationCaptureSnapshot::Source {
@@ -554,7 +560,7 @@ mod tests {
                 source_json: source,
             },
             owned_conversation: Some(CapturedConversation {
-                provider: "deepseek".into(),
+                provider: "synthetic".into(),
                 external_conversation_id: "synthetic-chat".into(),
                 purpose: CapturedConversationPurpose::Measurement,
                 correlation: ConversationCorrelation::CreateResponse,
@@ -590,7 +596,7 @@ mod tests {
         let (original, mut history) = capture(&scope, account_id, original_session);
         if mode == "invalid-history" {
             let mut value: Value = serde_json::from_str(&history).unwrap();
-            value["messages"][1]["status"] = json!("STREAMING");
+            value["cookie"] = json!("synthetic-private-value");
             history = value.to_string();
         }
         let stub = Runner {
@@ -617,7 +623,7 @@ mod tests {
                         account_id,
                         project_id: scope.project_id.unwrap(),
                         owner_kind: ChannelOwnerKind::Customer,
-                        platform: "deepseek".into(),
+                        platform: "synthetic".into(),
                         group_id: None,
                         status: ChannelStatus::Ready,
                         display_name: None,
@@ -731,6 +737,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleared_failure_retains_empty_inventory_and_exact_history_audit() {
+        let (state, scope, claim, evidence, stub, server) = fixture("cleared-failure").await;
+        assert_eq!(
+            recover_once(&state, &evidence, &scope, &claim).await,
+            Outcome::Recovered
+        );
+        let saved = evidence.stored.lock().await.clone().unwrap();
+        assert_eq!(saved.input.history_json, stub.history);
+        assert_eq!(
+            saved.input.completion.outcome,
+            geo_domain::ObservationCompletionOutcome::ClearedFailure
+        );
+        assert_eq!(
+            saved
+                .validate(&scope, &claim.original)
+                .unwrap()
+                .retained_message_inventory_sha256(),
+            sha256_hex(b"[]")
+        );
+        assert!(!claim.original.has_complete_conversation_evidence(&scope));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn identity_transport_retention_and_storage_failures_stay_distinct() {
         for (mode, expected, read) in [
             ("wrong-identity", Outcome::NeedsLogin, false),
@@ -741,6 +771,7 @@ mod tests {
             ("retained", Outcome::Retained, true),
             ("incomplete-history", Outcome::Retry, true),
             ("unsupported", Outcome::Retained, true),
+            ("source-ineligible", Outcome::Retained, true),
             ("needs_login", Outcome::NeedsLogin, true),
             ("lost-save", Outcome::Retry, true),
         ] {
