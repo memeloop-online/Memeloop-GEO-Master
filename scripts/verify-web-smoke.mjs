@@ -1829,6 +1829,7 @@ async function main() {
     .getByRole("heading", { name: "Synthetic questions · v1" })
     .waitFor();
   await page
+    .getByRole("region", { name: "问题集版本详情" })
     .getByText("Synthetic product question 1?", { exact: true })
     .waitFor();
   console.log(
