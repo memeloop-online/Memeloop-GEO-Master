@@ -248,7 +248,12 @@ describe("standalone arbitrary-topic measurement", () => {
       targets: [bound],
     });
     const user = userEvent.setup();
-    renderPanel(false, true);
+    renderPanel(
+      false,
+      true,
+      false,
+      "/?tab=records&target=stale&attempt=stale&analysisRevision=stale",
+    );
     const folder = (
       await screen.findByText("观测问题 · 本页 2 条记录")
     ).closest("details")!;
@@ -256,7 +261,12 @@ describe("standalone arbitrary-topic measurement", () => {
     await user.click(within(folder).getByText("观测问题 · 本页 2 条记录"));
     expect(folder).toHaveAttribute("open");
     expect(within(folder).getByText("当前版本 v1")).toBeVisible();
-    expect(within(folder).getAllByRole("button")).toHaveLength(2);
+    expect(
+      within(folder).getAllByRole("button", { name: /第[一二]次观测/ }),
+    ).toHaveLength(2);
+    expect(
+      within(folder).getByRole("button", { name: "排名变化" }),
+    ).toBeVisible();
     expect(within(folder).queryByText(/临时观测/)).not.toBeInTheDocument();
     const temporary = screen
       .getByText("临时测量 · 本页 1 条记录")
@@ -276,6 +286,47 @@ describe("standalone arbitrary-topic measurement", () => {
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
       "version=version-1",
     );
+    for (const parameter of ["target=", "attempt=", "analysisRevision="]) {
+      expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
+        parameter,
+      );
+    }
+  });
+
+  it("opens only the target identified by a ranking source link", async () => {
+    const selected = {
+      ...target,
+      target_id: "selected-target",
+      input: { ...target.input, question: "指定问题" },
+    };
+    const other = {
+      ...target,
+      target_id: "other-target",
+      input: { ...target.input, question: "其他问题" },
+    };
+    vi.mocked(getMeasurementPlan).mockResolvedValue({
+      ...plan,
+      targets: [other, selected],
+    });
+    vi.mocked(getChannelTarget).mockImplementation(
+      async (_tenant, _project, id) => ({
+        target: id === selected.target_id ? selected : other,
+        attempts: [],
+      }),
+    );
+    renderPanel(
+      false,
+      true,
+      false,
+      "/?tab=records&record=measurement-1&target=selected-target&attempt=selected-attempt&analysisRevision=selected-analysis",
+    );
+    expect(
+      await screen.findByRole("heading", { name: "指定问题" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("heading", { name: "其他问题" }),
+    ).not.toBeInTheDocument();
+    expect(getChannelTarget).toHaveBeenCalledTimes(1);
   });
   it.each(["record", "planId"])(
     "opens a %s deep link with history collapsed and the answer visible",

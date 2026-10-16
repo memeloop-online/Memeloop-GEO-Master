@@ -86,7 +86,8 @@ async fn accepted_search(
         Some(QuestionPurpose::FrozenEvaluation) => "SYNTHETIC_EXCLUDED_FROZEN_ANSWER",
         None => "SYNTHETIC_EXCLUDED_UNKNOWN_ANSWER",
     };
-    let claimed = Utc::now() - Duration::seconds(2);
+    let created_at = Utc::now();
+    let scheduled_at = created_at - Duration::seconds(2);
     let question_set_version_id = Uuid::new_v4();
     let target = ChannelTarget {
         target_id: Uuid::new_v4(),
@@ -101,7 +102,7 @@ async fn accepted_search(
             question: "How does a rain gauge work?".into(),
             market: "generic".into(),
             language: "en".into(),
-            scheduled_at: claimed,
+            scheduled_at,
             sample_ordinal: 0,
             question_binding: purpose.map(|purpose| FrozenQuestionBinding {
                 reference: QuestionReference {
@@ -146,7 +147,7 @@ async fn accepted_search(
                 title: "Synthetic topic".into(),
                 input_hash: plan_id.to_string(),
                 revision: 1,
-                created_at: claimed,
+                created_at,
                 targets,
             },
         )
@@ -203,8 +204,8 @@ async fn finish_accepted_search(
     // The exact same receipt acceptance checks are used by the recommendation
     // read; no external account, search, or publishing service is invoked.
     let citations = vec![citation.to_owned()];
-    let source_json = json!({"messages":[{"role":"assistant","text":answer}],
-        "completion":"complete","search_used":"yes","citations":citations})
+    let source_json = json!({"messages":[{"role":"assistant","text":answer,
+        "completion":"complete","search_used":"yes","citations":citations}]})
     .to_string();
     let source_sha256 = sha256_hex(source_json.as_bytes());
     let evidence = json!({
@@ -242,9 +243,9 @@ async fn finish_accepted_search(
     "source_json":source_json,"source_sha256":source_sha256,"surface":"model_api",
     "refs":[
         {"role":"answer_segment","path":"/messages/0/text","quote":answer},
-        {"role":"completion","path":"/completion","quote":"complete"},
-        {"role":"search_activity","path":"/search_used","quote":"yes"},
-        {"role":"citation","path":"/citations/0","quote":citation}
+        {"role":"completion","path":"/messages/0/completion","quote":"complete"},
+        {"role":"search_activity","path":"/messages/0/search_used","quote":"yes"},
+        {"role":"citation","path":"/messages/0/citations/0","quote":citation}
     ]});
     let receipt = json!({
         "kind":"runner_receipt",

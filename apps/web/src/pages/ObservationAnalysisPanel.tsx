@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { Button, Spinner } from "@fluentui/react-components";
 import {
   useInfiniteQuery,
@@ -6,7 +6,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { createIdempotencyKey } from "../api/client";
 import {
   createObservationAnalysis,
@@ -27,6 +27,7 @@ import {
   availableAnalysis,
   observationAnalysisKey,
 } from "./observationAnalysisResult";
+import "../i18n/questionSetRecommendationTrend";
 
 export function ObservationAnalysisPanel({
   tenantId,
@@ -43,6 +44,12 @@ export function ObservationAnalysisPanel({
 }) {
   const { session } = useAuth();
   const { t, i18n } = useTranslation("observationAnalysis");
+  const { t: trendT } = useTranslation("questionSetRecommendationTrend");
+  const [params] = useSearchParams();
+  const requestedRevisionId =
+    params.get("target") === targetId && params.get("attempt") === attemptId
+      ? params.get("analysisRevision")
+      : null;
   const client = useQueryClient();
   const pendingKey = useRef<string | null>(null);
   const key = observationAnalysisKey(
@@ -115,7 +122,30 @@ export function ObservationAnalysisPanel({
     },
   });
   const revisions = analysisRevisions(history.data);
-  const primary = availableAnalysis(revisions);
+  const primary = requestedRevisionId
+    ? revisions.find(
+        (revision) => revision.request.revision_id === requestedRevisionId,
+      )
+    : availableAnalysis(revisions);
+  const { fetchNextPage, hasNextPage, isFetching, isError } = history;
+  useEffect(() => {
+    if (
+      requestedRevisionId &&
+      !primary &&
+      hasNextPage &&
+      !isFetching &&
+      !isError
+    ) {
+      void fetchNextPage();
+    }
+  }, [
+    requestedRevisionId,
+    primary,
+    hasNextPage,
+    isFetching,
+    isError,
+    fetchNextPage,
+  ]);
   const hasSource = Boolean(history.data?.pages[0]?.sources.length);
   const extraction = history.data?.pages[0]?.extraction;
   const active = revisions.some((item) => item.state !== "completed");
@@ -205,6 +235,14 @@ export function ObservationAnalysisPanel({
     <>
       <h4>{t("title")}</h4>
       {history.isPending && <Spinner size="tiny" label={t("loading")} />}
+      {requestedRevisionId &&
+        !primary &&
+        !history.isPending &&
+        (history.hasNextPage && !history.isError ? (
+          <Spinner size="tiny" label={t("loading")} />
+        ) : (
+          !history.isError && <p role="alert">{trendT("revisionMissing")}</p>
+        ))}
       {history.isError && <p role="alert">{t("loadFailed")}</p>}
       {history.data && !hasSource && <p>{t("noSource")}</p>}
       {hasSource && !revisions.length && !extraction && (
@@ -247,7 +285,10 @@ export function ObservationAnalysisPanel({
       >
         {t("settings")}
       </Link>
-      {revisions.filter((revision) => revision !== primary).map(renderRevision)}
+      {(!requestedRevisionId || primary) &&
+        revisions
+          .filter((revision) => revision !== primary)
+          .map(renderRevision)}
       {history.hasNextPage && (
         <Button
           disabled={history.isFetching}
@@ -262,7 +303,13 @@ export function ObservationAnalysisPanel({
     <section aria-label={t("title")}>
       {primary ? (
         <>
-          <h4>{t("availableAnswer")}</h4>
+          <h4>
+            {t(
+              primary.result?.outcome.status === "grounded"
+                ? "availableAnswer"
+                : "title",
+            )}
+          </h4>
           {renderRevision(primary)}
           <details>
             <summary>{t("history")}</summary>

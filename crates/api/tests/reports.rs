@@ -298,10 +298,12 @@ async fn fixture() -> (
 #[tokio::test]
 async fn saved_standalone_analysis_fans_in_only_to_explicit_report_correction() {
     use geo_domain::{
-        ChannelOutcome, ChannelOutcomeStatus, MemoryObservationAnalysisRepository,
-        MemoryObservationCaptureRepository, ObservationAnalysisOutcome,
-        ObservationAnalysisRepository, ObservationAnalysisRequest, ObservationAnalysisResult,
-        ObservationAnalysisSource, StandaloneMeasurementPlan,
+        ChannelOutcome, ChannelOutcomeStatus, MemoryObservationAdmissionGate,
+        MemoryObservationAnalysisRepository, MemoryObservationCaptureRepository,
+        MemoryObservationExtractionRepository, ObservationAnalysisOutcome,
+        ObservationAnalysisRequest, ObservationAnalysisResult, ObservationAnalysisSource,
+        ObservationExtractionRepository, ObservationExtractionResponse,
+        ObservationExtractionResponseDisposition, StandaloneMeasurementPlan,
     };
     let (state, _, project_id, cycle_id, cutoff) = fixture().await;
     let scope = TenantScope::new(
@@ -318,10 +320,13 @@ async fn saved_standalone_analysis_fans_in_only_to_explicit_report_correction() 
     let at = cycle.report_window_start_at + Duration::minutes(1);
     let jobs = state.channel_job_repository();
     let captures = Arc::new(MemoryObservationCaptureRepository::new(jobs.clone()));
-    let analyses = Arc::new(MemoryObservationAnalysisRepository::new(
-        jobs.clone(),
-        captures.clone(),
-    ));
+    let gate = MemoryObservationAdmissionGate::default();
+    let analyses = Arc::new(
+        MemoryObservationAnalysisRepository::new(jobs.clone(), captures.clone())
+            .with_admission_gate(gate.clone()),
+    );
+    let extraction = MemoryObservationExtractionRepository::new(captures.clone())
+        .with_automatic_admission(gate, analyses.clone());
     let state = state.with_observation_evidence_resolver(
         geo_api::ObservationEvidenceResolver::new(analyses.clone(), captures),
     );
@@ -395,8 +400,8 @@ async fn saved_standalone_analysis_fans_in_only_to_explicit_report_correction() 
         .unwrap();
     let revision_id = Uuid::new_v4();
     let analyzed = cutoff + Duration::seconds(1);
-    analyses
-        .create(
+    let admitted = extraction
+        .admit_manual(
             &scope,
             "saved-analysis",
             &sha256_hex(b"saved-analysis"),
@@ -414,12 +419,30 @@ async fn saved_standalone_analysis_fans_in_only_to_explicit_report_correction() 
         )
         .await
         .unwrap();
-    let claim = analyses
-        .claim(&scope, revision_id, analyzed)
+    let intent_id = admitted.intent.intent_id;
+    let claim = extraction
+        .claim(&scope, intent_id, analyzed)
         .await
         .unwrap()
         .unwrap();
-    analyses.finish(&scope, revision_id, claim.claim_token, ObservationAnalysisResult {
+    extraction
+        .record_response(
+            &scope,
+            intent_id,
+            claim.claim_token,
+            ObservationExtractionResponse {
+                model_text: json!({"completion":"complete","search_used":"yes"}).to_string(),
+                disposition: ObservationExtractionResponseDisposition::Complete,
+                actual_model: "parser-model".into(),
+                config_revision: Some(1),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+            analyzed,
+        )
+        .await
+        .unwrap();
+    extraction.complete(&scope, intent_id, claim.claim_token, ObservationAnalysisResult {
         config_revision: Some(1), actual_model: Some("parser-model".into()),
         candidate_json: Some(json!({"completion":"complete","search_used":"yes"}).to_string()),
         outcome: ObservationAnalysisOutcome::Grounded {

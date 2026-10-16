@@ -30,6 +30,7 @@ import {
   listAllQuestionSetVersions,
 } from "../api/questions";
 import { ErrorState, LoadingState } from "../components/AsyncState";
+import { QuestionSetRecommendationTrend } from "../components/QuestionSetRecommendationTrend";
 import { PlannedTarget } from "./ChannelJobsPage";
 import { formatUiDate } from "../i18n";
 import "./measurementMessages";
@@ -68,6 +69,9 @@ export function StandaloneMeasurementPanel({
       const next = new URLSearchParams(previous);
       next.set("tab", "records");
       next.delete("planId");
+      next.delete("target");
+      next.delete("attempt");
+      next.delete("analysisRevision");
       next.set("record", id);
       if (questionSetId !== undefined) {
         next.delete("questionSetId");
@@ -773,6 +777,12 @@ export function StandaloneMeasurementPanel({
                                   })
                                 : t("savedSetVersion", { value: versionId })}
                             </summary>
+                            <QuestionSetRecommendationTrend
+                              tenantId={tenantId}
+                              projectId={projectId}
+                              questionSetId={groupId}
+                              questionSetVersionId={versionId}
+                            />
                             <ul>
                               {plans.map((plan) =>
                                 recordButton(plan, groupId, versionId),
@@ -839,6 +849,11 @@ export function StandaloneMeasurementPanel({
               </details>
               {detail.data.targets
                 .filter((target) => {
+                  if (
+                    params.get("target") &&
+                    params.get("target") !== target.target_id
+                  )
+                    return false;
                   if (target.input.kind !== "measure") return true;
                   const reference = target.input.question_binding?.reference;
                   if (requestedSetId)

@@ -337,7 +337,7 @@ describe("P13 versioned question sets", () => {
       );
       const user = userEvent.setup();
       renderPage(
-        "/app/tenant-1/project-1/measurement?tab=records&record=measurement-1&planId=measurement-1&set=set-1&version=version-1",
+        "/app/tenant-1/project-1/measurement?tab=records&record=measurement-1&planId=measurement-1&set=set-1&version=version-1&target=target-1&attempt=attempt-1&analysisRevision=analysis-1",
       );
       expect(await screen.findByText("原问题集的测量")).toBeVisible();
       await user.click(screen.getByRole("tab", { name: "问题集" }));
@@ -355,6 +355,11 @@ describe("P13 versioned question sets", () => {
       expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
         "planId=",
       );
+      for (const parameter of ["target=", "attempt=", "analysisRevision="]) {
+        expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
+          parameter,
+        );
+      }
       await user.click(screen.getByRole("tab", { name: "测量记录" }));
       expect(screen.queryByText("原问题集的测量")).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(

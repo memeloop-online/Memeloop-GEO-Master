@@ -182,6 +182,9 @@ export function QuestionSetsPage() {
         next.delete("record");
         next.delete("planId");
         next.delete("folder");
+        next.delete("target");
+        next.delete("attempt");
+        next.delete("analysisRevision");
       }
       for (const [key, value] of Object.entries(values)) {
         if (key === "set") next.delete("questionSetId");

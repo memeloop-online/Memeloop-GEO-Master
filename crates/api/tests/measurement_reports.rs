@@ -13,9 +13,11 @@ use geo_api::{
 use geo_domain::{
     ChannelOutcome, ChannelOutcomeStatus, ChannelTarget, ChannelTargetInput,
     DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, ErrorCode, MeasurementPeriodWindow,
-    MemoryObservationAnalysisRepository, MemoryObservationCaptureRepository,
-    ObservationAnalysisOutcome, ObservationAnalysisRepository, ObservationAnalysisRequest,
-    ObservationAnalysisResult, ObservationAnalysisSource, ProjectCreate, ProjectSettings,
+    MemoryObservationAdmissionGate, MemoryObservationAnalysisRepository,
+    MemoryObservationCaptureRepository, MemoryObservationExtractionRepository,
+    ObservationAnalysisOutcome, ObservationAnalysisRequest, ObservationAnalysisResult,
+    ObservationAnalysisSource, ObservationExtractionRepository, ObservationExtractionResponse,
+    ObservationExtractionResponseDisposition, ProjectCreate, ProjectSettings,
     StandaloneMeasurementPlan, TenantScope, sha256_hex,
 };
 use serde_json::json;
@@ -528,10 +530,13 @@ async fn no_cycle_preview_save_and_correction_preserve_unknown_and_frozen_sample
     let (_, target) = plan(&state, &scope, at).await;
     let jobs = state.channel_job_repository();
     let captures = Arc::new(MemoryObservationCaptureRepository::new(jobs.clone()));
-    let analyses = Arc::new(MemoryObservationAnalysisRepository::new(
-        jobs.clone(),
-        captures.clone(),
-    ));
+    let gate = MemoryObservationAdmissionGate::default();
+    let analyses = Arc::new(
+        MemoryObservationAnalysisRepository::new(jobs.clone(), captures.clone())
+            .with_admission_gate(gate.clone()),
+    );
+    let extraction = MemoryObservationExtractionRepository::new(captures.clone())
+        .with_automatic_admission(gate, analyses.clone());
     let state = state.with_observation_evidence_resolver(ObservationEvidenceResolver::new(
         analyses.clone(),
         captures,
@@ -598,8 +603,8 @@ async fn no_cycle_preview_save_and_correction_preserve_unknown_and_frozen_sample
     assert_eq!(first, replay.unwrap());
     let analyzed = now + Duration::minutes(1);
     let revision_id = Uuid::new_v4();
-    analyses
-        .create(
+    let admitted = extraction
+        .admit_manual(
             &scope,
             "analysis",
             &sha256_hex(b"analysis"),
@@ -617,12 +622,30 @@ async fn no_cycle_preview_save_and_correction_preserve_unknown_and_frozen_sample
         )
         .await
         .unwrap();
-    let claim = analyses
-        .claim(&scope, revision_id, analyzed)
+    let intent_id = admitted.intent.intent_id;
+    let claim = extraction
+        .claim(&scope, intent_id, analyzed)
         .await
         .unwrap()
         .unwrap();
-    analyses.finish(&scope, revision_id, claim.claim_token, ObservationAnalysisResult {
+    extraction
+        .record_response(
+            &scope,
+            intent_id,
+            claim.claim_token,
+            ObservationExtractionResponse {
+                model_text: json!({"completion":"complete","search_used":"yes"}).to_string(),
+                disposition: ObservationExtractionResponseDisposition::Complete,
+                actual_model: "parser-model".into(),
+                config_revision: Some(1),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+            analyzed,
+        )
+        .await
+        .unwrap();
+    extraction.complete(&scope, intent_id, claim.claim_token, ObservationAnalysisResult {
         config_revision: Some(1), actual_model: Some("parser-model".into()),
         candidate_json: Some(json!({"completion":"complete","search_used":"yes"}).to_string()),
         outcome: ObservationAnalysisOutcome::Grounded {
