@@ -9,10 +9,11 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use geo_domain::{
     AppError, ChannelOutcomeStatus, ChannelTargetInput, MeasurementPeriodPreview,
-    MeasurementPeriodReport, MeasurementPeriodSample, MeasurementPeriodSearchSample,
-    MeasurementPeriodWindow, ProjectId, TenantScope, build_measurement_period_search_sample,
-    effective_observation, freeze_measurement_period, preview_measurement_period_at_cutoff,
-    preview_measurement_period_with_search,
+    MeasurementPeriodReport, MeasurementPeriodSample, MeasurementPeriodSearchIdentity,
+    MeasurementPeriodSearchSample, MeasurementPeriodWindow, MeasurementReportConditions,
+    MeasurementReportQuestionSet, ObservationAnalysisOutcome, ProjectId, TenantScope,
+    build_measurement_period_search_sample, effective_observation, freeze_measurement_period,
+    preview_measurement_period_at_cutoff, preview_measurement_period_with_search,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -29,6 +30,8 @@ pub struct MeasurementPeriodQuery {
     pub start_at: Option<DateTime<Utc>>,
     pub end_at: Option<DateTime<Utc>>,
     pub report_timezone: Option<String>,
+    pub question_set_id: Option<Uuid>,
+    pub question_set_version_id: Option<Uuid>,
     pub project_id: Option<ProjectId>,
     pub tenant_id: Option<String>,
 }
@@ -41,6 +44,24 @@ pub struct MeasurementPeriodRequest {
     #[serde(default = "utc")]
     pub report_timezone: String,
     pub correction_of: Option<Uuid>,
+    pub question_set: Option<MeasurementReportQuestionSet>,
+}
+
+impl MeasurementPeriodQuery {
+    fn question_set(&self) -> Result<Option<MeasurementReportQuestionSet>, AppError> {
+        match (self.question_set_id, self.question_set_version_id) {
+            (None, None) => Ok(None),
+            (Some(question_set_id), Some(question_set_version_id)) => {
+                Ok(Some(MeasurementReportQuestionSet {
+                    question_set_id,
+                    question_set_version_id,
+                }))
+            }
+            _ => Err(AppError::invalid_request(
+                "both question set identifiers are required",
+            )),
+        }
+    }
 }
 
 fn utc() -> String {
@@ -70,20 +91,63 @@ pub async fn preview_project_measurements(
     state: &AppState,
     scope: &TenantScope,
     window: Option<MeasurementPeriodWindow>,
+    question_set: Option<MeasurementReportQuestionSet>,
     now: DateTime<Utc>,
 ) -> Result<MeasurementPeriodPreview, AppError> {
     let now = microseconds(now);
-    let window = window.unwrap_or_else(|| default_measurement_period_window(now));
-    let window = MeasurementPeriodWindow {
-        start_at: microseconds(window.start_at),
-        end_at: microseconds(window.end_at),
-        ..window
-    };
-    window.validate(now)?;
+    let window = window
+        .or_else(|| {
+            question_set
+                .is_none()
+                .then(|| default_measurement_period_window(now))
+        })
+        .map(|window| MeasurementPeriodWindow {
+            start_at: microseconds(window.start_at),
+            end_at: microseconds(window.end_at),
+            ..window
+        });
+    if let Some(window) = &window {
+        window.validate(now)?;
+    }
     ensure_project(state, scope).await?;
-    let samples = collect_samples(state, scope, &window, now, None).await?;
-    let search = collect_search_samples(state, scope, &window, now, None).await?;
-    preview_measurement_period_with_search(scope, &window, samples, search, now)
+    ensure_question_set(state, scope, question_set.as_ref()).await?;
+    let identities = collect_sample_identities(
+        state,
+        scope,
+        window.as_ref(),
+        question_set.as_ref(),
+        now,
+        None,
+    )
+    .await?;
+    let cohort = collect_search_cohort(
+        state,
+        scope,
+        window.as_ref(),
+        question_set.as_ref(),
+        now,
+        None,
+    )
+    .await?;
+    let window = window.unwrap_or_else(|| MeasurementPeriodWindow {
+        start_at: identities
+            .iter()
+            .map(|(_, _, at)| *at)
+            .chain(
+                cohort
+                    .iter()
+                    .flatten()
+                    .map(|identity| identity.scheduled_at),
+            )
+            .min()
+            .map(microseconds)
+            .unwrap_or(now - Duration::days(7)),
+        end_at: now,
+        report_timezone: utc(),
+    });
+    let samples = collect_samples(state, scope, &window, now, &identities).await?;
+    let search = collect_search_samples(state, scope, &window, now, cohort).await?;
+    preview_measurement_period_with_search(scope, &window, question_set, samples, search, now)
 }
 
 /// Window identity is the initial-create idempotency boundary. A correction
@@ -121,8 +185,11 @@ pub async fn save_project_measurement_report_at_cutoff(
         ));
     }
     ensure_project(state, scope).await?;
+    ensure_question_set(state, scope, request.question_set.as_ref()).await?;
     let repository = state.report_repository();
-    let rows = repository.list_measurement_periods(scope).await?;
+    let rows = repository
+        .list_measurement_periods(scope, request.question_set.clone())
+        .await?;
     let matching: Vec<_> = rows.iter().filter(|row| row.window() == window).collect();
     let parent = if let Some(parent_id) = request.correction_of {
         if let Some(replay) = matching
@@ -147,11 +214,30 @@ pub async fn save_project_measurement_report_at_cutoff(
         }
         None
     };
-    let samples = collect_samples(state, scope, &window, evidence_as_of, parent).await?;
-    let search = collect_search_samples(state, scope, &window, evidence_as_of, parent).await?;
+    let identities = collect_sample_identities(
+        state,
+        scope,
+        Some(&window),
+        request.question_set.as_ref(),
+        evidence_as_of,
+        parent,
+    )
+    .await?;
+    let cohort = collect_search_cohort(
+        state,
+        scope,
+        Some(&window),
+        request.question_set.as_ref(),
+        evidence_as_of,
+        parent,
+    )
+    .await?;
+    let samples = collect_samples(state, scope, &window, evidence_as_of, &identities).await?;
+    let search = collect_search_samples(state, scope, &window, evidence_as_of, cohort).await?;
     let preview = preview_measurement_period_at_cutoff(
         scope,
         &window,
+        request.question_set,
         samples,
         search,
         evidence_as_of,
@@ -178,13 +264,32 @@ async fn ensure_project(state: &AppState, scope: &TenantScope) -> Result<(), App
     Ok(())
 }
 
-async fn collect_samples(
+async fn ensure_question_set(
     state: &AppState,
     scope: &TenantScope,
-    window: &MeasurementPeriodWindow,
+    question_set: Option<&MeasurementReportQuestionSet>,
+) -> Result<(), AppError> {
+    if let Some(selected) = question_set {
+        state
+            .question_repository()
+            .get_version(
+                scope,
+                selected.question_set_id,
+                selected.question_set_version_id,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn collect_sample_identities(
+    state: &AppState,
+    scope: &TenantScope,
+    window: Option<&MeasurementPeriodWindow>,
+    question_set: Option<&MeasurementReportQuestionSet>,
     as_of: DateTime<Utc>,
     parent: Option<&MeasurementPeriodReport>,
-) -> Result<Vec<MeasurementPeriodSample>, AppError> {
+) -> Result<Vec<(Uuid, Uuid, DateTime<Utc>)>, AppError> {
     let repository = state.channel_job_repository();
     let mut identities = Vec::new();
     if let Some(parent) = parent {
@@ -193,7 +298,7 @@ async fn collect_samples(
             parent
                 .samples
                 .iter()
-                .map(|sample| (sample.plan_id, sample.target_id)),
+                .map(|sample| (sample.plan_id, sample.target_id, sample.scheduled_at)),
         );
     } else {
         let mut after = None;
@@ -208,20 +313,37 @@ async fn collect_samples(
                     continue;
                 }
                 for target in plan.targets {
-                    if let ChannelTargetInput::Measure { scheduled_at, .. } = target.input
-                        && scheduled_at >= window.start_at
-                        && scheduled_at < window.end_at
+                    if let ChannelTargetInput::Measure {
+                        scheduled_at,
+                        question_binding,
+                        ..
+                    } = target.input
+                        && window.is_none_or(|window| scheduled_at >= window.start_at)
+                        && scheduled_at < window.map_or(as_of, |window| window.end_at)
+                        && question_set
+                            .is_none_or(|selected| selected.matches(question_binding.as_ref()))
                     {
-                        identities.push((plan.plan_id, target.target_id));
+                        identities.push((plan.plan_id, target.target_id, scheduled_at));
                     }
                 }
             }
         }
     }
+    Ok(identities)
+}
+
+async fn collect_samples(
+    state: &AppState,
+    scope: &TenantScope,
+    window: &MeasurementPeriodWindow,
+    as_of: DateTime<Utc>,
+    identities: &[(Uuid, Uuid, DateTime<Utc>)],
+) -> Result<Vec<MeasurementPeriodSample>, AppError> {
+    let repository = state.channel_job_repository();
     let mut samples = Vec::new();
     for chunk in identities.chunks(64) {
         let mut views = Vec::new();
-        for (_, target_id) in chunk {
+        for (_, target_id, _) in chunk {
             let mut view = repository.get_target(scope, *target_id).await?;
             view.attempts.retain(|attempt| attempt.claimed_at <= as_of);
             views.push(view);
@@ -231,10 +353,20 @@ async fn collect_samples(
         } else {
             vec![]
         };
-        for (view, (plan_id, _)) in views.iter().zip(chunk) {
+        for (view, (plan_id, _, _)) in views.iter().zip(chunk) {
             let ChannelTargetInput::Measure {
                 scheduled_at,
                 question_binding,
+                question,
+                provider,
+                model,
+                surface,
+                search_mode,
+                protocol_version,
+                question_set_version,
+                market,
+                language,
+                sample_ordinal,
                 ..
             } = &view.target.input
             else {
@@ -276,6 +408,22 @@ async fn collect_samples(
                 as_of,
                 crate::citation_insights::accepted_live_search,
             );
+            let recommendations = observation
+                .as_ref()
+                .and_then(|observation| observation.provenance.as_ref())
+                .and_then(|source| {
+                    analyses
+                        .iter()
+                        .find(|revision| revision.request.revision_id == source.revision_id)
+                })
+                .and_then(|revision| revision.result.as_ref())
+                .and_then(|result| match &result.outcome {
+                    ObservationAnalysisOutcome::Grounded { audit, .. } => audit
+                        .get("recommendations")
+                        .filter(|value| !value.is_null())
+                        .cloned(),
+                    _ => None,
+                });
             samples.push(MeasurementPeriodSample {
                 plan_id: *plan_id,
                 target_id: view.target.target_id,
@@ -285,27 +433,40 @@ async fn collect_samples(
                     .input
                     .comparison_key()
                     .expect("measurement protocol"),
+                conditions: MeasurementReportConditions {
+                    question: question.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    surface: surface.clone(),
+                    search_mode: search_mode.clone(),
+                    protocol_version: protocol_version.clone(),
+                    question_set_version: question_set_version.clone(),
+                    market: market.clone(),
+                    language: language.clone(),
+                    sample_ordinal: *sample_ordinal,
+                },
                 question_binding: question_binding.clone(),
                 scheduled_at: *scheduled_at,
                 original_status: original_status.to_owned(),
                 observed_live: live.is_some(),
                 observation,
+                recommendations,
             });
         }
     }
     Ok(samples)
 }
 
-async fn collect_search_samples(
+async fn collect_search_cohort(
     state: &AppState,
     scope: &TenantScope,
-    window: &MeasurementPeriodWindow,
+    window: Option<&MeasurementPeriodWindow>,
+    question_set: Option<&MeasurementReportQuestionSet>,
     as_of: DateTime<Utc>,
     parent: Option<&MeasurementPeriodReport>,
-) -> Result<Option<Vec<MeasurementPeriodSearchSample>>, AppError> {
+) -> Result<Option<Vec<MeasurementPeriodSearchIdentity>>, AppError> {
     use std::collections::BTreeMap;
-    // An old snapshot did not freeze a search cohort. A correction must not
-    // retroactively add one or represent unavailable history as zero samples.
+    // A correction preserves whether search evidence was available at first save.
     if parent.is_some_and(|report| report.search.is_none()) {
         return Ok(None);
     }
@@ -355,11 +516,32 @@ async fn collect_search_samples(
                     return Err(AppError::conflict("search report cohort cursor invalid"));
                 }
                 after = Some(identity.measurement_id);
-                cohort.insert(identity.measurement_id, identity);
+                if question_set
+                    .is_none_or(|selected| selected.matches(identity.question_binding.as_ref()))
+                {
+                    cohort.insert(identity.measurement_id, identity);
+                }
             }
         }
     }
-    let identities: Vec<_> = cohort.into_values().collect();
+    Ok(Some(cohort.into_values().collect()))
+}
+
+async fn collect_search_samples(
+    state: &AppState,
+    scope: &TenantScope,
+    window: &MeasurementPeriodWindow,
+    as_of: DateTime<Utc>,
+    identities: Option<Vec<MeasurementPeriodSearchIdentity>>,
+) -> Result<Option<Vec<MeasurementPeriodSearchSample>>, AppError> {
+    use std::collections::BTreeMap;
+    let Some(identities) = identities else {
+        return Ok(None);
+    };
+    let service = state.serp_service().ok_or_else(|| {
+        AppError::capability_missing("saved search report evidence is unavailable")
+    })?;
+    let repository = service.report_repository();
     let mut samples = Vec::with_capacity(identities.len());
     for chunk in identities.chunks(100) {
         let ids: Vec<_> = chunk
@@ -406,7 +588,10 @@ async fn collect_search_samples(
 }
 
 #[utoipa::path(get, path="/api/v1/projects/{id}/measurement-report-preview",
-    security(("sessionCookie"=[])), params(("id"=ProjectId,Path)),
+    security(("sessionCookie"=[])), params(("id"=ProjectId,Path),
+        ("question_set_id"=Option<Uuid>,Query),("question_set_version_id"=Option<Uuid>,Query),
+        ("start_at"=Option<DateTime<Utc>>,Query),("end_at"=Option<DateTime<Utc>>,Query),
+        ("report_timezone"=Option<String>,Query)),
     responses((status=200,body=MeasurementPeriodPreview),(status=404,body=ErrorResponse)))]
 pub(crate) async fn preview(
     State(state): State<AppState>,
@@ -416,19 +601,21 @@ pub(crate) async fn preview(
     Extension(context): Extension<RequestContext>,
 ) -> Result<(HeaderMap, Json<MeasurementPeriodPreview>), ApiError> {
     let result = async {
+        let question_set = query.question_set()?;
         let _ = (query.project_id, query.tenant_id);
         let scope = crate::channel_jobs::scope(&state, &tenant, id).await?;
         let now = Utc::now();
         let window = match (query.start_at, query.end_at) {
-            (None, None) => Some(MeasurementPeriodWindow {
+            (None, None) if question_set.is_none() => Some(MeasurementPeriodWindow {
                 start_at: now - Duration::days(7),
                 end_at: now,
-                report_timezone: query.report_timezone.unwrap_or_else(utc),
+                report_timezone: query.report_timezone.clone().unwrap_or_else(utc),
             }),
+            (None, None) => None,
             (Some(start_at), Some(end_at)) => Some(MeasurementPeriodWindow {
                 start_at,
                 end_at,
-                report_timezone: query.report_timezone.unwrap_or_else(utc),
+                report_timezone: query.report_timezone.clone().unwrap_or_else(utc),
             }),
             _ => {
                 return Err(AppError::invalid_request(
@@ -436,7 +623,28 @@ pub(crate) async fn preview(
                 ));
             }
         };
-        preview_project_measurements(&state, &scope, window, now).await
+        let mut preview =
+            preview_project_measurements(&state, &scope, window, question_set, now).await?;
+        if let Some(timezone) = query
+            .report_timezone
+            .filter(|timezone| *timezone != preview.report_timezone)
+        {
+            let window = MeasurementPeriodWindow {
+                start_at: preview.report_window_start_at,
+                end_at: preview.report_window_end_at,
+                report_timezone: timezone,
+            };
+            preview = preview_measurement_period_at_cutoff(
+                &scope,
+                &window,
+                preview.question_set,
+                preview.samples,
+                preview.search.map(|section| section.samples),
+                preview.evidence_as_of,
+                preview.generated_at,
+            )?;
+        }
+        Ok(preview)
     }
     .await
     .map_err(|error| api_error(error, context.request_id))?;
@@ -446,19 +654,23 @@ pub(crate) async fn preview(
 }
 
 #[utoipa::path(get, path="/api/v1/projects/{id}/measurement-reports",
-    security(("sessionCookie"=[])), params(("id"=ProjectId,Path)),
+    security(("sessionCookie"=[])), params(("id"=ProjectId,Path),
+        ("question_set_id"=Option<Uuid>,Query),("question_set_version_id"=Option<Uuid>,Query)),
     responses((status=200,body=MeasurementPeriodList),(status=404,body=ErrorResponse)))]
 pub(crate) async fn list(
     State(state): State<AppState>,
     Path(id): Path<ProjectId>,
+    Query(query): Query<MeasurementPeriodQuery>,
     Extension(tenant): Extension<TenantScope>,
     Extension(context): Extension<RequestContext>,
 ) -> Result<Json<MeasurementPeriodList>, ApiError> {
     let result = async {
         let scope = crate::channel_jobs::scope(&state, &tenant, id).await?;
+        let question_set = query.question_set()?;
+        ensure_question_set(&state, &scope, question_set.as_ref()).await?;
         state
             .report_repository()
-            .list_measurement_periods(&scope)
+            .list_measurement_periods(&scope, question_set)
             .await
     }
     .await;

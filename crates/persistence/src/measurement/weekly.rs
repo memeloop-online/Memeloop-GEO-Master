@@ -230,6 +230,7 @@ impl PgReportRepository {
         .map_err(|_| AppError::new(ErrorCode::Internal, "stored measurement report is invalid"))?;
         if report.report_id != report_id
             || report.project_id != project
+            || report.question_set.is_some()
             || report.revision != 1
             || report.correction_of.is_some()
             || report.window() != schedule.window

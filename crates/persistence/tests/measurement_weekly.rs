@@ -115,11 +115,67 @@ async fn draft_weekly_reports_persist_cutoff_replay_config_and_scope_without_cyc
         .unwrap();
     discover(&repo, project, generated).await;
     assert_eq!(due(&repo, &scope, generated).await, vec![schedule.clone()]);
+    use geo_domain::QuestionRepository;
+    let version = geo_persistence::PgQuestionRepository::from_database(&db)
+        .create_set(
+            &scope,
+            geo_domain::CreateQuestionSet {
+                idempotency_key: "weekly-scope-exclusion".into(),
+                name: "Synthetic questions".into(),
+                questions: vec![geo_domain::QuestionDraft {
+                    question_id: None,
+                    text: "A synthetic question?".into(),
+                    intent: "learn".into(),
+                    product_refs: vec![],
+                    market: "generic".into(),
+                    language: "en".into(),
+                    weight: 1,
+                    source: geo_domain::QuestionSource {
+                        kind: geo_domain::QuestionSourceKind::UserProvided,
+                        reference_id: None,
+                    },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let scoped = freeze_measurement_period(
+        &scope,
+        preview_measurement_period_at_cutoff(
+            &scope,
+            &schedule.window,
+            Some(geo_domain::MeasurementReportQuestionSet {
+                question_set_id: version.question_set_id,
+                question_set_version_id: version.id,
+            }),
+            vec![],
+            None,
+            schedule.evidence_as_of,
+            generated,
+        )
+        .unwrap(),
+        1,
+        None,
+    )
+    .unwrap();
+    let scoped = repo
+        .create_measurement_period(&scope, scoped)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.complete_measurement_week(&scope, schedule.id, scoped.report_id, generated)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(due(&repo, &scope, generated).await, vec![schedule.clone()]);
     let report = freeze_measurement_period(
         &scope,
         preview_measurement_period_at_cutoff(
             &scope,
             &schedule.window,
+            None,
             vec![],
             None,
             schedule.evidence_as_of,
@@ -184,6 +240,7 @@ async fn draft_weekly_reports_persist_cutoff_replay_config_and_scope_without_cyc
         preview_measurement_period_at_cutoff(
             &scope,
             &next.window,
+            None,
             vec![],
             None,
             next.evidence_as_of + Duration::seconds(1),

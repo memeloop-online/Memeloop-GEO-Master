@@ -1063,12 +1063,18 @@ async fn report_contract(
     }
     let cutoff = report_now(database).await;
     let first = store
-        .list_report_measurements(scope, &window, cutoff, None, 100)
+        .list_report_measurements(scope, Some(&window), cutoff, None, 100)
         .await
         .unwrap();
     assert_eq!(first.len(), 100);
     let second = store
-        .list_report_measurements(scope, &window, cutoff, Some(first[99].measurement_id), 100)
+        .list_report_measurements(
+            scope,
+            Some(&window),
+            cutoff,
+            Some(first[99].measurement_id),
+            100,
+        )
         .await
         .unwrap();
     assert_eq!(second.len(), 5);
@@ -1087,7 +1093,7 @@ async fn report_contract(
     );
     assert!(
         store
-            .list_report_measurements(scope, &window, now + Duration::minutes(1), None, 100)
+            .list_report_measurements(scope, Some(&window), now + Duration::minutes(1), None, 100)
             .await
             .unwrap()
             .is_empty()
@@ -1119,14 +1125,20 @@ async fn report_contract(
     // A backdated accepted task cannot enter an already fixed cohort cutoff.
     assert_eq!(
         store
-            .list_report_measurements(scope, &window, cutoff, None, 100)
+            .list_report_measurements(scope, Some(&window), cutoff, None, 100)
             .await
             .unwrap(),
         first
     );
     assert_eq!(
         store
-            .list_report_measurements(scope, &window, cutoff, Some(first[99].measurement_id), 100)
+            .list_report_measurements(
+                scope,
+                Some(&window),
+                cutoff,
+                Some(first[99].measurement_id),
+                100
+            )
             .await
             .unwrap(),
         second
@@ -1134,7 +1146,7 @@ async fn report_contract(
     let later = store
         .list_report_measurements(
             scope,
-            &window,
+            Some(&window),
             report_now(database).await,
             Some(Uuid::from_u128(105)),
             100,
@@ -1277,7 +1289,13 @@ async fn report_contract(
     ] {
         assert!(
             store
-                .list_report_measurements(&foreign, &window, report_now(database).await, None, 100)
+                .list_report_measurements(
+                    &foreign,
+                    Some(&window),
+                    report_now(database).await,
+                    None,
+                    100
+                )
                 .await
                 .unwrap()
                 .is_empty()
@@ -1300,7 +1318,7 @@ async fn report_contract(
     for limit in [0, 101] {
         assert!(
             store
-                .list_report_measurements(scope, &window, cutoff, None, limit)
+                .list_report_measurements(scope, Some(&window), cutoff, None, limit)
                 .await
                 .is_err()
         );

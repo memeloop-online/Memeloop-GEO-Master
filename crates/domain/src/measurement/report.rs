@@ -285,6 +285,7 @@ pub trait ReportRepository: Send + Sync {
     async fn list_measurement_periods(
         &self,
         _scope: &TenantScope,
+        _question_set: Option<crate::MeasurementReportQuestionSet>,
     ) -> Result<Vec<crate::MeasurementPeriodReport>, AppError> {
         Err(AppError::capability_missing(
             "measurement period reports unavailable",
@@ -294,13 +295,7 @@ pub trait ReportRepository: Send + Sync {
         &self,
         scope: &TenantScope,
         report_id: Uuid,
-    ) -> Result<crate::MeasurementPeriodReport, AppError> {
-        self.list_measurement_periods(scope)
-            .await?
-            .into_iter()
-            .find(|row| row.report_id == report_id)
-            .ok_or_else(|| AppError::not_found("measurement report not found"))
-    }
+    ) -> Result<crate::MeasurementPeriodReport, AppError>;
 }
 
 #[derive(Default)]
@@ -337,6 +332,7 @@ impl ReportRepository for MemoryReportRepository {
         // and retries return that exact snapshot, never a refreshed reduction.
         if let Some(row) = rows.iter().find(|row| {
             row.window() == snapshot.window()
+                && row.question_set == snapshot.question_set
                 && row.revision == snapshot.revision
                 && row.correction_of == snapshot.correction_of
         }) {
@@ -350,6 +346,7 @@ impl ReportRepository for MemoryReportRepository {
     async fn list_measurement_periods(
         &self,
         scope: &TenantScope,
+        question_set: Option<crate::MeasurementReportQuestionSet>,
     ) -> Result<Vec<crate::MeasurementPeriodReport>, AppError> {
         let project = scope
             .project_id
@@ -363,8 +360,11 @@ impl ReportRepository for MemoryReportRepository {
                 scope.tenant_id.as_uuid(),
                 project.as_uuid(),
             ))
+            .into_iter()
+            .flatten()
+            .filter(|row| row.question_set == question_set)
             .cloned()
-            .unwrap_or_default();
+            .collect::<Vec<_>>();
         rows.sort_by_key(|row| {
             (
                 std::cmp::Reverse(row.report_window_end_at),
@@ -372,6 +372,27 @@ impl ReportRepository for MemoryReportRepository {
             )
         });
         Ok(rows)
+    }
+
+    async fn get_measurement_period(
+        &self,
+        scope: &TenantScope,
+        report_id: Uuid,
+    ) -> Result<crate::MeasurementPeriodReport, AppError> {
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::forbidden("project scope required"))?;
+        self.measurement_periods
+            .read()
+            .await
+            .get(&(
+                scope.operator_id.as_uuid(),
+                scope.tenant_id.as_uuid(),
+                project.as_uuid(),
+            ))
+            .and_then(|rows| rows.iter().find(|row| row.report_id == report_id))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("measurement report not found"))
     }
 
     async fn create(

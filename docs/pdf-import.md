@@ -23,7 +23,7 @@
 - 后续 turn 具有明确系统 origin/causation，UI 显示“解析完成，自动接续”；不得伪造一条用户消息。仅允许读取已绑定 release/version 并检索回答，不重新取得附件导入或原任务全部写操作权限。
 - 创建 continuation、run 和会话事件同事务；沿用会话串行。原请求取消抑制关联接续，部分成功/全失败按实际结果回答，不伪造引用。
 
-实施接缝为 `crates/api/src/agent_runtime.rs`、`crates/worker/src/host.rs`、Agent 仓储/dispatcher、PDF 完成 outbox 及 P00 事件呈现。验收须覆盖页面关闭、完成早于关联、乱序重复事件、多副本、事务边界重启、取消竞争和跨租户隔离。该方案解决后续任务入队恢复，不解决新 Run 的 running 阶段崩溃；完整同 Run 恢复仍按 `agent-tool-ledger.md` 的依赖推进。
+实施接缝为 `crates/api/src/agent/agent_runtime.rs`、`crates/worker/src/host.rs`、Agent 仓储/dispatcher、PDF 完成 outbox 及 P00 事件呈现。验收须覆盖页面关闭、完成早于关联、乱序重复事件、多副本、事务边界重启、取消竞争和跨租户隔离。该方案解决后续任务入队恢复，不解决新 Run 的 running 阶段崩溃；完整同 Run 恢复仍按 `agent-tool-ledger.md` 的依赖推进。
 
 已接入的前置能力是：导入结果返回真实 job ID、作用域内只读查询实时进度、按原始收据键核对任务、返回实际最终 release/version。验证状态以工作日志为准。这些前置能力不等于自动接续已经交付。
 

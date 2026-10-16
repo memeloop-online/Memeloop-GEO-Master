@@ -36,12 +36,43 @@ impl MeasurementPeriodWindow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementReportQuestionSet {
+    pub question_set_id: Uuid,
+    pub question_set_version_id: Uuid,
+}
+
+impl MeasurementReportQuestionSet {
+    pub fn matches(&self, binding: Option<&FrozenQuestionBinding>) -> bool {
+        binding.is_some_and(|binding| {
+            binding.reference.question_set_id == self.question_set_id
+                && binding.reference.question_set_version_id == self.question_set_version_id
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MeasurementReportConditions {
+    pub question: String,
+    pub provider: String,
+    pub model: String,
+    pub surface: String,
+    pub search_mode: String,
+    pub protocol_version: String,
+    pub question_set_version: String,
+    pub market: String,
+    pub language: String,
+    pub sample_ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct MeasurementPeriodSample {
     pub plan_id: Uuid,
     pub target_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<Uuid>,
     pub comparison_key: String,
+    pub conditions: MeasurementReportConditions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question_binding: Option<FrozenQuestionBinding>,
     pub scheduled_at: DateTime<Utc>,
@@ -50,6 +81,9 @@ pub struct MeasurementPeriodSample {
     /// Independently validated original live receipt, not saved-analysis success.
     pub observed_live: bool,
     pub observation: Option<EffectiveObservation>,
+    /// Grounded recommendation payload from the effective observation revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommendations: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -76,6 +110,8 @@ pub enum MeasurementPeriodReportKind {
 pub struct MeasurementPeriodPreview {
     pub kind: MeasurementPeriodPreviewKind,
     pub project_id: ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_set: Option<MeasurementReportQuestionSet>,
     pub report_window_start_at: DateTime<Utc>,
     pub report_window_end_at: DateTime<Utc>,
     pub report_timezone: String,
@@ -93,6 +129,8 @@ pub struct MeasurementPeriodReport {
     pub kind: MeasurementPeriodReportKind,
     pub report_id: Uuid,
     pub project_id: ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_set: Option<MeasurementReportQuestionSet>,
     pub revision: u32,
     pub correction_of: Option<Uuid>,
     pub report_window_start_at: DateTime<Utc>,
@@ -120,20 +158,30 @@ impl MeasurementPeriodReport {
 pub fn preview_measurement_period(
     scope: &TenantScope,
     window: &MeasurementPeriodWindow,
+    question_set: Option<MeasurementReportQuestionSet>,
     samples: Vec<MeasurementPeriodSample>,
     now: DateTime<Utc>,
 ) -> Result<MeasurementPeriodPreview, AppError> {
-    preview_measurement_period_with_search(scope, window, samples, None, now)
+    preview_measurement_period_with_search(scope, window, question_set, samples, None, now)
 }
 
 pub fn preview_measurement_period_with_search(
     scope: &TenantScope,
     window: &MeasurementPeriodWindow,
+    question_set: Option<MeasurementReportQuestionSet>,
     samples: Vec<MeasurementPeriodSample>,
     search_samples: Option<Vec<MeasurementPeriodSearchSample>>,
     now: DateTime<Utc>,
 ) -> Result<MeasurementPeriodPreview, AppError> {
-    preview_measurement_period_at_cutoff(scope, window, samples, search_samples, now, now)
+    preview_measurement_period_at_cutoff(
+        scope,
+        window,
+        question_set,
+        samples,
+        search_samples,
+        now,
+        now,
+    )
 }
 
 /// Project evidence at a fixed cutoff, independently of when the report is generated.
@@ -141,6 +189,7 @@ pub fn preview_measurement_period_with_search(
 pub fn preview_measurement_period_at_cutoff(
     scope: &TenantScope,
     window: &MeasurementPeriodWindow,
+    question_set: Option<MeasurementReportQuestionSet>,
     mut samples: Vec<MeasurementPeriodSample>,
     search_samples: Option<Vec<MeasurementPeriodSearchSample>>,
     evidence_as_of: DateTime<Utc>,
@@ -154,7 +203,10 @@ pub fn preview_measurement_period_at_cutoff(
     let mut seen = BTreeSet::new();
     let mut coverage = MeasurementPeriodCoverage::default();
     for sample in &mut samples {
-        if !seen.insert(sample.target_id)
+        if question_set
+            .as_ref()
+            .is_some_and(|selected| !selected.matches(sample.question_binding.as_ref()))
+            || !seen.insert(sample.target_id)
             || sample.scheduled_at < window.start_at
             || sample.scheduled_at >= window.end_at
             || sample.comparison_key.trim().is_empty()
@@ -199,6 +251,13 @@ pub fn preview_measurement_period_at_cutoff(
         }) {
             sample.observation = None;
         }
+        if sample
+            .observation
+            .as_ref()
+            .is_none_or(|observation| observation.provenance.is_none())
+        {
+            sample.recommendations = None;
+        }
         coverage.planned += 1;
         *coverage
             .counts
@@ -212,6 +271,17 @@ pub fn preview_measurement_period_at_cutoff(
                 .is_some_and(|observation| observation.provenance.is_some()),
         );
     }
+    if question_set.as_ref().is_some_and(|selected| {
+        search_samples.as_ref().is_some_and(|samples| {
+            samples
+                .iter()
+                .any(|sample| !selected.matches(sample.cohort.question_binding.as_ref()))
+        })
+    }) {
+        return Err(AppError::invalid_request(
+            "search sample outside report question set",
+        ));
+    }
     let search = search_samples
         .map(|samples| {
             super::measurement_report_search::measurement_period_search_section(
@@ -221,11 +291,12 @@ pub fn preview_measurement_period_at_cutoff(
             )
         })
         .transpose()?;
-    let bytes = serde_json::to_vec(&(window, &samples, &search))
+    let bytes = serde_json::to_vec(&(window, &question_set, &samples, &search))
         .map_err(|_| AppError::invalid_request("measurement report cannot be serialized"))?;
     Ok(MeasurementPeriodPreview {
         kind: MeasurementPeriodPreviewKind::MeasurementPeriodPreview,
         project_id,
+        question_set,
         report_window_start_at: window.start_at,
         report_window_end_at: window.end_at,
         report_timezone: window.report_timezone.clone(),
@@ -276,16 +347,20 @@ pub fn freeze_measurement_period(
         preview.generated_at,
     )?;
     let digest = Sha256::digest(
-        format!(
-            "measurement-period-v1:{}:{}:{}:{}:{}:{}:{revision}",
+        serde_json::to_vec(&(
+            "measurement-period-v1",
             scope.operator_id,
             scope.tenant_id,
             preview.project_id,
+            &preview.question_set,
             preview.report_window_start_at,
             preview.report_window_end_at,
-            preview.report_timezone,
-        )
-        .as_bytes(),
+            &preview.report_timezone,
+            revision,
+        ))
+        .map_err(|_| {
+            AppError::invalid_request("measurement report identity cannot be serialized")
+        })?,
     );
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -295,6 +370,7 @@ pub fn freeze_measurement_period(
         kind: MeasurementPeriodReportKind::MeasurementPeriod,
         report_id: Uuid::from_bytes(bytes),
         project_id: preview.project_id,
+        question_set: preview.question_set,
         revision,
         correction_of,
         report_window_start_at: preview.report_window_start_at,
@@ -326,6 +402,7 @@ pub fn validate_measurement_period_correction(
         .find(|row| Some(row.report_id) == proposed.correction_of)
         .ok_or_else(|| AppError::conflict("measurement report correction parent not found"))?;
     if parent.project_id != proposed.project_id
+        || parent.question_set != proposed.question_set
         || parent.window() != proposed.window()
         || parent.revision + 1 != proposed.revision
         || parent.evidence_as_of > proposed.evidence_as_of
@@ -352,11 +429,14 @@ pub fn validate_measurement_period_correction(
                     || before.target_id != after.target_id
                     || before.comparison_key != after.comparison_key
                     || before.question_binding != after.question_binding
+                    || before.conditions != after.conditions
                     || before.scheduled_at != after.scheduled_at
             })
-        || existing
-            .iter()
-            .any(|row| row.window() == proposed.window() && row.revision >= proposed.revision)
+        || existing.iter().any(|row| {
+            row.window() == proposed.window()
+                && row.question_set == proposed.question_set
+                && row.revision >= proposed.revision
+        })
     {
         return Err(AppError::conflict(
             "measurement report correction parent is not latest",
@@ -390,6 +470,19 @@ mod tests {
             target_id: Uuid::new_v4(),
             attempt_id: Some(Uuid::new_v4()),
             comparison_key: "protocol".into(),
+            conditions: MeasurementReportConditions {
+                question: "Synthetic question".into(),
+                provider: "provider".into(),
+                model: "model".into(),
+                surface: "consumer_web".into(),
+                search_mode: "web_search".into(),
+                protocol_version: "v1".into(),
+                question_set_version: "synthetic.v1".into(),
+                market: "generic".into(),
+                language: "en".into(),
+                sample_ordinal: 0,
+            },
+            recommendations: None,
             question_binding: None,
             scheduled_at: observed,
             original_status: "unknown".into(),
@@ -413,7 +506,7 @@ mod tests {
             }),
         };
         let accepted =
-            preview_measurement_period(&scope, &window, vec![sample.clone()], now).unwrap();
+            preview_measurement_period(&scope, &window, None, vec![sample.clone()], now).unwrap();
         assert_eq!(accepted.coverage.planned, 1);
         assert_eq!(accepted.coverage.counts["unknown"], 1);
         assert_eq!(accepted.coverage.grounded_saved_analysis, 1);
@@ -426,27 +519,40 @@ mod tests {
             .as_mut()
             .unwrap()
             .analyzed_at += Duration::seconds(1);
-        let late = preview_measurement_period(&scope, &window, vec![sample.clone()], now).unwrap();
+        let late =
+            preview_measurement_period(&scope, &window, None, vec![sample.clone()], now).unwrap();
         assert_eq!(late.coverage.grounded_saved_analysis, 0);
         assert!(late.samples[0].observation.is_none());
         sample.observation.as_mut().unwrap().provenance = None;
         assert!(
-            preview_measurement_period(&scope, &window, vec![sample.clone()], now)
+            preview_measurement_period(&scope, &window, None, vec![sample.clone()], now)
                 .unwrap()
                 .samples[0]
                 .observation
                 .is_none()
         );
         assert!(
-            preview_measurement_period(&scope, &window, vec![sample.clone(), sample.clone()], now)
-                .is_err()
+            preview_measurement_period(
+                &scope,
+                &window,
+                None,
+                vec![sample.clone(), sample.clone()],
+                now
+            )
+            .is_err()
         );
         let first = freeze_measurement_period(&scope, accepted, 1, None).unwrap();
         sample.target_id = Uuid::new_v4();
         let changed = freeze_measurement_period(
             &scope,
-            preview_measurement_period(&scope, &window, vec![sample], now + Duration::seconds(1))
-                .unwrap(),
+            preview_measurement_period(
+                &scope,
+                &window,
+                None,
+                vec![sample],
+                now + Duration::seconds(1),
+            )
+            .unwrap(),
             2,
             Some(first.report_id),
         )

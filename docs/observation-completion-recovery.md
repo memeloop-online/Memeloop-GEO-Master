@@ -45,6 +45,6 @@
 4. 持久保存并重新验证独立恢复证据后才记录 `Recovered`。浏览器确认释放后才能释放账号；关闭未知继续保留持久占用。
 5. `Retry` 按 30 秒至一小时退避；`NeedsLogin` 为 15 分钟至一小时。明确的 `History/CompletionUnverified` 表示历史尚未完成，允许只读重试；无诊断或不支持的 `Retained` 不自动升级为可重试。
 
-代码入口为领域及持久层的 `observation_completion_recovery_jobs.rs`、API 的 `observation_completion_recovery.rs` 和应用的 `observation_completion_recovery_dispatch.rs`。
+代码入口为领域的 `crates/domain/src/measurement/observation_completion_recovery_jobs.rs`、持久层的 `crates/persistence/src/measurement/completion_recovery_jobs.rs`、API 的 `crates/api/src/measurement/observation_completion_recovery.rs` 和应用的 `crates/app/src/observation_completion_recovery_dispatch.rs`。
 
 基础恢复实现已通过定向测试、独立审查及 CI PostgreSQL 实库测试，迁移 0056 和调度 API 已部署；后续真实任务已进入重试，闭合原因诊断仍待交付，重启恢复和真实同会话验收尚未完成。不得把代码接线、表存在、历史空队列或服务就绪标为自动恢复验收完成。最新交付和部署状态以 `HANDOFF.md` 为准。

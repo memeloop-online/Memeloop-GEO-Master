@@ -926,11 +926,12 @@ impl SerpRawEvidence {
 #[async_trait]
 pub trait SerpRepository: Send + Sync {
     /// Metadata-only report cohort, UUID ASC, limit 1..=100. Enforce full scope,
-    /// scheduled [start,end), and created/stored <= evidence_as_of.
+    /// scheduled [start,end), or all history before cutoff when window is absent;
+    /// created/stored <= evidence_as_of.
     async fn list_report_measurements(
         &self,
         scope: &TenantScope,
-        window: &crate::MeasurementPeriodWindow,
+        window: Option<&crate::MeasurementPeriodWindow>,
         evidence_as_of: DateTime<Utc>,
         after: Option<Uuid>,
         limit: usize,

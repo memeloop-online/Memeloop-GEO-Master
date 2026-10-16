@@ -23,6 +23,18 @@ const translations = {
     pageTitle: "测量与效果报告",
     pageDescription: "查看话题测量、已存回答分析与周期报告。",
     title: "话题测量报告",
+    questionSetTitle: "问题集排名报告",
+    questionSetDescription:
+      "查看该问题集版本的推荐排名变化，保存报告后可随时查看固定版本。",
+    questionSetPreview: "测量结果预览",
+    questionSetBack: "返回测量结果预览",
+    questionSetScopeError: "此报告不属于当前问题集版本，请重新打开。",
+    chooseWindow: "选择报告时间范围",
+    windowStart: "开始时间（本地时间）",
+    windowEnd: "结束时间（本地时间）",
+    applyWindow: "应用时间范围",
+    allHistory: "全部测量记录",
+    invalidWindow: "请选择有效的开始和结束时间，结束时间须晚于开始时间。",
     description: "查看近期问题的测量结果与已存回答分析。",
     preview: "最近七天 · 预览",
     previewNote: "刷新查看最新数据；保存后可查看固定版本。",
@@ -98,6 +110,20 @@ const translations = {
     pageDescription:
       "Review topic measurements, saved-response analyses and cycle reports.",
     title: "Topic measurement reports",
+    questionSetTitle: "Question set rank reports",
+    questionSetDescription:
+      "Review recommendation rank changes for this question set version. Save a report to revisit a fixed version.",
+    questionSetPreview: "Measurement results · preview",
+    questionSetBack: "Back to measurement results",
+    questionSetScopeError:
+      "This report does not belong to the current question set version. Open it again.",
+    chooseWindow: "Choose report period",
+    windowStart: "Start time (local time)",
+    windowEnd: "End time (local time)",
+    applyWindow: "Apply period",
+    allHistory: "All measurement history",
+    invalidWindow:
+      "Choose a valid start and end time. The end must be after the start.",
     description:
       "Review recent question measurements and saved-response analyses.",
     preview: "Last seven days · preview",

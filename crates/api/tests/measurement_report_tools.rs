@@ -153,7 +153,7 @@ async fn p00_period_preview_save_replay_get_list_need_no_cycle_or_setup() {
     assert!(
         state
             .report_repository()
-            .list_measurement_periods(&scope)
+            .list_measurement_periods(&scope, None)
             .await
             .unwrap()
             .is_empty()
@@ -282,6 +282,19 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
             target_id: Uuid::new_v4(),
             attempt_id: Some(Uuid::new_v4()),
             comparison_key: format!("{canary}_question"),
+            conditions: geo_domain::MeasurementReportConditions {
+                question: "Synthetic question".into(),
+                provider: "provider".into(),
+                model: "model".into(),
+                surface: "consumer_web".into(),
+                search_mode: "web_search".into(),
+                protocol_version: "v1".into(),
+                question_set_version: "synthetic.v1".into(),
+                market: "generic".into(),
+                language: "en".into(),
+                sample_ordinal: 0,
+            },
+            recommendations: None,
             question_binding: purpose.map(|purpose| FrozenQuestionBinding {
                 reference: QuestionReference {
                     question_set_id: Uuid::new_v4(),
@@ -321,6 +334,7 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
     let preview = geo_domain::preview_measurement_period_with_search(
         &scope,
         &window,
+        None,
         samples,
         Some(search),
         now,
