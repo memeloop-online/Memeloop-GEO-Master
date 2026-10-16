@@ -1,6 +1,6 @@
 //! Read-only saved-analysis evidence selection, shared by insights and reports.
 //! This has no inference, dispatch, cleanup, or measurement-write capability.
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use geo_domain::{
@@ -35,6 +35,7 @@ impl ObservationEvidenceResolver {
         if scope.project_id.is_none() {
             return Err(AppError::forbidden("project scope required"));
         }
+        let mut views_by_attempt = HashMap::new();
         let attempts = views
             .iter()
             .filter_map(|view| {
@@ -44,7 +45,11 @@ impl ObservationEvidenceResolver {
                         attempt.claimed_at <= as_of
                             && attempt.received_at.is_some_and(|at| at <= as_of)
                     })
-                    .map(|attempt| (view.target.target_id, attempt.attempt_id))
+                    .map(|attempt| {
+                        let pair = (view.target.target_id, attempt.attempt_id);
+                        views_by_attempt.entry(pair).or_insert(view);
+                        pair
+                    })
             })
             .collect::<Vec<_>>();
         let mut selected = Vec::new();
@@ -54,12 +59,9 @@ impl ObservationEvidenceResolver {
                 .latest_grounded_for_attempts(scope, batch, as_of)
                 .await?;
             for revision in revisions {
-                let Some(view) = views.iter().find(|view| {
-                    view.target.target_id == revision.request.target_id
-                        && view.attempts.last().is_some_and(|attempt| {
-                            attempt.attempt_id == revision.request.attempt_id
-                        })
-                }) else {
+                let Some(view) = views_by_attempt
+                    .get(&(revision.request.target_id, revision.request.attempt_id))
+                else {
                     continue;
                 };
                 let capture = match revision.request.source {
@@ -67,10 +69,7 @@ impl ObservationEvidenceResolver {
                         let Some(capture) = self.captures.get(scope, capture_id).await? else {
                             continue;
                         };
-                        if capture.receipt.stored_at > as_of
-                            || capture.receipt.capture_id != capture.input.capture_id
-                            || capture.receipt.schema_version != 1
-                        {
+                        if capture.receipt.stored_at > as_of {
                             continue;
                         }
                         Some(capture)

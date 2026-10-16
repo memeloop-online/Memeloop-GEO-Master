@@ -104,11 +104,8 @@ impl StructuredDocument {
         }));
         sections
     }
-    pub fn validate(&self, evidence: &[EvidenceRef]) -> Result<(), AppError> {
-        self.validate_structure(evidence)
-    }
     /// Structural validation alone does not authorize referenced media objects.
-    pub fn validate_structure(&self, evidence: &[EvidenceRef]) -> Result<(), AppError> {
+    pub fn validate(&self, evidence: &[EvidenceRef]) -> Result<(), AppError> {
         if !matches!(self.schema_version, None | Some(2)) {
             return Err(AppError::invalid_request(
                 "unsupported content schema version",

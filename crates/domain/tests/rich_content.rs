@@ -589,7 +589,7 @@ fn media_references_are_structurally_valid_but_require_a_media_publication_adapt
         "object_id":object_id,"object_version":2,
         "sha256":"0123456789abcdef".repeat(4),"alt":"A < device","caption":"Caption & detail"
     }}));
-    doc.validate_structure(&[]).unwrap();
+    doc.validate(&[]).unwrap();
     assert_eq!(doc.media_references()[0].object_id, object_id);
     assert!(
         doc.blocks[0]

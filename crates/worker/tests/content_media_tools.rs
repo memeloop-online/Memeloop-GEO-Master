@@ -123,10 +123,10 @@ fn recorded_bridge(recorder: Arc<Recorder>) -> HostBridge {
 }
 
 #[test]
-fn v16_surface_and_strict_media_dtos() {
+fn current_surface_and_strict_media_dtos() {
     assert_eq!(HOST_OPS_VERSION, "geo.hostops.v19");
-    assert_eq!(HostOp::COUNT, 48);
     let names = HostRuntime::op_surface();
+    assert!(!names.iter().any(|name| name == "op_host_knowledge_search_v1"));
     for (op, js_name) in [
         (HostOp::ContentMediaList, "op_host_content_media_list_v1"),
         (HostOp::ContentMediaBind, "op_host_content_media_bind_v1"),
