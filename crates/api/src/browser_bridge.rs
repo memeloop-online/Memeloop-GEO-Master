@@ -244,23 +244,57 @@ impl BrowserBridge {
         )
     }
 
+    /// The runner names its own failures in a closed vocabulary
+    /// (`{"error": "<code>"}`). A deployment with no interactive runtime and an
+    /// account that failed identity proof both answer `409`, so the status alone
+    /// cannot tell them apart; only the body can.
+    async fn runner_error_code(mut response: reqwest::Response) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            error: String,
+        }
+        const MAX_RUNNER_ERROR_BYTES: usize = 4096;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if body.len().saturating_add(chunk.len()) > MAX_RUNNER_ERROR_BYTES {
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice::<Envelope>(&body)
+            .ok()
+            .map(|envelope| envelope.error)
+    }
+
     async fn response<T: serde::de::DeserializeOwned>(
         mut response: reqwest::Response,
     ) -> Result<T, AppError> {
         let status = response.status();
         if !status.is_success() {
-            return Err(
-                if status == StatusCode::CONFLICT || status == StatusCode::UNPROCESSABLE_ENTITY {
+            let runner_code = Self::runner_error_code(response).await;
+            // A missing runtime is reported as a missing capability, never as a
+            // failed identity check or a generic dependency outage: the contract
+            // requires an undeployed runtime to read as explicitly unavailable.
+            return Err(match runner_code.as_deref() {
+                Some("capability_missing") => AppError::capability_missing(
+                    "browser login runtime is not configured on this deployment",
+                ),
+                Some("desktop_unavailable") => AppError::capability_missing(
+                    "browser desktop runtime is unavailable on this deployment",
+                ),
+                _ if status == StatusCode::CONFLICT
+                    || status == StatusCode::UNPROCESSABLE_ENTITY =>
+                {
                     AppError::conflict("browser login has not verified the account identity")
-                } else if status == StatusCode::NOT_FOUND {
+                }
+                _ if status == StatusCode::NOT_FOUND => {
                     AppError::not_found("browser login session expired")
-                } else {
-                    AppError::new(
-                        ErrorCode::DependencyUnavailable,
-                        "browser runner unavailable",
-                    )
-                },
-            );
+                }
+                _ => AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser runner unavailable",
+                ),
+            });
         }
         const MAX_RUNNER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
         let mut body = Vec::new();

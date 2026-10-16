@@ -245,6 +245,22 @@ function errorText(error: unknown) {
     : i18n.t("account.operationFailed");
 }
 
+// A deployment with no browser desktop runtime cannot start a remote sign-in at
+// all. Reporting that as a generic "operation did not finish" hides the one
+// fact the reader needs, so a missing capability gets its own title and detail.
+function remoteLoginError(error: unknown) {
+  if (error instanceof ApiError && error.code === "capability_missing") {
+    return {
+      title: i18n.t("account.remote.runtimeMissingTitle"),
+      detail: i18n.t("account.remote.runtimeMissingDetail"),
+    };
+  }
+  return {
+    title: i18n.t("account.channels.failed"),
+    detail: errorText(error),
+  };
+}
+
 function LoginStarting() {
   const { t } = useTranslation();
   return (
@@ -475,9 +491,10 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
     accountId?: string;
     platform: ChannelPlatformId;
   } | null>(null);
-  const [error, setError] = useState("");
+  const [error, setError] = useState<unknown>(null);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const failure = remoteLoginError(error);
   const activeAccount = accounts.data?.items.find(
     (account) => account.account_id === editAccountId,
   );
@@ -532,7 +549,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
 
   async function run(operation: () => Promise<unknown>, success: string) {
     setBusy(true);
-    setError("");
+    setError(null);
     setNotice("");
     try {
       await operation();
@@ -540,7 +557,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
       setNotice(success);
       return true;
     } catch (cause) {
-      setError(errorText(cause));
+      setError(cause);
       return false;
     } finally {
       setBusy(false);
@@ -585,7 +602,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
     setLoginStarting(true);
     setFailedLogin(null);
     setBusy(true);
-    setError("");
+    setError(null);
     setNotice("");
     let id = accountId;
     try {
@@ -612,7 +629,7 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
       if (loginAttempt.current !== attempt) return;
       setProxyPassword("");
       setFailedLogin({ accountId: id, platform: selectedPlatform! });
-      setError(errorText(cause));
+      setError(cause);
     } finally {
       if (loginAttempt.current === attempt) {
         loginAttempt.current = null;
@@ -724,10 +741,10 @@ export function ChannelAccountsPage({ view = "channels" }: { view?: View }) {
               <Link to="../setup">{t("account.channels.viewSetup")}</Link>
             </p>
           )}
-          {error && (
+          {error != null && (
             <ErrorState
-              title={t("account.channels.failed")}
-              detail={error}
+              title={failure.title}
+              detail={failure.detail}
               onRetry={
                 failedLogin
                   ? () => void connect(failedLogin.accountId)
