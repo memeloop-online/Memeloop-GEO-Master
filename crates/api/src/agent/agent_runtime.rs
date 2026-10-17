@@ -1601,10 +1601,21 @@ impl HostOps for RepositoryHostOps {
             .map_err(|error| worker_error(op, error))
     }
 
+    async fn content_source_read(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentSourceReadRequest,
+    ) -> Result<geo_worker::ContentSourcePage, HostOpError> {
+        let op = HostOp::ContentSourceRead;
+        crate::content_tools::source_read(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
     async fn content_prepare(
         &self,
         scope: &TenantScope,
-        request: geo_worker::ContentStepRequest,
+        request: geo_worker::ContentPrepareRequest,
     ) -> Result<geo_worker::ContentItemRef, HostOpError> {
         let op = HostOp::ContentPrepare;
         crate::content_tools::prepare(self.content_state(op)?, scope, request)
@@ -2076,7 +2087,16 @@ impl HostOps for RepositoryHostOps {
         scope: &TenantScope,
         request: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
-        let Some(provider) = self.model_provider.as_ref() else {
+        let provider = self.model_provider.clone().or_else(|| {
+            self.content_state.as_ref().and_then(|state| {
+                state
+                    .content_model
+                    .read()
+                    .expect("content model lock")
+                    .clone()
+            })
+        });
+        let Some(provider) = provider else {
             return Err(HostOpError::capability_missing(
                 HostOp::ModelComplete,
                 "no model provider bridge is configured",
@@ -2500,6 +2520,31 @@ mod tests {
         let result = ops.model_complete(&test_scope(), request).await.unwrap();
         assert_eq!(result.text, "hello");
         assert_eq!(result.model, "fake-model");
+    }
+
+    #[tokio::test]
+    async fn content_workflow_host_uses_the_current_content_model_after_assembly() {
+        let state = AppState::development();
+        let ops = RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone());
+        let request = ModelCompletionRequest {
+            prompt: "select exact evidence".into(),
+            system: None,
+            model: None,
+            max_output_tokens: None,
+            messages: vec![],
+            tools: vec![],
+        };
+        assert_eq!(
+            ops.model_complete(&test_scope(), request.clone())
+                .await
+                .unwrap_err()
+                .code,
+            HostOpErrorCode::CapabilityMissing
+        );
+        state.configure_content_model(Arc::new(FakeModelProvider));
+        let completion = ops.model_complete(&test_scope(), request).await.unwrap();
+        assert_eq!(completion.text, "select exact evidence");
+        assert_eq!(completion.model, "fake-model");
     }
 
     #[test]

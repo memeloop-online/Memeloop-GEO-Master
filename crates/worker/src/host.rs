@@ -453,10 +453,19 @@ fn validate_recorded_return(
                 }
             }
         }
-        HostOp::ContentPrepare
-        | HostOp::ContentGenerate
-        | HostOp::ContentCheck
-        | HostOp::ContentRepair => {
+        HostOp::ContentSourceRead => {
+            let requested: ContentSourceReadRequest = typed(op, request)?;
+            let response: ContentSourcePage = typed(op, result)?;
+            response.validate_for(&requested).map_err(invalid)?;
+        }
+        HostOp::ContentPrepare => {
+            let requested: ContentPrepareRequest = typed(op, request)?;
+            let response: ContentItemRef = typed(op, result)?;
+            if requested.item_id != response.item_id || response.branch_key.is_empty() {
+                return Err(HostOpError::internal(op, "step returned an unrelated item"));
+            }
+        }
+        HostOp::ContentGenerate | HostOp::ContentCheck | HostOp::ContentRepair => {
             let requested: ContentStepRequest = typed(op, request)?;
             let response: ContentItemRef = typed(op, result)?;
             if requested.item_id != response.item_id || response.branch_key.is_empty() {
@@ -987,6 +996,7 @@ pub enum HostOp {
     ChannelManifestRead,
     ChannelTargetExecute,
     ContentItemsRead,
+    ContentSourceRead,
     ContentPrepare,
     ContentGenerate,
     ContentCheck,
@@ -1016,7 +1026,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 47;
+    pub const COUNT: usize = 48;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -1042,6 +1052,7 @@ impl HostOp {
         Self::ChannelManifestRead,
         Self::ChannelTargetExecute,
         Self::ContentItemsRead,
+        Self::ContentSourceRead,
         Self::ContentPrepare,
         Self::ContentGenerate,
         Self::ContentCheck,
@@ -1094,6 +1105,7 @@ impl HostOp {
             Self::ChannelManifestRead => "channel.manifest.read.v1",
             Self::ChannelTargetExecute => "channel.target.execute.v1",
             Self::ContentItemsRead => "content.items.read.v1",
+            Self::ContentSourceRead => "content.source.read.v1",
             Self::ContentPrepare => "content.prepare.v1",
             Self::ContentGenerate => "content.generate.v1",
             Self::ContentCheck => "content.check.v1",
@@ -1147,6 +1159,7 @@ impl HostOp {
             Self::ChannelManifestRead => "op_host_channel_manifest_read_v1",
             Self::ChannelTargetExecute => "op_host_channel_target_execute_v1",
             Self::ContentItemsRead => "op_host_content_items_read_v1",
+            Self::ContentSourceRead => "op_host_content_source_read_v1",
             Self::ContentPrepare => "op_host_content_prepare_v1",
             Self::ContentGenerate => "op_host_content_generate_v1",
             Self::ContentCheck => "op_host_content_check_v1",
@@ -1260,6 +1273,7 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(15_000, 64),
                 HostOpLimits::new(120_000, 32),
                 HostOpLimits::new(15_000, 128), // paged content reads
+                HostOpLimits::new(15_000, 2_048), // exact frozen source pages
                 HostOpLimits::new(120_000, 2_048), // prepare
                 HostOpLimits::new(120_000, 2_048), // generate
                 HostOpLimits::new(120_000, 6_144), // check, up to three passes
@@ -1832,10 +1846,21 @@ pub trait HostOps: Send + Sync {
         ))
     }
 
+    async fn content_source_read(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentSourceReadRequest,
+    ) -> Result<ContentSourcePage, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentSourceRead,
+            "content source reading is not configured",
+        ))
+    }
+
     async fn content_prepare(
         &self,
         _scope: &TenantScope,
-        _request: ContentStepRequest,
+        _request: ContentPrepareRequest,
     ) -> Result<ContentItemRef, HostOpError> {
         Err(HostOpError::capability_missing(
             HostOp::ContentPrepare,
@@ -2177,8 +2202,7 @@ pub struct ContentHandoffRef {
     pub total: u64,
 }
 
-/// Only durable references and state cross the workflow boundary. Briefs,
-/// evidence, document bodies, and model prompts remain inside Rust services.
+/// Frozen content branches are paged independently from their source text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentItemsReadRequest {
@@ -2198,9 +2222,118 @@ pub struct ContentStepRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ContentPrepareRequest {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub evidence: Vec<geo_domain::ContentEvidence>,
+}
+
+impl ContentPrepareRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.execution_id.is_nil() || self.item_id.is_nil() || self.evidence.len() > 24 {
+            return Err("invalid content preparation references or evidence count".into());
+        }
+        if self.evidence.iter().any(|quote| {
+            quote.reference.source_version_id.is_nil()
+                || quote.reference.chunk_id.is_none_or(|id| id.is_nil())
+                || quote.exact_quote.trim().is_empty()
+                || quote.exact_quote.chars().count() > geo_domain::CONTENT_EVIDENCE_MAX_QUOTE_CHARS
+        }) {
+            return Err("preparation requires bounded exact located quotes".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentSourceRef {
+    pub source_id: Uuid,
+    pub source_version_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentSourceReadRequest {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub source_id: Uuid,
+    pub source_version_id: Uuid,
+    pub after_ordinal: Option<i32>,
+    pub limit: u32,
+}
+
+impl ContentSourceReadRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.execution_id.is_nil()
+            || self.item_id.is_nil()
+            || self.source_id.is_nil()
+            || self.source_version_id.is_nil()
+            || !(1..=32).contains(&self.limit)
+            || self.after_ordinal.is_some_and(|ordinal| ordinal < 0)
+        {
+            return Err("invalid content source references or page size".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentSourceChunk {
+    pub chunk_id: Uuid,
+    pub ordinal: i32,
+    pub locator: geo_domain::ChunkLocator,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentSourcePage {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub source_id: Uuid,
+    pub source_version_id: Uuid,
+    pub chunks: Vec<ContentSourceChunk>,
+    pub next_ordinal: Option<i32>,
+}
+
+impl ContentSourcePage {
+    pub fn validate_for(&self, request: &ContentSourceReadRequest) -> Result<(), String> {
+        if self.execution_id != request.execution_id
+            || self.item_id != request.item_id
+            || self.source_id != request.source_id
+            || self.source_version_id != request.source_version_id
+            || self.chunks.len() > request.limit as usize
+            || self.chunks.iter().any(|chunk| {
+                chunk.chunk_id.is_nil()
+                    || chunk.ordinal < 0
+                    || request
+                        .after_ordinal
+                        .is_some_and(|after| chunk.ordinal <= after)
+            })
+            || self
+                .chunks
+                .windows(2)
+                .any(|pair| pair[0].ordinal >= pair[1].ordinal)
+            || self
+                .next_ordinal
+                .is_some_and(|next| self.chunks.last().is_none_or(|chunk| chunk.ordinal != next))
+        {
+            return Err("content source page differs from requested source or cursor".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentItemRef {
     pub item_id: Uuid,
     pub branch_key: String,
+    pub document_key: String,
+    pub source_refs: Vec<ContentSourceRef>,
+    pub reusable_evidence: Option<Vec<geo_domain::ContentEvidence>>,
     pub status: ContentItemStatus,
     pub automatic_repair_count: u8,
 }

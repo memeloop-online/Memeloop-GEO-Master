@@ -1,12 +1,10 @@
-//! Narrow reference-only bridge to durable content execution.
-//! The scoped repositories remain authoritative; no brief, evidence, body,
-//! provider data, or step lease is exposed to the isolate.
+//! Scoped content execution and explicit frozen-source reads for the workflow.
 
 use geo_domain::{AppError, ContentExecution, ContentItem, TenantScope, sha256_hex};
 use geo_worker::{
     ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef, ContentHandoffRef,
-    ContentItemRef, ContentItemsPage, ContentItemsReadRequest, ContentStartRequest,
-    ContentStepRequest,
+    ContentItemRef, ContentItemsPage, ContentItemsReadRequest, ContentPrepareRequest,
+    ContentSourcePage, ContentSourceReadRequest, ContentStartRequest, ContentStepRequest,
 };
 use uuid::Uuid;
 
@@ -21,13 +19,25 @@ fn execution_ref(execution: ContentExecution) -> ContentExecutionRef {
     }
 }
 
-fn item_ref(item: ContentItem) -> ContentItemRef {
-    ContentItemRef {
+async fn item_ref(
+    state: &AppState,
+    scope: &TenantScope,
+    item: ContentItem,
+) -> Result<ContentItemRef, AppError> {
+    let source_refs = state.content_service().source_refs(scope, &item).await?;
+    let reusable_evidence = state
+        .content_service()
+        .reusable_evidence(scope, &item)
+        .await?;
+    Ok(ContentItemRef {
         item_id: item.item_id,
         branch_key: item.branch_key,
+        document_key: item.document_key,
+        source_refs,
+        reusable_evidence,
         status: item.status,
         automatic_repair_count: item.automatic_repair_count,
-    }
+    })
 }
 
 async fn scoped_execution(
@@ -155,10 +165,14 @@ pub(crate) async fn items(
     let end = offset.saturating_add(limit as usize).min(items.len());
     let next_cursor =
         (end < items.len()).then(|| format!("v1.{end}.{}", cursor_digest(scope, &execution, end)));
+    let mut page_items = Vec::new();
+    for item in &items[offset..end] {
+        page_items.push(item_ref(state, scope, item.clone()).await?);
+    }
     Ok(ContentItemsPage {
         execution_id: execution.execution_id,
         total: items.len() as u64,
-        items: items[offset..end].iter().cloned().map(item_ref).collect(),
+        items: page_items,
         next_cursor,
     })
 }
@@ -184,14 +198,37 @@ async fn scoped_item(
 pub(crate) async fn prepare(
     state: &AppState,
     scope: &TenantScope,
-    request: ContentStepRequest,
+    request: ContentPrepareRequest,
 ) -> Result<ContentItemRef, AppError> {
-    scoped_item(state, scope, &request).await?;
-    state
+    request.validate().map_err(AppError::invalid_request)?;
+    scoped_item(
+        state,
+        scope,
+        &ContentStepRequest {
+            execution_id: request.execution_id,
+            item_id: request.item_id,
+        },
+    )
+    .await?;
+    let item = state
         .content_service()
-        .prepare(scope, request.execution_id, request.item_id)
-        .await
-        .map(item_ref)
+        .prepare(
+            scope,
+            request.execution_id,
+            request.item_id,
+            request.evidence,
+        )
+        .await?;
+    item_ref(state, scope, item).await
+}
+
+pub(crate) async fn source_read(
+    state: &AppState,
+    scope: &TenantScope,
+    request: ContentSourceReadRequest,
+) -> Result<ContentSourcePage, AppError> {
+    scoped_execution(state, scope, request.execution_id).await?;
+    state.content_service().source_read(scope, request).await
 }
 
 pub(crate) async fn generate(
@@ -212,7 +249,7 @@ pub(crate) async fn generate(
         .get_item(scope, request.execution_id, request.item_id)
         .await?
         .ok_or_else(|| AppError::not_found("content item not found"))?;
-    Ok(item_ref(item))
+    item_ref(state, scope, item).await
 }
 
 pub(crate) async fn check(
@@ -221,11 +258,11 @@ pub(crate) async fn check(
     request: ContentStepRequest,
 ) -> Result<ContentItemRef, AppError> {
     scoped_item(state, scope, &request).await?;
-    state
+    let item = state
         .content_service()
         .check(scope, request.execution_id, request.item_id)
-        .await
-        .map(item_ref)
+        .await?;
+    item_ref(state, scope, item).await
 }
 
 pub(crate) async fn repair(
@@ -246,7 +283,7 @@ pub(crate) async fn repair(
         .get_item(scope, request.execution_id, request.item_id)
         .await?
         .ok_or_else(|| AppError::not_found("content item not found"))?;
-    Ok(item_ref(item))
+    item_ref(state, scope, item).await
 }
 
 pub(crate) async fn close(

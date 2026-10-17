@@ -2656,12 +2656,9 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                                             && chunk.text == quote.exact_quote
                                     }
                                     _ => {
-                                        chunk
-                                            .text
-                                            .chars()
-                                            .take(CONTENT_EVIDENCE_MAX_QUOTE_CHARS)
-                                            .collect::<String>()
-                                            == quote.exact_quote
+                                        quote.exact_quote.chars().count()
+                                            <= CONTENT_EVIDENCE_MAX_QUOTE_CHARS
+                                            && chunk.text.contains(&quote.exact_quote)
                                     }
                                 }
                         })
@@ -5065,6 +5062,24 @@ mod tests {
                 exact_quote: chunk.text.clone(),
             }],
         };
+        let mut substring = input.clone();
+        substring.evidence[0].exact_quote = "public sentence".into();
+        drop(
+            repository
+                .hold_content_evidence(&scope, &[substring])
+                .await
+                .unwrap(),
+        );
+        for invalid_quote in ["   ", "sentence not in source"] {
+            let mut invalid = input.clone();
+            invalid.evidence[0].exact_quote = invalid_quote.into();
+            assert!(
+                repository
+                    .hold_content_evidence(&scope, &[invalid])
+                    .await
+                    .is_err()
+            );
+        }
         let held = repository
             .hold_content_evidence(&scope, std::slice::from_ref(&input))
             .await

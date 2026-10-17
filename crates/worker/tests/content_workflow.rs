@@ -10,11 +10,13 @@ use geo_domain::{ContentCoverage, ContentExecutionStatus, DistributionTargetStat
 use geo_domain::{ContentItemStatus, TenantScope};
 use geo_worker::{
     ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef, ContentHandoffRef,
-    ContentItemRef, ContentItemsPage, ContentItemsReadRequest, ContentStepRequest,
-    DistributionManifestRef, DistributionResumeRequest, DistributionStartRequest,
-    DistributionTargetRef, DistributionTargetsPage, DistributionTargetsReadRequest, HostBridge,
-    HostOp, HostOpError, HostOps, HostRuntime, ManifestPage, ManifestReadRequest, MeasureRequest,
-    MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt, PublishRequest,
+    ContentItemRef, ContentItemsPage, ContentItemsReadRequest, ContentPrepareRequest,
+    ContentSourceChunk, ContentSourcePage, ContentSourceReadRequest, ContentSourceRef,
+    ContentStepRequest, DistributionManifestRef, DistributionResumeRequest,
+    DistributionStartRequest, DistributionTargetRef, DistributionTargetsPage,
+    DistributionTargetsReadRequest, HostBridge, HostOp, HostOpError, HostOps, HostRuntime,
+    ManifestPage, ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion,
+    ModelCompletionRequest, PublishReceipt, PublishRequest,
 };
 use uuid::Uuid;
 
@@ -47,6 +49,12 @@ impl Fixture {
                     .map(|n| ContentItemRef {
                         item_id: Uuid::from_u128(n),
                         branch_key: format!("cycle:1:document-{n}"),
+                        document_key: format!("document-{n}"),
+                        source_refs: vec![ContentSourceRef {
+                            source_id: Uuid::from_u128(900),
+                            source_version_id: Uuid::from_u128(901),
+                        }],
+                        reusable_evidence: None,
                         status: ContentItemStatus::Pending,
                         automatic_repair_count: 0,
                     })
@@ -208,13 +216,35 @@ impl HostOps for Fixture {
             next_cursor: None,
         })
     }
+    async fn content_source_read(
+        &self,
+        _scope: &TenantScope,
+        request: ContentSourceReadRequest,
+    ) -> Result<ContentSourcePage, HostOpError> {
+        Ok(ContentSourcePage {
+            execution_id: request.execution_id,
+            item_id: request.item_id,
+            source_id: request.source_id,
+            source_version_id: request.source_version_id,
+            chunks: vec![ContentSourceChunk {
+                chunk_id: Uuid::from_u128(902),
+                ordinal: 0,
+                locator: geo_domain::ChunkLocator::Manual {},
+                text: "a cited document".into(),
+            }],
+            next_ordinal: None,
+        })
+    }
     async fn content_prepare(
         &self,
         _scope: &TenantScope,
-        request: ContentStepRequest,
+        request: ContentPrepareRequest,
     ) -> Result<ContentItemRef, HostOpError> {
         self.step(
-            request,
+            ContentStepRequest {
+                execution_id: request.execution_id,
+                item_id: request.item_id,
+            },
             ContentItemStatus::Pending,
             ContentItemStatus::Prepared,
         )
@@ -320,10 +350,18 @@ impl HostOps for Fixture {
     async fn model_complete(
         &self,
         _scope: &TenantScope,
-        _request: ModelCompletionRequest,
+        request: ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
         Ok(ModelCompletion {
-            text: "a cited document".to_owned(),
+            text: if request
+                .system
+                .as_deref()
+                .is_some_and(|system| system.contains("content evidence selector"))
+            {
+                serde_json::json!({ "evidence": [{ "source_version_id": Uuid::from_u128(901), "chunk_id": Uuid::from_u128(902), "exact_quote": "a cited document" }] }).to_string()
+            } else {
+                "a cited document".to_owned()
+            },
             model: "injected-model".to_owned(),
             prompt_tokens: 1,
             completion_tokens: 3,
@@ -386,6 +424,56 @@ fn content_host_requests_reject_scope_bodies_and_policy_overrides() {
         }))
         .is_err()
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reference_host_wrapper_reads_the_requested_frozen_source_page() {
+    let fixture = Arc::new(Fixture::new());
+    let scope = TenantScope::new(
+        Uuid::new_v4().into(),
+        Uuid::new_v4().into(),
+        Some(Uuid::new_v4().into()),
+    );
+    let modules = [
+        ("memeloop://bundle/host-ops.js", geo_worker::HOST_OPS_JS),
+        (
+            ENTRY,
+            r#"import { hostOps } from './host-ops.js';
+            export async function main(request) {
+                const page = await hostOps.contentSourceRead(request);
+                Deno.core.ops.op_host_emit('source.page', JSON.stringify(page));
+            }"#,
+        ),
+    ];
+    let request = ContentSourceReadRequest {
+        execution_id: fixture.execution_id,
+        item_id: Uuid::from_u128(1),
+        source_id: Uuid::from_u128(900),
+        source_version_id: Uuid::from_u128(901),
+        after_ordinal: None,
+        limit: 32,
+    };
+    let mut runtime = HostRuntime::new(
+        &modules,
+        HostBridge::new(fixture, scope, tokio::runtime::Handle::current()),
+        None,
+    )
+    .unwrap();
+    runtime
+        .call_main(ENTRY, &serde_json::to_string(&request).unwrap(), DEADLINE)
+        .await
+        .unwrap();
+    let event = runtime
+        .host_state()
+        .events
+        .iter()
+        .find(|event| event.topic == "source.page")
+        .unwrap()
+        .payload
+        .clone();
+    let page: ContentSourcePage = serde_json::from_str(&event).unwrap();
+    page.validate_for(&request).unwrap();
+    assert_eq!(page.chunks[0].text, "a cited document");
 }
 
 #[tokio::test(flavor = "current_thread")]

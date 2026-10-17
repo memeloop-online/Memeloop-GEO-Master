@@ -26,15 +26,15 @@ use crate::host::{
     ChannelTargetExecuteRequest, ContentCloseRequest, ContentDistributeReadRequest,
     ContentDistributeRequest, ContentDocumentReadRequest, ContentExecutionReadRequest,
     ContentItemsReadRequest, ContentMediaBindRequest, ContentMediaInsertRequest,
-    ContentMediaListRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
-    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
-    DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
-    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeTextReadRequest,
-    KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
-    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
-    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
-    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
-    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
+    ContentMediaListRequest, ContentPrepareRequest, ContentSourceReadRequest, ContentStartRequest,
+    ContentStepRequest, CreateQuestionSet, DistributionReadRequest, DistributionResumeRequest,
+    DistributionStartRequest, DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge,
+    HostOp, HostOpError, KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest,
+    KnowledgeTextReadRequest, KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest,
+    MeasurementOptionsRequest, MeasurementPlanCreateRequest, MeasurementPlanReadRequest,
+    ModelCompletionRequest, ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest,
+    ProjectStartRequest, PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest,
+    ReportGetRequest, ReportPreviewRequest, ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -182,7 +182,20 @@ macro_rules! content_step_op {
         }
     };
 }
-content_step_op!(op_host_content_prepare_v1, ContentPrepare, content_prepare);
+project_op!(
+    op_host_content_prepare_v1,
+    ContentPrepare,
+    ContentPrepareRequest,
+    content_prepare,
+    ContentPrepareRequest::validate
+);
+project_op!(
+    op_host_content_source_read_v1,
+    ContentSourceRead,
+    ContentSourceReadRequest,
+    content_source_read,
+    ContentSourceReadRequest::validate
+);
 content_step_op!(
     op_host_content_generate_v1,
     ContentGenerate,
@@ -1093,6 +1106,7 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ChannelManifestRead.op_name(),
     HostOp::ChannelTargetExecute.op_name(),
     HostOp::ContentItemsRead.op_name(),
+    HostOp::ContentSourceRead.op_name(),
     HostOp::ContentPrepare.op_name(),
     HostOp::ContentGenerate.op_name(),
     HostOp::ContentCheck.op_name(),

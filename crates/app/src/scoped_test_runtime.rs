@@ -106,11 +106,12 @@ mod tests {
     use super::*;
     use geo_api::{EventBus, MemoryIdempotencyStore, MemoryOperationStore};
     use geo_domain::{
-        AgentRuntime, AppendMessage, ContentItemStatus, CreateConversation, DocumentScope,
-        ErrorCode, ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility,
-        KnowledgePurpose, MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
-        MemoryProjectRepository, ProjectCreate, ProjectSettings, ProjectStartCommand,
-        RuntimeCapability, SourceKind, hash_idempotency_key, settings_hash, start_request_hash,
+        AgentRuntime, AppendMessage, ContentEvidence, ContentItemStatus, CreateConversation,
+        DocumentScope, ErrorCode, EvidenceRef, ImportItem, InitialSource, InitialSourceKind,
+        InitialSourceVisibility, KnowledgePurpose, MemoryAuthRepository, MemoryContentRepository,
+        MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate, ProjectSettings,
+        ProjectStartCommand, RuntimeCapability, SourceKind, hash_idempotency_key, settings_hash,
+        start_request_hash,
     };
     use geo_provider::{ProviderError, RequestControl, TransportRequest, TransportResponse};
     use geo_worker::HostOpErrorCode;
@@ -230,7 +231,7 @@ mod tests {
             )
             .await
             .unwrap();
-        state
+        let imported = state
             .knowledge_repository()
             .import_batch(
                 &scope,
@@ -247,6 +248,22 @@ mod tests {
             )
             .await
             .unwrap();
+        let source = imported.items[0].source.as_ref().unwrap();
+        let detail = state
+            .knowledge_repository()
+            .get_source_detail(&scope, source.source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let chunk = &detail.chunks[0];
+        let evidence = vec![ContentEvidence {
+            reference: EvidenceRef {
+                source_version_id: chunk.source_version_id,
+                chunk_id: Some(chunk.chunk_id),
+                locator: chunk.locator.clone(),
+            },
+            exact_quote: chunk.text.clone(),
+        }];
         let service = state.content_service();
         let execution = service.start(&scope, started.cycle_id).await.unwrap();
         let item = service
@@ -259,7 +276,7 @@ mod tests {
             .expect("one frozen content branch");
         assert_eq!(
             service
-                .prepare(&scope, execution.execution_id, item.item_id)
+                .prepare(&scope, execution.execution_id, item.item_id, evidence)
                 .await
                 .unwrap()
                 .status,
