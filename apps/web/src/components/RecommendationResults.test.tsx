@@ -52,10 +52,15 @@ describe("recommendation results", () => {
     expect(second[3]).toHaveTextContent("未说明理由");
   });
 
-  it("does not mistake legacy results for no recommendations", () => {
-    const { container } = render(<RecommendationResults value={undefined} />);
-    expect(container).toBeEmptyDOMElement();
-  });
+  it.each([undefined, null])(
+    "shows missing analysis without treating it as no recommendations (%s)",
+    (value) => {
+      render(<RecommendationResults value={value} />);
+      expect(screen.getByText("推荐结果尚未分析")).toBeVisible();
+      expect(screen.queryByText("未发现具体推荐对象")).not.toBeInTheDocument();
+      expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    },
+  );
 
   it("distinguishes verified empty extraction from unverified extraction", () => {
     const { rerender } = render(<RecommendationResults value={result([])} />);
@@ -114,5 +119,8 @@ describe("recommendation results", () => {
       screen.getByRole("table", { name: "Recommendations" }),
     ).toBeVisible();
     expect(screen.getByText("No explicit rank")).toBeVisible();
+    cleanup();
+    render(<RecommendationResults value={undefined} />);
+    expect(screen.getByText("Recommendations not analyzed yet")).toBeVisible();
   });
 });

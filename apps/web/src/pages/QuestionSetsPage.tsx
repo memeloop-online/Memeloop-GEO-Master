@@ -185,6 +185,7 @@ export function QuestionSetsPage() {
         next.delete("target");
         next.delete("attempt");
         next.delete("analysisRevision");
+        next.delete("rankReport");
       }
       for (const [key, value] of Object.entries(values)) {
         if (key === "set") next.delete("questionSetId");
@@ -483,7 +484,9 @@ export function QuestionSetsPage() {
             </Field>
             {selectedSet && (
               <p>
-                <Link to={`?tab=records&set=${encodeURIComponent(setId)}`}>
+                <Link
+                  to={`?tab=records&set=${encodeURIComponent(setId)}&version=${encodeURIComponent(versionId)}`}
+                >
                   {t("viewSetMeasurements")}
                 </Link>{" "}
                 {canWrite && (

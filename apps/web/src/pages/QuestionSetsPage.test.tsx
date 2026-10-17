@@ -337,7 +337,7 @@ describe("P13 versioned question sets", () => {
       );
       const user = userEvent.setup();
       renderPage(
-        "/app/tenant-1/project-1/measurement?tab=records&record=measurement-1&planId=measurement-1&set=set-1&version=version-1&target=target-1&attempt=attempt-1&analysisRevision=analysis-1",
+        "/app/tenant-1/project-1/measurement?tab=records&record=measurement-1&planId=measurement-1&set=set-1&version=version-1&target=target-1&attempt=attempt-1&analysisRevision=analysis-1&rankReport=report-1",
       );
       expect(await screen.findByText("原问题集的测量")).toBeVisible();
       await user.click(screen.getByRole("tab", { name: "问题集" }));
@@ -355,7 +355,12 @@ describe("P13 versioned question sets", () => {
       expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
         "planId=",
       );
-      for (const parameter of ["target=", "attempt=", "analysisRevision="]) {
+      for (const parameter of [
+        "target=",
+        "attempt=",
+        "analysisRevision=",
+        "rankReport=",
+      ]) {
         expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
           parameter,
         );
@@ -368,6 +373,19 @@ describe("P13 versioned question sets", () => {
       );
     },
   );
+  it("keeps the selected question set version in its measurement-records link", async () => {
+    mockApi({ existing: true });
+    renderPage(
+      "/app/tenant-1/project-1/measurement?tab=sets&set=set-1&version=version-1",
+    );
+    const link = await screen.findByRole("link", {
+      name: "查看此问题集的测量记录",
+    });
+    expect(link).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/measurement?tab=records&set=set-1&version=version-1",
+    );
+  });
   it.each([
     ["zh-CN", "传统搜索"],
     ["en", "Web search"],

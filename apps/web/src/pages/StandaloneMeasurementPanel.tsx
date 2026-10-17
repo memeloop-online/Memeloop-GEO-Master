@@ -193,7 +193,8 @@ export function StandaloneMeasurementPanel({
     sets.data?.items.find((item) => item.id === setId) ??
     (!setId ? sets.data?.items[0] : undefined);
   const groups = new Map<string, Map<string, StandaloneMeasurementPlan[]>>();
-  for (const item of sets.data?.items ?? []) groups.set(item.id, new Map());
+  for (const item of sets.data?.items ?? [])
+    groups.set(item.id, new Map([[item.current_version_id, []]]));
   const temporaryPlans: StandaloneMeasurementPlan[] = [];
   for (const plan of history.data?.items ?? []) {
     const associations = new Map<string, Set<string>>();
@@ -220,7 +221,7 @@ export function StandaloneMeasurementPanel({
       groups.set(setId, versions);
     }
   }
-  if (selectedRankReport && requestedSetId && requestedVersionId) {
+  if (requestedSetId && requestedVersionId) {
     const versions =
       groups.get(requestedSetId) ??
       new Map<string, StandaloneMeasurementPlan[]>();
