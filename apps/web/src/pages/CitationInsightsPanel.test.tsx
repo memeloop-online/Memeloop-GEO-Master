@@ -287,97 +287,108 @@ afterEach(() => {
 });
 
 describe("citation insights", () => {
-  it("reads the cited analysis revision instead of the original attempt answer", async () => {
-    const analysis = {
-      revision_id: "analysis-1",
-      source: { kind: "capture" as const, capture_id: "capture-1" },
-      source_sha256: "digest",
-      observed_at: sample.observed_at,
-      analyzed_at: "2026-10-02T10:00:00Z",
-      actual_model: "analysis-model",
-      config_revision: 1,
-      prompt_version: "prompt-1",
-      parser_version: "parser-1",
-    };
-    vi.mocked(listObservationAnalyses).mockResolvedValue({
-      items: [
-        {
-          request: {
-            ...analysis,
-            target_id: sample.target_id,
-            attempt_id: sample.attempt_id,
-          },
-          request_digest: "request-digest",
-          state: "completed",
-          created_at: analysis.analyzed_at,
-          started_at: analysis.analyzed_at,
-          analyzed_at: analysis.analyzed_at,
-          result: {
-            actual_model: analysis.actual_model,
-            candidate_json: null,
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            outcome: {
-              status: "grounded",
-              raw_answer: "Independently extracted saved answer.",
-              citations: [],
-              audit: {},
+  it.each(["automatic-analysis-1", "manual-analysis-1"])(
+    "reads and links the cited %s revision instead of the original attempt answer",
+    async (revisionId) => {
+      const analysis = {
+        revision_id: revisionId,
+        source: { kind: "capture" as const, capture_id: "capture-1" },
+        source_sha256: "digest",
+        observed_at: sample.observed_at,
+        analyzed_at: "2026-10-02T10:00:00Z",
+        actual_model: "analysis-model",
+        config_revision: 1,
+        prompt_version: "prompt-1",
+        parser_version: "parser-1",
+      };
+      vi.mocked(listObservationAnalyses).mockResolvedValue({
+        items: [
+          {
+            request: {
+              ...analysis,
+              target_id: sample.target_id,
+              attempt_id: sample.attempt_id,
+            },
+            request_digest: "request-digest",
+            state: "completed",
+            created_at: analysis.analyzed_at,
+            started_at: analysis.analyzed_at,
+            analyzed_at: analysis.analyzed_at,
+            result: {
+              actual_model: analysis.actual_model,
+              candidate_json: null,
+              prompt_tokens: 1,
+              completion_tokens: 1,
+              outcome: {
+                status: "grounded",
+                raw_answer: "Independently extracted saved answer.",
+                citations: [],
+                audit: {},
+              },
             },
           },
-        },
-      ],
-      next_after: null,
-      sources: [],
-    });
-    mockApi([
-      {
-        ...emptyPage,
-        plan_ids: ["plan-1"],
-        coverage: {
-          ...emptyPage.coverage,
-          planned: 1,
-          other_completed: 1,
-          grounded_saved_analysis: 1,
-          fixture: 1,
-        },
-        observed_sources: [
-          {
-            host: "example.org",
-            citing_answers: 1,
-            samples: [{ ...sample, analysis }],
-            urls: [
-              {
-                url: "https://example.org/source",
-                citing_answers: 1,
-                samples: [{ ...sample, analysis }],
-              },
-            ],
-          },
         ],
-      },
-    ]);
-    renderPanel();
-    const user = userEvent.setup();
-    await screen.findByText("example.org");
-    expect(screen.getByText("已核验联网回答 0 项")).toBeInTheDocument();
-    expect(
-      screen.getByText("已存原文分析 1 项（单独统计）"),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/模拟记录/)).not.toBeInTheDocument();
-    expect(screen.getByText("fixture")).not.toBeVisible();
-    await user.click(screen.getByText("记录详情"));
-    expect(screen.getByText("fixture")).toBeVisible();
-    await user.click(screen.getByText("具体网页"));
-    await user.click(screen.getByRole("button", { name: "查看原始问答" }));
-    expect(
-      await screen.findByText("Independently extracted saved answer."),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("Answer with evidence.")).not.toBeInTheDocument();
-    expect(screen.getByText(/分析模型 analysis-model/)).toHaveTextContent(
-      "analysis-1",
-    );
-    expect(screen.queryByText(/原测量结果保持不变/)).not.toBeInTheDocument();
-  });
+        next_after: null,
+        sources: [],
+      });
+      mockApi([
+        {
+          ...emptyPage,
+          plan_ids: ["plan-1"],
+          coverage: {
+            ...emptyPage.coverage,
+            planned: 1,
+            other_completed: 1,
+            grounded_saved_analysis: 1,
+            fixture: 1,
+          },
+          observed_sources: [
+            {
+              host: "example.org",
+              citing_answers: 1,
+              samples: [{ ...sample, analysis }],
+              urls: [
+                {
+                  url: "https://example.org/source",
+                  citing_answers: 1,
+                  samples: [{ ...sample, analysis }],
+                },
+              ],
+            },
+          ],
+        },
+      ]);
+      renderPanel();
+      const user = userEvent.setup();
+      await screen.findByText("example.org");
+      expect(screen.getByText("已核验联网回答 0 项")).toBeInTheDocument();
+      expect(
+        screen.getByText("已存原文分析 1 项（单独统计）"),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/模拟记录/)).not.toBeInTheDocument();
+      expect(screen.getByText("fixture")).not.toBeVisible();
+      await user.click(screen.getByText("记录详情"));
+      expect(screen.getByText("fixture")).toBeVisible();
+      await user.click(screen.getByText("具体网页"));
+      await user.click(screen.getByRole("button", { name: "查看原始问答" }));
+      expect(
+        await screen.findByText("Independently extracted saved answer."),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText("Answer with evidence."),
+      ).not.toBeInTheDocument();
+      expect(screen.getByText(/分析模型 analysis-model/)).toHaveTextContent(
+        revisionId,
+      );
+      expect(
+        screen.getByRole("link", { name: "查看测量记录与分析版本" }),
+      ).toHaveAttribute(
+        "href",
+        `/app/tenant-1/project-1/measurement?tab=records&record=plan-1&target=target-1&attempt=attempt-1&analysisRevision=${revisionId}`,
+      );
+      expect(screen.queryByText(/原测量结果保持不变/)).not.toBeInTheDocument();
+    },
+  );
 
   it.each(["all_eligible", "explicit"] as const)(
     "adds a mapped target in %s mode without losing exclusions, pools or other targets",
@@ -525,6 +536,12 @@ describe("citation insights", () => {
     );
     expect(await screen.findByText("What was cited?")).toBeInTheDocument();
     expect(screen.getByText("Answer with evidence.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "查看测量记录与分析版本" }),
+    ).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/measurement?tab=records&record=plan-1&target=target-1&attempt=attempt-1",
+    );
     expect(
       screen.getByText("冻结评估问题 · 不进入内容优化"),
     ).toBeInTheDocument();

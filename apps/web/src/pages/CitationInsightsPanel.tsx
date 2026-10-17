@@ -133,6 +133,14 @@ function SourceSample({
       ? grounded.raw_answer
       : undefined
     : attempt?.outcome?.raw_answer;
+  const measurementQuery = new URLSearchParams({
+    tab: "records",
+    record: sample.plan_id,
+    target: sample.target_id,
+    attempt: sample.attempt_id,
+  });
+  if (sample.analysis?.revision_id)
+    measurementQuery.set("analysisRevision", sample.analysis.revision_id);
   const date = (value: string) =>
     new Intl.DateTimeFormat(i18n.language, {
       dateStyle: "medium",
@@ -170,7 +178,7 @@ function SourceSample({
             </p>
           )}
           <a
-            href={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/measurement?tab=records&record=${encodeURIComponent(sample.plan_id)}`}
+            href={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/measurement?${measurementQuery}`}
           >
             {t("measurementRecord")}
           </a>
