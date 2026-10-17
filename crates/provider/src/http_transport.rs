@@ -20,8 +20,12 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new() -> Result<Self, ProviderError> {
-        let client = Client::builder()
-            .redirect(Policy::none())
+        let builder = Client::builder().redirect(Policy::none());
+        // RequestControl bounds the whole operation, including stalled uploads.
+        // reqwest's implicit TCP deadline can otherwise expire earlier.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let builder = builder.tcp_user_timeout(None);
+        let client = builder
             .build()
             .map_err(|_| ProviderError::Transport("HTTP client initialization failed".into()))?;
         Ok(Self {
@@ -142,6 +146,9 @@ fn transport_failure(error: &reqwest::Error, phase: ModelPhase) -> ProviderError
         raw_os_error = io.and_then(|(_, code)| code),
         "model HTTP transport failed"
     );
+    if error.is_timeout() {
+        return ProviderError::Timeout;
+    }
     let message = match phase {
         ModelPhase::FullBody => "HTTP response failed",
         _ => "HTTP request failed",
@@ -424,6 +431,40 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, ProviderError::Timeout);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn classifies_reqwest_headers_and_body_timeouts() {
+        for send_headers in [false, true] {
+            let (listener, url) = listen().await;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_headers(&mut stream).await;
+                if send_headers {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                std::future::pending::<()>().await;
+            });
+            let transport = HttpTransport {
+                client: Client::builder()
+                    .timeout(Duration::from_millis(100))
+                    .build()
+                    .unwrap(),
+                public_only: false,
+            };
+            let error = transport
+                .send(
+                    request(url),
+                    RequestControl::new(Duration::from_secs(2)).unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error, ProviderError::Timeout);
+            server.abort();
+        }
     }
 
     #[tokio::test]
