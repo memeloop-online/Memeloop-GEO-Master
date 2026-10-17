@@ -154,15 +154,33 @@ function fixtureCompletion(body, model) {
   );
   const input = JSON.parse(user);
   assert(
-    Array.isArray(input.evidence),
+    Array.isArray(input.evidence) ||
+      (system.includes("source-grounded content evidence selector") &&
+        (Array.isArray(input.chunks) || Array.isArray(input.candidates))),
     "Fixture requires actual supplied source evidence",
   );
-  const quotes = input.evidence.filter(
+  const quotes = (input.evidence ?? []).filter(
     (entry) =>
       uuidPattern.test(entry.chunk_id) && typeof entry.quote === "string",
   );
   let content;
-  if (system.includes("source-grounded content generator")) {
+  if (system.includes("source-grounded content evidence selector")) {
+    const supplied = input.chunks ?? input.candidates;
+    const source = supplied.find((entry) =>
+      (entry.text ?? entry.exact_quote).includes(evidenceSentence),
+    );
+    content = {
+      evidence: source
+        ? [
+            {
+              source_version_id: source.source_version_id,
+              chunk_id: source.chunk_id,
+              exact_quote: source.exact_quote ?? source.text,
+            },
+          ]
+        : [],
+    };
+  } else if (system.includes("source-grounded content generator")) {
     const source = quotes.find((entry) =>
       entry.quote.includes(evidenceSentence),
     );

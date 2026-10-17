@@ -9,17 +9,17 @@ use geo_api::{
     RepositoryHostOps, content_runtime::ContentWorkflowExecutor,
 };
 use geo_domain::{
-    ContentItemStatus, ContentRepository, DocumentScope, ImportItem, InitialSource,
-    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository,
-    MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
+    ContentEvidence, ContentItemStatus, ContentRepository, DocumentScope, EvidenceRef, ImportItem,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
+    KnowledgeRepository, MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
     MemoryProjectRepository, ProjectCreate, ProjectPatch, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, SourceKind, TenantScope, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    ProjectStartCommand, ReviseSourceTextCommand, SourceKind, TenantScope, hash_idempotency_key,
+    settings_hash, start_request_hash,
 };
 use geo_worker::{
-    ContentCloseRequest, ContentExecutionReadRequest, ContentItemsReadRequest, ContentStartRequest,
-    ContentStepRequest, HostOpError, HostOpErrorCode, HostOps, ModelCompletion,
-    ModelCompletionRequest,
+    ContentCloseRequest, ContentExecutionReadRequest, ContentItemsReadRequest,
+    ContentPrepareRequest, ContentSourceReadRequest, ContentStartRequest, ContentStepRequest,
+    HostOpError, HostOpErrorCode, HostOps, ModelCompletion, ModelCompletionRequest,
 };
 use uuid::Uuid;
 
@@ -36,6 +36,57 @@ impl ContentWorkflowExecutor for AcceptedExecutor {
 }
 
 struct GroundedModel(AtomicUsize);
+
+async fn selected_prepare(
+    host: &RepositoryHostOps,
+    scope: &TenantScope,
+    step: &ContentStepRequest,
+) -> ContentPrepareRequest {
+    let items = host
+        .content_items_read(
+            scope,
+            ContentItemsReadRequest {
+                execution_id: step.execution_id,
+                cursor: None,
+                limit: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+    let item = items
+        .items
+        .iter()
+        .find(|item| item.item_id == step.item_id)
+        .unwrap();
+    let source = &item.source_refs[0];
+    let page = host
+        .content_source_read(
+            scope,
+            ContentSourceReadRequest {
+                execution_id: step.execution_id,
+                item_id: step.item_id,
+                source_id: source.source_id,
+                source_version_id: source.source_version_id,
+                after_ordinal: None,
+                limit: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let chunk = &page.chunks[0];
+    ContentPrepareRequest {
+        execution_id: step.execution_id,
+        item_id: step.item_id,
+        evidence: vec![ContentEvidence {
+            reference: EvidenceRef {
+                source_version_id: source.source_version_id,
+                chunk_id: Some(chunk.chunk_id),
+                locator: chunk.locator.clone(),
+            },
+            exact_quote: chunk.text.clone(),
+        }],
+    }
+}
 #[async_trait]
 impl ModelProviderBridge for GroundedModel {
     async fn complete(
@@ -132,7 +183,21 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
                 kind: SourceKind::Text,
                 name: "public".into(),
                 purpose: KnowledgePurpose::Public,
-                text: Some("Public description".into()),
+                text: Some(
+                    (0..30)
+                        .map(|ordinal| {
+                            if ordinal == 29 {
+                                format!(
+                                    "{}Late documented detail.",
+                                    "Long source context. ".repeat(90)
+                                )
+                            } else {
+                                format!("Public description section {ordinal}.")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                ),
                 url: None,
                 object_id: None,
                 knowledge_release_id: None,
@@ -258,16 +323,28 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .knowledge_repository()
         .import_batch(
             &scope,
-            vec![ImportItem {
-                client_item_id: "newer".into(),
-                kind: SourceKind::Text,
-                name: "newer".into(),
-                purpose: KnowledgePurpose::Public,
-                text: Some("Newer public description".into()),
-                url: None,
-                object_id: None,
-                knowledge_release_id: None,
-            }],
+            vec![
+                ImportItem {
+                    client_item_id: "newer".into(),
+                    kind: SourceKind::Text,
+                    name: "newer".into(),
+                    purpose: KnowledgePurpose::Public,
+                    text: Some("Newer public description".into()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                },
+                ImportItem {
+                    client_item_id: "internal".into(),
+                    kind: SourceKind::Text,
+                    name: "Internal fixture source".into(),
+                    purpose: KnowledgePurpose::Internal,
+                    text: Some("Internal fixture detail.".into()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                },
+            ],
         )
         .await
         .unwrap();
@@ -328,7 +405,13 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
     assert_eq!(first.items[0].automatic_repair_count, 0);
     let json = serde_json::to_string(&first).unwrap();
     for forbidden in [
-        "quotes", "evidence", "brief", "document", "markdown", "provider", "token",
+        "\"quotes\":",
+        "\"evidence\":",
+        "\"brief\":",
+        "\"document\":",
+        "\"markdown\":",
+        "\"provider\":",
+        "\"token\":",
     ] {
         assert!(!json.contains(forbidden), "host page leaked {forbidden}");
     }
@@ -390,9 +473,10 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
     assert_eq!(
         host.content_prepare(
             &scope,
-            ContentStepRequest {
+            ContentPrepareRequest {
                 execution_id: started_ref.execution_id,
-                item_id: Uuid::new_v4()
+                item_id: Uuid::new_v4(),
+                evidence: vec![],
             }
         )
         .await
@@ -424,7 +508,128 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         "an unprepared item cannot be repaired"
     );
     assert_eq!(model.0.load(Ordering::SeqCst), 0);
-    let prepared = host.content_prepare(&scope, step.clone()).await.unwrap();
+    let source = &first.items[0].source_refs[0];
+    let source_request = ContentSourceReadRequest {
+        execution_id: step.execution_id,
+        item_id: step.item_id,
+        source_id: source.source_id,
+        source_version_id: source.source_version_id,
+        after_ordinal: None,
+        limit: 24,
+    };
+    let page = host
+        .content_source_read(&scope, source_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(page.chunks.len(), 24);
+    assert_eq!(page.next_ordinal, Some(23));
+    let late_page = host
+        .content_source_read(
+            &scope,
+            ContentSourceReadRequest {
+                after_ordinal: page.next_ordinal,
+                ..source_request.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(late_page.chunks.len(), 6);
+    assert_eq!(late_page.chunks[0].ordinal, 24);
+    assert!(late_page.next_ordinal.is_none());
+    let late_chunk = late_page.chunks.last().unwrap();
+    assert!(late_chunk.text.find("Late documented detail.").unwrap() > 1600);
+    let selected = ContentPrepareRequest {
+        execution_id: step.execution_id,
+        item_id: step.item_id,
+        evidence: vec![ContentEvidence {
+            reference: EvidenceRef {
+                source_version_id: source.source_version_id,
+                chunk_id: Some(late_chunk.chunk_id),
+                locator: late_chunk.locator.clone(),
+            },
+            exact_quote: "Late documented detail.".into(),
+        }],
+    };
+    assert_eq!(
+        host.content_source_read(&foreign, source_request.clone())
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::NotFound
+    );
+    for invalid in [
+        ContentSourceReadRequest {
+            source_id: Uuid::new_v4(),
+            ..source_request.clone()
+        },
+        ContentSourceReadRequest {
+            source_version_id: Uuid::new_v4(),
+            ..source_request.clone()
+        },
+        ContentSourceReadRequest {
+            source_id: newer.items[1].source.as_ref().unwrap().source_id,
+            ..source_request.clone()
+        },
+        ContentSourceReadRequest {
+            source_id: newer.items[1].source.as_ref().unwrap().source_id,
+            source_version_id: newer.items[1]
+                .source_version
+                .as_ref()
+                .unwrap()
+                .source_version_id,
+            ..source_request.clone()
+        },
+    ] {
+        assert_eq!(
+            host.content_source_read(&scope, invalid)
+                .await
+                .unwrap_err()
+                .code,
+            HostOpErrorCode::Denied
+        );
+    }
+    let mut fabricated_quote = selected.clone();
+    fabricated_quote.evidence[0].exact_quote = "Unsupported fixture claim.".into();
+    let mut wrong_chunk = selected.clone();
+    wrong_chunk.evidence[0].reference.chunk_id = Some(Uuid::new_v4());
+    let mut wrong_locator = selected.clone();
+    wrong_locator.evidence[0].reference.locator = page.chunks[0].locator.clone();
+    let mut private_evidence = selected.clone();
+    let private_source = newer.items[1].source.as_ref().unwrap();
+    let private_detail = state
+        .knowledge_repository()
+        .get_source_detail(&scope, private_source.source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let private_chunk = &private_detail.chunks[0];
+    private_evidence.evidence[0] = ContentEvidence {
+        reference: EvidenceRef {
+            source_version_id: private_chunk.source_version_id,
+            chunk_id: Some(private_chunk.chunk_id),
+            locator: private_chunk.locator.clone(),
+        },
+        exact_quote: private_chunk.text.clone(),
+    };
+    for invalid in [
+        fabricated_quote,
+        wrong_chunk,
+        wrong_locator,
+        private_evidence,
+    ] {
+        assert_eq!(
+            host.content_prepare(&scope, invalid)
+                .await
+                .unwrap_err()
+                .code,
+            HostOpErrorCode::Failed
+        );
+    }
+    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+    let prepared = host
+        .content_prepare(&scope, selected.clone())
+        .await
+        .unwrap();
     assert_eq!(prepared.status, ContentItemStatus::Prepared);
     let projected = serde_json::to_string(&prepared).unwrap();
     assert!(!projected.contains("Public description"));
@@ -436,7 +641,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         execution_id: started_ref.execution_id,
         item_id: second.items[0].item_id,
     };
-    host.content_prepare(&scope, second_step.clone())
+    host.content_prepare(&scope, selected_prepare(&host, &scope, &second_step).await)
         .await
         .unwrap();
     host.content_generate(&scope, second_step.clone())
@@ -514,10 +719,15 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
     let changed = host
         .content_prepare(
             &scope,
-            ContentStepRequest {
-                execution_id: next_ref.execution_id,
-                item_id: next_items[0].item_id,
-            },
+            selected_prepare(
+                &host,
+                &scope,
+                &ContentStepRequest {
+                    execution_id: next_ref.execution_id,
+                    item_id: next_items[0].item_id,
+                },
+            )
+            .await,
         )
         .await
         .unwrap();
@@ -526,6 +736,46 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         model.0.load(Ordering::SeqCst),
         4,
         "a changed public source dependency must prepare a fresh draft"
+    );
+    let original_source = state
+        .knowledge_repository()
+        .get_source(&scope, source.source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .knowledge_repository()
+        .revise_source_text(
+            &scope,
+            original_source.source_id,
+            original_source.revision,
+            "supersede-fixture-source",
+            ReviseSourceTextCommand {
+                base_version_id: source.source_version_id,
+                media_type: "text/plain".into(),
+                text: "Replacement public description.".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        host.content_source_read(&scope, source_request)
+            .await
+            .is_err(),
+        "a superseded frozen source must not remain eligible for reading"
+    );
+    assert!(
+        host.content_prepare(
+            &scope,
+            ContentPrepareRequest {
+                execution_id: next_ref.execution_id,
+                item_id: next_items[1].item_id,
+                evidence: selected.evidence,
+            }
+        )
+        .await
+        .is_err(),
+        "a superseded frozen source must not prepare another branch"
     );
 }
 
@@ -623,7 +873,7 @@ async fn two_automatic_content_cycles_reuse_the_same_checked_revision_without_mo
         execution_id: first.execution_id,
         item_id: first_item.item_id,
     };
-    host.content_prepare(&scope, first_step.clone())
+    host.content_prepare(&scope, selected_prepare(&host, &scope, &first_step).await)
         .await
         .unwrap();
     host.content_generate(&scope, first_step.clone())
@@ -678,10 +928,15 @@ async fn two_automatic_content_cycles_reuse_the_same_checked_revision_without_mo
     let prepared = host
         .content_prepare(
             &scope,
-            ContentStepRequest {
-                execution_id: second.execution_id,
-                item_id: second_item.item_id,
-            },
+            selected_prepare(
+                &host,
+                &scope,
+                &ContentStepRequest {
+                    execution_id: second.execution_id,
+                    item_id: second_item.item_id,
+                },
+            )
+            .await,
         )
         .await
         .unwrap();

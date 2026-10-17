@@ -23,7 +23,12 @@ fn workflow_budgets() -> HostOpBudgets {
     // Match the existing finite planner's 10,000-item bound. Interactive-turn
     // defaults must not truncate a valid background manifest halfway through.
     let mut budgets = HostOpBudgets::default()
-        .with_limits(HostOp::ContentItemsRead, HostOpLimits::new(15_000, 10_000));
+        .with_limits(HostOp::ContentItemsRead, HostOpLimits::new(15_000, 10_000))
+        .with_limits(
+            HostOp::ContentSourceRead,
+            HostOpLimits::new(15_000, 320_000),
+        )
+        .with_limits(HostOp::ModelComplete, HostOpLimits::new(120_000, 320_000));
     for op in [
         HostOp::ContentPrepare,
         HostOp::ContentGenerate,
@@ -59,6 +64,8 @@ mod budget_tests {
         let budgets = workflow_budgets();
         for op in [
             HostOp::ContentItemsRead,
+            HostOp::ContentSourceRead,
+            HostOp::ModelComplete,
             HostOp::ContentPrepare,
             HostOp::ContentGenerate,
             HostOp::ContentCheck,

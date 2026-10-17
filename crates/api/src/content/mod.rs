@@ -1,6 +1,6 @@
 //! Scoped first-stage content business service. The JS workflow may order
-//! branches, but it cannot select evidence, invent citations, or mark a draft
-//! ready. Every model call is one bounded transform after a durable step claim.
+//! branches and selects exact evidence after explicitly reading frozen sources.
+//! Rust validates citations and durable state at the content boundary.
 
 pub(crate) mod content_export;
 pub(crate) mod content_media;
@@ -25,8 +25,8 @@ use geo_domain::{
     ContentPublicEligibility, ContentRepository, ContentReuseDecision, ContentReuseRequest,
     ContentRevision, ContentSemanticDescriptor, ContentStep, DOCUMENT_PLANNER_VERSION,
     DocumentManifest, DocumentManifestItemState, DocumentManifestPlanRequest, ErrorCode,
-    EvidenceRef, KnowledgeEvidence, KnowledgePurpose, KnowledgeRepository, ProjectId,
-    ProjectRepository, ProjectStatus, RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION,
+    EvidenceRef, KnowledgePurpose, KnowledgeRepository, ProjectId, ProjectRepository,
+    ProjectStatus, RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION,
     RICH_REPAIR_POLICY_VERSION, SourceState, StructuredDocument, TenantScope,
 };
 use geo_worker::ModelCompletionRequest;
@@ -45,24 +45,12 @@ const EVIDENCE_POLICY_VERSION: &str = "located-public-evidence-v1";
 const CHECK_POLICY_VERSION: &str = RICH_CHECK_POLICY_VERSION;
 const REPAIR_POLICY_VERSION: &str = RICH_REPAIR_POLICY_VERSION;
 const GENERATION_POLICY_REVISION: &str = "initial";
-const MAX_EVIDENCE: usize = 24;
 const MAX_QUOTE_CHARS: usize = geo_domain::CONTENT_EVIDENCE_MAX_QUOTE_CHARS;
 const MAX_BLOCKS: usize = 32;
 // Provider operations may legitimately take several minutes. Keep the fence
 // alive beyond the configured per-call deadline; a stale worker still cannot
 // commit once another owner reclaims the step.
 const LEASE_SECONDS: i64 = 900;
-
-fn evidence_excerpt(text: &str, locator: &geo_domain::ChunkLocator) -> Option<String> {
-    if matches!(locator, geo_domain::ChunkLocator::Csv { .. }) {
-        // CSV chunks bind the entire header/value record to this locator.
-        // A prefix can cut a cell or discard its column association. Retain
-        // whole records only; fragmenting requires its own evidence identity.
-        (text.chars().count() <= MAX_QUOTE_CHARS).then(|| text.to_owned())
-    } else {
-        Some(text.chars().take(MAX_QUOTE_CHARS).collect())
-    }
-}
 
 fn stable_id(key: &str) -> Uuid {
     let digest = Sha256::digest(key.as_bytes());
@@ -74,20 +62,6 @@ fn stable_id(key: &str) -> Uuid {
 
 fn title_check_id(revision_id: Uuid) -> Uuid {
     stable_id(&format!("content-title-check:{revision_id}"))
-}
-
-fn selected_quotes(selected: &[KnowledgeEvidence]) -> Vec<ContentEvidence> {
-    selected
-        .iter()
-        .map(|e| ContentEvidence {
-            reference: EvidenceRef {
-                source_version_id: e.source_version_id,
-                chunk_id: Some(e.chunk_id),
-                locator: e.locator.clone(),
-            },
-            exact_quote: e.quote.clone(),
-        })
-        .collect()
 }
 
 fn prompt_evidence(quotes: &[ContentEvidence]) -> Vec<serde_json::Value> {
@@ -102,12 +76,6 @@ fn prompt_evidence(quotes: &[ContentEvidence]) -> Vec<serde_json::Value> {
             })
         })
         .collect()
-}
-
-fn live_quotes_match(brief: &ContentBrief, current: &[KnowledgeEvidence]) -> bool {
-    !brief.quotes.is_empty()
-        && brief.quotes == selected_quotes(current)
-        && same_evidence(&brief.evidence, current)
 }
 
 fn eligibility(
@@ -216,11 +184,9 @@ impl ContentService {
             .iter()
             .filter(|i| i.status == ContentItemStatus::Ready)
         {
-            let current = self.evidence(scope, execution_id, item).await?;
-            if !item
-                .brief
-                .as_ref()
-                .is_some_and(|b| live_quotes_match(b, &current))
+            if !self
+                .prepared_evidence_valid(scope, execution_id, item)
+                .await?
             {
                 self.content
                     .invalidate_ready(
@@ -376,14 +342,23 @@ impl ContentService {
         scope: &TenantScope,
         execution_id: Uuid,
         item_id: Uuid,
+        references: Vec<ContentEvidence>,
     ) -> Result<ContentItem, AppError> {
         let item = self.item(scope, execution_id, item_id).await?;
         if item.status != ContentItemStatus::Pending {
+            if item
+                .brief
+                .as_ref()
+                .is_some_and(|brief| brief.quotes != references)
+            {
+                return Err(AppError::conflict(
+                    "prepared evidence differs from persisted selection",
+                ));
+            }
             return Ok(item);
         }
         self.require_active_project(scope).await?;
-        let selected = self.evidence(scope, execution_id, &item).await?;
-        if selected.is_empty() {
+        if references.is_empty() {
             return self
                 .content
                 .classify(
@@ -395,7 +370,14 @@ impl ContentService {
                 )
                 .await;
         }
-        let references: Vec<_> = selected_quotes(&selected);
+        if !self
+            .selected_evidence_valid(scope, execution_id, &item, &references)
+            .await?
+        {
+            return Err(AppError::conflict(
+                "selected evidence is outside eligible frozen sources",
+            ));
+        }
         let brief_title = item.document_key.clone();
         let brief_objective = format!(
             "Create a {} document grounded only in the prepared evidence.",
@@ -541,12 +523,14 @@ impl ContentService {
             return Err(AppError::conflict("document is not prepared"));
         }
         self.require_active_project(scope).await?;
-        let evidence = self.evidence(scope, execution_id, &item).await?;
         let brief = item
             .brief
             .as_ref()
             .ok_or_else(|| AppError::conflict("prepared brief missing"))?;
-        if !live_quotes_match(brief, &evidence) {
+        if !self
+            .prepared_evidence_valid(scope, execution_id, &item)
+            .await?
+        {
             self.content
                 .classify(
                     scope,
@@ -635,12 +619,14 @@ impl ContentService {
             return Ok(item);
         }
         self.require_active_project(scope).await?;
-        let evidence = self.evidence(scope, execution_id, &item).await?;
         let brief = item
             .brief
             .as_ref()
             .ok_or_else(|| AppError::conflict("prepared brief missing"))?;
-        if !live_quotes_match(brief, &evidence) {
+        if !self
+            .prepared_evidence_valid(scope, execution_id, &item)
+            .await?
+        {
             return self
                 .content
                 .classify(
@@ -702,14 +688,17 @@ impl ContentService {
             Ok(findings) => {
                 // A source may be reclassified while the independent model was
                 // working. Ready is only committed after a fresh eligibility read.
-                let latest = match self.evidence(scope, execution_id, &item).await {
+                let valid = match self
+                    .prepared_evidence_valid(scope, execution_id, &item)
+                    .await
+                {
                     Ok(latest) => latest,
                     Err(error) => {
                         self.content.release_step(scope, &lease).await?;
                         return Err(error);
                     }
                 };
-                if !live_quotes_match(brief, &latest) {
+                if !valid {
                     return self
                         .content
                         .fail_step(
@@ -783,12 +772,14 @@ impl ContentService {
             return Err(AppError::conflict("document does not need factual repair"));
         }
         self.require_active_project(scope).await?;
-        let evidence = self.evidence(scope, execution_id, &item).await?;
         let brief = item
             .brief
             .as_ref()
             .ok_or_else(|| AppError::conflict("prepared brief missing"))?;
-        if !live_quotes_match(brief, &evidence) {
+        if !self
+            .prepared_evidence_valid(scope, execution_id, &item)
+            .await?
+        {
             self.content
                 .classify(
                     scope,
@@ -877,14 +868,17 @@ impl ContentService {
             self.content.release_step(scope, &lease).await?;
             return Err(error);
         }
-        let latest = match self.evidence(scope, execution_id, &item).await {
+        let valid = match self
+            .prepared_evidence_valid(scope, execution_id, &item)
+            .await
+        {
             Ok(evidence) => evidence,
             Err(error) => {
                 self.content.release_step(scope, &lease).await?;
                 return Err(error);
             }
         };
-        if !live_quotes_match(brief, &latest) {
+        if !valid {
             self.content
                 .fail_step(
                     scope,
@@ -919,11 +913,9 @@ impl ContentService {
         {
             return Err(AppError::conflict("reused base revision has changed"));
         }
-        let current = self.evidence(scope, execution_id, &item).await?;
-        if !item
-            .brief
-            .as_ref()
-            .is_some_and(|brief| live_quotes_match(brief, &current))
+        if !self
+            .prepared_evidence_valid(scope, execution_id, &item)
+            .await?
         {
             return Err(AppError::conflict(
                 "reused evidence is no longer publicly eligible",
@@ -999,12 +991,12 @@ impl ContentService {
             .ok_or_else(|| AppError::not_found("content revision not found"))
     }
 
-    async fn evidence(
+    async fn frozen_manifest(
         &self,
         scope: &TenantScope,
         execution_id: Uuid,
         item: &ContentItem,
-    ) -> Result<Vec<KnowledgeEvidence>, AppError> {
+    ) -> Result<DocumentManifest, AppError> {
         let execution = self
             .content
             .get_execution(scope, execution_id)
@@ -1030,61 +1022,275 @@ impl ContentService {
                 "source versions are outside frozen release",
             ));
         }
-        let mut evidence = Vec::new();
-        let mut refs = item.source_version_refs.clone();
-        refs.sort();
-        refs.dedup();
-        // A bounded selection from the exact immutable versions. No text
-        // search guess, and no current-version substitution.
+        Ok(manifest)
+    }
+
+    pub(crate) async fn source_refs(
+        &self,
+        scope: &TenantScope,
+        item: &ContentItem,
+    ) -> Result<Vec<geo_worker::ContentSourceRef>, AppError> {
+        self.frozen_manifest(scope, item.execution_id, item).await?;
         let sources = self.knowledge.list_sources(scope).await?;
-        for version_id in refs {
-            let Some(source) = sources.iter().find(|s| {
-                s.current_version_id == Some(version_id)
-                    && s.state == SourceState::Active
-                    && s.purpose == KnowledgePurpose::Public
-            }) else {
+        let mut refs = Vec::new();
+        for version_id in &item.source_version_refs {
+            let mut owner = None;
+            for source in &sources {
+                if self
+                    .knowledge
+                    .get_source_version(scope, source.source_id, *version_id)
+                    .await?
+                    .is_some()
+                {
+                    owner = Some(source.source_id);
+                    break;
+                }
+            }
+            refs.push(geo_worker::ContentSourceRef {
+                source_id: owner
+                    .ok_or_else(|| AppError::conflict("frozen source version missing"))?,
+                source_version_id: *version_id,
+            });
+        }
+        Ok(refs)
+    }
+
+    pub(crate) async fn reusable_evidence(
+        &self,
+        scope: &TenantScope,
+        item: &ContentItem,
+    ) -> Result<Option<Vec<ContentEvidence>>, AppError> {
+        if item.status != ContentItemStatus::Pending {
+            return Ok(None);
+        }
+        let mut assets = self.content.list_project_assets(scope).await?;
+        assets.sort_by_key(|asset| (asset.created_at, asset.asset_id));
+        for asset in assets.into_iter().rev() {
+            let Some(origin) = self
+                .content
+                .get_item(scope, asset.execution_id, asset.item_id)
+                .await?
+            else {
                 continue;
+            };
+            if origin.status != ContentItemStatus::Ready
+                || origin.document_key != item.document_key
+                || origin.ready_revision_id != Some(asset.current_revision_id)
+                || origin.source_version_refs != item.source_version_refs
+            {
+                continue;
+            }
+            let (Some(brief), Some(persisted)) = (&origin.brief, &origin.semantic_descriptor)
+            else {
+                continue;
+            };
+            let (descriptor, _) = self
+                .semantic_descriptor(
+                    scope,
+                    item.execution_id,
+                    item,
+                    brief.quotes.clone(),
+                    &item.document_key,
+                    &format!(
+                        "Create a {} document grounded only in the prepared evidence.",
+                        item.document_key
+                    ),
+                )
+                .await?;
+            let canonical = descriptor.canonical()?;
+            let fingerprint = canonical.fingerprint()?;
+            if canonical != persisted.canonical()?
+                || origin.semantic_fingerprint.as_deref() != Some(fingerprint.as_str())
+                || !self
+                    .selected_evidence_valid(scope, item.execution_id, item, &brief.quotes)
+                    .await?
+            {
+                continue;
+            }
+            match self
+                .content
+                .resolve_checked_revision(
+                    scope,
+                    asset.execution_id,
+                    asset.item_id,
+                    asset.current_revision_id,
+                )
+                .await
+            {
+                Ok(Some(_)) => return Ok(Some(brief.quotes.clone())),
+                Ok(None) => {}
+                Err(error)
+                    if error.code == ErrorCode::Conflict
+                        && error.message == "origin checked revision changed" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn source_read(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentSourceReadRequest,
+    ) -> Result<geo_worker::ContentSourcePage, AppError> {
+        request.validate().map_err(AppError::invalid_request)?;
+        let item = self
+            .item(scope, request.execution_id, request.item_id)
+            .await?;
+        let manifest = self
+            .frozen_manifest(scope, request.execution_id, &item)
+            .await?;
+        if !item
+            .source_version_refs
+            .contains(&request.source_version_id)
+        {
+            return Err(AppError::forbidden(
+                "source version is outside frozen content branch",
+            ));
+        }
+        let detail = self
+            .knowledge
+            .get_source_detail(scope, request.source_id)
+            .await?
+            .filter(|detail| {
+                detail.source.state == SourceState::Active
+                    && detail.source.purpose == KnowledgePurpose::Public
+                    && detail.source.current_version_id == Some(request.source_version_id)
+                    && detail.versions.iter().any(|version| {
+                        version.source_id == request.source_id
+                            && version.source_version_id == request.source_version_id
+                    })
+            })
+            .ok_or_else(|| {
+                AppError::forbidden("frozen source is no longer public or source ownership differs")
+            })?;
+        let mut chunks: Vec<_> = detail
+            .chunks
+            .into_iter()
+            .filter(|chunk| chunk.source_version_id == request.source_version_id)
+            .collect();
+        chunks.sort_by_key(|chunk| chunk.ordinal);
+        if chunks
+            .windows(2)
+            .any(|pair| pair[0].ordinal == pair[1].ordinal)
+        {
+            return Err(AppError::conflict("source chunk ordinals are not unique"));
+        }
+        let mut remaining = chunks.into_iter().filter(|chunk| {
+            request
+                .after_ordinal
+                .is_none_or(|after| chunk.ordinal > after)
+        });
+        let selected: Vec<_> = remaining.by_ref().take(request.limit as usize).collect();
+        let next_ordinal = remaining
+            .next()
+            .and_then(|_| selected.last().map(|chunk| chunk.ordinal));
+        let page = geo_worker::ContentSourcePage {
+            execution_id: request.execution_id,
+            item_id: request.item_id,
+            source_id: request.source_id,
+            source_version_id: request.source_version_id,
+            chunks: selected
+                .into_iter()
+                .map(|chunk| geo_worker::ContentSourceChunk {
+                    chunk_id: chunk.chunk_id,
+                    ordinal: chunk.ordinal,
+                    locator: chunk.locator,
+                    text: chunk.text,
+                })
+                .collect(),
+            next_ordinal,
+        };
+        let guard = self
+            .knowledge
+            .hold_content_evidence(scope, &[eligibility(manifest.manifest_id, &item, vec![])])
+            .await?;
+        drop(guard);
+        Ok(page)
+    }
+
+    async fn prepared_evidence_valid(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item: &ContentItem,
+    ) -> Result<bool, AppError> {
+        let Some(brief) = &item.brief else {
+            return Ok(false);
+        };
+        if brief.evidence
+            != brief
+                .quotes
+                .iter()
+                .map(|quote| quote.reference.clone())
+                .collect::<Vec<_>>()
+        {
+            return Ok(false);
+        }
+        self.selected_evidence_valid(scope, execution_id, item, &brief.quotes)
+            .await
+    }
+
+    async fn selected_evidence_valid(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item: &ContentItem,
+        selected: &[ContentEvidence],
+    ) -> Result<bool, AppError> {
+        self.frozen_manifest(scope, execution_id, item).await?;
+        if selected.is_empty() || selected.len() > 24 {
+            return Ok(false);
+        }
+        let sources = self.knowledge.list_sources(scope).await?;
+        let mut chunks = Vec::new();
+        for version_id in &item.source_version_refs {
+            let Some(source) = sources.iter().find(|source| {
+                source.current_version_id == Some(*version_id)
+                    && source.state == SourceState::Active
+                    && source.purpose == KnowledgePurpose::Public
+            }) else {
+                return Ok(false);
             };
             let Some(detail) = self
                 .knowledge
                 .get_source_detail(scope, source.source_id)
                 .await?
             else {
-                continue;
+                return Ok(false);
             };
-            if !detail
-                .versions
-                .iter()
-                .any(|v| v.source_version_id == version_id)
+            if detail.source.state != SourceState::Active
+                || detail.source.purpose != KnowledgePurpose::Public
+                || detail.source.current_version_id != Some(*version_id)
             {
-                continue;
+                return Ok(false);
             }
-            let mut chunks = detail.chunks;
-            chunks.sort_by_key(|chunk| chunk.ordinal);
-            for chunk in chunks
-                .into_iter()
-                .filter(|c| c.source_version_id == version_id)
-            {
-                if chunk.text.trim().is_empty() {
-                    continue;
-                }
-                let Some(quote) = evidence_excerpt(&chunk.text, &chunk.locator) else {
-                    continue;
-                };
-                evidence.push(KnowledgeEvidence {
-                    source_id: source.source_id,
-                    source_version_id: version_id,
-                    chunk_id: chunk.chunk_id,
-                    source_name: source.name.clone(),
-                    purpose: KnowledgePurpose::Public,
-                    locator: chunk.locator,
-                    quote: quote.clone(),
-                    text: quote,
-                });
+            if !detail.versions.iter().any(|version| {
+                version.source_id == source.source_id && version.source_version_id == *version_id
+            }) {
+                return Ok(false);
             }
+            chunks.extend(
+                detail
+                    .chunks
+                    .into_iter()
+                    .filter(|chunk| chunk.source_version_id == *version_id),
+            );
         }
-        evidence.truncate(MAX_EVIDENCE);
-        Ok(evidence)
+        Ok(selected.iter().all(|quote| {
+            !quote.exact_quote.trim().is_empty()
+                && quote.exact_quote.chars().count() <= MAX_QUOTE_CHARS
+                && chunks.iter().any(|chunk| {
+                    Some(chunk.chunk_id) == quote.reference.chunk_id
+                        && chunk.source_version_id == quote.reference.source_version_id
+                        && chunk.locator == quote.reference.locator
+                        && if matches!(chunk.locator, geo_domain::ChunkLocator::Csv { .. }) {
+                            chunk.text == quote.exact_quote
+                        } else {
+                            chunk.text.contains(&quote.exact_quote)
+                        }
+                })
+        }))
     }
 }
 
@@ -1168,17 +1374,6 @@ fn validate_item(
         ));
     }
     Ok(())
-}
-
-fn same_evidence(refs: &[EvidenceRef], current: &[KnowledgeEvidence]) -> bool {
-    !refs.is_empty()
-        && refs.iter().all(|r| {
-            current.iter().any(|e| {
-                Some(e.chunk_id) == r.chunk_id
-                    && e.source_version_id == r.source_version_id
-                    && e.locator == r.locator
-            })
-        })
 }
 
 #[derive(Deserialize)]
@@ -2044,47 +2239,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn csv_evidence_preserves_complete_records_and_never_truncates_cells() {
-        let locator = geo_domain::ChunkLocator::Csv {
-            start_row: 2,
-            end_row: 2,
-            start_column: 1,
-            end_column: 2,
-            header_row: Some(1),
-            start_char: None,
-            end_char: None,
-        };
-        let row = serde_json::json!({
-            "headers":["型号","价格"],
-            "values":["001\n\"quoted\"","001.00 元"]
-        })
-        .to_string();
-        assert_eq!(evidence_excerpt(&row, &locator), Some(row.clone()));
-        let large = serde_json::json!({
-            "headers":["型号","价格"],
-            "values":["字".repeat(MAX_QUOTE_CHARS),"001.00 元"]
-        })
-        .to_string();
-        assert_eq!(evidence_excerpt(&large, &locator), None);
-        let selected: Vec<_> = [&large, &row]
-            .into_iter()
-            .filter_map(|text| evidence_excerpt(text, &locator))
-            .collect();
-        assert_eq!(selected, vec![row]);
-        let plain = geo_domain::ChunkLocator::Text {
-            start_line: 1,
-            end_line: 1,
-            start_char: 0,
-            end_char: 2000,
-        };
-        assert_eq!(
-            evidence_excerpt(&"字".repeat(2000), &plain)
-                .unwrap()
-                .chars()
-                .count(),
-            MAX_QUOTE_CHARS
-        );
+    // Fixtures explicitly select located records, just as the workflow does.
+    // Production preparation never calls this helper or chooses a prefix.
+    impl ContentService {
+        async fn prepare_fixture(
+            &self,
+            scope: &TenantScope,
+            execution_id: Uuid,
+            item_id: Uuid,
+        ) -> Result<ContentItem, AppError> {
+            let item = self.item(scope, execution_id, item_id).await?;
+            let mut evidence = Vec::new();
+            for source in self.source_refs(scope, &item).await? {
+                let mut after_ordinal = None;
+                loop {
+                    let page = self
+                        .source_read(
+                            scope,
+                            geo_worker::ContentSourceReadRequest {
+                                execution_id,
+                                item_id,
+                                source_id: source.source_id,
+                                source_version_id: source.source_version_id,
+                                after_ordinal,
+                                limit: 32,
+                            },
+                        )
+                        .await?;
+                    evidence.extend(
+                        page.chunks
+                            .into_iter()
+                            .filter(|chunk| {
+                                !chunk.text.trim().is_empty()
+                                    && chunk.text.chars().count() <= MAX_QUOTE_CHARS
+                            })
+                            .map(|chunk| ContentEvidence {
+                                reference: EvidenceRef {
+                                    source_version_id: source.source_version_id,
+                                    chunk_id: Some(chunk.chunk_id),
+                                    locator: chunk.locator,
+                                },
+                                exact_quote: chunk.text,
+                            }),
+                    );
+                    after_ordinal = page.next_ordinal;
+                    if after_ordinal.is_none() {
+                        break;
+                    }
+                }
+            }
+            evidence.truncate(24);
+            self.prepare(scope, execution_id, item_id, evidence).await
+        }
     }
     use async_trait::async_trait;
     use geo_domain::{
@@ -2541,7 +2747,7 @@ mod tests {
         let service = ContentService::new(repository.clone(), knowledge, projects)
             .with_model_provider(model.clone());
         service
-            .prepare(&scope, execution.execution_id, item_id)
+            .prepare_fixture(&scope, execution.execution_id, item_id)
             .await
             .unwrap();
         service
@@ -3044,12 +3250,12 @@ mod tests {
             .unwrap()
             .remove(0);
         let prepared = service
-            .prepare(&scope, execution.execution_id, item.item_id)
+            .prepare_fixture(&scope, execution.execution_id, item.item_id)
             .await
             .unwrap();
         let brief = prepared.brief.unwrap();
         assert!(!brief.evidence.is_empty());
-        assert!(brief.evidence.len() <= MAX_EVIDENCE);
+        assert!(brief.evidence.len() <= 24);
         for quote in &brief.quotes {
             assert!(quote.exact_quote.chars().count() <= MAX_QUOTE_CHARS);
             let reference = &quote.reference;
@@ -3172,7 +3378,7 @@ mod tests {
             .unwrap();
         for item in items {
             let prepared = service
-                .prepare(&scope, execution.execution_id, item.item_id)
+                .prepare_fixture(&scope, execution.execution_id, item.item_id)
                 .await
                 .unwrap();
             assert_eq!(
@@ -3282,7 +3488,7 @@ mod tests {
         let service = ContentService::new(repository.clone(), knowledge, projects)
             .with_model_provider(model.clone());
         service
-            .prepare(&scope, execution.execution_id, item_id)
+            .prepare_fixture(&scope, execution.execution_id, item_id)
             .await
             .unwrap();
         let error = service
@@ -3412,7 +3618,7 @@ mod tests {
         let service = ContentService::new(repository.clone(), knowledge, projects.clone())
             .with_model_provider(model.clone());
         service
-            .prepare(&scope, execution.execution_id, item_id)
+            .prepare_fixture(&scope, execution.execution_id, item_id)
             .await
             .unwrap();
         let paused = ContentService::new(
@@ -3502,7 +3708,7 @@ mod tests {
             .unwrap();
         for (index, item) in items.iter().enumerate() {
             service
-                .prepare(&scope, execution.execution_id, item.item_id)
+                .prepare_fixture(&scope, execution.execution_id, item.item_id)
                 .await
                 .unwrap();
             if index == 0 {

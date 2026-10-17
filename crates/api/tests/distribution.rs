@@ -12,18 +12,18 @@ use geo_domain::{
     AppError, ChannelAccount, ChannelAccountRecord, ChannelJobRepository, ChannelOutcome,
     ChannelOutcomeStatus, ChannelOwnerKind, ChannelRepository, ChannelStatus, ChannelTarget,
     ChannelTargetInput, ConnectorCapabilityRepository, ConnectorKey, ConnectorVerification,
-    ContentItemStatus, ContentRepository, DistributionRepository, DistributionScope,
-    DistributionScopeMode, DistributionTargetStatus, DocumentManifestPlanRequest, DocumentScope,
-    ErrorCode, FreezeDistribution, ImportItem, InitialSource, InitialSourceKind,
-    InitialSourceVisibility, IntentVerification, KnowledgePurpose, KnowledgeRepository,
-    MemoryAuthRepository, MemoryChannelJobRepository, MemoryChannelRepository,
-    MemoryConnectorCapabilityRepository, MemoryContentRepository, MemoryDistributionRepository,
-    MemoryKnowledgeRepository, MemoryProjectRepository, PLAIN_TEXT_ARTICLE_FORMAT,
-    PlatformPlacement, PreparedDistribution, Project, ProjectCreate, ProjectId, ProjectPatch,
-    ProjectRepository, ProjectSettings, ProjectStartCommand, PublicationLookupCandidate,
-    PublicationLookupFinding, PublicationLookupJob, PublicationLookupObservation,
-    PublicationLookupRepository, SourceKind, TenantScope, UpdateProject, hash_idempotency_key,
-    settings_hash, start_request_hash,
+    ContentEvidence, ContentItemStatus, ContentRepository, DistributionRepository,
+    DistributionScope, DistributionScopeMode, DistributionTargetStatus,
+    DocumentManifestPlanRequest, DocumentScope, ErrorCode, EvidenceRef, FreezeDistribution,
+    ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility, IntentVerification,
+    KnowledgePurpose, KnowledgeRepository, MemoryAuthRepository, MemoryChannelJobRepository,
+    MemoryChannelRepository, MemoryConnectorCapabilityRepository, MemoryContentRepository,
+    MemoryDistributionRepository, MemoryKnowledgeRepository, MemoryProjectRepository,
+    PLAIN_TEXT_ARTICLE_FORMAT, PlatformPlacement, PreparedDistribution, Project, ProjectCreate,
+    ProjectId, ProjectPatch, ProjectRepository, ProjectSettings, ProjectStartCommand,
+    PublicationLookupCandidate, PublicationLookupFinding, PublicationLookupJob,
+    PublicationLookupObservation, PublicationLookupRepository, SourceKind, TenantScope,
+    UpdateProject, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_worker::{
     DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
@@ -390,6 +390,21 @@ async fn setup(second_blocked: bool) -> Fixture {
         .as_ref()
         .unwrap()
         .knowledge_release_id;
+    let source = imported.items[0].source.as_ref().unwrap();
+    let detail = knowledge
+        .get_source_detail(&scope, source.source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let chunk = &detail.chunks[0];
+    let evidence = vec![ContentEvidence {
+        reference: EvidenceRef {
+            source_version_id: chunk.source_version_id,
+            chunk_id: Some(chunk.chunk_id),
+            locator: chunk.locator.clone(),
+        },
+        exact_quote: chunk.text.clone(),
+    }];
     let mut document_scope = project.settings.document_scope.clone();
     document_scope.markets = project.settings.effective_markets();
     document_scope.languages = project.settings.effective_languages();
@@ -428,7 +443,12 @@ async fn setup(second_blocked: bool) -> Fixture {
             continue;
         }
         first_stage
-            .prepare(&scope, execution.execution_id, item.item_id)
+            .prepare(
+                &scope,
+                execution.execution_id,
+                item.item_id,
+                evidence.clone(),
+            )
             .await
             .unwrap();
         first_stage
@@ -1556,10 +1576,29 @@ async fn successor_content_reuse_keeps_original_publish_identity_without_new_com
         .await
         .unwrap();
     assert_eq!(items.len(), 2);
+    let original_items = fixture
+        .content
+        .list_items(&fixture.scope, first.content_execution_id)
+        .await
+        .unwrap();
     for item in items {
+        let evidence = original_items
+            .iter()
+            .find(|original| original.document_key == item.document_key)
+            .unwrap()
+            .brief
+            .as_ref()
+            .unwrap()
+            .quotes
+            .clone();
         assert_eq!(
             content
-                .prepare(&fixture.scope, execution.execution_id, item.item_id)
+                .prepare(
+                    &fixture.scope,
+                    execution.execution_id,
+                    item.item_id,
+                    evidence
+                )
                 .await
                 .unwrap()
                 .status,

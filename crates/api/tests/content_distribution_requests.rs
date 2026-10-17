@@ -13,10 +13,10 @@ use geo_api::{
 use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
     ChannelRepository, ChannelStatus, ConnectorCapabilityRepository, ConnectorKey,
-    ConnectorSettings, ConnectorVerification, ContentBlock, ContentBlockKind,
+    ConnectorSettings, ConnectorVerification, ContentBlock, ContentBlockKind, ContentEvidence,
     ContentMediaRepository, ContentRepository, ContentStep, DistributionRepository,
-    DocumentManifestPlanRequest, DocumentScope, ImportItem, InitialSource, InitialSourceKind,
-    InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, Membership,
+    DocumentManifestPlanRequest, DocumentScope, EvidenceRef, ImportItem, InitialSource,
+    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, Membership,
     MemoryAuthRepository, MemoryChannelRepository, MemoryConnectorCapabilityRepository,
     MemoryContentMediaRepository, MemoryContentRepository, MemoryDistributionRepository,
     MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate, ProjectRepository,
@@ -256,8 +256,23 @@ async fn fixture() -> Fixture {
         .await
         .unwrap()
         .remove(0);
+    let source = imported.items[0].source.as_ref().unwrap();
+    let detail = knowledge
+        .get_source_detail(&scope, source.source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let chunk = &detail.chunks[0];
+    let evidence = vec![ContentEvidence {
+        reference: EvidenceRef {
+            source_version_id: chunk.source_version_id,
+            chunk_id: Some(chunk.chunk_id),
+            locator: chunk.locator.clone(),
+        },
+        exact_quote: chunk.text.clone(),
+    }];
     service
-        .prepare(&scope, execution.execution_id, item.item_id)
+        .prepare(&scope, execution.execution_id, item.item_id, evidence)
         .await
         .unwrap();
     let revision = service

@@ -512,17 +512,19 @@ impl PgContentRepository {
             };
             let locator = serde_json::to_value(&evidence.reference.locator).map_err(encode)?;
             let text: String = row.get("text");
-            let expected_quote: String = if matches!(
+            let matches_quote = if matches!(
                 evidence.reference.locator,
                 geo_domain::ChunkLocator::Csv { .. }
             ) {
-                text
+                text == evidence.exact_quote
             } else {
-                text.chars().take(1600).collect()
+                text.contains(&evidence.exact_quote)
             };
             if row.get::<serde_json::Value, _>("locator") != locator
-                || expected_quote != evidence.exact_quote
-                || evidence.exact_quote.chars().count() > 1600
+                || !matches_quote
+                || evidence.exact_quote.trim().is_empty()
+                || evidence.exact_quote.chars().count()
+                    > geo_domain::CONTENT_EVIDENCE_MAX_QUOTE_CHARS
             {
                 return Err(AppError::conflict("frozen evidence quote changed"));
             }

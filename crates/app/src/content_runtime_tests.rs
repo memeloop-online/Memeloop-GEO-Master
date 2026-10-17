@@ -31,6 +31,7 @@ use crate::runtime::assemble_content_workflow;
 
 #[derive(Default)]
 struct GroundedModel {
+    selected: AtomicUsize,
     generated: AtomicUsize,
     checked: AtomicUsize,
 }
@@ -43,6 +44,36 @@ impl ModelProviderBridge for GroundedModel {
         request: &ModelCompletionRequest,
     ) -> Result<ModelCompletion, HostOpError> {
         let input: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
+        if request
+            .system
+            .as_deref()
+            .unwrap_or_default()
+            .contains("source-grounded content evidence selector")
+        {
+            self.selected.fetch_add(1, Ordering::SeqCst);
+            let evidence = if let Some(chunks) = input["chunks"].as_array() {
+                chunks
+                    .iter()
+                    .map(|chunk| {
+                        serde_json::json!({
+                            "source_version_id":chunk["source_version_id"],
+                            "chunk_id":chunk["chunk_id"],
+                            "exact_quote":chunk["text"]
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                input["candidates"].as_array().unwrap().clone()
+            };
+            return Ok(ModelCompletion {
+                text: serde_json::json!({"evidence":evidence}).to_string(),
+                tool_calls: vec![],
+                model: "injected-content-test".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                finish_reason: "stop".into(),
+            });
+        }
         let citation = input["evidence"][0]["chunk_id"].as_str().unwrap();
         let text = if request
             .system
@@ -296,6 +327,7 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
     }
     assert_eq!(model.generated.load(Ordering::SeqCst), 2);
     assert_eq!(model.checked.load(Ordering::SeqCst), 2);
+    assert_eq!(model.selected.load(Ordering::SeqCst), 2);
     let frozen_distribution = state
         .distribution_service()
         .latest_for_cycle(&scope, started.cycle_id)
@@ -471,6 +503,7 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
             .is_empty(),
         "reuse does not copy origin assets into a new owner"
     );
+    assert_eq!(model.selected.load(Ordering::SeqCst), 2);
     let next_distribution = restarted
         .distribution_service()
         .latest_for_cycle(&scope, successor.cycle_id)
