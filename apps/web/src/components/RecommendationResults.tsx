@@ -14,8 +14,6 @@ import "../i18n/observationAnalysis";
 /** Render model-extracted entities only; never infer names or rank from prose. */
 export function RecommendationResults({ value }: { value: unknown }) {
   const { t } = useTranslation("observationAnalysis");
-  // Older saved analyses have no entity extraction, not an empty recommendation.
-  if (value == null) return null;
   const decoded = decodeVerifiedRecommendations(value);
   const items = [...(decoded ?? [])].sort(
     (left, right) => left.mention_order - right.mention_order,
@@ -23,7 +21,9 @@ export function RecommendationResults({ value }: { value: unknown }) {
   return (
     <section aria-label={t("recommendationsTitle")}>
       <h5>{t("recommendationsTitle")}</h5>
-      {decoded === null ? (
+      {value == null ? (
+        <p>{t("recommendationsNotAnalyzed")}</p>
+      ) : decoded === null ? (
         <p>{t("recommendationsUnverified")}</p>
       ) : !items.length ? (
         <p>{t("recommendationsEmpty")}</p>

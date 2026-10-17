@@ -211,6 +211,104 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it.each([undefined, "older-version"])(
+    "opens scoped report history without matching measurements on this page (requested version: %s)",
+    async (requestedVersion) => {
+      vi.mocked(listAllQuestionSets).mockResolvedValue({
+        items: [
+          {
+            id: "set-1",
+            name: "灯具问题",
+            current_version_id: "current-version",
+            current_revision: 2,
+            question_count: 1,
+            optimization_count: 1,
+            evaluation_count: 0,
+          },
+        ],
+        next_cursor: null,
+      });
+      vi.mocked(listMeasurementPlans).mockResolvedValue({
+        items: [plan],
+        next_after: "older-page",
+      });
+      const selectedVersion = requestedVersion ?? "current-version";
+      const snapshot = {
+        kind: "measurement_period" as const,
+        project_id: "project-1",
+        question_set: {
+          question_set_id: "set-1",
+          question_set_version_id: selectedVersion,
+        },
+        report_id: "report-1",
+        revision: 1,
+        correction_of: null,
+        report_window_start_at: "2026-09-01T00:00:00Z",
+        report_window_end_at: "2026-10-01T00:00:00Z",
+        report_timezone: "UTC",
+        evidence_as_of: "2026-10-01T00:00:00Z",
+        generated_at: "2026-10-01T00:00:00Z",
+        input_hash: "hash",
+        coverage: {
+          planned: 0,
+          counts: {},
+          observed_live: 0,
+          grounded_saved_analysis: 0,
+        },
+        samples: [],
+      };
+      vi.mocked(getMeasurementReportPreview).mockResolvedValue({
+        ...snapshot,
+        kind: "measurement_period_preview",
+      });
+      vi.mocked(listMeasurementReports).mockResolvedValue({
+        items: [snapshot],
+      });
+      vi.mocked(getMeasurementReport).mockResolvedValue(snapshot);
+      renderPanel(
+        false,
+        true,
+        false,
+        `/?tab=records&set=set-1${requestedVersion ? `&version=${requestedVersion}` : ""}`,
+      );
+      const folder = (
+        await screen.findByText("灯具问题 · 本页 0 条记录")
+      ).closest("details")!;
+      expect(
+        within(folder).queryByRole("button", { name: /自定义问题测量/ }),
+      ).not.toBeInTheDocument();
+      const versionFolder = within(folder)
+        .getByText(requestedVersion ? "历史版本 older-version" : "当前版本 v2")
+        .closest("details")!;
+      await userEvent.click(
+        within(versionFolder).getByRole("button", { name: "排名变化" }),
+      );
+      await userEvent.click(
+        await within(versionFolder).findByRole("button", {
+          name: /查看版本 1/,
+        }),
+      );
+      expect(
+        await within(versionFolder).findByText("报告版本 1"),
+      ).toBeVisible();
+      expect(listMeasurementReports).toHaveBeenCalledWith(
+        "tenant-1",
+        "project-1",
+        snapshot.question_set,
+      );
+      expect(getMeasurementReport).toHaveBeenCalledWith(
+        "tenant-1",
+        "project-1",
+        "report-1",
+      );
+      expect(listMeasurementPlans).toHaveBeenCalledTimes(1);
+      expect(getChannelTarget).not.toHaveBeenCalled();
+      expect(screen.getByTestId("measurement-url")).toHaveTextContent(
+        `version=${selectedVersion}&rankReport=report-1`,
+      );
+    },
+  );
+
   it.each([true, false])(
     "opens a linked saved rank report on reload independently of the current history page (record listed: %s)",
     async (listed) => {
