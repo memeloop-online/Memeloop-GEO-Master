@@ -5,9 +5,8 @@ use geo_domain::{
     QuestionPurpose, QuestionReference, QuestionRepository, QuestionRevision, QuestionSetPage,
     QuestionSetRecord, QuestionSetSummary, QuestionSetVersion, QuestionSetVersionPage,
     QuestionSetVersionSummary, ResolvedQuestion, ReviseQuestionSet, TenantScope,
-    normalize_question_text, validate_page_limit,
+    normalize_question_text, sha256_hex, validate_page_limit,
 };
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -105,10 +104,6 @@ fn purpose_column(purpose: QuestionPurpose) -> &'static str {
     }
 }
 
-fn alias_digest(normalized_text: &str) -> String {
-    hex::encode(Sha256::digest(normalized_text.as_bytes()))
-}
-
 async fn version_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     scope: &TenantScope,
@@ -191,7 +186,10 @@ async fn load_candidate_identities(
         .iter()
         .map(|draft| normalize_question_text(&draft.text))
         .collect();
-    let digests: Vec<_> = normalized.iter().map(|text| alias_digest(text)).collect();
+    let digests: Vec<_> = normalized
+        .iter()
+        .map(|text| sha256_hex(text.as_bytes()))
+        .collect();
     let mut explicit: Vec<_> = drafts
         .iter()
         .filter_map(|draft| draft.question_id)
@@ -318,7 +316,7 @@ async fn save_transition(
                 .bind(operator)
                 .bind(tenant)
                 .bind(project)
-                .bind(alias_digest(alias))
+                .bind(sha256_hex(alias.as_bytes()))
                 .bind(alias)
                 .bind(identity.id)
                 .execute(&mut **tx)

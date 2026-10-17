@@ -76,18 +76,6 @@ async fn validate_drafts(
     Ok(())
 }
 
-pub async fn list_sets(
-    state: &AppState,
-    scope: &TenantScope,
-    after: Option<Uuid>,
-    limit: u32,
-) -> Result<QuestionSetPage, AppError> {
-    state
-        .question_repository()
-        .list_sets(scope, after, limit)
-        .await
-}
-
 pub async fn create_set(
     state: &AppState,
     scope: &TenantScope,
@@ -103,31 +91,6 @@ pub async fn create_set(
     }
     validate_drafts(state, scope, &command.questions).await?;
     state.question_repository().create_set(scope, command).await
-}
-
-pub async fn list_versions(
-    state: &AppState,
-    scope: &TenantScope,
-    set_id: Uuid,
-    after_revision: Option<u32>,
-    limit: u32,
-) -> Result<QuestionSetVersionPage, AppError> {
-    state
-        .question_repository()
-        .list_versions(scope, set_id, after_revision, limit)
-        .await
-}
-
-pub async fn get_version(
-    state: &AppState,
-    scope: &TenantScope,
-    set_id: Uuid,
-    version_id: Uuid,
-) -> Result<QuestionSetVersion, AppError> {
-    state
-        .question_repository()
-        .get_version(scope, set_id, version_id)
-        .await
 }
 
 pub async fn revise_set(
@@ -162,7 +125,9 @@ pub async fn list_question_sets(
         .await
         .map_err(|e| api_error(e, context.request_id))?;
     let _ = (query.tenant_id, query.project_id);
-    list_sets(&state, &scope, query.after, query.limit.unwrap_or(50))
+    state
+        .question_repository()
+        .list_sets(&scope, query.after, query.limit.unwrap_or(50))
         .await
         .map(Json)
         .map_err(|e| api_error(e, context.request_id))
@@ -197,16 +162,17 @@ pub async fn list_question_set_versions(
         .await
         .map_err(|e| api_error(e, context.request_id))?;
     let _ = (query.tenant_id, query.project_id);
-    list_versions(
-        &state,
-        &scope,
-        set_id,
-        query.after_revision,
-        query.limit.unwrap_or(50),
-    )
-    .await
-    .map(Json)
-    .map_err(|e| api_error(e, context.request_id))
+    state
+        .question_repository()
+        .list_versions(
+            &scope,
+            set_id,
+            query.after_revision,
+            query.limit.unwrap_or(50),
+        )
+        .await
+        .map(Json)
+        .map_err(|e| api_error(e, context.request_id))
 }
 
 pub async fn get_question_set_version(
@@ -218,7 +184,9 @@ pub async fn get_question_set_version(
     let scope = crate::channel_jobs::scope(&state, &tenant, project_id)
         .await
         .map_err(|e| api_error(e, context.request_id))?;
-    get_version(&state, &scope, set_id, version_id)
+    state
+        .question_repository()
+        .get_version(&scope, set_id, version_id)
         .await
         .map(Json)
         .map_err(|e| api_error(e, context.request_id))

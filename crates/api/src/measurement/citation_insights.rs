@@ -104,7 +104,7 @@ pub async fn get_citation_insights(
     let result = async {
         let _ = (query.tenant_id, query.project_id);
         let scope = crate::channel_jobs::scope(&state, &tenant, project_id).await?;
-        read_citation_page(&state, &scope, query.after, query.limit).await
+        read_page(&state, &scope, query.after, query.limit, false).await
     }
     .await;
     result
@@ -112,25 +112,7 @@ pub async fn get_citation_insights(
         .map_err(|error| api_error(error, context.request_id))
 }
 
-pub(crate) async fn read_citation_page(
-    state: &AppState,
-    scope: &TenantScope,
-    after: Option<Uuid>,
-    limit: Option<usize>,
-) -> Result<CitationInsightPage, AppError> {
-    read_page(state, scope, after, limit, false).await
-}
-
-pub(crate) async fn read_optimization_citation_page(
-    state: &AppState,
-    scope: &TenantScope,
-    after: Option<Uuid>,
-    limit: Option<usize>,
-) -> Result<CitationInsightPage, AppError> {
-    read_page(state, scope, after, limit, true).await
-}
-
-async fn read_page(
+pub(crate) async fn read_page(
     state: &AppState,
     scope: &TenantScope,
     after: Option<Uuid>,

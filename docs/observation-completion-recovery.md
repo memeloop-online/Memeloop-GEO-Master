@@ -2,7 +2,7 @@
 
 本接口只读取原会话历史，不重新发送问题，不解释答案，也不删除会话。原始来源及其回执保持不变；答案与引用仍由共享 AI 解析流程处理。
 
-状态：通用回执改造正在工作区实施，审查、整合验证及部署尚未完成。本文描述当前候选契约，不代表线上已支持；准确交付状态见 `HANDOFF.md`，验证记录见 `WORKLOG.md`。
+状态：通用回执契约已随 PR #73 合并，独立审查及 CI 通过，配套部署和真实同会话验收尚未完成；准确交付状态见 `HANDOFF.md`，验证记录见 `WORKLOG.md`。
 
 ## 职责与证据边界
 
@@ -60,4 +60,4 @@
 
 代码入口为 MJS 的 `packages/browser-runner/src/provider-completion-recovery.mjs` 和 `packages/browser-runner/src/runner.mjs`、领域的 `crates/domain/src/measurement/observation_completion_recovery.rs` 与 `crates/domain/src/measurement/observation_completion_recovery_jobs.rs`、持久层的 `crates/persistence/src/measurement/completion_recovery_jobs.rs`、API 的 `crates/api/src/measurement/observation_completion_recovery.rs` 与 `crates/api/src/accounts/browser_bridge.rs`、应用的 `crates/app/src/observation_completion_recovery_dispatch.rs`。
 
-本次通用回执需完成跨 MJS／Rust 的契约审查、来源绑定与错误分流回归、持久存档及重启恢复验证，再进行部署和真实同会话只读恢复验收。现有表、旧批次测试或服务就绪不证明本次改造已交付。
+部署须使用相同契约的 API 与执行器，切换前核对在途任务；不增加旧格式解码或改写已存原始证据。仍须完成真实同会话只读恢复与重启验收，CI 和服务就绪不替代实际恢复结果。
