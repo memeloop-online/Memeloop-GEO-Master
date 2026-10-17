@@ -58,7 +58,10 @@ impl QuestionToolService for AppState {
         if let (Some(set_id), Some(version_id)) =
             (request.question_set_id, request.question_set_version_id)
         {
-            let version = questions::get_version(self, scope, set_id, version_id).await?;
+            let version = self
+                .question_repository()
+                .get_version(scope, set_id, version_id)
+                .await?;
             let after = request
                 .cursor
                 .as_deref()
@@ -102,7 +105,10 @@ impl QuestionToolService for AppState {
                         .map_err(|_| AppError::invalid_request("invalid version cursor"))
                 })
                 .transpose()?;
-            let page = questions::list_versions(self, scope, set_id, after_revision, limit).await?;
+            let page = self
+                .question_repository()
+                .list_versions(scope, set_id, after_revision, limit)
+                .await?;
             result.versions = page.items;
             result.next_cursor = page.next_cursor.map(|cursor| cursor.to_string());
         } else {
@@ -114,7 +120,10 @@ impl QuestionToolService for AppState {
                         .map_err(|_| AppError::invalid_request("invalid question-set cursor"))
                 })
                 .transpose()?;
-            let page = questions::list_sets(self, scope, after, limit).await?;
+            let page = self
+                .question_repository()
+                .list_sets(scope, after, limit)
+                .await?;
             result.sets = page.items;
             result.next_cursor = page.next_cursor.map(|cursor| cursor.to_string());
         }

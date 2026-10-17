@@ -30,10 +30,10 @@ pub(crate) async fn read(
         .ok_or_else(|| AppError::not_found("project not found"))?;
     let citations = match audience {
         RecommendationAudience::Human => {
-            citation_insights::read_citation_page(state, scope, after, limit).await?
+            citation_insights::read_page(state, scope, after, limit, false).await?
         }
         RecommendationAudience::Optimization => {
-            citation_insights::read_optimization_citation_page(state, scope, after, limit).await?
+            citation_insights::read_page(state, scope, after, limit, true).await?
         }
     };
     // The filtered repository guarantees these IDs belong to plans containing
