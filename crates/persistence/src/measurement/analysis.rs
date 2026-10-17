@@ -100,7 +100,7 @@ impl ObservationAnalysisRepository for PgObservationAnalysisRepository {
         let target = self.jobs.get_target(scope, request.target_id).await?;
         let capture = match request.source {
             ObservationAnalysisSource::Capture { capture_id } => {
-                self.captures.get(scope, capture_id).await?
+                self.captures.get_source(scope, capture_id).await?
             }
             ObservationAnalysisSource::AttemptEvidence { .. } => None,
         };

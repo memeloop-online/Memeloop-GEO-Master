@@ -66,10 +66,11 @@ impl ObservationEvidenceResolver {
                 };
                 let capture = match revision.request.source {
                     ObservationAnalysisSource::Capture { capture_id } => {
-                        let Some(capture) = self.captures.get(scope, capture_id).await? else {
+                        let Some(capture) = self.captures.get_source(scope, capture_id).await?
+                        else {
                             continue;
                         };
-                        if capture.receipt.stored_at > as_of {
+                        if capture.stored_at > as_of {
                             continue;
                         }
                         Some(capture)

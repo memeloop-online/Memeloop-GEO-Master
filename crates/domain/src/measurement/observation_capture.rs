@@ -192,6 +192,85 @@ pub struct ObservationCapture {
     pub receipt: ObservationCaptureReceipt,
 }
 
+/// Immutable interpretation input. Lifecycle metadata is deliberately absent:
+/// reading answer bytes never proves completion or authorizes remote deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationCaptureSource {
+    pub capture_id: Uuid,
+    pub target_id: Uuid,
+    pub attempt_id: Uuid,
+    pub account_id: Uuid,
+    pub runner_session_id: Uuid,
+    pub original_identity: Option<ObservationProviderIdentity>,
+    pub observed_at: DateTime<Utc>,
+    pub source_json: String,
+    pub source_sha256: String,
+    pub stored_at: DateTime<Utc>,
+}
+
+impl ObservationCaptureSource {
+    pub fn validate(&self, scope: &TenantScope) -> Result<(), AppError> {
+        crate::validate_observation_extraction_scope(scope)?;
+        if [
+            self.capture_id,
+            self.target_id,
+            self.attempt_id,
+            self.account_id,
+            self.runner_session_id,
+        ]
+        .iter()
+        .any(Uuid::is_nil)
+        {
+            return Err(AppError::invalid_request(
+                "observation source identity required",
+            ));
+        }
+        if let Some(identity) = &self.original_identity {
+            identity.validate()?;
+        }
+        let document = checked_json(
+            &self.source_json,
+            &self.source_sha256,
+            MAX_OBSERVATION_SOURCE_BYTES,
+        )?;
+        if !valid_observation_source_document(&document) {
+            return Err(AppError::invalid_request("invalid source document"));
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<&ObservationCapture> for ObservationCaptureSource {
+    type Error = AppError;
+
+    fn try_from(capture: &ObservationCapture) -> Result<Self, AppError> {
+        let ObservationCaptureSnapshot::Source {
+            source_json,
+            source_sha256,
+        } = &capture.input.snapshot
+        else {
+            return Err(AppError::invalid_request(
+                "analysis requires a source capture",
+            ));
+        };
+        if capture.input.ordinal != 0 || capture.receipt.capture_id != capture.input.capture_id {
+            return Err(AppError::conflict("observation source binding differs"));
+        }
+        Ok(Self {
+            capture_id: capture.input.capture_id,
+            target_id: capture.input.target_id,
+            attempt_id: capture.input.attempt_id,
+            account_id: capture.input.account_id,
+            runner_session_id: capture.input.runner_session_id,
+            original_identity: capture.input.original_identity.clone(),
+            observed_at: capture.input.observed_at,
+            source_json: source_json.clone(),
+            source_sha256: source_sha256.clone(),
+            stored_at: capture.receipt.stored_at,
+        })
+    }
+}
+
 impl ObservationCapture {
     /// This is necessary, not sufficient, for cleanup: callers must still
     /// authorize the exact persisted owner, attempt and original account.
@@ -560,6 +639,11 @@ pub struct ObservationCaptureSourceItem {
 
 #[async_trait]
 pub trait ObservationCaptureRepository: Send + Sync {
+    async fn get_source(
+        &self,
+        scope: &TenantScope,
+        capture_id: Uuid,
+    ) -> Result<Option<ObservationCaptureSource>, AppError>;
     /// Source phase, ordinal zero, ordered by UUID with an inclusive stored_at
     /// cutoff fixed across pages. Does not decide interpretation eligibility.
     async fn scan_sources(
@@ -575,7 +659,7 @@ pub trait ObservationCaptureRepository: Send + Sync {
         _scope: &TenantScope,
         _target_id: Uuid,
         _attempt_id: Uuid,
-    ) -> Result<Vec<ObservationCapture>, AppError> {
+    ) -> Result<Vec<ObservationCaptureSource>, AppError> {
         Ok(Vec::new())
     }
     async fn save(
@@ -608,6 +692,17 @@ impl MemoryObservationCaptureRepository {
 
 #[async_trait]
 impl ObservationCaptureRepository for MemoryObservationCaptureRepository {
+    async fn get_source(
+        &self,
+        scope: &TenantScope,
+        capture_id: Uuid,
+    ) -> Result<Option<ObservationCaptureSource>, AppError> {
+        self.get(scope, capture_id)
+            .await?
+            .as_ref()
+            .map(ObservationCaptureSource::try_from)
+            .transpose()
+    }
     async fn scan_sources(
         &self,
         as_of: DateTime<Utc>,
@@ -643,7 +738,7 @@ impl ObservationCaptureRepository for MemoryObservationCaptureRepository {
         scope: &TenantScope,
         target_id: Uuid,
         attempt_id: Uuid,
-    ) -> Result<Vec<ObservationCapture>, AppError> {
+    ) -> Result<Vec<ObservationCaptureSource>, AppError> {
         if scope.project_id.is_none() {
             return Err(AppError::forbidden("project scope required"));
         }
@@ -661,14 +756,9 @@ impl ObservationCaptureRepository for MemoryObservationCaptureRepository {
                         ObservationCaptureSnapshot::Source { .. }
                     )
             })
-            .map(|(_, capture)| capture.clone())
-            .collect();
-        items.sort_by_key(|capture| {
-            (
-                std::cmp::Reverse(capture.input.observed_at),
-                capture.input.capture_id,
-            )
-        });
+            .map(|(_, capture)| ObservationCaptureSource::try_from(capture))
+            .collect::<Result<Vec<_>, _>>()?;
+        items.sort_by_key(|capture| (std::cmp::Reverse(capture.observed_at), capture.capture_id));
         items.truncate(100);
         Ok(items)
     }

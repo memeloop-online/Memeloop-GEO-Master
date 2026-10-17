@@ -292,10 +292,68 @@ async fn capture_commit_replay_scope_and_attempt_binding() {
         store.save(&scope, wrong_account).await.unwrap_err().code,
         ErrorCode::Forbidden
     );
-    let mut same_ordinal = input;
+    let mut same_ordinal = input.clone();
     same_ordinal.capture_id = Uuid::new_v4();
     assert_eq!(
         store.save(&scope, same_ordinal).await.unwrap_err().code,
         ErrorCode::Conflict
     );
+
+    // Interpretation reads the retained source, independently of unrelated
+    // lifecycle payloads. These rows are inserted once and never rewritten.
+    for (metadata, tampered) in [
+        (serde_json::json!({"opaque":"retained"}), false),
+        (serde_json::json!(["unrelated", 7]), false),
+        (serde_json::json!({"opaque":"retained"}), true),
+    ] {
+        let mut archived = input.clone();
+        archived.capture_id = Uuid::new_v4();
+        archived.runner_session_id = Uuid::new_v4();
+        let mut body = serde_json::to_value(&archived).unwrap();
+        body["completion"] = metadata.clone();
+        body["owned_conversation"] = metadata;
+        if tampered {
+            body["snapshot"]["source_json"] = serde_json::json!("{\"messages\":[]}");
+        }
+        sqlx::query("INSERT INTO observation_captures (capture_id,operator_id,tenant_id,project_id,target_id,attempt_id,account_id,runner_session_id,ordinal,phase,input_hash,input) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,'source',$9,$10)")
+            .bind(archived.capture_id).bind(operator).bind(tenant).bind(project)
+            .bind(target).bind(attempt).bind(account).bind(archived.runner_session_id)
+            .bind(sha256_hex(serde_json::to_vec(&body).unwrap().as_slice())).bind(&body)
+            .execute(database.pool()).await.unwrap();
+        assert!(store.get(&scope, archived.capture_id).await.is_err());
+        if tampered {
+            assert!(store.get_source(&scope, archived.capture_id).await.is_err());
+            continue;
+        }
+        let source = store
+            .get_source(&scope, archived.capture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ObservationCaptureSnapshot::Source {
+            source_json,
+            source_sha256,
+        } = &input.snapshot
+        else {
+            unreachable!()
+        };
+        assert_eq!(&source.source_json, source_json);
+        assert_eq!(&source.source_sha256, source_sha256);
+        assert!(
+            store
+                .get_source(&other_scope, archived.capture_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let sources = store
+            .list_sources_for_attempt(&scope, target, attempt)
+            .await
+            .unwrap();
+        assert!(
+            sources
+                .iter()
+                .any(|item| item.capture_id == archived.capture_id)
+        );
+    }
 }

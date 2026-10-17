@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelTarget, ChannelTargetInput, ErrorCode, ObservationCapture,
     ObservationCaptureInput, ObservationCaptureReceipt, ObservationCaptureRepository,
-    ObservationCaptureSnapshot, ObservationCaptureSourceItem, TenantScope,
+    ObservationCaptureSnapshot, ObservationCaptureSource, ObservationCaptureSourceItem,
+    TenantScope,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -49,8 +50,118 @@ fn decode(row: sqlx::postgres::PgRow) -> Result<ObservationCapture, AppError> {
     })
 }
 
+// Select source fields only. Completion and remote conversation ownership are
+// private to lifecycle reads and never decoded by interpretation consumers.
+const SOURCE_COLUMNS: &str = "capture_id,target_id,attempt_id,account_id,runner_session_id,ordinal,phase,stored_at, \
+    input->>'capture_id' AS input_capture_id,input->>'target_id' AS input_target_id, \
+    input->>'attempt_id' AS input_attempt_id,input->>'account_id' AS input_account_id, \
+    input->>'runner_session_id' AS input_runner_session_id,input->'ordinal' AS input_ordinal, \
+    input #>> '{snapshot,phase}' AS input_phase,input->'observed_at' AS observed_at, \
+    input->'original_identity' AS original_identity, \
+    input #>> '{snapshot,source_json}' AS source_json, \
+    input #>> '{snapshot,source_sha256}' AS source_sha256";
+
+fn decode_source(
+    row: sqlx::postgres::PgRow,
+    scope: &TenantScope,
+) -> Result<ObservationCaptureSource, AppError> {
+    let invalid = || AppError::new(ErrorCode::Internal, "stored observation source invalid");
+    for field in [
+        "capture_id",
+        "target_id",
+        "attempt_id",
+        "account_id",
+        "runner_session_id",
+    ] {
+        let expected: Uuid = row.get(field);
+        let stored: Option<String> = row.get(format!("input_{field}").as_str());
+        if stored.as_deref() != Some(expected.to_string().as_str()) {
+            return Err(invalid());
+        }
+    }
+    if row.get::<String, _>("phase") != "source"
+        || row.get::<i32, _>("ordinal") != 0
+        || row.get::<Option<String>, _>("input_phase").as_deref() != Some("source")
+        || row.get::<serde_json::Value, _>("input_ordinal") != serde_json::json!(0)
+    {
+        return Err(invalid());
+    }
+    let original_identity: Option<serde_json::Value> = row.get("original_identity");
+    let source = ObservationCaptureSource {
+        capture_id: row.get("capture_id"),
+        target_id: row.get("target_id"),
+        attempt_id: row.get("attempt_id"),
+        account_id: row.get("account_id"),
+        runner_session_id: row.get("runner_session_id"),
+        original_identity: original_identity
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| invalid())?
+            .flatten(),
+        observed_at: serde_json::from_value(row.get("observed_at")).map_err(|_| invalid())?,
+        source_json: row
+            .get::<Option<String>, _>("source_json")
+            .ok_or_else(invalid)?,
+        source_sha256: row
+            .get::<Option<String>, _>("source_sha256")
+            .ok_or_else(invalid)?,
+        stored_at: row.get("stored_at"),
+    };
+    source.validate(scope).map_err(|_| invalid())?;
+    Ok(source)
+}
+
 #[async_trait]
 impl ObservationCaptureRepository for PgObservationCaptureRepository {
+    async fn get_source(
+        &self,
+        scope: &TenantScope,
+        capture_id: Uuid,
+    ) -> Result<Option<ObservationCaptureSource>, AppError> {
+        let query = format!(
+            "SELECT {SOURCE_COLUMNS} FROM observation_captures WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND capture_id=$4 AND phase='source'"
+        );
+        sqlx::query(&query)
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(scope_project(scope)?)
+            .bind(capture_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(unavailable)?
+            .map(|row| decode_source(row, scope))
+            .transpose()
+    }
+
+    async fn list_sources_for_attempt(
+        &self,
+        scope: &TenantScope,
+        target_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Vec<ObservationCaptureSource>, AppError> {
+        let project = scope_project(scope)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(unavailable)?;
+        let query = format!(
+            "SELECT {SOURCE_COLUMNS} FROM observation_captures WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND target_id=$4 AND attempt_id=$5 AND phase='source' ORDER BY (input->>'observed_at')::timestamptz DESC,capture_id LIMIT 100"
+        );
+        let items = sqlx::query(&query)
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project)
+            .bind(target_id)
+            .bind(attempt_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| decode_source(row, scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(items)
+    }
     async fn scan_sources(
         &self,
         as_of: DateTime<Utc>,
@@ -80,38 +191,6 @@ impl ObservationCaptureRepository for PgObservationCaptureRepository {
                 capture_id: row.get("capture_id"),
             })
             .collect())
-    }
-    async fn list_sources_for_attempt(
-        &self,
-        scope: &TenantScope,
-        target_id: Uuid,
-        attempt_id: Uuid,
-    ) -> Result<Vec<ObservationCapture>, AppError> {
-        let project = scope_project(scope)?;
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        crate::set_local_scope(&mut tx, scope)
-            .await
-            .map_err(unavailable)?;
-        let rows = sqlx::query(
-            "SELECT input,input_hash,stored_at FROM observation_captures \
-             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
-             AND target_id=$4 AND attempt_id=$5 AND phase='source' \
-             ORDER BY (input->>'observed_at')::timestamptz DESC,capture_id LIMIT 100",
-        )
-        .bind(scope.operator_id.as_uuid())
-        .bind(scope.tenant_id.as_uuid())
-        .bind(project)
-        .bind(target_id)
-        .bind(attempt_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-        let items = rows
-            .into_iter()
-            .map(decode)
-            .collect::<Result<Vec<_>, _>>()?;
-        tx.commit().await.map_err(unavailable)?;
-        Ok(items)
     }
     async fn save(
         &self,
