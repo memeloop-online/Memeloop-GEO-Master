@@ -114,12 +114,16 @@ fn pinned_client(
     {
         return Err(rejected());
     }
-    Client::builder()
+    let builder = Client::builder()
         .no_proxy()
         .redirect(Policy::none())
         .retry(reqwest::retry::never())
         .dns_resolver(Arc::new(NoUnpinnedDns))
-        .resolve_to_addrs(url.host_str().ok_or_else(rejected)?, &addresses)
+        .resolve_to_addrs(url.host_str().ok_or_else(rejected)?, &addresses);
+    // The caller bounds resolution, upload and response with its own deadline.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(None);
+    builder
         .build()
         .map_err(|_| ProviderError::Transport("HTTP client initialization failed".into()))
 }
