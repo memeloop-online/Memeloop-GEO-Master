@@ -171,13 +171,14 @@ async fn cleanup_once(
     let operation = async {
         let restored = state
             .channel_service()
-            .resume_provider_cleanup_browser_reserved(
+            .resume_owned_conversation_browser(
                 scope,
                 claim.account_id,
                 &claim.original_identity,
                 session_id,
-                reservation_id,
+                Some(reservation_id),
                 original_session_id,
+                geo_domain::BrowserOperationPurpose::Cleanup,
             )
             .await;
         // Repository/network errors do not identify a specific login failure.

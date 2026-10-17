@@ -3,10 +3,10 @@ use std::{sync::Arc, time::Duration};
 
 use chrono::Utc;
 use geo_domain::{
-    AppError, BrowserOperationPurpose, ObservationCaptureSnapshot,
-    ObservationCompletionRecoveryClaim, ObservationCompletionRecoveryInput,
-    ObservationCompletionRecoveryJobOutcome as Outcome, ObservationCompletionRecoveryJobRepository,
-    ObservationCompletionRecoveryRepository, ObservationProviderIdentity, TenantScope,
+    AppError, BrowserOperationPurpose, ObservationCompletionRecoveryClaim,
+    ObservationCompletionRecoveryInput, ObservationCompletionRecoveryJobOutcome as Outcome,
+    ObservationCompletionRecoveryJobRepository, ObservationCompletionRecoveryRepository,
+    ObservationProviderIdentity, TenantScope,
 };
 use uuid::Uuid;
 
@@ -183,7 +183,7 @@ async fn recover_once(
     let operation = async {
         state
             .channel_service()
-            .resume_completion_recovery_browser_reserved(
+            .resume_owned_conversation_browser(
                 scope,
                 account_id,
                 &ObservationProviderIdentity {
@@ -191,8 +191,9 @@ async fn recover_once(
                     platform_account_id: binding.platform_account_id.clone(),
                 },
                 session_id,
-                reservation_id,
+                Some(reservation_id),
                 original_session,
+                BrowserOperationPurpose::CompletionRecovery,
             )
             .await
             .inspect_err(|_| RetryDiagnostic::BrowserResumeFailed.record())?;
@@ -236,17 +237,12 @@ async fn recover_once(
                 if Utc::now() + chrono::Duration::seconds(10) >= claim.lease_until {
                     return Ok(RetryDiagnostic::LeaseBeforeSave.retry());
                 }
-                let ObservationCaptureSnapshot::Source { source_sha256, .. } =
-                    &original.input.snapshot
-                else {
-                    return Ok(Outcome::Retained);
-                };
                 let input = ObservationCompletionRecoveryInput {
                     recovery_id: claim.lease_id,
                     scope: scope.clone(),
-                    source_capture_id: original.input.capture_id,
-                    source_sha256: source_sha256.clone(),
-                    source_receipt_sha256: original.receipt.digest_sha256.clone(),
+                    source_capture_id: binding.source_capture_id,
+                    source_sha256: binding.source_sha256.clone(),
+                    source_receipt_sha256: binding.source_receipt_sha256.clone(),
                     recovery_execution_id: execution_id,
                     runner_session_id: session_id,
                     observed_at,
@@ -706,6 +702,18 @@ mod tests {
         );
         let saved = evidence.stored.lock().await.clone().unwrap();
         saved.validate(&scope, &claim.original).unwrap();
+        assert_eq!(
+            saved.input.source_capture_id,
+            claim.request_binding.source_capture_id
+        );
+        assert_eq!(
+            saved.input.source_sha256,
+            claim.request_binding.source_sha256
+        );
+        assert_eq!(
+            saved.input.source_receipt_sha256,
+            claim.request_binding.source_receipt_sha256
+        );
         assert_ne!(
             saved.input.runner_session_id,
             claim.original.input.runner_session_id
