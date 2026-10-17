@@ -617,72 +617,8 @@ impl ChannelService {
 
     /// Restore current authorization, but never adopt a replacement identity.
     /// The caller owns the supplied session ID and must close even if start fails.
-    #[cfg(test)]
-    pub(crate) async fn resume_provider_cleanup_browser(
-        &self,
-        scope: &TenantScope,
-        account_id: Uuid,
-        identity: &geo_domain::ObservationProviderIdentity,
-        session_id: Uuid,
-        original_session_id: Uuid,
-    ) -> Result<(), AppError> {
-        self.resume_owned_conversation_browser(
-            scope,
-            account_id,
-            identity,
-            session_id,
-            None,
-            original_session_id,
-            geo_domain::BrowserOperationPurpose::Cleanup,
-        )
-        .await
-    }
-
-    pub(crate) async fn resume_provider_cleanup_browser_reserved(
-        &self,
-        scope: &TenantScope,
-        account_id: Uuid,
-        identity: &geo_domain::ObservationProviderIdentity,
-        session_id: Uuid,
-        reservation_id: Uuid,
-        original_session_id: Uuid,
-    ) -> Result<(), AppError> {
-        self.resume_owned_conversation_browser(
-            scope,
-            account_id,
-            identity,
-            session_id,
-            Some(reservation_id),
-            original_session_id,
-            geo_domain::BrowserOperationPurpose::Cleanup,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn resume_completion_recovery_browser_reserved(
-        &self,
-        scope: &TenantScope,
-        account_id: Uuid,
-        identity: &geo_domain::ObservationProviderIdentity,
-        session_id: Uuid,
-        reservation_id: Uuid,
-        original_session_id: Uuid,
-    ) -> Result<(), AppError> {
-        self.resume_owned_conversation_browser(
-            scope,
-            account_id,
-            identity,
-            session_id,
-            Some(reservation_id),
-            original_session_id,
-            geo_domain::BrowserOperationPurpose::CompletionRecovery,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn resume_owned_conversation_browser(
+    pub(crate) async fn resume_owned_conversation_browser(
         &self,
         scope: &TenantScope,
         account_id: Uuid,
@@ -3589,12 +3525,14 @@ mod publication_binding_tests {
         };
         assert!(
             service
-                .resume_provider_cleanup_browser(
+                .resume_owned_conversation_browser(
                     &scope,
                     account_id,
                     &identity,
                     Uuid::new_v4(),
-                    original_session
+                    None,
+                    original_session,
+                    geo_domain::BrowserOperationPurpose::Cleanup,
                 )
                 .await
                 .is_err()
@@ -3604,12 +3542,14 @@ mod publication_binding_tests {
         identity.provider = "other".into();
         assert!(
             service
-                .resume_provider_cleanup_browser(
+                .resume_owned_conversation_browser(
                     &scope,
                     account_id,
                     &identity,
                     Uuid::new_v4(),
-                    original_session
+                    None,
+                    original_session,
+                    geo_domain::BrowserOperationPurpose::Cleanup,
                 )
                 .await
                 .is_err()
@@ -3618,12 +3558,14 @@ mod publication_binding_tests {
         identity.provider = "zhihu".into();
         let session_id = Uuid::new_v4();
         service
-            .resume_provider_cleanup_browser(
+            .resume_owned_conversation_browser(
                 &scope,
                 account_id,
                 &identity,
                 session_id,
+                None,
                 original_session,
+                geo_domain::BrowserOperationPurpose::Cleanup,
             )
             .await
             .unwrap();
@@ -3631,6 +3573,20 @@ mod publication_binding_tests {
         assert_eq!(
             stub.starts.lock().await[0]["session_id"],
             session_id.to_string()
+        );
+        let operation = service
+            .operations()
+            .unwrap()
+            .get_browser_operation(
+                &crate::browser_operations::execution_scope(&scope, session_id),
+                session_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            operation.purpose,
+            geo_domain::BrowserOperationPurpose::Cleanup
         );
         server.abort();
     }
@@ -3660,12 +3616,14 @@ mod publication_binding_tests {
         };
         assert!(
             service
-                .resume_provider_cleanup_browser(
+                .resume_owned_conversation_browser(
                     &scope,
                     account_id,
                     &identity,
                     Uuid::new_v4(),
+                    None,
                     Uuid::new_v4(),
+                    geo_domain::BrowserOperationPurpose::Cleanup,
                 )
                 .await
                 .is_err()
@@ -3677,12 +3635,14 @@ mod publication_binding_tests {
         );
         assert!(
             service
-                .resume_provider_cleanup_browser(
+                .resume_owned_conversation_browser(
                     &other_scope,
                     account_id,
                     &identity,
                     Uuid::new_v4(),
+                    None,
                     original_session,
+                    geo_domain::BrowserOperationPurpose::Cleanup,
                 )
                 .await
                 .is_err()
@@ -3690,12 +3650,14 @@ mod publication_binding_tests {
         assert_eq!(stub.starts.lock().await.len(), 1);
         let session = Uuid::new_v4();
         service
-            .resume_provider_cleanup_browser(
+            .resume_owned_conversation_browser(
                 &scope,
                 account_id,
                 &identity,
                 session,
+                None,
                 original_session,
+                geo_domain::BrowserOperationPurpose::Cleanup,
             )
             .await
             .unwrap();
@@ -3750,12 +3712,14 @@ mod publication_binding_tests {
         };
         let session = Uuid::new_v4();
         service
-            .resume_provider_cleanup_browser(
+            .resume_owned_conversation_browser(
                 &scope,
                 account_id,
                 &identity,
                 session,
+                None,
                 original_session,
+                geo_domain::BrowserOperationPurpose::Cleanup,
             )
             .await
             .unwrap();
