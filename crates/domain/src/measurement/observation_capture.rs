@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::provider_conversation_lifecycle::{completion_inventory, deepseek_evidence_chat_id};
 use crate::{AppError, ChannelJobRepository, ChannelTargetInput, TenantScope};
 
 pub const MAX_OBSERVATION_SOURCE_BYTES: usize = 750_000;
@@ -78,18 +77,64 @@ pub struct ObservationProviderIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ObservationCompletionProtocol {
-    ConnectJson,
-    DeepseekHistoryJson,
+pub enum ObservationCompletionOutcome {
+    Complete,
+    ClearedFailure,
 }
 
 /// Transport lifecycle proof, independent of answer interpretation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationCaptureCompletion {
-    pub protocol: ObservationCompletionProtocol,
-    pub terminal: bool,
-    pub assistant_message_ids: Vec<String>,
+    pub outcome: ObservationCompletionOutcome,
+    pub message_inventory: Vec<(String, String)>,
+}
+
+impl ObservationCaptureCompletion {
+    /// The authenticated adapter owns provider protocol verification. Rust only
+    /// accepts a canonical inventory, never a claim of deletion authority.
+    pub fn validate(&self) -> Result<(), AppError> {
+        let valid = self.message_inventory.len() <= 32_768
+            && self.message_inventory.iter().all(|(id, role)| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                    && matches!(role.as_str(), "user" | "assistant" | "system")
+            })
+            && self
+                .message_inventory
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+            && match self.outcome {
+                ObservationCompletionOutcome::Complete => {
+                    self.message_inventory
+                        .iter()
+                        .any(|(_, role)| role == "user")
+                        && self
+                            .message_inventory
+                            .iter()
+                            .any(|(_, role)| role == "assistant")
+                }
+                ObservationCompletionOutcome::ClearedFailure => self.message_inventory.is_empty(),
+            };
+        if !valid {
+            return Err(AppError::invalid_request(
+                "invalid observation completion inventory",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn message_inventory_sha256(&self) -> Result<String, AppError> {
+        self.validate()?;
+        Ok(hex::encode(Sha256::digest(
+            serde_json::to_vec(&self.message_inventory).map_err(|_| {
+                AppError::invalid_request("invalid observation completion inventory")
+            })?,
+        )))
+    }
 }
 
 impl ObservationProviderIdentity {
@@ -151,8 +196,15 @@ impl ObservationCapture {
     /// This is necessary, not sufficient, for cleanup: callers must still
     /// authorize the exact persisted owner, attempt and original account.
     pub fn has_complete_conversation_evidence(&self, scope: &TenantScope) -> bool {
-        self.input.completion.is_some()
-            && self.receipt.capture_id == self.input.capture_id
+        self.input
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.outcome == ObservationCompletionOutcome::Complete)
+            && self.valid_receipt(scope)
+    }
+
+    fn valid_receipt(&self, scope: &TenantScope) -> bool {
+        self.receipt.capture_id == self.input.capture_id
             && self.receipt.schema_version == 1
             && self
                 .input
@@ -164,28 +216,14 @@ impl ObservationCapture {
     /// The remote adapter must compare its fully paginated inventory before
     /// deletion; assistant completion alone does not cover later added turns.
     pub fn retained_message_inventory_sha256(&self, scope: &TenantScope) -> Option<String> {
-        if !self.has_complete_conversation_evidence(scope) {
+        if !self.valid_receipt(scope) {
             return None;
         }
-        let source_json = match &self.input.snapshot {
-            ObservationCaptureSnapshot::Source { source_json, .. }
-            | ObservationCaptureSnapshot::Extraction { source_json, .. } => source_json,
-            ObservationCaptureSnapshot::Candidate { .. } => return None,
-        };
-        let document = serde_json::from_str(source_json).ok()?;
-        let inventory = completion_inventory(
-            &self.input.owned_conversation.as_ref()?.provider,
-            &document,
-            &self
-                .input
-                .owned_conversation
-                .as_ref()?
-                .external_conversation_id,
-            self.input.completion.as_ref()?,
-        )?;
-        Some(hex::encode(Sha256::digest(
-            serde_json::to_vec(&inventory).ok()?,
-        )))
+        self.input
+            .completion
+            .as_ref()?
+            .message_inventory_sha256()
+            .ok()
     }
 }
 
@@ -233,7 +271,11 @@ fn safe_json(value: &serde_json::Value, depth: usize) -> bool {
     }
 }
 
-fn checked_json(raw: &str, digest: &str, limit: usize) -> Result<serde_json::Value, AppError> {
+pub(crate) fn checked_json(
+    raw: &str,
+    digest: &str,
+    limit: usize,
+) -> Result<serde_json::Value, AppError> {
     if raw.is_empty()
         || raw.len() > limit
         || !valid_digest(digest)
@@ -304,8 +346,6 @@ pub(crate) fn valid_observation_source_document(document: &serde_json::Value) ->
         || fields
             .get("capture_status")
             .is_some_and(|value| !valid_capture_status(value))
-        || ((fields.contains_key("lifecycle") || fields.contains_key("ownership"))
-            && deepseek_evidence_chat_id(document).is_none())
     {
         return false;
     }
@@ -456,36 +496,18 @@ impl ObservationCaptureInput {
                 if !valid_observation_source_document(&document) {
                     return Err(AppError::invalid_request("invalid source document"));
                 }
-                if (document.get("lifecycle").is_some() || document.get("ownership").is_some())
-                    && !self.owned_conversation.as_ref().is_some_and(|owned| {
-                        owned.provider == "deepseek"
-                            && deepseek_evidence_chat_id(&document)
-                                == Some(owned.external_conversation_id.as_str())
-                    })
-                {
-                    return Err(AppError::invalid_request(
-                        "observation lifecycle conversation mismatch",
-                    ));
-                }
                 if let Some(completion) = &self.completion {
                     let owned = self.owned_conversation.as_ref().filter(|owned| {
                         self.original_identity
                             .as_ref()
                             .is_some_and(|identity| identity.provider == owned.provider)
                     });
-                    if !owned.is_some_and(|owned| {
-                        completion_inventory(
-                            &owned.provider,
-                            &document,
-                            &owned.external_conversation_id,
-                            completion,
-                        )
-                        .is_some()
-                    }) {
+                    if owned.is_none() {
                         return Err(AppError::invalid_request(
                             "invalid observation completion evidence",
                         ));
                     }
+                    completion.validate()?;
                 }
             }
             ObservationCaptureSnapshot::Candidate {
@@ -1081,7 +1103,67 @@ mod tests {
         assert!(input.validate(&scope).is_err());
     }
 
-    fn completed_capture() -> (TenantScope, ObservationCaptureInput, serde_json::Value) {
+    #[test]
+    fn generic_completion_inventory_is_canonical_and_distinguishes_empty_failure() {
+        let completion = ObservationCaptureCompletion {
+            outcome: ObservationCompletionOutcome::Complete,
+            message_inventory: vec![
+                ("1".into(), "user".into()),
+                ("2".into(), "assistant".into()),
+            ],
+        };
+        assert!(completion.validate().is_ok());
+        assert_eq!(
+            completion.message_inventory_sha256().unwrap(),
+            hex::encode(Sha256::digest(br#"[["1","user"],["2","assistant"]]"#))
+        );
+        let failed = ObservationCaptureCompletion {
+            outcome: ObservationCompletionOutcome::ClearedFailure,
+            message_inventory: vec![],
+        };
+        assert!(failed.validate().is_ok());
+        assert_eq!(
+            failed.message_inventory_sha256().unwrap(),
+            hex::encode(Sha256::digest(b"[]"))
+        );
+        for inventory in [
+            vec![],
+            vec![("1".into(), "assistant".into())],
+            vec![("1".into(), "user".into())],
+            vec![
+                ("2".into(), "assistant".into()),
+                ("1".into(), "user".into()),
+            ],
+            vec![
+                ("1".into(), "user".into()),
+                ("1".into(), "assistant".into()),
+            ],
+            vec![
+                ("../1".into(), "user".into()),
+                ("2".into(), "assistant".into()),
+            ],
+            vec![
+                ("1".into(), "unknown".into()),
+                ("2".into(), "assistant".into()),
+            ],
+        ] {
+            let mut invalid = completion.clone();
+            invalid.message_inventory = inventory;
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = failed;
+        invalid.message_inventory = completion.message_inventory;
+        assert!(invalid.validate().is_err());
+        for legacy in [
+            serde_json::json!({"protocol":"connect_json","terminal":true,"assistant_message_ids":["2"]}),
+            serde_json::json!({"outcome":"unknown","message_inventory":[]}),
+        ] {
+            assert!(serde_json::from_value::<ObservationCaptureCompletion>(legacy).is_err());
+        }
+    }
+
+    #[test]
+    fn normalized_completion_binds_generic_owner_identity_phase_and_receipt() {
         let scope = TenantScope::new(
             OperatorId::new(Uuid::new_v4()),
             TenantId::new(Uuid::new_v4()),
@@ -1093,731 +1175,96 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
         );
-        input.original_identity.as_mut().unwrap().provider = "kimi".into();
         input.owned_conversation = Some(CapturedConversation {
-            provider: "kimi".into(),
+            provider: input.original_identity.as_ref().unwrap().provider.clone(),
             external_conversation_id: "synthetic-chat".into(),
             purpose: CapturedConversationPurpose::Measurement,
             correlation: ConversationCorrelation::CreateResponse,
         });
         input.completion = Some(ObservationCaptureCompletion {
-            protocol: ObservationCompletionProtocol::ConnectJson,
-            terminal: true,
-            assistant_message_ids: vec!["synthetic-message".into()],
+            outcome: ObservationCompletionOutcome::Complete,
+            message_inventory: vec![
+                ("1".into(), "user".into()),
+                ("2".into(), "assistant".into()),
+            ],
         });
-        let document = serde_json::json!({"messages": [
-            {"chat": {"id": "synthetic-chat"}},
-            {"message": {"id": "synthetic-message", "chat_id": "synthetic-chat", "role": "assistant", "status": "COMPLETED"}}
-        ]});
-        replace_source(&mut input, &document);
-        (scope, input, document)
-    }
-
-    fn replace_source(input: &mut ObservationCaptureInput, document: &serde_json::Value) {
-        let raw = document.to_string();
-        input.snapshot = ObservationCaptureSnapshot::Source {
-            source_sha256: hex::encode(Sha256::digest(raw.as_bytes())),
-            source_json: raw,
+        let capture = ObservationCapture {
+            receipt: ObservationCaptureReceipt {
+                capture_id: input.capture_id,
+                schema_version: 1,
+                digest_sha256: input.validate(&scope).unwrap(),
+                stored_at: Utc::now(),
+            },
+            input: input.clone(),
         };
+        assert!(capture.has_complete_conversation_evidence(&scope));
+        assert!(capture.retained_message_inventory_sha256(&scope).is_some());
+        let mut changed = capture.clone();
+        changed
+            .input
+            .owned_conversation
+            .as_mut()
+            .unwrap()
+            .external_conversation_id = "other-chat".into();
+        assert!(changed.retained_message_inventory_sha256(&scope).is_none());
+        for field in 0..3 {
+            let mut invalid = input.clone();
+            match field {
+                0 => invalid.original_identity = None,
+                1 => invalid.owned_conversation = None,
+                _ => invalid
+                    .completion
+                    .as_mut()
+                    .unwrap()
+                    .message_inventory
+                    .reverse(),
+            }
+            assert!(invalid.validate(&scope).is_err());
+        }
+        input.completion.as_mut().unwrap().outcome = ObservationCompletionOutcome::ClearedFailure;
+        input.completion.as_mut().unwrap().message_inventory.clear();
+        assert!(input.validate(&scope).is_ok());
+        let cleared = ObservationCapture {
+            receipt: ObservationCaptureReceipt {
+                digest_sha256: input.validate(&scope).unwrap(),
+                ..capture.receipt
+            },
+            input,
+        };
+        assert!(!cleared.has_complete_conversation_evidence(&scope));
+        assert_eq!(
+            cleared.retained_message_inventory_sha256(&scope),
+            Some(crate::sha256_hex(b"[]"))
+        );
     }
 
     #[test]
-    fn deepseek_minimal_ownership_is_retained_without_completion_and_binds_receipt() {
-        let (scope, mut input, _) = completed_capture();
-        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
-        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
-        input.completion = None;
-        let full = crate::measurement::provider_conversation_lifecycle::synthetic_deepseek_source();
+    fn source_envelope_retains_opaque_evidence_and_closed_generic_metadata() {
         let document = serde_json::json!({
-            "messages": [],
-            "ownership": {
-                "schema_version": "geo.deepseek.ownership.v1",
-                "provider": "deepseek",
-                "creation": full["lifecycle"]["creation"],
-                "submission": full["lifecycle"]["submission"]
-            }
+            "messages":[{"text":"synthetic answer"}],
+            "ownership":{"opaque":"adapter audit"},
+            "lifecycle":{"opaque":"adapter audit"},
+            "capture_status":{"schema_version":"geo.observation.capture-status.v1","transport":"partial","termination":"eof"},
+            "source_redaction":{"schema_version":"geo.observation.source-redaction.v1","policy":"reasoning-and-private-fields","omitted_paths":["/messages/0/private"]}
         });
-        replace_source(&mut input, &document);
-        let capture = ObservationCapture {
-            receipt: ObservationCaptureReceipt {
-                capture_id: input.capture_id,
-                schema_version: 1,
-                digest_sha256: input.validate(&scope).unwrap(),
-                stored_at: Utc::now(),
-            },
-            input: input.clone(),
-        };
-        assert!(!capture.has_complete_conversation_evidence(&scope));
-        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
-        let mut invalid = input.clone();
-        invalid.completion = Some(ObservationCaptureCompletion {
-            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
-            terminal: true,
-            assistant_message_ids: vec!["2".into()],
-        });
-        assert!(invalid.validate(&scope).is_err());
-        for provider in ["kimi", "unknown"] {
-            let mut invalid = input.clone();
-            invalid.owned_conversation.as_mut().unwrap().provider = provider.into();
-            invalid.original_identity.as_mut().unwrap().provider = provider.into();
-            assert!(invalid.validate(&scope).is_err());
-        }
-        let mut invalid = input.clone();
-        invalid.owned_conversation = None;
-        assert!(invalid.validate(&scope).is_err());
-        let mut invalid = input.clone();
-        invalid
-            .owned_conversation
-            .as_mut()
-            .unwrap()
-            .external_conversation_id = "other-chat".into();
-        assert!(invalid.validate(&scope).is_err());
-        let mut changed = document.clone();
-        changed["ownership"]["submission"]["prompt_sha256"] = serde_json::json!("b".repeat(64));
-        replace_source(&mut invalid, &changed);
-        invalid.owned_conversation = input.owned_conversation.clone();
-        assert_ne!(
-            invalid.validate(&scope).unwrap(),
-            capture.receipt.digest_sha256
-        );
-    }
-
-    #[test]
-    fn deepseek_ownership_rejects_malformed_or_conflicting_proofs() {
-        let (scope, mut input, _) = completed_capture();
-        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
-        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
-        input.completion = None;
-        let mut document =
-            crate::measurement::provider_conversation_lifecycle::synthetic_deepseek_source();
-        document["ownership"] = serde_json::json!({
-            "schema_version": "geo.deepseek.ownership.v1",
-            "provider": "deepseek",
-            "creation": document["lifecycle"]["creation"],
-            "submission": document["lifecycle"]["submission"]
-        });
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_ok());
-        for (path, value) in [
-            ("/ownership/provider", serde_json::json!("kimi")),
-            ("/ownership/schema_version", serde_json::json!("unknown")),
-            (
-                "/ownership/creation/source",
-                serde_json::json!("model_output"),
-            ),
-            (
-                "/ownership/creation/chat_session_id",
-                serde_json::json!("bad/chat"),
-            ),
-            (
-                "/ownership/submission/chat_session_id",
-                serde_json::json!("other"),
-            ),
-            (
-                "/ownership/submission/parent_message_id",
-                serde_json::json!(0),
-            ),
-            (
-                "/ownership/submission/model_type",
-                serde_json::json!("bad model"),
-            ),
-            (
-                "/ownership/submission/prompt_sha256",
-                serde_json::json!("A".repeat(64)),
-            ),
-            (
-                "/ownership/submission/search_enabled",
-                serde_json::json!(false),
-            ),
-            (
-                "/ownership/submission/thinking_enabled",
-                serde_json::json!(true),
-            ),
-            (
-                "/ownership/submission/model_type",
-                serde_json::json!("other-model"),
-            ),
-            (
-                "/ownership/submission/prompt_sha256",
-                serde_json::json!("b".repeat(64)),
-            ),
-            ("/ownership", serde_json::Value::Null),
-            ("/lifecycle", serde_json::Value::Null),
-        ] {
-            let mut invalid = document.clone();
-            *invalid.pointer_mut(path).unwrap() = value;
-            replace_source(&mut input, &invalid);
-            assert!(input.validate(&scope).is_err(), "{path}");
-        }
-        document.as_object_mut().unwrap().remove("lifecycle");
-        for path in ["/ownership", "/ownership/creation", "/ownership/submission"] {
-            let mut invalid = document.clone();
-            invalid
-                .pointer_mut(path)
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .insert("extra".into(), serde_json::json!(true));
-            assert!(!valid_observation_source_document(&invalid), "{path}");
-            for key in document.pointer(path).unwrap().as_object().unwrap().keys() {
-                let mut invalid = document.clone();
-                invalid
-                    .pointer_mut(path)
-                    .unwrap()
-                    .as_object_mut()
-                    .unwrap()
-                    .remove(key);
-                assert!(!valid_observation_source_document(&invalid), "{path}/{key}");
-            }
-        }
-        document["messages"][0]["data"]["model_type"] = serde_json::json!("other-model");
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_err());
-    }
-
-    #[test]
-    fn deepseek_completion_binds_owned_source_and_canonical_inventory() {
-        let (scope, mut input, _) = completed_capture();
-        let document =
-            crate::measurement::provider_conversation_lifecycle::synthetic_deepseek_source();
-        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
-        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
-        input.completion = Some(ObservationCaptureCompletion {
-            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
-            terminal: true,
-            assistant_message_ids: vec!["2".into()],
-        });
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_ok());
-        let serialized = serde_json::to_value(&input).unwrap();
-        assert_eq!(
-            serialized["completion"]["protocol"],
-            "deepseek_history_json"
-        );
-        assert_eq!(
-            serde_json::from_value::<ObservationCaptureInput>(serialized).unwrap(),
-            input
-        );
-        let capture = ObservationCapture {
-            receipt: ObservationCaptureReceipt {
-                capture_id: input.capture_id,
-                schema_version: 1,
-                digest_sha256: input.validate(&scope).unwrap(),
-                stored_at: Utc::now(),
-            },
-            input: input.clone(),
-        };
-        assert!(capture.has_complete_conversation_evidence(&scope));
-        assert_eq!(
-            capture.retained_message_inventory_sha256(&scope),
-            Some(hex::encode(Sha256::digest(
-                br#"[["1","user"],["2","assistant"]]"#
-            )))
-        );
-        for no_completion in [false, true] {
-            let mut invalid = input.clone();
-            if no_completion {
-                invalid.completion = None;
-            }
-            invalid
-                .owned_conversation
-                .as_mut()
-                .unwrap()
-                .external_conversation_id = "other-chat".into();
-            assert!(invalid.validate(&scope).is_err());
-            invalid
-                .owned_conversation
-                .as_mut()
-                .unwrap()
-                .external_conversation_id = "synthetic-chat".into();
-            invalid.owned_conversation.as_mut().unwrap().provider = "kimi".into();
-            invalid.original_identity.as_mut().unwrap().provider = "kimi".into();
-            assert!(invalid.validate(&scope).is_err());
-            invalid.owned_conversation = None;
-            assert!(invalid.validate(&scope).is_err());
-        }
-        let mut invalid = input.clone();
-        invalid.original_identity = None;
-        assert!(invalid.validate(&scope).is_err());
-        let mut metadata_only = input.clone();
-        metadata_only.completion = None;
-        assert!(metadata_only.validate(&scope).is_ok());
-        let mut capture = capture;
-        capture.input = metadata_only;
-        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
-        assert!(!capture.has_complete_conversation_evidence(&scope));
-        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
-    }
-
-    #[test]
-    fn deepseek_source_accepts_only_closed_metadata_without_granting_completion() {
-        let (scope, mut input, _) = completed_capture();
-        input.original_identity.as_mut().unwrap().provider = "deepseek".into();
-        input.owned_conversation.as_mut().unwrap().provider = "deepseek".into();
-        input.completion = None;
-        let document =
-            crate::measurement::provider_conversation_lifecycle::synthetic_deepseek_source();
         assert!(valid_observation_source_document(&document));
-        for value in [
-            serde_json::Value::Null,
-            serde_json::json!({}),
-            serde_json::json!("geo.deepseek.lifecycle.v1"),
-            serde_json::json!({"provider": "kimi"}),
-        ] {
+        for field in 0..5 {
             let mut invalid = document.clone();
-            invalid["lifecycle"] = value;
-            assert!(!valid_observation_source_document(&invalid));
-            replace_source(&mut input, &invalid);
-            assert!(input.validate(&scope).is_err());
-        }
-        let mut missing_sse = document.clone();
-        missing_sse["messages"] = serde_json::json!([]);
-        replace_source(&mut input, &missing_sse);
-        assert!(
-            input.validate(&scope).is_ok(),
-            "metadata may be retained without declaring completion"
-        );
-        input.completion = Some(ObservationCaptureCompletion {
-            protocol: ObservationCompletionProtocol::DeepseekHistoryJson,
-            terminal: true,
-            assistant_message_ids: vec!["2".into()],
-        });
-        assert!(
-            input.validate(&scope).is_err(),
-            "metadata cannot substitute for actual stream evidence"
-        );
-        input.completion = None;
-        missing_sse.as_object_mut().unwrap().remove("lifecycle");
-        replace_source(&mut input, &missing_sse);
-        assert!(
-            input.validate(&scope).is_ok(),
-            "partial evidence remains retainable with lifecycle omitted"
-        );
-    }
-
-    #[test]
-    fn capture_status_retains_ownerless_evidence_without_completion_authority() {
-        let (scope, mut input, _) = completed_capture();
-        input.owned_conversation = None;
-        input.completion = None;
-        for (transport, termination) in [
-            ("complete", "complete"),
-            ("partial", "eof"),
-            ("partial", "timeout"),
-            ("partial", "aborted"),
-            ("partial", "malformed"),
-            ("partial", "limit_exceeded"),
-        ] {
-            let document = serde_json::json!({
-                "messages": [{"text": "synthetic prefix"}],
-                "capture_status": {
-                    "schema_version": "geo.observation.capture-status.v1",
-                    "transport": transport,
-                    "termination": termination
+            match field {
+                0 => invalid["extra"] = serde_json::json!(true),
+                1 => invalid["capture_status"]["extra"] = serde_json::json!(true),
+                2 => invalid["capture_status"]["transport"] = serde_json::json!("complete"),
+                3 => {
+                    invalid["source_redaction"]["omitted_paths"] =
+                        serde_json::json!(["/messages/0/text"])
                 }
-            });
-            replace_source(&mut input, &document);
-            let before = input.clone();
-            let capture = ObservationCapture {
-                receipt: ObservationCaptureReceipt {
-                    capture_id: input.capture_id,
-                    schema_version: 1,
-                    digest_sha256: input.validate(&scope).unwrap(),
-                    stored_at: Utc::now(),
-                },
-                input: input.clone(),
-            };
-            assert_eq!(input, before);
-            assert!(!capture.has_complete_conversation_evidence(&scope));
-            assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
-            input.completion = Some(ObservationCaptureCompletion {
-                protocol: ObservationCompletionProtocol::ConnectJson,
-                terminal: true,
-                assistant_message_ids: vec!["synthetic-message".into()],
-            });
-            assert!(input.validate(&scope).is_err());
-            input.completion = None;
-        }
-    }
-
-    #[test]
-    fn capture_status_rejects_unknown_fields_values_and_inconsistent_transport() {
-        let (scope, mut input, mut document) = completed_capture();
-        document["capture_status"] = serde_json::json!({
-            "schema_version": "geo.observation.capture-status.v1",
-            "transport": "complete",
-            "termination": "complete"
-        });
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_ok());
-        for (key, value) in [
-            ("schema_version", serde_json::json!("unknown")),
-            ("transport", serde_json::json!("unknown")),
-            ("termination", serde_json::json!("creation_proof_missing")),
-            ("transport", serde_json::json!("partial")),
-            ("termination", serde_json::json!("timeout")),
-            ("termination", serde_json::json!(null)),
-            ("extra", serde_json::json!(true)),
-        ] {
-            let mut invalid = document.clone();
-            invalid["capture_status"][key] = value;
-            replace_source(&mut input, &invalid);
-            assert!(input.validate(&scope).is_err(), "{key}");
-        }
-        for status in [
-            serde_json::json!(null),
-            serde_json::json!([]),
-            serde_json::json!({"transport": "complete", "termination": "complete"}),
-        ] {
-            document["capture_status"] = status;
-            replace_source(&mut input, &document);
-            assert!(input.validate(&scope).is_err());
-        }
-    }
-
-    #[test]
-    fn source_redaction_retains_closed_manifest_without_changing_completion() {
-        let (scope, mut input, mut document) = completed_capture();
-        document["source_redaction"] = serde_json::json!({
-            "schema_version": "geo.observation.source-redaction.v1",
-            "policy": "reasoning-and-private-fields",
-            "omitted_paths": ["/messages/1/message/reasoning", "/messages/0/escaped~1~0"]
-        });
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_ok());
-        let before = input.clone();
-        assert!(input.validate(&scope).is_ok());
-        assert_eq!(input, before);
-        for paths in [
-            serde_json::json!(["/messages/1/message/id"]),
-            serde_json::json!(["/messages/2/reasoning"]),
-            serde_json::json!(["/messages/01/reasoning"]),
-            serde_json::json!(["/messages/-1/reasoning"]),
-            serde_json::json!(["/messages/1"]),
-            serde_json::json!(["/rendered_text"]),
-            serde_json::json!(["/messages/1/invalid~2"]),
-            serde_json::json!(["/messages/1/control\n"]),
-            serde_json::json!([format!("/messages/1/{}", "x".repeat(2048))]),
-            serde_json::json!([null]),
-            serde_json::json!("not-an-array"),
-            serde_json::json!(vec!["/messages/1/reasoning"; 32_769]),
-        ] {
-            let mut invalid = document.clone();
-            invalid["source_redaction"]["omitted_paths"] = paths;
-            replace_source(&mut input, &invalid);
-            assert!(input.validate(&scope).is_err());
-        }
-        for (key, value) in [
-            ("schema_version", serde_json::json!("unknown")),
-            ("policy", serde_json::json!("unknown")),
-            ("extra", serde_json::json!("synthetic")),
-        ] {
-            let mut invalid = document.clone();
-            invalid["source_redaction"][key] = value;
-            replace_source(&mut input, &invalid);
-            assert!(input.validate(&scope).is_err());
-        }
-        document["source_redaction"] = serde_json::Value::Null;
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_err());
-    }
-
-    #[test]
-    fn unregistered_provider_cannot_borrow_kimi_completion_or_inventory() {
-        let (scope, input, _) = completed_capture();
-        for provider in ["deepseek", "doubao", "glm", "unknown", "Kimi"] {
-            let mut invalid = input.clone();
-            invalid.original_identity.as_mut().unwrap().provider = provider.into();
-            invalid.owned_conversation.as_mut().unwrap().provider = provider.into();
-            assert!(invalid.validate(&scope).is_err());
-            // Match the actual input bytes so a digest mismatch cannot mask
-            // accidental acceptance of another provider's lifecycle evidence.
-            let digest = hex::encode(Sha256::digest(serde_json::to_vec(&invalid).unwrap()));
-            let capture = ObservationCapture {
-                receipt: ObservationCaptureReceipt {
-                    capture_id: invalid.capture_id,
-                    schema_version: 1,
-                    digest_sha256: digest,
-                    stored_at: Utc::now(),
-                },
-                input: invalid.clone(),
-            };
-            assert!(!capture.has_complete_conversation_evidence(&scope));
-            assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
-            // Unknown-provider raw evidence remains retainable, but it cannot
-            // establish transport completion or authorize remote deletion.
-            invalid.completion = None;
-            assert!(invalid.validate(&scope).is_ok());
-        }
-    }
-
-    #[test]
-    fn completion_verifies_raw_source_and_extraction_and_receipt_integrity() {
-        let (scope, input, _) = completed_capture();
-        let digest = input.validate(&scope).unwrap();
-        let mut capture = ObservationCapture {
-            receipt: ObservationCaptureReceipt {
-                capture_id: input.capture_id,
-                schema_version: 1,
-                digest_sha256: digest,
-                stored_at: Utc::now(),
-            },
-            input,
-        };
-        assert!(capture.has_complete_conversation_evidence(&scope));
-        capture.receipt.digest_sha256 = "0".repeat(64);
-        assert!(!capture.has_complete_conversation_evidence(&scope));
-        assert!(capture.retained_message_inventory_sha256(&scope).is_none());
-        capture.input.ordinal = 1;
-        capture.input.owned_conversation.as_mut().unwrap().purpose =
-            CapturedConversationPurpose::Extraction;
-        let ObservationCaptureSnapshot::Source {
-            source_json,
-            source_sha256,
-        } = capture.input.snapshot
-        else {
-            unreachable!();
-        };
-        capture.input.snapshot = ObservationCaptureSnapshot::Extraction {
-            source_capture_id: Uuid::new_v4(),
-            source_json,
-            source_sha256,
-        };
-        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
-        assert!(capture.has_complete_conversation_evidence(&scope));
-        capture.input.completion = None;
-        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
-        assert!(!capture.has_complete_conversation_evidence(&scope));
-    }
-
-    #[test]
-    fn completion_latest_explicit_status_wins_without_interpreting_text() {
-        let (scope, mut input, mut document) = completed_capture();
-        document["messages"][1]["message"]["status"] = serde_json::json!("STREAMING");
-        document["messages"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({
-                "message": {"id": "synthetic-message", "status": 2}
-            }));
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_ok());
-        document["messages"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({
-                "message": {"id": "synthetic-message", "status": "STREAMING", "text": "COMPLETED"}
-            }));
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_err());
-        input.completion = None;
-        assert!(
-            input.validate(&scope).is_ok(),
-            "partial raw evidence remains retainable"
-        );
-    }
-
-    #[test]
-    fn retained_inventory_is_sorted_deduplicated_and_covers_user_turns() {
-        let (scope, mut input, mut document) = completed_capture();
-        document["messages"].as_array_mut().unwrap().extend([
-            serde_json::json!({"message": {"id": "a-user", "chat_id": "synthetic-chat", "role": 2}}),
-            serde_json::json!({"message": {"id": "synthetic-message", "status": 2}}),
-            serde_json::json!({"message": {"id": "a-user", "text": "incremental"}}),
-        ]);
-        replace_source(&mut input, &document);
-        let mut capture = ObservationCapture {
-            receipt: ObservationCaptureReceipt {
-                capture_id: input.capture_id,
-                schema_version: 1,
-                digest_sha256: input.validate(&scope).unwrap(),
-                stored_at: Utc::now(),
-            },
-            input,
-        };
-        let expected = hex::encode(Sha256::digest(
-            br#"[["a-user","user"],["synthetic-message","assistant"]]"#,
-        ));
-        assert_eq!(
-            capture.retained_message_inventory_sha256(&scope),
-            Some(expected.clone())
-        );
-        document["messages"].as_array_mut().unwrap().push(
-            serde_json::json!({"message": {"id": "z-user", "chat_id": "synthetic-chat", "role": "user"}}),
-        );
-        replace_source(&mut capture.input, &document);
-        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
-        assert_ne!(
-            capture.retained_message_inventory_sha256(&scope),
-            Some(expected)
-        );
-        document["messages"][2]["message"]["chat_id"] = serde_json::json!("different-chat");
-        replace_source(&mut capture.input, &document);
-        assert!(
-            capture.input.validate(&scope).is_err(),
-            "explicit user chat bindings must match"
-        );
-        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
-        capture.input.completion = None;
-        capture.receipt.digest_sha256 = capture.input.validate(&scope).unwrap();
-        assert_eq!(capture.retained_message_inventory_sha256(&scope), None);
-    }
-
-    #[test]
-    fn completion_rejects_missing_identity_status_and_unclaimed_assistants() {
-        let (scope, valid, document) = completed_capture();
-        for field in ["id", "role", "status"] {
-            let mut document = document.clone();
-            document["messages"][1]["message"]
-                .as_object_mut()
-                .unwrap()
-                .remove(field);
-            let mut input = valid.clone();
-            replace_source(&mut input, &document);
-            assert!(input.validate(&scope).is_err(), "{field}");
-        }
-        for field in ["status", "role", "chat_id"] {
-            let mut document = document.clone();
-            document["messages"]
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::json!({
-                    "message": {"id": "synthetic-message", (field): null}
-                }));
-            let mut input = valid.clone();
-            replace_source(&mut input, &document);
-            assert!(input.validate(&scope).is_err(), "{field}");
-        }
-        let mut extra = document.clone();
-        extra["messages"].as_array_mut().unwrap().push(serde_json::json!({
-            "message": {"id": "other-message", "role": 3, "chat_id": "synthetic-chat", "status": 2}
-        }));
-        let mut input = valid.clone();
-        replace_source(&mut input, &extra);
-        assert!(input.validate(&scope).is_err());
-        input
-            .completion
-            .as_mut()
-            .unwrap()
-            .assistant_message_ids
-            .push("other-message".into());
-        assert!(input.validate(&scope).is_ok());
-        for ids in [
-            vec![],
-            vec!["forged".into()],
-            vec!["synthetic-message".into(), "synthetic-message".into()],
-            vec!["invalid/id".into()],
-            vec!["x".repeat(129)],
-            vec!["synthetic-message".into(); 257],
-        ] {
-            let mut input = valid.clone();
-            input.completion.as_mut().unwrap().assistant_message_ids = ids;
-            assert!(input.validate(&scope).is_err());
-        }
-    }
-
-    #[test]
-    fn completion_binds_observed_incremental_schema_to_preceding_chat() {
-        let (scope, mut input, _) = completed_capture();
-        let mut document = serde_json::json!({"messages": [
-            {"chat": {"id": "synthetic-chat"}},
-            {"message": {"id": "synthetic-system", "role": "system", "status": "MESSAGE_STATUS_COMPLETED", "scenario": "synthetic", "createTime": "2026-01-01T00:00:00Z"}},
-            {"message": {"id": "synthetic-user", "role": "user", "blocks": [], "isGoal": false, "status": "MESSAGE_STATUS_COMPLETED", "parentId": "synthetic-system", "createTime": "2026-01-01T00:00:00Z"}},
-            {"message": {"id": "synthetic-message", "role": "assistant", "status": "MESSAGE_STATUS_GENERATING"}},
-            {"message": {"id": "synthetic-message", "refs": []}},
-            {"message": {"id": "synthetic-message", "status": "MESSAGE_STATUS_COMPLETED"}}
-        ]});
-        replace_source(&mut input, &document);
-        let capture = ObservationCapture {
-            receipt: ObservationCaptureReceipt {
-                capture_id: input.capture_id,
-                schema_version: 1,
-                digest_sha256: input.validate(&scope).unwrap(),
-                stored_at: Utc::now(),
-            },
-            input: input.clone(),
-        };
-        assert_eq!(capture.retained_message_inventory_sha256(&scope), Some(hex::encode(Sha256::digest(
-            br#"[["synthetic-message","assistant"],["synthetic-system","system"],["synthetic-user","user"]]"#
-        ))));
-        for status in [
-            "MESSAGE_STATUS_GENERATING",
-            "MESSAGE_STATUS_UNKNOWN",
-            "completed",
-        ] {
-            document["messages"][5]["message"]["status"] = serde_json::json!(status);
-            replace_source(&mut input, &document);
-            assert!(input.validate(&scope).is_err());
-        }
-        document["messages"][5]["message"]["status"] =
-            serde_json::json!("MESSAGE_STATUS_COMPLETED");
-        document["messages"].as_array_mut().unwrap().swap(0, 1);
-        for explicit_chat in [false, true] {
-            if explicit_chat {
-                document["messages"][0]["message"]["chat_id"] = serde_json::json!("synthetic-chat");
+                _ => {
+                    invalid["source_redaction"]["omitted_paths"] =
+                        serde_json::json!(["/messages/2/private"])
+                }
             }
-            replace_source(&mut input, &document);
-            assert!(
-                input.validate(&scope).is_err(),
-                "message before chat must not authorize completion"
-            );
+            assert!(!valid_observation_source_document(&invalid), "{field}");
         }
-        document["messages"].as_array_mut().unwrap().swap(0, 1);
-        document["messages"][1]["message"]["role"] = serde_json::json!(1);
-        replace_source(&mut input, &document);
-        assert!(
-            input.validate(&scope).is_err(),
-            "unobserved numeric system role remains unknown"
-        );
-        document["messages"][1]["message"]["role"] = serde_json::json!("system");
-        document["messages"][1]["message"]["chat_id"] = serde_json::json!("different-chat");
-        replace_source(&mut input, &document);
-        assert!(input.validate(&scope).is_err());
-    }
-
-    #[test]
-    fn completion_requires_owned_provider_raw_phase_and_terminal_protocol() {
-        let (scope, input, document) = completed_capture();
-        let mut invalid = input.clone();
-        invalid.original_identity = None;
-        assert!(invalid.validate(&scope).is_err());
-        invalid = input.clone();
-        invalid.owned_conversation = None;
-        assert!(invalid.validate(&scope).is_err());
-        invalid = input.clone();
-        invalid.original_identity.as_mut().unwrap().provider = "other".into();
-        invalid.owned_conversation.as_mut().unwrap().provider = "other".into();
-        assert!(invalid.validate(&scope).is_err());
-        invalid = input.clone();
-        invalid.completion.as_mut().unwrap().terminal = false;
-        assert!(invalid.validate(&scope).is_err());
-        invalid = input.clone();
-        invalid
-            .owned_conversation
-            .as_mut()
-            .unwrap()
-            .external_conversation_id = "other-chat".into();
-        assert!(invalid.validate(&scope).is_err());
-        invalid = input.clone();
-        let mut no_chat = document.clone();
-        no_chat["messages"].as_array_mut().unwrap().remove(0);
-        replace_source(&mut invalid, &no_chat);
-        assert!(invalid.validate(&scope).is_err());
-        invalid = input.clone();
-        invalid.ordinal = 1;
-        invalid.owned_conversation.as_mut().unwrap().purpose =
-            CapturedConversationPurpose::Extraction;
-        invalid.snapshot = ObservationCaptureSnapshot::Candidate {
-            source_capture_id: Uuid::new_v4(),
-            route: ExtractionRoute::SignedInBrowser,
-            candidate_json: "{}".into(),
-            candidate_sha256: hex::encode(Sha256::digest(b"{}")),
-            grounding_reason: None,
-        };
-        assert!(invalid.validate(&scope).is_err());
-        let mut serialized = serde_json::to_value(input).unwrap();
-        serialized["completion"]["protocol"] = serde_json::json!("other");
-        assert!(serde_json::from_value::<ObservationCaptureInput>(serialized).is_err());
     }
 
     #[test]

@@ -80,19 +80,34 @@ export function capturedConversationCompletion(exchange) {
     if (Object.hasOwn(message, "status")) state.status = message.status;
     messages.set(message.id, state);
   }
-  const assistantIds = [];
+  const inventory = [];
   for (const [id, state] of messages) {
     if (!state.role || state.chatId !== chatId) return null;
-    if (state.role !== "assistant") continue;
-    if (!["COMPLETED", "MESSAGE_STATUS_COMPLETED", 2].includes(state.status))
+    if (
+      state.role === "assistant" &&
+      !["COMPLETED", "MESSAGE_STATUS_COMPLETED", 2].includes(state.status)
+    )
       return null;
-    assistantIds.push(id);
+    if (
+      state.role === "system" &&
+      ![
+        "COMPLETED",
+        "MESSAGE_STATUS_COMPLETED",
+        2,
+        "MESSAGE_STATUS_UNSPECIFIED",
+      ].includes(state.status)
+    )
+      return null;
+    inventory.push([id, state.role]);
   }
-  return assistantIds.length && assistantIds.length <= 256
+  return inventory.length <= 256 &&
+    inventory.some(([, role]) => role === "user") &&
+    inventory.some(([, role]) => role === "assistant")
     ? {
-        protocol: "connect_json",
-        terminal: true,
-        assistant_message_ids: assistantIds,
+        outcome: "complete",
+        message_inventory: inventory.sort(([left], [right]) =>
+          left < right ? -1 : left > right ? 1 : 0,
+        ),
       }
     : null;
 }

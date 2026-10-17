@@ -3,7 +3,7 @@ use geo_domain::{
     CapturedConversation, CapturedConversationPurpose, ChannelJobRepository, ChannelTarget,
     ChannelTargetInput, ConversationCorrelation, ErrorCode, ObservationCaptureCompletion,
     ObservationCaptureInput, ObservationCaptureRepository, ObservationCaptureSnapshot,
-    ObservationCompletionProtocol, ObservationProviderIdentity, StandaloneMeasurementPlan,
+    ObservationCompletionOutcome, ObservationProviderIdentity, StandaloneMeasurementPlan,
     TenantScope, sha256_hex,
 };
 use geo_persistence::{
@@ -146,9 +146,11 @@ async fn capture_commit_replay_scope_and_attempt_binding() {
             correlation: ConversationCorrelation::CreateResponse,
         }),
         completion: Some(ObservationCaptureCompletion {
-            protocol: ObservationCompletionProtocol::ConnectJson,
-            terminal: true,
-            assistant_message_ids: vec!["synthetic-message".into()],
+            outcome: ObservationCompletionOutcome::Complete,
+            message_inventory: vec![
+                ("1".into(), "user".into()),
+                ("2".into(), "assistant".into()),
+            ],
         }),
         snapshot: ObservationCaptureSnapshot::Source {
             source_sha256: sha256_hex(complete_json.as_bytes()),

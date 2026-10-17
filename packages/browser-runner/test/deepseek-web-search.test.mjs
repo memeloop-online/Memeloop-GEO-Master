@@ -439,9 +439,11 @@ test("fresh first-turn history is bound to transport IDs and retained in durable
     capturedConversationCompletion(saved),
   );
   assert.deepEqual(capturedConversationCompletion(saved), {
-    protocol: "deepseek_history_json",
-    terminal: true,
-    assistant_message_ids: ["2"],
+    outcome: "complete",
+    message_inventory: [
+      ["0", "user"],
+      ["2", "assistant"],
+    ],
   });
   assert.equal(
     f.evidence.source_sha256,
@@ -1273,9 +1275,11 @@ test("real Chrome runs fresh navigation, dynamic controls, exact prefetched sess
           "fixture-selected",
         );
         assert.deepEqual(capturedConversationCompletion(captured), {
-          protocol: "deepseek_history_json",
-          terminal: true,
-          assistant_message_ids: ["2"],
+          outcome: "complete",
+          message_inventory: [
+            ["1", "user"],
+            ["2", "assistant"],
+          ],
         });
         return { durable: true };
       },

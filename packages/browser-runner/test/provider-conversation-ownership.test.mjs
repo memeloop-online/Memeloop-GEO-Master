@@ -12,6 +12,7 @@ const completedExchange = () => ({
   connect_json_terminal: true,
   messages: [
     { chat: { id: "new-chat" } },
+    { message: { id: "question-1", role: "user" } },
     {
       message: {
         id: "answer-1",
@@ -30,12 +31,18 @@ test("completion uses final observed statuses for every owned assistant message"
     message: { id: "answer-2", chat_id: "new-chat", role: 3, status: 2 },
   });
   assert.deepEqual(capturedConversationCompletion(exchange, kimi), {
-    protocol: "connect_json",
-    terminal: true,
-    assistant_message_ids: ["answer-1", "answer-2"],
+    outcome: "complete",
+    message_inventory: [
+      ["answer-1", "assistant"],
+      ["answer-2", "assistant"],
+      ["question-1", "user"],
+    ],
   });
   exchange.messages.push({ message: { id: "answer-1", text: "tail" } });
-  assert.equal(capturedConversationCompletion(exchange, kimi)?.terminal, true);
+  assert.equal(
+    capturedConversationCompletion(exchange, kimi)?.outcome,
+    "complete",
+  );
 });
 
 test("legacy, ambiguous, incomplete and unknown statuses never prove completion", () => {
@@ -44,19 +51,20 @@ test("legacy, ambiguous, incomplete and unknown statuses never prove completion"
     (exchange) => (exchange.connect_json_terminal = false),
     (exchange) => (exchange.connect_json_terminal = "true"),
     (exchange) => (exchange.messages = [{ chat: { id: "new-chat" } }]),
+    (exchange) => exchange.messages.splice(1, 1),
     (exchange) =>
       ([exchange.messages[0], exchange.messages[1]] = [
         exchange.messages[1],
         exchange.messages[0],
       ]),
-    (exchange) => (exchange.messages[1].message.chat_id = "other-chat"),
-    (exchange) => delete exchange.messages[1].message.role,
-    (exchange) => delete exchange.messages[1].message.id,
-    (exchange) => (exchange.messages[1].message.role = "future-role"),
-    (exchange) => (exchange.messages[2].message.role = "user"),
+    (exchange) => (exchange.messages[2].message.chat_id = "other-chat"),
+    (exchange) => delete exchange.messages[2].message.role,
+    (exchange) => delete exchange.messages[2].message.id,
+    (exchange) => (exchange.messages[2].message.role = "future-role"),
+    (exchange) => (exchange.messages[3].message.role = "user"),
     (exchange) => {
-      delete exchange.messages[1].message.status;
       delete exchange.messages[2].message.status;
+      delete exchange.messages[3].message.status;
     },
     (exchange) => exchange.messages.push({ error: { code: "fixture-error" } }),
     (exchange) =>
@@ -122,9 +130,12 @@ test("preceding chat scopes system, user and incremental assistant lifecycle env
     ],
   };
   assert.deepEqual(capturedConversationCompletion(exchange, kimi), {
-    protocol: "connect_json",
-    terminal: true,
-    assistant_message_ids: ["synthetic-assistant"],
+    outcome: "complete",
+    message_inventory: [
+      ["synthetic-assistant", "assistant"],
+      ["synthetic-system", "system"],
+      ["synthetic-user", "user"],
+    ],
   });
   for (const change of [
     (source) => source.messages.splice(0, 1),
@@ -216,9 +227,11 @@ test("only explicit registered providers can identify or prove captured conversa
     ...completedExchange(),
     provider: "kimi",
     completion: {
-      protocol: "connect_json",
-      terminal: true,
-      assistant_message_ids: ["invented"],
+      outcome: "complete",
+      message_inventory: [
+        ["invented", "assistant"],
+        ["question", "user"],
+      ],
     },
   };
   for (const provider of [
@@ -278,9 +291,11 @@ test("only explicit registered providers can identify or prove captured conversa
     },
   ]);
   assert.deepEqual(capturedConversationCompletion(exchange, kimi), {
-    protocol: "connect_json",
-    terminal: true,
-    assistant_message_ids: ["answer-1"],
+    outcome: "complete",
+    message_inventory: [
+      ["answer-1", "assistant"],
+      ["question-1", "user"],
+    ],
   });
   assert.equal(
     await reportCapturedConversation(

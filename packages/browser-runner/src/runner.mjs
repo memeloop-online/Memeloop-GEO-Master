@@ -1190,17 +1190,28 @@ export function createRunner(options = {}) {
         "execution_id",
         "expected_identity",
         "external_conversation_id",
-        "request_message_id",
-        "response_message_id",
+        "source_capture_id",
+        "source_json",
+        "source_sha256",
+        "source_receipt_sha256",
       ]) ||
       typeof input.execution_id !== "string" ||
       !UUID.test(input.execution_id) ||
+      typeof input.source_capture_id !== "string" ||
+      !UUID.test(input.source_capture_id) ||
+      typeof input.source_json !== "string" ||
+      !input.source_json.length ||
+      Buffer.byteLength(input.source_json, "utf8") > 750_000 ||
+      typeof input.source_sha256 !== "string" ||
+      !SHA256.test(input.source_sha256) ||
+      createHash("sha256").update(input.source_json).digest("hex") !==
+        input.source_sha256 ||
+      typeof input.source_receipt_sha256 !== "string" ||
+      !SHA256.test(input.source_receipt_sha256) ||
       !fields(input.expected_identity, ["provider", "platform_account_id"]) ||
-      !providerCompletionRecoveryAdapter(input.expected_identity.provider) ||
+      !validId(input.expected_identity.provider) ||
       !validId(input.expected_identity.platform_account_id) ||
-      !providerCompletionRecoveryAdapter(
-        input.expected_identity.provider,
-      ).validScope(input)
+      !validId(input.external_conversation_id)
     )
       throw new RunnerError(400, "invalid_completion_recovery");
     const fingerprint = createHash("sha256")
@@ -1211,8 +1222,9 @@ export function createRunner(options = {}) {
           provider: input.expected_identity.provider,
           platform_account_id: input.expected_identity.platform_account_id,
           external_conversation_id: input.external_conversation_id,
-          request_message_id: input.request_message_id,
-          response_message_id: input.response_message_id,
+          source_capture_id: input.source_capture_id,
+          source_sha256: input.source_sha256,
+          source_receipt_sha256: input.source_receipt_sha256,
         }),
       )
       .digest("hex");
@@ -1226,6 +1238,9 @@ export function createRunner(options = {}) {
     const reply = (status, stage, code, reason) => ({
       execution_id: input.execution_id,
       external_conversation_id: input.external_conversation_id,
+      source_capture_id: input.source_capture_id,
+      source_sha256: input.source_sha256,
+      source_receipt_sha256: input.source_receipt_sha256,
       status,
       ...(stage
         ? { diagnostic: { stage, code, ...(reason ? { reason } : {}) } }
@@ -1287,6 +1302,8 @@ export function createRunner(options = {}) {
           ),
         });
         if (expired()) return deadlineReply();
+        if (!result && historyReason === "source_ineligible")
+          return reply("retained", "source", "source_ineligible");
         if (!result)
           return reply(
             "retained",
@@ -1300,17 +1317,17 @@ export function createRunner(options = {}) {
         if (expired()) return deadlineReply();
         const finalFailure = identityFailure(finalIdentity);
         if (finalFailure) return finalFailure;
-        const historyJson = JSON.stringify(result.history);
         return {
           ...reply("recovered"),
           recovery_identity: {
             provider: record.platform,
             platform_account_id: identity.platform_account_id,
           },
-          observed_at: result.history.observed_at,
-          history_json: historyJson,
+          observed_at: result.observed_at,
+          completion: result.completion,
+          history_json: result.history_json,
           history_sha256: createHash("sha256")
-            .update(historyJson)
+            .update(result.history_json)
             .digest("hex"),
         };
       } catch {

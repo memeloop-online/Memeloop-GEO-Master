@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::provider_conversation_lifecycle::{
-    completion_inventory, deepseek_failed_empty_inventory, deepseek_recovery_document,
-};
+use super::observation_capture::checked_json;
 use crate::{
     AppError, ConversationCorrelation, MAX_OBSERVATION_SOURCE_BYTES, ObservationCapture,
     ObservationCaptureCompletion, ObservationCaptureSnapshot, ObservationProviderIdentity,
@@ -32,7 +30,9 @@ pub struct ObservationCompletionRecoveryInput {
     /// Independently observed on the recovery browser, never copied as proof
     /// from the original capture or inferred from history.
     pub recovery_identity: ObservationProviderIdentity,
-    /// Closed browser_observed_history projection, not the raw private response.
+    pub external_conversation_id: String,
+    pub completion: ObservationCaptureCompletion,
+    /// Bounded sanitized history audit; provider semantics belong to the adapter.
     pub history_json: String,
     pub history_sha256: String,
 }
@@ -42,7 +42,7 @@ pub struct ObservationCompletionRecoveryInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedObservationCompletionRecovery {
     digest_sha256: String,
-    completion: Option<ObservationCaptureCompletion>,
+    completion: ObservationCaptureCompletion,
     retained_message_inventory_sha256: String,
 }
 
@@ -51,10 +51,8 @@ impl ValidatedObservationCompletionRecovery {
         &self.digest_sha256
     }
 
-    /// Empty history after a cleared provider error retains cleanup inventory
-    /// only; it does not establish assistant completion.
-    pub fn completion(&self) -> Option<&ObservationCaptureCompletion> {
-        self.completion.as_ref()
+    pub fn completion(&self) -> &ObservationCaptureCompletion {
+        &self.completion
     }
 
     pub fn retained_message_inventory_sha256(&self) -> &str {
@@ -68,9 +66,7 @@ impl ObservationCompletionRecoveryInput {
     /// This verifies evidence, not the current account reservation, execution
     /// lease, exclusive conversation ownership, or permission to delete.
     ///
-    /// Only ownership-only ordinal-zero sources are recoverable here. A source
-    /// already carrying lifecycle/completion returns an explicit not-needed
-    /// error; replay the original immutable sidecar for idempotent recovery.
+    /// Only incomplete ordinal-zero sources are recoverable here.
     pub fn validate(
         &self,
         scope: &TenantScope,
@@ -103,10 +99,7 @@ impl ObservationCompletionRecoveryInput {
         {
             return Err(invalid());
         }
-        let ObservationCaptureSnapshot::Source {
-            source_json,
-            source_sha256,
-        } = &original.input.snapshot
+        let ObservationCaptureSnapshot::Source { source_sha256, .. } = &original.input.snapshot
         else {
             return Err(invalid());
         };
@@ -118,56 +111,28 @@ impl ObservationCompletionRecoveryInput {
             .ok_or_else(invalid)?;
         if self.source_sha256 != *source_sha256
             || original.input.original_identity.as_ref() != Some(&self.recovery_identity)
-            || self.recovery_identity.provider != "deepseek"
-            || owned.provider != "deepseek"
+            || self.recovery_identity.provider != owned.provider
+            || self.external_conversation_id != owned.external_conversation_id
+            || original.input.ordinal != 0
+            || owned.purpose != crate::CapturedConversationPurpose::Measurement
             || owned.correlation != ConversationCorrelation::CreateResponse
-            || self.history_json.is_empty()
-            || self.history_json.len() > MAX_OBSERVATION_SOURCE_BYTES
-            || hex::encode(Sha256::digest(self.history_json.as_bytes())) != self.history_sha256
         {
             return Err(invalid());
         }
-        let source: serde_json::Value = serde_json::from_str(source_json).map_err(|_| invalid())?;
-        if original.input.completion.is_some() || source.get("lifecycle").is_some() {
-            return Err(AppError::invalid_request(
-                "completion recovery not needed for lifecycle-bearing source",
-            ));
+        if original.input.completion.is_some() {
+            return Err(AppError::invalid_request("completion recovery not needed"));
         }
-        let history: serde_json::Value =
-            serde_json::from_str(&self.history_json).map_err(|_| invalid())?;
-        if history["observed_at"]
-            .as_str()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc))
-            != Some(self.observed_at)
-        {
-            return Err(invalid());
-        }
-        let (completion, retained_message_inventory_sha256) =
-            if deepseek_failed_empty_inventory(&source, &history).is_some() {
-                // A cleared, failed conversation has a complete empty inventory,
-                // but no assistant completion to recover.
-                (None, hex::encode(Sha256::digest(b"[]")))
-            } else {
-                let (document, completion) =
-                    deepseek_recovery_document(&source, history).ok_or_else(invalid)?;
-                let inventory = completion_inventory(
-                    &owned.provider,
-                    &document,
-                    &owned.external_conversation_id,
-                    &completion,
-                )
-                .ok_or_else(invalid)?;
-                let digest = hex::encode(Sha256::digest(
-                    serde_json::to_vec(&inventory).map_err(|_| invalid())?,
-                ));
-                (Some(completion), digest)
-            };
+        checked_json(
+            &self.history_json,
+            &self.history_sha256,
+            MAX_OBSERVATION_SOURCE_BYTES,
+        )?;
+        let retained_message_inventory_sha256 = self.completion.message_inventory_sha256()?;
         Ok(ValidatedObservationCompletionRecovery {
             digest_sha256: hex::encode(Sha256::digest(
                 serde_json::to_vec(self).map_err(|_| invalid())?,
             )),
-            completion,
+            completion: self.completion.clone(),
             retained_message_inventory_sha256,
         })
     }
@@ -255,16 +220,10 @@ pub trait ObservationCompletionRecoveryRepository: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::measurement::provider_conversation_lifecycle::synthetic_deepseek_source;
     use crate::{
         CapturedConversation, CapturedConversationPurpose, ObservationCaptureInput,
-        ObservationCaptureReceipt,
+        ObservationCaptureReceipt, ObservationCompletionOutcome,
     };
-    use serde_json::{Value, json};
-
-    fn digest(value: &str) -> String {
-        hex::encode(Sha256::digest(value.as_bytes()))
-    }
 
     fn fixture() -> (
         TenantScope,
@@ -276,36 +235,26 @@ mod tests {
             Uuid::new_v4().into(),
             Some(Uuid::new_v4().into()),
         );
-        let mut source = synthetic_deepseek_source();
-        let history_json = source["lifecycle"]["history"].to_string();
-        source["ownership"] = json!({
-            "schema_version": "geo.deepseek.ownership.v1",
-            "provider": "deepseek",
-            "creation": source["lifecycle"]["creation"],
-            "submission": source["lifecycle"]["submission"],
-        });
-        source.as_object_mut().unwrap().remove("lifecycle");
-        let source_json = source.to_string();
+        let source_json = r#"{"messages":[{"text":"synthetic answer"}]}"#.to_owned();
         let identity = ObservationProviderIdentity {
-            provider: "deepseek".into(),
+            provider: "synthetic".into(),
             platform_account_id: "synthetic-account".into(),
         };
-        let observed_at = "2026-01-01T00:00:00Z".parse().unwrap();
         let input = ObservationCaptureInput {
             capture_id: Uuid::new_v4(),
             target_id: Uuid::new_v4(),
             attempt_id: Uuid::new_v4(),
             account_id: Uuid::new_v4(),
             runner_session_id: Uuid::new_v4(),
-            original_identity: Some(identity.clone()),
             ordinal: 0,
-            observed_at,
+            observed_at: Utc::now(),
+            original_identity: Some(identity.clone()),
             snapshot: ObservationCaptureSnapshot::Source {
-                source_sha256: digest(&source_json),
-                source_json: source_json.clone(),
+                source_sha256: crate::sha256_hex(source_json.as_bytes()),
+                source_json,
             },
             owned_conversation: Some(CapturedConversation {
-                provider: "deepseek".into(),
+                provider: "synthetic".into(),
                 external_conversation_id: "synthetic-chat".into(),
                 purpose: CapturedConversationPurpose::Measurement,
                 correlation: ConversationCorrelation::CreateResponse,
@@ -317,369 +266,112 @@ mod tests {
                 capture_id: input.capture_id,
                 schema_version: 1,
                 digest_sha256: input.validate(&scope).unwrap(),
-                stored_at: observed_at,
+                stored_at: Utc::now(),
             },
             input,
+        };
+        let ObservationCaptureSnapshot::Source { source_sha256, .. } = &original.input.snapshot
+        else {
+            unreachable!()
         };
         let recovery = ObservationCompletionRecoveryInput {
             recovery_id: Uuid::new_v4(),
             scope: scope.clone(),
             source_capture_id: original.input.capture_id,
-            source_sha256: digest(&source_json),
+            source_sha256: source_sha256.clone(),
             source_receipt_sha256: original.receipt.digest_sha256.clone(),
             recovery_execution_id: Uuid::new_v4(),
             runner_session_id: Uuid::new_v4(),
-            observed_at,
+            observed_at: Utc::now(),
             recovery_identity: identity,
-            history_sha256: digest(&history_json),
-            history_json,
-        };
-        (scope, original, recovery)
-    }
-
-    fn replace_source(
-        scope: &TenantScope,
-        original: &mut ObservationCapture,
-        recovery: &mut ObservationCompletionRecoveryInput,
-        source: Value,
-    ) {
-        let source_json = source.to_string();
-        recovery.source_sha256 = digest(&source_json);
-        original.input.snapshot = ObservationCaptureSnapshot::Source {
-            source_sha256: recovery.source_sha256.clone(),
-            source_json,
-        };
-        original.receipt.digest_sha256 = original.input.validate(scope).unwrap();
-        recovery.source_receipt_sha256 = original.receipt.digest_sha256.clone();
-    }
-
-    #[test]
-    fn completion_recovery_is_replayable_without_mutating_original_or_authorizing_delete() {
-        let (scope, original, recovery) = fixture();
-        let before = original.clone();
-        let binding = original.recovery_request_binding(&scope).unwrap();
-        assert_eq!(binding.provider, "deepseek");
-        assert_eq!(binding.platform_account_id, "synthetic-account");
-        assert_eq!(binding.external_conversation_id, "synthetic-chat");
-        assert_eq!(binding.request_message_id, "1");
-        assert_eq!(binding.response_message_id, "2");
-        let validated = recovery.validate(&scope, &original).unwrap();
-        assert_eq!(validated, recovery.validate(&scope, &original).unwrap());
-        assert_eq!(validated.completion().unwrap().assistant_message_ids, ["2"]);
-        assert_eq!(
-            validated.retained_message_inventory_sha256(),
-            digest(r#"[["1","user"],["2","assistant"]]"#)
-        );
-        assert_eq!(validated.digest_sha256().len(), 64);
-        assert_eq!(original, before);
-        assert!(!original.has_complete_conversation_evidence(&scope));
-        assert!(original.retained_message_inventory_sha256(&scope).is_none());
-    }
-
-    fn empty_failed_fixture() -> (
-        TenantScope,
-        ObservationCapture,
-        ObservationCompletionRecoveryInput,
-    ) {
-        let (scope, mut original, mut recovery) = fixture();
-        let ObservationCaptureSnapshot::Source { source_json, .. } = &original.input.snapshot
-        else {
-            unreachable!()
-        };
-        let mut source: Value = serde_json::from_str(source_json).unwrap();
-        source["messages"] = json!([
-            source["messages"][0],
-            {"event":"hint","data":{"type":"error","finish_reason":"backend_err","clear_response":true}},
-            {"event":"close","data":{"click_behavior":"retry"}},
-        ]);
-        source["capture_status"] = json!({
-            "schema_version":"geo.observation.capture-status.v1","transport":"complete","termination":"complete"
-        });
-        replace_source(&scope, &mut original, &mut recovery, source);
-        let mut history: Value = serde_json::from_str(&recovery.history_json).unwrap();
-        history["messages"] = json!([]);
-        history["current_message_id"] = Value::Null;
-        recovery.history_json = history.to_string();
-        recovery.history_sha256 = digest(&recovery.history_json);
-        (scope, original, recovery)
-    }
-
-    #[test]
-    fn cleared_error_empty_inventory_does_not_invent_completion_or_change_source() {
-        let (scope, original, input) = empty_failed_fixture();
-        let before = original.clone();
-        let validated = input.validate(&scope, &original).unwrap();
-        assert!(validated.completion().is_none());
-        assert_eq!(validated.retained_message_inventory_sha256(), digest("[]"));
-        let recovery = ObservationCompletionRecovery {
-            receipt: ObservationCompletionRecoveryReceipt {
-                recovery_id: input.recovery_id,
-                schema_version: 1,
-                digest_sha256: validated.digest_sha256().into(),
-                stored_at: input.observed_at,
+            external_conversation_id: "synthetic-chat".into(),
+            completion: ObservationCaptureCompletion {
+                outcome: ObservationCompletionOutcome::Complete,
+                message_inventory: vec![
+                    ("1".into(), "user".into()),
+                    ("2".into(), "assistant".into()),
+                ],
             },
-            input,
+            history_json: r#"{"messages":[]}"#.into(),
+            history_sha256: crate::sha256_hex(br#"{"messages":[]}"#),
         };
-        assert_eq!(
-            original
-                .resolved_message_inventory_sha256(&scope, Some(&recovery))
-                .unwrap(),
-            Some(digest("[]"))
-        );
-        assert_eq!(original, before);
-        assert!(!original.has_complete_conversation_evidence(&scope));
-        assert!(original.input.completion.is_none());
-        assert!(original.recovery_request_binding(&scope).is_ok());
+        (scope, original, recovery)
     }
 
     #[test]
-    fn empty_history_requires_original_cleared_error_and_exact_fresh_empty_graph() {
-        for mutation in 0..13 {
-            let (scope, mut original, mut recovery) = empty_failed_fixture();
-            let ObservationCaptureSnapshot::Source { source_json, .. } = &original.input.snapshot
-            else {
-                unreachable!()
-            };
-            let mut source: Value = serde_json::from_str(source_json).unwrap();
-            let mut history: Value = serde_json::from_str(&recovery.history_json).unwrap();
-            match mutation {
-                0 => source["messages"][1]["data"]["clear_response"] = json!(false),
-                1 => source["messages"][1]["data"]["finish_reason"] = json!("other"),
-                2 => source["messages"][1]["data"]["type"] = json!("notice"),
-                3 => {
-                    source["messages"].as_array_mut().unwrap().remove(1);
-                }
-                4 => {
-                    source["capture_status"]["transport"] = json!("partial");
-                    source["capture_status"]["termination"] = json!("eof");
-                }
-                5 => history["chat_session_id"] = json!("other-chat"),
-                6 => history["cache_control"] = json!("APPEND"),
-                7 => history["current_message_id"] = json!(1),
-                8 => {
-                    history
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("current_message_id");
-                }
-                9 => history["cache_request"]["cache_version"] = json!(1),
-                10 => history["messages"] = json!([{"message_id":1,"role":"USER"}]),
-                11 => source["messages"]
-                    .as_array_mut()
-                    .unwrap()
-                    .insert(1, json!({"event":"delta","data":{"v":"text"}})),
-                _ => {
-                    history["unexpected"] = json!(true);
-                }
-            }
-            replace_source(&scope, &mut original, &mut recovery, source);
-            recovery.history_json = history.to_string();
-            recovery.history_sha256 = digest(&recovery.history_json);
-            assert!(recovery.validate(&scope, &original).is_err(), "{mutation}");
-        }
-        let (scope, original, mut recovery) = fixture();
-        let (_, _, empty) = empty_failed_fixture();
-        recovery.history_json = empty.history_json;
-        recovery.history_sha256 = empty.history_sha256;
-        assert!(recovery.validate(&scope, &original).is_err());
-    }
-
-    #[test]
-    fn inventory_resolution_requires_bound_sidecar_and_valid_receipt() {
+    fn generic_recovery_binds_source_owner_identity_and_immutable_audit() {
         let (scope, original, input) = fixture();
-        let before = original.clone();
-        let recovery = ObservationCompletionRecovery {
+        let unchanged = original.clone();
+        let evidence = input.validate(&scope, &original).unwrap();
+        assert_eq!(
+            evidence.completion().outcome,
+            crate::ObservationCompletionOutcome::Complete
+        );
+        let binding = original.recovery_request_binding(&scope).unwrap();
+        assert_eq!(binding.source_capture_id, input.source_capture_id);
+        assert_eq!(
+            binding.source_receipt_sha256,
+            original.receipt.digest_sha256
+        );
+        let stored = ObservationCompletionRecovery {
             receipt: ObservationCompletionRecoveryReceipt {
                 recovery_id: input.recovery_id,
                 schema_version: 1,
-                digest_sha256: input
-                    .validate(&scope, &original)
-                    .unwrap()
-                    .digest_sha256()
-                    .into(),
-                stored_at: input.observed_at,
+                digest_sha256: evidence.digest_sha256().into(),
+                stored_at: Utc::now(),
             },
-            input,
+            input: input.clone(),
         };
+        assert!(stored.validate(&scope, &original).is_ok());
         assert_eq!(
             original
-                .resolved_message_inventory_sha256(&scope, None)
+                .resolved_message_inventory_sha256(&scope, Some(&stored))
                 .unwrap(),
-            None
+            Some(evidence.retained_message_inventory_sha256().into())
         );
-        assert_eq!(
-            original
-                .resolved_message_inventory_sha256(&scope, Some(&recovery))
-                .unwrap(),
-            Some(digest(r#"[["1","user"],["2","assistant"]]"#))
-        );
-        for mutation in 0..6 {
-            let mut invalid = recovery.clone();
-            match mutation {
-                0 => invalid.receipt.recovery_id = Uuid::new_v4(),
-                1 => invalid.receipt.schema_version = 2,
-                2 => invalid.receipt.digest_sha256 = "0".repeat(64),
-                3 => invalid.input.source_capture_id = Uuid::new_v4(),
-                4 => invalid.input.scope.tenant_id = Uuid::new_v4().into(),
-                _ => invalid.input.source_receipt_sha256 = "0".repeat(64),
-            }
-            assert!(
-                original
-                    .resolved_message_inventory_sha256(&scope, Some(&invalid))
-                    .is_err()
-            );
-        }
-        assert_eq!(original, before);
-    }
-
-    #[test]
-    fn completion_recovery_rejects_changed_bindings_and_provenance() {
-        let (scope, original, recovery) = fixture();
-        for change in 0..12 {
-            let mut invalid = recovery.clone();
-            match change {
-                0 => invalid.scope.project_id = Some(Uuid::new_v4().into()),
-                1 => invalid.source_capture_id = Uuid::new_v4(),
-                2 => invalid.source_sha256 = "0".repeat(64),
-                3 => invalid.source_receipt_sha256 = "0".repeat(64),
-                4 => invalid.recovery_identity.platform_account_id = "other-account".into(),
-                5 => invalid.runner_session_id = original.input.runner_session_id,
-                6 => invalid.recovery_execution_id = original.input.attempt_id,
-                7 => invalid.recovery_id = Uuid::nil(),
+        assert_eq!(original, unchanged);
+        assert!(!original.has_complete_conversation_evidence(&scope));
+        let mut corrupt = stored;
+        corrupt.receipt.digest_sha256 = "0".repeat(64);
+        assert!(corrupt.validate(&scope, &original).is_err());
+        for field in 0..12 {
+            let mut invalid = input.clone();
+            match field {
+                0 => invalid.source_capture_id = Uuid::new_v4(),
+                1 => invalid.source_sha256 = "0".repeat(64),
+                2 => invalid.source_receipt_sha256 = "0".repeat(64),
+                3 => invalid.recovery_identity.platform_account_id = "other-account".into(),
+                4 => invalid.recovery_identity.provider = "other".into(),
+                5 => invalid.external_conversation_id = "other-chat".into(),
+                6 => invalid.runner_session_id = original.input.runner_session_id,
+                7 => invalid.recovery_execution_id = original.input.attempt_id,
                 8 => invalid.history_sha256 = "0".repeat(64),
-                9 => invalid.observed_at += chrono::Duration::seconds(1),
-                10 => invalid.scope.tenant_id = Uuid::new_v4().into(),
-                _ => invalid.scope.operator_id = Uuid::new_v4().into(),
-            }
-            assert!(invalid.validate(&scope, &original).is_err(), "{change}");
-        }
-        for change in 0..6 {
-            let mut invalid = original.clone();
-            match change {
-                0 => invalid.receipt.capture_id = Uuid::new_v4(),
-                1 => invalid.receipt.schema_version = 2,
-                2 => invalid.input.target_id = Uuid::new_v4(),
-                3 => invalid.input.attempt_id = Uuid::new_v4(),
-                4 => invalid.input.account_id = Uuid::new_v4(),
-                _ => invalid.input.original_identity = None,
-            }
-            assert!(recovery.validate(&scope, &invalid).is_err(), "{change}");
-            assert!(
-                invalid.recovery_request_binding(&scope).is_err(),
-                "{change}"
-            );
-        }
-        let mut missing_identity = original.clone();
-        missing_identity.input.original_identity = None;
-        missing_identity.receipt.digest_sha256 = missing_identity.input.validate(&scope).unwrap();
-        let mut rebound = recovery;
-        rebound.source_receipt_sha256 = missing_identity.receipt.digest_sha256.clone();
-        assert!(rebound.validate(&scope, &missing_identity).is_err());
-        assert!(missing_identity.recovery_request_binding(&scope).is_err());
-    }
-
-    #[test]
-    fn completion_recovery_cannot_supply_missing_or_ambiguous_original_transport_evidence() {
-        for change in 0..8 {
-            let (scope, mut original, mut recovery) = fixture();
-            let ObservationCaptureSnapshot::Source { source_json, .. } = &original.input.snapshot
-            else {
-                unreachable!()
-            };
-            let mut source: Value = serde_json::from_str(source_json).unwrap();
-            match change {
-                0 => {
-                    source["messages"].as_array_mut().unwrap().remove(0);
-                }
-                1 => {
-                    source["messages"].as_array_mut().unwrap().remove(2);
-                }
-                2 => {
-                    let ready = source["messages"][0].clone();
-                    source["messages"].as_array_mut().unwrap().push(ready);
-                }
-                3 => {
-                    let finish = source["messages"][2].clone();
-                    source["messages"].as_array_mut().unwrap().push(finish);
-                }
-                4 => source["messages"].as_array_mut().unwrap().swap(0, 2),
-                5 => source["messages"][0]["data"]["request_message_id"] = json!(3),
-                6 => source["messages"][2]["raw_data"] = Value::Null,
+                9 => invalid.completion.message_inventory.reverse(),
+                10 => invalid.scope.project_id = Some(Uuid::new_v4().into()),
                 _ => {
-                    source.as_object_mut().unwrap().remove("ownership");
+                    invalid.history_json = r#"{"cookie":"private"}"#.into();
+                    invalid.history_sha256 = crate::sha256_hex(invalid.history_json.as_bytes());
                 }
             }
-            replace_source(&scope, &mut original, &mut recovery, source);
-            assert!(recovery.validate(&scope, &original).is_err(), "{change}");
-            if change == 5 {
-                // Original transport is authoritative for scheduling; the
-                // later history must match these IDs, not old fixture IDs.
-                assert_eq!(
-                    original
-                        .recovery_request_binding(&scope)
-                        .unwrap()
-                        .request_message_id,
-                    "3"
-                );
-            } else {
-                assert!(
-                    original.recovery_request_binding(&scope).is_err(),
-                    "{change}"
-                );
-            }
+            assert!(invalid.validate(&scope, &original).is_err(), "{field}");
         }
     }
 
     #[test]
-    fn completion_recovery_reuses_closed_history_verifier() {
-        for (path, value) in [
-            ("/chat_session_id", json!("other-chat")),
-            ("/cache_control", json!("APPEND")),
-            ("/cache_request/cache_version", json!(1)),
-            ("/messages/1/status", json!("STREAMING")),
-            ("/messages/1/message_id", json!(3)),
-            ("/messages/1/parent_id", json!(3)),
-            ("/messages/1/has_pending_fragment", json!(true)),
-            ("/current_message_id", json!(3)),
-        ] {
-            let (scope, original, mut recovery) = fixture();
-            let mut history: Value = serde_json::from_str(&recovery.history_json).unwrap();
-            *history.pointer_mut(path).unwrap() = value;
-            recovery.history_json = history.to_string();
-            recovery.history_sha256 = digest(&recovery.history_json);
-            assert!(recovery.validate(&scope, &original).is_err(), "{path}");
-        }
-        let (scope, original, mut recovery) = fixture();
-        let mut history: Value = serde_json::from_str(&recovery.history_json).unwrap();
-        history["answer"] = json!("not a transport field");
-        recovery.history_json = history.to_string();
-        recovery.history_sha256 = digest(&recovery.history_json);
-        assert!(recovery.validate(&scope, &original).is_err());
-    }
-
-    #[test]
-    fn completion_recovery_accepts_original_redacted_finish_but_not_fabricated_terminal_flag() {
-        let (scope, mut original, mut recovery) = fixture();
-        let ObservationCaptureSnapshot::Source { source_json, .. } = &original.input.snapshot
-        else {
-            unreachable!()
-        };
-        let mut source: Value = serde_json::from_str(source_json).unwrap();
-        source["messages"][2]
-            .as_object_mut()
-            .unwrap()
-            .remove("raw_data");
-        source["source_redaction"] = json!({
-            "schema_version": "geo.observation.source-redaction.v1",
-            "policy": "reasoning-and-private-fields",
-            "omitted_paths": ["/messages/2/raw_data"],
-        });
-        replace_source(&scope, &mut original, &mut recovery, source.clone());
-        assert!(recovery.validate(&scope, &original).is_ok());
-        assert!(original.recovery_request_binding(&scope).is_ok());
-        source["source_redaction"]["omitted_paths"] = json!([]);
-        replace_source(&scope, &mut original, &mut recovery, source);
-        assert!(recovery.validate(&scope, &original).is_err());
-        assert!(original.recovery_request_binding(&scope).is_err());
+    fn cleared_failure_is_an_explicit_empty_inventory_and_never_assistant_completion() {
+        let (scope, original, mut input) = fixture();
+        input.completion.outcome = crate::ObservationCompletionOutcome::ClearedFailure;
+        input.completion.message_inventory.clear();
+        let evidence = input.validate(&scope, &original).unwrap();
+        assert_eq!(
+            evidence.completion().outcome,
+            crate::ObservationCompletionOutcome::ClearedFailure
+        );
+        assert_eq!(
+            evidence.retained_message_inventory_sha256(),
+            crate::sha256_hex(b"[]")
+        );
+        input.completion.outcome = crate::ObservationCompletionOutcome::Complete;
+        assert!(input.validate(&scope, &original).is_err());
     }
 }

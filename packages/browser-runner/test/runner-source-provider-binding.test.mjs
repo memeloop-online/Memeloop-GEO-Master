@@ -8,7 +8,7 @@ const sourceJson = JSON.stringify({
 });
 const sourceSha256 = createHash("sha256").update(sourceJson).digest("hex");
 
-async function runCapture(platform, receipts) {
+async function runCapture(platform, receipts, completion) {
   const stored = [];
   const runner = createRunner({
     browserType: {
@@ -52,6 +52,7 @@ async function runCapture(platform, receipts) {
               phase,
               source_json: sourceJson,
               source_sha256: sourceSha256,
+              ...(completion ? { completion } : {}),
             });
           return { status: "completed", evidence: [] };
         },
@@ -90,6 +91,36 @@ async function runCapture(platform, receipts) {
     await runner.shutdown();
   }
 }
+
+test("source and extraction callbacks forward the same normalized inventory receipt", async () => {
+  const completion = {
+    outcome: "complete",
+    message_inventory: [
+      ["answer", "assistant"],
+      ["question", "user"],
+    ],
+  };
+  const stored = await runCapture(
+    "kimi",
+    [
+      {
+        provider: "kimi",
+        purpose: "measurement",
+        external_conversation_id: "selected-source",
+      },
+      {
+        provider: "kimi",
+        purpose: "extraction",
+        external_conversation_id: "selected-extraction",
+      },
+    ],
+    completion,
+  );
+  assert.deepEqual(
+    stored.map((record) => record.completion),
+    [completion, completion],
+  );
+});
 
 for (const platform of ["kimi", "deepseek"]) {
   test(`${platform} measurement ownership binds to the session platform and browser extraction stays Kimi`, async () => {

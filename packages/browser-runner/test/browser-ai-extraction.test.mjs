@@ -289,6 +289,7 @@ test("signed-in extraction selects Kimi lifecycle proof for its durable checkpoi
   const f = fixture({
     responseChatId: "synthetic-extraction",
     responseMessages: [
+      { message: { id: "synthetic-question", role: "user" } },
       {
         message: {
           id: "synthetic-answer",
@@ -307,9 +308,11 @@ test("signed-in extraction selects Kimi lifecycle proof for its durable checkpoi
   );
   assert.equal(records.length, 1);
   assert.deepEqual(records[0].completion, {
-    protocol: "connect_json",
-    terminal: true,
-    assistant_message_ids: ["synthetic-answer"],
+    outcome: "complete",
+    message_inventory: [
+      ["synthetic-answer", "assistant"],
+      ["synthetic-question", "user"],
+    ],
   });
   assert.equal(f.stats().sent, 1);
 });

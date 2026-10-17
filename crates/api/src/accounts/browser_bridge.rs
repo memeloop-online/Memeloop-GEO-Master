@@ -465,7 +465,12 @@ impl BrowserBridge {
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
         };
-        if !geo_domain::provider_conversation_cleanup_supported(&expected_identity.provider)
+        if (geo_domain::ObservationProviderIdentity {
+            provider: expected_identity.provider.clone(),
+            platform_account_id: expected_identity.platform_account_id.clone(),
+        })
+        .validate()
+        .is_err()
             || !valid_id(&expected_identity.platform_account_id)
             || !valid_id(chat_id)
             || ticket.is_some_and(|value| {
@@ -669,8 +674,10 @@ pub struct CompletionRecoveryRequest {
     pub execution_id: Uuid,
     pub expected_identity: CompletionRecoveryIdentity,
     pub external_conversation_id: String,
-    pub request_message_id: String,
-    pub response_message_id: String,
+    pub source_capture_id: Uuid,
+    pub source_json: String,
+    pub source_sha256: String,
+    pub source_receipt_sha256: String,
 }
 
 impl CompletionRecoveryRequest {
@@ -682,23 +689,26 @@ impl CompletionRecoveryRequest {
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
         };
-        let message_id = |value: &str| {
-            !value.is_empty()
-                && value.len() <= 16
-                && value.bytes().all(|c| c.is_ascii_digit())
-                && (value == "0" || !value.starts_with('0'))
+        let digest = |value: &str| {
+            value.len() == 64
                 && value
-                    .parse::<u64>()
-                    .is_ok_and(|id| id <= 9_007_199_254_740_991)
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
         };
         if session_id.is_nil()
             || self.execution_id.is_nil()
-            || self.expected_identity.provider != "deepseek"
-            || !identifier(&self.expected_identity.platform_account_id)
+            || self.source_capture_id.is_nil()
+            || (geo_domain::ObservationProviderIdentity {
+                provider: self.expected_identity.provider.clone(),
+                platform_account_id: self.expected_identity.platform_account_id.clone(),
+            })
+            .validate()
+            .is_err()
             || !identifier(&self.external_conversation_id)
-            || !message_id(&self.request_message_id)
-            || !message_id(&self.response_message_id)
-            || self.request_message_id == self.response_message_id
+            || self.source_json.is_empty()
+            || self.source_json.len() > geo_domain::MAX_OBSERVATION_SOURCE_BYTES
+            || sha256_hex(self.source_json.as_bytes()) != self.source_sha256
+            || !digest(&self.source_receipt_sha256)
         {
             return Err(AppError::invalid_request(
                 "invalid conversation recovery scope",
@@ -715,24 +725,37 @@ pub enum CompletionRecoveryResult {
     Recovered {
         execution_id: Uuid,
         external_conversation_id: String,
+        source_capture_id: Uuid,
+        source_sha256: String,
+        source_receipt_sha256: String,
         recovery_identity: CompletionRecoveryIdentity,
         observed_at: chrono::DateTime<chrono::Utc>,
+        completion: geo_domain::ObservationCaptureCompletion,
         history_json: String,
         history_sha256: String,
     },
     Retained {
         execution_id: Uuid,
         external_conversation_id: String,
+        source_capture_id: Uuid,
+        source_sha256: String,
+        source_receipt_sha256: String,
         diagnostic: Option<CompletionRecoveryDiagnostic>,
     },
     NeedsLogin {
         execution_id: Uuid,
         external_conversation_id: String,
+        source_capture_id: Uuid,
+        source_sha256: String,
+        source_receipt_sha256: String,
         diagnostic: Option<CompletionRecoveryDiagnostic>,
     },
     Unknown {
         execution_id: Uuid,
         external_conversation_id: String,
+        source_capture_id: Uuid,
+        source_sha256: String,
+        source_receipt_sha256: String,
         diagnostic: Option<CompletionRecoveryDiagnostic>,
     },
 }
@@ -777,6 +800,7 @@ impl CompletionRecoveryReason {
 #[serde(rename_all = "snake_case")]
 pub enum CompletionRecoveryStage {
     Scope,
+    Source,
     Identity,
     History,
     Deadline,
@@ -787,6 +811,7 @@ pub enum CompletionRecoveryStage {
 #[serde(rename_all = "snake_case")]
 pub enum CompletionRecoveryCode {
     UnsupportedPlatform,
+    SourceIneligible,
     ReauthRequired,
     AccountMismatch,
     CompletionUnverified,
@@ -796,39 +821,50 @@ pub enum CompletionRecoveryCode {
 
 impl CompletionRecoveryResult {
     fn validate(&self, request: &CompletionRecoveryRequest) -> Result<(), AppError> {
-        let (execution_id, chat_id) = match self {
+        let (execution_id, chat_id, source_id, source_hash, receipt_hash) = match self {
             Self::Recovered {
                 execution_id,
                 external_conversation_id,
                 recovery_identity,
-                history_json,
-                history_sha256,
+                source_capture_id,
+                source_sha256,
+                source_receipt_sha256,
                 ..
             } => {
-                if recovery_identity != &request.expected_identity
-                    || history_json.is_empty()
-                    || history_json.len() > geo_domain::MAX_OBSERVATION_SOURCE_BYTES
-                    || sha256_hex(history_json.as_bytes()) != *history_sha256
-                    || serde_json::from_str::<serde_json::Value>(history_json).is_err()
-                {
+                if recovery_identity != &request.expected_identity {
                     return Err(BrowserBridge::recovery_unavailable());
                 }
-                (execution_id, external_conversation_id)
+                (
+                    execution_id,
+                    external_conversation_id,
+                    source_capture_id,
+                    source_sha256,
+                    source_receipt_sha256,
+                )
             }
             Self::Retained {
                 execution_id,
                 external_conversation_id,
                 diagnostic,
+                source_capture_id,
+                source_sha256,
+                source_receipt_sha256,
             }
             | Self::NeedsLogin {
                 execution_id,
                 external_conversation_id,
                 diagnostic,
+                source_capture_id,
+                source_sha256,
+                source_receipt_sha256,
             }
             | Self::Unknown {
                 execution_id,
                 external_conversation_id,
                 diagnostic,
+                source_capture_id,
+                source_sha256,
+                source_receipt_sha256,
             } => {
                 if diagnostic.as_ref().is_some_and(|diagnostic| {
                     !matches!(
@@ -836,6 +872,9 @@ impl CompletionRecoveryResult {
                         (
                             CompletionRecoveryStage::Scope,
                             CompletionRecoveryCode::UnsupportedPlatform
+                        ) | (
+                            CompletionRecoveryStage::Source,
+                            CompletionRecoveryCode::SourceIneligible
                         ) | (
                             CompletionRecoveryStage::Identity,
                             CompletionRecoveryCode::ReauthRequired
@@ -850,22 +889,35 @@ impl CompletionRecoveryResult {
                             CompletionRecoveryStage::Runner,
                             CompletionRecoveryCode::TransportUnknown
                         )
-                    ) || (diagnostic.reason.is_some()
-                        && (!matches!(self, Self::Retained { .. })
-                            || !matches!(
-                                (&diagnostic.stage, &diagnostic.code),
-                                (
-                                    CompletionRecoveryStage::History,
-                                    CompletionRecoveryCode::CompletionUnverified
-                                )
-                            )))
+                    ) || (matches!(&diagnostic.stage, CompletionRecoveryStage::Source)
+                        && !matches!(self, Self::Retained { .. }))
+                        || (diagnostic.reason.is_some()
+                            && (!matches!(self, Self::Retained { .. })
+                                || !matches!(
+                                    (&diagnostic.stage, &diagnostic.code),
+                                    (
+                                        CompletionRecoveryStage::History,
+                                        CompletionRecoveryCode::CompletionUnverified
+                                    )
+                                )))
                 }) {
                     return Err(BrowserBridge::recovery_unavailable());
                 }
-                (execution_id, external_conversation_id)
+                (
+                    execution_id,
+                    external_conversation_id,
+                    source_capture_id,
+                    source_sha256,
+                    source_receipt_sha256,
+                )
             }
         };
-        if *execution_id != request.execution_id || *chat_id != request.external_conversation_id {
+        if *execution_id != request.execution_id
+            || *chat_id != request.external_conversation_id
+            || *source_id != request.source_capture_id
+            || *source_hash != request.source_sha256
+            || *receipt_hash != request.source_receipt_sha256
+        {
             return Err(BrowserBridge::recovery_unavailable());
         }
         Ok(())
@@ -1171,29 +1223,31 @@ mod completion_recovery_tests {
     };
 
     fn request() -> CompletionRecoveryRequest {
+        let source_json = r#"{"messages":[]}"#.to_owned();
         CompletionRecoveryRequest {
             execution_id: Uuid::new_v4(),
             expected_identity: CompletionRecoveryIdentity {
-                provider: "deepseek".into(),
+                provider: "synthetic".into(),
                 platform_account_id: "fixture-account".into(),
             },
             external_conversation_id: "fixture-chat".into(),
-            request_message_id: "0".into(),
-            response_message_id: "1".into(),
+            source_capture_id: Uuid::new_v4(),
+            source_sha256: sha256_hex(source_json.as_bytes()),
+            source_json,
+            source_receipt_sha256: "a".repeat(64),
         }
     }
 
     fn receipt(request: &CompletionRecoveryRequest) -> serde_json::Value {
-        // Transport validates integrity, not provider completion semantics.
-        let history = r#"{"synthetic":"history"}"#;
+        let history = r#"{"messages":[]}"#;
         serde_json::json!({
-            "status": "recovered",
-            "execution_id": request.execution_id,
-            "external_conversation_id": request.external_conversation_id,
-            "recovery_identity": request.expected_identity,
-            "observed_at": "2026-01-01T00:00:00Z",
-            "history_json": history,
-            "history_sha256": sha256_hex(history.as_bytes())
+            "status":"recovered", "execution_id":request.execution_id,
+            "external_conversation_id":request.external_conversation_id,
+            "source_capture_id":request.source_capture_id, "source_sha256":request.source_sha256,
+            "source_receipt_sha256":request.source_receipt_sha256,
+            "recovery_identity":request.expected_identity, "observed_at":"2026-01-01T00:00:00Z",
+            "completion":{"outcome":"complete","message_inventory":[["1","user"],["2","assistant"]]},
+            "history_json":history, "history_sha256":sha256_hex(history.as_bytes())
         })
     }
 
@@ -1213,56 +1267,29 @@ mod completion_recovery_tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let bridge =
             BrowserBridge::new(format!("http://{address}"), "fixture-token".into()).unwrap();
-        let mut invalid = vec![];
-        for provider in ["kimi", "DeepSeek", "unknown", ""] {
-            let mut value = request();
-            value.expected_identity.provider = provider.into();
-            invalid.push(value);
+        for field in 0..8 {
+            let mut invalid = request();
+            match field {
+                0 => invalid.expected_identity.provider = "../provider".into(),
+                1 => invalid.expected_identity.platform_account_id.clear(),
+                2 => invalid.external_conversation_id = "../chat".into(),
+                3 => invalid.execution_id = Uuid::nil(),
+                4 => invalid.source_capture_id = Uuid::nil(),
+                5 => invalid.source_sha256 = "0".repeat(64),
+                6 => invalid.source_receipt_sha256 = "A".repeat(64),
+                _ => invalid.source_json = "x".repeat(geo_domain::MAX_OBSERVATION_SOURCE_BYTES + 1),
+            }
+            assert_eq!(
+                bridge
+                    .recover_conversation_completion(Uuid::new_v4(), &invalid)
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                ErrorCode::InvalidRequest
+            );
         }
-        for message in [
-            "",
-            "-1",
-            "01",
-            "1.0",
-            "9007199254740992",
-            "10000000000000000",
-            "秘密",
-        ] {
-            let mut value = request();
-            value.request_message_id = message.into();
-            invalid.push(value);
-            let mut value = request();
-            value.response_message_id = message.into();
-            invalid.push(value);
-        }
-        for identifier in ["", "../chat", "has space", &"a".repeat(129)] {
-            let mut value = request();
-            value.external_conversation_id = identifier.into();
-            invalid.push(value);
-            let mut value = request();
-            value.expected_identity.platform_account_id = identifier.into();
-            invalid.push(value);
-        }
-        let mut value = request();
-        value.execution_id = Uuid::nil();
-        invalid.push(value);
-        let mut value = request();
-        value.response_message_id = value.request_message_id.clone();
-        invalid.push(value);
-        for value in invalid {
-            let error = bridge
-                .recover_conversation_completion(Uuid::new_v4(), &value)
-                .await
-                .err()
-                .unwrap();
-            assert_eq!(error.code, ErrorCode::InvalidRequest);
-        }
-        let error = bridge
-            .recover_conversation_completion(Uuid::nil(), &request())
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(request().validate(Uuid::nil()).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
     }
@@ -1275,11 +1302,9 @@ mod completion_recovery_tests {
             "chat",
             "account",
             "provider",
-            "digest",
-            "uppercase_digest",
-            "oversized_history",
-            "oversized_response",
-            "invalid_json",
+            "source",
+            "source_hash",
+            "receipt_hash",
             "timestamp",
             "unknown_field",
             "identity_extra",
@@ -1296,31 +1321,12 @@ mod completion_recovery_tests {
                 "account" => {
                     response["recovery_identity"]["platform_account_id"] = "other-account".into()
                 }
-                "provider" => response["recovery_identity"]["provider"] = "kimi".into(),
-                "digest" => response["history_sha256"] = "0".repeat(64).into(),
-                "uppercase_digest" => {
-                    response["history_sha256"] = response["history_sha256"]
-                        .as_str()
-                        .unwrap()
-                        .to_uppercase()
-                        .into()
-                }
-                "oversized_history" | "oversized_response" | "invalid_json" => {
-                    let history = if mutation == "invalid_json" {
-                        "{".into()
-                    } else {
-                        serde_json::to_string(&"a".repeat(if mutation == "oversized_response" {
-                            8 * 1024 * 1024
-                        } else {
-                            geo_domain::MAX_OBSERVATION_SOURCE_BYTES
-                        }))
-                        .unwrap()
-                    };
-                    response["history_sha256"] = sha256_hex(history.as_bytes()).into();
-                    response["history_json"] = history.into();
-                }
+                "provider" => response["recovery_identity"]["provider"] = "other".into(),
+                "source" => response["source_capture_id"] = serde_json::json!(Uuid::new_v4()),
+                "source_hash" => response["source_sha256"] = "0".repeat(64).into(),
+                "receipt_hash" => response["source_receipt_sha256"] = "0".repeat(64).into(),
                 "timestamp" => response["observed_at"] = "not-a-time".into(),
-                "unknown_field" => response["payload"] = serde_json::json!({"action":"delete"}),
+                "unknown_field" => response["action"] = "delete".into(),
                 "identity_extra" => response["recovery_identity"]["raw"] = "private".into(),
                 "missing_identity" => {
                     response
@@ -1328,7 +1334,10 @@ mod completion_recovery_tests {
                         .unwrap()
                         .remove("recovery_identity");
                 }
-                "wrong_type" => response["history_json"] = serde_json::json!({}),
+                "wrong_type" => {
+                    response["completion"] =
+                        serde_json::json!({"outcome":"unknown","message_inventory":[]})
+                }
                 _ => {}
             }
             let expected = serde_json::to_value(&request).unwrap();
@@ -1345,12 +1354,14 @@ mod completion_recovery_tests {
                     async move {
                         observed.fetch_add(1, Ordering::SeqCst);
                         assert_eq!(wire.headers()["authorization"], "Bearer fixture-token");
-                        let body = to_bytes(wire.into_body(), 8192).await.unwrap();
-                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let body: serde_json::Value = serde_json::from_slice(
+                            &to_bytes(wire.into_body(), 8192).await.unwrap(),
+                        )
+                        .unwrap();
                         assert_eq!(body, expected);
-                        assert_eq!(body.as_object().unwrap().len(), 5);
-                        assert!(body.get("payload").is_none());
+                        assert_eq!(body.as_object().unwrap().len(), 7);
                         assert!(body.get("action").is_none());
+                        assert!(body.get("request_message_id").is_none());
                         if mutation == "malformed" {
                             "{".into()
                         } else {
@@ -1362,11 +1373,15 @@ mod completion_recovery_tests {
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let bridge =
                 BrowserBridge::new(format!("http://{address}"), "fixture-token".into()).unwrap();
-            let result = bridge
-                .recover_conversation_completion(session_id, &request)
-                .await;
-            assert_eq!(result.is_ok(), mutation == "none", "{mutation}");
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "no fallback or retry");
+            assert_eq!(
+                bridge
+                    .recover_conversation_completion(session_id, &request)
+                    .await
+                    .is_ok(),
+                mutation == "none",
+                "{mutation}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
             server.abort();
         }
     }
@@ -1377,7 +1392,9 @@ mod completion_recovery_tests {
         for status in ["retained", "needs_login", "unknown"] {
             let base = serde_json::json!({
                 "status": status, "execution_id": request.execution_id,
-                "external_conversation_id": request.external_conversation_id
+                "external_conversation_id": request.external_conversation_id,
+                "source_capture_id":request.source_capture_id, "source_sha256":request.source_sha256,
+                "source_receipt_sha256":request.source_receipt_sha256
             });
             let result: CompletionRecoveryResult = serde_json::from_value(base.clone()).unwrap();
             assert!(result.validate(&request).is_ok());
@@ -1433,6 +1450,13 @@ mod completion_recovery_tests {
                         .map_or(true, |result| result.validate(&request).is_err())
                 );
             }
+            let mut value = base.clone();
+            value["diagnostic"] = serde_json::json!({"stage":"source","code":"source_ineligible"});
+            let result: CompletionRecoveryResult = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(result.validate(&request).is_ok(), status == "retained");
+            value["diagnostic"]["reason"] = "history_binding_mismatch".into();
+            let result: CompletionRecoveryResult = serde_json::from_value(value).unwrap();
+            assert!(result.validate(&request).is_err());
             let mut value = base;
             value["history_json"] = "{}".into();
             assert!(serde_json::from_value::<CompletionRecoveryResult>(value).is_err());
@@ -1440,15 +1464,6 @@ mod completion_recovery_tests {
         let mut value = receipt(&request);
         value["status"] = "deleted".into();
         assert!(serde_json::from_value::<CompletionRecoveryResult>(value).is_err());
-    }
-
-    #[test]
-    fn recovery_message_ids_accept_safe_integer_boundaries_only() {
-        let mut value = request();
-        value.response_message_id = "9007199254740991".into();
-        assert!(value.validate(Uuid::new_v4()).is_ok());
-        value.response_message_id = "9007199254740992".into();
-        assert!(value.validate(Uuid::new_v4()).is_err());
     }
 }
 
@@ -1494,7 +1509,7 @@ mod measurement_options_tests {
     }
 
     #[tokio::test]
-    async fn unregistered_cleanup_provider_or_invalid_scope_is_rejected_before_network() {
+    async fn invalid_cleanup_scope_is_rejected_before_network() {
         use axum::{Router, routing::post};
         use std::sync::{
             Arc,
@@ -1517,7 +1532,7 @@ mod measurement_options_tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let bridge = BrowserBridge::new(format!("http://{addr}"), "fixture-token".into()).unwrap();
-        for provider in ["DeepSeek", "doubao", "glm", "unknown", "Kimi"] {
+        for provider in ["", "../provider", "invalid provider"] {
             for action in [CleanupAction::Delete, CleanupAction::Reconcile] {
                 let error = bridge
                     .cleanup_conversation(
@@ -1533,7 +1548,7 @@ mod measurement_options_tests {
                     )
                     .await
                     .err()
-                    .expect("unregistered provider must not reach runner");
+                    .expect("invalid provider must not reach runner");
                 assert_eq!(error.code, ErrorCode::InvalidRequest);
             }
         }
