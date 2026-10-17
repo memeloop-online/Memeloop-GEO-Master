@@ -509,16 +509,17 @@ impl ContentService {
         ))
     }
 
-    pub async fn generate(
+    pub async fn begin_generate(
         &self,
         scope: &TenantScope,
         execution_id: Uuid,
         item_id: Uuid,
-    ) -> Result<ContentRevision, AppError> {
+    ) -> Result<Option<(Uuid, ContentSemanticDescriptor)>, AppError> {
         let item = self.item(scope, execution_id, item_id).await?;
         if item.status != ContentItemStatus::Prepared {
             if let Some(revision_id) = item.current_revision_id {
-                return self.revision(scope, item.asset_id, revision_id).await;
+                self.revision(scope, item.asset_id, revision_id).await?;
+                return Ok(None);
             }
             return Err(AppError::conflict("document is not prepared"));
         }
@@ -544,6 +545,13 @@ impl ContentService {
                 "prepared evidence is no longer publicly eligible",
             ));
         }
+        let descriptor = item
+            .semantic_descriptor
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("prepared semantic descriptor missing"))?;
+        if descriptor.evidence != brief.quotes {
+            return Err(AppError::conflict("prepared semantic evidence changed"));
+        }
         let lease = self
             .content
             .claim(
@@ -556,50 +564,66 @@ impl ContentService {
                 LEASE_SECONDS,
             )
             .await?;
-        let descriptor = item
-            .semantic_descriptor
-            .as_ref()
-            .ok_or_else(|| AppError::conflict("prepared semantic descriptor missing"))?;
-        if descriptor.evidence != brief.quotes {
-            self.content.release_step(scope, &lease).await?;
-            return Err(AppError::conflict("prepared semantic evidence changed"));
-        }
-        let output = self.complete(scope, "You are a source-grounded content generator. Output ONLY a JSON object {\"schema_version\":2,\"title\":string,\"blocks\":[{\"kind\":\"heading|paragraph|list\",\"text\":string,\"citation_ids\":[UUID],\"items\":[string]}]}. Never invent evidence, attribution, prices, claims, or citations. Every block including headings must cite the supplied chunk UUIDs. The title will be independently checked. Do not supply readiness, IDs, or metadata.",
-            serde_json::json!({
-                "brief": {"title": descriptor.brief_title, "objective": descriptor.brief_objective},
-                "document": {
-                    "key": descriptor.document_key, "content_type": descriptor.content_type,
-                    "product_id": descriptor.product_id, "market": descriptor.market,
-                    "language": descriptor.language, "brand_name": descriptor.brand_name,
-                    "product_name": descriptor.product_name, "target_audience": descriptor.target_audience,
-                    "objective": descriptor.objective, "question_clusters": descriptor.question_clusters,
-                },
-                "evidence": prompt_evidence(&descriptor.evidence),
-            })).await;
-        let document = match output {
-            Ok(text) => parse_generated(&text, &brief.evidence, &item.branch_key),
-            Err(error)
-                if matches!(
-                    error.code,
-                    ErrorCode::DependencyUnavailable | ErrorCode::CapabilityMissing
-                ) =>
-            {
-                self.content.release_step(scope, &lease).await?;
-                return Err(error);
+        Ok(Some((lease.token, descriptor.clone())))
+    }
+
+    pub async fn finish_generate(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+        item_id: Uuid,
+        token: Uuid,
+        outcome: geo_worker::ContentGenerateOutcome,
+    ) -> Result<ContentRevision, AppError> {
+        let item = self.item(scope, execution_id, item_id).await?;
+        let Some(lease) = item
+            .steps
+            .iter()
+            .find(|lease| lease.step == ContentStep::Generate && lease.token == token)
+        else {
+            if item.attempts.iter().any(|attempt| {
+                attempt.step == ContentStep::Generate
+                    && attempt.token == token
+                    && attempt.outcome == geo_domain::ContentAttemptOutcome::Completed
+            }) {
+                return self
+                    .revision(
+                        scope,
+                        item.asset_id,
+                        item.current_revision_id
+                            .ok_or_else(|| AppError::conflict("generated revision missing"))?,
+                    )
+                    .await;
             }
-            Err(error) => Err(error),
+            return Err(AppError::conflict("generation lease is no longer active"));
+        };
+        let brief = item
+            .brief
+            .as_ref()
+            .ok_or_else(|| AppError::conflict("prepared brief missing"))?;
+        let document = match outcome {
+            geo_worker::ContentGenerateOutcome::Completed { text } if text.len() <= 64 * 1024 => {
+                parse_generated(&text, &brief.evidence, &item.branch_key)
+            }
+            geo_worker::ContentGenerateOutcome::Unavailable => {
+                self.content.release_step(scope, lease).await?;
+                return Err(AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "content generation model unavailable",
+                ));
+            }
+            geo_worker::ContentGenerateOutcome::Invalid
+            | geo_worker::ContentGenerateOutcome::Completed { .. } => Err(
+                AppError::invalid_request("generator returned unusable structured content"),
+            ),
         };
         match document {
-            Ok(document) => {
-                self.content
-                    .complete_generate(scope, &lease, document)
-                    .await
-            }
+            Ok(document) => self.content.complete_generate(scope, lease, document).await,
             Err(error) => {
                 self.content
                     .fail_step(
                         scope,
-                        &lease,
+                        lease,
                         "generator returned unusable structured content",
                     )
                     .await?;
@@ -2242,6 +2266,50 @@ mod tests {
     // Fixtures explicitly select located records, just as the workflow does.
     // Production preparation never calls this helper or chooses a prefix.
     impl ContentService {
+        async fn generate_fixture(
+            &self,
+            scope: &TenantScope,
+            execution_id: Uuid,
+            item_id: Uuid,
+        ) -> Result<ContentRevision, AppError> {
+            let Some((token, descriptor)) =
+                self.begin_generate(scope, execution_id, item_id).await?
+            else {
+                let item = self.item(scope, execution_id, item_id).await?;
+                return self
+                    .revision(scope, item.asset_id, item.current_revision_id.unwrap())
+                    .await;
+            };
+            let output = self
+                .complete(
+                    scope,
+                    "fixture generation",
+                    serde_json::json!({
+                        "evidence": prompt_evidence(&descriptor.evidence),
+                    }),
+                )
+                .await;
+            let outcome = match output {
+                Ok(text) => geo_worker::ContentGenerateOutcome::Completed { text },
+                Err(error) => {
+                    let outcome = if matches!(
+                        error.code,
+                        ErrorCode::DependencyUnavailable | ErrorCode::CapabilityMissing
+                    ) {
+                        geo_worker::ContentGenerateOutcome::Unavailable
+                    } else {
+                        geo_worker::ContentGenerateOutcome::Invalid
+                    };
+                    let _ = self
+                        .finish_generate(scope, execution_id, item_id, token, outcome)
+                        .await;
+                    return Err(error);
+                }
+            };
+            self.finish_generate(scope, execution_id, item_id, token, outcome)
+                .await
+        }
+
         async fn prepare_fixture(
             &self,
             scope: &TenantScope,
@@ -2751,7 +2819,7 @@ mod tests {
             .await
             .unwrap();
         service
-            .generate(&scope, execution.execution_id, item_id)
+            .generate_fixture(&scope, execution.execution_id, item_id)
             .await
             .unwrap();
         assert_eq!(
@@ -2770,6 +2838,59 @@ mod tests {
             execution.execution_id,
             item_id,
         )
+    }
+
+    #[tokio::test]
+    async fn completed_generation_replay_requires_its_persisted_token_and_calls_no_model() {
+        let (scope, repository, service, model, execution_id, item_id) =
+            repair_fixture(1, false).await;
+        let item = repository
+            .get_item(&scope, execution_id, item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let token = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.step == ContentStep::Generate)
+            .unwrap()
+            .token;
+        let calls = model.calls.load(Ordering::SeqCst);
+        assert!(
+            service
+                .begin_generate(&scope, execution_id, item_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let replay = service
+            .finish_generate(
+                &scope,
+                execution_id,
+                item_id,
+                token,
+                geo_worker::ContentGenerateOutcome::Completed {
+                    text: "untrusted replay text".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(Some(replay.revision_id), item.current_revision_id);
+        assert_eq!(
+            service
+                .finish_generate(
+                    &scope,
+                    execution_id,
+                    item_id,
+                    Uuid::new_v4(),
+                    geo_worker::ContentGenerateOutcome::Completed { text: "{}".into() },
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(model.calls.load(Ordering::SeqCst), calls);
     }
 
     #[tokio::test]
@@ -3282,7 +3403,7 @@ mod tests {
         }));
         assert!(
             service
-                .generate(&scope, execution.execution_id, item.item_id)
+                .generate_fixture(&scope, execution.execution_id, item.item_id)
                 .await
                 .is_ok()
         );
@@ -3386,7 +3507,7 @@ mod tests {
                 "Public description"
             );
             let revision = service
-                .generate(&scope, execution.execution_id, item.item_id)
+                .generate_fixture(&scope, execution.execution_id, item.item_id)
                 .await
                 .unwrap();
             assert_eq!(revision.document.blocks[0].text, "Public description");
@@ -3396,7 +3517,7 @@ mod tests {
                 .unwrap();
             assert_eq!(checked.status, ContentItemStatus::Ready);
             service
-                .generate(&scope, execution.execution_id, item.item_id)
+                .generate_fixture(&scope, execution.execution_id, item.item_id)
                 .await
                 .unwrap();
             service
@@ -3492,7 +3613,7 @@ mod tests {
             .await
             .unwrap();
         let error = service
-            .generate(&scope, execution.execution_id, item_id)
+            .generate_fixture(&scope, execution.execution_id, item_id)
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::DependencyUnavailable);
@@ -3513,7 +3634,7 @@ mod tests {
                 .is_none()
         );
         service
-            .generate(&scope, execution.execution_id, item_id)
+            .generate_fixture(&scope, execution.execution_id, item_id)
             .await
             .unwrap();
         model.fail_first.store(true, Ordering::SeqCst);
@@ -3629,7 +3750,7 @@ mod tests {
         .with_model_provider(model.clone());
         assert_eq!(
             paused
-                .generate(&scope, execution.execution_id, item_id)
+                .generate_fixture(&scope, execution.execution_id, item_id)
                 .await
                 .unwrap_err()
                 .code,
@@ -3714,7 +3835,7 @@ mod tests {
             if index == 0 {
                 assert!(
                     service
-                        .generate(&scope, execution.execution_id, item.item_id)
+                        .generate_fixture(&scope, execution.execution_id, item.item_id)
                         .await
                         .is_err()
                 );
@@ -3729,7 +3850,7 @@ mod tests {
                 );
             } else {
                 service
-                    .generate(&scope, execution.execution_id, item.item_id)
+                    .generate_fixture(&scope, execution.execution_id, item.item_id)
                     .await
                     .unwrap();
                 assert_eq!(

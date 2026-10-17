@@ -25,16 +25,17 @@ use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
     ChannelTargetExecuteRequest, ContentCloseRequest, ContentDistributeReadRequest,
     ContentDistributeRequest, ContentDocumentReadRequest, ContentExecutionReadRequest,
-    ContentItemsReadRequest, ContentMediaBindRequest, ContentMediaInsertRequest,
-    ContentMediaListRequest, ContentPrepareRequest, ContentSourceReadRequest, ContentStartRequest,
-    ContentStepRequest, CreateQuestionSet, DistributionReadRequest, DistributionResumeRequest,
-    DistributionStartRequest, DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge,
-    HostOp, HostOpError, KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest,
-    KnowledgeTextReadRequest, KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest,
-    MeasurementOptionsRequest, MeasurementPlanCreateRequest, MeasurementPlanReadRequest,
-    ModelCompletionRequest, ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest,
-    ProjectStartRequest, PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest,
-    ReportGetRequest, ReportPreviewRequest, ReportReduceRequest, validate_question_create,
+    ContentGenerateFinishRequest, ContentItemsReadRequest, ContentMediaBindRequest,
+    ContentMediaInsertRequest, ContentMediaListRequest, ContentPrepareRequest,
+    ContentSourceReadRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
+    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
+    DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
+    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeTextReadRequest,
+    KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
+    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
+    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
+    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
+    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -196,10 +197,19 @@ project_op!(
     content_source_read,
     ContentSourceReadRequest::validate
 );
-content_step_op!(
-    op_host_content_generate_v1,
-    ContentGenerate,
-    content_generate
+project_op!(
+    op_host_content_generate_begin_v1,
+    ContentGenerateBegin,
+    ContentStepRequest,
+    content_generate_begin,
+    ContentStepRequest::validate
+);
+project_op!(
+    op_host_content_generate_finish_v1,
+    ContentGenerateFinish,
+    ContentGenerateFinishRequest,
+    content_generate_finish,
+    ContentGenerateFinishRequest::validate
 );
 content_step_op!(op_host_content_check_v1, ContentCheck, content_check);
 content_step_op!(op_host_content_repair_v1, ContentRepair, content_repair);
@@ -1108,7 +1118,8 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ContentItemsRead.op_name(),
     HostOp::ContentSourceRead.op_name(),
     HostOp::ContentPrepare.op_name(),
-    HostOp::ContentGenerate.op_name(),
+    HostOp::ContentGenerateBegin.op_name(),
+    HostOp::ContentGenerateFinish.op_name(),
     HostOp::ContentCheck.op_name(),
     HostOp::ContentRepair.op_name(),
     HostOp::ContentClose.op_name(),

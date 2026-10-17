@@ -17,7 +17,8 @@ use geo_domain::{
     settings_hash, start_request_hash,
 };
 use geo_worker::{
-    ContentCloseRequest, ContentExecutionReadRequest, ContentItemsReadRequest,
+    ContentCloseRequest, ContentExecutionReadRequest, ContentGenerateBeginResult,
+    ContentGenerateFinishRequest, ContentGenerateOutcome, ContentItemRef, ContentItemsReadRequest,
     ContentPrepareRequest, ContentSourceReadRequest, ContentStartRequest, ContentStepRequest,
     HostOpError, HostOpErrorCode, HostOps, ModelCompletion, ModelCompletionRequest,
 };
@@ -36,6 +37,47 @@ impl ContentWorkflowExecutor for AcceptedExecutor {
 }
 
 struct GroundedModel(AtomicUsize);
+
+async fn generate_selected(
+    host: &RepositoryHostOps,
+    scope: &TenantScope,
+    step: ContentStepRequest,
+) -> ContentItemRef {
+    let ContentGenerateBeginResult::Claimed { token, descriptor } = host
+        .content_generate_begin(scope, step.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("a prepared fixture must claim generation");
+    };
+    let output = host
+        .model_complete(
+            scope,
+            ModelCompletionRequest {
+                prompt: serde_json::json!({"evidence": descriptor.evidence.iter().map(|e| serde_json::json!({
+                    "chunk_id": e.reference.chunk_id, "quote": e.exact_quote
+                })).collect::<Vec<_>>()}).to_string(),
+                system: None,
+                model: None,
+                max_output_tokens: None,
+                messages: vec![],
+                tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    host.content_generate_finish(
+        scope,
+        ContentGenerateFinishRequest {
+            execution_id: step.execution_id,
+            item_id: step.item_id,
+            token,
+            outcome: ContentGenerateOutcome::Completed { text: output.text },
+        },
+    )
+    .await
+    .unwrap()
+}
 
 async fn selected_prepare(
     host: &RepositoryHostOps,
@@ -633,7 +675,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
     assert_eq!(prepared.status, ContentItemStatus::Prepared);
     let projected = serde_json::to_string(&prepared).unwrap();
     assert!(!projected.contains("Public description"));
-    let drafted = host.content_generate(&scope, step.clone()).await.unwrap();
+    let drafted = generate_selected(&host, &scope, step.clone()).await;
     assert_eq!(drafted.status, ContentItemStatus::Drafted);
     let ready = host.content_check(&scope, step).await.unwrap();
     assert_eq!(ready.status, ContentItemStatus::Ready);
@@ -644,9 +686,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
     host.content_prepare(&scope, selected_prepare(&host, &scope, &second_step).await)
         .await
         .unwrap();
-    host.content_generate(&scope, second_step.clone())
-        .await
-        .unwrap();
+    generate_selected(&host, &scope, second_step.clone()).await;
     host.content_check(&scope, second_step).await.unwrap();
     assert_eq!(model.0.load(Ordering::SeqCst), 4);
     let handoff = host
@@ -876,9 +916,7 @@ async fn two_automatic_content_cycles_reuse_the_same_checked_revision_without_mo
     host.content_prepare(&scope, selected_prepare(&host, &scope, &first_step).await)
         .await
         .unwrap();
-    host.content_generate(&scope, first_step.clone())
-        .await
-        .unwrap();
+    generate_selected(&host, &scope, first_step.clone()).await;
     host.content_check(&scope, first_step).await.unwrap();
     let first_checked = repository
         .get_item(&scope, first.execution_id, first_item.item_id)
