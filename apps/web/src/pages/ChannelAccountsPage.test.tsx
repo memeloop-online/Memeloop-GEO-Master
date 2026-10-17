@@ -370,6 +370,97 @@ afterEach(() => {
   setUnauthorizedHandler(undefined);
 });
 
+describe("remote login runtime errors", () => {
+  const cases = [
+    {
+      code: "capability_missing",
+      details: { reason: "browser_login_runtime_missing" },
+      message: "browser login runtime is not configured",
+      zh: "远程登录尚未配置。请联系管理员。",
+      en: "Remote sign-in is not configured. Contact your administrator.",
+    },
+    {
+      code: "dependency_unavailable",
+      details: { reason: "desktop_unavailable" },
+      message: "browser desktop temporarily unavailable",
+      zh: "远程登录暂不可用。请稍后重试。",
+      en: "Remote sign-in is temporarily unavailable. Please try again.",
+    },
+    {
+      code: "capability_missing",
+      message: "channel secret key is not configured",
+      zh: "channel secret key is not configured",
+      en: "channel secret key is not configured",
+    },
+    {
+      code: "dependency_unavailable",
+      message: "browser runner unavailable",
+      zh: "browser runner unavailable",
+      en: "browser runner unavailable",
+    },
+  ];
+
+  for (const operator of [false, true]) {
+    for (const locale of ["zh", "en"] as const) {
+      it.each(cases)(
+        `shows exact start error without false deployment diagnosis (operator=${operator}, locale=${locale}, code=$code)`,
+        async (failure) => {
+          await i18n.changeLanguage(locale === "zh" ? "zh-CN" : "en");
+          const { fetchMock } = mockApi([], operator);
+          const original = fetchMock.getMockImplementation()!;
+          fetchMock.mockImplementation((request, init) => {
+            if (
+              new URL(String(request), "http://localhost").pathname.endsWith(
+                "/channel-login-sessions",
+              ) &&
+              init?.method === "POST"
+            )
+              return Promise.resolve(response(failure, 503));
+            return original(request, init);
+          });
+          operator ? renderOperator() : renderPage("connect");
+          await userEvent.click(
+            await screen.findByRole("button", {
+              name: operator
+                ? "创建并登录总部账号"
+                : locale === "zh"
+                  ? "启动远程登录"
+                  : "Start remote sign-in",
+            }),
+          );
+          expect(await screen.findByText(failure[locale])).toBeVisible();
+          expect(screen.queryByText(/Linux|WSL2/)).toBeNull();
+          expect(desktopConnections).toHaveLength(0);
+        },
+      );
+    }
+
+    it.each(cases.slice(0, 2))(
+      `localizes desktop authorization errors (operator=${operator}, code=$code)`,
+      async (failure) => {
+        const { fetchMock } = mockApi([], operator);
+        const original = fetchMock.getMockImplementation()!;
+        fetchMock.mockImplementation((request, init) => {
+          if (String(request).includes("/desktop-authorization"))
+            return Promise.resolve(response(failure, 503));
+          return original(request, init);
+        });
+        operator ? renderOperator() : renderPage("connect");
+        await userEvent.click(
+          await screen.findByRole("button", {
+            name: operator ? "创建并登录总部账号" : "启动远程登录",
+          }),
+        );
+        expect(await screen.findByText(failure.zh)).toBeVisible();
+        expect(desktopConnections).toHaveLength(0);
+        expect(
+          screen.getByRole("button", { name: "重新连接画面" }),
+        ).toBeEnabled();
+      },
+    );
+  }
+});
+
 describe("persisted queue remote login adapter", () => {
   function withQueue(completionStatus = 200) {
     const fixture = mockApi([account], true);

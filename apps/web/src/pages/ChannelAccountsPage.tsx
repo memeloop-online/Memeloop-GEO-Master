@@ -30,6 +30,7 @@ import i18n from "../i18n";
 import { useAuth } from "../auth/AuthProvider";
 import { queryScopeFor } from "../auth/types";
 import { ApiError } from "../api/client";
+import { remoteLoginErrorMessage } from "../api/remoteLoginError";
 import {
   assignPoolAccount,
   cancelPoolLogin,
@@ -240,9 +241,10 @@ function ConnectorCapabilityRow({
 }
 
 function errorText(error: unknown) {
-  return error instanceof Error
-    ? error.message
-    : i18n.t("account.operationFailed");
+  return (
+    remoteLoginErrorMessage(error) ??
+    (error instanceof Error ? error.message : i18n.t("account.operationFailed"))
+  );
 }
 
 function LoginStarting() {

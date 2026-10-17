@@ -265,7 +265,7 @@ test("auth, fixed platform list, and retired control routes", async () => {
       session_id: "headless-login",
       platform: "fixture",
     }),
-    { status: 503, body: { error: "capability_missing" } },
+    { status: 503, body: { error: "browser_login_runtime_missing" } },
   );
   assert.deepEqual(
     await request("/v1/sessions", "POST", {
@@ -433,7 +433,7 @@ test("without desktop runtime or saved state, login fails before launching a bro
   try {
     await assert.rejects(
       headless.create({ session_id: "missing-state", platform: "fixture" }),
-      (error) => error.code === "capability_missing",
+      (error) => error.code === "browser_login_runtime_missing",
     );
     assert.equal(launches, 0);
   } finally {
