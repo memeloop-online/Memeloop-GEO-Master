@@ -91,7 +91,7 @@ async fn fixed_fields_cover_success_error_and_dropped_future_without_payloads(ou
     }
 }
 
-async fn read_headers(stream: &mut TcpStream) {
+async fn read_headers(stream: &mut TcpStream) -> usize {
     let mut bytes = Vec::new();
     let mut buffer = [0; 1024];
     while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -100,25 +100,37 @@ async fn read_headers(stream: &mut TcpStream) {
         bytes.extend_from_slice(&buffer[..count]);
         assert!(bytes.len() < 16 * 1024);
     }
+    String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().unwrap())
+        })
+        .unwrap()
 }
 
 async fn diagnostics_distinguish_stalled_headers_and_body_without_request_payloads(
     output: &Capture,
 ) {
-    for send_headers in [false, true] {
+    for (send_headers, close_response) in [(false, false), (true, false), (false, true)] {
         output.0.lock().unwrap().clear();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+        let (payload_tx, payload_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            read_headers(&mut stream).await;
+            payload_tx.send(read_headers(&mut stream).await).unwrap();
             if send_headers {
                 stream
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nprivate-body-canary")
                     .await
                     .unwrap();
             }
-            std::future::pending::<()>().await;
+            if !close_response {
+                std::future::pending::<()>().await;
+            }
         });
         // Exercise the public client instead of exposing TransportRequest's
         // private credential field solely for this integration test.
@@ -149,12 +161,45 @@ async fn diagnostics_distinguish_stalled_headers_and_body_without_request_payloa
                 RequestControl::new(Duration::from_millis(100)).unwrap(),
             )
             .await;
-        assert_eq!(result.unwrap_err(), ProviderError::Timeout);
+        let expected = if close_response {
+            ProviderError::Transport("HTTP request failed".into())
+        } else {
+            ProviderError::Timeout
+        };
+        assert_eq!(result.unwrap_err(), expected);
+        let payload_bytes = payload_rx.await.unwrap();
         server.abort();
         let text = output.text();
         assert!(text.contains("HttpHeaders"));
         assert_eq!(text.contains("FullBody"), send_headers);
-        assert!(text.contains("unfinished"));
+        assert!(text.contains(if close_response {
+            "error"
+        } else {
+            "unfinished"
+        }));
+        assert!(text.contains(&format!("request_payload_bytes={payload_bytes}")));
+        let timeout_ms: u64 = text
+            .split("outer_timeout_ms=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=100).contains(&timeout_ms));
+        if close_response {
+            for field in [
+                "connect=false",
+                "timeout=false",
+                "request=true",
+                "body=false",
+                "decode=false",
+                "io_kind=None",
+            ] {
+                assert!(text.contains(field), "missing {field}");
+            }
+        }
         assert!(!text.contains(&base_url));
         assert!(!text.contains("test-only-bearer-value"));
         assert!(!text.contains("private-body-canary"));

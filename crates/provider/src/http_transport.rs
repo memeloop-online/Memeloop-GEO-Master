@@ -3,6 +3,7 @@
 use crate::diagnostics::{ModelPhase, ModelPhaseTimer};
 use async_trait::async_trait;
 use reqwest::{Client, redirect::Policy};
+use std::error::Error;
 use tokio::time::timeout;
 use url::Url;
 
@@ -70,11 +71,22 @@ impl Transport for HttpTransport {
                 &self.client
             };
             let headers_phase = ModelPhaseTimer::start(ModelPhase::HttpHeaders);
-            let response = client
+            let request = client
                 .post(url)
                 .bearer_auth(request.bearer_token())
                 .json(&request.body)
-                .send()
+                .build()
+                .map_err(|error| transport_failure(&error, ModelPhase::HttpHeaders))?;
+            tracing::info!(
+                request_payload_bytes = request
+                    .body()
+                    .and_then(|body| body.as_bytes())
+                    .map(|bytes| bytes.len()),
+                outer_timeout_ms = control.timeout().as_millis() as u64,
+                "model HTTP request prepared"
+            );
+            let response = client
+                .execute(request)
                 .await
                 .map_err(|error| transport_failure(&error, ModelPhase::HttpHeaders));
             headers_phase.finish(response.is_ok());
@@ -117,7 +129,8 @@ impl Transport for HttpTransport {
 
 fn transport_failure(error: &reqwest::Error, phase: ModelPhase) -> ProviderError {
     // reqwest error text and its source chain can contain URLs and credentials.
-    // Only fixed classification flags belong in operational diagnostics.
+    // Only classification flags, I/O kinds and OS error numbers are safe here.
+    let io = io_failure(error);
     tracing::warn!(
         phase = ?phase,
         connect = error.is_connect(),
@@ -125,6 +138,8 @@ fn transport_failure(error: &reqwest::Error, phase: ModelPhase) -> ProviderError
         request = error.is_request(),
         body = error.is_body(),
         decode = error.is_decode(),
+        io_kind = ?io.map(|(kind, _)| kind),
+        raw_os_error = io.and_then(|(_, code)| code),
         "model HTTP transport failed"
     );
     let message = match phase {
@@ -132,6 +147,19 @@ fn transport_failure(error: &reqwest::Error, phase: ModelPhase) -> ProviderError
         _ => "HTTP request failed",
     };
     ProviderError::Transport(message.into())
+}
+
+fn io_failure(error: &(dyn Error + 'static)) -> Option<(std::io::ErrorKind, Option<i32>)> {
+    let mut source = Some(error);
+    // Error implementations may expose unusually deep or cyclic source chains.
+    for _ in 0..16 {
+        let current = source?;
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            return Some((io.kind(), io.raw_os_error()));
+        }
+        source = current.source();
+    }
+    None
 }
 
 fn response_too_large() -> ProviderError {
@@ -154,6 +182,62 @@ mod tests {
         CompletionRequest, Message, ProviderClient, ProviderSurface, ResolvedToken, SearchMode,
         SecretRef, TokenCenter,
     };
+
+    #[derive(Debug)]
+    struct ErrorSource(Option<Box<dyn Error + Send + Sync>>);
+
+    impl std::fmt::Display for ErrorSource {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("https://example.invalid/?token=synthetic-private-value")
+        }
+    }
+
+    impl Error for ErrorSource {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.0.as_deref().map(|source| source as &dyn Error)
+        }
+    }
+
+    #[test]
+    fn io_failure_extracts_only_safe_fields_from_sensitive_source_chain() {
+        let source = ErrorSource(Some(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Authorization: Bearer synthetic-private-value",
+        ))));
+        let diagnostic = io_failure(&source);
+        assert_eq!(diagnostic, Some((std::io::ErrorKind::TimedOut, None)));
+        let rendered = format!("{diagnostic:?}");
+        assert!(!rendered.contains("synthetic-private-value"));
+        assert!(!rendered.contains("example.invalid"));
+
+        let os_error = std::io::Error::from_raw_os_error(123);
+        assert_eq!(io_failure(&os_error), Some((os_error.kind(), Some(123))));
+    }
+
+    #[test]
+    fn io_failure_handles_unknown_deep_and_cyclic_sources() {
+        assert_eq!(io_failure(&ErrorSource(None)), None);
+        let mut source: Box<dyn Error + Send + Sync> =
+            Box::new(std::io::Error::from_raw_os_error(123));
+        for _ in 0..16 {
+            source = Box::new(ErrorSource(Some(source)));
+        }
+        assert_eq!(io_failure(source.as_ref()), None);
+
+        #[derive(Debug)]
+        struct CyclicError;
+        impl std::fmt::Display for CyclicError {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("diagnostics must not format source errors");
+            }
+        }
+        impl Error for CyclicError {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(self)
+            }
+        }
+        assert_eq!(io_failure(&CyclicError), None);
+    }
 
     fn request(url: String) -> TransportRequest {
         TransportRequest {
