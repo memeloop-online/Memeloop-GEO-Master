@@ -29,6 +29,154 @@ async fn authenticated_body(request: Request) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+#[test]
+fn unconfigured_browser_has_specific_runtime_reason() {
+    let error = crate::channels::ChannelService::development()
+        .browser()
+        .err()
+        .expect("missing browser");
+    assert_eq!(error.code, ErrorCode::CapabilityMissing);
+    assert_eq!(
+        error.details,
+        Some(json!({"reason": "browser_login_runtime_missing"}))
+    );
+}
+
+#[tokio::test]
+async fn runner_errors_distinguish_missing_runtime_from_temporary_desktop_failure() {
+    for (status, body, code, reason) in [
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "browser_login_runtime_missing"}).to_string(),
+            ErrorCode::CapabilityMissing,
+            Some("browser_login_runtime_missing"),
+        ),
+        (
+            StatusCode::CONFLICT,
+            json!({"error": "desktop_unavailable"}).to_string(),
+            ErrorCode::DependencyUnavailable,
+            Some("desktop_unavailable"),
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "capability_missing"}).to_string(),
+            ErrorCode::CapabilityMissing,
+            None,
+        ),
+        (
+            StatusCode::CONFLICT,
+            json!({"error": "login_required"}).to_string(),
+            ErrorCode::Conflict,
+            None,
+        ),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "account_mismatch"}).to_string(),
+            ErrorCode::Conflict,
+            None,
+        ),
+        (
+            StatusCode::NOT_FOUND,
+            json!({"error": "session_not_found"}).to_string(),
+            ErrorCode::NotFound,
+            None,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{".into(),
+            ErrorCode::DependencyUnavailable,
+            None,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "browser_login_runtime_missing", "padding": "x".repeat(4096)})
+                .to_string(),
+            ErrorCode::DependencyUnavailable,
+            None,
+        ),
+    ] {
+        let app = Router::new().route(
+            "/v1/lifecycle",
+            get(move || {
+                let body = body.clone();
+                async move { (status, body) }
+            }),
+        );
+        let (bridge, server) = serve(app).await;
+        let error = bridge.lifecycle_generation().await.unwrap_err();
+        assert_eq!(error.code, code);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details["reason"].as_str()),
+            reason
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn desktop_not_ready_is_temporary_not_missing() {
+    let session_id = Uuid::new_v4();
+    let app = Router::new().route(
+        &format!("/v1/sessions/{session_id}/desktop-readiness"),
+        get(|| async { axum::Json(json!({"ready": false})) }),
+    );
+    let (bridge, server) = serve(app).await;
+    let error = bridge.desktop_ready(session_id).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::DependencyUnavailable);
+    assert_eq!(
+        error.details,
+        Some(json!({"reason": "desktop_unavailable"}))
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn pinned_start_preserves_runtime_error_when_pinned_cleanup_fails() {
+    let session_id = Uuid::new_v4();
+    let generation = Uuid::new_v4();
+    let disposals = Arc::new(AtomicUsize::new(0));
+    let observed = disposals.clone();
+    let app = Router::new()
+        .route(
+            "/v1/sessions",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({"error": "browser_login_runtime_missing"})),
+                )
+            }),
+        )
+        .route(
+            &format!("/v1/sessions/{session_id}/dispose"),
+            post(move |request: Request| {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        authenticated_body(request).await,
+                        json!({"expected_generation": generation})
+                    );
+                    StatusCode::CONFLICT
+                }
+            }),
+        );
+    let (bridge, server) = serve(app).await;
+    let error = bridge
+        .start_in_generation(session_id, generation, "fixture", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::CapabilityMissing);
+    assert_eq!(
+        error.details,
+        Some(json!({"reason": "browser_login_runtime_missing"}))
+    );
+    assert_eq!(disposals.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
 #[tokio::test]
 async fn lifecycle_generation_requires_authenticated_typed_receipt() {
     let generation = Uuid::new_v4();

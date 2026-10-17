@@ -97,9 +97,10 @@ impl ChannelService {
     }
 
     pub(crate) fn browser(&self) -> Result<&BrowserBridge, AppError> {
-        self.browser
-            .as_ref()
-            .ok_or_else(|| AppError::capability_missing("browser login runner is not configured"))
+        self.browser.as_ref().ok_or_else(|| {
+            AppError::capability_missing("browser login runner is not configured")
+                .with_details(serde_json::json!({"reason": "browser_login_runtime_missing"}))
+        })
     }
 
     fn aad(scope: &TenantScope, account_id: Uuid, purpose: &str) -> Vec<u8> {

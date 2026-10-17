@@ -79,7 +79,8 @@ impl BrowserBridge {
             return Err(AppError::new(
                 ErrorCode::DependencyUnavailable,
                 "browser desktop unavailable",
-            ));
+            )
+            .with_details(serde_json::json!({"reason": "desktop_unavailable"})));
         }
         Ok(())
     }
@@ -244,11 +245,52 @@ impl BrowserBridge {
         )
     }
 
+    async fn runner_error_code(response: &mut reqwest::Response) -> Option<String> {
+        #[derive(Deserialize)]
+        struct RunnerError {
+            error: String,
+        }
+        const MAX_ERROR_BYTES: usize = 4096;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if body.len().saturating_add(chunk.len()) > MAX_ERROR_BYTES {
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice::<RunnerError>(&body)
+            .ok()
+            .map(|error| error.error)
+    }
+
     async fn response<T: serde::de::DeserializeOwned>(
         mut response: reqwest::Response,
     ) -> Result<T, AppError> {
         let status = response.status();
         if !status.is_success() {
+            // Only explicit runner signals refine the status fallback. A generic
+            // missing capability does not diagnose an absent login runtime.
+            match Self::runner_error_code(&mut response).await.as_deref() {
+                Some("browser_login_runtime_missing") => {
+                    return Err(AppError::capability_missing(
+                        "browser login runtime is not configured",
+                    )
+                    .with_details(serde_json::json!({"reason": "browser_login_runtime_missing"})));
+                }
+                Some("desktop_unavailable") => {
+                    return Err(AppError::new(
+                        ErrorCode::DependencyUnavailable,
+                        "browser desktop temporarily unavailable",
+                    )
+                    .with_details(serde_json::json!({"reason": "desktop_unavailable"})));
+                }
+                Some("capability_missing") => {
+                    return Err(AppError::capability_missing(
+                        "browser capability unavailable",
+                    ));
+                }
+                _ => {}
+            }
             return Err(
                 if status == StatusCode::CONFLICT || status == StatusCode::UNPROCESSABLE_ENTITY {
                     AppError::conflict("browser login has not verified the account identity")

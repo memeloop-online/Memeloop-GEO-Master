@@ -347,7 +347,7 @@ export function createRunner(options = {}) {
     const proxy = parseProxy(input.proxy);
     const storageState = parseState(input.storage_state);
     if (!desktop && !storageState) {
-      throw new RunnerError(503, "capability_missing");
+      throw new RunnerError(503, "browser_login_runtime_missing");
     }
     const acquisition = Promise.withResolvers();
     const record = {

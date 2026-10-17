@@ -3,6 +3,7 @@ import { Button, Spinner } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
 import type RFB from "@novnc/novnc";
 import type { DesktopAuthorization } from "../api/channels";
+import { remoteLoginErrorMessage } from "../api/remoteLoginError";
 
 function desktopUrl(authorization: DesktopAuthorization): string {
   const { websocket_path: path, protocol } = authorization;
@@ -79,10 +80,10 @@ export function RemoteDesktop({
       rfb.addEventListener("securityfailure", () => {
         if (generation.current === attempt) setError(t("remoteDesktop.failed"));
       });
-    } catch {
+    } catch (cause) {
       if (generation.current === attempt) {
         setState("disconnected");
-        setError(t("remoteDesktop.failed"));
+        setError(remoteLoginErrorMessage(cause) ?? t("remoteDesktop.failed"));
       }
     }
   }

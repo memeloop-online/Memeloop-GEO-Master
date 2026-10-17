@@ -57,6 +57,8 @@ const accounts = {
         ended: "登录会话已结束。请关闭后重新连接。",
         connected: "账号已连接。",
         failed: "远程登录操作未完成",
+        runtimeMissingDetail: "远程登录尚未配置。请联系管理员。",
+        temporarilyUnavailableDetail: "远程登录暂不可用。请稍后重试。",
       },
       channels: {
         eyebrow: "账号与资源",
@@ -190,6 +192,10 @@ const accounts = {
         ended: "Sign-in session ended. Close it and reconnect.",
         connected: "Account connected.",
         failed: "Remote sign-in did not finish",
+        runtimeMissingDetail:
+          "Remote sign-in is not configured. Contact your administrator.",
+        temporarilyUnavailableDetail:
+          "Remote sign-in is temporarily unavailable. Please try again.",
       },
       channels: {
         eyebrow: "Accounts & resources",
