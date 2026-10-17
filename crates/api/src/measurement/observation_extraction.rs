@@ -5,9 +5,9 @@ use std::{sync::Arc, time::Duration};
 use chrono::Utc;
 use geo_domain::{
     AppError, AutomaticExtractionAdmission, ObservationAnalysisResult,
-    ObservationCaptureRepository, ObservationCaptureSnapshot, ObservationExtractionClaim,
-    ObservationExtractionIntent, ObservationExtractionInterruption,
-    ObservationExtractionRepository, ObservationExtractionRequest, ObservationExtractionResponse,
+    ObservationCaptureRepository, ObservationExtractionClaim, ObservationExtractionIntent,
+    ObservationExtractionInterruption, ObservationExtractionRepository,
+    ObservationExtractionRequest, ObservationExtractionResponse,
     ObservationExtractionResponseDisposition, ObservationExtractionState, ProjectAiUsage,
     TenantScope,
 };
@@ -135,12 +135,12 @@ impl ObservationExtractionService {
         }
         let capture = self
             .captures
-            .get(scope, capture_id)
+            .get_source(scope, capture_id)
             .await?
             .ok_or_else(|| AppError::not_found("extraction source not found"))?;
         let request = ObservationExtractionRequest {
-            target_id: capture.input.target_id,
-            attempt_id: capture.input.attempt_id,
+            target_id: capture.target_id,
+            attempt_id: capture.attempt_id,
             source_capture_id: Some(capture_id),
             source_evidence_index: None,
             manual_revision_id: None,
@@ -219,7 +219,7 @@ impl ObservationExtractionService {
                 } else {
                     let capture =
                         self.captures
-                            .get(
+                            .get_source(
                                 scope,
                                 claim.intent.request.source_capture_id.ok_or_else(|| {
                                     AppError::conflict("extraction capture required")
@@ -228,12 +228,7 @@ impl ObservationExtractionService {
                             .await?
                             .ok_or_else(|| AppError::not_found("extraction source not found"))?;
                     claim.intent.request.validate_source(scope, &capture)?;
-                    let ObservationCaptureSnapshot::Source { source_json, .. } =
-                        capture.input.snapshot
-                    else {
-                        return Err(AppError::conflict("extraction requires source capture"));
-                    };
-                    source_json
+                    capture.source_json
                 };
                 let prompt = crate::observation_ai_callback::extraction_prompt_versioned(
                     &source_json,
@@ -435,7 +430,10 @@ impl SourceAdmissionScan {
         for item in items {
             self.after = Some(item.capture_id);
             let outcome = async {
-                let Some(capture) = service.captures.get(&item.scope, item.capture_id).await?
+                let Some(capture) = service
+                    .captures
+                    .get_source(&item.scope, item.capture_id)
+                    .await?
                 else {
                     return Ok::<_, AppError>(());
                 };
@@ -445,16 +443,11 @@ impl SourceAdmissionScan {
                 {
                     return Ok(());
                 }
-                let ObservationCaptureSnapshot::Source { source_sha256, .. } =
-                    &capture.input.snapshot
-                else {
-                    return Ok(());
-                };
                 service
                     .enqueue_source(
                         &item.scope,
                         item.capture_id,
-                        source_sha256,
+                        &capture.source_sha256,
                         "geo.observation.extract.v4",
                     )
                     .await?;
@@ -539,7 +532,7 @@ mod tests {
     use crate::{ModelProviderBridge, ProjectAiSettingsService};
     use geo_domain::{
         MemoryObservationExtractionRepository, ObservationAnalysisOutcome, ObservationCapture,
-        ObservationCaptureInput, ObservationCaptureReceipt,
+        ObservationCaptureInput, ObservationCaptureReceipt, ObservationCaptureSnapshot,
     };
     use geo_worker::{HostOpError, ModelCompletion};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -683,6 +676,17 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ObservationCaptureRepository for Captures {
+        async fn get_source(
+            &self,
+            scope: &TenantScope,
+            capture_id: Uuid,
+        ) -> Result<Option<geo_domain::ObservationCaptureSource>, AppError> {
+            self.get(scope, capture_id)
+                .await?
+                .as_ref()
+                .map(geo_domain::ObservationCaptureSource::try_from)
+                .transpose()
+        }
         async fn scan_sources(
             &self,
             _: chrono::DateTime<Utc>,

@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::{
     AppError, ChannelAttempt, ChannelJobRepository, ChannelOutcomeStatus, ChannelTargetInput,
-    ChannelTargetView, ObservationCapture, ObservationCaptureRepository,
-    ObservationCaptureSnapshot, TenantScope, sha256_hex,
+    ChannelTargetView, ObservationCaptureRepository, ObservationCaptureSource, TenantScope,
+    sha256_hex,
 };
 
 pub const MAX_ANALYSIS_CANDIDATE_BYTES: usize = 150_000;
@@ -372,7 +372,7 @@ pub fn observation_analysis_source_json(
     scope: &TenantScope,
     request: &ObservationAnalysisRequest,
     target: &ChannelTargetView,
-    capture: Option<&ObservationCapture>,
+    capture: Option<&ObservationCaptureSource>,
 ) -> Result<String, AppError> {
     if scope.project_id.is_none() {
         return Err(AppError::forbidden("project scope required"));
@@ -403,20 +403,13 @@ pub fn observation_analysis_source_json(
         ObservationAnalysisSource::Capture { capture_id } => {
             let capture = capture
                 .filter(|capture| {
-                    capture.input.capture_id == capture_id
-                        && capture.input.target_id == request.target_id
-                        && capture.input.attempt_id == request.attempt_id
-                        && capture.input.account_id == target.target.input.account_id()
+                    capture.capture_id == capture_id
+                        && capture.target_id == request.target_id
+                        && capture.attempt_id == request.attempt_id
+                        && capture.account_id == target.target.input.account_id()
                 })
                 .ok_or_else(|| AppError::not_found("analysis source capture not found"))?;
-            if capture.receipt.capture_id != capture.input.capture_id
-                || capture.receipt.schema_version != 1
-                || capture.input.validate(scope)? != capture.receipt.digest_sha256
-            {
-                return Err(AppError::conflict(
-                    "analysis source receipt digest mismatch",
-                ));
-            }
+            capture.validate(scope)?;
             // An unavailable runner response is conservatively marked fixture
             // by dispatch. Only an independently persisted, identity-bound
             // checkpoint may recover interpretation from an explicitly unknown
@@ -446,26 +439,17 @@ pub fn observation_analysis_source_json(
             }
             if outcome.fixture
                 && (!receipt_allows_saved_source
-                    || !capture.input.original_identity.as_ref().is_some_and(|identity| {
+                    || !capture.original_identity.as_ref().is_some_and(|identity| {
                     matches!(&target.target.input, ChannelTargetInput::Measure { provider, .. }
                         if identity.provider == *provider && !identity.platform_account_id.is_empty())
                 }))
             {
                 return Err(AppError::conflict("analysis source provenance unavailable"));
             }
-            let ObservationCaptureSnapshot::Source {
-                source_json,
-                source_sha256,
-            } = &capture.input.snapshot
-            else {
-                return Err(AppError::invalid_request(
-                    "analysis requires a source capture",
-                ));
-            };
             (
-                source_json.clone(),
-                source_sha256.clone(),
-                capture.input.observed_at,
+                capture.source_json.clone(),
+                capture.source_sha256.clone(),
+                capture.observed_at,
             )
         }
         ObservationAnalysisSource::AttemptEvidence { evidence_index } => {
@@ -625,7 +609,7 @@ impl MemoryObservationAnalysisRepository {
         let target = self.jobs.get_target(scope, request.target_id).await?;
         let capture = match request.source {
             ObservationAnalysisSource::Capture { capture_id } => {
-                self.captures.get(scope, capture_id).await?
+                self.captures.get_source(scope, capture_id).await?
             }
             ObservationAnalysisSource::AttemptEvidence { .. } => None,
         };
@@ -751,7 +735,7 @@ impl MemoryObservationAnalysisRepository {
                         .await?;
                     let capture = match revision.request.source {
                         ObservationAnalysisSource::Capture { capture_id } => {
-                            self.captures.get(scope, capture_id).await?
+                            self.captures.get_source(scope, capture_id).await?
                         }
                         ObservationAnalysisSource::AttemptEvidence { .. } => None,
                     };
@@ -821,7 +805,7 @@ impl ObservationAnalysisRepository for MemoryObservationAnalysisRepository {
         let target = self.jobs.get_target(scope, request.target_id).await?;
         let capture = match request.source {
             ObservationAnalysisSource::Capture { capture_id } => {
-                self.captures.get(scope, capture_id).await?
+                self.captures.get_source(scope, capture_id).await?
             }
             ObservationAnalysisSource::AttemptEvidence { .. } => None,
         };
@@ -972,10 +956,23 @@ mod tests {
     use super::*;
     use crate::{
         ChannelOutcome, ChannelOutcomeStatus, ChannelTarget, ErrorCode, MemoryChannelJobRepository,
-        MemoryObservationCaptureRepository, ObservationCaptureInput, StandaloneMeasurementPlan,
+        MemoryObservationCaptureRepository, ObservationCapture, ObservationCaptureInput,
+        ObservationCaptureSnapshot, StandaloneMeasurementPlan,
     };
     use chrono::Duration;
     use serde_json::json;
+
+    fn observation_analysis_source_json(
+        scope: &TenantScope,
+        request: &ObservationAnalysisRequest,
+        target: &ChannelTargetView,
+        capture: Option<&ObservationCapture>,
+    ) -> Result<String, AppError> {
+        let source = capture
+            .map(ObservationCaptureSource::try_from)
+            .transpose()?;
+        super::observation_analysis_source_json(scope, request, target, source.as_ref())
+    }
 
     struct Fixture {
         scope: TenantScope,
@@ -1935,7 +1932,11 @@ mod tests {
             observation_analysis_source_json(&f.scope, &capture_request, &target, Some(&capture))
                 .is_ok()
         );
-        capture.receipt.digest_sha256 = "0".repeat(64);
+        let ObservationCaptureSnapshot::Source { source_json, .. } = &mut capture.input.snapshot
+        else {
+            unreachable!()
+        };
+        source_json.push(' ');
         assert!(
             observation_analysis_source_json(&f.scope, &capture_request, &target, Some(&capture))
                 .is_err()
@@ -2121,7 +2122,7 @@ mod tests {
                 .is_err()
         );
         for field in [
-            "capture", "account", "attempt", "target", "provider", "receipt", "schema",
+            "capture", "account", "attempt", "target", "provider", "receipt",
         ] {
             let mut rebound = capture.clone();
             match field {
@@ -2133,7 +2134,6 @@ mod tests {
                     rebound.input.original_identity.as_mut().unwrap().provider = "other".into()
                 }
                 "receipt" => rebound.receipt.capture_id = Uuid::new_v4(),
-                "schema" => rebound.receipt.schema_version = 99,
                 _ => unreachable!(),
             }
             rebound.receipt.digest_sha256 = rebound.input.validate(&f.scope).unwrap();

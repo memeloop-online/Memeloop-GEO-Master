@@ -9,8 +9,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    AppError, ObservationAnalysisResult, ObservationCapture, ObservationCaptureRepository,
-    ObservationCaptureSnapshot, TenantScope, sha256_hex,
+    AppError, ObservationAnalysisResult, ObservationCaptureRepository, ObservationCaptureSource,
+    TenantScope, sha256_hex,
 };
 
 pub const MAX_EXTRACTION_MODEL_TEXT_BYTES: usize = 2_000_000;
@@ -102,25 +102,14 @@ impl ObservationExtractionRequest {
     pub fn validate_source(
         &self,
         scope: &TenantScope,
-        capture: &ObservationCapture,
+        capture: &ObservationCaptureSource,
     ) -> Result<(), AppError> {
         self.intent_key(scope)?;
-        let ObservationCaptureSnapshot::Source {
-            source_json,
-            source_sha256,
-        } = &capture.input.snapshot
-        else {
-            return Err(AppError::conflict("extraction requires source capture"));
-        };
-        if Some(capture.input.capture_id) != self.source_capture_id
-            || Some(capture.receipt.capture_id) != self.source_capture_id
-            || capture.input.target_id != self.target_id
-            || capture.input.attempt_id != self.attempt_id
-            || capture.receipt.schema_version != 1
-            || capture.input.ordinal != 0
-            || capture.input.validate(scope)? != capture.receipt.digest_sha256
-            || source_sha256 != &self.source_sha256
-            || sha256_hex(source_json.as_bytes()) != self.source_sha256
+        capture.validate(scope)?;
+        if Some(capture.capture_id) != self.source_capture_id
+            || capture.target_id != self.target_id
+            || capture.attempt_id != self.attempt_id
+            || capture.source_sha256 != self.source_sha256
         {
             return Err(AppError::conflict("extraction source binding differs"));
         }
@@ -625,7 +614,7 @@ impl ObservationExtractionRepository for MemoryObservationExtractionRepository {
         let key = request.intent_key(scope)?;
         let capture = self
             .captures
-            .get(
+            .get_source(
                 scope,
                 request
                     .source_capture_id
@@ -929,7 +918,8 @@ mod tests {
     use super::*;
     use crate::{
         MemoryChannelJobRepository, MemoryObservationCaptureRepository, ObservationAnalysisOutcome,
-        ObservationCaptureInput, ObservationCaptureReceipt,
+        ObservationCapture, ObservationCaptureInput, ObservationCaptureReceipt,
+        ObservationCaptureSnapshot,
     };
 
     fn scope() -> TenantScope {
@@ -1001,6 +991,17 @@ mod tests {
             _input: ObservationCaptureInput,
         ) -> Result<ObservationCaptureReceipt, AppError> {
             panic!("discovery must not write captures")
+        }
+        async fn get_source(
+            &self,
+            scope: &TenantScope,
+            capture_id: Uuid,
+        ) -> Result<Option<crate::ObservationCaptureSource>, AppError> {
+            self.get(scope, capture_id)
+                .await?
+                .as_ref()
+                .map(crate::ObservationCaptureSource::try_from)
+                .transpose()
         }
         async fn get(
             &self,
@@ -1376,12 +1377,13 @@ mod tests {
             },
             input,
         };
+        let capture = ObservationCaptureSource::try_from(&capture).unwrap();
         request.validate_source(&scope, &capture).unwrap();
         let mut changed = request.clone();
         changed.attempt_id = Uuid::new_v4();
         assert!(changed.validate_source(&scope, &capture).is_err());
         let mut tampered = capture.clone();
-        tampered.receipt.digest_sha256 = sha256_hex(b"tampered");
+        tampered.source_json.push(' ');
         assert!(request.validate_source(&scope, &tampered).is_err());
     }
     #[tokio::test]

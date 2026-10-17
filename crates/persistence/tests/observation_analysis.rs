@@ -148,7 +148,7 @@ async fn durable_analysis_and_original_evidence_remain_scoped() {
         .await
         .unwrap();
     assert_eq!(saved_sources.len(), 1);
-    assert_eq!(saved_sources[0].input.capture_id, capture_id);
+    assert_eq!(saved_sources[0].capture_id, capture_id);
     assert!(
         captures
             .list_sources_for_attempt(&other, target_id, attempt_id)

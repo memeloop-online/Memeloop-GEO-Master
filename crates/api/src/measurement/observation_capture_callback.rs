@@ -207,35 +207,22 @@ impl ObservationCaptureCallbackService {
         }
         let capture = self
             .repository
-            .get(&ticket.scope, source_capture_id)
+            .get_source(&ticket.scope, source_capture_id)
             .await
             .map_err(status)?
             .ok_or(StatusCode::NOT_FOUND)?;
-        let expected_capture_digest = capture.input.validate(&ticket.scope).map_err(status)?;
-        let input = capture.input;
-        if input.capture_id != source_capture_id
-            || input.ordinal != 0
-            || input.target_id != ticket.target_id
-            || input.attempt_id != ticket.attempt_id
-            || input.account_id != ticket.account_id
-            || input.runner_session_id != ticket.runner_session_id
-            || input.original_identity.as_ref() != Some(&ticket.original_identity)
-            || capture.receipt.capture_id != source_capture_id
-            || capture.receipt.digest_sha256 != expected_capture_digest
+        capture.validate(&ticket.scope).map_err(status)?;
+        if capture.capture_id != source_capture_id
+            || capture.target_id != ticket.target_id
+            || capture.attempt_id != ticket.attempt_id
+            || capture.account_id != ticket.account_id
+            || capture.runner_session_id != ticket.runner_session_id
+            || capture.original_identity.as_ref() != Some(&ticket.original_identity)
+            || capture.source_sha256 != source_sha256
         {
             return Err(StatusCode::FORBIDDEN);
         }
-        match input.snapshot {
-            ObservationCaptureSnapshot::Source {
-                source_json,
-                source_sha256: saved_digest,
-            } if saved_digest == source_sha256
-                && geo_domain::sha256_hex(source_json.as_bytes()) == source_sha256 =>
-            {
-                Ok((ticket.scope, source_json))
-            }
-            _ => Err(StatusCode::FORBIDDEN),
-        }
+        Ok((ticket.scope, capture.source_json))
     }
 
     async fn capture(
@@ -458,6 +445,17 @@ mod tests {
             Ok(receipt)
         }
 
+        async fn get_source(
+            &self,
+            scope: &TenantScope,
+            capture_id: Uuid,
+        ) -> Result<Option<geo_domain::ObservationCaptureSource>, AppError> {
+            self.get(scope, capture_id)
+                .await?
+                .as_ref()
+                .map(geo_domain::ObservationCaptureSource::try_from)
+                .transpose()
+        }
         async fn get(
             &self,
             scope: &TenantScope,

@@ -202,7 +202,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         let target = self.jobs.get_target(scope, request.target_id).await?;
         let capture = match request.source {
             ObservationAnalysisSource::Capture { capture_id } => {
-                self.captures.get(scope, capture_id).await?
+                self.captures.get_source(scope, capture_id).await?
             }
             ObservationAnalysisSource::AttemptEvidence { .. } => None,
         };
@@ -262,7 +262,7 @@ impl ObservationExtractionRepository for PgObservationExtractionRepository {
         let key = request.intent_key(scope)?;
         let capture = self
             .captures
-            .get(scope, automatic_capture(&request)?)
+            .get_source(scope, automatic_capture(&request)?)
             .await?
             .ok_or_else(|| AppError::not_found("extraction source not found"))?;
         request.validate_source(scope, &capture)?;

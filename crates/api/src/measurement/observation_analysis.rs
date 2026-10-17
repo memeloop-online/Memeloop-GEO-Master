@@ -14,11 +14,10 @@ use geo_domain::{
     AppError, ChannelJobRepository, ChannelTargetInput, ChannelTargetView,
     ObservationAnalysisOutcome, ObservationAnalysisRepository, ObservationAnalysisRequest,
     ObservationAnalysisResult, ObservationAnalysisRevision, ObservationAnalysisSource,
-    ObservationAnalysisState, ObservationCaptureRepository, ObservationCaptureSnapshot,
-    ObservationExtractionIntent, ObservationExtractionRepository,
-    ObservationExtractionResponseDisposition, ObservationExtractionState,
-    ObservationExtractionStatus, ProjectId, TenantScope, observation_analysis_source_json,
-    sha256_hex,
+    ObservationAnalysisState, ObservationCaptureRepository, ObservationExtractionIntent,
+    ObservationExtractionRepository, ObservationExtractionResponseDisposition,
+    ObservationExtractionState, ObservationExtractionStatus, ProjectId, TenantScope,
+    observation_analysis_source_json, sha256_hex,
 };
 use geo_provider::diagnostics::{ModelPhase, ModelPhaseTimer};
 #[cfg(test)]
@@ -245,15 +244,13 @@ impl ObservationAnalysisService {
             .list_sources_for_attempt(scope, target_id, attempt_id)
             .await?
         {
-            if let ObservationCaptureSnapshot::Source { source_sha256, .. } =
-                &capture.input.snapshot
             {
                 let source = SavedSource {
                     source: ObservationAnalysisSource::Capture {
-                        capture_id: capture.input.capture_id,
+                        capture_id: capture.capture_id,
                     },
-                    source_sha256: source_sha256.clone(),
-                    observed_at: capture.input.observed_at,
+                    source_sha256: capture.source_sha256.clone(),
+                    observed_at: capture.observed_at,
                 };
                 let request = Self::request(target_id, attempt_id, source.clone());
                 if observation_analysis_source_json(scope, &request, target, Some(&capture)).is_ok()
@@ -340,12 +337,12 @@ impl ObservationAnalysisService {
     pub(crate) async fn needs_source_extraction(
         &self,
         scope: &TenantScope,
-        capture: &geo_domain::ObservationCapture,
+        capture: &geo_domain::ObservationCaptureSource,
     ) -> Result<bool, AppError> {
-        let mut target = self.jobs.get_target(scope, capture.input.target_id).await?;
+        let mut target = self.jobs.get_target(scope, capture.target_id).await?;
         target
             .attempts
-            .retain(|attempt| attempt.attempt_id == capture.input.attempt_id);
+            .retain(|attempt| attempt.attempt_id == capture.attempt_id);
         if !target
             .attempts
             .first()
@@ -411,7 +408,7 @@ impl ObservationAnalysisService {
         let target = self.jobs.get_target(scope, request.target_id).await?;
         let capture = match request.source {
             ObservationAnalysisSource::Capture { capture_id } => {
-                self.captures.get(scope, capture_id).await?
+                self.captures.get_source(scope, capture_id).await?
             }
             ObservationAnalysisSource::AttemptEvidence { .. } => None,
         };
@@ -489,7 +486,7 @@ impl ObservationAnalysisService {
             .await?;
         let capture = self
             .captures
-            .get(
+            .get_source(
                 scope,
                 intent
                     .request
@@ -510,7 +507,7 @@ impl ObservationAnalysisService {
                     .ok_or_else(|| AppError::conflict("automatic capture required"))?,
             },
             source_sha256: intent.request.source_sha256.clone(),
-            observed_at: capture.input.observed_at,
+            observed_at: capture.observed_at,
             prompt_version: intent.request.prompt_version.clone(),
             parser_version: intent.request.parser_version.clone(),
         };
@@ -879,8 +876,9 @@ mod tests {
         ChannelOutcome, ChannelOutcomeStatus, ChannelTarget, DEVELOPMENT_OPERATOR_ID,
         DEVELOPMENT_TENANT_ID, MemoryObservationAnalysisRepository,
         MemoryObservationCaptureRepository, MemoryObservationExtractionRepository,
-        ObservationCaptureInput, ObservationExtractionRequest, ObservationExtractionResponse,
-        ObservationProviderIdentity, ProjectCreate, ProjectSettings, StandaloneMeasurementPlan,
+        ObservationCaptureInput, ObservationCaptureSnapshot, ObservationExtractionRequest,
+        ObservationExtractionResponse, ObservationProviderIdentity, ProjectCreate, ProjectSettings,
+        StandaloneMeasurementPlan,
     };
     use geo_worker::{HostOpError, ModelCompletion};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1359,6 +1357,109 @@ mod tests {
         }
     }
 
+    struct SourceOnlyCaptures(Arc<dyn ObservationCaptureRepository>);
+
+    #[async_trait::async_trait]
+    impl ObservationCaptureRepository for SourceOnlyCaptures {
+        async fn scan_sources(
+            &self,
+            at: DateTime<Utc>,
+            after: Option<Uuid>,
+            limit: usize,
+        ) -> Result<Vec<geo_domain::ObservationCaptureSourceItem>, AppError> {
+            self.0.scan_sources(at, after, limit).await
+        }
+        async fn get_source(
+            &self,
+            scope: &TenantScope,
+            id: Uuid,
+        ) -> Result<Option<geo_domain::ObservationCaptureSource>, AppError> {
+            self.0.get_source(scope, id).await
+        }
+        async fn list_sources_for_attempt(
+            &self,
+            scope: &TenantScope,
+            target: Uuid,
+            attempt: Uuid,
+        ) -> Result<Vec<geo_domain::ObservationCaptureSource>, AppError> {
+            self.0
+                .list_sources_for_attempt(scope, target, attempt)
+                .await
+        }
+        async fn save(
+            &self,
+            _: &TenantScope,
+            _: ObservationCaptureInput,
+        ) -> Result<geo_domain::ObservationCaptureReceipt, AppError> {
+            panic!("semantic consumer must not write lifecycle evidence")
+        }
+        async fn get(
+            &self,
+            _: &TenantScope,
+            _: Uuid,
+        ) -> Result<Option<geo_domain::ObservationCapture>, AppError> {
+            panic!("semantic consumer must not decode lifecycle evidence")
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_results_and_reports_read_sources_without_lifecycle_access() {
+        let mut f = fixture(true, true, false).await;
+        f.service.captures = Arc::new(SourceOnlyCaptures(f.service.captures.clone()));
+        let queued = f
+            .service
+            .submit(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                AnalyzeSavedSource {
+                    idempotency_key: "source-only-analysis".into(),
+                    capture_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        f.service
+            .execute(&f.scope, queued.request.revision_id)
+            .await
+            .unwrap();
+        let resolver = crate::ObservationEvidenceResolver::new(
+            f.service.repository.clone(),
+            f.service.captures.clone(),
+        );
+        assert_eq!(
+            resolver
+                .resolve(&f.scope, std::slice::from_ref(&f.original), Utc::now())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let state = f
+            .state
+            .with_observation_analysis(f.service)
+            .with_observation_evidence_resolver(resolver);
+        let app = crate::router(state);
+        let auth = analysis_test_auth(&app).await;
+        let project = f.scope.project_id.unwrap();
+        for path in [
+            format!(
+                "/api/v1/projects/{project}/channel-targets/{}/attempts/{}/analyses",
+                f.target_id, f.attempt_id
+            ),
+            format!("/api/v1/projects/{project}/citation-insights"),
+            format!("/api/v1/projects/{project}/measurement-report-preview"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http("GET", &path, Some(&auth), json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn source_recovery_admits_persisted_capture_once_without_replaying_history() {
         let f = fixture(false, true, false).await;
@@ -1403,17 +1504,13 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let ObservationCaptureSnapshot::Source { source_sha256, .. } = &capture.input.snapshot
-        else {
-            panic!("source required")
-        };
         let request = ObservationExtractionRequest {
             target_id: f.target_id,
             attempt_id: f.attempt_id,
-            source_capture_id: Some(capture.input.capture_id),
+            source_capture_id: Some(capture.capture_id),
             source_evidence_index: None,
             manual_revision_id: None,
-            source_sha256: source_sha256.clone(),
+            source_sha256: capture.source_sha256.clone(),
             prompt_version: PROMPT_VERSION.into(),
             parser_version: PARSER_VERSION.into(),
             policy_version: EXTRACTION_POLICY_VERSION.into(),

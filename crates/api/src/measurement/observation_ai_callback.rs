@@ -276,6 +276,17 @@ mod tests {
             ));
             Ok(receipt)
         }
+        async fn get_source(
+            &self,
+            scope: &TenantScope,
+            capture_id: Uuid,
+        ) -> Result<Option<geo_domain::ObservationCaptureSource>, AppError> {
+            self.get(scope, capture_id)
+                .await?
+                .as_ref()
+                .map(geo_domain::ObservationCaptureSource::try_from)
+                .transpose()
+        }
         async fn get(
             &self,
             scope: &TenantScope,
