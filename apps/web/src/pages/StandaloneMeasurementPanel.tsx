@@ -12,7 +12,12 @@ import {
   Tooltip,
 } from "@fluentui/react-components";
 import { AddRegular } from "@fluentui/react-icons";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 import { useChannelData } from "../api/channels";
@@ -113,6 +118,15 @@ export function StandaloneMeasurementPanel({
   const [questionId, setQuestionId] = useState("");
   const [after, setAfter] = useState<string>();
   const [previous, setPrevious] = useState<(string | undefined)[]>([]);
+  const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    if (!requestedSetId) return;
+    setOpenFolders((previous) =>
+      previous[requestedSetId] === true
+        ? previous
+        : { ...previous, [requestedSetId]: true },
+    );
+  }, [requestedSetId, selectedRankReport]);
   // Preserve the entire accepted-intent candidate across transport failures,
   // including its timestamp, so retrying cannot create a second measurement.
   const pendingRequest = useRef<{
@@ -231,6 +245,26 @@ export function StandaloneMeasurementPanel({
       new Map<string, StandaloneMeasurementPlan[]>();
     if (!versions.has(requestedVersionId)) versions.set(requestedVersionId, []);
     groups.set(requestedSetId, versions);
+  }
+  const folderIds = [...groups.keys()];
+  const folderVersions = useQueries({
+    queries: folderIds.map((id) => ({
+      queryKey: [...key, "versions", id],
+      queryFn: () => listAllQuestionSetVersions(tenantId, projectId, id),
+      enabled: Boolean(
+        session &&
+        recordsOnly &&
+        historyOpen &&
+        !(selectedRankReport && requestedSetId === id) &&
+        (openFolders[id] ?? requestedSetId === id),
+      ),
+      retry: false,
+    })),
+  });
+  for (const [index, id] of folderIds.entries()) {
+    for (const version of folderVersions[index].data?.items ?? []) {
+      if (!groups.get(id)!.has(version.id)) groups.get(id)!.set(version.id, []);
+    }
   }
   const recordButton = (
     plan: StandaloneMeasurementPlan,
@@ -759,6 +793,8 @@ export function StandaloneMeasurementPanel({
                 )}
                 <nav aria-label={t("measurementFolders")}>
                   {[...groups].map(([groupId, versions]) => {
+                    const versionHistory =
+                      folderVersions[folderIds.indexOf(groupId)];
                     const set = sets.data?.items.find(
                       (item) => item.id === groupId,
                     );
@@ -766,7 +802,20 @@ export function StandaloneMeasurementPanel({
                       [...versions.values()].flat().map((plan) => plan.plan_id),
                     ).size;
                     return (
-                      <details key={groupId} open={requestedSetId === groupId}>
+                      <details
+                        key={groupId}
+                        open={
+                          openFolders[groupId] ?? requestedSetId === groupId
+                        }
+                        onToggle={(event) => {
+                          const open = event.currentTarget.open;
+                          setOpenFolders((previous) =>
+                            previous[groupId] === open
+                              ? previous
+                              : { ...previous, [groupId]: open },
+                          );
+                        }}
+                      >
                         <summary>
                           {set?.name ?? t("unnamedQuestionSet")} ·{" "}
                           {t("folderRecordCount", { count })}
@@ -784,28 +833,50 @@ export function StandaloneMeasurementPanel({
                           </Link>
                         )}
                         {count === 0 && <p>{t("folderNoRecords")}</p>}
-                        {[...versions].map(([versionId, plans]) => (
-                          <details key={versionId} open>
-                            <summary>
-                              {set?.current_version_id === versionId
-                                ? t("currentSetVersion", {
-                                    revision: set.current_revision,
-                                  })
-                                : t("savedSetVersion", { value: versionId })}
-                            </summary>
-                            <QuestionSetRecommendationTrend
-                              tenantId={tenantId}
-                              projectId={projectId}
-                              questionSetId={groupId}
-                              questionSetVersionId={versionId}
-                            />
-                            <ul>
-                              {plans.map((plan) =>
-                                recordButton(plan, groupId, versionId),
-                              )}
-                            </ul>
-                          </details>
-                        ))}
+                        {versionHistory.isFetching && (
+                          <LoadingState
+                            label={t("folderVersionsLoading")}
+                            compact
+                          />
+                        )}
+                        {versionHistory.isError && (
+                          <ErrorState
+                            title={t("folderVersionsUnavailable")}
+                            detail={errorText(versionHistory.error)}
+                            onRetry={() => void versionHistory.refetch()}
+                          />
+                        )}
+                        {[...versions].map(([versionId, plans]) => {
+                          const savedVersion = versionHistory.data?.items.find(
+                            (item) => item.id === versionId,
+                          );
+                          return (
+                            <details key={versionId} open>
+                              <summary>
+                                {set?.current_version_id === versionId
+                                  ? t("currentSetVersion", {
+                                      revision: set.current_revision,
+                                    })
+                                  : t("savedSetVersion", {
+                                      value: savedVersion
+                                        ? `v${savedVersion.revision}`
+                                        : versionId,
+                                    })}
+                              </summary>
+                              <QuestionSetRecommendationTrend
+                                tenantId={tenantId}
+                                projectId={projectId}
+                                questionSetId={groupId}
+                                questionSetVersionId={versionId}
+                              />
+                              <ul>
+                                {plans.map((plan) =>
+                                  recordButton(plan, groupId, versionId),
+                                )}
+                              </ul>
+                            </details>
+                          );
+                        })}
                       </details>
                     );
                   })}
