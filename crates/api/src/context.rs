@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Extension, Request, State},
+    extract::Request,
     http::{HeaderMap, HeaderValue, Method, header::HeaderName},
     middleware::Next,
     response::Response,
@@ -20,16 +20,6 @@ pub const TENANT_SELECTOR_HEADER: &str = "x-tenant-selector";
 pub const CSRF_HEADER: &str = "x-csrf-token";
 pub const SESSION_COOKIE_NAME: &str = "__Host-geo_session";
 pub const DEV_SESSION_COOKIE_NAME: &str = "geo_dev_session";
-
-#[derive(Clone, Copy)]
-pub struct SessionCookieConfig(pub &'static str);
-
-#[derive(Clone)]
-pub struct AuthMiddlewareState {
-    pub repository: SharedAuthRepository,
-    pub cookie_name: &'static str,
-    pub origin_config: OriginConfig,
-}
 
 pub type SharedAuthRepository = Arc<dyn AuthRepository>;
 
@@ -129,20 +119,6 @@ pub async fn no_store_middleware(request: Request, next: Next) -> Response {
 /// Resolve Host -> operator -> opaque session -> user -> membership -> tenant
 /// scope.  The tenant selector is deliberately a separate header/query value:
 /// it selects among server-loaded memberships but cannot invent a tenant.
-pub async fn auth_scope_middleware(
-    State(state): State<crate::AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let cookie_name = if state.durable_storage() {
-        SESSION_COOKIE_NAME
-    } else {
-        DEV_SESSION_COOKIE_NAME
-    };
-    auth_scope_with_repository_and_cookie(state.auth_repository(), Some(cookie_name), request, next)
-        .await
-}
-
 pub async fn auth_scope_from_request(mut request: Request, next: Next) -> Response {
     let Some(state) = request.extensions().get::<crate::AppState>().cloned() else {
         return crate::error::error_response(
@@ -174,14 +150,6 @@ pub async fn auth_scope_from_request(mut request: Request, next: Next) -> Respon
     renew_cookie_response(next.run(request).await, renewal)
 }
 
-pub async fn auth_scope_with_repository(
-    repository: SharedAuthRepository,
-    request: Request,
-    next: Next,
-) -> Response {
-    auth_scope_with_repository_and_cookie(repository, None, request, next).await
-}
-
 pub async fn auth_scope_with_repository_and_cookie(
     repository: SharedAuthRepository,
     cookie_name: Option<&'static str>,
@@ -203,58 +171,8 @@ pub async fn auth_scope_with_repository_and_cookie(
     renew_cookie_response(next.run(request).await, renewal)
 }
 
-pub async fn auth_scope_from_extension(
-    Extension(repository): Extension<SharedAuthRepository>,
-    request: Request,
-    next: Next,
-) -> Response {
-    auth_scope_with_repository(repository, request, next).await
-}
-
-pub async fn auth_scope_from_extensions(
-    Extension(repository): Extension<SharedAuthRepository>,
-    Extension(cookie): Extension<SessionCookieConfig>,
-    request: Request,
-    next: Next,
-) -> Response {
-    auth_scope_with_repository_and_cookie(repository, Some(cookie.0), request, next).await
-}
-
-pub async fn auth_scope_from_middleware_state(
-    Extension(config): Extension<AuthMiddlewareState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    auth_scope_with_repository_and_cookie(
-        config.repository,
-        Some(config.cookie_name),
-        request,
-        next,
-    )
-    .await
-}
-
 /// Resolve only the host and session identity for auth/session endpoints.  A
 /// tenant selector is not needed to inspect or revoke the current session.
-pub async fn session_auth_middleware(
-    State(state): State<crate::AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let cookie_name = if state.durable_storage() {
-        SESSION_COOKIE_NAME
-    } else {
-        DEV_SESSION_COOKIE_NAME
-    };
-    session_auth_with_repository_and_cookie(
-        state.auth_repository(),
-        Some(cookie_name),
-        request,
-        next,
-    )
-    .await
-}
-
 pub async fn session_auth_from_request(mut request: Request, next: Next) -> Response {
     let Some(state) = request.extensions().get::<crate::AppState>().cloned() else {
         return crate::error::error_response(
@@ -283,14 +201,6 @@ pub async fn session_auth_from_request(mut request: Request, next: Next) -> Resp
     let renewal = persistent_cookie_renewal(&request, &auth, Some(cookie_name));
     request.extensions_mut().insert(auth);
     renew_cookie_response(next.run(request).await, renewal)
-}
-
-pub async fn session_auth_with_repository(
-    repository: SharedAuthRepository,
-    request: Request,
-    next: Next,
-) -> Response {
-    session_auth_with_repository_and_cookie(repository, None, request, next).await
 }
 
 pub async fn session_auth_with_repository_and_cookie(
@@ -363,48 +273,9 @@ fn renew_cookie_response(mut response: Response, renewal: Option<HeaderValue>) -
     response
 }
 
-pub async fn session_auth_from_extension(
-    Extension(repository): Extension<SharedAuthRepository>,
-    request: Request,
-    next: Next,
-) -> Response {
-    session_auth_with_repository(repository, request, next).await
-}
-
-pub async fn session_auth_from_extensions(
-    Extension(repository): Extension<SharedAuthRepository>,
-    Extension(cookie): Extension<SessionCookieConfig>,
-    request: Request,
-    next: Next,
-) -> Response {
-    session_auth_with_repository_and_cookie(repository, Some(cookie.0), request, next).await
-}
-
-pub async fn session_auth_from_middleware_state(
-    Extension(config): Extension<AuthMiddlewareState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    session_auth_with_repository_and_cookie(
-        config.repository,
-        Some(config.cookie_name),
-        request,
-        next,
-    )
-    .await
-}
-
 /// Same-origin and session-bound CSRF validation for state-changing protected
 /// requests.  This middleware is installed outside the idempotency middleware
 /// so rejected cross-site requests never reserve a business idempotency key.
-pub async fn csrf_origin_middleware(
-    State(state): State<crate::AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    csrf_origin_with_config(state.origin_config().clone(), request, next).await
-}
-
 pub async fn csrf_origin_from_request(request: Request, next: Next) -> Response {
     let origin_config = request
         .extensions()
@@ -420,10 +291,6 @@ pub async fn csrf_origin_from_request(request: Request, next: Next) -> Response 
         );
     };
     csrf_origin_with_config(origin_config, request, next).await
-}
-
-pub async fn csrf_origin_with_scheme(scheme: Arc<str>, request: Request, next: Next) -> Response {
-    csrf_origin_with_config(OriginConfig::new(scheme), request, next).await
 }
 
 pub async fn csrf_origin_with_config(
@@ -463,22 +330,6 @@ pub async fn csrf_origin_with_config(
         }
     }
     next.run(request).await
-}
-
-pub async fn csrf_origin_from_config_extension(
-    Extension(origin_config): Extension<OriginConfig>,
-    request: Request,
-    next: Next,
-) -> Response {
-    csrf_origin_with_config(origin_config, request, next).await
-}
-
-pub async fn csrf_origin_from_middleware_state(
-    Extension(config): Extension<AuthMiddlewareState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    csrf_origin_with_config(config.origin_config, request, next).await
 }
 
 pub fn validate_origin(request: &Request) -> Result<(), AppError> {
