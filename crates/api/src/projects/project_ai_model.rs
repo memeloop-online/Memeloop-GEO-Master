@@ -20,6 +20,7 @@ pub struct ProjectConfiguredModelBridge<T = HttpTransport> {
     inherited: Option<SharedModelProvider>,
     transport: Arc<T>,
     observation_timeout: Duration,
+    workbench_timeout: Duration,
 }
 
 impl ProjectConfiguredModelBridge<HttpTransport> {
@@ -33,8 +34,15 @@ impl ProjectConfiguredModelBridge<HttpTransport> {
             Err(std::env::VarError::NotUnicode(_)) => return Err(invalid_observation_timeout()),
         };
         let observation_timeout = observation_timeout(configured.as_deref())?;
+        let configured = match std::env::var("GEO_WORKBENCH_MODEL_TIMEOUT_SECONDS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => return Err(invalid_workbench_timeout()),
+        };
+        let workbench_timeout = workbench_timeout(configured.as_deref())?;
         Self::with_transport(settings, inherited, Arc::new(HttpTransport::public_only()?))
-            .with_observation_timeout(observation_timeout)
+            .with_observation_timeout(observation_timeout)?
+            .with_workbench_timeout(workbench_timeout)
     }
 }
 
@@ -49,6 +57,9 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
             inherited,
             transport,
             observation_timeout: Duration::from_secs(300),
+            workbench_timeout: geo_worker::HostOpBudgets::default()
+                .limits(HostOp::ModelComplete)
+                .timeout(),
         }
     }
 
@@ -57,6 +68,20 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
             .map_err(|_| invalid_observation_timeout())?;
         self.observation_timeout = timeout;
         Ok(self)
+    }
+
+    pub fn with_workbench_timeout(mut self, timeout: Duration) -> Result<Self, ProviderError> {
+        crate::provider_bridge::provider_deadline(timeout)
+            .map_err(|_| invalid_workbench_timeout())?;
+        if timeout.as_millis() == 0 || timeout.as_millis() > u64::MAX as u128 {
+            return Err(invalid_workbench_timeout());
+        }
+        self.workbench_timeout = timeout;
+        Ok(self)
+    }
+
+    pub fn workbench_timeout(&self) -> Duration {
+        self.workbench_timeout
     }
 
     pub async fn complete_for_usage(
@@ -127,7 +152,9 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
                                 .await
                         }
                         ProjectAiUsage::WorkbenchContent => {
-                            inherited.complete(scope, request).await
+                            inherited
+                                .complete_with_timeout(scope, request, self.workbench_timeout)
+                                .await
                         }
                     };
                     completion.map(|completion| (completion, revision))
@@ -153,7 +180,7 @@ impl<T: Transport + 'static> ProjectConfiguredModelBridge<T> {
         .map_err(|_| custom_unavailable())?;
         let timeout = match usage {
             ProjectAiUsage::ObservationAnalysis => self.observation_timeout,
-            ProjectAiUsage::WorkbenchContent => Duration::from_secs(60),
+            ProjectAiUsage::WorkbenchContent => self.workbench_timeout,
         };
         let bridge = ProviderClientBridge::new(client, config.model, timeout)?;
         // ProviderClientBridge's single-model allowlist rejects a worker
@@ -172,6 +199,31 @@ fn invalid_observation_timeout() -> ProviderError {
         "observation model timeout must be positive integer seconds with a representable deadline"
             .into(),
     )
+}
+
+fn invalid_workbench_timeout() -> ProviderError {
+    ProviderError::InvalidRequest(
+        "workbench model timeout must be positive integer seconds with a representable deadline"
+            .into(),
+    )
+}
+
+fn workbench_timeout(value: Option<&str>) -> Result<Duration, ProviderError> {
+    let timeout = match value {
+        Some(value) => Duration::from_secs(
+            value
+                .parse::<u64>()
+                .map_err(|_| invalid_workbench_timeout())?,
+        ),
+        None => geo_worker::HostOpBudgets::default()
+            .limits(HostOp::ModelComplete)
+            .timeout(),
+    };
+    crate::provider_bridge::provider_deadline(timeout).map_err(|_| invalid_workbench_timeout())?;
+    if timeout.as_millis() > u64::MAX as u128 {
+        return Err(invalid_workbench_timeout());
+    }
+    Ok(timeout)
 }
 
 fn observation_timeout(value: Option<&str>) -> Result<Duration, ProviderError> {
@@ -290,6 +342,29 @@ mod tests {
         assert!(bridge.with_observation_timeout(Duration::ZERO).is_err());
     }
 
+    #[test]
+    fn workbench_budget_configuration_uses_host_default_and_rejects_invalid_seconds() {
+        assert_eq!(
+            workbench_timeout(None).unwrap(),
+            geo_worker::HostOpBudgets::default()
+                .limits(HostOp::ModelComplete)
+                .timeout()
+        );
+        assert_eq!(
+            workbench_timeout(Some("180")).unwrap(),
+            Duration::from_secs(180)
+        );
+        for invalid in ["", "0", "-1", "abc", "1.5", "18446744073709551615"] {
+            assert!(workbench_timeout(Some(invalid)).is_err());
+        }
+        let bridge = ProjectConfiguredModelBridge::with_transport(
+            ProjectAiSettingsService::development(),
+            None,
+            Arc::new(RecordingTransport::default()),
+        );
+        assert!(bridge.with_workbench_timeout(Duration::ZERO).is_err());
+    }
+
     #[derive(Default)]
     struct DelayedTransport(Mutex<Vec<Duration>>);
 
@@ -310,8 +385,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn observation_budget_reaches_inherited_and_custom_transport_without_extending_workbench()
-    {
+    async fn workbench_and_observation_budgets_reach_inherited_and_custom_transport() {
         for custom in [false, true] {
             let settings = ProjectAiSettingsService::development();
             let scope = scope();
@@ -351,12 +425,23 @@ mod tests {
             assert_eq!(start.elapsed(), Duration::from_secs(61));
             assert_eq!(*transport.0.lock().unwrap(), [Duration::from_secs(300)]);
             let start = tokio::time::Instant::now();
+            let answer = bridge.complete(&scope, &request()).await.unwrap();
+            assert_eq!(answer.text, "answer");
+            assert_eq!(start.elapsed(), Duration::from_secs(61));
+            let bridge = bridge
+                .with_workbench_timeout(Duration::from_secs(60))
+                .unwrap();
+            let start = tokio::time::Instant::now();
             let error = bridge.complete(&scope, &request()).await.unwrap_err();
             assert_eq!(error.code, geo_worker::HostOpErrorCode::DeadlineExceeded);
             assert_eq!(start.elapsed(), Duration::from_secs(60));
             assert_eq!(
                 *transport.0.lock().unwrap(),
-                [Duration::from_secs(300), Duration::from_secs(60),]
+                [
+                    Duration::from_secs(300),
+                    Duration::from_secs(120),
+                    Duration::from_secs(60),
+                ]
             );
         }
     }
