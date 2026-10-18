@@ -114,7 +114,7 @@ mod tests {
         start_request_hash,
     };
     use geo_provider::{ProviderError, RequestControl, TransportRequest, TransportResponse};
-    use geo_worker::{ContentGenerateOutcome, HostOpErrorCode, HostOps};
+    use geo_worker::{ContentModelOutcome, HostOpErrorCode, HostOps};
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -365,7 +365,7 @@ mod tests {
                 allowed.1,
                 allowed.2,
                 token,
-                ContentGenerateOutcome::Completed { text: output.text },
+                ContentModelOutcome::Completed { text: output.text },
             )
             .await
             .unwrap();
@@ -388,7 +388,7 @@ mod tests {
                     execution_id,
                     item_id,
                     token,
-                    ContentGenerateOutcome::Unavailable,
+                    ContentModelOutcome::Unavailable,
                 )
                 .await
                 .unwrap_err();

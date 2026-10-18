@@ -25,7 +25,7 @@ use geo_domain::{
     TenantScope, UploadSessionCommand, User, VerifiedImage, hash_idempotency_key, settings_hash,
     start_request_hash,
 };
-use geo_worker::{ContentGenerateOutcome, HostOpError, ModelCompletion, ModelCompletionRequest};
+use geo_worker::{ContentModelOutcome, HostOpError, ModelCompletion, ModelCompletionRequest};
 use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -248,8 +248,7 @@ async fn fixture() -> Fixture {
     let content = Arc::new(MemoryContentRepository::with_media_repository(
         media.clone(),
     ));
-    let service = ContentService::new(content.clone(), knowledge.clone(), projects.clone())
-        .with_model_provider(Arc::new(FixtureModel));
+    let service = ContentService::new(content.clone(), knowledge.clone(), projects.clone());
     let execution = service.start(&scope, started.cycle_id).await.unwrap();
     let item = content
         .list_items(&scope, execution.execution_id)
@@ -303,7 +302,7 @@ async fn fixture() -> Fixture {
             execution.execution_id,
             item.item_id,
             token,
-            ContentGenerateOutcome::Completed { text: output.text },
+            ContentModelOutcome::Completed { text: output.text },
         )
         .await
         .unwrap();

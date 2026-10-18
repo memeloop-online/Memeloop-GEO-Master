@@ -26,10 +26,11 @@ use geo_domain::{
     UpdateProject, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_worker::{
-    ContentGenerateOutcome, DistributionReadRequest, DistributionResumeRequest,
+    ContentModelOutcome, DistributionReadRequest, DistributionResumeRequest,
     DistributionStartRequest, DistributionTargetsReadRequest, HostOpError, HostOpErrorCode,
     HostOps, ModelCompletion, ModelCompletionRequest,
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 struct ReadOnlyLookup {
@@ -121,26 +122,10 @@ impl ModelProviderBridge for GroundedModel {
     ) -> Result<ModelCompletion, HostOpError> {
         let input: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
         let citation = input["evidence"][0]["chunk_id"].as_str().unwrap();
-        let text = if request
-            .system
-            .as_deref()
-            .unwrap_or_default()
-            .contains("checker")
-        {
-            let block = input["document"]["blocks"][0]["block_id"].as_str().unwrap();
-            let title = input["title_check_id"].as_str().unwrap();
-            serde_json::json!({"checks":[
-                {"block_id":title,"verdict":"supported","citation_ids":[citation],
-                 "detail":"Verified from the public source"},
-                {"block_id":block,"verdict":"supported","citation_ids":[citation],
-                 "detail":"Verified from the public source"}]})
-            .to_string()
-        } else {
-            serde_json::json!({"schema_version":2,"title":"A documented answer","blocks":[{
-                "kind":"paragraph","text":"Public description",
-                "citation_ids":[citation],"items":[]}]})
-            .to_string()
-        };
+        let text = serde_json::json!({"schema_version":2,"title":"A documented answer","blocks":[{
+            "kind":"paragraph","text":"Public description",
+            "citation_ids":[citation],"items":[]}]})
+        .to_string();
         Ok(ModelCompletion {
             text,
             tool_calls: vec![],
@@ -421,8 +406,7 @@ async fn setup(second_blocked: bool) -> Fixture {
         .unwrap();
     assert_eq!(planned.items.len(), 2);
     let content = Arc::new(MemoryContentRepository::default());
-    let first_stage = ContentService::new(content.clone(), knowledge.clone(), projects.clone())
-        .with_model_provider(Arc::new(GroundedModel));
+    let first_stage = ContentService::new(content.clone(), knowledge.clone(), projects.clone());
     let execution = first_stage.start(&scope, started.cycle_id).await.unwrap();
     let items = content
         .list_items(&scope, execution.execution_id)
@@ -478,13 +462,38 @@ async fn setup(second_blocked: bool) -> Fixture {
                 execution.execution_id,
                 item.item_id,
                 token,
-                ContentGenerateOutcome::Completed { text: output.text },
+                ContentModelOutcome::Completed { text: output.text },
             )
             .await
             .unwrap();
+        let (token, revision, quotes) = first_stage
+            .begin_check(&scope, execution.execution_id, item.item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let citation = quotes[0].reference.chunk_id.unwrap();
+        let digest =
+            Sha256::digest(format!("content-title-check:{}", revision.revision_id).as_bytes());
+        let mut title_bytes: [u8; 16] = digest[..16].try_into().unwrap();
+        title_bytes[6] = (title_bytes[6] & 0x0f) | 0x50;
+        title_bytes[8] = (title_bytes[8] & 0x3f) | 0x80;
+        let checks = serde_json::json!({"checks":[
+            {"block_id": Uuid::from_bytes(title_bytes), "verdict": "supported",
+             "citation_ids": [citation], "detail": "Verified from the public source"},
+            {"block_id": revision.document.blocks[0].block_id, "verdict": "supported",
+             "citation_ids": [citation], "detail": "Verified from the public source"}
+        ]});
         assert_eq!(
             first_stage
-                .check(&scope, execution.execution_id, item.item_id)
+                .finish_check(
+                    &scope,
+                    execution.execution_id,
+                    item.item_id,
+                    token,
+                    ContentModelOutcome::Completed {
+                        text: checks.to_string()
+                    },
+                )
                 .await
                 .unwrap()
                 .status,

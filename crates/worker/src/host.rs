@@ -492,8 +492,54 @@ fn validate_recorded_return(
                 return Err(HostOpError::internal(op, "step returned an unrelated item"));
             }
         }
-        HostOp::ContentCheck | HostOp::ContentRepair => {
+        HostOp::ContentCheckBegin => {
             let requested: ContentStepRequest = typed(op, request)?;
+            let response: ContentCheckBeginResult = typed(op, result)?;
+            match response {
+                ContentCheckBeginResult::Current { item }
+                    if item.item_id != requested.item_id || item.branch_key.is_empty() =>
+                {
+                    return Err(HostOpError::internal(
+                        op,
+                        "check returned an unrelated item",
+                    ));
+                }
+                ContentCheckBeginResult::Claimed { token, .. } if token.is_nil() => {
+                    return Err(HostOpError::internal(op, "check returned an invalid claim"));
+                }
+                _ => {}
+            }
+        }
+        HostOp::ContentRepairBegin => {
+            let requested: ContentStepRequest = typed(op, request)?;
+            let response: ContentRepairBeginResult = typed(op, result)?;
+            match response {
+                ContentRepairBeginResult::Current { item }
+                    if item.item_id != requested.item_id || item.branch_key.is_empty() =>
+                {
+                    return Err(HostOpError::internal(
+                        op,
+                        "repair returned an unrelated item",
+                    ));
+                }
+                ContentRepairBeginResult::Claimed { token, .. } if token.is_nil() => {
+                    return Err(HostOpError::internal(
+                        op,
+                        "repair returned an invalid claim",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        HostOp::ContentCheckFinish => {
+            let requested: ContentCheckFinishRequest = typed(op, request)?;
+            let response: ContentItemRef = typed(op, result)?;
+            if requested.item_id != response.item_id || response.branch_key.is_empty() {
+                return Err(HostOpError::internal(op, "step returned an unrelated item"));
+            }
+        }
+        HostOp::ContentRepairFinish => {
+            let requested: ContentRepairFinishRequest = typed(op, request)?;
             let response: ContentItemRef = typed(op, result)?;
             if requested.item_id != response.item_id || response.branch_key.is_empty() {
                 return Err(HostOpError::internal(op, "step returned an unrelated item"));
@@ -586,7 +632,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v20";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v21";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1027,8 +1073,10 @@ pub enum HostOp {
     ContentPrepare,
     ContentGenerateBegin,
     ContentGenerateFinish,
-    ContentCheck,
-    ContentRepair,
+    ContentCheckBegin,
+    ContentCheckFinish,
+    ContentRepairBegin,
+    ContentRepairFinish,
     ContentClose,
     ContentStart,
     ContentExecutionRead,
@@ -1054,7 +1102,7 @@ pub enum HostOp {
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 49;
+    pub const COUNT: usize = 51;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -1084,8 +1132,10 @@ impl HostOp {
         Self::ContentPrepare,
         Self::ContentGenerateBegin,
         Self::ContentGenerateFinish,
-        Self::ContentCheck,
-        Self::ContentRepair,
+        Self::ContentCheckBegin,
+        Self::ContentCheckFinish,
+        Self::ContentRepairBegin,
+        Self::ContentRepairFinish,
         Self::ContentClose,
         Self::ContentStart,
         Self::ContentExecutionRead,
@@ -1138,8 +1188,10 @@ impl HostOp {
             Self::ContentPrepare => "content.prepare.v1",
             Self::ContentGenerateBegin => "content.generate.begin.v1",
             Self::ContentGenerateFinish => "content.generate.finish.v1",
-            Self::ContentCheck => "content.check.v1",
-            Self::ContentRepair => "content.repair.v1",
+            Self::ContentCheckBegin => "content.check.begin.v1",
+            Self::ContentCheckFinish => "content.check.finish.v1",
+            Self::ContentRepairBegin => "content.repair.begin.v1",
+            Self::ContentRepairFinish => "content.repair.finish.v1",
             Self::ContentClose => "content.close.v1",
             Self::ContentStart => "content.start.v1",
             Self::ContentExecutionRead => "content.execution.read.v1",
@@ -1193,8 +1245,10 @@ impl HostOp {
             Self::ContentPrepare => "op_host_content_prepare_v1",
             Self::ContentGenerateBegin => "op_host_content_generate_begin_v1",
             Self::ContentGenerateFinish => "op_host_content_generate_finish_v1",
-            Self::ContentCheck => "op_host_content_check_v1",
-            Self::ContentRepair => "op_host_content_repair_v1",
+            Self::ContentCheckBegin => "op_host_content_check_begin_v1",
+            Self::ContentCheckFinish => "op_host_content_check_finish_v1",
+            Self::ContentRepairBegin => "op_host_content_repair_begin_v1",
+            Self::ContentRepairFinish => "op_host_content_repair_finish_v1",
             Self::ContentClose => "op_host_content_close_v1",
             Self::ContentStart => "op_host_content_start_v1",
             Self::ContentExecutionRead => "op_host_content_execution_read_v1",
@@ -1308,8 +1362,10 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(120_000, 2_048), // prepare
                 HostOpLimits::new(30_000, 2_048), // generation claim
                 HostOpLimits::new(30_000, 2_048), // generation result
-                HostOpLimits::new(120_000, 6_144), // check, up to three passes
-                HostOpLimits::new(120_000, 4_096), // repair, up to two passes
+                HostOpLimits::new(30_000, 6_144), // check claim, up to three passes
+                HostOpLimits::new(30_000, 6_144), // check result
+                HostOpLimits::new(30_000, 4_096), // repair claim, up to two passes
+                HostOpLimits::new(30_000, 4_096), // repair result
                 HostOpLimits::new(30_000, 4),   // close
                 HostOpLimits::new(30_000, 4),   // start
                 HostOpLimits::new(15_000, 32),  // execution read
@@ -1922,24 +1978,46 @@ pub trait HostOps: Send + Sync {
         ))
     }
 
-    async fn content_check(
+    async fn content_check_begin(
         &self,
         _scope: &TenantScope,
         _request: ContentStepRequest,
-    ) -> Result<ContentItemRef, HostOpError> {
+    ) -> Result<ContentCheckBeginResult, HostOpError> {
         Err(HostOpError::capability_missing(
-            HostOp::ContentCheck,
+            HostOp::ContentCheckBegin,
             "content execution is not configured",
         ))
     }
 
-    async fn content_repair(
+    async fn content_check_finish(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentCheckFinishRequest,
+    ) -> Result<ContentItemRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentCheckFinish,
+            "content execution is not configured",
+        ))
+    }
+
+    async fn content_repair_begin(
         &self,
         _scope: &TenantScope,
         _request: ContentStepRequest,
+    ) -> Result<ContentRepairBeginResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentRepairBegin,
+            "content repair is not configured",
+        ))
+    }
+
+    async fn content_repair_finish(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentRepairFinishRequest,
     ) -> Result<ContentItemRef, HostOpError> {
         Err(HostOpError::capability_missing(
-            HostOp::ContentRepair,
+            HostOp::ContentRepairFinish,
             "content repair is not configured",
         ))
     }
@@ -2286,7 +2364,7 @@ pub enum ContentGenerateBeginResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ContentGenerateOutcome {
+pub enum ContentModelOutcome {
     Completed { text: String },
     Unavailable,
     Invalid,
@@ -2298,13 +2376,79 @@ pub struct ContentGenerateFinishRequest {
     pub execution_id: Uuid,
     pub item_id: Uuid,
     pub token: Uuid,
-    pub outcome: ContentGenerateOutcome,
+    pub outcome: ContentModelOutcome,
 }
 
 impl ContentGenerateFinishRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.execution_id.is_nil() || self.item_id.is_nil() || self.token.is_nil() {
             return Err("generation requires non-zero execution, item and lease references".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContentCheckBeginResult {
+    Current {
+        item: ContentItemRef,
+    },
+    Claimed {
+        token: Uuid,
+        revision: Box<geo_domain::ContentRevision>,
+        quotes: Vec<geo_domain::ContentEvidence>,
+        title_check_id: Uuid,
+        check_sections: Vec<(Option<Uuid>, String)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContentRepairBeginResult {
+    Current {
+        item: ContentItemRef,
+    },
+    Claimed {
+        token: Uuid,
+        revision: Box<geo_domain::ContentRevision>,
+        quotes: Vec<geo_domain::ContentEvidence>,
+        blocking_findings: Vec<geo_domain::ContentFinding>,
+        check_sections: Vec<(Option<Uuid>, String)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentCheckFinishRequest {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub token: Uuid,
+    pub outcome: ContentModelOutcome,
+}
+
+impl ContentCheckFinishRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.execution_id.is_nil() || self.item_id.is_nil() || self.token.is_nil() {
+            return Err("check requires non-zero execution, item and lease references".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentRepairFinishRequest {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub token: Uuid,
+    pub outcome: ContentModelOutcome,
+}
+
+impl ContentRepairFinishRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.execution_id.is_nil() || self.item_id.is_nil() || self.token.is_nil() {
+            return Err("repair requires non-zero execution, item and lease references".into());
         }
         Ok(())
     }
@@ -5033,8 +5177,8 @@ mod tests {
             budgets.limits(HostOp::ContentGenerateFinish).max_calls,
             2_048
         );
-        assert_eq!(budgets.limits(HostOp::ContentCheck).max_calls, 6_144);
-        assert_eq!(budgets.limits(HostOp::ContentRepair).max_calls, 4_096);
+        assert_eq!(budgets.limits(HostOp::ContentCheckBegin).max_calls, 6_144);
+        assert_eq!(budgets.limits(HostOp::ContentRepairBegin).max_calls, 4_096);
         assert_eq!(budgets.limits(HostOp::ContentClose).max_calls, 4);
         assert_eq!(budgets.limits(HostOp::ContentStart).max_calls, 4);
         assert_eq!(budgets.limits(HostOp::DistributionStart).max_calls, 4);

@@ -2,10 +2,12 @@
 
 use geo_domain::{AppError, ContentExecution, ContentItem, TenantScope, sha256_hex};
 use geo_worker::{
-    ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef,
-    ContentGenerateBeginResult, ContentGenerateFinishRequest, ContentHandoffRef, ContentItemRef,
-    ContentItemsPage, ContentItemsReadRequest, ContentPrepareRequest, ContentSourcePage,
-    ContentSourceReadRequest, ContentStartRequest, ContentStepRequest,
+    ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest,
+    ContentExecutionReadRequest, ContentExecutionRef, ContentGenerateBeginResult,
+    ContentGenerateFinishRequest, ContentHandoffRef, ContentItemRef, ContentItemsPage,
+    ContentItemsReadRequest, ContentPrepareRequest, ContentRepairBeginResult,
+    ContentRepairFinishRequest, ContentSourcePage, ContentSourceReadRequest, ContentStartRequest,
+    ContentStepRequest,
 };
 use uuid::Uuid;
 
@@ -292,28 +294,116 @@ pub(crate) async fn generate_finish(
     item_ref(state, scope, item).await
 }
 
-pub(crate) async fn check(
+pub(crate) async fn check_begin(
     state: &AppState,
     scope: &TenantScope,
     request: ContentStepRequest,
-) -> Result<ContentItemRef, AppError> {
+) -> Result<ContentCheckBeginResult, AppError> {
     scoped_item(state, scope, &request).await?;
+    if let Some((token, revision, quotes)) = state
+        .content_service()
+        .begin_check(scope, request.execution_id, request.item_id)
+        .await?
+    {
+        return Ok(ContentCheckBeginResult::Claimed {
+            token,
+            title_check_id: super::title_check_id(revision.revision_id),
+            check_sections: revision.document.check_sections(),
+            revision: Box::new(revision),
+            quotes,
+        });
+    }
     let item = state
         .content_service()
-        .check(scope, request.execution_id, request.item_id)
+        .repository()
+        .get_item(scope, request.execution_id, request.item_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("content item not found"))?;
+    Ok(ContentCheckBeginResult::Current {
+        item: item_ref(state, scope, item).await?,
+    })
+}
+
+pub(crate) async fn check_finish(
+    state: &AppState,
+    scope: &TenantScope,
+    request: ContentCheckFinishRequest,
+) -> Result<ContentItemRef, AppError> {
+    scoped_item(
+        state,
+        scope,
+        &ContentStepRequest {
+            execution_id: request.execution_id,
+            item_id: request.item_id,
+        },
+    )
+    .await?;
+    let item = state
+        .content_service()
+        .finish_check(
+            scope,
+            request.execution_id,
+            request.item_id,
+            request.token,
+            request.outcome,
+        )
         .await?;
     item_ref(state, scope, item).await
 }
 
-pub(crate) async fn repair(
+pub(crate) async fn repair_begin(
     state: &AppState,
     scope: &TenantScope,
     request: ContentStepRequest,
-) -> Result<ContentItemRef, AppError> {
+) -> Result<ContentRepairBeginResult, AppError> {
     scoped_item(state, scope, &request).await?;
+    if let Some((token, revision, quotes, blocking_findings)) = state
+        .content_service()
+        .begin_repair(scope, request.execution_id, request.item_id)
+        .await?
+    {
+        return Ok(ContentRepairBeginResult::Claimed {
+            token,
+            check_sections: revision.document.check_sections(),
+            revision: Box::new(revision),
+            quotes,
+            blocking_findings,
+        });
+    }
+    let item = state
+        .content_service()
+        .repository()
+        .get_item(scope, request.execution_id, request.item_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("content item not found"))?;
+    Ok(ContentRepairBeginResult::Current {
+        item: item_ref(state, scope, item).await?,
+    })
+}
+
+pub(crate) async fn repair_finish(
+    state: &AppState,
+    scope: &TenantScope,
+    request: ContentRepairFinishRequest,
+) -> Result<ContentItemRef, AppError> {
+    scoped_item(
+        state,
+        scope,
+        &ContentStepRequest {
+            execution_id: request.execution_id,
+            item_id: request.item_id,
+        },
+    )
+    .await?;
     state
         .content_service()
-        .repair(scope, request.execution_id, request.item_id)
+        .finish_repair(
+            scope,
+            request.execution_id,
+            request.item_id,
+            request.token,
+            request.outcome,
+        )
         .await?;
     // Report fresh persisted state; the model response is never an authority
     // for step status or the repair count exposed to the isolate.

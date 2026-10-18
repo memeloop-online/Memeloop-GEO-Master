@@ -33,16 +33,18 @@ fn workflow_budgets() -> HostOpBudgets {
         HostOp::ContentPrepare,
         HostOp::ContentGenerateBegin,
         HostOp::ContentGenerateFinish,
-        HostOp::ContentCheck,
-        HostOp::ContentRepair,
+        HostOp::ContentCheckBegin,
+        HostOp::ContentCheckFinish,
+        HostOp::ContentRepairBegin,
+        HostOp::ContentRepairFinish,
     ] {
         budgets = budgets.with_limits(
             op,
             HostOpLimits::new(
                 120_000,
                 match op {
-                    HostOp::ContentCheck => 30_000,
-                    HostOp::ContentRepair => 20_000,
+                    HostOp::ContentCheckBegin | HostOp::ContentCheckFinish => 30_000,
+                    HostOp::ContentRepairBegin | HostOp::ContentRepairFinish => 20_000,
                     _ => 10_000,
                 },
             ),
@@ -70,15 +72,17 @@ mod budget_tests {
             HostOp::ContentPrepare,
             HostOp::ContentGenerateBegin,
             HostOp::ContentGenerateFinish,
-            HostOp::ContentCheck,
-            HostOp::ContentRepair,
+            HostOp::ContentCheckBegin,
+            HostOp::ContentCheckFinish,
+            HostOp::ContentRepairBegin,
+            HostOp::ContentRepairFinish,
             HostOp::DistributionResume,
             HostOp::DistributionTargetsRead,
         ] {
             assert!(budgets.limits(op).max_calls >= 10_000);
         }
-        assert_eq!(budgets.limits(HostOp::ContentCheck).max_calls, 30_000);
-        assert_eq!(budgets.limits(HostOp::ContentRepair).max_calls, 20_000);
+        assert_eq!(budgets.limits(HostOp::ContentCheckBegin).max_calls, 30_000);
+        assert_eq!(budgets.limits(HostOp::ContentRepairBegin).max_calls, 20_000);
     }
 }
 

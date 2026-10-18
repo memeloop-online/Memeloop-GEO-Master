@@ -7,15 +7,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use geo_domain::{
-    CONTENT_SEMANTIC_DESCRIPTOR_VERSION, ContentCoverage, ContentEvidence, ContentExecutionStatus,
-    ContentSemanticDescriptor, DistributionTargetStatus, EvidenceRef,
+    CONTENT_SEMANTIC_DESCRIPTOR_VERSION, ContentBlock, ContentBlockKind, ContentCoverage,
+    ContentEvidence, ContentExecutionStatus, ContentFinding, ContentRevision,
+    ContentSemanticDescriptor, DistributionTargetStatus, EvidenceRef, StructuredDocument,
 };
 use geo_domain::{ContentItemStatus, TenantScope};
 use geo_worker::{
-    ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef,
-    ContentGenerateBeginResult, ContentGenerateFinishRequest, ContentGenerateOutcome,
-    ContentHandoffRef, ContentItemRef, ContentItemsPage, ContentItemsReadRequest,
-    ContentPrepareRequest, ContentSourceChunk, ContentSourcePage, ContentSourceReadRequest,
+    ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest,
+    ContentExecutionReadRequest, ContentExecutionRef, ContentGenerateBeginResult,
+    ContentGenerateFinishRequest, ContentHandoffRef, ContentItemRef, ContentItemsPage,
+    ContentItemsReadRequest, ContentModelOutcome, ContentPrepareRequest, ContentRepairBeginResult,
+    ContentRepairFinishRequest, ContentSourceChunk, ContentSourcePage, ContentSourceReadRequest,
     ContentSourceRef, ContentStepRequest, DistributionManifestRef, DistributionResumeRequest,
     DistributionStartRequest, DistributionTargetRef, DistributionTargetsPage,
     DistributionTargetsReadRequest, HostBridge, HostOp, HostOpError, HostOps, HostRuntime,
@@ -35,6 +37,8 @@ struct Fixture {
     items: Mutex<Vec<ContentItemRef>>,
     generated: Mutex<Vec<Uuid>>,
     generation_model_calls: Mutex<usize>,
+    check_model_calls: Mutex<usize>,
+    repair_model_calls: Mutex<usize>,
     interrupt_once: Mutex<bool>,
     expansion: Mutex<u64>,
     interrupt_expansion_once: Mutex<bool>,
@@ -67,6 +71,8 @@ impl Fixture {
             ),
             generated: Mutex::new(Vec::new()),
             generation_model_calls: Mutex::new(0),
+            check_model_calls: Mutex::new(0),
+            repair_model_calls: Mutex::new(0),
             interrupt_once: Mutex::new(true),
             expansion: Mutex::new(0),
             interrupt_expansion_once: Mutex::new(false),
@@ -103,6 +109,48 @@ impl Fixture {
             item.status = to;
         }
         Ok(item.clone())
+    }
+    fn revision(item: &ContentItemRef) -> ContentRevision {
+        ContentRevision {
+            revision_id: Uuid::from_u128(
+                item.item_id.as_u128() + 20_000 + u128::from(item.automatic_repair_count) * 100,
+            ),
+            asset_id: Uuid::from_u128(item.item_id.as_u128() + 30_000),
+            revision: i32::from(item.automatic_repair_count) + 1,
+            base_revision_id: None,
+            derived_from_revision_id: None,
+            document: StructuredDocument {
+                schema_version: 2,
+                title: "A cited document".into(),
+                blocks: vec![ContentBlock {
+                    block_id: item.item_id,
+                    kind: ContentBlockKind::Paragraph,
+                    text: "a cited document".into(),
+                    citation_ids: vec![Uuid::from_u128(902)],
+                    items: vec![],
+                    rich: None,
+                }],
+            },
+            markdown: "a cited document".into(),
+            evidence: vec![EvidenceRef {
+                source_version_id: Uuid::from_u128(901),
+                chunk_id: Some(Uuid::from_u128(902)),
+                locator: geo_domain::ChunkLocator::Manual {},
+            }],
+            quotes: vec![],
+            findings: vec![],
+            created_at: chrono::Utc::now(),
+        }
+    }
+    fn quotes() -> Vec<ContentEvidence> {
+        vec![ContentEvidence {
+            reference: EvidenceRef {
+                source_version_id: Uuid::from_u128(901),
+                chunk_id: Some(Uuid::from_u128(902)),
+                locator: geo_domain::ChunkLocator::Manual {},
+            },
+            exact_quote: "a cited document".into(),
+        }]
     }
 }
 
@@ -317,7 +365,7 @@ impl HostOps for Fixture {
             request.token,
             Uuid::from_u128(request.item_id.as_u128() + 10_000)
         );
-        let ContentGenerateOutcome::Completed { text } = request.outcome else {
+        let ContentModelOutcome::Completed { text } = request.outcome else {
             return Err(HostOpError::failed(
                 HostOp::ContentGenerateFinish,
                 "fixture requires a completed generation",
@@ -345,11 +393,12 @@ impl HostOps for Fixture {
         }
         Ok(item)
     }
-    async fn content_check(
+    async fn content_check_begin(
         &self,
         _scope: &TenantScope,
         request: ContentStepRequest,
-    ) -> Result<ContentItemRef, HostOpError> {
+    ) -> Result<ContentCheckBeginResult, HostOpError> {
+        assert_eq!(request.execution_id, self.execution_id);
         let item = self
             .items
             .lock()
@@ -358,18 +407,99 @@ impl HostOps for Fixture {
             .find(|item| item.item_id == request.item_id)
             .unwrap()
             .clone();
-        let to = if request.item_id == Uuid::from_u128(1) && item.automatic_repair_count < 2 {
+        if item.status != ContentItemStatus::Drafted {
+            return Ok(ContentCheckBeginResult::Current { item });
+        }
+        let revision = Self::revision(&item);
+        Ok(ContentCheckBeginResult::Claimed {
+            token: revision.revision_id,
+            check_sections: revision.document.check_sections(),
+            title_check_id: Uuid::from_u128(item.item_id.as_u128() + 40_000),
+            revision: Box::new(revision),
+            quotes: Self::quotes(),
+        })
+    }
+    async fn content_check_finish(
+        &self,
+        _scope: &TenantScope,
+        request: ContentCheckFinishRequest,
+    ) -> Result<ContentItemRef, HostOpError> {
+        let ContentModelOutcome::Completed { text } = request.outcome else {
+            return Err(HostOpError::failed(
+                HostOp::ContentCheckFinish,
+                "fixture requires a completed check",
+            ));
+        };
+        let input: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let to = if input["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["verdict"] == "unsupported")
+        {
             ContentItemStatus::NeedsRepair
         } else {
             ContentItemStatus::Ready
         };
-        self.step(request, ContentItemStatus::Drafted, to)
+        self.step(
+            ContentStepRequest {
+                execution_id: request.execution_id,
+                item_id: request.item_id,
+            },
+            ContentItemStatus::Drafted,
+            to,
+        )
     }
-    async fn content_repair(
+    async fn content_repair_begin(
         &self,
         _scope: &TenantScope,
         request: ContentStepRequest,
+    ) -> Result<ContentRepairBeginResult, HostOpError> {
+        assert_eq!(request.execution_id, self.execution_id);
+        let item = self
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|item| item.item_id == request.item_id)
+            .unwrap()
+            .clone();
+        if item.status != ContentItemStatus::NeedsRepair || item.automatic_repair_count >= 2 {
+            return Err(HostOpError::denied(
+                HostOp::ContentRepairBegin,
+                "repair is not eligible",
+            ));
+        }
+        let revision = Self::revision(&item);
+        Ok(ContentRepairBeginResult::Claimed {
+            token: revision.revision_id,
+            check_sections: revision.document.check_sections(),
+            blocking_findings: vec![ContentFinding {
+                finding_id: Uuid::new_v4(),
+                code: "unsupported_claim".into(),
+                block_id: Some(item.item_id),
+                evidence: revision.evidence.clone(),
+                detail: "Correct the unsupported fragment".into(),
+                blocking: true,
+            }],
+            revision: Box::new(revision),
+            quotes: Self::quotes(),
+        })
+    }
+    async fn content_repair_finish(
+        &self,
+        _scope: &TenantScope,
+        request: ContentRepairFinishRequest,
     ) -> Result<ContentItemRef, HostOpError> {
+        assert_eq!(request.execution_id, self.execution_id);
+        let ContentModelOutcome::Completed { text } = request.outcome else {
+            return Err(HostOpError::failed(
+                HostOp::ContentRepairFinish,
+                "fixture requires a completed repair",
+            ));
+        };
+        let document: StructuredDocument = serde_json::from_str(&text).unwrap();
+        assert_eq!(document.blocks[0].block_id, request.item_id);
         let mut items = self.items.lock().unwrap();
         let item = items
             .iter_mut()
@@ -377,7 +507,7 @@ impl HostOps for Fixture {
             .unwrap();
         if item.status != ContentItemStatus::NeedsRepair || item.automatic_repair_count >= 2 {
             return Err(HostOpError::denied(
-                HostOp::ContentRepair,
+                HostOp::ContentRepairFinish,
                 "repair is not eligible",
             ));
         }
@@ -419,6 +549,43 @@ impl HostOps for Fixture {
                 .is_some_and(|system| system.contains("content evidence selector"))
             {
                 serde_json::json!({ "evidence": [{ "source_version_id": Uuid::from_u128(901), "chunk_id": Uuid::from_u128(902), "exact_quote": "a cited document" }] }).to_string()
+            } else if request
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("independent factual checker")
+            {
+                *self.check_model_calls.lock().unwrap() += 1;
+                let input: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
+                let block_id: Uuid =
+                    serde_json::from_value(input["document"]["blocks"][0]["block_id"].clone())
+                        .unwrap();
+                let item = self
+                    .items
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item.item_id == block_id)
+                    .unwrap()
+                    .clone();
+                let unsupported =
+                    item.item_id == Uuid::from_u128(1) && item.automatic_repair_count < 2;
+                serde_json::json!({"checks": [
+                    {"block_id": input["title_check_id"], "verdict": "supported",
+                     "citation_ids": [Uuid::from_u128(902)], "detail": "Title is supported"},
+                    {"block_id": block_id, "verdict": if unsupported {"unsupported"} else {"supported"},
+                     "citation_ids": [Uuid::from_u128(902)], "detail": "Check the cited fragment"}
+                ]}).to_string()
+            } else if request
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("repairer")
+            {
+                *self.repair_model_calls.lock().unwrap() += 1;
+                let input: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
+                assert!(!input["blocking_findings"].as_array().unwrap().is_empty());
+                input["previous_document"].to_string()
             } else {
                 *self.generation_model_calls.lock().unwrap() += 1;
                 let input: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
@@ -571,6 +738,8 @@ async fn blocked_branch_keeps_the_denominator_and_does_not_prevent_other_prepara
         &[Uuid::from_u128(1)]
     );
     assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 1);
+    assert_eq!(*fixture.check_model_calls.lock().unwrap(), 3);
+    assert_eq!(*fixture.repair_model_calls.lock().unwrap(), 2);
     assert_eq!(
         fixture.items.lock().unwrap()[1].status,
         ContentItemStatus::Blocked
@@ -613,6 +782,8 @@ async fn two_documents_resume_after_generation_without_duplicate_model_call() {
     );
     assert_eq!(fixture.generated.lock().unwrap().len(), 2);
     assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 2);
+    assert_eq!(*fixture.check_model_calls.lock().unwrap(), 1);
+    assert_eq!(*fixture.repair_model_calls.lock().unwrap(), 0);
     drop(first);
     let mut resumed = HostRuntime::new(
         &modules,
@@ -627,6 +798,8 @@ async fn two_documents_resume_after_generation_without_duplicate_model_call() {
         "durable drafts must not be regenerated"
     );
     assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 2);
+    assert_eq!(*fixture.check_model_calls.lock().unwrap(), 4);
+    assert_eq!(*fixture.repair_model_calls.lock().unwrap(), 2);
     assert!(
         resumed
             .host_state()
@@ -672,6 +845,8 @@ async fn closed_execution_resumes_frozen_distribution_without_regenerating_or_se
     assert_eq!(*fixture.expansion.lock().unwrap(), 128);
     assert_eq!(fixture.generated.lock().unwrap().len(), 0);
     assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 0);
+    assert_eq!(*fixture.check_model_calls.lock().unwrap(), 0);
+    assert_eq!(*fixture.repair_model_calls.lock().unwrap(), 0);
     drop(first);
     let mut resumed = HostRuntime::new(
         &modules,
@@ -682,6 +857,8 @@ async fn closed_execution_resumes_frozen_distribution_without_regenerating_or_se
     resumed.call_main(ENTRY, &input, DEADLINE).await.unwrap();
     assert_eq!(fixture.generated.lock().unwrap().len(), 0);
     assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 0);
+    assert_eq!(*fixture.check_model_calls.lock().unwrap(), 0);
+    assert_eq!(*fixture.repair_model_calls.lock().unwrap(), 0);
     assert!(
         resumed
             .host_state()

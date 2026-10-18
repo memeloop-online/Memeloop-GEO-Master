@@ -1645,24 +1645,46 @@ impl HostOps for RepositoryHostOps {
             .map_err(|error| worker_error(op, error))
     }
 
-    async fn content_check(
+    async fn content_check_begin(
         &self,
         scope: &TenantScope,
         request: geo_worker::ContentStepRequest,
-    ) -> Result<geo_worker::ContentItemRef, HostOpError> {
-        let op = HostOp::ContentCheck;
-        crate::content_tools::check(self.content_state(op)?, scope, request)
+    ) -> Result<geo_worker::ContentCheckBeginResult, HostOpError> {
+        let op = HostOp::ContentCheckBegin;
+        crate::content_tools::check_begin(self.content_state(op)?, scope, request)
             .await
             .map_err(|error| worker_error(op, error))
     }
 
-    async fn content_repair(
+    async fn content_check_finish(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentCheckFinishRequest,
+    ) -> Result<geo_worker::ContentItemRef, HostOpError> {
+        let op = HostOp::ContentCheckFinish;
+        crate::content_tools::check_finish(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_repair_begin(
         &self,
         scope: &TenantScope,
         request: geo_worker::ContentStepRequest,
+    ) -> Result<geo_worker::ContentRepairBeginResult, HostOpError> {
+        let op = HostOp::ContentRepairBegin;
+        crate::content_tools::repair_begin(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_repair_finish(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentRepairFinishRequest,
     ) -> Result<geo_worker::ContentItemRef, HostOpError> {
-        let op = HostOp::ContentRepair;
-        crate::content_tools::repair(self.content_state(op)?, scope, request)
+        let op = HostOp::ContentRepairFinish;
+        crate::content_tools::repair_finish(self.content_state(op)?, scope, request)
             .await
             .map_err(|error| worker_error(op, error))
     }

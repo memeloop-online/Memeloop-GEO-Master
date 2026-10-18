@@ -699,20 +699,11 @@ impl AppState {
     }
 
     pub fn content_service(&self) -> ContentService {
-        let service = ContentService::new(
+        ContentService::new(
             Arc::clone(&self.content_repository),
             self.knowledge_repository(),
             self.project_repository(),
-        );
-        match self
-            .content_model
-            .read()
-            .expect("content model lock")
-            .clone()
-        {
-            Some(provider) => service.with_model_provider(provider),
-            None => service,
-        }
+        )
     }
 
     pub fn distribution_repository(&self) -> Arc<dyn geo_domain::DistributionRepository> {
