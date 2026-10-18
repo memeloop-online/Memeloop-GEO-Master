@@ -43,11 +43,13 @@ export function StandaloneMeasurementPanel({
   projectId,
   canWrite,
   recordsOnly = false,
+  active = true,
 }: {
   tenantId: string;
   projectId: string;
   canWrite: boolean;
   recordsOnly?: boolean;
+  active?: boolean;
 }) {
   const { t } = useTranslation("measurement");
   const [params, setParams] = useSearchParams();
@@ -169,7 +171,9 @@ export function StandaloneMeasurementPanel({
     queryKey: [...key, "options", selectedAccount?.account_id],
     queryFn: () =>
       getMeasurementOptions(tenantId, projectId, selectedAccount!.account_id),
-    enabled: Boolean(session && accountReady && canWrite && !recordsOnly),
+    enabled: Boolean(
+      session && accountReady && canWrite && !recordsOnly && active,
+    ),
     retry: false,
   });
   const models = options.data?.models ?? [];
@@ -281,7 +285,7 @@ export function StandaloneMeasurementPanel({
     : (version.data?.questions ?? []);
   const refreshAccounts = channels.accounts.refetch;
   useEffect(() => {
-    if (recordsOnly) return;
+    if (recordsOnly || !active) return;
     const refresh = () => {
       if (document.visibilityState !== "hidden") void refreshAccounts();
     };
@@ -291,7 +295,7 @@ export function StandaloneMeasurementPanel({
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", refresh);
     };
-  }, [recordsOnly, refreshAccounts]);
+  }, [recordsOnly, active, refreshAccounts]);
   const submission = useMutation({
     mutationFn: (input: StandaloneMeasurementRequest) =>
       createMeasurementPlan(tenantId, projectId, input),
