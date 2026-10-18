@@ -29,8 +29,8 @@ const saved = (
   document,
   proposal,
   versions = {
-    prompt_version: "geo.observation.extract.v3",
-    parser_version: "geo.observation.extract.v5",
+    prompt_version: "geo.observation.extract.v4",
+    parser_version: "geo.observation.extract.v6",
   },
 ) => {
   const source_json = JSON.stringify(document);
@@ -71,7 +71,7 @@ test("800 AI-selected fragments around interruptions retain every concrete audit
   assert.equal(result.candidate_json, JSON.stringify(proposal));
   assert.equal(
     result.outcome.audit.prompt_version,
-    "geo.observation.extract.v3",
+    "geo.observation.extract.v4",
   );
   assert.deepEqual(result.outcome.audit.refs, grounded.audit.refs);
   assert.equal(
@@ -183,18 +183,24 @@ test("empty suffix, escaped keys, duplicates, and UTF-8/expanded-count limits", 
   );
 });
 
-test("saved version binding keeps omitted legacy versions and rejects ranges under legacy", () => {
+test("saved ranges require explicit current versions and reject historical versions", () => {
   const document = {
     messages: [{ done: true, searched: true }, fragment("x")],
   };
   const compact = candidate([range(1, 2)]);
   const singleton = candidate([{ path: "/messages/1/response/content/text" }]);
-  assert.equal(
-    saved(document, singleton, {}).outcome.audit.prompt_version,
-    "geo.observation.extract.v2",
-  );
-  assert.equal(saved(document, compact, {}).outcome.status, "unverified");
+  assert.equal(saved(document, singleton).outcome.status, "grounded");
+  assert.equal(saved(document, compact).outcome.status, "grounded");
   for (const versions of [
+    {},
+    {
+      prompt_version: "geo.observation.extract.v2",
+      parser_version: "geo.observation.extract.v4",
+    },
+    {
+      prompt_version: "geo.observation.extract.v3",
+      parser_version: "geo.observation.extract.v5",
+    },
     { prompt_version: "geo.observation.extract.v3" },
     { parser_version: "geo.observation.extract.v5" },
     { prompt_version: null, parser_version: null },

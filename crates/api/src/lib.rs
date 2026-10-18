@@ -64,7 +64,7 @@ pub use measurement_reports::{
 pub use observation_ai_callback::ObservationAiCallbackService;
 pub use observation_analysis::{
     GroundingResult, HttpSavedObservationGrounder, ObservationAnalysisService,
-    SavedObservationGrounder,
+    PreparedObservationPrompt, SavedObservationGrounder,
 };
 pub use observation_capture_callback::ObservationCaptureCallbackService;
 pub use observation_completion_recovery::dispatch_observation_completion_recovery;

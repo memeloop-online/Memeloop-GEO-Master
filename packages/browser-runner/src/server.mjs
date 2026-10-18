@@ -6,6 +6,7 @@ import { createRunner, RunnerError } from "./runner.mjs";
 import { readRichMultipart } from "./rich-transport.mjs";
 import {
   groundSavedObservation,
+  prepareSavedObservation,
   SAVED_GROUNDING_BODY_BYTES,
 } from "./saved-observation-grounding.mjs";
 
@@ -193,6 +194,19 @@ export function createRunnerServer({
         send(response, 200, runner.capabilities());
       } else if (request.method === "GET" && path === "/v1/lifecycle") {
         send(response, 200, runner.lifecycle());
+      } else if (
+        request.method === "POST" &&
+        path === "/v1/observation-analyses/prepare"
+      ) {
+        try {
+          const prepared = prepareSavedObservation(
+            await readJson(request, SAVED_GROUNDING_BODY_BYTES),
+          );
+          send(response, prepared.error ? 400 : 200, prepared);
+        } catch (error) {
+          if (!(error instanceof RunnerError)) throw error;
+          send(response, 400, { error: error.code });
+        }
       } else if (
         request.method === "POST" &&
         path === "/v1/observation-analyses/ground"

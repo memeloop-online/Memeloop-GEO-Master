@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { groundSavedObservation } from "../src/saved-observation-grounding.mjs";
+import {
+  groundSavedObservation,
+  prepareSavedObservation,
+} from "../src/saved-observation-grounding.mjs";
+import { extractionPrompt } from "../src/ai-observation-parser.mjs";
 import { createRunnerServer } from "../src/server.mjs";
 
 const source = {
@@ -36,6 +40,8 @@ const request = (overrides = {}) => {
     source_sha256: digest(source_json),
     candidate_json: JSON.stringify(candidate),
     protocol: { model: "synthetic-model", search_mode: "official_search" },
+    prompt_version: "geo.observation.extract.v4",
+    parser_version: "geo.observation.extract.v6",
     ...overrides,
   };
 };
@@ -207,7 +213,7 @@ test("optional recommendation audit overflow preserves bounded answer provenance
   }
 });
 
-test("empty, missing and historical recommendation analysis remain distinct", () => {
+test("empty and missing recommendation analysis remain distinct; historical versions are rejected", () => {
   assert.equal(
     groundSavedObservation(recommendationRequest([])).outcome.audit
       .recommendations.status,
@@ -225,14 +231,149 @@ test("empty, missing and historical recommendation analysis remain distinct", ()
   ]) {
     const historical = request({ prompt_version, parser_version });
     assert.equal(
-      groundSavedObservation(historical).outcome.audit.recommendations,
-      undefined,
+      groundSavedObservation(historical).outcome.reason,
+      "version_rejected",
     );
     historical.candidate_json = recommendationRequest().candidate_json;
     assert.equal(
       groundSavedObservation(historical).outcome.status,
       "unverified",
     );
+  }
+});
+
+const prepareRequest = (overrides = {}) => {
+  const { candidate_json, protocol, ...input } = request();
+  return { ...input, ...overrides };
+};
+
+test("saved prompt preparation reuses current prompt with exact saved indices and metadata", () => {
+  const document = {
+    messages: [
+      { state: "completed", text: "合成片段一" },
+      { arbitrary: { value: "合成片段二" } },
+    ],
+    rendered_text: "合成完整可见回答",
+    capture_status: {
+      schema_version: "geo.observation.capture-status.v1",
+      transport: "partial",
+      termination: "eof",
+    },
+    source_redaction: {
+      schema_version: "geo.observation.source-redaction.v1",
+      policy: "reasoning-and-private-fields",
+      omitted_paths: ["/messages/0/reasoning"],
+    },
+  };
+  const source_json = JSON.stringify(document, null, 2);
+  const input = prepareRequest({
+    source_json,
+    source_sha256: digest(source_json),
+  });
+  const before = structuredClone(input);
+  const result = prepareSavedObservation(input);
+  assert.deepEqual(input, before);
+  assert.deepEqual(result, {
+    prompt: extractionPrompt(document),
+    source_sha256: digest(source_json),
+    prompt_version: "geo.observation.extract.v4",
+    parser_version: "geo.observation.extract.v6",
+  });
+  for (const key of ["rendered_text", "capture_status", "source_redaction"])
+    assert.ok(
+      result.prompt.includes(`/${key} = ${JSON.stringify(document[key])}`),
+    );
+  for (const [index, message] of document.messages.entries())
+    assert.ok(
+      result.prompt.includes(`/messages/${index} = ${JSON.stringify(message)}`),
+    );
+});
+
+test("saved prompt preparation rejects malformed, oversized and unsupported input with bounded reasons", () => {
+  for (const [overrides, error] of [
+    [{ source_sha256: "A".repeat(64) }, "shape_rejected"],
+    [{ source_sha256: "0".repeat(64) }, "source_digest_mismatch"],
+    [{ source_json: "{", source_sha256: digest("{") }, "source_invalid_json"],
+    [{ source_json: "中".repeat(250_001) }, "source_too_large"],
+    [
+      {
+        prompt_version: "geo.observation.extract.v2",
+        parser_version: "geo.observation.extract.v4",
+      },
+      "version_rejected",
+    ],
+    [
+      {
+        prompt_version: "geo.observation.extract.v3",
+        parser_version: "geo.observation.extract.v5",
+      },
+      "version_rejected",
+    ],
+    [{ parser_version: "geo.observation.extract.v5" }, "version_rejected"],
+    [{ prompt_version: null }, "version_rejected"],
+    [{ candidate_json: "{}" }, "shape_rejected"],
+    [{ protocol: {} }, "shape_rejected"],
+    [{ session_id: "synthetic-session" }, "shape_rejected"],
+  ])
+    assert.deepEqual(prepareSavedObservation(prepareRequest(overrides)), {
+      error,
+    });
+  for (const document of [
+    null,
+    [],
+    {},
+    { messages: null },
+    { messages: {} },
+    { messages: [], rendered_text: 42 },
+  ]) {
+    const source_json = JSON.stringify(document);
+    assert.deepEqual(
+      prepareSavedObservation(
+        prepareRequest({ source_json, source_sha256: digest(source_json) }),
+      ),
+      { error: "shape_rejected" },
+    );
+  }
+  for (const omitted of [
+    "source_json",
+    "source_sha256",
+    "prompt_version",
+    "parser_version",
+  ]) {
+    const input = prepareRequest();
+    delete input[omitted];
+    assert.deepEqual(prepareSavedObservation(input), {
+      error: "shape_rejected",
+    });
+  }
+  const source_json = JSON.stringify({ messages: Array(100_000).fill(null) });
+  assert.ok(Buffer.byteLength(source_json) <= 750_000);
+  assert.deepEqual(
+    prepareSavedObservation(
+      prepareRequest({ source_json, source_sha256: digest(source_json) }),
+    ),
+    { error: "prompt_too_large" },
+  );
+});
+
+test("saved grounding requires both explicit current extraction versions", () => {
+  for (const versions of [
+    {},
+    { prompt_version: "geo.observation.extract.v4" },
+    { parser_version: "geo.observation.extract.v6" },
+    { prompt_version: null, parser_version: null },
+    {
+      prompt_version: "geo.observation.extract.v3",
+      parser_version: "geo.observation.extract.v6",
+    },
+  ]) {
+    const input = request();
+    delete input.prompt_version;
+    delete input.parser_version;
+    assert.deepEqual(groundSavedObservation({ ...input, ...versions }), {
+      candidate_json: null,
+      outcome: { status: "unverified", reason: "version_rejected" },
+    });
   }
 });
 
@@ -398,4 +539,61 @@ test("service endpoint is bearer-only and does not touch runner/session methods"
   });
   assert.equal(oversized.status, 413);
   assert.deepEqual(await oversized.json(), { error: "payload_too_large" });
+});
+
+test("prompt preparation endpoint is authenticated, bounded and independent of runner and model", async (t) => {
+  const runner = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error("runner methods must not be accessed");
+      },
+    },
+  );
+  const server = createRunnerServer({
+    token: "synthetic-service-token",
+    runner,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const url = `http://127.0.0.1:${server.address().port}/v1/observation-analyses/prepare`;
+  const headers = {
+    authorization: "Bearer synthetic-service-token",
+    "content-type": "application/json",
+  };
+  const denied = await fetch(url, {
+    method: "POST",
+    body: JSON.stringify(prepareRequest()),
+  });
+  assert.equal(denied.status, 401);
+  const input = prepareRequest();
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(input),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), prepareSavedObservation(input));
+  for (const [body, error] of [
+    ["{", "invalid_json"],
+    [
+      JSON.stringify({ ...input, source_sha256: "0".repeat(64) }),
+      "source_digest_mismatch",
+    ],
+    [JSON.stringify({ ...input, candidate_json: "{}" }), "shape_rejected"],
+    [
+      JSON.stringify({
+        ...input,
+        prompt_version: "geo.observation.extract.v3",
+        parser_version: "geo.observation.extract.v5",
+      }),
+      "version_rejected",
+    ],
+    [" ".repeat(6_000_001), "payload_too_large"],
+  ]) {
+    const rejected = await fetch(url, { method: "POST", headers, body });
+    assert.equal(rejected.status, 400);
+    assert.deepEqual(await rejected.json(), { error });
+  }
 });
