@@ -2,9 +2,10 @@
 
 use geo_domain::{AppError, ContentExecution, ContentItem, TenantScope, sha256_hex};
 use geo_worker::{
-    ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef, ContentHandoffRef,
-    ContentItemRef, ContentItemsPage, ContentItemsReadRequest, ContentPrepareRequest,
-    ContentSourcePage, ContentSourceReadRequest, ContentStartRequest, ContentStepRequest,
+    ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef,
+    ContentGenerateBeginResult, ContentGenerateFinishRequest, ContentHandoffRef, ContentItemRef,
+    ContentItemsPage, ContentItemsReadRequest, ContentPrepareRequest, ContentSourcePage,
+    ContentSourceReadRequest, ContentStartRequest, ContentStepRequest,
 };
 use uuid::Uuid;
 
@@ -231,18 +232,57 @@ pub(crate) async fn source_read(
     state.content_service().source_read(scope, request).await
 }
 
-pub(crate) async fn generate(
+pub(crate) async fn generate_begin(
     state: &AppState,
     scope: &TenantScope,
     request: ContentStepRequest,
-) -> Result<ContentItemRef, AppError> {
+) -> Result<ContentGenerateBeginResult, AppError> {
     scoped_item(state, scope, &request).await?;
+    let claim = state
+        .content_service()
+        .begin_generate(scope, request.execution_id, request.item_id)
+        .await?;
+    if let Some((token, descriptor)) = claim {
+        return Ok(ContentGenerateBeginResult::Claimed {
+            token,
+            descriptor: Box::new(descriptor),
+        });
+    }
+    let item = state
+        .content_service()
+        .repository()
+        .get_item(scope, request.execution_id, request.item_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("content item not found"))?;
+    Ok(ContentGenerateBeginResult::Current {
+        item: item_ref(state, scope, item).await?,
+    })
+}
+
+pub(crate) async fn generate_finish(
+    state: &AppState,
+    scope: &TenantScope,
+    request: ContentGenerateFinishRequest,
+) -> Result<ContentItemRef, AppError> {
+    scoped_item(
+        state,
+        scope,
+        &ContentStepRequest {
+            execution_id: request.execution_id,
+            item_id: request.item_id,
+        },
+    )
+    .await?;
     state
         .content_service()
-        .generate(scope, request.execution_id, request.item_id)
+        .finish_generate(
+            scope,
+            request.execution_id,
+            request.item_id,
+            request.token,
+            request.outcome,
+        )
         .await?;
-    // The model transform returns a revision; the op must report the persisted
-    // item transition, not infer a status from an in-memory response.
     let item = state
         .content_service()
         .repository()

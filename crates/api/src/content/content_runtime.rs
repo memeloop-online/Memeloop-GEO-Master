@@ -31,7 +31,8 @@ fn workflow_budgets() -> HostOpBudgets {
         .with_limits(HostOp::ModelComplete, HostOpLimits::new(120_000, 320_000));
     for op in [
         HostOp::ContentPrepare,
-        HostOp::ContentGenerate,
+        HostOp::ContentGenerateBegin,
+        HostOp::ContentGenerateFinish,
         HostOp::ContentCheck,
         HostOp::ContentRepair,
     ] {
@@ -67,7 +68,8 @@ mod budget_tests {
             HostOp::ContentSourceRead,
             HostOp::ModelComplete,
             HostOp::ContentPrepare,
-            HostOp::ContentGenerate,
+            HostOp::ContentGenerateBegin,
+            HostOp::ContentGenerateFinish,
             HostOp::ContentCheck,
             HostOp::ContentRepair,
             HostOp::DistributionResume,

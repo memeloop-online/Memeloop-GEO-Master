@@ -6,13 +6,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use geo_domain::{ContentCoverage, ContentExecutionStatus, DistributionTargetStatus};
+use geo_domain::{
+    CONTENT_SEMANTIC_DESCRIPTOR_VERSION, ContentCoverage, ContentEvidence, ContentExecutionStatus,
+    ContentSemanticDescriptor, DistributionTargetStatus, EvidenceRef,
+};
 use geo_domain::{ContentItemStatus, TenantScope};
 use geo_worker::{
-    ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef, ContentHandoffRef,
-    ContentItemRef, ContentItemsPage, ContentItemsReadRequest, ContentPrepareRequest,
-    ContentSourceChunk, ContentSourcePage, ContentSourceReadRequest, ContentSourceRef,
-    ContentStepRequest, DistributionManifestRef, DistributionResumeRequest,
+    ContentCloseRequest, ContentExecutionReadRequest, ContentExecutionRef,
+    ContentGenerateBeginResult, ContentGenerateFinishRequest, ContentGenerateOutcome,
+    ContentHandoffRef, ContentItemRef, ContentItemsPage, ContentItemsReadRequest,
+    ContentPrepareRequest, ContentSourceChunk, ContentSourcePage, ContentSourceReadRequest,
+    ContentSourceRef, ContentStepRequest, DistributionManifestRef, DistributionResumeRequest,
     DistributionStartRequest, DistributionTargetRef, DistributionTargetsPage,
     DistributionTargetsReadRequest, HostBridge, HostOp, HostOpError, HostOps, HostRuntime,
     ManifestPage, ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion,
@@ -30,6 +34,7 @@ struct Fixture {
     handoff_id: Uuid,
     items: Mutex<Vec<ContentItemRef>>,
     generated: Mutex<Vec<Uuid>>,
+    generation_model_calls: Mutex<usize>,
     interrupt_once: Mutex<bool>,
     expansion: Mutex<u64>,
     interrupt_expansion_once: Mutex<bool>,
@@ -61,6 +66,7 @@ impl Fixture {
                     .collect(),
             ),
             generated: Mutex::new(Vec::new()),
+            generation_model_calls: Mutex::new(0),
             interrupt_once: Mutex::new(true),
             expansion: Mutex::new(0),
             interrupt_expansion_once: Mutex::new(false),
@@ -249,37 +255,91 @@ impl HostOps for Fixture {
             ContentItemStatus::Prepared,
         )
     }
-    async fn content_generate(
+    async fn content_generate_begin(
         &self,
         scope: &TenantScope,
         request: ContentStepRequest,
+    ) -> Result<ContentGenerateBeginResult, HostOpError> {
+        assert_eq!(request.execution_id, self.execution_id);
+        let item = self
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|item| item.item_id == request.item_id)
+            .unwrap()
+            .clone();
+        if item.status != ContentItemStatus::Prepared {
+            return Ok(ContentGenerateBeginResult::Current { item });
+        }
+        Ok(ContentGenerateBeginResult::Claimed {
+            token: Uuid::from_u128(request.item_id.as_u128() + 10_000),
+            descriptor: Box::new(ContentSemanticDescriptor {
+                version: CONTENT_SEMANTIC_DESCRIPTOR_VERSION,
+                scope: scope.clone(),
+                document_key: item.document_key,
+                content_type: "faq".into(),
+                product_id: None,
+                market: "US".into(),
+                language: "en".into(),
+                planner_version: "fixture-planner".into(),
+                source_version_ids: vec![Uuid::from_u128(901)],
+                evidence: vec![ContentEvidence {
+                    reference: EvidenceRef {
+                        source_version_id: Uuid::from_u128(901),
+                        chunk_id: Some(Uuid::from_u128(902)),
+                        locator: geo_domain::ChunkLocator::Manual {},
+                    },
+                    exact_quote: "a cited document".into(),
+                }],
+                brand_name: "Example".into(),
+                product_name: None,
+                target_audience: None,
+                objective: None,
+                question_clusters: vec![],
+                brief_title: "A cited document".into(),
+                brief_objective: "Answer using public evidence".into(),
+                generation_policy_version: geo_domain::RICH_GENERATION_POLICY_VERSION.into(),
+                evidence_policy_version: "located-public-evidence-v1".into(),
+                check_policy_version: geo_domain::RICH_CHECK_POLICY_VERSION.into(),
+                repair_policy_version: geo_domain::RICH_REPAIR_POLICY_VERSION.into(),
+                output_schema_version: "structured-document-v2".into(),
+                generation_policy_revision: "initial".into(),
+            }),
+        })
+    }
+    async fn content_generate_finish(
+        &self,
+        _scope: &TenantScope,
+        request: ContentGenerateFinishRequest,
     ) -> Result<ContentItemRef, HostOpError> {
+        assert_eq!(
+            request.token,
+            Uuid::from_u128(request.item_id.as_u128() + 10_000)
+        );
+        let ContentGenerateOutcome::Completed { text } = request.outcome else {
+            return Err(HostOpError::failed(
+                HostOp::ContentGenerateFinish,
+                "fixture requires a completed generation",
+            ));
+        };
+        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(document["schema_version"], 2);
         let item = self.step(
-            request.clone(),
+            ContentStepRequest {
+                execution_id: request.execution_id,
+                item_id: request.item_id,
+            },
             ContentItemStatus::Prepared,
             ContentItemStatus::Drafted,
         )?;
         if !self.generated.lock().unwrap().contains(&request.item_id) {
             self.generated.lock().unwrap().push(request.item_id);
-            // This stand-in goes through the provider host capability; the
-            // production ContentService injects that provider after a lease.
-            self.model_complete(
-                scope,
-                ModelCompletionRequest {
-                    prompt: "Generate one cited document".to_owned(),
-                    system: None,
-                    model: None,
-                    max_output_tokens: None,
-                    messages: Vec::new(),
-                    tools: Vec::new(),
-                },
-            )
-            .await?;
         }
         if request.item_id == Uuid::from_u128(1) && *self.interrupt_once.lock().unwrap() {
             *self.interrupt_once.lock().unwrap() = false;
             return Err(HostOpError::failed(
-                HostOp::ContentGenerate,
+                HostOp::ContentGenerateFinish,
                 "interrupted after durable generation",
             ));
         }
@@ -360,7 +420,16 @@ impl HostOps for Fixture {
             {
                 serde_json::json!({ "evidence": [{ "source_version_id": Uuid::from_u128(901), "chunk_id": Uuid::from_u128(902), "exact_quote": "a cited document" }] }).to_string()
             } else {
-                "a cited document".to_owned()
+                *self.generation_model_calls.lock().unwrap() += 1;
+                let input: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
+                assert_eq!(input["evidence"][0]["quote"], "a cited document");
+                serde_json::json!({
+                    "schema_version": 2,
+                    "title": "A cited document",
+                    "blocks": [{"kind": "paragraph", "text": "a cited document",
+                        "citation_ids": [Uuid::from_u128(902)], "items": []}]
+                })
+                .to_string()
             },
             model: "injected-model".to_owned(),
             prompt_tokens: 1,
@@ -501,6 +570,7 @@ async fn blocked_branch_keeps_the_denominator_and_does_not_prevent_other_prepara
         fixture.generated.lock().unwrap().as_slice(),
         &[Uuid::from_u128(1)]
     );
+    assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 1);
     assert_eq!(
         fixture.items.lock().unwrap()[1].status,
         ContentItemStatus::Blocked
@@ -542,6 +612,7 @@ async fn two_documents_resume_after_generation_without_duplicate_model_call() {
         "first handoff must remain incomplete"
     );
     assert_eq!(fixture.generated.lock().unwrap().len(), 2);
+    assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 2);
     drop(first);
     let mut resumed = HostRuntime::new(
         &modules,
@@ -555,6 +626,7 @@ async fn two_documents_resume_after_generation_without_duplicate_model_call() {
         2,
         "durable drafts must not be regenerated"
     );
+    assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 2);
     assert!(
         resumed
             .host_state()
@@ -599,6 +671,7 @@ async fn closed_execution_resumes_frozen_distribution_without_regenerating_or_se
     assert!(first.call_main(ENTRY, &input, DEADLINE).await.is_err());
     assert_eq!(*fixture.expansion.lock().unwrap(), 128);
     assert_eq!(fixture.generated.lock().unwrap().len(), 0);
+    assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 0);
     drop(first);
     let mut resumed = HostRuntime::new(
         &modules,
@@ -608,6 +681,7 @@ async fn closed_execution_resumes_frozen_distribution_without_regenerating_or_se
     .unwrap();
     resumed.call_main(ENTRY, &input, DEADLINE).await.unwrap();
     assert_eq!(fixture.generated.lock().unwrap().len(), 0);
+    assert_eq!(*fixture.generation_model_calls.lock().unwrap(), 0);
     assert!(
         resumed
             .host_state()

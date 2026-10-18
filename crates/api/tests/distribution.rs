@@ -26,9 +26,9 @@ use geo_domain::{
     UpdateProject, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_worker::{
-    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
-    DistributionTargetsReadRequest, HostOpError, HostOpErrorCode, HostOps, ModelCompletion,
-    ModelCompletionRequest,
+    ContentGenerateOutcome, DistributionReadRequest, DistributionResumeRequest,
+    DistributionStartRequest, DistributionTargetsReadRequest, HostOpError, HostOpErrorCode,
+    HostOps, ModelCompletion, ModelCompletionRequest,
 };
 use uuid::Uuid;
 
@@ -451,8 +451,35 @@ async fn setup(second_blocked: bool) -> Fixture {
             )
             .await
             .unwrap();
+        let (token, descriptor) = first_stage
+            .begin_generate(&scope, execution.execution_id, item.item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let output = GroundedModel
+            .complete(
+                &scope,
+                &ModelCompletionRequest {
+                    prompt: serde_json::json!({"evidence": descriptor.evidence.iter().map(|e| serde_json::json!({
+                        "chunk_id": e.reference.chunk_id, "quote": e.exact_quote
+                    })).collect::<Vec<_>>()}).to_string(),
+                    system: None,
+                    model: None,
+                    max_output_tokens: None,
+                    messages: vec![],
+                    tools: vec![],
+                },
+            )
+            .await
+            .unwrap();
         first_stage
-            .generate(&scope, execution.execution_id, item.item_id)
+            .finish_generate(
+                &scope,
+                execution.execution_id,
+                item.item_id,
+                token,
+                ContentGenerateOutcome::Completed { text: output.text },
+            )
             .await
             .unwrap();
         assert_eq!(

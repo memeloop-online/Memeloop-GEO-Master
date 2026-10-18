@@ -1623,13 +1623,24 @@ impl HostOps for RepositoryHostOps {
             .map_err(|error| worker_error(op, error))
     }
 
-    async fn content_generate(
+    async fn content_generate_begin(
         &self,
         scope: &TenantScope,
         request: geo_worker::ContentStepRequest,
+    ) -> Result<geo_worker::ContentGenerateBeginResult, HostOpError> {
+        let op = HostOp::ContentGenerateBegin;
+        crate::content_tools::generate_begin(self.content_state(op)?, scope, request)
+            .await
+            .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_generate_finish(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentGenerateFinishRequest,
     ) -> Result<geo_worker::ContentItemRef, HostOpError> {
-        let op = HostOp::ContentGenerate;
-        crate::content_tools::generate(self.content_state(op)?, scope, request)
+        let op = HostOp::ContentGenerateFinish;
+        crate::content_tools::generate_finish(self.content_state(op)?, scope, request)
             .await
             .map_err(|error| worker_error(op, error))
     }

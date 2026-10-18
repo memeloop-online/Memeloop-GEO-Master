@@ -104,7 +104,7 @@ fn guarded_provider<T: Transport + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geo_api::{EventBus, MemoryIdempotencyStore, MemoryOperationStore};
+    use geo_api::{EventBus, MemoryIdempotencyStore, MemoryOperationStore, RepositoryHostOps};
     use geo_domain::{
         AgentRuntime, AppendMessage, ContentEvidence, ContentItemStatus, CreateConversation,
         DocumentScope, ErrorCode, EvidenceRef, ImportItem, InitialSource, InitialSourceKind,
@@ -114,7 +114,7 @@ mod tests {
         start_request_hash,
     };
     use geo_provider::{ProviderError, RequestControl, TransportRequest, TransportResponse};
-    use geo_worker::HostOpErrorCode;
+    use geo_worker::{ContentGenerateOutcome, HostOpErrorCode, HostOps};
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -339,24 +339,65 @@ mod tests {
         std::fs::remove_file(path).unwrap();
 
         let service = state.content_service();
-        let revision = service
-            .generate(&allowed.0, allowed.1, allowed.2)
+        let host = RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone());
+        let (token, descriptor) = service
+            .begin_generate(&allowed.0, allowed.1, allowed.2)
             .await
-            .expect("the configured project generates through the assembled content provider");
+            .unwrap()
+            .unwrap();
+        let request = ModelCompletionRequest {
+            prompt: serde_json::json!({"evidence": descriptor.evidence.iter().map(|e| serde_json::json!({
+                "chunk_id": e.reference.chunk_id, "quote": e.exact_quote
+            })).collect::<Vec<_>>()}).to_string(),
+            system: None,
+            model: None,
+            max_output_tokens: None,
+            messages: vec![],
+            tools: vec![],
+        };
+        let output = host
+            .model_complete(&allowed.0, request.clone())
+            .await
+            .expect("the configured project uses the assembled content provider");
+        let revision = service
+            .finish_generate(
+                &allowed.0,
+                allowed.1,
+                allowed.2,
+                token,
+                ContentGenerateOutcome::Completed { text: output.text },
+            )
+            .await
+            .unwrap();
         assert_eq!(revision.document.title, "Approved public description");
         assert_eq!(transport.0.load(Ordering::SeqCst), 1);
         for (scope, execution_id, item_id) in [other_operator, other_tenant, other_project] {
+            let (token, _) = service
+                .begin_generate(&scope, execution_id, item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let error = host
+                .model_complete(&scope, request.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, HostOpErrorCode::Denied);
             let error = service
-                .generate(&scope, execution_id, item_id)
+                .finish_generate(
+                    &scope,
+                    execution_id,
+                    item_id,
+                    token,
+                    ContentGenerateOutcome::Unavailable,
+                )
                 .await
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::DependencyUnavailable);
-            assert_eq!(error.message, "content model failed: Denied");
             assert_eq!(transport.0.load(Ordering::SeqCst), 1);
         }
         let no_project = TenantScope::new(ai.scope.operator_id, ai.scope.tenant_id, None);
         let error = service
-            .generate(&no_project, allowed.1, allowed.2)
+            .begin_generate(&no_project, allowed.1, allowed.2)
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);

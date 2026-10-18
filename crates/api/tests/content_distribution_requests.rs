@@ -25,7 +25,7 @@ use geo_domain::{
     TenantScope, UploadSessionCommand, User, VerifiedImage, hash_idempotency_key, settings_hash,
     start_request_hash,
 };
-use geo_worker::{HostOpError, ModelCompletion, ModelCompletionRequest};
+use geo_worker::{ContentGenerateOutcome, HostOpError, ModelCompletion, ModelCompletionRequest};
 use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -275,8 +275,36 @@ async fn fixture() -> Fixture {
         .prepare(&scope, execution.execution_id, item.item_id, evidence)
         .await
         .unwrap();
+    let (token, descriptor) = service
+        .begin_generate(&scope, execution.execution_id, item.item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let output = FixtureModel
+        .complete(
+            &scope,
+            &ModelCompletionRequest {
+                prompt: json!({"evidence": descriptor.evidence.iter().map(|e| json!({
+                    "chunk_id": e.reference.chunk_id, "quote": e.exact_quote
+                })).collect::<Vec<_>>()})
+                .to_string(),
+                system: None,
+                model: None,
+                max_output_tokens: None,
+                messages: vec![],
+                tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
     let revision = service
-        .generate(&scope, execution.execution_id, item.item_id)
+        .finish_generate(
+            &scope,
+            execution.execution_id,
+            item.item_id,
+            token,
+            ContentGenerateOutcome::Completed { text: output.text },
+        )
         .await
         .unwrap();
     let lease = content

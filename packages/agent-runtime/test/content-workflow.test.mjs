@@ -42,6 +42,11 @@ async function run({
     })),
   itemCount = 1,
   incomplete = false,
+  generationError,
+  generationCompletion = {
+    text: '{"schema_version":2,"title":"Generated","blocks":[]}',
+  },
+  currentAtGeneration = false,
 } = {}) {
   const item = {
     item_id: itemId,
@@ -60,6 +65,8 @@ async function run({
   const calls = [];
   const sourceReads = [];
   const modelRequests = [];
+  const generationRequests = [];
+  const generationFinishes = [];
   const preparations = [];
   let interrupted = false;
   const read = (current = items[0]) => ({ ...current });
@@ -91,6 +98,11 @@ async function run({
       };
     },
     async modelComplete(request) {
+      if (request.system.includes("content generator")) {
+        generationRequests.push(request);
+        if (generationError) throw generationError;
+        return generationCompletion;
+      }
       modelRequests.push(request);
       return {
         text: JSON.stringify({
@@ -104,7 +116,47 @@ async function run({
       requested(request).status = preparedStatus;
       return read(requested(request));
     },
-    async generate(request) {
+    async generateBegin(request) {
+      if (currentAtGeneration) {
+        requested(request).status = "ready";
+        return { state: "current", item: read(requested(request)) };
+      }
+      return {
+        state: "claimed",
+        token: "stored-generation-token",
+        descriptor: {
+          document_key: requested(request).document_key,
+          brief_title: "Frozen brief",
+          brief_objective: "Frozen objective",
+          content_type: "faq",
+          market: "synthetic-market",
+          language: "en",
+          brand_name: "Synthetic brand",
+          question_clusters: ["synthetic-topic"],
+          evidence: preparations.find(
+            (entry) => entry.item_id === request.item_id,
+          )?.evidence ?? [
+            {
+              reference: {
+                source_version_id: sourceVersionId,
+                chunk_id: "chunk-0",
+                locator: chunk(0).locator,
+              },
+              exact_quote: "Source fact 0",
+            },
+          ],
+        },
+      };
+    },
+    async generateFinish(request) {
+      generationFinishes.push(request);
+      assert.equal(request.token, "stored-generation-token");
+      if (request.outcome.status === "unavailable")
+        throw new Error("generation unavailable");
+      if (request.outcome.status === "invalid") {
+        requested(request).status = "blocked";
+        throw new Error("invalid generation");
+      }
       calls.push("generate");
       requested(request).status = "drafted";
       return read(requested(request));
@@ -190,6 +242,8 @@ async function run({
       items,
       sourceReads,
       modelRequests,
+      generationRequests,
+      generationFinishes,
       preparations,
       host,
       workflow: main,
@@ -417,13 +471,63 @@ test("final selection cannot invent a new quote from a candidate", async () => {
   assert.equal(result.preparations.length, 0);
 });
 
-test("prepared and ready replay skip source reads and selection", async () => {
+test("prepared replay generates once and ready replay makes no model calls", async () => {
   for (const initial of ["prepared", "ready"]) {
     const result = await run({ initial, checks: [false] });
     assert.equal(result.sourceReads.length, 0);
     assert.equal(result.modelRequests.length, 0);
     assert.equal(result.preparations.length, 0);
+    assert.equal(
+      result.generationRequests.length,
+      initial === "prepared" ? 1 : 0,
+    );
   }
+});
+
+test("generation uses the frozen semantic descriptor and submits only the stored lease token", async () => {
+  const result = await run({ initial: "prepared" });
+  const request = result.generationRequests[0];
+  const input = JSON.parse(request.prompt);
+  assert.equal(request.max_output_tokens, 4096);
+  assert.deepEqual(input.brief, {
+    title: "Frozen brief",
+    objective: "Frozen objective",
+  });
+  assert.equal(input.document.key, "synthetic-document-0");
+  assert.equal(input.evidence[0].quote, "Source fact 0");
+  assert.deepEqual(Object.keys(result.generationFinishes[0]).sort(), [
+    "execution_id",
+    "item_id",
+    "outcome",
+    "token",
+  ]);
+  assert.equal(result.generationFinishes[0].outcome.status, "completed");
+});
+
+test("a current generation result skips the model after a stale prepared read", async () => {
+  const result = await run({ initial: "prepared", currentAtGeneration: true });
+  assert.equal(result.generationRequests.length, 0);
+  assert.equal(result.generationFinishes.length, 0);
+  assert.equal(result.item.status, "ready");
+});
+
+test("generation provider failures release the claim without blocking the prepared item", async () => {
+  const result = await run({
+    initial: "prepared",
+    generationError: new Error("provider unavailable"),
+    incomplete: true,
+  });
+  assert.equal(result.item.status, "prepared");
+  assert.equal(result.generationFinishes[0].outcome.status, "unavailable");
+});
+
+test("generation tool calls are rejected through the persisted invalid outcome", async () => {
+  const result = await run({
+    initial: "prepared",
+    generationCompletion: { text: "{}", tool_calls: [{}] },
+  });
+  assert.equal(result.item.status, "blocked");
+  assert.equal(result.generationFinishes[0].outcome.status, "invalid");
 });
 
 test("pending item reuses qualified persisted evidence without a model call", async () => {

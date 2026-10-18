@@ -25,7 +25,8 @@ function host() {
     "op_host_content_source_read_v1",
     "op_host_model_complete_v1",
     "op_host_content_prepare_v1",
-    "op_host_content_generate_v1",
+    "op_host_content_generate_begin_v1",
+    "op_host_content_generate_finish_v1",
     "op_host_content_check_v1",
     "op_host_content_repair_v1",
     "op_host_content_close_v1",
@@ -46,7 +47,10 @@ function host() {
     sourceRead: (input) => invoke("op_host_content_source_read_v1", input),
     modelComplete: (input) => invoke("op_host_model_complete_v1", input),
     prepare: (input) => invoke("op_host_content_prepare_v1", input),
-    generate: (input) => invoke("op_host_content_generate_v1", input),
+    generateBegin: (input) =>
+      invoke("op_host_content_generate_begin_v1", input),
+    generateFinish: (input) =>
+      invoke("op_host_content_generate_finish_v1", input),
     check: (input) => invoke("op_host_content_check_v1", input),
     repair: (input) => invoke("op_host_content_repair_v1", input),
     close: (input) => invoke("op_host_content_close_v1", input),
@@ -380,6 +384,61 @@ async function prepareDistribution(execution, handoff, capability, ctx) {
   });
 }
 
+async function generateContent(request, capability, ctx) {
+  const claim = await capability.generateBegin(request);
+  if (claim.state === "current") return claim.item;
+  const descriptor = claim.descriptor;
+  let completion;
+  try {
+    if (ctx.isCancelled()) throw new Error("Content generation cancelled.");
+    completion = await capability.modelComplete({
+      system:
+        'You are a source-grounded content generator. Output ONLY a JSON object {"schema_version":2,"title":string,"blocks":[{"kind":"heading|paragraph|list","text":string,"citation_ids":[UUID],"items":[string]}]}. Never invent evidence, attribution, prices, claims, or citations. Every block including headings must cite the supplied chunk UUIDs. The title will be independently checked. Do not supply readiness, IDs, or metadata.',
+      prompt: JSON.stringify({
+        brief: {
+          title: descriptor.brief_title,
+          objective: descriptor.brief_objective,
+        },
+        document: {
+          key: descriptor.document_key,
+          content_type: descriptor.content_type,
+          product_id: descriptor.product_id,
+          market: descriptor.market,
+          language: descriptor.language,
+          brand_name: descriptor.brand_name,
+          product_name: descriptor.product_name,
+          target_audience: descriptor.target_audience,
+          objective: descriptor.objective,
+          question_clusters: descriptor.question_clusters,
+        },
+        evidence: descriptor.evidence.map((entry) => ({
+          source_version_id: entry.reference.source_version_id,
+          chunk_id: entry.reference.chunk_id,
+          locator: entry.reference.locator,
+          quote: entry.exact_quote,
+        })),
+      }),
+      max_output_tokens: 4096,
+    });
+    if (ctx.isCancelled()) throw new Error("Content generation cancelled.");
+  } catch (error) {
+    await capability.generateFinish({
+      ...request,
+      token: claim.token,
+      outcome: { status: "unavailable" },
+    });
+    throw error;
+  }
+  return capability.generateFinish({
+    ...request,
+    token: claim.token,
+    outcome:
+      completion.tool_calls?.length || typeof completion.text !== "string"
+        ? { status: "invalid" }
+        : { status: "completed", text: completion.text },
+  });
+}
+
 async function processItem(item, executionId, capability, ctx) {
   const request = { execution_id: executionId, item_id: item.item_id };
   let current = item;
@@ -399,7 +458,7 @@ async function processItem(item, executionId, capability, ctx) {
       current = await capability.prepare({ ...request, evidence });
     }
     if (current.status === "prepared") {
-      current = await capability.generate(request);
+      current = await generateContent(request, capability, ctx);
     }
     while (current.status === "drafted" || current.status === "needs_repair") {
       if (
