@@ -34,6 +34,11 @@ GEO_SCOPED_TEST_AGENT_BUNDLE_SHA256=<digest from the same tested image>
 需要原生内容工作流时，继续配置现有 `GEO_CONTENT_BUNDLE_PATH` 和
 `GEO_CONTENT_BUNDLE_SHA256`；它们同样必须来自正在部署的镜像。
 
+内容后台扫描使用同一既有模型作用域：只领取该项目的待启动周期、恢复运行中的内容，
+或继续已封存内容的分发准备。其他项目不被领取或改变，分页仍继续查找后续合格项。
+持久本机开发沿用已配置的租户／项目范围，正式 Token Center 部署不应用此测试过滤。
+无需额外开关；显式内容请求和既有发布队列仍遵循各自业务作用域。
+
 ## 请求隔离
 
 模型调用在取凭据或发出请求之前比较完整 `TenantScope`。
