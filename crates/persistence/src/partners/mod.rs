@@ -1,17 +1,18 @@
 //! Durable acceptance followed by one atomic knowledge item per transaction.
 mod admin;
+mod content_export;
 
 pub use admin::PgPartnerAdminRepository;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ErrorCode, KnowledgePurpose, PartnerAdvance, PartnerDisposition, PartnerIssuedKey,
-    PartnerKnowledgeRefs, PartnerPrincipal, PartnerRepository, PartnerSyncAction, PartnerSyncItem,
-    PartnerSyncPage, PartnerSyncReceipt, PartnerSyncRequest, PartnerSyncResult, PartnerSyncStatus,
-    PartnerSyncWork, SourceState, TenantScope, issue_partner_key, partner_sync_item_hash,
-    partner_sync_request_hash, validate_partner_sync_item, validate_partner_sync_request,
-    verify_partner_key,
+    AppError, ErrorCode, KnowledgePurpose, PartnerAdvance, PartnerContentExport,
+    PartnerDisposition, PartnerIssuedKey, PartnerKnowledgeRefs, PartnerPrincipal,
+    PartnerRepository, PartnerSyncAction, PartnerSyncItem, PartnerSyncPage, PartnerSyncReceipt,
+    PartnerSyncRequest, PartnerSyncResult, PartnerSyncStatus, PartnerSyncWork, SourceState,
+    TenantScope, issue_partner_key, partner_sync_item_hash, partner_sync_request_hash,
+    validate_partner_sync_item, validate_partner_sync_request, verify_partner_key,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -112,7 +113,7 @@ async fn connection_allowed(
     connection: Uuid,
 ) -> Result<bool, AppError> {
     Ok(scoped(
-        "SELECT knowledge_write AND revoked_at IS NULL AS allowed FROM partner_connections \
+        "SELECT revoked_at IS NULL AS allowed FROM partner_connections \
          WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND connection_id=$4 FOR SHARE",
         scope,
     )?
@@ -126,8 +127,24 @@ async fn connection_allowed(
 async fn principal_allowed(
     tx: &mut Transaction<'_, Postgres>,
     principal: &PartnerPrincipal,
+    permission: PartnerPermission,
 ) -> Result<bool, AppError> {
-    let connection = connection_allowed(tx, &principal.scope, principal.connection_id).await?;
+    let connection = scoped(
+        "SELECT knowledge_write,content_export,revoked_at IS NULL AS active FROM partner_connections \
+         WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND connection_id=$4 FOR SHARE",
+        &principal.scope,
+    )?
+    .bind(principal.connection_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db)?
+    .is_some_and(|row| {
+        row.get::<bool, _>("active")
+            && row.get::<bool, _>(match permission {
+                PartnerPermission::KnowledgeWrite => "knowledge_write",
+                PartnerPermission::ContentExport => "content_export",
+            })
+    });
     let key = scoped(
         "SELECT revoked_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp()) AS allowed \
          FROM partner_keys WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
@@ -136,6 +153,11 @@ async fn principal_allowed(
         .fetch_optional(&mut **tx).await.map_err(db)?
         .is_some_and(|row| row.get::<bool, _>("allowed"));
     Ok(connection && key)
+}
+
+enum PartnerPermission {
+    KnowledgeWrite,
+    ContentExport,
 }
 
 async fn audit(
@@ -320,6 +342,7 @@ impl PgPartnerRepository {
                 connection_id: work.connection_id,
                 key_id: key,
             },
+            PartnerPermission::KnowledgeWrite,
         )
         .await?;
         let Some(row) = scoped(
@@ -829,6 +852,14 @@ async fn apply_item(
 
 #[async_trait]
 impl PartnerRepository for PgPartnerRepository {
+    async fn content_export(
+        &self,
+        principal: &PartnerPrincipal,
+        revision_id: Uuid,
+    ) -> Result<PartnerContentExport, AppError> {
+        content_export::snapshot(self, principal, revision_id).await
+    }
+
     async fn authenticate(
         &self,
         connection_id: Uuid,
@@ -844,7 +875,7 @@ impl PartnerRepository for PgPartnerRepository {
             (k.operator_id,k.tenant_id,k.project_id,k.connection_id) \
             WHERE k.connection_id=$1 AND k.key_id=$2 AND k.revoked_at IS NULL \
             AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) \
-            AND c.revoked_at IS NULL AND c.knowledge_write",
+            AND c.revoked_at IS NULL",
         )
         .bind(connection_id)
         .bind(key_id)
@@ -881,7 +912,7 @@ impl PartnerRepository for PgPartnerRepository {
         set_local_scope(&mut tx, &principal.scope)
             .await
             .map_err(db)?;
-        if !principal_allowed(&mut tx, principal).await? {
+        if !principal_allowed(&mut tx, principal, PartnerPermission::KnowledgeWrite).await? {
             return Err(AppError::unauthorized("invalid service credential"));
         }
         let identity = serde_json::to_string(&(
@@ -961,7 +992,7 @@ impl PartnerRepository for PgPartnerRepository {
         set_local_scope(&mut tx, &principal.scope)
             .await
             .map_err(db)?;
-        if !principal_allowed(&mut tx, principal).await? {
+        if !principal_allowed(&mut tx, principal, PartnerPermission::KnowledgeWrite).await? {
             return Err(AppError::unauthorized("invalid service credential"));
         }
         // SHARE prevents the worker advancing between receipt and result reads.

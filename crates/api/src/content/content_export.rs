@@ -93,7 +93,7 @@ pub(crate) async fn export_bundle(
             .map_err(|error| api_error(error, context.request_id))?
     };
     let archive =
-        tokio::task::spawn_blocking(move || bundle_bytes(revision, &format, keys, snapshots))
+        tokio::task::spawn_blocking(move || bundle_bytes(revision, &format, keys, snapshots, None))
             .await
             .map_err(|_| {
                 api_error(
@@ -121,17 +121,23 @@ pub(crate) async fn export_bundle(
     Ok(response)
 }
 
-fn bundle_bytes(
+pub(crate) struct ExportManifestContext {
+    pub language: Option<String>,
+}
+
+pub(crate) fn bundle_bytes(
     revision: ContentRevision,
     format: &str,
     keys: Vec<MediaObjectKey>,
     snapshots: Vec<AuthorizedMediaSnapshot>,
+    manifest: Option<ExportManifestContext>,
 ) -> Result<Vec<u8>, AppError> {
     if snapshots.len() != keys.len() {
         return Err(AppError::conflict("authorized image set is incomplete"));
     }
     let mut paths = HashMap::with_capacity(keys.len());
     let mut entries = Vec::with_capacity(keys.len());
+    let mut media_manifest = Vec::with_capacity(keys.len());
     let mut total = 0u64;
     for (expected, snapshot) in keys.into_iter().zip(snapshots) {
         snapshot.image.validate()?;
@@ -155,12 +161,21 @@ fn bundle_bytes(
             expected.object_id, expected.object_version, extension
         );
         paths.insert(expected, path.clone());
+        media_manifest.push(serde_json::json!({
+            "object_id": image.key.object_id,
+            "object_version": image.key.object_version,
+            "sha256": image.key.sha256,
+            "media_type": image.media_type,
+            "byte_len": image.byte_len,
+            "path": path,
+        }));
         entries.push((path, snapshot.bytes));
     }
     let (filename, document) = match format {
-        "markdown" if entries.is_empty() => {
-            (format!("{}.md", revision.revision_id), revision.markdown)
-        }
+        "markdown" if entries.is_empty() => (
+            format!("{}.md", revision.revision_id),
+            revision.markdown.clone(),
+        ),
         "markdown" => (
             format!("{}.md", revision.revision_id),
             revision
@@ -182,6 +197,30 @@ fn bundle_bytes(
     if document.len() > MAX_DOCUMENT_EXPORT_BYTES {
         return Err(AppError::invalid_request("content export is too large"));
     }
+    let manifest_bytes = manifest
+        .map(|context| {
+            let mut value = serde_json::json!({
+                "schema_version": 1,
+                "content_asset_id": revision.asset_id,
+                "content_revision_id": revision.revision_id,
+                "title": revision.document.title,
+                "format": format,
+                "payload_filename": filename,
+                "payload_sha256": hex::encode(Sha256::digest(document.as_bytes())),
+                "media": media_manifest,
+                "evidence_refs": revision.evidence.iter().map(|reference| serde_json::json!({
+                    "source_version_id": reference.source_version_id,
+                    "chunk_id": reference.chunk_id,
+                })).collect::<Vec<_>>(),
+            });
+            if let Some(language) = context.language {
+                value["language"] = serde_json::Value::String(language);
+            }
+            serde_json::to_vec(&value).map_err(|_| {
+                AppError::new(ErrorCode::Internal, "content export could not be prepared")
+            })
+        })
+        .transpose()?;
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     writer
@@ -192,6 +231,14 @@ fn bundle_bytes(
         .map_err(|_| AppError::new(ErrorCode::Internal, "content export could not be prepared"))?;
     for (path, bytes) in entries {
         writer.start_file(path, options).map_err(|_| {
+            AppError::new(ErrorCode::Internal, "content export could not be prepared")
+        })?;
+        writer.write_all(&bytes).map_err(|_| {
+            AppError::new(ErrorCode::Internal, "content export could not be prepared")
+        })?;
+    }
+    if let Some(bytes) = manifest_bytes {
+        writer.start_file("manifest.json", options).map_err(|_| {
             AppError::new(ErrorCode::Internal, "content export could not be prepared")
         })?;
         writer.write_all(&bytes).map_err(|_| {
@@ -243,7 +290,7 @@ mod tests {
         use std::io::Read;
 
         let revision = text_revision();
-        let archive = bundle_bytes(revision.clone(), "markdown", vec![], vec![]).unwrap();
+        let archive = bundle_bytes(revision.clone(), "markdown", vec![], vec![], None).unwrap();
         let mut zip = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
         assert_eq!(zip.len(), 1);
         let mut saved = String::new();
@@ -255,6 +302,153 @@ mod tests {
     }
 
     #[test]
+    fn manifest_has_actual_payload_digest_and_ids_without_source_text_or_diagnostics() {
+        use std::io::Read;
+
+        let mut revision = text_revision();
+        let reference = geo_domain::EvidenceRef {
+            source_version_id: Uuid::new_v4(),
+            chunk_id: Some(Uuid::new_v4()),
+            locator: geo_domain::ChunkLocator::Text {
+                start_line: 1,
+                end_line: 1,
+                start_char: 0,
+                end_char: 10,
+            },
+        };
+        revision.evidence.push(reference.clone());
+        revision.quotes.push(geo_domain::ContentEvidence {
+            reference: reference.clone(),
+            exact_quote: "synthetic source quote withheld".into(),
+        });
+        revision.findings.push(geo_domain::ContentFinding {
+            finding_id: Uuid::new_v4(),
+            code: "synthetic".into(),
+            block_id: None,
+            evidence: vec![],
+            detail: "synthetic diagnostic withheld".into(),
+            blocking: false,
+        });
+        let archive = bundle_bytes(
+            revision.clone(),
+            "html",
+            vec![],
+            vec![],
+            Some(ExportManifestContext { language: None }),
+        )
+        .unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
+        let mut manifest = String::new();
+        zip.by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
+        for private in [
+            "synthetic source quote withheld",
+            "synthetic diagnostic withheld",
+            "locator",
+            "quotes",
+            "findings",
+        ] {
+            assert!(!manifest.contains(private));
+        }
+        let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(manifest["content_asset_id"], revision.asset_id.to_string());
+        assert_eq!(
+            manifest["content_revision_id"],
+            revision.revision_id.to_string()
+        );
+        assert_eq!(
+            manifest["evidence_refs"][0]["source_version_id"],
+            reference.source_version_id.to_string()
+        );
+        assert!(manifest.get("language").is_none());
+        let mut payload = String::new();
+        zip.by_name(manifest["payload_filename"].as_str().unwrap())
+            .unwrap()
+            .read_to_string(&mut payload)
+            .unwrap();
+        assert_eq!(
+            manifest["payload_sha256"],
+            hex::encode(Sha256::digest(payload.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn rich_archive_manifest_names_the_exact_packed_media() {
+        use geo_domain::{MediaReference, RichContent, RichNode};
+        use std::io::Read;
+
+        let bytes = b"synthetic immutable media".to_vec();
+        let key = MediaObjectKey {
+            object_id: Uuid::new_v4(),
+            object_version: 7,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        };
+        let mut revision = text_revision();
+        revision.document.blocks.push(ContentBlock {
+            block_id: Uuid::new_v4(),
+            kind: ContentBlockKind::Rich,
+            text: String::new(),
+            citation_ids: vec![],
+            items: vec![],
+            rich: Some(RichContent {
+                version: 1,
+                node: RichNode::Media {
+                    attrs: MediaReference {
+                        object_id: key.object_id,
+                        object_version: key.object_version,
+                        sha256: key.sha256.clone(),
+                        alt: "Synthetic".into(),
+                        caption: String::new(),
+                    },
+                },
+            }),
+        });
+        let snapshot = AuthorizedMediaSnapshot {
+            image: VerifiedImage {
+                key: key.clone(),
+                media_type: "image/png".into(),
+                byte_len: bytes.len() as u64,
+                width: 1,
+                height: 1,
+            },
+            bytes: bytes.clone(),
+        };
+        let archive = bundle_bytes(
+            revision,
+            "html",
+            vec![key.clone()],
+            vec![snapshot],
+            Some(ExportManifestContext {
+                language: Some("en".into()),
+            }),
+        )
+        .unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
+        assert_eq!(zip.len(), 3);
+        let mut manifest = String::new();
+        zip.by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        let image = &manifest["media"][0];
+        assert_eq!(image["object_version"], 7);
+        assert_eq!(image["sha256"], key.sha256);
+        let path = image["path"].as_str().unwrap();
+        let mut packed = Vec::new();
+        zip.by_name(path).unwrap().read_to_end(&mut packed).unwrap();
+        assert_eq!(packed, bytes);
+        let mut payload = String::new();
+        zip.by_name(manifest["payload_filename"].as_str().unwrap())
+            .unwrap()
+            .read_to_string(&mut payload)
+            .unwrap();
+        assert!(payload.contains(path));
+    }
+
+    #[test]
     fn incomplete_or_corrupt_snapshot_never_produces_archive() {
         let revision = text_revision();
         let key = MediaObjectKey {
@@ -262,7 +456,7 @@ mod tests {
             object_version: 2,
             sha256: hex::encode(Sha256::digest(b"the original bytes")),
         };
-        assert!(bundle_bytes(revision.clone(), "html", vec![key.clone()], vec![]).is_err());
+        assert!(bundle_bytes(revision.clone(), "html", vec![key.clone()], vec![], None).is_err());
         let snapshot = AuthorizedMediaSnapshot {
             image: VerifiedImage {
                 key: key.clone(),
@@ -273,7 +467,7 @@ mod tests {
             },
             bytes: b"changed".to_vec(),
         };
-        assert!(bundle_bytes(revision, "html", vec![key], vec![snapshot]).is_err());
+        assert!(bundle_bytes(revision, "html", vec![key], vec![snapshot], None).is_err());
     }
 
     #[test]

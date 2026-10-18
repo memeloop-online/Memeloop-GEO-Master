@@ -1,7 +1,9 @@
 mod media;
 
 pub use media::PgContentMediaRepository;
-pub(crate) use media::validate_content_media_in_transaction;
+pub(crate) use media::{
+    snapshot_authorized_images_in_transaction, validate_content_media_in_transaction,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -412,7 +414,7 @@ impl PgContentRepository {
     // Project -> execution -> registry is the lock order for every content
     // transition. In particular source changes in another transaction cannot
     // race a reuse decision: source rows are locked FOR SHARE below.
-    async fn lock_project(
+    pub(crate) async fn lock_project(
         tx: &mut Transaction<'_, Postgres>,
         scope: &TenantScope,
     ) -> Result<(), AppError> {
@@ -445,7 +447,7 @@ impl PgContentRepository {
         )
         .await
     }
-    async fn validate_frozen_sources(
+    pub(crate) async fn validate_frozen_sources(
         tx: &mut Transaction<'_, Postgres>,
         scope: &TenantScope,
         execution_id: Uuid,

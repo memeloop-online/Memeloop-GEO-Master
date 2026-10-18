@@ -43,6 +43,10 @@ where
             "/api/v1/partner/connections/{id}/knowledge-syncs/{operation_id}",
             get(results),
         )
+        .route(
+            "/api/v1/partner/connections/{id}/content-exports/{revision_id}",
+            get(content_export),
+        )
         .with_state(PartnerState::new(repository, auth_capacity))
         .layer(middleware::from_fn(crate::context::no_store_middleware))
         .layer(middleware::from_fn(
@@ -111,15 +115,15 @@ fn request_id(request: &Request) -> Uuid {
 /// Never return repository diagnostics, which may contain private input or SQL.
 fn failure(error: AppError, request_id: Uuid) -> Response {
     let message = match error.code {
-        ErrorCode::InvalidRequest => "invalid knowledge sync request",
+        ErrorCode::InvalidRequest => "invalid partner request",
         ErrorCode::Unauthorized => "service authentication required",
         ErrorCode::Forbidden => "service permission denied",
-        ErrorCode::NotFound => "knowledge sync not found",
-        ErrorCode::Conflict => "knowledge sync conflicts with an existing request",
-        ErrorCode::NotReady => "knowledge sync is not ready",
-        ErrorCode::CapabilityMissing => "knowledge sync capability unavailable",
-        ErrorCode::DependencyUnavailable => "knowledge sync service unavailable",
-        ErrorCode::Internal => "knowledge sync failed",
+        ErrorCode::NotFound => "partner resource not found",
+        ErrorCode::Conflict => "partner resource state conflicts with this request",
+        ErrorCode::NotReady => "partner resource is not ready",
+        ErrorCode::CapabilityMissing => "partner capability unavailable",
+        ErrorCode::DependencyUnavailable => "partner service unavailable",
+        ErrorCode::Internal => "partner request failed",
     };
     let mut response = api_error(AppError::new(error.code, message), request_id).into_response();
     if error.code == ErrorCode::Unauthorized {
@@ -264,6 +268,87 @@ async fn results(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentExportQuery {
+    #[serde(default = "default_export_format")]
+    format: String,
+}
+
+fn default_export_format() -> String {
+    "markdown".into()
+}
+
+async fn content_export(
+    State(state): State<PartnerState>,
+    path: Result<Path<(Uuid, Uuid)>, PathRejection>,
+    request: Request,
+) -> Response {
+    use crate::content::content_export::{ExportManifestContext, bundle_bytes};
+
+    let request_id = request_id(&request);
+    let Ok(Path((connection_id, revision_id))) = path else {
+        return failure(invalid(), request_id);
+    };
+    let principal = match authenticate(&state, request.headers(), connection_id).await {
+        Ok(principal) => principal,
+        Err(error) => return failure(error, request_id),
+    };
+    let format = match Query::<ContentExportQuery>::try_from_uri(request.uri()) {
+        Ok(Query(query)) if matches!(query.format.as_str(), "markdown" | "html") => query.format,
+        _ => return failure(invalid(), request_id),
+    };
+    let snapshot = match state
+        .repository
+        .content_export(&principal, revision_id)
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failure(error, request_id),
+    };
+    // A repository result can never turn an exact-version request into latest.
+    if snapshot.revision.revision_id != revision_id {
+        return failure(AppError::conflict("content revision changed"), request_id);
+    }
+    let archive = match tokio::task::spawn_blocking(move || {
+        bundle_bytes(
+            snapshot.revision,
+            &format,
+            snapshot.media_keys,
+            snapshot.media,
+            Some(ExportManifestContext {
+                language: snapshot.language,
+            }),
+        )
+    })
+    .await
+    {
+        Ok(Ok(archive)) => archive,
+        Ok(Err(error)) => return failure(error, request_id),
+        Err(_) => {
+            return failure(
+                AppError::new(ErrorCode::Internal, "content export failed"),
+                request_id,
+            );
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/zip".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{revision_id}.zip\""),
+            ),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff".to_owned(),
+            ),
+        ],
+        archive,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +373,7 @@ mod tests {
         calls: Mutex<Vec<String>>,
         fail_accept: AtomicBool,
         hold_authentication: AtomicBool,
+        export_granted: AtomicBool,
         authentication_entered: tokio::sync::Notify,
         authentication_release: tokio::sync::Notify,
         hold_acceptance: AtomicBool,
@@ -312,6 +398,7 @@ mod tests {
                 calls: Mutex::new(vec![]),
                 fail_accept: AtomicBool::new(false),
                 hold_authentication: AtomicBool::new(false),
+                export_granted: AtomicBool::new(false),
                 authentication_entered: tokio::sync::Notify::new(),
                 authentication_release: tokio::sync::Notify::new(),
                 hold_acceptance: AtomicBool::new(false),
@@ -362,6 +449,50 @@ mod tests {
 
     #[async_trait]
     impl PartnerRepository for Fake {
+        async fn content_export(
+            &self,
+            principal: &PartnerPrincipal,
+            revision_id: Uuid,
+        ) -> Result<geo_domain::PartnerContentExport, AppError> {
+            self.check(principal)?;
+            self.calls.lock().unwrap().push("content_export".into());
+            if !self.export_granted.load(Ordering::SeqCst) {
+                return Err(AppError::forbidden(SECRET));
+            }
+            if revision_id != self.operation_id {
+                return Err(AppError::not_found(SECRET));
+            }
+            Ok(geo_domain::PartnerContentExport {
+                revision: geo_domain::ContentRevision {
+                    revision_id,
+                    asset_id: Uuid::new_v4(),
+                    revision: 1,
+                    base_revision_id: None,
+                    derived_from_revision_id: None,
+                    document: geo_domain::StructuredDocument {
+                        schema_version: 2,
+                        title: "Saved title".into(),
+                        blocks: vec![geo_domain::ContentBlock {
+                            block_id: Uuid::new_v4(),
+                            kind: geo_domain::ContentBlockKind::Paragraph,
+                            text: "Saved content".into(),
+                            citation_ids: vec![],
+                            items: vec![],
+                            rich: None,
+                        }],
+                    },
+                    markdown: "Saved exact content.\r\n".into(),
+                    evidence: vec![],
+                    quotes: vec![],
+                    findings: vec![],
+                    created_at: chrono::Utc::now(),
+                },
+                language: Some("en".into()),
+                media_keys: vec![],
+                media: vec![],
+            })
+        }
+
         async fn authenticate(
             &self,
             connection_id: Uuid,
@@ -472,6 +603,108 @@ mod tests {
             assert_eq!(value["request_id"], request_id);
         }
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn export_requires_its_grant_and_returns_exact_archive_without_publication() {
+        use std::io::{Cursor, Read};
+
+        let fake = Fake::new();
+        let uri = format!(
+            "/api/v1/partner/connections/{}/content-exports/{}",
+            fake.principal.connection_id, fake.operation_id
+        );
+        assert_eq!(
+            send(fake.clone(), fake.request("GET", &uri, String::new()))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        fake.export_granted.store(true, Ordering::SeqCst);
+        for format in ["markdown", "html"] {
+            let response = partner_router::<()>(fake.clone(), NonZeroUsize::new(1).unwrap())
+                .oneshot(fake.request("GET", &format!("{uri}?format={format}"), String::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/zip");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            let bytes = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains(SECRET));
+            let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            assert_eq!(zip.len(), 2);
+            let mut manifest = String::new();
+            zip.by_name("manifest.json")
+                .unwrap()
+                .read_to_string(&mut manifest)
+                .unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+            assert_eq!(
+                manifest["content_revision_id"],
+                fake.operation_id.to_string()
+            );
+            assert_eq!(manifest["language"], "en");
+            let mut payload = String::new();
+            zip.by_name(manifest["payload_filename"].as_str().unwrap())
+                .unwrap()
+                .read_to_string(&mut payload)
+                .unwrap();
+            if format == "markdown" {
+                assert_eq!(payload, "Saved exact content.\r\n");
+            }
+            assert_eq!(
+                manifest["payload_sha256"],
+                geo_domain::sha256_hex(payload.as_bytes())
+            );
+        }
+        for query in [
+            "format=pdf",
+            "variant_id=forged",
+            "tenant_id=forged",
+            "format=html&format=markdown",
+        ] {
+            assert_eq!(
+                send(
+                    fake.clone(),
+                    fake.request("GET", &format!("{uri}?{query}"), String::new())
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let missing = uri.replace(&fake.operation_id.to_string(), &Uuid::new_v4().to_string());
+        assert_eq!(
+            send(fake.clone(), fake.request("GET", &missing, String::new()))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let foreign = uri.replace(
+            &fake.principal.connection_id.to_string(),
+            &Uuid::new_v4().to_string(),
+        );
+        assert_eq!(
+            send(fake.clone(), fake.request("GET", &foreign, String::new()))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        fake.revoked.store(true, Ordering::SeqCst);
+        assert_eq!(
+            send(fake.clone(), fake.request("GET", &uri, String::new()))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| call == "authenticate" || call == "content_export")
+        );
     }
 
     #[tokio::test]

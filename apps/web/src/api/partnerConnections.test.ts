@@ -4,6 +4,26 @@ import * as api from "./partnerConnections";
 
 afterEach(() => vi.restoreAllMocks());
 describe("partner connection API", () => {
+  it("sets only the scoped content export permission without caching the command", async () => {
+    const fetch = vi.spyOn(client, "apiFetch").mockResolvedValue({});
+    await api.setPartnerContentExport(
+      "tenant",
+      "project",
+      "synthetic/id",
+      true,
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "/projects/project/partner-connections/synthetic%2Fid/permissions",
+      {
+        tenantId: "tenant",
+        projectId: "project",
+        method: "POST",
+        body: { content_export: true },
+        cache: "no-store",
+        idempotency: "omit",
+      },
+    );
+  });
   it("uses scoped paginated metadata reads without browser caching", async () => {
     const fetch = vi
       .spyOn(client, "apiFetch")

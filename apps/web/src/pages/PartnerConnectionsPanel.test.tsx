@@ -37,6 +37,7 @@ const connection: api.PartnerConnection = {
   created_at: "2026-01-01T00:00:00Z",
   revoked_at: null,
   knowledge_write: true,
+  content_export: false,
 };
 const key: api.PartnerKey = {
   key_id: "synthetic-key",
@@ -51,10 +52,20 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
-function setup(keys: api.PartnerKey[] = []) {
+function setup(
+  keys: api.PartnerKey[] = [],
+  savedConnection: api.PartnerConnection = connection,
+) {
   const connections = vi
     .spyOn(api, "listPartnerConnections")
-    .mockResolvedValue({ items: [connection], next_cursor: null });
+    .mockResolvedValue({ items: [savedConnection], next_cursor: null });
+  const permission = vi
+    .spyOn(api, "setPartnerContentExport")
+    .mockImplementation(async (_, __, ___, enabled) => {
+      const updated = { ...savedConnection, content_export: enabled };
+      connections.mockResolvedValue({ items: [updated], next_cursor: null });
+      return updated;
+    });
   const list = vi
     .spyOn(api, "listPartnerKeys")
     .mockResolvedValue({ items: keys, next_cursor: null });
@@ -82,6 +93,7 @@ function setup(keys: api.PartnerKey[] = []) {
   const view = render(content("project"));
   return {
     connections,
+    permission,
     list,
     issue,
     rotate,
@@ -107,6 +119,89 @@ afterEach(() => {
 });
 
 describe("partner connection administration", () => {
+  it("shows export disabled until the permission change is confirmed and persists both settings", async () => {
+    const { permission, connections, rerender } = setup();
+    const control = await screen.findByRole("switch", {
+      name: "Allow content export",
+    });
+    expect(control).not.toBeChecked();
+    expect(
+      screen.getByText(/Exporting does not publish articles/),
+    ).toBeVisible();
+    const pending = deferred<api.PartnerConnection>();
+    permission.mockReturnValueOnce(pending.promise);
+    await userEvent.click(control);
+    expect(permission).toHaveBeenCalledWith(
+      "tenant",
+      "project",
+      connection.connection_id,
+      true,
+    );
+    expect(control).not.toBeChecked();
+    expect(control).toBeDisabled();
+    const enabled = { ...connection, content_export: true };
+    connections.mockResolvedValue({ items: [enabled], next_cursor: null });
+    await act(async () => {
+      pending.resolve(enabled);
+      await pending.promise;
+    });
+    await waitFor(() => expect(control).toBeChecked());
+    rerender();
+    expect(control).toBeChecked();
+    await userEvent.click(control);
+    expect(permission).toHaveBeenLastCalledWith(
+      "tenant",
+      "project",
+      connection.connection_id,
+      false,
+    );
+    await waitFor(() => expect(control).not.toBeChecked());
+  });
+  it("refreshes an unconfirmed permission change without retrying or exposing private errors", async () => {
+    const { permission, connections } = setup();
+    const control = await screen.findByRole("switch", {
+      name: "Allow content export",
+    });
+    permission.mockRejectedValue(new Error("synthetic-private-error"));
+    connections.mockResolvedValue({
+      items: [{ ...connection, content_export: true }],
+      next_cursor: null,
+    });
+    await userEvent.click(control);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The export permission change is not confirmed. Reload to check.",
+    );
+    await waitFor(() => expect(control).toBeChecked());
+    expect(control).toBeEnabled();
+    expect(permission).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByText("synthetic-private-error"),
+    ).not.toBeInTheDocument();
+  });
+  it("disables export permission changes for revoked connections", async () => {
+    const { permission } = setup([], {
+      ...connection,
+      content_export: true,
+      revoked_at: "2026-01-02T00:00:00Z",
+    });
+    const control = await screen.findByRole("switch", {
+      name: "Allow content export",
+    });
+    expect(control).toBeDisabled();
+    expect(screen.getByText(/revoked and cannot export content/)).toBeVisible();
+    await userEvent.click(control);
+    expect(permission).not.toHaveBeenCalled();
+  });
+  it("allows key management independently of individual operation permissions", async () => {
+    setup([key], { ...connection, knowledge_write: false });
+    expect(
+      await screen.findByText("Knowledge import is not enabled."),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Create key" })).toBeEnabled();
+    expect(
+      await screen.findByRole("button", { name: "Rotate key" }),
+    ).toBeEnabled();
+  });
   it("allows normal creation and rotation without loading all historic keys", async () => {
     const { list, issue } = setup([key]);
     list.mockResolvedValue({

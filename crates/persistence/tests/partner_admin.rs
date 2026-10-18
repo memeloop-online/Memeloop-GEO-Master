@@ -260,6 +260,7 @@ async fn lifecycle_reuses_audited_mutations_and_persists_metadata() {
     let service = PgPartnerRepository::from_database(&database);
     let connection = repo.create_connection(&scope).await.unwrap();
     assert!(connection.knowledge_write);
+    assert!(!connection.content_export);
     assert!(connection.revoked_at.is_none());
     let id = connection.connection_id;
     let original = repo.issue_key(&scope, id, None).await.unwrap();
@@ -339,4 +340,84 @@ async fn lifecycle_reuses_audited_mutations_and_persists_metadata() {
         assert!(events.iter().any(|actual| actual == event));
     }
     tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn content_export_is_explicit_scoped_revocable_and_independent_of_import() {
+    let (database, repo, scope) = setup().await;
+    let service = PgPartnerRepository::from_database(&database);
+    let connection = repo.create_connection(&scope).await.unwrap();
+    assert!(!connection.content_export);
+    let enabled = repo
+        .set_content_export(&scope, connection.connection_id, true)
+        .await
+        .unwrap();
+    assert!(enabled.content_export);
+    assert!(enabled.knowledge_write);
+    let foreign = TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id);
+    assert_eq!(
+        error_code(
+            repo.set_content_export(&foreign, connection.connection_id, false)
+                .await
+        ),
+        ErrorCode::NotFound
+    );
+    assert!(
+        repo.list_connections(&scope, None, 100)
+            .await
+            .unwrap()
+            .items[0]
+            .content_export
+    );
+    // Import permission is not an authentication gate or a key provisioning gate.
+    sqlx::query("UPDATE partner_connections SET knowledge_write=false WHERE connection_id=$1")
+        .bind(connection.connection_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let key = repo
+        .issue_key(&scope, connection.connection_id, None)
+        .await
+        .unwrap();
+    assert!(authenticated(&service, connection.connection_id, &key).await);
+    let principal = service
+        .authenticate(
+            connection.connection_id,
+            key.key.key_id,
+            key.bearer.split_once('.').unwrap().1,
+        )
+        .await
+        .unwrap();
+    let missing = Uuid::new_v4();
+    assert_eq!(
+        error_code(service.content_export(&principal, missing).await),
+        ErrorCode::NotFound
+    );
+    let disabled = repo
+        .set_content_export(&scope, connection.connection_id, false)
+        .await
+        .unwrap();
+    assert!(!disabled.content_export);
+    assert!(!disabled.knowledge_write);
+    assert_eq!(
+        error_code(service.content_export(&principal, missing).await),
+        ErrorCode::Forbidden
+    );
+    repo.revoke_connection(&scope, connection.connection_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        error_code(
+            repo.set_content_export(&scope, connection.connection_id, true)
+                .await
+        ),
+        ErrorCode::NotFound
+    );
+    let events: Vec<String> = sqlx::query_scalar("SELECT event FROM partner_audit_events WHERE connection_id=$1 AND event LIKE 'content_export_%' ORDER BY occurred_at,audit_id")
+        .bind(connection.connection_id).fetch_all(database.pool()).await.unwrap();
+    assert_eq!(
+        events,
+        ["content_export_enabled", "content_export_disabled"]
+    );
 }
