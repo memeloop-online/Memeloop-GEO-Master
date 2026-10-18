@@ -105,6 +105,29 @@ function fixture() {
   return { page, calls, options };
 }
 
+test("durable extraction handoff preserves the source and disposes observers without audit dereference", async () => {
+  const f = fixture();
+  const diagnostics = [];
+  const pending = {
+    status: "extraction_pending",
+    intent_id: "99999999-9999-4999-8999-999999999999",
+  };
+  f.options.apiExtract = async () => {
+    f.calls.push("extract");
+    return pending;
+  };
+  f.options.onDiagnostic = (entry) => diagnostics.push(entry);
+  const result = await observeDeepSeekWebSearch(f.page, payload, f.options);
+  assert.equal(result, pending);
+  assert.equal(f.calls.filter((call) => call === "send").length, 1);
+  assert.ok(f.calls.includes("source"));
+  assert.ok(f.calls.includes("ownership"));
+  assert.ok(f.calls.includes("dispose-config"));
+  assert.ok(f.calls.includes("dispose-create"));
+  assert.equal(f.calls.includes("candidate"), false);
+  assert.deepEqual(diagnostics, []);
+});
+
 function historyFixture() {
   const f = fixture();
   const exchange = {

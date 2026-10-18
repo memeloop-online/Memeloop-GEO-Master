@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
 import { adapters as defaultAdapters } from "./adapters.mjs";
-import { parseExtractionJson } from "./ai-observation-parser.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
 import { cleanupDiagnostic } from "./provider-conversation-cleanup.mjs";
 import { providerCleanupAdapter } from "./provider-cleanup-registry.mjs";
@@ -764,16 +763,12 @@ export function createRunner(options = {}) {
                 },
                 async apiExtract(_prompt, { signal, deadlineAt } = {}) {
                   if (!sourceReceipt || !observationAi?.extract) return null;
-                  const waitBudgetMs = Math.floor(
-                    deadlineAt - performance.now(),
-                  );
-                  if (!Number.isSafeInteger(waitBudgetMs) || waitBudgetMs <= 0)
+                  if (signal?.aborted || deadlineAt <= performance.now())
                     return null;
                   const result = await observationAi.extract(
                     {
                       schema_version: 1,
                       prompt_version: "geo.observation.extract.v4",
-                      wait_budget_ms: waitBudgetMs,
                       capture_ticket: input.source_capture_ticket,
                       source_capture_id: sourceReceipt.capture_id,
                       source_sha256: sourceDigest,
@@ -781,23 +776,18 @@ export function createRunner(options = {}) {
                     { signal },
                   );
                   if (
-                    typeof result?.text !== "string" ||
-                    Buffer.byteLength(result.text) > 150_000 ||
-                    typeof result.model !== "string" ||
-                    !/^[\w./:-]{1,256}$/u.test(result.model) ||
-                    !Number.isSafeInteger(result.config_version) ||
-                    result.config_version < 0
+                    result?.status !== "accepted" ||
+                    typeof result.intent_id !== "string" ||
+                    !UUID.test(result.intent_id) ||
+                    Object.keys(result).some(
+                      (key) => !["status", "intent_id"].includes(key),
+                    )
                   )
                     return null;
-                  const extracted = parseExtractionJson(result.text);
-                  return extracted
-                    ? {
-                        extracted,
-                        model: result.model,
-                        config_version: result.config_version,
-                        surface: "model_api",
-                      }
-                    : null;
+                  return {
+                    status: "extraction_pending",
+                    intent_id: result.intent_id,
+                  };
                 },
                 onConversationCaptured(receipt) {
                   if (

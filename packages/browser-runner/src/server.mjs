@@ -20,6 +20,7 @@ function serviceCallback(
   maxResponseBytes,
   timeoutMs = 10_000,
   onTiming,
+  expectedStatus = 200,
 ) {
   // Deployment configuration only, never a model/request-selected URL.
   // Private cluster service traffic may use HTTP; external deployments use TLS.
@@ -69,7 +70,7 @@ function serviceCallback(
           : AbortSignal.timeout(timeoutMs),
       });
       timing("headers", response.status);
-      if (response.status !== 200)
+      if (response.status !== expectedStatus)
         throw new Error("service_callback_unavailable");
       const length = Number(response.headers.get("content-length") ?? 0);
       if (length > maxResponseBytes)
@@ -170,6 +171,8 @@ export function createRunnerServer({
       "/internal/v1/observation-ai/extract",
       320_000,
       90_000,
+      undefined,
+      202,
     ),
   };
   const authorizeCleanup = serviceCallback(

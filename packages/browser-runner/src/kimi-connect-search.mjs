@@ -618,6 +618,7 @@ export async function observeKimiConnectSearch(
             ),
         }),
     });
+    if (observation?.status === "extraction_pending") return observation;
     if (!observation || signal?.aborted) return unverified();
     return {
       raw_answer: observation.raw_answer,

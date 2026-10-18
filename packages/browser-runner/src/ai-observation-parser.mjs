@@ -594,6 +594,13 @@ export async function interpretObservation(
     } finally {
       evidenceOpen = false;
     }
+    // Durable enqueue is a terminal handoff, not a candidate to ground or a
+    // failed route to retry. The worker owns all subsequent interpretation.
+    if (
+      route === "configured_model_api" &&
+      result?.status === "extraction_pending"
+    )
+      return result;
     if (signal?.aborted) {
       reportObservationDiagnostic(
         onDiagnostic,

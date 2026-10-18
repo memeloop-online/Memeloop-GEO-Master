@@ -267,6 +267,11 @@ async function browserFixture(browser, mode) {
       calls.push("extract");
       assert.ok(savedSource, "source was committed before extraction");
       if (mode === "extraction") return null;
+      if (mode === "pending")
+        return {
+          status: "extraction_pending",
+          intent_id: "99999999-9999-4999-8999-999999999999",
+        };
       return {
         model: "fixture-parser",
         surface: "model_api",
@@ -304,6 +309,7 @@ test("production DeepSeek adapter runs the default browser→history→source→
       "history",
       "persistence",
       "extraction",
+      "pending",
       "identity",
       "model",
     ]) {
@@ -383,6 +389,17 @@ test("production DeepSeek adapter runs the default browser→history→source→
             ),
             false,
           );
+          if (mode === "pending") {
+            assert.equal(f.result.status, "unknown");
+            assert.equal(f.result.stage, "measure");
+            assert.equal(f.result.reason, "extraction_pending");
+            assert.equal(f.result.raw_answer, undefined);
+            assert.deepEqual(f.calls, ["ownership", "source", "extract"]);
+            assert.deepEqual(
+              f.result.evidence.map((item) => item.kind),
+              ["observation_capture", "provider_conversation_ownership"],
+            );
+          }
           if (mode === "persistence") {
             assert.equal(f.calls.includes("extract"), false);
             assert.equal(f.result.reason, "evidence_persist_failed");

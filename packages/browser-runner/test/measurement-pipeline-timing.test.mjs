@@ -35,23 +35,9 @@ const messages = [
   { text: "A synthetic source-backed answer." },
   { url: "https://example.org/article", reference: "synthetic-reference" },
 ];
-const candidate = {
-  completion: "complete",
-  completion_evidence: [{ path: "/messages/1/state" }],
-  search_used: "yes",
-  search_evidence: [{ path: "/messages/2/search" }],
-  answer_segments: [{ path: "/messages/3/text" }],
-  citations: [
-    {
-      url: { path: "/messages/4/url" },
-      usage: { path: "/messages/4/reference" },
-    },
-  ],
-};
 const extraction = {
-  text: JSON.stringify(candidate),
-  model: "synthetic-parser",
-  config_version: 2,
+  status: "accepted",
+  intent_id: "99999999-9999-4999-8999-999999999999",
 };
 const frame = (flags, value) => {
   const data = Buffer.from(JSON.stringify(value));
@@ -71,10 +57,7 @@ const deferred = () => {
 };
 const flush = () => setImmediate();
 
-async function pipeline(
-  t,
-  { preferBrowser = false, holdSource, holdCandidate } = {},
-) {
+async function pipeline(t, { preferBrowser = false, holdSource } = {}) {
   let now = 0;
   t.mock.timers.enable({ apis: ["setTimeout"] });
   t.mock.method(performance, "now", () => now);
@@ -209,7 +192,7 @@ async function pipeline(
   const persist = async (body) => {
     const phase = body.snapshot.phase;
     events.push(`${phase}_pending`);
-    await (phase === "source" ? holdSource?.promise : holdCandidate?.promise);
+    if (phase === "source") await holdSource?.promise;
     stored.push(structuredClone(body));
     events.push(`${phase}_stored`);
     return {
@@ -288,11 +271,13 @@ test("durable source acknowledgement precedes policy and API extraction", async 
     "api",
   ]);
   p.apiResult.resolve(extraction);
-  assert.equal((await p.result).status, "completed");
+  const receipt = await p.result;
+  assert.equal(receipt.status, "unknown");
+  assert.equal(receipt.reason, "extraction_pending");
   assert.equal(p.sends, 1);
 });
 
-test("real parsing can outlast the capture window and still complete", async (t) => {
+test("durable extraction ACK releases the runner without a candidate or invented answer", async (t) => {
   const p = await pipeline(t);
   assert.equal(p.network.sourceDeadlineAt, 30_000);
   await p.advance(35_000);
@@ -300,12 +285,19 @@ test("real parsing can outlast the capture window and still complete", async (t)
   assert.equal(p.apiSignal.aborted, false);
   p.apiResult.resolve(extraction);
   const receipt = await p.result;
-  assert.equal(receipt.status, "completed");
-  assert.equal(receipt.raw_answer, messages[3].text);
+  assert.equal(receipt.status, "unknown");
+  assert.equal(receipt.reason, "extraction_pending");
+  assert.equal(receipt.raw_answer, undefined);
   assert.equal(receipt.provenance, "fixture");
+  assert.equal(receipt.stage, "measure");
+  assert.deepEqual(
+    receipt.evidence.map((item) => item.kind),
+    ["observation_capture", "provider_conversation_ownership"],
+  );
+  assert.deepEqual(await p.replay(), receipt);
   assert.deepEqual(
     p.stored.map((body) => body.snapshot.phase),
-    ["source", "candidate"],
+    ["source"],
   );
   assert.equal(p.sends, 1);
 });
@@ -345,19 +337,15 @@ test("fallback is clipped to remaining analysis deadline and timeout preserves s
   assert.equal(p.sends, 1);
 });
 
-test("grounded candidate acknowledgement precedes successful runner receipt", async (t) => {
-  const holdCandidate = deferred();
-  const p = await pipeline(t, { holdCandidate });
-  p.apiResult.resolve(extraction);
-  await flush();
-  assert.equal(p.events.at(-1), "candidate_pending");
-  assert.equal(p.settled, false);
-  assert.equal(p.stored.length, 1);
-  holdCandidate.resolve();
+test("malformed extraction ACK fails closed without candidate persistence or resend", async (t) => {
+  const p = await pipeline(t);
+  p.apiResult.resolve({ status: "accepted", intent_id: "not-a-uuid" });
   const receipt = await p.result;
-  assert.equal(receipt.status, "completed");
-  assert.deepEqual(p.events.slice(-2), ["candidate_stored", "receipt"]);
-  assert.equal(p.stored[1].snapshot.source_capture_id, SOURCE_ID);
-  assert.equal(p.stored[1].snapshot.grounding_reason, "grounded");
+  assert.equal(receipt.status, "unknown");
+  assert.notEqual(receipt.reason, "extraction_pending");
+  assert.deepEqual(
+    p.stored.map((body) => body.snapshot.phase),
+    ["source"],
+  );
   assert.equal(p.sends, 1);
 });

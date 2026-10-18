@@ -139,6 +139,89 @@ async function renderAutomaticResult(
 }
 
 describe("automatic measurement results", () => {
+  it.each([
+    ["zh-CN", true],
+    ["en", true],
+    ["zh-CN", false],
+    ["en", false],
+  ] as const)(
+    "keeps a pending extraction receipt neutral in %s (automatic %s)",
+    async (language, automatic) => {
+      await i18n.changeLanguage(language);
+      const { client, requests } = await renderAutomaticResult(
+        { status: "unknown", detail: "extraction_pending", raw_answer: null },
+        automatic,
+        {
+          items: [],
+          sources: [],
+          next_after: null,
+          extraction: {
+            state: "running",
+            created_at: "2026-10-01T00:01:00Z",
+            started_at: "2026-10-01T00:01:00Z",
+            finished_at: null,
+            interruption: null,
+          },
+        },
+      );
+      expect(
+        screen.getByText(i18n.t("running", { ns: "observationAnalysis" })),
+      ).toBeVisible();
+      expect(
+        screen.getAllByText(
+          i18n.t("resultSourceSaved", { ns: "measurement" }),
+          { exact: false },
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.queryByText(
+          /结果未知|未能确认本次测量结果|盲目重发|等待对账|Measurement result unknown/,
+        ),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(
+          i18n.t("automaticUnknownDetail", { ns: "measurement" }),
+        ),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText("extraction_pending")).not.toBeInTheDocument();
+      expect(
+        requests.filter((request) => request.method === "POST"),
+      ).toHaveLength(0);
+      client.clear();
+      await act(async () => {
+        await i18n.changeLanguage("zh-CN");
+      });
+    },
+  );
+
+  it("retains the saved original receipt after analysis and surfaces a real interruption", async () => {
+    const { client } = await renderAutomaticResult(
+      { status: "unknown", detail: "extraction_pending" },
+      true,
+      {
+        ...savedAnalysisPage,
+        extraction: {
+          state: "interrupted",
+          created_at: "2026-10-01T00:01:00Z",
+          started_at: "2026-10-01T00:01:00Z",
+          finished_at: "2026-10-01T00:02:00Z",
+          interruption: "inference_interrupted",
+        },
+      },
+    );
+    expect(screen.getByText("回答可查看")).toBeVisible();
+    await userEvent.click(screen.getByText("执行记录"));
+    expect(screen.getByText(/原始记录已保存/)).toBeVisible();
+    await userEvent.click(screen.getByText("解析记录与操作"));
+    expect(
+      screen.getByText("解析中断。你可以重新解析已存回答。"),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("未能确认本次测量结果。"),
+    ).not.toBeInTheDocument();
+    client.clear();
+  });
+
   it.each(["zh-CN", "en"])(
     "makes a saved answer primary while preserving the unknown receipt in %s",
     async (language) => {

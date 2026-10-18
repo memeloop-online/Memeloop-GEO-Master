@@ -87,6 +87,12 @@ function providerUnavailable(outcome?: ChannelOutcome | null) {
   );
 }
 
+function extractionPending(outcome?: ChannelOutcome | null) {
+  return (
+    outcome?.status === "unknown" && outcome.detail === "extraction_pending"
+  );
+}
+
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : "操作失败，请重试。";
 }
@@ -181,9 +187,11 @@ export function TargetCard({
           ? t("automaticQueued")
           : status === "in_flight"
             ? t("automaticInFlight")
-            : providerUnavailable(latestOutcome)
-              ? t("automaticProviderUnavailable")
-              : t(`automaticOutcome.${status}`, { defaultValue: status });
+            : extractionPending(latestOutcome)
+              ? t("resultSourceSaved")
+              : providerUnavailable(latestOutcome)
+                ? t("automaticProviderUnavailable")
+                : t(`automaticOutcome.${status}`, { defaultValue: status });
   if (automatic && input.kind === "measure") {
     const measurementDate = (value?: string | null) =>
       value
@@ -240,9 +248,11 @@ export function TargetCard({
                   t("resultFixture")
                 ) : (
                   t(
-                    providerUnavailable(outcome)
-                      ? "automaticProviderUnavailable"
-                      : `automaticOutcome.${outcome.status}`,
+                    extractionPending(outcome)
+                      ? "resultSourceSaved"
+                      : providerUnavailable(outcome)
+                        ? "automaticProviderUnavailable"
+                        : `automaticOutcome.${outcome.status}`,
                     { defaultValue: outcome.status },
                   )
                 )
@@ -274,9 +284,10 @@ export function TargetCard({
                   <details>
                     <summary>{t("resultExecutionHistory")}</summary>
                     {receipt}
-                    {outcome?.status === "unknown" && (
-                      <p>{unknownDetail(outcome)}</p>
-                    )}
+                    {outcome?.status === "unknown" &&
+                      !extractionPending(outcome) && (
+                        <p>{unknownDetail(outcome)}</p>
+                      )}
                   </details>
                 </>
               ) : (
@@ -321,9 +332,12 @@ export function TargetCard({
             </div>
           );
         })}
-        {attempted && status === "unknown" && !hasSavedAnswer && (
-          <p role="status">{unknownDetail(latestOutcome)}</p>
-        )}
+        {attempted &&
+          status === "unknown" &&
+          !hasSavedAnswer &&
+          !extractionPending(latestOutcome) && (
+            <p role="status">{unknownDetail(latestOutcome)}</p>
+          )}
         <details
           onToggle={(event) =>
             setShowTechnicalDetails(event.currentTarget.open)
@@ -357,7 +371,13 @@ export function TargetCard({
           </p>
         </div>
         <Badge appearance="outline">
-          {automatic ? automaticLabel : (statusLabels[status] ?? status)}
+          {automatic
+            ? automaticLabel
+            : input.kind === "measure" && extractionPending(latestOutcome)
+              ? hasSavedAnswer
+                ? t("resultAnswerAvailable")
+                : t("resultSourceSaved")
+              : (statusLabels[status] ?? status)}
         </Badge>
       </div>
       <p className="channel-job-ids">
@@ -401,17 +421,25 @@ export function TargetCard({
             <>
               <p>
                 结果：
-                {automatic
-                  ? t(`automaticOutcome.${attempt.outcome.status}`, {
-                      defaultValue: attempt.outcome.status,
-                    })
-                  : (statusLabels[attempt.outcome.status] ??
-                    attempt.outcome.status)}
-                {" · "}
-                {input.kind === "measure" &&
-                providerUnavailable(attempt.outcome)
-                  ? unknownDetail(attempt.outcome)
-                  : (attempt.outcome.detail ?? "无详细说明")}
+                {input.kind === "measure" && extractionPending(attempt.outcome)
+                  ? t("resultSourceSaved")
+                  : automatic
+                    ? t(`automaticOutcome.${attempt.outcome.status}`, {
+                        defaultValue: attempt.outcome.status,
+                      })
+                    : (statusLabels[attempt.outcome.status] ??
+                      attempt.outcome.status)}
+                {!(
+                  input.kind === "measure" && extractionPending(attempt.outcome)
+                ) && (
+                  <>
+                    {" · "}
+                    {input.kind === "measure" &&
+                    providerUnavailable(attempt.outcome)
+                      ? unknownDetail(attempt.outcome)
+                      : (attempt.outcome.detail ?? "无详细说明")}
+                  </>
+                )}
               </p>
               <p>
                 {input.kind === "measure"
@@ -484,13 +512,15 @@ export function TargetCard({
             {executing ? "正在执行…" : "执行此目标"}
           </Button>
         )}
-      {attempted && status === "unknown" && (
-        <p role="status">
-          {automatic
-            ? t("automaticUnknownDetail")
-            : "结果未知；当前没有安全的手动重发操作，请等待对账。"}
-        </p>
-      )}
+      {attempted &&
+        status === "unknown" &&
+        !(input.kind === "measure" && extractionPending(latestOutcome)) && (
+          <p role="status">
+            {automatic
+              ? t("automaticUnknownDetail")
+              : "结果未知；当前没有安全的手动重发操作，请等待对账。"}
+          </p>
+        )}
       {input.kind === "publish" &&
         view?.attempts.some(
           (attempt) => !attempt.outcome || attempt.outcome.status === "unknown",

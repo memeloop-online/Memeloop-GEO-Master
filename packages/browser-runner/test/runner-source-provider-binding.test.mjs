@@ -98,7 +98,7 @@ async function runCapture(platform, receipts, completion, extraction = {}) {
   }
 }
 
-test("extraction forwards only the remaining route budget and its cancellation signal", async (t) => {
+test("extraction forwards cancellation but no synchronous wait budget", async (t) => {
   const controller = new AbortController();
   let calls = 0;
   t.mock.method(performance, "now", () => 1_000);
@@ -121,7 +121,6 @@ test("extraction forwards only the remaining route budget and its cancellation s
         assert.deepEqual(body, {
           schema_version: 1,
           prompt_version: "geo.observation.extract.v4",
-          wait_budget_ms: 56_001,
           capture_ticket: "aabb",
           source_capture_id: "33333333-3333-4333-8333-333333333333",
           source_sha256: sourceSha256,
@@ -138,6 +137,40 @@ test("extraction forwards only the remaining route budget and its cancellation s
   assert.equal(calls, 1);
   assert.equal(stored.length, 2);
   assert.ok(stored.every((body) => !Object.hasOwn(body, "wait_budget_ms")));
+});
+
+test("extraction accepts only the durable typed ACK, never legacy model output", async () => {
+  const intent_id = "99999999-9999-4999-8999-999999999999";
+  const accepted = { status: "accepted", intent_id };
+  let result;
+  await runCapture("kimi", [], undefined, {
+    async inspectHooks(hooks) {
+      for (const malformed of [
+        null,
+        {},
+        { status: "accepted" },
+        { status: "accepted", intent_id: 123 },
+        { status: "accepted", intent_id: "invalid" },
+        { status: "completed", intent_id },
+        { ...accepted, text: "{}" },
+        { text: "{}", model: "fixture-model", config_version: 1 },
+      ]) {
+        result = malformed;
+        assert.equal(await hooks.apiExtract("not sent"), null);
+      }
+      result = accepted;
+      assert.deepEqual(await hooks.apiExtract("not sent"), {
+        status: "extraction_pending",
+        intent_id,
+      });
+    },
+    observationAi: {
+      async extract(body) {
+        assert.equal(Object.hasOwn(body, "wait_budget_ms"), false);
+        return result;
+      },
+    },
+  });
 });
 
 test("source and extraction callbacks forward the same normalized inventory receipt", async () => {
