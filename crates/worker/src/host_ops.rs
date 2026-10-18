@@ -23,19 +23,20 @@ use serde::de::DeserializeOwned;
 
 use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
-    ChannelTargetExecuteRequest, ContentCloseRequest, ContentDistributeReadRequest,
-    ContentDistributeRequest, ContentDocumentReadRequest, ContentExecutionReadRequest,
-    ContentGenerateFinishRequest, ContentItemsReadRequest, ContentMediaBindRequest,
-    ContentMediaInsertRequest, ContentMediaListRequest, ContentPrepareRequest,
-    ContentSourceReadRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
-    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
-    DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
-    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeTextReadRequest,
-    KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
-    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
-    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
-    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
-    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
+    ChannelTargetExecuteRequest, ContentCheckFinishRequest, ContentCloseRequest,
+    ContentDistributeReadRequest, ContentDistributeRequest, ContentDocumentReadRequest,
+    ContentExecutionReadRequest, ContentGenerateFinishRequest, ContentItemsReadRequest,
+    ContentMediaBindRequest, ContentMediaInsertRequest, ContentMediaListRequest,
+    ContentPrepareRequest, ContentRepairFinishRequest, ContentSourceReadRequest,
+    ContentStartRequest, ContentStepRequest, CreateQuestionSet, DistributionReadRequest,
+    DistributionResumeRequest, DistributionStartRequest, DistributionTargetsReadRequest,
+    HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
+    KnowledgeImportStatusRequest, KnowledgeTextReadRequest, KnowledgeTextReviseRequest,
+    ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest, MeasurementPlanCreateRequest,
+    MeasurementPlanReadRequest, ModelCompletionRequest, ProjectCurrentRequest,
+    ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest, PublishRequest,
+    QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest, ReportPreviewRequest,
+    ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -150,39 +151,6 @@ pub async fn op_host_content_items_read_v1(
     Ok(encode(op, &result)?)
 }
 
-macro_rules! content_step_op {
-    ($name:ident, $variant:ident, $method:ident) => {
-        #[op2]
-        #[string]
-        pub async fn $name(
-            state: Rc<RefCell<OpState>>,
-            #[string] request: String,
-        ) -> Result<String, JsErrorBox> {
-            let op = HostOp::$variant;
-            let bridge = bridge(&state.borrow())?;
-            let request = parse_request::<ContentStepRequest>(op, &request)?;
-            if request.execution_id.is_nil() || request.item_id.is_nil() {
-                return Err(js_error(HostOpError::invalid_request(
-                    op,
-                    "execution and item references must be non-zero",
-                )));
-            }
-            let requested_item = request.item_id;
-            let result = bridge
-                .invoke_recorded(op, &request.clone(), |bridge| async move {
-                    bridge.capabilities().$method(bridge.scope(), request).await
-                })
-                .await?;
-            if result.item_id != requested_item || result.branch_key.is_empty() {
-                return Err(js_error(HostOpError::internal(
-                    op,
-                    "step returned an unrelated item",
-                )));
-            }
-            Ok(encode(op, &result)?)
-        }
-    };
-}
 project_op!(
     op_host_content_prepare_v1,
     ContentPrepare,
@@ -211,8 +179,34 @@ project_op!(
     content_generate_finish,
     ContentGenerateFinishRequest::validate
 );
-content_step_op!(op_host_content_check_v1, ContentCheck, content_check);
-content_step_op!(op_host_content_repair_v1, ContentRepair, content_repair);
+project_op!(
+    op_host_content_check_begin_v1,
+    ContentCheckBegin,
+    ContentStepRequest,
+    content_check_begin,
+    ContentStepRequest::validate
+);
+project_op!(
+    op_host_content_check_finish_v1,
+    ContentCheckFinish,
+    ContentCheckFinishRequest,
+    content_check_finish,
+    ContentCheckFinishRequest::validate
+);
+project_op!(
+    op_host_content_repair_begin_v1,
+    ContentRepairBegin,
+    ContentStepRequest,
+    content_repair_begin,
+    ContentStepRequest::validate
+);
+project_op!(
+    op_host_content_repair_finish_v1,
+    ContentRepairFinish,
+    ContentRepairFinishRequest,
+    content_repair_finish,
+    ContentRepairFinishRequest::validate
+);
 
 #[op2]
 #[string]
@@ -1120,8 +1114,10 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::ContentPrepare.op_name(),
     HostOp::ContentGenerateBegin.op_name(),
     HostOp::ContentGenerateFinish.op_name(),
-    HostOp::ContentCheck.op_name(),
-    HostOp::ContentRepair.op_name(),
+    HostOp::ContentCheckBegin.op_name(),
+    HostOp::ContentCheckFinish.op_name(),
+    HostOp::ContentRepairBegin.op_name(),
+    HostOp::ContentRepairFinish.op_name(),
     HostOp::ContentClose.op_name(),
     HostOp::ContentStart.op_name(),
     HostOp::ContentExecutionRead.op_name(),

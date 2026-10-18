@@ -626,7 +626,10 @@ async fn the_reference_bundle_declares_the_surface_it_expects() {
         "publishSubmit",
         "measureSample",
         "distributionStart",
-        "contentRepair",
+        "contentCheckBegin",
+        "contentCheckFinish",
+        "contentRepairBegin",
+        "contentRepairFinish",
         "distributionRead",
         "distributionResume",
         "distributionTargetsRead",
@@ -638,6 +641,56 @@ async fn the_reference_bundle_declares_the_surface_it_expects() {
             "`{capability}` must be declared by the bundle: {declared:?}"
         );
     }
+    for removed in ["contentCheck", "contentRepair"] {
+        assert!(!declared.iter().any(|entry| entry == removed));
+    }
+}
+
+#[tokio::test]
+async fn content_review_ops_require_capabilities_and_bound_finish_tokens() {
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        const step = {
+          execution_id: "00000000-0000-4000-8000-000000000001",
+          item_id: "00000000-0000-4000-8000-000000000002"
+        };
+        const finish = { ...step, token: "00000000-0000-4000-8000-000000000003", outcome: {status: "invalid"} };
+        await attempt("check_begin", () => hostOps.contentCheckBegin(step));
+        await attempt("check_finish", () => hostOps.contentCheckFinish(finish));
+        await attempt("repair_begin", () => hostOps.contentRepairBegin(step));
+        await attempt("repair_finish", () => hostOps.contentRepairFinish(finish));
+        await attempt("check_missing_token", () => hostOps.contentCheckFinish({...step, outcome: {status: "invalid"}}));
+        await attempt("repair_foreign", () => hostOps.contentRepairFinish({...finish, tenant_id: "00000000-0000-4000-8000-000000000004"}));
+        "#,
+        bridge(Arc::new(FakeHostOps::new())),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for (topic, op) in [
+        ("check_begin", "content_check_begin"),
+        ("check_finish", "content_check_finish"),
+        ("repair_begin", "content_repair_begin"),
+        ("repair_finish", "content_repair_finish"),
+    ] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "capability_missing",
+            op,
+        );
+    }
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "check_missing_token"),
+        "invalid_request",
+        "content_check_finish",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "repair_foreign"),
+        "invalid_request",
+        "content_repair_finish",
+    );
 }
 
 #[tokio::test]

@@ -17,10 +17,12 @@ use geo_domain::{
     settings_hash, start_request_hash,
 };
 use geo_worker::{
-    ContentCloseRequest, ContentExecutionReadRequest, ContentGenerateBeginResult,
-    ContentGenerateFinishRequest, ContentGenerateOutcome, ContentItemRef, ContentItemsReadRequest,
-    ContentPrepareRequest, ContentSourceReadRequest, ContentStartRequest, ContentStepRequest,
-    HostOpError, HostOpErrorCode, HostOps, ModelCompletion, ModelCompletionRequest,
+    ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest,
+    ContentExecutionReadRequest, ContentGenerateBeginResult, ContentGenerateFinishRequest,
+    ContentItemRef, ContentItemsReadRequest, ContentModelOutcome, ContentPrepareRequest,
+    ContentRepairBeginResult, ContentRepairFinishRequest, ContentSourceReadRequest,
+    ContentStartRequest, ContentStepRequest, HostOpError, HostOpErrorCode, HostOps,
+    ModelCompletion, ModelCompletionRequest,
 };
 use uuid::Uuid;
 
@@ -36,7 +38,7 @@ impl ContentWorkflowExecutor for AcceptedExecutor {
     }
 }
 
-struct GroundedModel(AtomicUsize);
+struct GroundedModel(AtomicUsize, AtomicUsize);
 
 async fn generate_selected(
     host: &RepositoryHostOps,
@@ -72,11 +74,126 @@ async fn generate_selected(
             execution_id: step.execution_id,
             item_id: step.item_id,
             token,
-            outcome: ContentGenerateOutcome::Completed { text: output.text },
+            outcome: ContentModelOutcome::Completed { text: output.text },
         },
     )
     .await
     .unwrap()
+}
+
+async fn check_selected(
+    host: &RepositoryHostOps,
+    scope: &TenantScope,
+    step: ContentStepRequest,
+) -> (ContentItemRef, ContentCheckFinishRequest) {
+    let ContentCheckBeginResult::Claimed {
+        token,
+        revision,
+        quotes,
+        title_check_id,
+        check_sections,
+    } = host.content_check_begin(scope, step.clone()).await.unwrap()
+    else {
+        panic!("a drafted fixture must claim its independent check");
+    };
+    let output = host
+        .model_complete(
+            scope,
+            ModelCompletionRequest {
+                prompt: serde_json::json!({
+                    "document": revision.document, "title_check_id": title_check_id,
+                    "check_sections": check_sections,
+                    "evidence": quotes.iter().map(|e| serde_json::json!({
+                        "chunk_id": e.reference.chunk_id, "quote": e.exact_quote
+                    })).collect::<Vec<_>>()
+                })
+                .to_string(),
+                system: Some("independent factual checker".into()),
+                model: None,
+                max_output_tokens: None,
+                messages: vec![],
+                tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let request = ContentCheckFinishRequest {
+        execution_id: step.execution_id,
+        item_id: step.item_id,
+        token,
+        outcome: ContentModelOutcome::Completed { text: output.text },
+    };
+    let item = host
+        .content_check_finish(scope, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        host.content_check_finish(scope, request.clone())
+            .await
+            .unwrap(),
+        item,
+        "replaying a completed check token must not create another check"
+    );
+    (item, request)
+}
+
+async fn repair_selected(
+    host: &RepositoryHostOps,
+    scope: &TenantScope,
+    step: ContentStepRequest,
+) -> (ContentItemRef, ContentRepairFinishRequest) {
+    let ContentRepairBeginResult::Claimed {
+        token,
+        revision,
+        quotes,
+        blocking_findings,
+        check_sections,
+    } = host
+        .content_repair_begin(scope, step.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("the fixture must claim a blocked revision for repair");
+    };
+    let output = host
+        .model_complete(
+            scope,
+            ModelCompletionRequest {
+                prompt: serde_json::json!({
+                    "previous_document": revision.document,
+                    "blocking_findings": blocking_findings, "check_sections": check_sections,
+                    "evidence": quotes.iter().map(|e| serde_json::json!({
+                        "chunk_id": e.reference.chunk_id, "quote": e.exact_quote
+                    })).collect::<Vec<_>>()
+                })
+                .to_string(),
+                system: Some("source-grounded factual repairer".into()),
+                model: None,
+                max_output_tokens: None,
+                messages: vec![],
+                tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let request = ContentRepairFinishRequest {
+        execution_id: step.execution_id,
+        item_id: step.item_id,
+        token,
+        outcome: ContentModelOutcome::Completed { text: output.text },
+    };
+    let item = host
+        .content_repair_finish(scope, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        host.content_repair_finish(scope, request.clone())
+            .await
+            .unwrap(),
+        item,
+        "replaying a completed repair token must not create another revision"
+    );
+    (item, request)
 }
 
 async fn selected_prepare(
@@ -145,17 +262,32 @@ impl ModelProviderBridge for GroundedModel {
             .unwrap_or_default()
             .contains("checker")
         {
+            let unsupported = self.1.swap(0, Ordering::SeqCst) != 0;
             let block = input["document"]["blocks"][0]["block_id"].as_str().unwrap();
             let title = input["title_check_id"].as_str().unwrap();
             serde_json::json!({"checks":[
                 {"block_id":title,"verdict":"supported","citation_ids":[citation],
                     "detail":"Source quote supports title"},
-                {"block_id":block,"verdict":"supported","citation_ids":[citation],
+                {"block_id":block,"verdict":if unsupported {"unsupported"} else {"supported"},"citation_ids":[citation],
                     "detail":"Source quote supports statement"}]})
             .to_string()
+        } else if request
+            .system
+            .as_deref()
+            .unwrap_or_default()
+            .contains("repairer")
+        {
+            let mut document = input["previous_document"].clone();
+            document["blocks"][0]["text"] = input["evidence"][0]["quote"].clone();
+            document.to_string()
         } else {
+            let text = if self.1.load(Ordering::SeqCst) > 0 {
+                "Public description. Unsupported draft sentence."
+            } else {
+                "Public description"
+            };
             serde_json::json!({"schema_version":2,"title":"A documented answer","blocks":[{"kind":"paragraph",
-                "text":"Public description","citation_ids":[citation],"items":[]}]})
+                "text":text,"citation_ids":[citation],"items":[]}]})
             .to_string()
         };
         Ok(ModelCompletion {
@@ -269,7 +401,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
             .is_none()
     );
     let executor = Arc::new(AcceptedExecutor(AtomicUsize::new(0)));
-    let model = Arc::new(GroundedModel(AtomicUsize::new(0)));
+    let model = Arc::new(GroundedModel(AtomicUsize::new(0), AtomicUsize::new(1)));
     let state = AppState::with_stores_and_auth_and_projects_and_knowledge(
         Arc::new(MemoryOperationStore::default()),
         Arc::new(MemoryIdempotencyStore::default()),
@@ -534,7 +666,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         item_id,
     };
     assert_eq!(
-        host.content_repair(&foreign, step.clone())
+        host.content_repair_begin(&foreign, step.clone())
             .await
             .unwrap_err()
             .code,
@@ -542,7 +674,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         "the repair op must resolve scope before model work"
     );
     assert_eq!(
-        host.content_repair(&scope, step.clone())
+        host.content_repair_begin(&scope, step.clone())
             .await
             .unwrap_err()
             .code,
@@ -677,8 +809,86 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
     assert!(!projected.contains("Public description"));
     let drafted = generate_selected(&host, &scope, step.clone()).await;
     assert_eq!(drafted.status, ContentItemStatus::Drafted);
-    let ready = host.content_check(&scope, step).await.unwrap();
+    let (checked, first_check) = check_selected(&host, &scope, step.clone()).await;
+    assert_eq!(checked.status, ContentItemStatus::NeedsRepair);
+    assert_eq!(
+        host.content_check_finish(&foreign, first_check.clone())
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::NotFound,
+        "a completed check token cannot bypass tenant scope"
+    );
+    let (repaired, repair_finish) = repair_selected(&host, &scope, step.clone()).await;
+    assert_eq!(repaired.status, ContentItemStatus::Drafted);
+    assert_eq!(repaired.automatic_repair_count, 1);
+    assert_eq!(
+        host.content_repair_finish(&foreign, repair_finish.clone())
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::NotFound,
+        "a completed repair token cannot bypass tenant scope"
+    );
+    assert_eq!(
+        host.content_repair_finish(
+            &scope,
+            ContentRepairFinishRequest {
+                token: first_check.token,
+                ..repair_finish.clone()
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        HostOpErrorCode::Failed,
+        "a completed check token cannot authorize a repair completion"
+    );
+    let (ready, _) = check_selected(&host, &scope, step.clone()).await;
     assert_eq!(ready.status, ContentItemStatus::Ready);
+    assert_eq!(
+        host.content_check_finish(&scope, first_check)
+            .await
+            .unwrap(),
+        ready
+    );
+    assert_eq!(
+        host.content_repair_finish(&scope, repair_finish)
+            .await
+            .unwrap(),
+        ready
+    );
+    let persisted = state
+        .content_service()
+        .repository()
+        .get_item(&scope, step.execution_id, step.item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let revisions = state
+        .content_service()
+        .repository()
+        .list_revisions(&scope, persisted.asset_id.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        revisions.len(),
+        2,
+        "completed repair replay cannot append a revision"
+    );
+    for revision in &revisions {
+        assert_eq!(
+            state
+                .content_service()
+                .repository()
+                .list_checks(&scope, revision.revision_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "completed check replay cannot append a check"
+        );
+    }
     let second_step = ContentStepRequest {
         execution_id: started_ref.execution_id,
         item_id: second.items[0].item_id,
@@ -687,8 +897,8 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .await
         .unwrap();
     generate_selected(&host, &scope, second_step.clone()).await;
-    host.content_check(&scope, second_step).await.unwrap();
-    assert_eq!(model.0.load(Ordering::SeqCst), 4);
+    check_selected(&host, &scope, second_step).await;
+    assert_eq!(model.0.load(Ordering::SeqCst), 6);
     let handoff = host
         .content_close(
             &scope,
@@ -774,7 +984,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
     assert_eq!(changed.status, ContentItemStatus::Prepared);
     assert_eq!(
         model.0.load(Ordering::SeqCst),
-        4,
+        6,
         "a changed public source dependency must prepare a fresh draft"
     );
     let original_source = state
@@ -879,7 +1089,7 @@ async fn two_automatic_content_cycles_reuse_the_same_checked_revision_without_mo
         )
         .await
         .unwrap();
-    let model = Arc::new(GroundedModel(AtomicUsize::new(0)));
+    let model = Arc::new(GroundedModel(AtomicUsize::new(0), AtomicUsize::new(0)));
     let executor = Arc::new(AcceptedExecutor(AtomicUsize::new(0)));
     let repository = Arc::new(MemoryContentRepository::default());
     let state = AppState::with_stores_and_auth_and_projects_and_knowledge(
@@ -917,7 +1127,7 @@ async fn two_automatic_content_cycles_reuse_the_same_checked_revision_without_mo
         .await
         .unwrap();
     generate_selected(&host, &scope, first_step.clone()).await;
-    host.content_check(&scope, first_step).await.unwrap();
+    check_selected(&host, &scope, first_step).await;
     let first_checked = repository
         .get_item(&scope, first.execution_id, first_item.item_id)
         .await

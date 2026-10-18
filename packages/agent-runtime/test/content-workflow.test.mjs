@@ -47,6 +47,12 @@ async function run({
     text: '{"schema_version":2,"title":"Generated","blocks":[]}',
   },
   currentAtGeneration = false,
+  checkError,
+  repairError,
+  checkCompletion,
+  repairCompletion,
+  currentAtCheck = false,
+  currentAtRepair = false,
 } = {}) {
   const item = {
     item_id: itemId,
@@ -67,11 +73,78 @@ async function run({
   const modelRequests = [];
   const generationRequests = [];
   const generationFinishes = [];
+  const checkRequests = [];
+  const repairRequests = [];
+  const checkFinishes = [];
+  const repairFinishes = [];
+  const reviewClaims = new Map();
   const preparations = [];
   let interrupted = false;
   const read = (current = items[0]) => ({ ...current });
   const requested = (request) =>
     items.find((entry) => entry.item_id === request.item_id);
+  const quotesFor = (request) =>
+    preparations.find((entry) => entry.item_id === request.item_id)
+      ?.evidence ?? [
+      {
+        reference: {
+          source_version_id: sourceVersionId,
+          chunk_id: "chunk-0",
+          locator: chunk(0).locator,
+        },
+        exact_quote: "Source fact 0",
+      },
+    ];
+  const reviewClaim = (step, request) => {
+    const item = requested(request);
+    const token = `stored-${step}-${item.item_id}-${item.automatic_repair_count}`;
+    reviewClaims.set(token, { step, item_id: item.item_id });
+    return {
+      state: "claimed",
+      token,
+      revision: {
+        revision_id: `revision-${item.item_id}-${item.automatic_repair_count}`,
+        document: {
+          schema_version: 2,
+          title: "Frozen stored title",
+          blocks: [
+            {
+              block_id: "stored-block",
+              kind: "rich",
+              text: "",
+              items: [],
+              citation_ids: ["chunk-0"],
+              rich: {
+                version: 1,
+                node: {
+                  type: "paragraph",
+                  content: [
+                    {
+                      type: "text",
+                      text: "Stored typed claim",
+                      marks: [{ type: "bold" }],
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      },
+      quotes: quotesFor(request),
+      check_sections: [
+        [null, "Frozen stored title"],
+        ["stored-block", "Stored typed claim"],
+      ],
+    };
+  };
+  const verifyReviewFinish = (step, request) => {
+    assert.deepEqual(reviewClaims.get(request.token), {
+      step,
+      item_id: request.item_id,
+    });
+    assert.equal(request.execution_id, executionId);
+  };
   const host = {
     executionRead: async () => ({
       execution_id: executionId,
@@ -103,6 +176,27 @@ async function run({
         if (generationError) throw generationError;
         return generationCompletion;
       }
+      if (request.system.includes("factual checker")) {
+        checkRequests.push(request);
+        if (checkError) throw checkError;
+        const blocked = checks.shift();
+        return (
+          checkCompletion ?? {
+            text: JSON.stringify({
+              checks: [{ verdict: blocked ? "unsupported" : "supported" }],
+            }),
+          }
+        );
+      }
+      if (request.system.includes("factual repairer")) {
+        repairRequests.push(request);
+        if (repairError) throw repairError;
+        return (
+          repairCompletion ?? {
+            text: JSON.stringify(JSON.parse(request.prompt).previous_document),
+          }
+        );
+      }
       modelRequests.push(request);
       return {
         text: JSON.stringify({
@@ -133,18 +227,7 @@ async function run({
           language: "en",
           brand_name: "Synthetic brand",
           question_clusters: ["synthetic-topic"],
-          evidence: preparations.find(
-            (entry) => entry.item_id === request.item_id,
-          )?.evidence ?? [
-            {
-              reference: {
-                source_version_id: sourceVersionId,
-                chunk_id: "chunk-0",
-                locator: chunk(0).locator,
-              },
-              exact_quote: "Source fact 0",
-            },
-          ],
+          evidence: quotesFor(request),
         },
       };
     },
@@ -161,10 +244,30 @@ async function run({
       requested(request).status = "drafted";
       return read(requested(request));
     },
-    async check(request) {
+    async checkBegin(request) {
+      if (currentAtCheck) {
+        requested(request).status = "ready";
+        return { state: "current", item: read(requested(request)) };
+      }
+      return {
+        ...reviewClaim("check", request),
+        title_check_id: "stored-title-check",
+      };
+    },
+    async checkFinish(request) {
+      verifyReviewFinish("check", request);
+      checkFinishes.push(request);
+      if (request.outcome.status === "unavailable")
+        throw new Error("check unavailable");
+      if (request.outcome.status === "invalid") {
+        requested(request).status = "blocked";
+        return read(requested(request));
+      }
       calls.push("check");
       const item = requested(request);
-      const blocked = checks.shift();
+      const blocked = JSON.parse(request.outcome.text).checks.some(
+        (finding) => finding.verdict === "unsupported",
+      );
       item.status = blocked
         ? item.automatic_repair_count === 2
           ? "blocked"
@@ -172,7 +275,36 @@ async function run({
         : "ready";
       return read(item);
     },
-    async repair(request) {
+    async repairBegin(request) {
+      if (currentAtRepair) {
+        requested(request).status = "drafted";
+        requested(request).automatic_repair_count++;
+        return { state: "current", item: read(requested(request)) };
+      }
+      const claim = reviewClaim("repair", request);
+      return {
+        ...claim,
+        blocking_findings: [
+          {
+            finding_id: "stored-finding",
+            code: "unsupported_claim",
+            block_id: "stored-block",
+            evidence: [claim.quotes[0].reference],
+            detail: "Unsupported stored claim",
+            blocking: true,
+          },
+        ],
+      };
+    },
+    async repairFinish(request) {
+      verifyReviewFinish("repair", request);
+      repairFinishes.push(request);
+      if (request.outcome.status === "unavailable")
+        throw new Error("repair unavailable");
+      if (request.outcome.status === "invalid") {
+        requested(request).status = "blocked";
+        throw new Error("invalid repair");
+      }
       calls.push("repair");
       const item = requested(request);
       item.status = "drafted";
@@ -244,6 +376,10 @@ async function run({
       modelRequests,
       generationRequests,
       generationFinishes,
+      checkRequests,
+      repairRequests,
+      checkFinishes,
+      repairFinishes,
       preparations,
       host,
       workflow: main,
@@ -530,6 +666,131 @@ test("generation tool calls are rejected through the persisted invalid outcome",
   assert.equal(result.generationFinishes[0].outcome.status, "invalid");
 });
 
+test("checking uses the stored rich document, title identity, sections, and exact evidence", async () => {
+  const result = await run({ initial: "drafted" });
+  const request = result.checkRequests[0];
+  const input = JSON.parse(request.prompt);
+  assert.equal(request.max_output_tokens, 4096);
+  assert.ok(request.system.includes("untrusted data"));
+  assert.ok(request.system.includes("title AND EVERY top-level block_id"));
+  assert.equal(input.title_check_id, "stored-title-check");
+  assert.equal(input.document.title, "Frozen stored title");
+  assert.deepEqual(input.document.blocks[0].rich.node.content[0], {
+    type: "text",
+    text: "Stored typed claim",
+    marks: [{ type: "bold" }],
+  });
+  assert.deepEqual(input.check_sections, [
+    [null, "Frozen stored title"],
+    ["stored-block", "Stored typed claim"],
+  ]);
+  assert.equal(input.evidence[0].quote, "Source fact 0");
+  assert.deepEqual(Object.keys(result.checkFinishes[0]).sort(), [
+    "execution_id",
+    "item_id",
+    "outcome",
+    "token",
+  ]);
+  assert.equal(result.checkFinishes[0].token, `stored-check-${itemId}-0`);
+  assert.equal(result.checkFinishes[0].outcome.status, "completed");
+});
+
+test("repair uses the checked revision and blocking findings before an independent new check", async () => {
+  const result = await run({ initial: "needs_repair" });
+  assert.equal(result.repairRequests.length, 1);
+  assert.equal(result.checkRequests.length, 1);
+  const request = result.repairRequests[0];
+  const input = JSON.parse(request.prompt);
+  assert.equal(request.max_output_tokens, 4096);
+  assert.ok(request.system.includes("untrusted data"));
+  assert.ok(request.system.includes("Preserve unflagged blocks exactly"));
+  assert.equal(input.previous_document.blocks[0].block_id, "stored-block");
+  assert.deepEqual(input.blocking_findings, [
+    {
+      finding_id: "stored-finding",
+      code: "unsupported_claim",
+      block_id: "stored-block",
+      evidence: [input.exact_quotes[0].reference],
+      detail: "Unsupported stored claim",
+      blocking: true,
+    },
+  ]);
+  assert.equal(input.evidence[0].quote, input.exact_quotes[0].exact_quote);
+  assert.deepEqual(input.check_sections, [
+    [null, "Frozen stored title"],
+    ["stored-block", "Stored typed claim"],
+  ]);
+  assert.deepEqual(Object.keys(result.repairFinishes[0]).sort(), [
+    "execution_id",
+    "item_id",
+    "outcome",
+    "token",
+  ]);
+  assert.equal(result.repairFinishes[0].token, `stored-repair-${itemId}-0`);
+  assert.equal(result.checkFinishes[0].token, `stored-check-${itemId}-1`);
+  assert.equal(result.item.automatic_repair_count, 1);
+  assert.equal(result.item.status, "ready");
+});
+
+test("current check and repair results skip their model calls after stale item reads", async () => {
+  const checked = await run({ initial: "drafted", currentAtCheck: true });
+  assert.equal(checked.checkRequests.length, 0);
+  assert.equal(checked.checkFinishes.length, 0);
+  assert.equal(checked.item.status, "ready");
+  const repaired = await run({
+    initial: "needs_repair",
+    currentAtRepair: true,
+  });
+  assert.equal(repaired.repairRequests.length, 0);
+  assert.equal(repaired.repairFinishes.length, 0);
+  assert.equal(repaired.checkRequests.length, 1);
+  assert.equal(repaired.item.automatic_repair_count, 1);
+  assert.equal(repaired.item.status, "ready");
+});
+
+for (const [stage, initial] of [
+  ["check", "drafted"],
+  ["repair", "needs_repair"],
+]) {
+  for (const [label, error] of [
+    ["provider failure", new Error("provider unavailable")],
+    ["cancelled provider call", new DOMException("cancelled", "AbortError")],
+  ]) {
+    test(`${stage} ${label} releases the claim and preserves the previous state`, async () => {
+      const result = await run({
+        initial,
+        [`${stage}Error`]: error,
+        incomplete: true,
+      });
+      assert.equal(result.item.status, initial);
+      assert.equal(result.item.automatic_repair_count, 0);
+      assert.equal(result[`${stage}Requests`].length, 1);
+      assert.deepEqual(result[`${stage}Finishes`][0].outcome, {
+        status: "unavailable",
+      });
+      assert.ok(!result.calls.includes("distributionStart"));
+    });
+  }
+  for (const [label, completion] of [
+    ["tool calls", { text: "{}", tool_calls: [{}] }],
+    ["missing text", {}],
+  ]) {
+    test(`${stage} ${label} is persisted as invalid without another model stage`, async () => {
+      const result = await run({ initial, [`${stage}Completion`]: completion });
+      assert.equal(result.item.status, "blocked");
+      assert.equal(result.item.automatic_repair_count, 0);
+      assert.deepEqual(result[`${stage}Finishes`][0].outcome, {
+        status: "invalid",
+      });
+      assert.equal(result[`${stage}Requests`].length, 1);
+      assert.equal(
+        result[stage === "check" ? "repairRequests" : "checkRequests"].length,
+        0,
+      );
+    });
+  }
+}
+
 test("pending item reuses qualified persisted evidence without a model call", async () => {
   const evidence = [
     {
@@ -737,13 +998,16 @@ test("no-progress check cannot spin or prepare distribution", async () => {
         },
       ],
     }),
-    async check() {
+    async checkBegin() {
       calls.push("check");
       return {
-        item_id: itemId,
-        branch_key: "frozen-branch",
-        status: "drafted",
-        automatic_repair_count: 0,
+        state: "current",
+        item: {
+          item_id: itemId,
+          branch_key: "frozen-branch",
+          status: "drafted",
+          automatic_repair_count: 0,
+        },
       };
     },
     async close() {

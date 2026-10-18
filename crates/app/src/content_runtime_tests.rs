@@ -34,6 +34,7 @@ struct GroundedModel {
     selected: AtomicUsize,
     generated: AtomicUsize,
     checked: AtomicUsize,
+    repaired: AtomicUsize,
 }
 
 #[async_trait]
@@ -92,24 +93,49 @@ impl ModelProviderBridge for GroundedModel {
                     .iter()
                     .map(|block| block["block_id"].as_str().unwrap()),
             );
+            let unsupported = input["document"]["blocks"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Unsupported draft sentence.");
+            let title_id = input["title_check_id"].as_str().unwrap();
             let checks = ids
                 .into_iter()
                 .map(|block_id| {
                     serde_json::json!({
-                        "block_id":block_id, "verdict":"supported",
+                        "block_id":block_id,
+                        "verdict": if unsupported && block_id != title_id { "unsupported" } else { "supported" },
                         "citation_ids":[citation],
-                        "detail":"The supplied quote supports this exact claim"
+                        "detail": if unsupported && block_id != title_id {
+                            "Unsupported draft sentence. is absent from the supplied quote"
+                        } else {
+                            "The supplied quote supports this exact claim"
+                        }
                     })
                 })
                 .collect::<Vec<_>>();
             serde_json::json!({"checks":checks}).to_string()
+        } else if request
+            .system
+            .as_deref()
+            .unwrap_or_default()
+            .contains("factual repairer")
+        {
+            self.repaired.fetch_add(1, Ordering::SeqCst);
+            let mut document = input["previous_document"].clone();
+            assert_eq!(input["blocking_findings"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                input["blocking_findings"][0]["block_id"],
+                document["blocks"][0]["block_id"]
+            );
+            document["blocks"][0]["text"] = input["evidence"][0]["quote"].clone();
+            document.to_string()
         } else {
             self.generated.fetch_add(1, Ordering::SeqCst);
             let quote = input["evidence"][0]["quote"].as_str().unwrap();
             serde_json::json!({
                 "schema_version":2,
                 "title":quote,
-                "blocks":[{"kind":"paragraph","text":quote,"citation_ids":[citation],"items":[]}]
+                "blocks":[{"kind":"paragraph","text":format!("{quote} Unsupported draft sentence."),"citation_ids":[citation],"items":[]}]
             })
             .to_string()
         };
@@ -305,7 +331,7 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
     assert!(
         items
             .iter()
-            .all(|item| item.status == ContentItemStatus::Ready)
+            .all(|item| item.status == ContentItemStatus::Ready && item.automatic_repair_count == 1)
     );
     let assets = repository
         .list_assets(&scope, execution.execution_id)
@@ -318,7 +344,7 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
             .list_revisions(&scope, asset.asset_id)
             .await
             .unwrap();
-        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions.len(), 2);
         assert_eq!(
             revisions[0].document.blocks[0].citation_ids.len(),
             1,
@@ -326,7 +352,8 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
         );
     }
     assert_eq!(model.generated.load(Ordering::SeqCst), 2);
-    assert_eq!(model.checked.load(Ordering::SeqCst), 2);
+    assert_eq!(model.checked.load(Ordering::SeqCst), 4);
+    assert_eq!(model.repaired.load(Ordering::SeqCst), 2);
     assert_eq!(model.selected.load(Ordering::SeqCst), 2);
     let frozen_distribution = state
         .distribution_service()
@@ -427,7 +454,8 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
     .expect("native replay bounded")
     .expect("native replay succeeds");
     assert_eq!(model.generated.load(Ordering::SeqCst), 2);
-    assert_eq!(model.checked.load(Ordering::SeqCst), 2);
+    assert_eq!(model.checked.load(Ordering::SeqCst), 4);
+    assert_eq!(model.repaired.load(Ordering::SeqCst), 2);
     assert!(
         restarted
             .distribution_service()
@@ -492,7 +520,8 @@ async fn generated_content_bundle_dispatches_two_branches_and_replays_without_mo
         assert_ne!(next.execution_id, original.execution_id);
     }
     assert_eq!(model.generated.load(Ordering::SeqCst), 2);
-    assert_eq!(model.checked.load(Ordering::SeqCst), 2);
+    assert_eq!(model.checked.load(Ordering::SeqCst), 4);
+    assert_eq!(model.repaired.load(Ordering::SeqCst), 2);
     assert!(
         restarted
             .content_service()
