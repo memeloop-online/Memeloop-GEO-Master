@@ -878,15 +878,30 @@ test("browser UI submits exactly once and its captured framed request creates v2
     responseDelayMs = 0;
     omitEnd = true;
     const captureDiagnostics = [];
+    const partialEvidence = [];
+    const partialOwnership = [];
     assert.equal(
       await observeKimiConnectSearch(page, frozen, {
         trustedOrigin: origin,
         deadlineAt: performance.now() + 1_000,
         onDiagnostic: (entry) => captureDiagnostics.push(entry),
+        onEvidence: async (record) => partialEvidence.push(record),
+        onConversationCaptured: async (receipt) => {
+          partialOwnership.push(receipt);
+          return { durable: false };
+        },
       }),
       null,
-      "a streamed answer without the Connect end frame is not evidence",
+      "an incomplete stream cannot become a successful observation",
     );
+    assert.equal(partialEvidence.length, 1);
+    assert.equal(partialEvidence[0].kind, "observation_capture");
+    const partialSource = JSON.parse(partialEvidence[0].source_json);
+    assert.equal(partialSource.capture_status.transport, "partial");
+    assert.ok(partialSource.messages.length > 0);
+    assert.equal(partialOwnership.length, 1);
+    assert.equal(partialOwnership[0].external_conversation_id, "chat-1");
+    assert.equal(partialEvidence[0].completion, undefined);
     assert.equal(captureDiagnostics.at(-1).stage, "capture");
     assert.ok(
       ["capture_unverified", "budget_exhausted"].includes(

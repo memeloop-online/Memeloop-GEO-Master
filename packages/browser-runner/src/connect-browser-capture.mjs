@@ -3,7 +3,7 @@ import { createConnectJsonDecoder } from "./connect-json.mjs";
 // Chromium's ordinary getResponseBody path can UTF-8-decode +json MIME,
 // replacing binary frame-header bytes. Network streamResourceContent exposes
 // base64 bytes without changing the page's fetch, cookies, or response.
-async function observeWireBytes(page, endpoint, maxBytes) {
+async function observeWireBytes(page, endpoint, maxBytes, onBytes) {
   const session = await page.context().newCDPSession(page);
   let resolve;
   const body = new Promise((done) => (resolve = done));
@@ -34,6 +34,7 @@ async function observeWireBytes(page, endpoint, maxBytes) {
   session.on("Network.responseReceived", (event) => {
     if (event.response.url !== endpoint || closed) return;
     if (requestId) {
+      onBytes.invalidate();
       fail();
       return;
     }
@@ -44,7 +45,14 @@ async function observeWireBytes(page, endpoint, maxBytes) {
         if (closed) return;
         prefix = decode(result.bufferedData);
         if (!prefix) return fail();
+        try {
+          onBytes(prefix);
+          for (const chunk of chunks) onBytes(chunk);
+        } catch {
+          return fail();
+        }
         enabled = true;
+        if (onBytes.terminal()) ended = true;
         finish();
       }, fail);
   });
@@ -54,6 +62,17 @@ async function observeWireBytes(page, endpoint, maxBytes) {
     const bytes = decode(event.data);
     if (!bytes) return fail();
     chunks.push(bytes);
+    if (enabled) {
+      try {
+        onBytes(bytes);
+      } catch {
+        return fail();
+      }
+      if (onBytes.terminal()) {
+        ended = true;
+        finish();
+      }
+    }
   });
   session.on("Network.loadingFinished", (event) => {
     if (event.requestId !== requestId) return;
@@ -98,6 +117,9 @@ export async function captureConnectExchange(
     maxFrameBytes = 1024 * 1024,
     maxTotalBytes = 8 * 1024 * 1024,
     maxMessages = 256,
+    onPartialCapture,
+    onDiagnostic,
+    checkpointTimeoutMs = 5_000,
   },
 ) {
   if (
@@ -105,7 +127,9 @@ export async function captureConnectExchange(
     typeof submit !== "function" ||
     typeof matchRequest !== "function" ||
     !Number.isFinite(timeoutMs) ||
-    timeoutMs <= 0
+    timeoutMs <= 0 ||
+    !Number.isFinite(checkpointTimeoutMs) ||
+    checkpointTimeoutMs <= 0
   )
     return null;
   try {
@@ -129,6 +153,11 @@ export async function captureConnectExchange(
   let wire;
   let deliverResponse;
   let stopWaiting;
+  let decoder;
+  let trustedResponse = false;
+  let ambiguous = false;
+  let termination = "malformed";
+  let result = null;
   const controller = new AbortController();
   const firstResponse = new Promise((resolve) => {
     deliverResponse = resolve;
@@ -137,6 +166,7 @@ export async function captureConnectExchange(
     stopWaiting = resolve;
   });
   const abort = () => {
+    termination = signal?.aborted ? "aborted" : "timeout";
     controller.abort();
     stopWaiting(null);
   };
@@ -152,6 +182,7 @@ export async function captureConnectExchange(
         // Raw-byte observation deliberately permits only one endpoint
         // exchange. Never pair another request's bytes with a matched request.
         if (wire) abort();
+        trustedResponse = false;
         return;
       }
     } catch {
@@ -161,6 +192,7 @@ export async function captureConnectExchange(
     // Retried or competing matching submissions are ambiguous. Do not choose
     // a convenient successful response and hide the other request.
     if (matches !== 1) {
+      trustedResponse = false;
       abort();
       return;
     }
@@ -181,15 +213,12 @@ export async function captureConnectExchange(
             Number(length) > maxTotalBytes)
         )
           return null;
+        trustedResponse = true;
         const body = wire ? await wire.body : await response.body();
         if (!body) return null;
         if (closed || controller.signal.aborted) return null;
-        const decoder = createConnectJsonDecoder({
-          maxFrameBytes,
-          maxTotalBytes,
-          maxMessages,
-        });
-        decoder.push(body);
+        if (!wire) decoder.push(body);
+        if (!decoder.terminal) termination = "eof";
         const decoded = decoder.finish();
         return {
           messages: decoded.messages,
@@ -213,22 +242,35 @@ export async function captureConnectExchange(
   try {
     if (signal?.aborted) return null;
     timer = setTimeout(abort, timeoutMs);
+    decoder = createConnectJsonDecoder({
+      maxFrameBytes,
+      maxTotalBytes,
+      maxMessages,
+    });
     // Structural doubles exercise lifecycle handling without a browser. A
     // real page must support byte-preserving observation; no text fallback.
     if (typeof page.context === "function") {
-      const opening = observeWireBytes(page, endpoint, maxTotalBytes).then(
-        async (observer) => {
-          if (closed || controller.signal.aborted) {
-            await observer.close();
-            return null;
-          }
-          return observer;
-        },
-      );
+      const onBytes = (bytes) => decoder.push(bytes);
+      onBytes.terminal = () => decoder.terminal;
+      onBytes.invalidate = () => {
+        ambiguous = true;
+      };
+      const opening = observeWireBytes(
+        page,
+        endpoint,
+        maxTotalBytes,
+        onBytes,
+      ).then(async (observer) => {
+        if (closed || controller.signal.aborted) {
+          await observer.close();
+          return null;
+        }
+        return observer;
+      });
       wire = await Promise.race([opening, stopped]);
       if (!wire || controller.signal.aborted) return null;
     }
-    return await Promise.race([
+    result = await Promise.race([
       (async () => {
         await submit(page, controller.signal);
         if (closed || controller.signal.aborted) return null;
@@ -237,6 +279,7 @@ export async function captureConnectExchange(
       })(),
       stopped,
     ]);
+    return result;
   } catch {
     return null;
   } finally {
@@ -245,6 +288,60 @@ export async function captureConnectExchange(
     controller.abort();
     page.off("response", onResponse);
     signal?.removeEventListener("abort", abort);
+    if (!result) {
+      try {
+        onDiagnostic?.({
+          stage: trustedResponse ? "capture_stream" : "capture_request",
+          code:
+            termination === "timeout"
+              ? "timeout"
+              : termination === "aborted"
+                ? "cancelled"
+                : "capture_unverified",
+        });
+      } catch {
+        // Diagnostics cannot prevent source checkpointing or observer cleanup.
+      }
+    }
+    if (
+      !result &&
+      !ambiguous &&
+      trustedResponse &&
+      matches === 1 &&
+      typeof onPartialCapture === "function"
+    ) {
+      const prefix = decoder?.snapshot();
+      if (prefix?.messages.length) {
+        let checkpointTimer;
+        try {
+          await Promise.race([
+            Promise.resolve().then(() =>
+              onPartialCapture({
+                ...prefix,
+                connect_json_terminal: false,
+                started_at: startedAt,
+                received_at: new Date().toISOString(),
+                capture_status: {
+                  schema_version: "geo.observation.capture-status.v1",
+                  transport: "partial",
+                  termination,
+                },
+              }),
+            ),
+            new Promise((_, reject) => {
+              checkpointTimer = setTimeout(
+                () => reject(new Error("evidence_persist_failed")),
+                checkpointTimeoutMs,
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(checkpointTimer);
+          await wire?.close();
+          wire = null;
+        }
+      }
+    }
     await wire?.close();
   }
 }

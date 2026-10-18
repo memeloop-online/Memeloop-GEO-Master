@@ -83,6 +83,124 @@ test("duplicate matching responses remain ambiguous even with identical bytes", 
   assert.equal(page.listenerCount("response"), 0);
 });
 
+test("partial correlated stream checkpoints once on timeout without another send", async () => {
+  for (const matched of [true, false]) {
+    const page = new EventEmitter();
+    const session = new EventEmitter();
+    const prefix = frame(0, { text: "unfinished answer" });
+    let sends = 0;
+    let checkpoints = 0;
+    let detached = 0;
+    session.send = async (method) =>
+      method === "Network.enable"
+        ? {}
+        : { bufferedData: prefix.subarray(0, 3).toString("base64") };
+    session.detach = async () => {
+      detached++;
+    };
+    page.context = () => ({ newCDPSession: async () => session });
+    const result = await captureConnectExchange(
+      page,
+      options(
+        async () => {
+          sends++;
+          session.emit("Network.responseReceived", {
+            requestId: "partial",
+            response: { url: endpoint },
+          });
+          page.emit(
+            "response",
+            response({
+              request: () => ({
+                method: () => "POST",
+                postData: () => (matched ? "question-1" : "unmatched"),
+              }),
+            }),
+          );
+          // Data arrives before streamResourceContent resolves: prefix comes first.
+          session.emit("Network.dataReceived", {
+            requestId: "partial",
+            data: prefix.subarray(3).toString("base64"),
+          });
+        },
+        {
+          timeoutMs: 25,
+          onPartialCapture: async (capture) => {
+            checkpoints++;
+            assert.deepEqual(capture.messages, [{ text: "unfinished answer" }]);
+            assert.equal(capture.connect_json_terminal, false);
+            assert.equal(capture.capture_status.transport, "partial");
+            assert.equal(capture.capture_status.termination, "timeout");
+          },
+        },
+      ),
+    );
+    assert.equal(result, null);
+    assert.equal(checkpoints, matched ? 1 : 0);
+    assert.equal(sends, 1);
+    assert.equal(detached, 1);
+  }
+});
+
+test("valid terminal completes without waiting for network loadingFinished", async () => {
+  const page = new EventEmitter();
+  const session = new EventEmitter();
+  session.send = async (method) =>
+    method === "Network.enable"
+      ? {}
+      : { bufferedData: body.toString("base64") };
+  session.detach = async () => {};
+  page.context = () => ({ newCDPSession: async () => session });
+  const result = await captureConnectExchange(
+    page,
+    options(
+      async () => {
+        session.emit("Network.responseReceived", {
+          requestId: "terminal",
+          response: { url: endpoint },
+        });
+        page.emit("response", response());
+      },
+      { onPartialCapture: () => assert.fail("complete stream is not partial") },
+    ),
+  );
+  assert.equal(result?.connect_json_terminal, true);
+  assert.equal(result.messages.length, 1);
+});
+
+test("ambiguous raw requests cannot checkpoint a partial prefix", async () => {
+  const page = new EventEmitter();
+  const session = new EventEmitter();
+  session.send = async (method) =>
+    method === "Network.enable"
+      ? {}
+      : { bufferedData: frame(0, { text: "partial" }).toString("base64") };
+  session.detach = async () => {};
+  page.context = () => ({ newCDPSession: async () => session });
+  const result = await captureConnectExchange(
+    page,
+    options(
+      async () => {
+        session.emit("Network.responseReceived", {
+          requestId: "first",
+          response: { url: endpoint },
+        });
+        await Promise.resolve();
+        session.emit("Network.responseReceived", {
+          requestId: "second",
+          response: { url: endpoint },
+        });
+        page.emit("response", response());
+      },
+      {
+        onPartialCapture: () =>
+          assert.fail("ambiguous source must not persist"),
+      },
+    ),
+  );
+  assert.equal(result, null);
+});
+
 test("status, content type, incomplete streams and server errors cannot complete", async () => {
   for (const override of [
     { status: () => 401 },

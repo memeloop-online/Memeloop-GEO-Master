@@ -98,6 +98,15 @@ export function createConnectJsonDecoder({
   }
 
   return {
+    get terminal() {
+      return !!end && !headerUsed && !payload && !closed;
+    },
+    snapshot() {
+      return {
+        messages: structuredClone(messages),
+        connect_json_terminal: !!end && !headerUsed && !payload && !closed,
+      };
+    },
     push(chunk) {
       if (closed) fail("decoder is closed");
       if (!(chunk instanceof Uint8Array)) fail("expected Uint8Array");
