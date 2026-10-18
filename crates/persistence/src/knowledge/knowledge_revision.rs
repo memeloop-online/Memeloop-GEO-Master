@@ -21,12 +21,14 @@ pub(super) async fn content(
     let project = PgKnowledgeRepository::project_id(scope)?;
     let mut tx = repo.transaction(scope).await?;
     let row = sqlx::query(
-        "SELECT version.representation,version.content_sha256,version.object_id,
+        "SELECT version.representation,version.content_sha256,version.object_id,version.original_url,
                 version.object_version,body.media_type AS authored_media_type,body.body,
                 object.detected_media_type,object.sha256 AS object_sha256,
                 object.actual_size,object.object_version AS actual_object_version,
-                blob.content AS object_bytes,blob.sha256 AS blob_sha256,
-                blob.actual_size AS blob_size
+                COALESCE(snapshot.content,blob.content) AS object_bytes,
+                COALESCE(snapshot.sha256,blob.sha256) AS blob_sha256,
+                COALESCE(snapshot.actual_size,blob.actual_size) AS blob_size,
+                snapshot.object_version AS snapshot_object_version
          FROM knowledge_source_versions version
          LEFT JOIN knowledge_authored_text body ON body.source_version_id=version.source_version_id
            AND body.operator_id=version.operator_id AND body.tenant_id=version.tenant_id
@@ -38,6 +40,9 @@ pub(super) async fn content(
            AND session.operator_id=object.operator_id AND session.tenant_id=object.tenant_id
            AND session.project_id=object.project_id AND session.state='committed'
          LEFT JOIN knowledge_upload_blobs blob ON blob.upload_session_id=session.upload_session_id
+         LEFT JOIN knowledge_url_snapshot_bytes snapshot ON snapshot.object_id=object.object_id
+           AND snapshot.operator_id=object.operator_id AND snapshot.tenant_id=object.tenant_id
+           AND snapshot.project_id=object.project_id
          WHERE version.source_version_id=$1 AND version.source_id=$2
            AND version.operator_id=$3 AND version.tenant_id=$4 AND version.project_id=$5",
     )
@@ -66,6 +71,24 @@ pub(super) async fn content(
     }
     if representation != "original" {
         return Err(AppError::conflict("unknown source representation"));
+    }
+    if row.get::<Option<String>, _>("original_url").is_some() {
+        let bytes = row
+            .get::<Option<Vec<u8>>, _>("object_bytes")
+            .ok_or_else(|| AppError::conflict("URL snapshot integrity check failed"))?;
+        let hash = sha256_hex(&bytes);
+        if row.get::<Option<i64>, _>("object_version")
+            != row.get::<Option<i64>, _>("actual_object_version")
+            || row.get::<Option<i64>, _>("object_version")
+                != row.get::<Option<i64>, _>("snapshot_object_version")
+            || Some(bytes.len() as i64) != row.get::<Option<i64>, _>("actual_size")
+            || Some(bytes.len() as i64) != row.get::<Option<i64>, _>("blob_size")
+            || Some(hash.as_str()) != row.get::<Option<String>, _>("blob_sha256").as_deref()
+            || Some(hash.as_str()) != row.get::<Option<String>, _>("object_sha256").as_deref()
+            || hash != row.get::<String, _>("content_sha256")
+        {
+            return Err(AppError::conflict("URL snapshot integrity check failed"));
+        }
     }
     if let Some(media_type) = row.get::<Option<String>, _>("detected_media_type")
         && matches!(media_type.as_str(), "text/plain" | "text/markdown")

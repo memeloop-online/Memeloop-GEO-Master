@@ -270,7 +270,10 @@ impl AppState {
     pub fn development_with_password(password: &str) -> Self {
         Self::development_with_knowledge_repository(
             password,
-            Arc::new(MemoryKnowledgeRepository::default()),
+            Arc::new(
+                MemoryKnowledgeRepository::default()
+                    .with_url_fetcher(Arc::new(knowledge::url_import::PublicUrlPageFetcher)),
+            ),
         )
     }
 
@@ -364,11 +367,14 @@ impl AppState {
     ) -> Self {
         Self::development_with_knowledge_repository(
             password,
-            Arc::new(MemoryKnowledgeRepository::with_parser_profiles(
-                pdf_profile,
-                office_profile.clone(),
-                office_profile,
-            )),
+            Arc::new(
+                MemoryKnowledgeRepository::with_parser_profiles(
+                    pdf_profile,
+                    office_profile.clone(),
+                    office_profile,
+                )
+                .with_url_fetcher(Arc::new(knowledge::url_import::PublicUrlPageFetcher)),
+            ),
         )
     }
 
@@ -419,7 +425,10 @@ impl AppState {
             idempotency_store,
             auth_repository,
             project_repository,
-            Arc::new(MemoryKnowledgeRepository::default()),
+            Arc::new(
+                MemoryKnowledgeRepository::default()
+                    .with_url_fetcher(Arc::new(knowledge::url_import::PublicUrlPageFetcher)),
+            ),
             events,
             durable_storage,
         )
@@ -532,7 +541,10 @@ impl AppState {
             Arc::new(PgIdempotencyStore::from_database(database)),
             Arc::new(PgAuthRepository::from_database(database)),
             Arc::new(PgProjectRepository::from_database(database)),
-            Arc::new(PgKnowledgeRepository::from_database(database)),
+            Arc::new(
+                PgKnowledgeRepository::from_database(database)
+                    .with_url_fetcher(Arc::new(knowledge::url_import::PublicUrlPageFetcher)),
+            ),
             EventBus::default(),
             true,
         )
@@ -585,7 +597,8 @@ impl AppState {
         office_profile: Option<String>,
     ) -> Self {
         let mut state = Self::from_database(database);
-        let mut repository = PgKnowledgeRepository::from_database(database);
+        let mut repository = PgKnowledgeRepository::from_database(database)
+            .with_url_fetcher(Arc::new(knowledge::url_import::PublicUrlPageFetcher));
         if let Some(profile) = pdf_profile {
             repository = repository.with_pdf_parser_profile(profile);
         }

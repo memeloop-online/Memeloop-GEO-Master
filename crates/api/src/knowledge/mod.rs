@@ -1,5 +1,6 @@
 pub(crate) mod office_parse;
 pub(crate) mod pdf_parse;
+pub(crate) mod url_import;
 
 use axum::{
     Json, Router,
