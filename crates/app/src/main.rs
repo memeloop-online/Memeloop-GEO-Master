@@ -237,7 +237,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         agent_dispatch::spawn(state.clone(), scanner);
     }
     if let Some((scanner, cycles)) = content_scanner {
-        content_dispatch::spawn(state.clone(), scanner, cycles);
+        content_dispatch::spawn(
+            state.clone(),
+            scanner,
+            cycles,
+            config
+                .scoped_test_ai
+                .as_ref()
+                .map(|ai| ai.scope.clone())
+                .or_else(|| config.persistent_dev_ai_scope.clone()),
+        );
     }
     dispatch::spawn(state.clone());
     browser_operation_dispatch::spawn(state.clone());
