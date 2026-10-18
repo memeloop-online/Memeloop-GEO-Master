@@ -108,6 +108,18 @@ function isChallenge(page) {
   );
 }
 
+export function stampTerminalObservation(outcome, observedAt) {
+  // This is the time the live attempt settled as unknown, not proof that a
+  // source was captured or the operation succeeded. Never replace source time.
+  if (
+    outcome.provenance !== "live" ||
+    outcome.status !== "unknown" ||
+    outcome.occurred_at !== undefined
+  )
+    return outcome;
+  return { ...outcome, occurred_at: new Date(observedAt).toISOString() };
+}
+
 export function createRunner(options = {}) {
   const {
     browserType = chromium,
@@ -988,7 +1000,7 @@ export function createRunner(options = {}) {
         record.lastTouched = clock();
         entry.settledAt = clock();
       }
-    })();
+    })().then((outcome) => stampTerminalObservation(outcome, clock()));
     entry.promise = promise;
     executions.set(input.execution_id, entry);
     return promise;

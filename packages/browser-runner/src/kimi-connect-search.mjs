@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { captureConnectExchange } from "./connect-browser-capture.mjs";
 import {
   interpretObservation,
+  persistObservationSource,
   observationAbortCode,
   reportObservationDiagnostic,
 } from "./ai-observation-parser.mjs";
@@ -538,6 +539,34 @@ export async function observeKimiConnectSearch(
       timeoutMs,
       signal,
       maxMessages: 32_768,
+      onDiagnostic: (entry) =>
+        reportObservationDiagnostic(onDiagnostic, entry.stage, entry.code),
+      onPartialCapture: async (prefix) => {
+        // Creation identity is independent of answer completion. Stage only
+        // the existing transport-backed identity; the source callback below
+        // commits ownership and evidence together without cleanup permission.
+        await reportCapturedConversation(
+          prefix,
+          "measurement",
+          onConversationCaptured,
+          { provider: "kimi" },
+        );
+        let renderedText;
+        try {
+          const rendered = page.locator(
+            ".chat-content-item-assistant .markdown-container:not(.toolcall-content-text) > .markdown",
+          );
+          if ((await rendered.count()) > 0)
+            renderedText = await rendered.last().innerText({ timeout: 1_000 });
+        } catch {
+          // The correlated transport prefix remains evidence without DOM text.
+        }
+        await persistObservationSource(prefix, {
+          provider: "kimi",
+          renderedText,
+          onEvidence,
+        });
+      },
       matchRequest(candidate) {
         const body = requestBody(candidate, payload.question, payload.model);
         if (!body) return false;
