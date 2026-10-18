@@ -12,6 +12,7 @@ import {
   Link,
   MemoryRouter,
   useLocation,
+  useNavigate,
   useSearchParams,
 } from "react-router-dom";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -110,11 +111,16 @@ const plan = {
 };
 function UrlState() {
   const location = useLocation();
+  const navigate = useNavigate();
   return (
     <>
       <output data-testid="measurement-url">{location.search}</output>
       <Link to="?tab=records&record=measurement-2">Open another record</Link>
       <Link to="?tab=records">Clear selection</Link>
+      <Link to="?tab=records&set=set-2&version=version-2&rankReport=report-2">
+        Open another saved report
+      </Link>
+      <button onClick={() => navigate(-1)}>Back to previous selection</button>
     </>
   );
 }
@@ -260,7 +266,7 @@ describe("standalone arbitrary-topic measurement", () => {
     expect(state.refetch).toHaveBeenCalledOnce();
   });
 
-  it.each([undefined, "older-version"])(
+  it.each([undefined, "older-version", "discover"])(
     "opens scoped report history without matching measurements on this page (requested version: %s)",
     async (requestedVersion) => {
       vi.mocked(listAllQuestionSets).mockResolvedValue({
@@ -281,7 +287,27 @@ describe("standalone arbitrary-topic measurement", () => {
         items: [plan],
         next_after: "older-page",
       });
-      const selectedVersion = requestedVersion ?? "current-version";
+      const discover = requestedVersion === "discover";
+      const selectedVersion = discover
+        ? "older-version"
+        : (requestedVersion ?? "current-version");
+      if (discover) {
+        vi.mocked(listAllQuestionSetVersions).mockResolvedValue({
+          items: [2, 1].map((revision) => ({
+            id: revision === 2 ? "current-version" : "older-version",
+            question_set_id: "set-1",
+            revision,
+            parent_version_id: revision === 2 ? "older-version" : null,
+            name: "灯具问题",
+            question_count: 1,
+            optimization_count: 1,
+            evaluation_count: 0,
+            split_policy_version: "v1",
+            created_at: "2026-09-01T00:00:00Z",
+          })),
+          next_cursor: null,
+        });
+      }
       const snapshot = {
         kind: "measurement_period" as const,
         project_id: "project-1",
@@ -318,16 +344,37 @@ describe("standalone arbitrary-topic measurement", () => {
         false,
         true,
         false,
-        `/?tab=records&set=set-1${requestedVersion ? `&version=${requestedVersion}` : ""}`,
+        discover
+          ? "/?tab=records"
+          : `/?tab=records&set=set-1${requestedVersion ? `&version=${requestedVersion}` : ""}`,
       );
       const folder = (
         await screen.findByText("灯具问题 · 本页 0 条记录")
       ).closest("details")!;
+      if (discover) {
+        expect(listAllQuestionSetVersions).not.toHaveBeenCalled();
+        await userEvent.click(
+          within(folder).getByText("灯具问题 · 本页 0 条记录"),
+        );
+        await within(folder).findByText("历史版本 v1");
+        expect(listAllQuestionSetVersions).toHaveBeenCalledWith(
+          "tenant-1",
+          "project-1",
+          "set-1",
+        );
+        expect(listMeasurementPlans).toHaveBeenCalledOnce();
+      }
       expect(
         within(folder).queryByRole("button", { name: /自定义问题测量/ }),
       ).not.toBeInTheDocument();
       const versionFolder = within(folder)
-        .getByText(requestedVersion ? "历史版本 older-version" : "当前版本 v2")
+        .getByText(
+          discover
+            ? "历史版本 v1"
+            : requestedVersion
+              ? "历史版本 older-version"
+              : "当前版本 v2",
+        )
         .closest("details")!;
       await userEvent.click(
         within(versionFolder).getByRole("button", { name: "排名变化" }),
@@ -423,6 +470,7 @@ describe("standalone arbitrary-topic measurement", () => {
         "report-1",
       );
       expect(getMeasurementReportPreview).not.toHaveBeenCalled();
+      expect(listAllQuestionSetVersions).not.toHaveBeenCalled();
       expect(screen.getByTestId("measurement-url")).toHaveTextContent(
         "record=measurement-1",
       );
@@ -439,6 +487,40 @@ describe("standalone arbitrary-topic measurement", () => {
         expect(
           screen.getByRole("button", { name: "测量历史" }),
         ).toHaveAttribute("aria-expanded", "false");
+      } else {
+        const folder = screen
+          .getByText("历史版本 version-1")
+          .closest("details")!
+          .parentElement!.closest("details")!;
+        const summary = folder.querySelector("summary")!;
+        await userEvent.click(summary);
+        expect(folder).not.toHaveAttribute("open");
+        await userEvent.click(
+          screen.getByRole("link", { name: "Open another saved report" }),
+        );
+        await userEvent.click(
+          screen.getByRole("button", { name: "Back to previous selection" }),
+        );
+        await waitFor(() =>
+          expect(
+            screen
+              .getByText("历史版本 version-1")
+              .closest("details")!
+              .parentElement!.closest("details"),
+          ).toHaveAttribute("open"),
+        );
+        expect(await screen.findByText("报告版本 1")).toBeVisible();
+        await userEvent.click(
+          screen.getByRole("button", { name: "返回测量结果预览" }),
+        );
+        await userEvent.click(screen.getByRole("button", { name: "测量历史" }));
+        await waitFor(() =>
+          expect(listAllQuestionSetVersions).toHaveBeenCalledWith(
+            "tenant-1",
+            "project-1",
+            "set-1",
+          ),
+        );
       }
     },
   );
