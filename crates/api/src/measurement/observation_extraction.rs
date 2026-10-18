@@ -15,7 +15,7 @@ use geo_worker::ModelCompletionRequest;
 use tokio::{sync::Notify, task::JoinSet};
 use uuid::Uuid;
 
-use crate::{ObservationAnalysisService, ProjectConfiguredModelBridge};
+use crate::{ObservationAnalysisService, ProjectConfiguredModelBridge, SavedObservationGrounder};
 
 pub const EXTRACTION_POLICY_VERSION: &str = "geo.observation.automatic.v1";
 const WORKERS: usize = 4;
@@ -91,6 +91,7 @@ pub struct ObservationExtractionService {
     repository: Arc<dyn ObservationExtractionRepository>,
     captures: Arc<dyn ObservationCaptureRepository>,
     model: Arc<ProjectConfiguredModelBridge>,
+    grounder: Arc<dyn SavedObservationGrounder>,
     continuation: Option<Arc<dyn ObservationExtractionContinuation>>,
     wake: Arc<Notify>,
 }
@@ -104,11 +105,13 @@ impl ObservationExtractionService {
         repository: Arc<dyn ObservationExtractionRepository>,
         captures: Arc<dyn ObservationCaptureRepository>,
         model: impl Into<Arc<ProjectConfiguredModelBridge>>,
+        grounder: Arc<dyn SavedObservationGrounder>,
     ) -> Self {
         Self {
             repository,
             captures,
             model: model.into(),
+            grounder,
             continuation: None,
             wake: Arc::new(Notify::new()),
         }
@@ -231,11 +234,28 @@ impl ObservationExtractionService {
                     claim.intent.request.validate_source(scope, &capture)?;
                     capture.source_json
                 };
-                let prompt = crate::observation_ai_callback::extraction_prompt_versioned(
-                    &source_json,
-                    &claim.intent.request.prompt_version,
-                )
-                .map_err(|_| AppError::invalid_request("invalid extraction source"))?;
+                failure = crate::observation_analysis::failed("analysis_prompt_unavailable");
+                let request = &claim.intent.request;
+                let prepared = self
+                    .grounder
+                    .prepare(
+                        &source_json,
+                        &request.source_sha256,
+                        &request.prompt_version,
+                        &request.parser_version,
+                    )
+                    .await?;
+                if prepared.source_sha256 != request.source_sha256
+                    || prepared.prompt_version != request.prompt_version
+                    || prepared.parser_version != request.parser_version
+                    || prepared.prompt.is_empty()
+                    || prepared.prompt.len() > 1_500_000
+                    || prepared.prompt.contains('\0')
+                {
+                    return Err(AppError::invalid_request(
+                        "invalid prepared extraction prompt",
+                    ));
+                }
                 inference_resolved = false;
                 let (completion, revision) = self
                     .model
@@ -243,7 +263,7 @@ impl ObservationExtractionService {
                         scope,
                         ProjectAiUsage::ObservationAnalysis,
                         &ModelCompletionRequest {
-                            prompt,
+                            prompt: prepared.prompt,
                             system: None,
                             model: None,
                             max_output_tokens: Some(24_000),
@@ -538,6 +558,64 @@ mod tests {
     use geo_worker::{HostOpError, ModelCompletion};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    const PREPARED_PROMPT: &str = "synthetic prepared observation prompt\r\n";
+
+    #[derive(Default)]
+    struct Preparation {
+        invalid: Option<&'static str>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SavedObservationGrounder for Preparation {
+        async fn prepare(
+            &self,
+            source: &str,
+            digest: &str,
+            prompt_version: &str,
+            parser_version: &str,
+        ) -> Result<crate::PreparedObservationPrompt, AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(geo_domain::sha256_hex(source.as_bytes()), digest);
+            assert_eq!(source, r#"{"messages":[{"text":"synthetic answer"}]}"#);
+            assert_eq!(prompt_version, "geo.observation.extract.v4");
+            assert_eq!(parser_version, "geo.observation.extract.v6");
+            if self.invalid == Some("unavailable") {
+                return Err(AppError::capability_missing(
+                    "synthetic preparation unavailable",
+                ));
+            }
+            let mut prepared = crate::PreparedObservationPrompt {
+                prompt: PREPARED_PROMPT.into(),
+                source_sha256: digest.into(),
+                prompt_version: prompt_version.into(),
+                parser_version: parser_version.into(),
+            };
+            match self.invalid {
+                Some("digest") => prepared.source_sha256 = "0".repeat(64),
+                Some("prompt_version") => prepared.prompt_version = "unexpected".into(),
+                Some("parser_version") => prepared.parser_version = "unexpected".into(),
+                Some("empty") => prepared.prompt.clear(),
+                Some("nul") => prepared.prompt.push('\0'),
+                Some("oversized") => prepared.prompt = "x".repeat(1_500_001),
+                _ => {}
+            }
+            Ok(prepared)
+        }
+
+        async fn ground(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: serde_json::Value,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::GroundingResult, AppError> {
+            unreachable!("extraction only checkpoints inference")
+        }
+    }
+
     struct LostCheckpointAck {
         inner: Arc<MemoryObservationExtractionRepository>,
         lose_next_ack: AtomicBool,
@@ -726,8 +804,9 @@ mod tests {
         async fn complete(
             &self,
             _: &TenantScope,
-            _: &ModelCompletionRequest,
+            request: &ModelCompletionRequest,
         ) -> Result<ModelCompletion, HostOpError> {
+            assert_eq!(request.prompt, PREPARED_PROMPT);
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
             self.release.notified().await;
@@ -803,8 +882,12 @@ mod tests {
             Some(model.clone()),
         )
         .unwrap();
-        let service =
-            ObservationExtractionService::new(repository.clone(), captures.clone(), bridge);
+        let service = ObservationExtractionService::new(
+            repository.clone(),
+            captures.clone(),
+            bridge,
+            Arc::new(Preparation::default()),
+        );
         (scope, captures, repository, model, service)
     }
     async fn enqueue(
@@ -826,6 +909,47 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preparation_failure_or_mismatched_binding_never_calls_model() {
+        for invalid in [
+            "unavailable",
+            "digest",
+            "prompt_version",
+            "parser_version",
+            "empty",
+            "nul",
+            "oversized",
+        ] {
+            let (scope, captures, repository, model, mut service) = fixture();
+            let preparation = Arc::new(Preparation {
+                invalid: Some(invalid),
+                calls: AtomicUsize::new(0),
+            });
+            service.grounder = preparation.clone();
+            let intent = enqueue(&service, &scope, &captures).await;
+            assert!(
+                service.dispatch(&scope, intent.intent_id).await.is_err(),
+                "{invalid}"
+            );
+            assert_eq!(preparation.calls.load(Ordering::SeqCst), 1, "{invalid}");
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0, "{invalid}");
+            let stored = repository
+                .get(&scope, intent.intent_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.state,
+                ObservationExtractionState::Interrupted,
+                "{invalid}"
+            );
+            assert!(stored.response.is_none());
+            service.dispatch(&scope, intent.intent_id).await.unwrap();
+            assert_eq!(preparation.calls.load(Ordering::SeqCst), 1, "{invalid}");
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0, "{invalid}");
+        }
     }
 
     #[tokio::test]

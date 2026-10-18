@@ -42,11 +42,18 @@ pub fn configure_callbacks(
         std::sync::Arc::new(
             geo_persistence::PgObservationExtractionRepository::from_database(database),
         );
-    let state = match (
+    let grounder: Option<std::sync::Arc<dyn geo_api::SavedObservationGrounder>> = match (
         env::var("GEO_BROWSER_RUNNER_URL").ok(),
         env::var("GEO_BROWSER_RUNNER_TOKEN").ok(),
     ) {
-        (Some(url), Some(token)) => {
+        (Some(url), Some(token)) => Some(std::sync::Arc::new(
+            geo_api::HttpSavedObservationGrounder::new(&url, &token)?,
+        )),
+        (None, None) => None,
+        _ => return Err("browser runner URL and token must be configured together".into()),
+    };
+    let state = match &grounder {
+        Some(grounder) => {
             let settings = state.project_ai_settings();
             let inherited =
                 settings.inherited_provider(geo_domain::ProjectAiUsage::ObservationAnalysis);
@@ -59,13 +66,12 @@ pub fn configure_callbacks(
                     geo_persistence::PgObservationCaptureRepository::from_database(database),
                 ),
                 geo_api::ProjectConfiguredModelBridge::new(settings, inherited)?,
-                std::sync::Arc::new(geo_api::HttpSavedObservationGrounder::new(&url, &token)?),
+                grounder.clone(),
             )
             .with_extraction_repository(extraction_repository.clone());
             state.with_observation_analysis(analysis)
         }
-        (None, None) => state,
-        _ => return Err("browser runner URL and token must be configured together".into()),
+        None => state,
     };
     let token = env::var("GEO_BROWSER_RUNNER_CALLBACK_TOKEN").ok();
     let key = env::var("GEO_CHANNEL_SECRET_KEY").ok();
@@ -75,6 +81,7 @@ pub fn configure_callbacks(
         token.as_deref(),
         key.as_deref(),
         extraction_repository,
+        grounder,
     )
 }
 
@@ -84,27 +91,40 @@ fn callbacks_with_credentials(
     token: Option<&str>,
     key: Option<&str>,
     extraction_repository: std::sync::Arc<dyn geo_domain::ObservationExtractionRepository>,
+    grounder: Option<std::sync::Arc<dyn geo_api::SavedObservationGrounder>>,
 ) -> Result<AppState, Box<dyn Error>> {
     let settings = state.project_ai_settings();
     let inherited = settings.inherited_provider(geo_domain::ProjectAiUsage::ObservationAnalysis);
-    let mut extraction = geo_api::ObservationExtractionService::new(
-        extraction_repository,
-        std::sync::Arc::new(
-            geo_persistence::PgObservationCaptureRepository::from_database(database),
-        ),
-        geo_api::ProjectConfiguredModelBridge::new(settings.clone(), inherited)?,
-    );
-    let state = if let Some(analysis) = state.observation_analysis_service().cloned() {
-        let analysis = analysis.with_extraction_dispatcher(&extraction);
-        extraction = extraction.with_continuation(std::sync::Arc::new(analysis.clone()));
-        state.with_observation_analysis(analysis)
+    let extraction = if let Some(grounder) = grounder {
+        Some(geo_api::ObservationExtractionService::new(
+            extraction_repository,
+            std::sync::Arc::new(
+                geo_persistence::PgObservationCaptureRepository::from_database(database),
+            ),
+            geo_api::ProjectConfiguredModelBridge::new(settings.clone(), inherited)?,
+            grounder,
+        ))
     } else {
-        state
+        None
     };
-    let _extraction_dispatcher =
-        geo_api::spawn_observation_extraction_dispatcher(extraction.clone());
-    if let Some(analysis) = state.observation_analysis_service() {
-        geo_api::spawn_observation_source_recovery(extraction.clone(), analysis.clone());
+    let (state, extraction) = if let (Some(analysis), Some(extraction)) = (
+        state.observation_analysis_service().cloned(),
+        extraction.as_ref(),
+    ) {
+        let analysis = analysis.with_extraction_dispatcher(extraction);
+        let extraction = extraction
+            .clone()
+            .with_continuation(std::sync::Arc::new(analysis.clone()));
+        (state.with_observation_analysis(analysis), Some(extraction))
+    } else {
+        (state, extraction)
+    };
+    if let Some(extraction) = &extraction {
+        let _extraction_dispatcher =
+            geo_api::spawn_observation_extraction_dispatcher(extraction.clone());
+        if let Some(analysis) = state.observation_analysis_service() {
+            geo_api::spawn_observation_source_recovery(extraction.clone(), analysis.clone());
+        }
     }
     let Some(token) = token else {
         return Ok(state);
@@ -118,8 +138,15 @@ fn callbacks_with_credentials(
         cipher.clone(),
         token,
     )?;
-    let observation_ai =
-        geo_api::ObservationAiCallbackService::new(captures.clone(), settings.clone(), extraction);
+    let state = if let Some(extraction) = extraction {
+        state.with_observation_ai_callback(geo_api::ObservationAiCallbackService::new(
+            captures.clone(),
+            settings,
+            extraction,
+        ))
+    } else {
+        state
+    };
     let publication = geo_api::PublicationSendCallbackService::new(
         std::sync::Arc::new(
             geo_persistence::PgPublicationSendAuthorizationRepository::from_database(database),
@@ -135,7 +162,6 @@ fn callbacks_with_credentials(
         token,
     )?;
     Ok(state
-        .with_observation_ai_callback(observation_ai)
         .with_observation_capture_callback(captures)
         .with_publication_send_callback(publication)
         .with_provider_cleanup_callback(cleanup))

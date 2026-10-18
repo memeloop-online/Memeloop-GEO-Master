@@ -74,8 +74,25 @@ pub struct GroundingResult {
     pub outcome: ObservationAnalysisOutcome,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedObservationPrompt {
+    pub prompt: String,
+    pub source_sha256: String,
+    pub prompt_version: String,
+    pub parser_version: String,
+}
+
 #[async_trait::async_trait]
 pub trait SavedObservationGrounder: Send + Sync {
+    async fn prepare(
+        &self,
+        source: &str,
+        digest: &str,
+        prompt_version: &str,
+        parser_version: &str,
+    ) -> Result<PreparedObservationPrompt, AppError>;
+
     async fn ground(
         &self,
         source: &str,
@@ -87,12 +104,12 @@ pub trait SavedObservationGrounder: Send + Sync {
     ) -> Result<GroundingResult, AppError>;
 }
 
-/// A service-only call to the existing deterministic JS grounding validator.
+/// Service-only prompt preparation and validation through the existing JS adapter.
 /// No browser session, credentials or model configuration enter this request.
 #[derive(Clone)]
 pub struct HttpSavedObservationGrounder {
     client: reqwest::Client,
-    endpoint: String,
+    base_url: String,
     token: String,
 }
 
@@ -119,10 +136,7 @@ impl HttpSavedObservationGrounder {
             .map_err(|_| AppError::capability_missing("grounding service unavailable"))?;
         Ok(Self {
             client,
-            endpoint: format!(
-                "{}/v1/observation-analyses/ground",
-                base_url.trim_end_matches('/')
-            ),
+            base_url: base_url.trim_end_matches('/').into(),
             token: token.into(),
         })
     }
@@ -130,6 +144,38 @@ impl HttpSavedObservationGrounder {
 
 #[async_trait::async_trait]
 impl SavedObservationGrounder for HttpSavedObservationGrounder {
+    async fn prepare(
+        &self,
+        source: &str,
+        digest: &str,
+        prompt_version: &str,
+        parser_version: &str,
+    ) -> Result<PreparedObservationPrompt, AppError> {
+        let unavailable =
+            || AppError::capability_missing("saved observation prompt preparation unavailable");
+        let mut response = self
+            .client
+            .post(format!("{}/v1/observation-analyses/prepare", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&json!({"source_json":source,"source_sha256":digest,
+                "prompt_version":prompt_version,"parser_version":parser_version}))
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        if response.status() != StatusCode::OK {
+            return Err(unavailable());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+            // JSON escaping can expand the bounded UTF-8 prompt sixfold.
+            if bytes.len() + chunk.len() > 9_010_000 {
+                return Err(unavailable());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| unavailable())
+    }
+
     async fn ground(
         &self,
         source: &str,
@@ -141,7 +187,7 @@ impl SavedObservationGrounder for HttpSavedObservationGrounder {
     ) -> Result<GroundingResult, AppError> {
         let unavailable =
             || AppError::capability_missing("saved observation grounding unavailable");
-        let mut response = self.client.post(&self.endpoint).bearer_auth(&self.token)
+        let mut response = self.client.post(format!("{}/v1/observation-analyses/ground", self.base_url)).bearer_auth(&self.token)
             .json(&json!({"source_json":source,"source_sha256":digest,"candidate_json":candidate,"protocol":protocol,
                 "prompt_version":prompt_version,"parser_version":parser_version}))
             .send().await.map_err(|_| unavailable())?;
@@ -674,6 +720,7 @@ impl ObservationAnalysisService {
                                 repository.clone(),
                                 self.captures.clone(),
                                 self.model.clone(),
+                                self.grounder.clone(),
                             )
                             .with_continuation(Arc::new(self.clone()))
                             .dispatch(scope, intent.intent_id)
@@ -884,6 +931,91 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn http_preparation_uses_existing_authenticated_adapter_and_exact_source() {
+        let source = r#"{"messages":[{"text":"synthetic answer"}]}"#;
+        let digest = sha256_hex(source.as_bytes());
+        let expected = json!({
+            "source_json": source,
+            "source_sha256": digest,
+            "prompt_version": PROMPT_VERSION,
+            "parser_version": PARSER_VERSION,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/observation-analyses/prepare",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let expected = expected.clone();
+                    async move {
+                        assert_eq!(
+                            headers[axum::http::header::AUTHORIZATION],
+                            "Bearer synthetic-service-token"
+                        );
+                        assert_eq!(body, expected);
+                        Json(json!({
+                            "prompt": "synthetic prepared observation prompt\r\n",
+                            "source_sha256": body["source_sha256"],
+                            "prompt_version": body["prompt_version"],
+                            "parser_version": body["parser_version"],
+                        }))
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let grounder = HttpSavedObservationGrounder::new(
+            &format!("http://{address}/"),
+            "synthetic-service-token",
+        )
+        .unwrap();
+        let prepared = grounder
+            .prepare(source, &digest, PROMPT_VERSION, PARSER_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(prepared.prompt, "synthetic prepared observation prompt\r\n");
+        assert_eq!(prepared.source_sha256, digest);
+        assert_eq!(prepared.prompt_version, PROMPT_VERSION);
+        assert_eq!(prepared.parser_version, PARSER_VERSION);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_preparation_rejects_failure_and_unexpected_response_fields() {
+        for (status, body) in [
+            (StatusCode::BAD_REQUEST, json!({"error": "shape_rejected"})),
+            (
+                StatusCode::OK,
+                json!({"prompt":"synthetic", "source_sha256":"synthetic", "prompt_version":PROMPT_VERSION, "parser_version":PARSER_VERSION, "extra":true}),
+            ),
+            (StatusCode::OK, json!({"error":"unexpected response"})),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/v1/observation-analyses/prepare",
+                axum::routing::post(move || {
+                    let body = body.clone();
+                    async move { (status, Json(body)) }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let grounder = HttpSavedObservationGrounder::new(
+                &format!("http://{address}"),
+                "synthetic-service-token",
+            )
+            .unwrap();
+            assert!(
+                grounder
+                    .prepare("{}", &"0".repeat(64), PROMPT_VERSION, PARSER_VERSION)
+                    .await
+                    .is_err()
+            );
+            server.abort();
+        }
+    }
+
     struct Model(AtomicUsize);
     #[async_trait::async_trait]
     impl ModelProviderBridge for Model {
@@ -893,7 +1025,7 @@ mod tests {
             request: &ModelCompletionRequest,
         ) -> Result<ModelCompletion, HostOpError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            assert!(request.prompt.contains("/messages/0"));
+            assert_eq!(request.prompt, "synthetic prepared observation prompt\n");
             assert!(request.tools.is_empty());
             assert!(request.model.is_none());
             Ok(ModelCompletion {
@@ -914,6 +1046,18 @@ mod tests {
     struct InvalidAuditGrounder;
     #[async_trait::async_trait]
     impl SavedObservationGrounder for InvalidAuditGrounder {
+        async fn prepare(
+            &self,
+            source: &str,
+            digest: &str,
+            prompt_version: &str,
+            parser_version: &str,
+        ) -> Result<PreparedObservationPrompt, AppError> {
+            Grounder { unavailable: false }
+                .prepare(source, digest, prompt_version, parser_version)
+                .await
+        }
+
         async fn ground(
             &self,
             _: &str,
@@ -1114,6 +1258,26 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl SavedObservationGrounder for Grounder {
+        async fn prepare(
+            &self,
+            source: &str,
+            digest: &str,
+            prompt_version: &str,
+            parser_version: &str,
+        ) -> Result<PreparedObservationPrompt, AppError> {
+            assert_eq!(sha256_hex(source.as_bytes()), digest);
+            assert_eq!(
+                (prompt_version, parser_version),
+                (PROMPT_VERSION, PARSER_VERSION)
+            );
+            Ok(PreparedObservationPrompt {
+                prompt: "synthetic prepared observation prompt\n".into(),
+                source_sha256: digest.into(),
+                prompt_version: prompt_version.into(),
+                parser_version: parser_version.into(),
+            })
+        }
+
         async fn ground(
             &self,
             source: &str,
@@ -1468,6 +1632,7 @@ mod tests {
             repository.clone(),
             f.service.captures.clone(),
             f.service.model.clone(),
+            f.service.grounder.clone(),
         )
         .with_continuation(Arc::new(f.service.clone()));
         let mut scan = crate::observation_extraction::SourceAdmissionScan::new();
@@ -2179,6 +2344,7 @@ mod tests {
             repository.clone(),
             f.service.captures.clone(),
             f.service.model.clone(),
+            f.service.grounder.clone(),
         );
         let wake = dispatcher.wake_handle();
         f.service = f.service.with_extraction_dispatcher(&dispatcher);
@@ -2385,6 +2551,7 @@ mod tests {
             repository.clone(),
             f.service.captures.clone(),
             f.service.model.clone(),
+            f.service.grounder.clone(),
         )
         .with_continuation(Arc::new(f.service.clone()));
         let task = tokio::spawn({

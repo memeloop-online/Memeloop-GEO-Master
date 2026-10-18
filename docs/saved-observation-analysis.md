@@ -14,6 +14,17 @@
 - 仅使用当前 prompt `geo.observation.extract.v4`、parser `geo.observation.extract.v6`。旧 schema 分派、直接临时推理路径和旧数据兼容不再保留。
 - AI 负责理解原文与提取语义。执行器核对原文引用，不使用供应商内容规则或名称正则解析器。推荐对象契约见 [recommendation-measurement.md](recommendation-measurement.md)。
 
+### 提示准备
+
+当前来源的提示统一由执行器中的 MJS `extractionPrompt` 准备。Rust 通过既有鉴权客户端调用
+`POST /v1/observation-analyses/prepare`，请求为 `source_json`、`source_sha256`、
+`prompt_version`、`parser_version`；响应为 `prompt` 及相同摘要和版本。
+端点只处理保存的来源字节，不打开浏览器、不调用模型。原始消息索引、可见正文、
+采集状态和脱敏说明保留，模型凭据仍由 Rust 管理。准备失败不进入推理。
+
+提示准备和结果核对仅接受显式当前版本，未指定版本及旧格式均拒绝，不进行兼容分派。
+部署时先更新执行器端点，再更新依赖该端点的 API；先升级 API 会导致准备失败。
+
 ## 执行与恢复
 
 1. 自动受理复用同一来源的任务；手动受理在一个事务中创建分析版本和关联任务。

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  extractionPrompt,
   observationDocument,
   parseExtractionJson,
 } from "./ai-observation-parser.mjs";
@@ -13,8 +14,72 @@ const MAX_SOURCE_BYTES = 750_000;
 const MAX_CANDIDATE_BYTES = 150_000;
 const MAX_PROTOCOL_BYTES = 8192;
 const MAX_AUDIT_BYTES = 512_000;
+const MAX_PROMPT_BYTES = 1_500_000;
+const PROMPT_VERSION = "geo.observation.extract.v4";
+const PARSER_VERSION = "geo.observation.extract.v6";
 const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** Prepare the current extraction prompt from exact saved source bytes only. */
+export function prepareSavedObservation(input) {
+  const rejected = (error) => ({ error });
+  if (
+    !object(input) ||
+    Object.keys(input).length !== 4 ||
+    Object.keys(input).some(
+      (key) =>
+        ![
+          "source_json",
+          "source_sha256",
+          "prompt_version",
+          "parser_version",
+        ].includes(key),
+    ) ||
+    typeof input.source_json !== "string" ||
+    typeof input.source_sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(input.source_sha256)
+  )
+    return rejected("shape_rejected");
+  if (
+    input.prompt_version !== PROMPT_VERSION ||
+    input.parser_version !== PARSER_VERSION
+  )
+    return rejected("version_rejected");
+  if (Buffer.byteLength(input.source_json, "utf8") > MAX_SOURCE_BYTES)
+    return rejected("source_too_large");
+  if (
+    createHash("sha256").update(input.source_json, "utf8").digest("hex") !==
+    input.source_sha256
+  )
+    return rejected("source_digest_mismatch");
+  let document;
+  try {
+    document = JSON.parse(input.source_json);
+  } catch {
+    return rejected("source_invalid_json");
+  }
+  if (
+    !object(document) ||
+    !Array.isArray(document.messages) ||
+    (Object.hasOwn(document, "rendered_text") &&
+      typeof document.rendered_text !== "string")
+  )
+    return rejected("shape_rejected");
+  try {
+    // Keep saved message indices and capture/redaction metadata unchanged.
+    const prompt = extractionPrompt(document);
+    if (Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES)
+      return rejected("prompt_too_large");
+    return {
+      prompt,
+      source_sha256: input.source_sha256,
+      prompt_version: PROMPT_VERSION,
+      parser_version: PARSER_VERSION,
+    };
+  } catch {
+    return rejected("shape_rejected");
+  }
+}
 
 /**
  * Pure replay of a proposed extraction against exact persisted source bytes.
@@ -47,24 +112,10 @@ export function groundSavedObservation(input) {
     !/^[a-f0-9]{64}$/u.test(input.source_sha256)
   )
     return rejected("shape_rejected");
-  const promptVersion = input.prompt_version ?? "geo.observation.extract.v2";
-  const parserVersion = input.parser_version ?? "geo.observation.extract.v4";
-  const legacy =
-    promptVersion === "geo.observation.extract.v2" &&
-    parserVersion === "geo.observation.extract.v4";
-  const compact =
-    promptVersion === "geo.observation.extract.v3" &&
-    parserVersion === "geo.observation.extract.v5";
-  const recommendations =
-    promptVersion === "geo.observation.extract.v4" &&
-    parserVersion === "geo.observation.extract.v6";
+  const promptVersion = input.prompt_version;
   if (
-    (!legacy && !compact && !recommendations) ||
-    Object.hasOwn(input, "prompt_version") !==
-      Object.hasOwn(input, "parser_version") ||
-    (Object.hasOwn(input, "prompt_version") &&
-      (typeof input.prompt_version !== "string" ||
-        typeof input.parser_version !== "string"))
+    promptVersion !== PROMPT_VERSION ||
+    input.parser_version !== PARSER_VERSION
   )
     return rejected("version_rejected");
   if (Buffer.byteLength(input.source_json, "utf8") > MAX_SOURCE_BYTES)
@@ -106,15 +157,15 @@ export function groundSavedObservation(input) {
   try {
     const grounded = validateAiObservation(document, candidate, {
       semanticOnly: true,
-      allowRanges: compact || recommendations,
-      allowRecommendations: recommendations,
+      allowRanges: true,
+      allowRecommendations: true,
     });
     if (!grounded)
       return rejected(
         observationRejectionReason(document, candidate, {
           semanticOnly: true,
-          allowRanges: compact || recommendations,
-          allowRecommendations: recommendations,
+          allowRanges: true,
+          allowRecommendations: true,
         }),
       );
     const result = {
@@ -135,9 +186,8 @@ export function groundSavedObservation(input) {
     // Optional recommendations must not displace grounded answer provenance.
     // Retain the original proposal above; only the projected analysis is omitted.
     if (
-      recommendations &&
       Buffer.byteLength(JSON.stringify(result.outcome.audit), "utf8") >
-        MAX_AUDIT_BYTES
+      MAX_AUDIT_BYTES
     ) {
       result.outcome.audit.recommendations = {
         version: "geo.recommendations.v1",
