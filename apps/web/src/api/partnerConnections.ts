@@ -3,6 +3,7 @@ import { apiFetch } from "./client";
 export interface PartnerConnection {
   connection_id: string;
   knowledge_write: boolean;
+  content_export: boolean;
   created_at: string;
   revoked_at: string | null;
 }
@@ -73,6 +74,19 @@ function command<T>(
 }
 export function createPartnerConnection(tenantId: string, projectId: string) {
   return command<PartnerConnection>(tenantId, projectId, path(projectId));
+}
+export function setPartnerContentExport(
+  tenantId: string,
+  projectId: string,
+  connectionId: string,
+  enabled: boolean,
+) {
+  return command<PartnerConnection>(
+    tenantId,
+    projectId,
+    `${path(projectId, connectionId)}/permissions`,
+    { content_export: enabled },
+  );
 }
 export function issuePartnerKey(
   tenantId: string,

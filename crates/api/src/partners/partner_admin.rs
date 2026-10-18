@@ -32,6 +32,12 @@ struct IssueKey {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ContentExportPermission {
+    content_export: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PageQuery {
     // Browser selectors must agree with authenticated scope, never create it.
     tenant_id: Option<TenantId>,
@@ -178,6 +184,26 @@ async fn create_connection(
         .into_response())
 }
 
+async fn set_permissions(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(ctx): Extension<RequestContext>,
+    Path((project, connection)): Path<(ProjectId, Uuid)>,
+    input: Result<Json<ContentExportPermission>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let map = |error| safe_error(error, ctx);
+    let scope = scope(&state, &auth, project).await.map_err(map)?;
+    let input = body(input, ctx)?;
+    Ok(Json(
+        repository(&state)
+            .map_err(map)?
+            .set_content_export(&scope, connection, input.content_export)
+            .await
+            .map_err(map)?,
+    )
+    .into_response())
+}
+
 async fn list_keys(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -280,6 +306,10 @@ pub(crate) fn routes() -> Router<AppState> {
             get(list_connections).post(create_connection),
         )
         .route(
+            "/projects/{project_id}/partner-connections/{connection_id}/permissions",
+            post(set_permissions),
+        )
+        .route(
             "/projects/{project_id}/partner-connections/{connection_id}/keys",
             get(list_keys).post(issue_key),
         )
@@ -341,6 +371,7 @@ mod tests {
             PartnerAdminConnection {
                 connection_id: self.connection,
                 knowledge_write: true,
+                content_export: false,
                 created_at: self.key.created_at,
                 revoked_at: None,
             }
@@ -376,6 +407,18 @@ mod tests {
         ) -> Result<PartnerAdminConnection, AppError> {
             self.record(scope, "create".into())?;
             Ok(self.connection())
+        }
+        async fn set_content_export(
+            &self,
+            scope: &TenantScope,
+            connection: Uuid,
+            enabled: bool,
+        ) -> Result<PartnerAdminConnection, AppError> {
+            assert_eq!(connection, self.connection);
+            self.record(scope, format!("content-export:{enabled}"))?;
+            let mut connection = self.connection();
+            connection.content_export = enabled;
+            Ok(connection)
         }
         async fn list_keys(
             &self,
@@ -554,6 +597,50 @@ mod tests {
             let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
             (status, String::from_utf8(bytes.to_vec()).unwrap())
         }
+    }
+
+    #[tokio::test]
+    async fn export_permission_is_separate_and_requires_an_explicit_boolean() {
+        let f = Fixture::new(Role::CustomerAdmin).await;
+        let (status, value) = f.send(f.request("POST", &f.base, "{}")).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let value: Value = serde_json::from_str(&value).unwrap();
+        assert_eq!(value["content_export"], false);
+        assert_eq!(value["knowledge_write"], true);
+        let path = format!("{}/{}/permissions", f.base, f.fake.connection);
+        for enabled in [true, false] {
+            let payload = json!({"content_export": enabled}).to_string();
+            let (status, value) = f.send(f.request("POST", &path, &payload)).await;
+            assert_eq!(status, StatusCode::OK);
+            let value: Value = serde_json::from_str(&value).unwrap();
+            assert_eq!(value["content_export"], enabled);
+            assert_eq!(value["knowledge_write"], true);
+            assert!(value.get("bearer").is_none());
+        }
+        for payload in [
+            "{}",
+            "null",
+            r#"{"content_export":"true"}"#,
+            r#"{"content_export":true,"knowledge_write":true}"#,
+            r#"{"content_export":true,"content_export":false}"#,
+        ] {
+            assert_eq!(
+                f.send(f.request("POST", &path, payload)).await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut request = f.request("POST", &path, r#"{"content_export":true}"#);
+        request.headers_mut().remove(crate::CSRF_HEADER);
+        assert_eq!(f.send(request).await.0, StatusCode::FORBIDDEN);
+        let f = Fixture::new(Role::CustomerMember).await;
+        let path = format!("{}/{}/permissions", f.base, f.fake.connection);
+        assert_eq!(
+            f.send(f.request("POST", &path, r#"{"content_export":true}"#))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(f.fake.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

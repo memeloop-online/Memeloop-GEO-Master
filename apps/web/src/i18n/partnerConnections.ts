@@ -2,7 +2,11 @@ export const partnerConnectionsResources = {
   "zh-CN": {
     tab: "合作方连接",
     title: "合作方连接",
-    description: "允许合作方导入本项目的知识资料，不包含内容发布权限。",
+    description: "管理合作方的知识导入和内容导出权限，以及 API 密钥。",
+    allowExport: "允许内容导出",
+    exportHint: "允许此连接下载已保存的内容版本。导出不会发布文章。",
+    exportRevoked: "连接已撤销，无法继续导出内容。",
+    permissionFailed: "导出权限变更尚未确认，请重新读取后核对。",
     adminOnly: "管理合作方连接需要工作区管理员权限。",
     add: "添加连接",
     keys: "API 密钥",
@@ -41,7 +45,13 @@ export const partnerConnectionsResources = {
     tab: "Partner connections",
     title: "Partner connections",
     description:
-      "Allow partners to import knowledge into this project. Publishing is not included.",
+      "Manage partner access to knowledge imports, content exports, and API keys.",
+    allowExport: "Allow content export",
+    exportHint:
+      "Allow this connection to download saved content versions. Exporting does not publish articles.",
+    exportRevoked: "This connection is revoked and cannot export content.",
+    permissionFailed:
+      "The export permission change is not confirmed. Reload to check.",
     adminOnly:
       "A workspace administrator is required to manage partner connections.",
     add: "Add connection",

@@ -7,7 +7,10 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use crate::{AppError, ErrorCode, KnowledgePurpose, TenantScope};
+use crate::{
+    AppError, AuthorizedMediaSnapshot, ContentRevision, ErrorCode, KnowledgePurpose,
+    MediaObjectKey, TenantScope,
+};
 
 pub const PARTNER_SYNC_SCHEMA_VERSION: u16 = 1;
 pub const PARTNER_SYNC_MAX_ITEMS: usize = 100;
@@ -121,6 +124,15 @@ pub struct PartnerIssuedKey {
     pub secret: String,
 }
 
+/// Authorized immutable bytes captured before packaging; never serialize the
+/// internal revision, which includes source quotes and checking diagnostics.
+pub struct PartnerContentExport {
+    pub revision: ContentRevision,
+    pub language: Option<String>,
+    pub media_keys: Vec<MediaObjectKey>,
+    pub media: Vec<AuthorizedMediaSnapshot>,
+}
+
 impl PartnerIssuedKey {
     pub fn bearer(&self) -> String {
         format!("{}.{}", self.key_id, self.secret)
@@ -135,6 +147,13 @@ pub trait PartnerRepository: Send + Sync {
         key_id: Uuid,
         secret: &str,
     ) -> Result<PartnerPrincipal, AppError>;
+    async fn content_export(
+        &self,
+        _principal: &PartnerPrincipal,
+        _revision_id: Uuid,
+    ) -> Result<PartnerContentExport, AppError> {
+        Err(AppError::capability_missing("content export unavailable"))
+    }
     async fn accept(
         &self,
         principal: &PartnerPrincipal,

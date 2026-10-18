@@ -10,6 +10,7 @@ use crate::{AppError, TenantScope};
 pub struct PartnerAdminConnection {
     pub connection_id: Uuid,
     pub knowledge_write: bool,
+    pub content_export: bool,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
@@ -54,6 +55,12 @@ pub trait PartnerAdminRepository: Send + Sync {
     async fn create_connection(
         &self,
         scope: &TenantScope,
+    ) -> Result<PartnerAdminConnection, AppError>;
+    async fn set_content_export(
+        &self,
+        scope: &TenantScope,
+        connection: Uuid,
+        enabled: bool,
     ) -> Result<PartnerAdminConnection, AppError>;
     async fn list_keys(
         &self,

@@ -65,6 +65,7 @@ fn connection(row: &PgRow) -> PartnerAdminConnection {
     PartnerAdminConnection {
         connection_id: row.get("connection_id"),
         knowledge_write: row.get("knowledge_write"),
+        content_export: row.get("content_export"),
         created_at: row.get("created_at"),
         revoked_at: row.get("revoked_at"),
     }
@@ -95,7 +96,7 @@ impl PgPartnerAdminRepository {
         let mut tx = self.pool.begin().await.map_err(db)?;
         set_local_scope(&mut tx, scope).await.map_err(db)?;
         let row = scoped(
-            "SELECT connection_id,knowledge_write,created_at,revoked_at FROM partner_connections \
+            "SELECT connection_id,knowledge_write,content_export,created_at,revoked_at FROM partner_connections \
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND connection_id=$4",
             scope,
         )?
@@ -147,7 +148,7 @@ impl PartnerAdminRepository for PgPartnerAdminRepository {
         let mut tx = self.pool.begin().await.map_err(db)?;
         set_local_scope(&mut tx, scope).await.map_err(db)?;
         let rows = scoped(
-            "SELECT connection_id,knowledge_write,created_at,revoked_at FROM partner_connections \
+            "SELECT connection_id,knowledge_write,content_export,created_at,revoked_at FROM partner_connections \
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 \
              AND ($4::uuid IS NULL OR connection_id>$4) ORDER BY connection_id LIMIT $5",
             scope,
@@ -174,6 +175,43 @@ impl PartnerAdminRepository for PgPartnerAdminRepository {
     ) -> Result<PartnerAdminConnection, AppError> {
         let id = self.inner.create_connection(scope).await?;
         self.read_connection(scope, id).await
+    }
+
+    async fn set_content_export(
+        &self,
+        scope: &TenantScope,
+        id: Uuid,
+        enabled: bool,
+    ) -> Result<PartnerAdminConnection, AppError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        set_local_scope(&mut tx, scope).await.map_err(db)?;
+        let row = scoped(
+            "UPDATE partner_connections SET content_export=$5 \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND connection_id=$4 \
+               AND revoked_at IS NULL \
+             RETURNING connection_id,knowledge_write,content_export,created_at,revoked_at",
+            scope,
+        )?
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        .ok_or_else(unavailable)?;
+        super::audit(
+            &mut tx,
+            scope,
+            id,
+            None,
+            if enabled {
+                "content_export_enabled"
+            } else {
+                "content_export_disabled"
+            },
+        )
+        .await?;
+        tx.commit().await.map_err(db)?;
+        Ok(connection(&row))
     }
 
     async fn list_keys(

@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { Button, Card, Field, Input } from "@fluentui/react-components";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { Button, Card, Field, Input, Switch } from "@fluentui/react-components";
+import {
+  useInfiniteQuery,
+  useQueryClient,
+  type InfiniteData,
+} from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useLocation } from "react-router-dom";
 import { getAuthGeneration } from "../api/client";
@@ -30,7 +34,7 @@ function ConnectionCard({
   refresh,
 }: Scope & {
   connection: api.PartnerConnection;
-  refresh: () => Promise<unknown>;
+  refresh: (updated?: api.PartnerConnection) => Promise<unknown>;
 }) {
   const { t } = useTranslation("partnerConnections");
   const current = useLifetime();
@@ -66,6 +70,29 @@ function ConnectionCard({
     expiresAt === null ||
     (Number.isFinite(expiresAt) && expiresAt > Date.now());
   const revoked = Boolean(connection.revoked_at);
+  async function changeExportPermission(enabled: boolean) {
+    if (lock.current || revoked || !current()) return;
+    lock.current = true;
+    setBusy(true);
+    setNotice(undefined);
+    try {
+      const updated = await api.setPartnerContentExport(
+        tenantId,
+        projectId,
+        connection.connection_id,
+        enabled,
+      );
+      if (!current()) return;
+      await refresh(updated);
+    } catch {
+      if (!current()) return;
+      setNotice("permissionFailed");
+      await refresh();
+    } finally {
+      lock.current = false;
+      if (current()) setBusy(false);
+    }
+  }
   async function act(
     action: "issue" | "rotate" | "revoke" | "connection",
     keyId?: string,
@@ -142,6 +169,14 @@ function ConnectionCard({
         {t("created", { date: formatUiDate(connection.created_at) })}
       </p>
       {!connection.knowledge_write && <p>{t("restricted")}</p>}
+      <Field hint={t(revoked ? "exportRevoked" : "exportHint")}>
+        <Switch
+          label={t("allowExport")}
+          checked={connection.content_export}
+          disabled={busy || revoked}
+          onChange={(_, data) => void changeExportPermission(data.checked)}
+        />
+      </Field>
       <h4>{t("keys")}</h4>
       {query.isPending && <p role="status">{t("loading")}</p>}
       {query.isError && <p role="alert">{t("loadFailed")}</p>}
@@ -164,7 +199,7 @@ function ConnectionCard({
             {!revoked && !key.revoked_at && (
               <>
                 <Button
-                  disabled={busy || !validExpiry || !connection.knowledge_write}
+                  disabled={busy || !validExpiry}
                   onClick={() => void act("rotate", key.key_id)}
                 >
                   {t("rotate")}
@@ -210,7 +245,7 @@ function ConnectionCard({
           </Field>
           <p>{t("rotateHint")}</p>
           <Button
-            disabled={busy || !validExpiry || !connection.knowledge_write}
+            disabled={busy || !validExpiry}
             onClick={() => void act("issue")}
           >
             {t("createKey")}
@@ -221,7 +256,11 @@ function ConnectionCard({
         </>
       )}
       {uncertain && <p role="alert">{t("uncertain")}</p>}
-      {notice && notice !== "uncertain" && <p role="status">{t(notice)}</p>}
+      {notice && notice !== "uncertain" && (
+        <p role={notice === "permissionFailed" ? "alert" : "status"}>
+          {t(notice)}
+        </p>
+      )}
       {secret && current() && !revoked && (
         <div role="region" aria-label={t("secret")}>
           <p>{t("oneTime")}</p>
@@ -246,11 +285,13 @@ function ConnectionCard({
 function ScopedPanel({ tenantId, projectId, identity }: Scope) {
   const { t } = useTranslation("partnerConnections");
   const current = useLifetime();
+  const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
   const [failed, setFailed] = useState(false);
+  const queryKey = ["partner-connections", identity, tenantId, projectId];
   const query = useInfiniteQuery({
-    queryKey: ["partner-connections", identity, tenantId, projectId],
+    queryKey,
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam }) =>
       api.listPartnerConnections(tenantId, projectId, pageParam),
@@ -295,7 +336,28 @@ function ScopedPanel({ tenantId, projectId, identity }: Scope) {
           projectId={projectId}
           identity={identity}
           connection={connection}
-          refresh={() => query.refetch()}
+          refresh={(updated) => {
+            if (updated) {
+              queryClient.setQueryData<
+                InfiniteData<api.PartnerPage<api.PartnerConnection>>
+              >(queryKey, (data) =>
+                data
+                  ? {
+                      ...data,
+                      pages: data.pages.map((page) => ({
+                        ...page,
+                        items: page.items.map((item) =>
+                          item.connection_id === updated.connection_id
+                            ? updated
+                            : item,
+                        ),
+                      })),
+                    }
+                  : data,
+              );
+            }
+            return query.refetch();
+          }}
         />
       ))}
       {query.hasNextPage && (

@@ -116,6 +116,32 @@ pub(crate) async fn validate_content_media_in_transaction(
     Ok(bindings)
 }
 
+/// Snapshot authorized image bytes while retaining the caller's project lock
+/// and transaction through the content export decision.
+pub(crate) async fn snapshot_authorized_images_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    keys: &[MediaObjectKey],
+) -> Result<Vec<AuthorizedMediaSnapshot>, AppError> {
+    let ordered = ordered_media_snapshot_keys(keys)?;
+    let bindings = lock_content_media_bindings(tx, scope, &ordered).await?;
+    // Binding lengths have just been compared against locked object
+    // metadata, so reject an oversized aggregate before selecting blobs.
+    let mut total = 0;
+    for binding in &bindings {
+        total = add_media_snapshot_bytes(total, binding.image.byte_len)?;
+    }
+    let mut snapshots = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let bytes = validate_bytes(tx, scope, &binding.image).await?;
+        snapshots.push(AuthorizedMediaSnapshot {
+            image: binding.image,
+            bytes,
+        });
+    }
+    Ok(snapshots)
+}
+
 async fn lock_content_media_bindings(
     tx: &mut Transaction<'_, Postgres>,
     scope: &TenantScope,
@@ -245,24 +271,9 @@ impl ContentMediaRepository for PgContentMediaRepository {
         scope: &TenantScope,
         keys: &[MediaObjectKey],
     ) -> Result<Vec<AuthorizedMediaSnapshot>, AppError> {
-        let ordered = ordered_media_snapshot_keys(keys)?;
         let mut tx = self.transaction(scope).await?;
         lock_project(&mut tx, scope).await?;
-        let bindings = lock_content_media_bindings(&mut tx, scope, &ordered).await?;
-        // Binding lengths have just been compared against locked object
-        // metadata, so reject an oversized aggregate before selecting blobs.
-        let mut total = 0;
-        for binding in &bindings {
-            total = add_media_snapshot_bytes(total, binding.image.byte_len)?;
-        }
-        let mut snapshots = Vec::with_capacity(bindings.len());
-        for binding in bindings {
-            let bytes = validate_bytes(&mut tx, scope, &binding.image).await?;
-            snapshots.push(AuthorizedMediaSnapshot {
-                image: binding.image,
-                bytes,
-            });
-        }
+        let snapshots = snapshot_authorized_images_in_transaction(&mut tx, scope, keys).await?;
         tx.commit().await.map_err(db)?;
         Ok(snapshots)
     }
