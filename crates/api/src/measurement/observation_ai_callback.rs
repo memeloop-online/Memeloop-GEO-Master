@@ -46,7 +46,6 @@ struct ExtractRequest {
     source_capture_id: Uuid,
     source_sha256: String,
     prompt_version: String,
-    wait_budget_ms: std::num::NonZeroU64,
 }
 
 #[derive(Serialize)]
@@ -56,10 +55,9 @@ struct Policy {
 }
 
 #[derive(Serialize)]
-struct Extraction {
-    text: String,
-    model: String,
-    config_version: i64,
+struct ExtractionAccepted {
+    status: &'static str,
+    intent_id: Uuid,
 }
 
 impl ObservationAiCallbackService {
@@ -170,12 +168,7 @@ fn policy_timing(stage: &'static str, started: std::time::Instant, success: bool
 async fn extract(
     State(service): State<ObservationAiCallbackService>,
     Json(request): Json<ExtractRequest>,
-) -> Result<Json<Extraction>, StatusCode> {
-    let deadline = tokio::time::Instant::now()
-        .checked_add(std::time::Duration::from_millis(
-            request.wait_budget_ms.get(),
-        ))
-        .ok_or(StatusCode::BAD_REQUEST)?;
+) -> Result<(StatusCode, Json<ExtractionAccepted>), StatusCode> {
     let request = SourceRequest {
         schema_version: request.schema_version,
         capture_ticket: request.capture_ticket,
@@ -201,26 +194,13 @@ async fn extract(
         )
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let completion = service
-        .extraction
-        .wait_response(
-            &scope,
-            intent.intent_id,
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        )
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .ok_or(StatusCode::GATEWAY_TIMEOUT)?;
-    if completion.model_text.len() > 150_000
-        || completion.disposition != geo_domain::ObservationExtractionResponseDisposition::Complete
-    {
-        return Err(StatusCode::BAD_GATEWAY);
-    }
-    Ok(Json(Extraction {
-        text: completion.model_text,
-        model: completion.actual_model,
-        config_version: completion.config_revision.ok_or(StatusCode::BAD_GATEWAY)?,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ExtractionAccepted {
+            status: "accepted",
+            intent_id: intent.intent_id,
+        }),
+    ))
 }
 
 async fn service_auth(
@@ -388,7 +368,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn callbacks_require_auth_and_exact_persisted_source_and_expose_only_model_result() {
+    async fn callbacks_require_auth_and_exact_source_and_accept_before_slow_inference() {
         let scope = TenantScope::new(
             Uuid::new_v4().into(),
             Uuid::new_v4().into(),
@@ -445,13 +425,9 @@ mod tests {
             bridge,
         );
         let dispatcher = crate::spawn_observation_extraction_dispatcher(extraction.clone());
-        let service = ObservationAiCallbackService::new(capture, settings, extraction);
+        let service = ObservationAiCallbackService::new(capture, settings, extraction.clone());
         let body = serde_json::json!({"schema_version":1,"capture_ticket":ticket,"source_capture_id":receipt.capture_id,"source_sha256":geo_domain::sha256_hex(source.as_bytes()),"prompt_version":"geo.observation.extract.v4"});
         for path in [POLICY_PATH, EXTRACT_PATH] {
-            let mut body = body.clone();
-            if path == EXTRACT_PATH {
-                body["wait_budget_ms"] = serde_json::json!(60_000);
-            }
             for bearer in [None, Some("wrong")] {
                 assert_eq!(
                     post_request(routes(Some(service.clone())), path, body.clone(), bearer)
@@ -490,16 +466,12 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&policy).unwrap(),
             serde_json::json!({"prefer_connected_account":true,"config_version":0})
         );
-        for budget in [
-            None,
-            Some(serde_json::json!(0)),
-            Some(serde_json::json!(-1)),
-            Some(serde_json::json!(1.5)),
+        for version in [
+            "geo.observation.extract.v3",
+            "geo.observation.extract.future",
         ] {
             let mut invalid = body.clone();
-            if let Some(budget) = budget {
-                invalid["wait_budget_ms"] = budget;
-            }
+            invalid["prompt_version"] = serde_json::json!(version);
             assert_eq!(
                 post_request(
                     routes(Some(service.clone())),
@@ -509,16 +481,16 @@ mod tests {
                 )
                 .await
                 .0,
-                StatusCode::UNPROCESSABLE_ENTITY
+                StatusCode::BAD_REQUEST
             );
         }
-        let mut extract_body = body;
-        extract_body["wait_budget_ms"] = serde_json::json!(100);
+        let mut obsolete = body.clone();
+        obsolete["wait_budget_ms"] = serde_json::json!(60_000);
         assert_eq!(
             post_request(
                 routes(Some(service.clone())),
-                POLICY_PATH,
-                extract_body.clone(),
+                EXTRACT_PATH,
+                obsolete,
                 Some(BEARER)
             )
             .await
@@ -526,35 +498,42 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY
         );
         let started = tokio::time::Instant::now();
-        assert_eq!(
-            post_request(
-                routes(Some(service.clone())),
-                EXTRACT_PATH,
-                extract_body.clone(),
-                Some(BEARER)
-            )
-            .await
-            .0,
-            StatusCode::GATEWAY_TIMEOUT
-        );
-        assert_eq!(started.elapsed(), std::time::Duration::from_millis(100));
-        assert_eq!(model.0.load(Ordering::SeqCst), 1);
-        extract_body["wait_budget_ms"] = serde_json::json!(60_000);
-        let started = tokio::time::Instant::now();
         let (status, result) = post_request(
-            routes(Some(service)),
+            routes(Some(service.clone())),
             EXTRACT_PATH,
-            extract_body,
+            body.clone(),
             Some(BEARER),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(started.elapsed() > std::time::Duration::from_secs(55));
-        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let intent_id: Uuid = serde_json::from_value(result["intent_id"].clone()).unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result).unwrap(),
-            serde_json::json!({"text":"{\"completion\":\"unknown\"}","model":"actual-model","config_version":0})
+            result,
+            serde_json::json!({"status":"accepted","intent_id":intent_id})
         );
+        assert!(
+            extraction
+                .wait_response(&scope, intent_id, std::time::Duration::ZERO)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (status, duplicate) =
+            post_request(routes(Some(service)), EXTRACT_PATH, body, Some(BEARER)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&duplicate).unwrap(),
+            result
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        let response = extraction
+            .wait_response(&scope, intent_id, std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.model_text, "{\"completion\":\"unknown\"}");
         assert_eq!(model.0.load(Ordering::SeqCst), 1);
         dispatcher.abort();
     }

@@ -272,6 +272,39 @@ test("source omissions validate escaped paths and reject malformed manifests bef
   }
 });
 
+test("accepted extraction bypasses grounding, candidate writes and failure diagnostics", async () => {
+  const calls = [];
+  const pending = {
+    status: "extraction_pending",
+    intent_id: "99999999-9999-4999-8999-999999999999",
+    get extracted() {
+      assert.fail("accepted work must not be grounded");
+    },
+  };
+  const result = await interpretObservation(exchange, {
+    onEvidence: async (record) => calls.push(record.phase),
+    onDiagnostic: () => assert.fail("ACK is not an extraction failure"),
+    getExtractionPolicy: async () => ({ prefer_connected_account: false }),
+    browserExtract: async () => assert.fail("browser route disabled"),
+    apiExtract: async () => {
+      calls.push("api");
+      return pending;
+    },
+  });
+  assert.equal(result, pending);
+  assert.deepEqual(calls, ["source", "api"]);
+});
+
+test("successful preferred connected browser never enqueues configured extraction", async () => {
+  const result = await interpretObservation(exchange, {
+    getExtractionPolicy: async () => ({ prefer_connected_account: true }),
+    browserExtract: async () => extraction(),
+    apiExtract: async () =>
+      assert.fail("already grounded in connected browser"),
+  });
+  assert.ok(result.audit);
+});
+
 test("saved project preference selects API only after raw persistence", async () => {
   const calls = [];
   const result = await interpretObservation(exchange, {

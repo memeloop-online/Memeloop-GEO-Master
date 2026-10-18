@@ -503,6 +503,11 @@ export async function measureKimi(
       );
     },
   });
+  if (observation?.status === "extraction_pending")
+    return unknown("extraction_pending", "measure", [
+      ...capturedEvidence,
+      ...ownershipEvidence,
+    ]);
   if (observation?.reason === "requested_model_unavailable")
     return unsupported("requested_model_unavailable");
   if (!observation)
@@ -656,6 +661,11 @@ export async function measureDeepseek(
       );
     },
   });
+  if (observation?.status === "extraction_pending")
+    return unknown("extraction_pending", "measure", [
+      ...capturedEvidence,
+      ...ownershipEvidence,
+    ]);
   if (observation?.reason === "requested_model_unavailable")
     return unsupported("requested_model_unavailable");
   if (

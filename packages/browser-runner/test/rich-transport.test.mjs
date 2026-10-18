@@ -147,27 +147,25 @@ before(async () => {
         "schema_version",
         "source_capture_id",
         "source_sha256",
-        ...(request.url.endsWith("/extract") ? ["wait_budget_ms"] : []),
       ]);
       if (request.url.endsWith("/extract")) {
         assert.equal(body.prompt_version, "geo.observation.extract.v4");
-        assert.ok(Number.isSafeInteger(body.wait_budget_ms));
-        assert.ok(body.wait_budget_ms > 0 && body.wait_budget_ms <= 60_000);
       }
       assert.equal(
         body.source_capture_id,
         "88888888-8888-4888-8888-888888888888",
       );
       assert.equal(body.source_sha256, captures.at(-1).snapshot.source_sha256);
-      response.writeHead(200, { "content-type": "application/json" });
+      response.writeHead(request.url.endsWith("/extract") ? 202 : 200, {
+        "content-type": "application/json",
+      });
       response.end(
         JSON.stringify(
           request.url.endsWith("/policy")
             ? { prefer_connected_account: false, config_version: 7 }
             : {
-                text: '{"completion":"unknown"}',
-                model: "actual-project-model",
-                config_version: 8,
+                status: "accepted",
+                intent_id: "99999999-9999-4999-8999-999999999999",
               },
         ),
       );
@@ -308,10 +306,8 @@ before(async () => {
               signal: network.signal,
             }),
             {
-              extracted: { completion: "unknown" },
-              model: "actual-project-model",
-              config_version: 8,
-              surface: "model_api",
+              status: "extraction_pending",
+              intent_id: "99999999-9999-4999-8999-999999999999",
             },
           );
           await network.onConversationCaptured?.({
@@ -648,6 +644,60 @@ test("lost source callback stops extraction and does not retry", async () => {
   assert.equal(captures.at(-1).snapshot.phase, "source");
   assert.deepEqual(await sendMeasurement("capture-failure"), result);
   captureMode = "grant";
+});
+
+test("only extraction callbacks accept 202 and extraction rejects legacy 200", async () => {
+  let status = 202;
+  let route = "extract";
+  const callback = createServer((_request, response) => {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        status: "accepted",
+        intent_id: "99999999-9999-4999-8999-999999999999",
+      }),
+    );
+  });
+  await new Promise((resolve) => callback.listen(0, "127.0.0.1", resolve));
+  const server = createRunnerServer({
+    token: serviceToken,
+    captureOrigin: `http://127.0.0.1:${callback.address().port}`,
+    captureToken: serviceToken,
+    onPolicyTiming() {},
+    runner: {
+      async execute(_input, capture, ai) {
+        return route === "capture" ? capture({}) : ai[route]({});
+      },
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    for (const [nextRoute, nextStatus, expected] of [
+      ["extract", 202, 200],
+      ["policy", 202, 503],
+      ["capture", 202, 503],
+      ["extract", 200, 503],
+    ]) {
+      route = nextRoute;
+      status = nextStatus;
+      const response = await fetch(
+        `http://127.0.0.1:${server.address().port}/v1/executions`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${serviceToken}`,
+            "content-type": "application/json",
+          },
+          body: "{}",
+        },
+      );
+      assert.equal(response.status, expected, `${route}:${status}`);
+      await response.json();
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => callback.close(resolve));
+  }
 });
 
 test("policy timing failures never alter callback results or expose error details", async () => {

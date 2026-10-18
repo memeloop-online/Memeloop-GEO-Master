@@ -163,6 +163,7 @@ impl ObservationExtractionService {
         Ok(intent)
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_response(
         &self,
         scope: &TenantScope,

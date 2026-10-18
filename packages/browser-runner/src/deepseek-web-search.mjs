@@ -491,6 +491,7 @@ export async function observeDeepSeekWebSearch(
         ),
       overallDeadline,
     );
+    if (observation?.status === "extraction_pending") return observation;
     if (!observation)
       return unknown(
         persistenceFailed
