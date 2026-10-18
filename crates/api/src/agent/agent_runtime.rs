@@ -75,6 +75,7 @@ struct Configured {
     capabilities: Arc<dyn HostOps>,
     tool_call_repository: Option<Arc<dyn AgentRepository>>,
     v8_heap_limit_bytes: usize,
+    budgets: HostOpBudgets,
 }
 
 /// The wall-clock ceiling for one turn.
@@ -197,6 +198,7 @@ impl EmbeddedAgentRuntime {
                 capabilities,
                 tool_call_repository: None,
                 v8_heap_limit_bytes,
+                budgets: HostOpBudgets::default(),
             }),
         }
     }
@@ -212,6 +214,25 @@ impl EmbeddedAgentRuntime {
             configured.tool_call_repository = Some(repository);
         }
         self
+    }
+
+    /// Match the model capability's configured deadline without changing the
+    /// overall turn ceiling or any other tool's call count and timeout.
+    pub fn with_model_timeout(mut self, timeout: Duration) -> Result<Self, WorkerError> {
+        crate::provider_bridge::provider_deadline(timeout)
+            .map_err(|_| WorkerError::new("configuration", "invalid model timeout"))?;
+        let timeout_ms = u64::try_from(timeout.as_millis())
+            .ok()
+            .filter(|timeout_ms| *timeout_ms > 0)
+            .ok_or_else(|| WorkerError::new("configuration", "invalid model timeout"))?;
+        if let Some(configured) = self.configured.as_mut() {
+            let mut limits = configured.budgets.limits(HostOp::ModelComplete);
+            limits.timeout_ms = timeout_ms;
+            configured.budgets = configured
+                .budgets
+                .with_limits(HostOp::ModelComplete, limits);
+        }
+        Ok(self)
     }
 
     fn validate_v8_heap_limit(v8_heap_limit_bytes: usize) -> Result<(), WorkerError> {
@@ -316,6 +337,7 @@ impl EmbeddedAgentRuntime {
         let tool_call_repository = configured.tool_call_repository.clone();
         let run_id = input.run_id;
         let v8_heap_limit_bytes = configured.v8_heap_limit_bytes;
+        let budgets = configured.budgets;
         let run_scope = scope.clone();
         let attachments = input.attachments.clone();
         let worker_cancellation = Arc::clone(&cancellation);
@@ -340,7 +362,7 @@ impl EmbeddedAgentRuntime {
                 let mut bridge = HostBridge::new(capabilities, run_scope.clone(), application)
                     .with_attachments(attachments)
                     .with_cancellation(Arc::clone(&worker_cancellation))
-                    .with_budgets(HostOpBudgets::default());
+                    .with_budgets(budgets);
                 if let Some(repository) = tool_call_repository {
                     bridge = bridge.with_recorder(
                         run_id,
@@ -2402,6 +2424,26 @@ mod tests {
     use async_trait::async_trait;
     use geo_worker::HostOpErrorCode;
     use std::sync::Arc;
+
+    #[test]
+    fn configured_model_deadline_changes_only_the_model_host_budget() {
+        let state = AppState::development();
+        let runtime = EmbeddedAgentRuntime::configured(Arc::new(RepositoryHostOps::new(
+            state.knowledge_repository(),
+        )))
+        .with_model_timeout(Duration::from_secs(180))
+        .unwrap();
+        let budgets = runtime.configured.as_ref().unwrap().budgets;
+        for op in HostOp::ALL {
+            let mut expected = HostOpBudgets::default().limits(op);
+            if op == HostOp::ModelComplete {
+                expected.timeout_ms = 180_000;
+            }
+            assert_eq!(budgets.limits(op), expected);
+        }
+        assert_eq!(TURN_DEADLINE, Duration::from_secs(600));
+        assert!(runtime.with_model_timeout(Duration::ZERO).is_err());
+    }
 
     #[test]
     fn single_article_idempotency_conflicts_are_typed_for_model_retries() {

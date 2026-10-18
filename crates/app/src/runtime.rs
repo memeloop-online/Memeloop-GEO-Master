@@ -214,10 +214,10 @@ fn assemble_with_optional_provider(
         inherited.clone(),
         None,
     );
-    let provider: SharedModelProvider = Arc::new(
-        ProjectConfiguredModelBridge::new(settings, inherited)
-            .map_err(|_| AssemblyError::ProviderConfiguration)?,
-    );
+    let provider = ProjectConfiguredModelBridge::new(settings, inherited)
+        .map_err(|_| AssemblyError::ProviderConfiguration)?;
+    let model_timeout = provider.workbench_timeout();
+    let provider: SharedModelProvider = Arc::new(provider);
     state.configure_content_model(Arc::clone(&provider));
     let capabilities = RepositoryHostOps::new(state.knowledge_repository())
         .with_model_provider(provider)
@@ -231,6 +231,8 @@ fn assemble_with_optional_provider(
         Box::leak(Box::new([(BUNDLE_SPECIFIER, source)]));
     Ok(Arc::new(
         EmbeddedAgentRuntime::with_bundle(bundle, BUNDLE_SPECIFIER, Arc::new(capabilities))
+            .with_model_timeout(model_timeout)
+            .map_err(|_| AssemblyError::ProviderConfiguration)?
             .with_tool_call_repository(state.agent_repository()),
     ))
 }
