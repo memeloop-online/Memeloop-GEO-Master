@@ -262,12 +262,7 @@ impl ModelProviderBridge for GroundedModel {
             .unwrap_or_default()
             .contains("checker")
         {
-            let unsupported = self
-                .1
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok();
+            let unsupported = self.1.swap(0, Ordering::SeqCst) != 0;
             let block = input["document"]["blocks"][0]["block_id"].as_str().unwrap();
             let title = input["title_check_id"].as_str().unwrap();
             serde_json::json!({"checks":[
