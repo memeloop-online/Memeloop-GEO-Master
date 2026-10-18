@@ -144,6 +144,7 @@ async function pipeline(
         },
       };
     return {
+      waitFor: async () => {},
       isVisible: async () => true,
       fill: async (text) => assert.equal(text, QUESTION),
       count: async () => 0,

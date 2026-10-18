@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { chromium } from "playwright";
@@ -46,6 +47,7 @@ function configurationPage(failedStage, error, { failReadback = false } = {}) {
   return {
     goto: async () => {},
     url: () => "https://www.kimi.com/",
+    locator: () => ({ waitFor: async () => {} }),
     keyboard: { press: async () => {} },
     getByTestId(name) {
       if (name === "model-select-trigger")
@@ -183,6 +185,43 @@ test("unknown adapter evidence keeps safe stage diagnostics without successful o
     JSON.stringify(outcome),
     /synthetic-private|example\.org/u,
   );
+});
+
+test("a source budget consumed by configuration cannot fill the composer", async () => {
+  const page = configurationPage();
+  let fills = 0;
+  page.locator = () => ({
+    waitFor: async () => {},
+    isVisible: async () => true,
+    fill: async () => fills++,
+  });
+  const getByTestId = page.getByTestId;
+  page.getByTestId = (name) => {
+    const locator = getByTestId(name);
+    if (name === "model-option") {
+      const all = locator.all;
+      locator.all = async () => {
+        const options = await all();
+        options[0].click = async () => {
+          await new Promise((resolve) => setTimeout(resolve, 75));
+        };
+        return options;
+      };
+    }
+    return locator;
+  };
+  const diagnostics = [];
+  assert.equal(
+    await observeKimiConnectSearch(page, frozen, {
+      sourceDeadlineAt: performance.now() + 50,
+      deadlineAt: performance.now() + 10_000,
+      onDiagnostic: (entry) => diagnostics.push(entry),
+    }),
+    null,
+  );
+  assert.equal(fills, 0);
+  assert.equal(diagnostics.at(-1).stage, "composer");
+  assert.equal(diagnostics.at(-1).code, "budget_exhausted");
 });
 
 const request = {
@@ -514,6 +553,148 @@ const pageHtml = `<!doctype html><html><body>
     });
   };
 </script></body></html>`;
+
+test("loading-shell readiness is bounded and never fills or sends after timeout or cancellation", async (t) => {
+  let sends = 0;
+  let readinessDelayMs;
+  const server = createServer((incoming, reply) => {
+    if (incoming.method === "GET" && incoming.url === "/") {
+      const html = pageHtml.replace("<body>", "<body><main hidden>").replace(
+        "</body>",
+        `</main><script>
+            window.configurationClicks = 0;
+            window.composerInputs = 0;
+            document.querySelector('[data-testid="model-select-trigger"]')
+              .addEventListener("click", () => window.configurationClicks++);
+            document.querySelector(".chat-input-editor")
+              .addEventListener("input", () => window.composerInputs++);
+            window.revealFixture = () => document.querySelector("main").hidden = false;
+            ${readinessDelayMs === undefined ? "" : `setTimeout(window.revealFixture, ${readinessDelayMs});`}
+          </script></body>`,
+      );
+      reply.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      reply.end(html);
+      return;
+    }
+    if (incoming.method === "POST" && incoming.url.endsWith("/Chat")) {
+      sends += 1;
+      reply.writeHead(200, { "content-type": "application/connect+json" });
+      for (const event of messages) reply.write(frame(0, event));
+      reply.end(frame(2, {}));
+      return;
+    }
+    reply.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
+    });
+    const page = await browser.newPage();
+    const trustedOrigin = `http://127.0.0.1:${server.address().port}`;
+    const assertUntouched = async () => {
+      assert.deepEqual(
+        await page.evaluate(() => ({
+          configurationClicks: window.configurationClicks,
+          composerInputs: window.composerInputs,
+          question: document.querySelector(".chat-input-editor").textContent,
+        })),
+        { configurationClicks: 0, composerInputs: 0, question: "" },
+      );
+      assert.equal(sends, 0);
+    };
+    await t.test(
+      "source deadline expires while the shell stays unready",
+      async () => {
+        const diagnostics = [];
+        assert.equal(
+          await observeKimiConnectSearch(page, frozen, {
+            trustedOrigin,
+            sourceDeadlineAt: performance.now() + 250,
+            deadlineAt: performance.now() + 10_000,
+            onDiagnostic: (entry) => diagnostics.push(entry),
+          }),
+          null,
+        );
+        assert.equal(diagnostics.at(-1).stage, "composer");
+        assert.equal(diagnostics.at(-1).code, "budget_exhausted");
+        await assertUntouched();
+      },
+    );
+    await t.test(
+      "standalone timeout also bounds a permanently unready shell",
+      async () => {
+        const diagnostics = [];
+        assert.equal(
+          await observeKimiConnectSearch(page, frozen, {
+            trustedOrigin,
+            timeoutMs: 100,
+            onDiagnostic: (entry) => diagnostics.push(entry),
+          }),
+          null,
+        );
+        assert.equal(diagnostics.at(-1).stage, "composer");
+        assert.equal(diagnostics.at(-1).code, "timeout");
+        await assertUntouched();
+      },
+    );
+    await t.test(
+      "cancellation returns promptly and late readiness cannot continue",
+      async () => {
+        await page.goto("about:blank");
+        const controller = new AbortController();
+        const diagnostics = [];
+        const listeners = getEventListeners(controller.signal, "abort").length;
+        const observing = observeKimiConnectSearch(page, frozen, {
+          trustedOrigin,
+          deadlineAt: performance.now() + 10_000,
+          signal: controller.signal,
+          onDiagnostic: (entry) => diagnostics.push(entry),
+        });
+        await page.waitForFunction(
+          () => typeof window.revealFixture === "function",
+        );
+        assert.equal(
+          getEventListeners(controller.signal, "abort").length,
+          listeners + 1,
+        );
+        const cancelledAt = performance.now();
+        controller.abort();
+        assert.equal(await observing, null);
+        assert.ok(performance.now() - cancelledAt < 1_000);
+        assert.equal(diagnostics.at(-1).stage, "composer");
+        assert.equal(diagnostics.at(-1).code, "cancelled");
+        assert.equal(
+          getEventListeners(controller.signal, "abort").length,
+          listeners,
+        );
+        await page.evaluate(() => window.revealFixture());
+        await page.locator(".chat-input-editor").waitFor({ state: "visible" });
+        await assertUntouched();
+      },
+    );
+    await t.test(
+      "readiness beyond the model-menu timeout still selects the exact model and sends once",
+      async () => {
+        readinessDelayMs = 5_200;
+        const observed = await observeKimiConnectSearch(page, frozen, {
+          trustedOrigin,
+          sourceDeadlineAt: performance.now() + 12_000,
+        });
+        assert.equal(observed?.raw_answer, "An answer.");
+        assert.equal(sends, 1);
+        assert.equal(await page.evaluate(() => window.configurationClicks), 1);
+        assert.equal(await page.evaluate(() => window.composerInputs), 1);
+        assert.equal(observed.search_event.request_model, MODEL);
+      },
+    );
+  } finally {
+    await browser?.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
 
 test("search configuration selects exact bilingual title prefixes with descriptions, never other tools", async () => {
   const browser = await chromium.launch({

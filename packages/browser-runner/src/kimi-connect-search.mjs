@@ -459,6 +459,50 @@ export async function observeKimiConnectSearch(
       timeout: 12_000,
     });
     if (new URL(page.url()).origin !== trustedOrigin) return unverified();
+    stage = "composer";
+    const composer = page.locator(
+      '[role="textbox"][contenteditable="true"].chat-input-editor',
+    );
+    const captureDeadlineAt = sourceDeadlineAt ?? deadlineAt;
+    const readinessRemaining =
+      captureDeadlineAt === undefined
+        ? timeoutMs
+        : captureDeadlineAt - performance.now();
+    if (!Number.isFinite(readinessRemaining) || readinessRemaining <= 0)
+      return unverified("budget_exhausted");
+    if (signal?.aborted) return unverified();
+    // DOMContentLoaded can precede the hydrated composer and model menu.
+    // Wait on the page's real UI within the existing source budget.
+    let abortReadiness;
+    try {
+      const ready = await Promise.race([
+        composer
+          .waitFor({ state: "visible", timeout: readinessRemaining })
+          .then(() => true),
+        new Promise((resolve) => {
+          abortReadiness = () => resolve(false);
+          signal?.addEventListener("abort", abortReadiness, { once: true });
+          if (signal?.aborted) abortReadiness();
+        }),
+      ]);
+      if (!ready || signal?.aborted) return unverified();
+    } catch (error) {
+      return unverified(
+        captureDeadlineAt !== undefined &&
+          performance.now() >= captureDeadlineAt
+          ? "budget_exhausted"
+          : error?.name === "TimeoutError"
+            ? "timeout"
+            : "unexpected_exception",
+      );
+    } finally {
+      signal?.removeEventListener("abort", abortReadiness);
+    }
+    if (
+      captureDeadlineAt !== undefined &&
+      performance.now() >= captureDeadlineAt
+    )
+      return unverified("budget_exhausted");
     stage = "configuration";
     const configured = await configureKimiSearch(
       page,
@@ -471,15 +515,16 @@ export async function observeKimiConnectSearch(
         ? { reason: configured }
         : unverified();
     stage = "composer";
-    const composer = page.locator(
-      '[role="textbox"][contenteditable="true"].chat-input-editor',
-    );
     if (!(await composer.isVisible())) return unverified();
     if (signal?.aborted) return unverified();
+    if (
+      captureDeadlineAt !== undefined &&
+      performance.now() >= captureDeadlineAt
+    )
+      return unverified("budget_exhausted");
     await composer.fill(payload.question);
     // The runner's monotonic deadline includes its identity and UI setup.
     // Standalone fixture calls retain their explicit/default capture timeout.
-    const captureDeadlineAt = sourceDeadlineAt ?? deadlineAt;
     if (captureDeadlineAt !== undefined) {
       const remaining = captureDeadlineAt - performance.now();
       if (!Number.isFinite(remaining) || remaining <= 0)
