@@ -45,10 +45,8 @@ impl ObservationCapture {
             return Err(invalid());
         }
         let identity = self.input.original_identity.as_ref().ok_or_else(invalid)?;
-        identity.validate()?;
         let owned = self.input.owned_conversation.as_ref().ok_or_else(invalid)?;
-        if identity.provider != owned.provider
-            || owned.purpose != CapturedConversationPurpose::Measurement
+        if owned.purpose != CapturedConversationPurpose::Measurement
             || owned.correlation != ConversationCorrelation::CreateResponse
         {
             return Err(invalid());

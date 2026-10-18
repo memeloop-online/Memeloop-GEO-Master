@@ -172,6 +172,16 @@ export function QuestionSetsPage() {
       : params.has("set") || params.has("questionSetId")
         ? "sets"
         : "sets";
+  const [visitedTabs, setVisitedTabs] = useState(
+    () => new Set<MeasurementTab>([tab]),
+  );
+  useEffect(() => {
+    setVisitedTabs((visited) =>
+      visited.has(tab) ? visited : new Set(visited).add(tab),
+    );
+  }, [tab]);
+  const wasVisited = (entry: MeasurementTab) =>
+    tab === entry || visitedTabs.has(entry);
   const setId = params.get("set") ?? params.get("questionSetId") ?? "";
   const requestedVersionId =
     params.get("version") ?? params.get("versionId") ?? "";
@@ -218,13 +228,13 @@ export function QuestionSetsPage() {
   const sets = useQuery({
     queryKey: baseKey,
     queryFn: () => listAllQuestionSets(tenantId!, projectId!),
-    enabled: Boolean(scope),
+    enabled: Boolean(scope && wasVisited("sets")),
     retry: false,
   });
   const versions = useQuery({
     queryKey: [...baseKey, "versions", setId],
     queryFn: () => listAllQuestionSetVersions(tenantId!, projectId!, setId),
-    enabled: Boolean(scope && setId),
+    enabled: Boolean(scope && setId && wasVisited("sets")),
     retry: false,
   });
   const selectedSet = sets.data?.items.find((item) => item.id === setId);
@@ -233,7 +243,7 @@ export function QuestionSetsPage() {
     queryKey: [...baseKey, "version", setId, versionId],
     queryFn: () =>
       getQuestionSetVersion(tenantId!, projectId!, setId, versionId),
-    enabled: Boolean(scope && setId && versionId),
+    enabled: Boolean(scope && setId && versionId && wasVisited("sets")),
     retry: false,
   });
   const [name, setName] = useState("");
@@ -388,20 +398,25 @@ export function QuestionSetsPage() {
         hidden={tab !== "measure"}
         aria-label={t("measure")}
       >
-        <StandaloneMeasurementPanel
-          key={`${tenantId}/${projectId}`}
-          tenantId={tenantId}
-          projectId={projectId}
-          canWrite={canWrite}
-        />
-        <details className="measurement-prediction">
-          <summary>{t("prediction")}</summary>
-          <TopicQuestionGenerator
-            tenantId={tenantId}
-            projectId={projectId}
-            canWrite={canWrite}
-          />
-        </details>
+        {wasVisited("measure") && (
+          <>
+            <StandaloneMeasurementPanel
+              key={`${tenantId}/${projectId}`}
+              tenantId={tenantId}
+              projectId={projectId}
+              canWrite={canWrite}
+              active={tab === "measure"}
+            />
+            <details className="measurement-prediction">
+              <summary>{t("prediction")}</summary>
+              <TopicQuestionGenerator
+                tenantId={tenantId}
+                projectId={projectId}
+                canWrite={canWrite}
+              />
+            </details>
+          </>
+        )}
       </section>
       <section
         role="tabpanel"
@@ -409,7 +424,9 @@ export function QuestionSetsPage() {
         hidden={tab !== "search"}
         aria-label={t("search")}
       >
-        <SerpMeasurementPanel tenantId={tenantId} projectId={projectId} />
+        {wasVisited("search") && (
+          <SerpMeasurementPanel tenantId={tenantId} projectId={projectId} />
+        )}
       </section>
       <section
         role="tabpanel"
@@ -417,13 +434,15 @@ export function QuestionSetsPage() {
         hidden={tab !== "records"}
         aria-label={t("records")}
       >
-        <StandaloneMeasurementPanel
-          key={`${tenantId}/${projectId}/records`}
-          tenantId={tenantId}
-          projectId={projectId}
-          canWrite={canWrite}
-          recordsOnly
-        />
+        {wasVisited("records") && (
+          <StandaloneMeasurementPanel
+            key={`${tenantId}/${projectId}/records`}
+            tenantId={tenantId}
+            projectId={projectId}
+            canWrite={canWrite}
+            recordsOnly
+          />
+        )}
       </section>
       <section
         role="tabpanel"
@@ -431,11 +450,13 @@ export function QuestionSetsPage() {
         hidden={tab !== "insights"}
         aria-label={t("insights")}
       >
-        <CitationInsightsPanel
-          key={`${tenantId}/${projectId}/citations`}
-          tenantId={tenantId}
-          projectId={projectId}
-        />
+        {wasVisited("insights") && (
+          <CitationInsightsPanel
+            key={`${tenantId}/${projectId}/citations`}
+            tenantId={tenantId}
+            projectId={projectId}
+          />
+        )}
       </section>
       <section
         role="tabpanel"

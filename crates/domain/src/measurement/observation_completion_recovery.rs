@@ -42,17 +42,12 @@ pub struct ObservationCompletionRecoveryInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedObservationCompletionRecovery {
     digest_sha256: String,
-    completion: ObservationCaptureCompletion,
     retained_message_inventory_sha256: String,
 }
 
 impl ValidatedObservationCompletionRecovery {
     pub fn digest_sha256(&self) -> &str {
         &self.digest_sha256
-    }
-
-    pub fn completion(&self) -> &ObservationCaptureCompletion {
-        &self.completion
     }
 
     pub fn retained_message_inventory_sha256(&self) -> &str {
@@ -111,7 +106,6 @@ impl ObservationCompletionRecoveryInput {
             .ok_or_else(invalid)?;
         if self.source_sha256 != *source_sha256
             || original.input.original_identity.as_ref() != Some(&self.recovery_identity)
-            || self.recovery_identity.provider != owned.provider
             || self.external_conversation_id != owned.external_conversation_id
             || original.input.ordinal != 0
             || owned.purpose != crate::CapturedConversationPurpose::Measurement
@@ -132,7 +126,6 @@ impl ObservationCompletionRecoveryInput {
             digest_sha256: hex::encode(Sha256::digest(
                 serde_json::to_vec(self).map_err(|_| invalid())?,
             )),
-            completion: self.completion.clone(),
             retained_message_inventory_sha256,
         })
     }
@@ -304,7 +297,7 @@ mod tests {
         let unchanged = original.clone();
         let evidence = input.validate(&scope, &original).unwrap();
         assert_eq!(
-            evidence.completion().outcome,
+            input.completion.outcome,
             crate::ObservationCompletionOutcome::Complete
         );
         let binding = original.recovery_request_binding(&scope).unwrap();
@@ -364,7 +357,7 @@ mod tests {
         input.completion.message_inventory.clear();
         let evidence = input.validate(&scope, &original).unwrap();
         assert_eq!(
-            evidence.completion().outcome,
+            input.completion.outcome,
             crate::ObservationCompletionOutcome::ClearedFailure
         );
         assert_eq!(

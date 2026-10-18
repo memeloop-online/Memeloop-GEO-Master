@@ -211,6 +211,55 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it("defers model discovery until the measurement form is active", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const panel = render(
+      <StandaloneMeasurementPanel
+        tenantId="tenant-1"
+        projectId="project-1"
+        canWrite
+        active={false}
+      />,
+      {
+        wrapper: ({ children }) => (
+          <FluentProvider theme={webLightTheme}>
+            <QueryClientProvider client={client}>
+              <MemoryRouter>{children}</MemoryRouter>
+            </QueryClientProvider>
+          </FluentProvider>
+        ),
+      },
+    );
+    await waitFor(() => expect(listAllQuestionSets).toHaveBeenCalledOnce());
+    window.dispatchEvent(new Event("focus"));
+    expect(getMeasurementOptions).not.toHaveBeenCalled();
+    expect(state.refetch).not.toHaveBeenCalled();
+    panel.rerender(
+      <StandaloneMeasurementPanel
+        tenantId="tenant-1"
+        projectId="project-1"
+        canWrite
+        active
+      />,
+    );
+    expect(await screen.findByText("模型：网页当前模型")).toBeVisible();
+    expect(getMeasurementOptions).toHaveBeenCalledOnce();
+    window.dispatchEvent(new Event("focus"));
+    expect(state.refetch).toHaveBeenCalledOnce();
+    panel.rerender(
+      <StandaloneMeasurementPanel
+        tenantId="tenant-1"
+        projectId="project-1"
+        canWrite
+        active={false}
+      />,
+    );
+    window.dispatchEvent(new Event("focus"));
+    expect(state.refetch).toHaveBeenCalledOnce();
+  });
+
   it.each([undefined, "older-version"])(
     "opens scoped report history without matching measurements on this page (requested version: %s)",
     async (requestedVersion) => {

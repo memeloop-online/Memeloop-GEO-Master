@@ -796,21 +796,19 @@ pub(crate) async fn plan_document_manifest(
     Json(request): Json<DocumentManifestPlanRequest>,
 ) -> Result<Json<DocumentManifest>, ApiError> {
     require_project_writer(&auth).map_err(|error| api_error(error, context.request_id))?;
-    let scope = knowledge_scope(&state, &auth.scope, query.project_id)
+    let project = state
+        .project_repository()
+        .get(&auth.scope, query.project_id)
         .await
-        .map_err(|error| api_error(error, context.request_id))?;
+        .map_err(|error| api_error(error, context.request_id))?
+        .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
+    let scope = project.scope();
     if request.manifest_id.is_nil() {
         return Err(api_error(
             AppError::invalid_request("manifest_id must not be nil"),
             context.request_id,
         ));
     }
-    let project = state
-        .project_repository()
-        .get(&scope, query.project_id)
-        .await
-        .map_err(|error| api_error(error, context.request_id))?
-        .ok_or_else(|| api_error(AppError::not_found("project not found"), context.request_id))?;
     let start = state
         .project_repository()
         .get_start(&scope, query.project_id)

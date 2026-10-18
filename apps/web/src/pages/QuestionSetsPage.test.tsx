@@ -294,6 +294,63 @@ afterEach(async () => {
 });
 
 describe("P13 versioned question sets", () => {
+  it("opens a saved rank report without mounting unrelated measurement tabs", async () => {
+    const calls = mockApi({ existing: true });
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(request), "http://localhost").pathname;
+        if (path.endsWith("/measurement-plans"))
+          return new Promise<Response>(() => {});
+        if (path.endsWith("/measurement-reports"))
+          return Promise.resolve(reply({ items: [] }));
+        if (path.endsWith("/measurement-reports/report-1"))
+          return Promise.resolve(
+            reply({
+              kind: "measurement_period",
+              report_id: "report-1",
+              project_id: "project-1",
+              question_set: {
+                question_set_id: "set-1",
+                question_set_version_id: "version-1",
+              },
+              revision: 1,
+              correction_of: null,
+              report_window_start_at: "2026-09-01T00:00:00Z",
+              report_window_end_at: "2026-10-01T00:00:00Z",
+              report_timezone: "UTC",
+              evidence_as_of: "2026-10-01T00:00:00Z",
+              generated_at: "2026-10-01T00:00:00Z",
+              input_hash: "hash",
+              coverage: {
+                planned: 0,
+                counts: {},
+                observed_live: 0,
+                grounded_saved_analysis: 0,
+              },
+              samples: [],
+            }),
+          );
+        return baseFetch(request, init);
+      }),
+    );
+    renderPage(
+      "/app/tenant-1/project-1/measurement?tab=records&set=set-1&version=version-1&rankReport=report-1",
+    );
+    expect(await screen.findByText("报告版本 1")).toBeVisible();
+    expect(
+      calls.filter((call) =>
+        /\/(serp-capabilities|serp-measurements|citation-insights|source-channel-recommendations|measurement-options|versions)(\/|$)/.test(
+          call.path,
+        ),
+      ),
+    ).toEqual([]);
+    expect(
+      document.querySelector('[aria-labelledby="measurement-tab-measure"]'),
+    ).toBeEmptyDOMElement();
+  });
+
   it.each(["set", "version"])(
     "clears a selected measurement when changing its %s through the question-set tab",
     async (selection) => {
