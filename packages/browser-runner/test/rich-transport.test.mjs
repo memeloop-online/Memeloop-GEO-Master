@@ -147,9 +147,13 @@ before(async () => {
         "schema_version",
         "source_capture_id",
         "source_sha256",
+        ...(request.url.endsWith("/extract") ? ["wait_budget_ms"] : []),
       ]);
-      if (request.url.endsWith("/extract"))
+      if (request.url.endsWith("/extract")) {
         assert.equal(body.prompt_version, "geo.observation.extract.v4");
+        assert.ok(Number.isSafeInteger(body.wait_budget_ms));
+        assert.ok(body.wait_budget_ms > 0 && body.wait_budget_ms <= 60_000);
+      }
       assert.equal(
         body.source_capture_id,
         "88888888-8888-4888-8888-888888888888",
@@ -296,7 +300,13 @@ before(async () => {
             config_version: 7,
           });
           assert.deepEqual(
-            await network.apiExtract("must not cross callback boundary"),
+            await network.apiExtract("must not cross callback boundary", {
+              deadlineAt: Math.min(
+                network.deadlineAt,
+                performance.now() + 60_000,
+              ),
+              signal: network.signal,
+            }),
             {
               extracted: { completion: "unknown" },
               model: "actual-project-model",

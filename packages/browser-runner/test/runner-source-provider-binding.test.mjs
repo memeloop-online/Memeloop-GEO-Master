@@ -8,7 +8,7 @@ const sourceJson = JSON.stringify({
 });
 const sourceSha256 = createHash("sha256").update(sourceJson).digest("hex");
 
-async function runCapture(platform, receipts, completion) {
+async function runCapture(platform, receipts, completion, extraction = {}) {
   const stored = [];
   const runner = createRunner({
     browserType: {
@@ -45,7 +45,7 @@ async function runCapture(platform, receipts, completion) {
             assert.deepEqual(hooks.onConversationCaptured(receipt), {
               durable: false,
             });
-          for (const phase of ["source", "extraction"])
+          for (const phase of ["source", "extraction"]) {
             await hooks.onEvidence({
               kind: "observation_capture",
               schema_version: "geo.observation.capture.v1",
@@ -54,6 +54,8 @@ async function runCapture(platform, receipts, completion) {
               source_sha256: sourceSha256,
               ...(completion ? { completion } : {}),
             });
+            if (phase === "source") await extraction.inspectHooks?.(hooks);
+          }
           return { status: "completed", evidence: [] };
         },
       },
@@ -82,7 +84,11 @@ async function runCapture(platform, receipts, completion) {
         stored_at: "2026-01-01T00:00:00Z",
       };
     };
-    const result = await runner.execute(input, persist);
+    const result = await runner.execute(
+      input,
+      persist,
+      extraction.observationAi,
+    );
     assert.equal(result.status, "completed");
     await runner.execute(input, persist);
     assert.equal(stored.length, 2, "same execution must not be resubmitted");
@@ -91,6 +97,48 @@ async function runCapture(platform, receipts, completion) {
     await runner.shutdown();
   }
 }
+
+test("extraction forwards only the remaining route budget and its cancellation signal", async (t) => {
+  const controller = new AbortController();
+  let calls = 0;
+  t.mock.method(performance, "now", () => 1_000);
+  const stored = await runCapture("kimi", [], undefined, {
+    async inspectHooks(hooks) {
+      const pending = hooks.apiExtract("must not cross callback boundary", {
+        deadlineAt: 57_001.75,
+        signal: controller.signal,
+      });
+      controller.abort();
+      assert.equal(await pending, null);
+      assert.equal(
+        await hooks.apiExtract("expired", { deadlineAt: 999 }),
+        null,
+      );
+    },
+    observationAi: {
+      async extract(body, { signal }) {
+        calls++;
+        assert.deepEqual(body, {
+          schema_version: 1,
+          prompt_version: "geo.observation.extract.v4",
+          wait_budget_ms: 56_001,
+          capture_ticket: "aabb",
+          source_capture_id: "33333333-3333-4333-8333-333333333333",
+          source_sha256: sourceSha256,
+        });
+        assert.equal(signal, controller.signal);
+        await new Promise((resolve) =>
+          signal.addEventListener("abort", resolve, { once: true }),
+        );
+        assert.equal(signal.aborted, true);
+        return null;
+      },
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(stored.length, 2);
+  assert.ok(stored.every((body) => !Object.hasOwn(body, "wait_budget_ms")));
+});
 
 test("source and extraction callbacks forward the same normalized inventory receipt", async () => {
   const completion = {

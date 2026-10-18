@@ -762,12 +762,18 @@ export function createRunner(options = {}) {
                     throw new Error("observation_policy_invalid");
                   return policy;
                 },
-                async apiExtract(_prompt, { signal } = {}) {
+                async apiExtract(_prompt, { signal, deadlineAt } = {}) {
                   if (!sourceReceipt || !observationAi?.extract) return null;
+                  const waitBudgetMs = Math.floor(
+                    deadlineAt - performance.now(),
+                  );
+                  if (!Number.isSafeInteger(waitBudgetMs) || waitBudgetMs <= 0)
+                    return null;
                   const result = await observationAi.extract(
                     {
                       schema_version: 1,
                       prompt_version: "geo.observation.extract.v4",
+                      wait_budget_ms: waitBudgetMs,
                       capture_ticket: input.source_capture_ticket,
                       source_capture_id: sourceReceipt.capture_id,
                       source_sha256: sourceDigest,
