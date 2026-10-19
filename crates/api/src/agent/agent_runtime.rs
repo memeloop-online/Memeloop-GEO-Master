@@ -2124,6 +2124,57 @@ impl HostOps for RepositoryHostOps {
         Ok(geo_worker::KnowledgeImportAttachmentsResult { items })
     }
 
+    async fn knowledge_import_url(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::KnowledgeImportUrlRequest,
+    ) -> Result<geo_worker::KnowledgeImportUrlResult, HostOpError> {
+        let op = HostOp::KnowledgeImportUrl;
+        let response = self
+            .knowledge
+            .import_batch(
+                scope,
+                vec![ImportItem {
+                    client_item_id: format!(
+                        "agent-url:{}",
+                        geo_domain::sha256_hex(request.idempotency_key.as_bytes())
+                    ),
+                    kind: SourceKind::Url,
+                    name: request.name.unwrap_or_else(|| "Webpage".to_owned()),
+                    purpose: request.purpose,
+                    text: None,
+                    url: Some(request.url),
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .map_err(|error| worker_error(op, error))?;
+        let receipt = response
+            .items
+            .into_iter()
+            .next()
+            .ok_or_else(|| HostOpError::internal(op, "webpage import produced no receipt"))?;
+        let ready = matches!(
+            receipt.status,
+            ImportStatus::Succeeded | ImportStatus::Partial
+        );
+        Ok(geo_worker::KnowledgeImportUrlResult {
+            status: receipt.status,
+            import_job_id: receipt.import_job.map(|job| job.import_job_id),
+            source_id: receipt.source.map(|source| source.source_id),
+            source_version_id: receipt
+                .source_version
+                .filter(|_| ready)
+                .map(|version| version.source_version_id),
+            knowledge_release_id: receipt
+                .release
+                .filter(|_| ready)
+                .map(|release| release.knowledge_release_id),
+            error: receipt.error,
+        })
+    }
+
     async fn knowledge_import_status(
         &self,
         scope: &TenantScope,
