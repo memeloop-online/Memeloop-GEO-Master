@@ -404,6 +404,7 @@ test("the current Rust op registration starts the bundle and serves explicit sou
   assert.ok(registeredOps, "Rust must declare its production op registration");
   const opNames = registeredOps.match(/op_host_\w+/gu);
   assert.ok(opNames.includes("op_host_knowledge_text_read_v1"));
+  assert.ok(opNames.includes("op_host_content_create_v1"));
   assert.ok(!opNames.includes("op_host_knowledge_search_v1"));
   const ops = Object.fromEntries(
     opNames.map((name) => [
@@ -416,6 +417,22 @@ test("the current Rust op registration starts the bundle and serves explicit sou
   const contentReference = {
     execution_id: "00000000-0000-4000-8000-000000000093",
     item_id: "00000000-0000-4000-8000-000000000094",
+  };
+  const contentRequest = {
+    request_id: "00000000-0000-4000-8000-000000000095",
+    topic: "Equipment upkeep",
+    source_version_ids: [manualReference.source_version_id],
+    documents: [
+      {
+        key: "guide",
+        content_type: "article",
+        title: null,
+        instructions: null,
+      },
+    ],
+    language: "en",
+    market: null,
+    audience: null,
   };
   const calls = [];
   const requests = [];
@@ -430,6 +447,14 @@ test("the current Rust op registration starts the bundle and serves explicit sou
     calls.push(["content_document_read", JSON.parse(payload)]);
     return JSON.stringify({ ...contentReference, document: { blocks: [] } });
   };
+  ops.op_host_content_create_v1 = async (payload) => {
+    calls.push(["content_create", JSON.parse(payload)]);
+    return JSON.stringify({
+      execution_id: contentReference.execution_id,
+      origin: { kind: "on_demand", request: contentRequest },
+      status: "running",
+    });
+  };
   ops.op_host_model_complete_v1 = async (payload) => {
     const request = JSON.parse(payload);
     requests.push(request);
@@ -441,6 +466,7 @@ test("the current Rust op registration starts the bundle and serves explicit sou
     const step = [
       ["knowledge_text_read", manualReference],
       ["content_document_read", contentReference],
+      ["content_create", contentRequest],
     ][requests.length - 1];
     return JSON.stringify(
       step
@@ -468,8 +494,9 @@ test("the current Rust op registration starts the bundle and serves explicit sou
     assert.deepEqual(calls, [
       ["knowledge_text_read", manualReference],
       ["content_document_read", contentReference],
+      ["content_create", contentRequest],
     ]);
-    assert.equal(requests.length, 3);
+    assert.equal(requests.length, 4);
     assert.match(requests[1].messages.at(-1).content, /Two years/u);
     assert.equal(emitted.length, 1);
     assert.equal(emitted[0][0], "loop.completed");
@@ -1139,6 +1166,7 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "measurement_plan_create",
         "measurement_plan_read",
         "content_start",
+        "content_create",
         "content_execution_read",
         "content_media_list",
         "content_document_read",
@@ -1601,6 +1629,7 @@ test("attachment-only turn imports bound items, reads its exact source version, 
         "measurement_plan_create",
         "measurement_plan_read",
         "content_start",
+        "content_create",
         "content_execution_read",
         "content_media_list",
         "content_document_read",
@@ -2391,6 +2420,112 @@ test("a failed candidate-question write never completes as a saved prediction", 
     );
     assert.equal(modelCalls, 1);
     assert.deepEqual(events, []);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("homepage content create discovers a scoped schema and preserves its frozen request on retry", async () => {
+  const request = {
+    request_id: "00000000-0000-4000-8000-000000000311",
+    topic: "Equipment maintenance",
+    source_version_ids: [
+      "00000000-0000-4000-8000-000000000312",
+      "00000000-0000-4000-8000-000000000313",
+    ],
+    documents: [
+      {
+        key: "guide",
+        content_type: "article",
+        title: "Maintenance guide",
+        instructions: "Use only the selected sources",
+      },
+      {
+        key: "questions",
+        content_type: "faq",
+        title: null,
+        instructions: null,
+      },
+    ],
+    language: "en",
+    market: null,
+    audience: null,
+  };
+  const executionId = "00000000-0000-4000-8000-000000000314";
+  const receipt = {
+    execution_id: executionId,
+    origin: { kind: "on_demand", request },
+    status: "running",
+    coverage: {
+      total: 2,
+      ready: 0,
+      blocked: 0,
+      deferred: 0,
+      not_applicable: 0,
+      cancelled: 0,
+      incomplete: 2,
+    },
+  };
+  const calls = [];
+  let modelCall = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async contentCreate(input) {
+      calls.push(input);
+      return receipt;
+    },
+    async modelComplete(input) {
+      const schema = input.tools.find(
+        (tool) => tool.function.name === "content_create",
+      ).function.parameters;
+      assert.equal(schema.additionalProperties, false);
+      assert.deepEqual(schema.required, Object.keys(request));
+      assert.deepEqual(Object.keys(schema.properties), Object.keys(request));
+      assert.equal(schema.properties.request_id.format, "uuid");
+      assert.equal(schema.properties.source_version_ids.items.format, "uuid");
+      assert.equal(
+        schema.properties.documents.items.additionalProperties,
+        false,
+      );
+      assert.deepEqual(schema.properties.documents.items.required, [
+        "key",
+        "content_type",
+        "title",
+        "instructions",
+      ]);
+      assert.deepEqual(schema.properties.market.type, ["string", "null"]);
+      assert.match(input.system, /Never invent a brand or cycle/u);
+      assert.match(input.system, /exact selected ready source versions/u);
+      const next = modelCall++;
+      if (next < 2) {
+        return {
+          ...finalModelAnswer(""),
+          finish_reason: "tool_calls",
+          tool_calls: [
+            {
+              id: `on-demand-${next}`,
+              type: "function",
+              function: {
+                name: "content_create",
+                arguments: JSON.stringify(request),
+              },
+            },
+          ],
+        };
+      }
+      assert.match(input.messages.at(-1).content, /"status":"running"/u);
+      assert.match(input.messages.at(-1).content, /"kind":"on_demand"/u);
+      return finalModelAnswer("The two content documents are queued.");
+    },
+  };
+  try {
+    const { main } = await import(`${bundlePath.href}?onDemand=${Date.now()}`);
+    const result = await main({
+      ...historyTurn,
+      prompt: "Create an article and FAQ using the selected sources",
+    });
+    assert.equal(result.answer, "The two content documents are queued.");
+    assert.deepEqual(calls, [request, request]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

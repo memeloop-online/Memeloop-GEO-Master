@@ -1021,12 +1021,14 @@ pub trait ProjectRepository: Send + Sync {
         ))
     }
     /// Keep the project eligibility read lock across one content-repository
-    /// commit. Acquire before the knowledge guard, and never await project or
+    /// commit. On-demand work accepts unarchived draft and paused projects;
+    /// automatic work requires an active project. Acquire before the knowledge guard, and never await project or
     /// knowledge operations again while either read lock is held.
     async fn hold_content_project<'a>(
         &'a self,
         _scope: &TenantScope,
         _project_id: ProjectId,
+        _on_demand: bool,
     ) -> Result<ContentProjectGuard<'a>, AppError> {
         Err(AppError::capability_missing(
             "atomic content project eligibility guard is unavailable",
@@ -1343,6 +1345,7 @@ impl ProjectRepository for MemoryProjectRepository {
         &'a self,
         scope: &TenantScope,
         project_id: ProjectId,
+        on_demand: bool,
     ) -> Result<ContentProjectGuard<'a>, AppError> {
         if scope.project_id != Some(project_id) {
             return Err(AppError::forbidden("project is outside content scope"));
@@ -1355,7 +1358,9 @@ impl ProjectRepository for MemoryProjectRepository {
                 project.operator_id == scope.operator_id && project.tenant_id == scope.tenant_id
             })
             .ok_or_else(|| AppError::not_found("project not found"))?;
-        if project.status != ProjectStatus::Active {
+        if project.status == ProjectStatus::Archived
+            || (!on_demand && project.status != ProjectStatus::Active)
+        {
             return Err(AppError::conflict(
                 "project is not active for public content",
             ));
@@ -2235,7 +2240,10 @@ mod tests {
         .unwrap();
         project.status = ProjectStatus::Active;
         repository.insert(project).await.unwrap();
-        let held = repository.hold_content_project(&scope, id).await.unwrap();
+        let held = repository
+            .hold_content_project(&scope, id, false)
+            .await
+            .unwrap();
         assert_eq!(held.mode(), super::ContentGuardMode::Held);
         let writer_repo = repository.clone();
         let writer = tokio::spawn(async move {
@@ -2252,7 +2260,67 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(repository.hold_content_project(&scope, id).await.is_err());
+        assert!(
+            repository
+                .hold_content_project(&scope, id, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .hold_content_project(&scope, id, true)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_content_project_guard_allows_draft_and_rejects_archived() {
+        let repository = MemoryProjectRepository::new();
+        let id = Uuid::new_v4().into();
+        let scope = super::TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), Some(id));
+        let project = super::Project::new(
+            id,
+            &scope,
+            "manual-content",
+            "Manual content",
+            ProjectSettings::default(),
+        )
+        .unwrap();
+        repository.insert(project).await.unwrap();
+        assert!(
+            repository
+                .hold_content_project(&scope, id, true)
+                .await
+                .is_ok()
+        );
+        assert!(
+            repository
+                .hold_content_project(&scope, id, false)
+                .await
+                .is_err()
+        );
+        repository
+            .state
+            .write()
+            .await
+            .projects
+            .get_mut(&id)
+            .unwrap()
+            .status = ProjectStatus::Archived;
+        assert!(
+            repository
+                .hold_content_project(&scope, id, true)
+                .await
+                .is_err()
+        );
+        let other = super::TenantScope::new(scope.operator_id, Uuid::new_v4().into(), Some(id));
+        assert!(
+            repository
+                .hold_content_project(&other, id, true)
+                .await
+                .is_err()
+        );
     }
 
     fn utc(value: &str) -> DateTime<Utc> {

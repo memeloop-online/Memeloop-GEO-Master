@@ -953,6 +953,83 @@ pub struct DocumentManifestPlanRequest {
 }
 
 pub const DOCUMENT_PLANNER_VERSION: &str = "deterministic-document-v1";
+pub const ON_DEMAND_DOCUMENT_PLANNER_VERSION: &str = "on-demand-document-v1";
+
+/// Freeze exactly the requested source versions and document branches. Source
+/// eligibility is rechecked atomically when the repository stores this manifest.
+pub fn build_on_demand_manifest(
+    scope: &TenantScope,
+    request: &crate::ContentCreateRequest,
+    release: &KnowledgeRelease,
+) -> Result<DocumentManifest, AppError> {
+    request.validate()?;
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::invalid_request("project_id is required for on-demand content"))?;
+    if release.operator_id != scope.operator_id
+        || release.tenant_id != scope.tenant_id
+        || release.project_id != project_id
+    {
+        return Err(AppError::not_found("knowledge release not found"));
+    }
+    if request
+        .source_version_ids
+        .iter()
+        .any(|id| !release.source_version_refs.contains(id))
+    {
+        return Err(AppError::conflict(
+            "selected source version is outside the knowledge release",
+        ));
+    }
+    let manifest_id = deterministic_uuid(&format!(
+        "on-demand-manifest:{}:{}:{}:{}",
+        scope.operator_id, scope.tenant_id, project_id, request.request_id
+    ));
+    let scope_hash = request.input_hash()?;
+    let items = request
+        .documents
+        .iter()
+        .map(|document| DocumentManifestItem {
+            document_manifest_item_id: deterministic_uuid(&format!(
+                "{manifest_id}:{}",
+                document.key
+            )),
+            manifest_id,
+            knowledge_release_id: release.knowledge_release_id,
+            document_key: document.key.clone(),
+            content_type: document.content_type.clone(),
+            product_id: None,
+            market: request
+                .market
+                .clone()
+                .unwrap_or_else(|| "default".to_owned()),
+            language: request.language.clone(),
+            state: DocumentManifestItemState::Planned,
+            block_reason: None,
+            dependency_hash: sha256_hex(format!("{scope_hash}:{}", document.key).as_bytes()),
+            source_version_refs: request.source_version_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(DocumentManifest {
+        manifest_id,
+        operator_id: scope.operator_id,
+        tenant_id: scope.tenant_id,
+        project_id,
+        revision: 1,
+        knowledge_release_id: release.knowledge_release_id,
+        planner_version: ON_DEMAND_DOCUMENT_PLANNER_VERSION.to_owned(),
+        state: DocumentManifestState::Ready,
+        sealed: true,
+        expected_count: Some(items.len() as i64),
+        scope_hash,
+        coverage: DocumentManifestCoverage {
+            total: items.len() as u64,
+            planned: items.len() as u64,
+            ..DocumentManifestCoverage::default()
+        },
+        items,
+    })
+}
 
 /// Build a bounded, stable set of document branches from a frozen release.
 /// The order and keys are deterministic, so callers can safely page or resume
@@ -1512,6 +1589,11 @@ pub trait KnowledgeRepository: Send + Sync {
         scope: &TenantScope,
         request: DocumentManifestPlanRequest,
         document_scope: DocumentScope,
+    ) -> Result<DocumentManifest, AppError>;
+    async fn save_on_demand_manifest(
+        &self,
+        scope: &TenantScope,
+        manifest: DocumentManifest,
     ) -> Result<DocumentManifest, AppError>;
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError>;
 }
@@ -4956,6 +5038,87 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
         Ok(manifest)
     }
 
+    async fn save_on_demand_manifest(
+        &self,
+        scope: &TenantScope,
+        manifest: DocumentManifest,
+    ) -> Result<DocumentManifest, AppError> {
+        let project_id = Self::require_project(scope)?;
+        if manifest.operator_id != scope.operator_id
+            || manifest.tenant_id != scope.tenant_id
+            || manifest.project_id != project_id
+        {
+            return Err(AppError::forbidden("manifest is outside project scope"));
+        }
+        if manifest.planner_version != ON_DEMAND_DOCUMENT_PLANNER_VERSION
+            || !manifest.sealed
+            || manifest.expected_count != Some(manifest.items.len() as i64)
+            || manifest.items.is_empty()
+        {
+            return Err(AppError::invalid_request(
+                "sealed on-demand manifest required",
+            ));
+        }
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.document_manifests.get(&manifest.manifest_id) {
+            if existing.operator_id != scope.operator_id
+                || existing.tenant_id != scope.tenant_id
+                || existing.project_id != project_id
+                || existing.scope_hash != manifest.scope_hash
+                || existing.planner_version != manifest.planner_version
+            {
+                return Err(AppError::conflict(
+                    "content request ID was already used with different input",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        let release = state
+            .releases
+            .get(&manifest.knowledge_release_id)
+            .filter(|release| Self::in_scope(scope, *release))
+            .ok_or_else(|| AppError::not_found("knowledge release not found"))?;
+        let mut keys = std::collections::HashSet::new();
+        let mut item_ids = std::collections::HashSet::new();
+        for item in &manifest.items {
+            if item.manifest_id != manifest.manifest_id
+                || item.knowledge_release_id != release.knowledge_release_id
+                || item.state != DocumentManifestItemState::Planned
+                || !keys.insert(item.document_key.as_str())
+                || !item_ids.insert(item.document_manifest_item_id)
+                || item.source_version_refs.is_empty()
+            {
+                return Err(AppError::invalid_request(
+                    "on-demand manifest has inconsistent branches",
+                ));
+            }
+            for id in &item.source_version_refs {
+                let version = state
+                    .versions
+                    .get(id)
+                    .filter(|version| Self::in_scope(scope, *version))
+                    .filter(|_| release.source_version_refs.contains(id))
+                    .ok_or_else(|| {
+                        AppError::conflict("selected source is outside frozen release")
+                    })?;
+                if !state.sources.get(&version.source_id).is_some_and(|source| {
+                    Self::in_scope(scope, source)
+                        && source.state == SourceState::Active
+                        && source.purpose == KnowledgePurpose::Public
+                        && source.current_version_id == Some(*id)
+                }) {
+                    return Err(AppError::conflict(
+                        "selected source is no longer public or current",
+                    ));
+                }
+            }
+        }
+        state
+            .document_manifests
+            .insert(manifest.manifest_id, manifest.clone());
+        Ok(manifest)
+    }
+
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError> {
         Self::require_project(scope)?;
         let state = self.state.read().await;
@@ -6943,6 +7106,189 @@ mod tests {
                 .put_upload_content(&other, session.upload_session_id, b"x".to_vec())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_manifest_freezes_only_selected_public_versions_and_rechecks_revocation() {
+        use crate::{ContentCreateDocument, ContentCreateRequest, ErrorCode};
+        let repository = MemoryKnowledgeRepository::default();
+        let scope = scope();
+        let imported = repository
+            .import_batch(
+                &scope,
+                (0..4)
+                    .map(|index| ImportItem {
+                        client_item_id: format!("selected-source-{index}"),
+                        kind: SourceKind::Text,
+                        name: format!("Reference {index}"),
+                        purpose: if index == 3 {
+                            KnowledgePurpose::Internal
+                        } else {
+                            KnowledgePurpose::Public
+                        },
+                        text: Some(format!("Reference {index} describes rated capacity.")),
+                        url: None,
+                        object_id: None,
+                        knowledge_release_id: None,
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let release = imported.items[3].release.as_ref().unwrap();
+        let request = ContentCreateRequest {
+            request_id: Uuid::new_v4(),
+            topic: "Choosing an air filter".into(),
+            source_version_ids: imported.items[..2]
+                .iter()
+                .map(|item| item.source_version.as_ref().unwrap().source_version_id)
+                .collect(),
+            documents: vec![
+                ContentCreateDocument {
+                    key: "article".into(),
+                    content_type: "article".into(),
+                    title: None,
+                    instructions: None,
+                },
+                ContentCreateDocument {
+                    key: "faq".into(),
+                    content_type: "faq".into(),
+                    title: None,
+                    instructions: None,
+                },
+            ],
+            language: "en".into(),
+            market: None,
+            audience: None,
+        };
+        let manifest = super::build_on_demand_manifest(&scope, &request, release).unwrap();
+        assert_eq!(manifest.items.len(), 2);
+        assert_eq!(manifest.expected_count, Some(2));
+        assert!(
+            manifest
+                .items
+                .iter()
+                .all(|item| item.source_version_refs == request.source_version_ids)
+        );
+        let stored = repository
+            .save_on_demand_manifest(&scope, manifest.clone())
+            .await
+            .unwrap();
+        assert_eq!(stored, manifest);
+        assert_eq!(
+            repository
+                .get_document_manifest(&scope, manifest.manifest_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            manifest
+        );
+        let guard_inputs = manifest
+            .items
+            .iter()
+            .map(|item| super::ContentPublicEligibility {
+                document_manifest_id: manifest.manifest_id,
+                document_manifest_item_id: item.document_manifest_item_id,
+                source_version_ids: item.source_version_refs.clone(),
+                evidence: vec![],
+            })
+            .collect::<Vec<_>>();
+        drop(
+            repository
+                .hold_content_evidence(&scope, &guard_inputs)
+                .await
+                .unwrap(),
+        );
+
+        let foreign_scope = TenantScope {
+            project_id: Some(Uuid::new_v4().into()),
+            ..scope.clone()
+        };
+        assert!(super::build_on_demand_manifest(&foreign_scope, &request, release).is_err());
+        assert!(
+            repository
+                .get_document_manifest(&foreign_scope, manifest.manifest_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repository
+                .save_on_demand_manifest(&foreign_scope, manifest.clone())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Forbidden
+        );
+        let mut outside = request.clone();
+        outside.source_version_ids[0] = Uuid::new_v4();
+        assert!(super::build_on_demand_manifest(&scope, &outside, release).is_err());
+
+        let mut internal = request.clone();
+        internal.request_id = Uuid::new_v4();
+        internal.source_version_ids = vec![
+            imported.items[3]
+                .source_version
+                .as_ref()
+                .unwrap()
+                .source_version_id,
+        ];
+        let internal_manifest =
+            super::build_on_demand_manifest(&scope, &internal, release).unwrap();
+        assert_eq!(
+            repository
+                .save_on_demand_manifest(&scope, internal_manifest)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+
+        let mut changed = request.clone();
+        changed.audience = Some("Different readers".into());
+        let changed_manifest = super::build_on_demand_manifest(&scope, &changed, release).unwrap();
+        assert_eq!(
+            repository
+                .save_on_demand_manifest(&scope, changed_manifest)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let revoked_source = imported.items[0].source.as_ref().unwrap().source_id;
+        repository
+            .state
+            .write()
+            .await
+            .sources
+            .get_mut(&revoked_source)
+            .unwrap()
+            .purpose = KnowledgePurpose::Internal;
+        assert!(
+            repository
+                .hold_content_evidence(&scope, &guard_inputs)
+                .await
+                .is_err()
+        );
+        let mut new_request = request.clone();
+        new_request.request_id = Uuid::new_v4();
+        let revoked_manifest =
+            super::build_on_demand_manifest(&scope, &new_request, release).unwrap();
+        assert_eq!(
+            repository
+                .save_on_demand_manifest(&scope, revoked_manifest)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            repository
+                .save_on_demand_manifest(&scope, manifest.clone())
+                .await
+                .unwrap(),
+            manifest
         );
     }
 

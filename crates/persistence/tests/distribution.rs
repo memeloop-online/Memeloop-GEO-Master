@@ -3,13 +3,14 @@ use chrono::{Duration, Utc};
 use geo_domain::{
     ChannelJobRepository, ChannelOutcome, ChannelOutcomeStatus, ChannelPlan, ChannelTargetInput,
     ChunkLocator, ContentBlock, ContentBlockKind, ContentCheck, ContentCoverage, ContentEvidence,
-    ContentExecution, ContentExecutionStatus, ContentHandoff, ContentHandoffItem,
-    ContentItemStatus, ContentRevision, DistributionRepository, DistributionTargetStatus,
-    DocumentManifest, DocumentManifestItemState, ErrorCode, EvidenceRef, FreezeDistribution,
-    InitialSource, InitialSourceKind, InitialSourceVisibility, MediaObjectKey, MediaReference,
-    PlatformPlacement, PreparedDistribution, ProjectCreate, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, RICH_MARKDOWN_FORMAT, RichContent, RichNode, StructuredDocument,
-    TenantScope, VerifiedImage, hash_idempotency_key, settings_hash, start_request_hash,
+    ContentExecution, ContentExecutionOrigin, ContentExecutionStatus, ContentHandoff,
+    ContentHandoffItem, ContentItemStatus, ContentRevision, DistributionRepository,
+    DistributionTargetStatus, DocumentManifest, DocumentManifestItemState, ErrorCode, EvidenceRef,
+    FreezeDistribution, InitialSource, InitialSourceKind, InitialSourceVisibility, MediaObjectKey,
+    MediaReference, PlatformPlacement, PreparedDistribution, ProjectCreate, ProjectRepository,
+    ProjectSettings, ProjectStartCommand, RICH_MARKDOWN_FORMAT, RichContent, RichNode,
+    StructuredDocument, TenantScope, VerifiedImage, hash_idempotency_key, settings_hash,
+    start_request_hash,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgChannelJobRepository, PgContentMediaRepository,
@@ -225,7 +226,9 @@ async fn fixture(pool: &PgPool) -> Fixture {
     let execution = ContentExecution {
         execution_id,
         project_id: project.id,
-        cycle_id: accepted.cycle_id,
+        origin: ContentExecutionOrigin::Cycle {
+            cycle_id: accepted.cycle_id,
+        },
         manifest_id: document_id,
         manifest_revision: manifest.revision,
         policy_version: "fixture".into(),
@@ -1003,7 +1006,7 @@ async fn next_cycle(pool: &PgPool, first: &Fixture) -> Fixture {
     let handoff_id = Uuid::new_v4();
     let mut execution = first.execution.clone();
     execution.execution_id = execution_id;
-    execution.cycle_id = cycle;
+    execution.origin = ContentExecutionOrigin::Cycle { cycle_id: cycle };
     execution.manifest_id = document_id;
     execution.input_hash = format!("fixture-{execution_id}");
     execution.handoff_id = Some(handoff_id);

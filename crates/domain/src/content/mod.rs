@@ -22,6 +22,99 @@ pub const RICH_GENERATION_POLICY_VERSION: &str = "rich-content-generation-v2";
 pub const RICH_CHECK_POLICY_VERSION: &str = "rich-content-check-v2";
 pub const RICH_REPAIR_POLICY_VERSION: &str = "rich-content-repair-v2";
 
+/// Frozen user input for one project-scoped, manually requested content run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContentCreateRequest {
+    pub request_id: Uuid,
+    pub topic: String,
+    pub source_version_ids: Vec<Uuid>,
+    pub documents: Vec<ContentCreateDocument>,
+    pub language: String,
+    pub market: Option<String>,
+    pub audience: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContentCreateDocument {
+    pub key: String,
+    pub content_type: String,
+    pub title: Option<String>,
+    pub instructions: Option<String>,
+}
+
+impl ContentCreateRequest {
+    pub fn validate(&self) -> Result<(), AppError> {
+        let nonempty =
+            |value: &str, max: usize| !value.trim().is_empty() && value.chars().count() <= max;
+        let optional = |value: &Option<String>, max: usize| {
+            value.as_ref().is_none_or(|value| nonempty(value, max))
+        };
+        let mut sources = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        if self.request_id.is_nil()
+            || !nonempty(&self.topic, 20_000)
+            || !nonempty(&self.language, 128)
+            || !optional(&self.market, 256)
+            || !optional(&self.audience, 4_000)
+            || self.source_version_ids.is_empty()
+            || self.source_version_ids.len() > 10_000
+            || self
+                .source_version_ids
+                .iter()
+                .any(|id| id.is_nil() || !sources.insert(*id))
+            || self.documents.is_empty()
+            || self.documents.len() > 10_000
+            || self.documents.iter().any(|document| {
+                !nonempty(&document.key, 256)
+                    || !keys.insert(document.key.trim())
+                    || !nonempty(&document.content_type, 128)
+                    || !optional(&document.title, 2_000)
+                    || !optional(&document.instructions, 20_000)
+            })
+        {
+            return Err(AppError::invalid_request(
+                "content request requires a request ID, topic, language, unique source versions and document keys",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn input_hash(&self) -> Result<String, AppError> {
+        self.validate()?;
+        let frozen = serde_json::to_string(self)
+            .map_err(|_| AppError::invalid_request("content request cannot be serialized"))?;
+        Ok(hash(&["on-demand-content-v1", &frozen]))
+    }
+
+    pub fn execution_id(&self, scope: &TenantScope) -> Result<Uuid, AppError> {
+        let project_id = scope.project_id.ok_or_else(|| {
+            AppError::invalid_request("project_id is required for on-demand content")
+        })?;
+        Ok(stable_id(&format!(
+            "on-demand-content:{}:{}:{}:{}",
+            scope.operator_id, scope.tenant_id, project_id, self.request_id
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContentExecutionOrigin {
+    Cycle { cycle_id: Uuid },
+    OnDemand { request: ContentCreateRequest },
+}
+
+impl ContentExecutionOrigin {
+    pub fn cycle_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Cycle { cycle_id } => Some(*cycle_id),
+            Self::OnDemand { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentExecutionStatus {
@@ -560,7 +653,7 @@ pub struct ContentHandoff {
 pub struct ContentExecution {
     pub execution_id: Uuid,
     pub project_id: ProjectId,
-    pub cycle_id: Uuid,
+    pub origin: ContentExecutionOrigin,
     pub manifest_id: Uuid,
     pub manifest_revision: i32,
     pub policy_version: String,
@@ -569,6 +662,11 @@ pub struct ContentExecution {
     pub expected_count: u64,
     pub coverage: ContentCoverage,
     pub handoff_id: Option<Uuid>,
+}
+impl ContentExecution {
+    pub fn cycle_id(&self) -> Option<Uuid> {
+        self.origin.cycle_id()
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentItem {
@@ -647,6 +745,20 @@ pub fn start_content_state(
     manifest: &DocumentManifest,
     policy_version: &str,
 ) -> Result<ContentState, AppError> {
+    start_content_state_with_origin(
+        scope,
+        ContentExecutionOrigin::Cycle { cycle_id },
+        manifest,
+        policy_version,
+    )
+}
+
+pub fn start_content_state_with_origin(
+    scope: &TenantScope,
+    origin: ContentExecutionOrigin,
+    manifest: &DocumentManifest,
+    policy_version: &str,
+) -> Result<ContentState, AppError> {
     if scope.project_id != Some(manifest.project_id)
         || scope.operator_id != manifest.operator_id
         || scope.tenant_id != manifest.tenant_id
@@ -661,16 +773,48 @@ pub fn start_content_state(
             "sealed manifest and policy version required",
         ));
     }
+    let origin_key = match &origin {
+        ContentExecutionOrigin::Cycle { cycle_id } => cycle_id.to_string(),
+        ContentExecutionOrigin::OnDemand { request } => {
+            request.validate()?;
+            let mut selected = request.source_version_ids.clone();
+            selected.sort_unstable();
+            if manifest.items.len() != request.documents.len()
+                || manifest.items.iter().any(|item| {
+                    let mut refs = item.source_version_refs.clone();
+                    refs.sort_unstable();
+                    refs != selected
+                        || !request.documents.iter().any(|document| {
+                            document.key == item.document_key
+                                && document.content_type == item.content_type
+                        })
+                        || item.language != request.language
+                        || item.market != request.market.as_deref().unwrap_or("default")
+                })
+                || manifest.scope_hash != request.input_hash()?
+            {
+                return Err(AppError::invalid_request(
+                    "on-demand manifest differs from frozen request",
+                ));
+            }
+            format!("on_demand:{}", request.request_id)
+        }
+    };
     let root = format!(
         "{}:{}:{}:{}:{}:{}",
         scope.operator_id,
         scope.tenant_id,
         manifest.project_id,
-        cycle_id,
+        origin_key,
         manifest.manifest_id,
         manifest.revision
     );
-    let execution_id = stable_id(&format!("content:{root}:{}", policy_version));
+    let execution_id = match &origin {
+        ContentExecutionOrigin::Cycle { .. } => {
+            stable_id(&format!("content:{root}:{}", policy_version))
+        }
+        ContentExecutionOrigin::OnDemand { request } => request.execution_id(scope)?,
+    };
     let mut items = Vec::with_capacity(manifest.items.len());
     let mut item_ids = std::collections::HashSet::new();
     let mut keys = std::collections::HashSet::new();
@@ -684,7 +828,10 @@ pub fn start_content_state(
                 "manifest contains inconsistent or repeated items",
             ));
         }
-        let branch_key = format!("{cycle_id}:{}:{}", manifest.revision, planned.document_key);
+        let branch_key = format!(
+            "{origin_key}:{}:{}",
+            manifest.revision, planned.document_key
+        );
         let frozen_item = serde_json::to_string(planned)
             .map_err(|_| AppError::invalid_request("manifest item cannot be serialized"))?;
         let input_hash = hash(&[&branch_key, &frozen_item, policy_version]);
@@ -735,7 +882,7 @@ pub fn start_content_state(
         execution: ContentExecution {
             execution_id,
             project_id: manifest.project_id,
-            cycle_id,
+            origin,
             manifest_id: manifest.manifest_id,
             manifest_revision: manifest.revision,
             policy_version: policy_version.to_owned(),
@@ -1665,6 +1812,13 @@ pub trait ContentRepository: Send + Sync {
         manifest: DocumentManifest,
         policy_version: &str,
     ) -> Result<ContentExecution, AppError>;
+    async fn start_on_demand(
+        &self,
+        scope: &TenantScope,
+        request: ContentCreateRequest,
+        manifest: DocumentManifest,
+        policy_version: &str,
+    ) -> Result<ContentExecution, AppError>;
     async fn prepare_or_reuse(
         &self,
         scope: &TenantScope,
@@ -1934,6 +2088,36 @@ impl ContentRepository for MemoryContentRepository {
         }
         let result = state.execution.clone();
         guard.insert(result.execution_id, (scope.clone(), state));
+        Ok(result)
+    }
+    async fn start_on_demand(
+        &self,
+        scope: &TenantScope,
+        request: ContentCreateRequest,
+        manifest: DocumentManifest,
+        policy_version: &str,
+    ) -> Result<ContentExecution, AppError> {
+        request.validate()?;
+        let execution_id = request.execution_id(scope)?;
+        let mut guard = self.state.write().await;
+        if let Some((stored_scope, existing)) = guard.get(&execution_id) {
+            if stored_scope != scope
+                || existing.execution.origin != (ContentExecutionOrigin::OnDemand { request })
+            {
+                return Err(AppError::conflict(
+                    "content request ID was already used with different input",
+                ));
+            }
+            return Ok(existing.execution.clone());
+        }
+        let state = start_content_state_with_origin(
+            scope,
+            ContentExecutionOrigin::OnDemand { request },
+            &manifest,
+            policy_version,
+        )?;
+        let result = state.execution.clone();
+        guard.insert(execution_id, (scope.clone(), state));
         Ok(result)
     }
     async fn prepare_or_reuse(
@@ -2366,7 +2550,7 @@ impl ContentRepository for MemoryContentRepository {
             .read()
             .await
             .values()
-            .filter(|(s, v)| scope.contains(s) && v.execution.cycle_id == cycle_id)
+            .filter(|(s, v)| scope.contains(s) && v.execution.cycle_id() == Some(cycle_id))
             .map(|(_, v)| v.execution.clone())
             .collect())
     }
@@ -3019,6 +3203,358 @@ impl ContentRepository for MemoryContentRepository {
 }
 
 #[cfg(test)]
+mod on_demand_tests {
+    use super::*;
+    use crate::{
+        ChunkLocator, ErrorCode, KnowledgeCoverage, KnowledgeRelease, build_on_demand_manifest,
+    };
+
+    fn fixture() -> (TenantScope, ContentCreateRequest, KnowledgeRelease) {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let selected = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let mut all_sources = selected.clone();
+        all_sources.push(Uuid::new_v4());
+        let request = ContentCreateRequest {
+            request_id: Uuid::new_v4(),
+            topic: "Choosing a home air filter".into(),
+            source_version_ids: selected,
+            documents: vec![
+                ContentCreateDocument {
+                    key: "guide".into(),
+                    content_type: "article".into(),
+                    title: Some("Filter selection guide".into()),
+                    instructions: Some("Explain the sizing tradeoffs".into()),
+                },
+                ContentCreateDocument {
+                    key: "questions".into(),
+                    content_type: "faq".into(),
+                    title: None,
+                    instructions: None,
+                },
+            ],
+            language: "en".into(),
+            market: None,
+            audience: Some("Homeowners".into()),
+        };
+        let release = KnowledgeRelease {
+            knowledge_release_id: Uuid::new_v4(),
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id: scope.project_id.unwrap(),
+            sequence: 1,
+            previous_release_id: None,
+            source_version_refs: all_sources,
+            fact_revision_refs: vec![],
+            index_build_id: "test".into(),
+            pipeline_versions: serde_json::json!({}),
+            content_hash: "test".into(),
+            coverage: KnowledgeCoverage {
+                source_version_count: 3,
+                chunk_count: 3,
+                failed_source_count: 0,
+                blocked_reasons: vec![],
+            },
+            created_at: Utc::now(),
+        };
+        (scope, request, release)
+    }
+
+    #[tokio::test]
+    async fn request_replay_freezes_two_branches_and_is_project_scoped() {
+        let repo = MemoryContentRepository::new();
+        let (scope, request, release) = fixture();
+        let manifest = build_on_demand_manifest(&scope, &request, &release).unwrap();
+        let execution = repo
+            .start_on_demand(
+                &scope,
+                request.clone(),
+                manifest.clone(),
+                RICH_GENERATION_POLICY_VERSION,
+            )
+            .await
+            .unwrap();
+        assert_eq!(execution.cycle_id(), None);
+        assert_eq!(
+            execution.origin,
+            ContentExecutionOrigin::OnDemand {
+                request: request.clone()
+            }
+        );
+        let items = repo
+            .list_items(&scope, execution.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].content_type, "article");
+        assert_eq!(items[1].content_type, "faq");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.source_version_refs == request.source_version_ids)
+        );
+
+        let mut newer_release = release.clone();
+        newer_release.knowledge_release_id = Uuid::new_v4();
+        newer_release.source_version_refs.push(Uuid::new_v4());
+        let newer_manifest = build_on_demand_manifest(&scope, &request, &newer_release).unwrap();
+        let replay = repo
+            .start_on_demand(&scope, request.clone(), newer_manifest, "new-server-policy")
+            .await
+            .unwrap();
+        assert_eq!(execution, replay);
+        assert_eq!(
+            items,
+            repo.list_items(&scope, execution.execution_id)
+                .await
+                .unwrap()
+        );
+        let mut changed = request.clone();
+        changed.documents[0].instructions = Some("Different writing constraints".into());
+        let changed_manifest = build_on_demand_manifest(&scope, &changed, &release).unwrap();
+        assert_eq!(
+            repo.start_on_demand(
+                &scope,
+                changed,
+                changed_manifest,
+                RICH_GENERATION_POLICY_VERSION
+            )
+            .await
+            .unwrap_err()
+            .code,
+            ErrorCode::Conflict
+        );
+
+        let other_scope = TenantScope {
+            project_id: Some(Uuid::new_v4().into()),
+            ..scope.clone()
+        };
+        assert!(
+            repo.get_execution(&other_scope, execution.execution_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let other_release = KnowledgeRelease {
+            project_id: other_scope.project_id.unwrap(),
+            ..release
+        };
+        let other_manifest =
+            build_on_demand_manifest(&other_scope, &request, &other_release).unwrap();
+        let other = repo
+            .start_on_demand(
+                &other_scope,
+                request,
+                other_manifest,
+                RICH_GENERATION_POLICY_VERSION,
+            )
+            .await
+            .unwrap();
+        assert_ne!(other.execution_id, execution.execution_id);
+    }
+
+    #[test]
+    fn execution_rejects_source_expansion_and_changed_document_specs() {
+        let (scope, request, release) = fixture();
+        let manifest = build_on_demand_manifest(&scope, &request, &release).unwrap();
+        let mut expanded = manifest.clone();
+        expanded.items[0]
+            .source_version_refs
+            .push(release.source_version_refs[2]);
+        assert!(
+            start_content_state_with_origin(
+                &scope,
+                ContentExecutionOrigin::OnDemand {
+                    request: request.clone()
+                },
+                &expanded,
+                RICH_GENERATION_POLICY_VERSION
+            )
+            .is_err()
+        );
+        let mut changed = manifest;
+        changed.items[1].content_type = "article".into();
+        assert!(
+            start_content_state_with_origin(
+                &scope,
+                ContentExecutionOrigin::OnDemand { request },
+                &changed,
+                RICH_GENERATION_POLICY_VERSION
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_branch_preserves_checked_asset_and_sealed_result_on_replay() {
+        let repo = MemoryContentRepository::new();
+        let (scope, request, release) = fixture();
+        let manifest = build_on_demand_manifest(&scope, &request, &release).unwrap();
+        let execution = repo
+            .start_on_demand(
+                &scope,
+                request.clone(),
+                manifest.clone(),
+                RICH_GENERATION_POLICY_VERSION,
+            )
+            .await
+            .unwrap();
+        let item_id = manifest.items[0].document_manifest_item_id;
+        let reference = EvidenceRef {
+            source_version_id: request.source_version_ids[0],
+            chunk_id: Some(Uuid::new_v4()),
+            locator: ChunkLocator::Text {
+                start_line: 1,
+                end_line: 1,
+                start_char: 0,
+                end_char: 10,
+            },
+        };
+        let prepare = repo
+            .claim(
+                &scope,
+                execution.execution_id,
+                item_id,
+                ContentStep::Prepare,
+                "test",
+                Utc::now(),
+                60,
+            )
+            .await
+            .unwrap();
+        repo.complete_prepare(
+            &scope,
+            &prepare,
+            ContentBrief {
+                brief_id: Uuid::new_v4(),
+                title: "Filter guide".into(),
+                objective: "Explain supported sizing".into(),
+                evidence: vec![reference.clone()],
+                quotes: vec![ContentEvidence {
+                    reference: reference.clone(),
+                    exact_quote: "Rated capacity".into(),
+                }],
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let generate = repo
+            .claim(
+                &scope,
+                execution.execution_id,
+                item_id,
+                ContentStep::Generate,
+                "test",
+                Utc::now(),
+                60,
+            )
+            .await
+            .unwrap();
+        let revision = repo
+            .complete_generate(
+                &scope,
+                &generate,
+                StructuredDocument {
+                    title: "Filter guide".into(),
+                    schema_version: 2,
+                    blocks: vec![ContentBlock {
+                        block_id: Uuid::new_v4(),
+                        kind: ContentBlockKind::Paragraph,
+                        text: "Choose according to rated capacity.".into(),
+                        citation_ids: vec![reference.chunk_id.unwrap()],
+                        items: vec![],
+                        rich: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let check = repo
+            .claim(
+                &scope,
+                execution.execution_id,
+                item_id,
+                ContentStep::Check,
+                RICH_CHECK_POLICY_VERSION,
+                Utc::now(),
+                60,
+            )
+            .await
+            .unwrap();
+        repo.complete_check(&scope, &check, vec![]).await.unwrap();
+        let failed = repo
+            .claim(
+                &scope,
+                execution.execution_id,
+                manifest.items[1].document_manifest_item_id,
+                ContentStep::Prepare,
+                "test",
+                Utc::now(),
+                60,
+            )
+            .await
+            .unwrap();
+        repo.fail_step(&scope, &failed, "insufficient_source_evidence")
+            .await
+            .unwrap();
+        let handoff = repo.close(&scope, execution.execution_id).await.unwrap();
+        assert_eq!(handoff.coverage.total, 2);
+        assert_eq!(handoff.coverage.ready, 1);
+        assert_eq!(handoff.coverage.blocked, 1);
+        assert_eq!(repo.list_project_assets(&scope).await.unwrap().len(), 1);
+        assert_eq!(
+            repo.list_checks(&scope, revision.revision_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            repo.get_revision(&scope, revision.asset_id, revision.revision_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            revision
+        );
+        let replay = repo
+            .start_on_demand(&scope, request, manifest, RICH_GENERATION_POLICY_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(replay.status, ContentExecutionStatus::Closed);
+        assert_eq!(
+            repo.get_handoff(&scope, execution.execution_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            handoff
+        );
+    }
+
+    #[test]
+    fn invalid_or_repeated_request_dimensions_are_rejected() {
+        let (_, request, _) = fixture();
+        let mut duplicate_key = request.clone();
+        duplicate_key.documents[1].key = duplicate_key.documents[0].key.clone();
+        assert!(duplicate_key.validate().is_err());
+        let mut repeated_source = request.clone();
+        repeated_source
+            .source_version_ids
+            .push(request.source_version_ids[0]);
+        assert!(repeated_source.validate().is_err());
+        let mut blank_topic = request.clone();
+        blank_topic.topic = " ".into();
+        assert!(blank_topic.validate().is_err());
+        let mut scoped_json = serde_json::to_value(&request).unwrap();
+        scoped_json["project_id"] = serde_json::json!(Uuid::new_v4());
+        assert!(serde_json::from_value::<ContentCreateRequest>(scoped_json).is_err());
+    }
+}
+
+#[cfg(test)]
 mod revision_lookup_tests {
     use super::*;
     use crate::ErrorCode;
@@ -3126,7 +3662,9 @@ mod revision_lookup_tests {
             execution: ContentExecution {
                 execution_id,
                 project_id: scope.project_id.expect("test scope has a project"),
-                cycle_id: Uuid::new_v4(),
+                origin: ContentExecutionOrigin::Cycle {
+                    cycle_id: Uuid::new_v4(),
+                },
                 manifest_id: Uuid::new_v4(),
                 manifest_revision: 1,
                 policy_version: "test".into(),

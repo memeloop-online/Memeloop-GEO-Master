@@ -11,17 +11,18 @@
 
 ## 当前检查点
 
-| 范围 | 当前状态 |
-|---|---|
-| 主分支 | `390c5c4`（PR #101），包含冻结内容选证上下文；源码 host v23，部署仍为 v22 |
-| API | 已部署 `676c1e2` 精确来源，host v22／52 项，原生定时器、单页网页导入及内容工作流已配置 |
-| Web | 已部署 `37ba145`，计划／内容空态及既有资料刷新读回通过 |
-| 浏览器执行器 | 已部署 `793ad4d`（PR #94 精确来源），支持部分流式来源存档及实际未知回执时间 |
-| 显式内容来源选择 | PR #80 已包含于部署镜像；内容工作流已启用，真实运行待验收 |
-| 模型传输截止 | PR #81 双平台 CI 通过并已合并部署；已存推荐回答真实解析成功 |
-| 内容检查／修正工作流 | PR #84 已部署，后台内容工作流已启用；真实生成及检查待验收 |
-| 合作方内容导出 | PR #86 已部署；设置开关／刷新／撤销真实验证通过，实际内容下载及合作方联调待验收 |
-| 统一测量提示／内容调度范围 | PR #89／#90 已部署；鉴权提示准备契约通过，已核对限定项目无待执行内容积压 |
+| 范围                       | 当前状态                                                                                      |
+| -------------------------- | --------------------------------------------------------------------------------------------- |
+| 主分支                     | `9bb5493`（PR #102），包含保存分析的自动重推理抑制；主分支 host v23，部署仍为 v22             |
+| 开发中                     | 按需内容生成 host v24／53 项、迁移 0067 及无周期资产目录已进入集成；未部署，Rust 检查尚未通过 |
+| API                        | 已部署 `676c1e2` 精确来源，host v22／52 项，原生定时器、单页网页导入及内容工作流已配置        |
+| Web                        | 已部署 `37ba145`，计划／内容空态及既有资料刷新读回通过                                        |
+| 浏览器执行器               | 已部署 `793ad4d`（PR #94 精确来源），支持部分流式来源存档及实际未知回执时间                   |
+| 显式内容来源选择           | PR #80 已包含于部署镜像；内容工作流已启用，真实运行待验收                                     |
+| 模型传输截止               | PR #81 双平台 CI 通过并已合并部署；已存推荐回答真实解析成功                                   |
+| 内容检查／修正工作流       | PR #84 已部署，后台内容工作流已启用；真实生成及检查待验收                                     |
+| 合作方内容导出             | PR #86 已部署；设置开关／刷新／撤销真实验证通过，实际内容下载及合作方联调待验收               |
+| 统一测量提示／内容调度范围 | PR #89／#90 已部署；鉴权提示准备契约通过，已核对限定项目无待执行内容积压                      |
 
 PR #77 的错误分类已随三组件更新部署。源码、CI、镜像、实际部署及业务验收分别核对，不由主分支提交推定运行版本。当前 API 为 host v22，两份 bundle 已随镜像提供，实际摘要与配置一致。后台内容工作流在核对既有限定作用域及零待执行积压后启用；项目仍无当前周期或内容资产，不以执行器启用推定已生成内容。
 
@@ -49,14 +50,14 @@ PR #97／#98 已合并部署，host v22／52 项与 Agent bundle 实际摘要核
 
 Rust 的 API、领域及持久化业务均按 `accounts`、`agent`、`content`、`knowledge`、`measurement`、`partners`、`projects`、`publishing` 归类；从各目录的 `mod.rs` 进入，旧的根级业务文件路径已失效。
 
-| 关注点 | 入口 |
-|---|---|
-| 应用装配／模型路由 | [app/src/main.rs](../crates/app/src/main.rs)、[api/src/lib.rs](../crates/api/src/lib.rs)、[runtime-deployment.md](runtime-deployment.md) |
-| AI 会话与执行 | [AgentWorkbenchPage.tsx](../apps/web/src/pages/AgentWorkbenchPage.tsx)、[api/src/agent/mod.rs](../crates/api/src/agent/mod.rs)、[run_executor.rs](../crates/api/src/agent/run_executor.rs) |
-| JS 工具／内容工作流 | [agent-loop.mjs](../packages/agent-runtime/src/agent-loop.mjs)、[content-workflow.mjs](../packages/agent-runtime/src/content-workflow.mjs)、[worker/src/host.rs](../crates/worker/src/host.rs) |
-| 问题集／测量／报告 | [QuestionSetsPage.tsx](../apps/web/src/pages/QuestionSetsPage.tsx)、[api/src/measurement/mod.rs](../crates/api/src/measurement/mod.rs)、[persistence/src/measurement/mod.rs](../crates/persistence/src/measurement/mod.rs) |
-| 账号／远程登录 | [api/src/accounts/mod.rs](../crates/api/src/accounts/mod.rs)、[browser-runner/src/server.mjs](../packages/browser-runner/src/server.mjs)、[remote-login-runtime.md](remote-login-runtime.md) |
-| 内容／发布 | [api/src/content/mod.rs](../crates/api/src/content/mod.rs)、[api/src/publishing/mod.rs](../crates/api/src/publishing/mod.rs)、[ContentPages.tsx](../apps/web/src/pages/ContentPages.tsx) |
+| 关注点              | 入口                                                                                                                                                                                                                       |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 应用装配／模型路由  | [app/src/main.rs](../crates/app/src/main.rs)、[api/src/lib.rs](../crates/api/src/lib.rs)、[runtime-deployment.md](runtime-deployment.md)                                                                                   |
+| AI 会话与执行       | [AgentWorkbenchPage.tsx](../apps/web/src/pages/AgentWorkbenchPage.tsx)、[api/src/agent/mod.rs](../crates/api/src/agent/mod.rs)、[run_executor.rs](../crates/api/src/agent/run_executor.rs)                                 |
+| JS 工具／内容工作流 | [agent-loop.mjs](../packages/agent-runtime/src/agent-loop.mjs)、[content-workflow.mjs](../packages/agent-runtime/src/content-workflow.mjs)、[worker/src/host.rs](../crates/worker/src/host.rs)                             |
+| 问题集／测量／报告  | [QuestionSetsPage.tsx](../apps/web/src/pages/QuestionSetsPage.tsx)、[api/src/measurement/mod.rs](../crates/api/src/measurement/mod.rs)、[persistence/src/measurement/mod.rs](../crates/persistence/src/measurement/mod.rs) |
+| 账号／远程登录      | [api/src/accounts/mod.rs](../crates/api/src/accounts/mod.rs)、[browser-runner/src/server.mjs](../packages/browser-runner/src/server.mjs)、[remote-login-runtime.md](remote-login-runtime.md)                               |
+| 内容／发布          | [api/src/content/mod.rs](../crates/api/src/content/mod.rs)、[api/src/publishing/mod.rs](../crates/api/src/publishing/mod.rs)、[ContentPages.tsx](../apps/web/src/pages/ContentPages.tsx)                                   |
 
 ## 本地运行
 

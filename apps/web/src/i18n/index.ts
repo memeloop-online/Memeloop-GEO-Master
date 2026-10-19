@@ -188,6 +188,11 @@ export const resources = {
         reuseSummary: "本轮使用已有内容，原内容与检查证据保持不变。",
         cycleTitle: "本轮内容",
         cycleDescription: "查看本轮计划生成的内容及最新进度。",
+        savedContent: "已保存内容",
+        savedContentDescription: "查看、编辑或下载已生成的内容。",
+        loadingSavedContent: "正在读取已保存内容",
+        savedContentUnavailable: "无法读取已保存内容",
+        refreshSavedContent: "刷新内容",
         planProgress: "内容计划与生成进度",
         notStarted: "内容尚未开始生成。",
         resumeDescription: "继续生成尚未完成的内容，已完成的版本会保留。",
@@ -512,6 +517,11 @@ export const resources = {
         cycleTitle: "Content for this cycle",
         cycleDescription:
           "View the content planned for this cycle and its latest progress.",
+        savedContent: "Saved content",
+        savedContentDescription: "View, edit, or download generated content.",
+        loadingSavedContent: "Loading saved content",
+        savedContentUnavailable: "Unable to load saved content",
+        refreshSavedContent: "Refresh content",
         planProgress: "Content plan and generation progress",
         notStarted: "Content generation has not started.",
         resumeDescription:

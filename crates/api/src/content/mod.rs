@@ -20,12 +20,12 @@ use axum::{
 };
 use chrono::Utc;
 use geo_domain::{
-    AppError, ContentAsset, ContentBlock, ContentBlockKind, ContentBrief, ContentEvidence,
-    ContentExecution, ContentFinding, ContentHandoff, ContentItem, ContentItemStatus,
-    ContentPublicEligibility, ContentRepository, ContentReuseDecision, ContentReuseRequest,
-    ContentRevision, ContentSemanticDescriptor, ContentStep, DOCUMENT_PLANNER_VERSION,
-    DocumentManifest, DocumentManifestItemState, DocumentManifestPlanRequest, ErrorCode,
-    EvidenceRef, KnowledgePurpose, KnowledgeRepository, ProjectId, ProjectRepository,
+    AppError, ContentAsset, ContentBlock, ContentBlockKind, ContentBrief, ContentCreateRequest,
+    ContentEvidence, ContentExecution, ContentExecutionOrigin, ContentFinding, ContentHandoff,
+    ContentItem, ContentItemStatus, ContentPublicEligibility, ContentRepository,
+    ContentReuseDecision, ContentReuseRequest, ContentRevision, ContentSemanticDescriptor,
+    ContentStep, DocumentManifest, DocumentManifestItemState, DocumentManifestPlanRequest,
+    ErrorCode, EvidenceRef, KnowledgePurpose, KnowledgeRepository, ProjectId, ProjectRepository,
     ProjectStatus, RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION,
     RICH_REPAIR_POLICY_VERSION, SourceState, StructuredDocument, TenantScope,
 };
@@ -102,7 +102,11 @@ pub struct ContentService {
 }
 
 impl ContentService {
-    async fn require_active_project(&self, scope: &TenantScope) -> Result<(), AppError> {
+    async fn require_project_for_origin(
+        &self,
+        scope: &TenantScope,
+        origin: &ContentExecutionOrigin,
+    ) -> Result<(), AppError> {
         let project_id = scope
             .project_id
             .ok_or_else(|| AppError::invalid_request("project scope required"))?;
@@ -111,12 +115,30 @@ impl ContentService {
             .get(scope, project_id)
             .await?
             .ok_or_else(|| AppError::not_found("project not found"))?;
-        if project.status != ProjectStatus::Active {
+        if project.status == ProjectStatus::Archived
+            || (matches!(origin, ContentExecutionOrigin::Cycle { .. })
+                && project.status != ProjectStatus::Active)
+        {
             return Err(AppError::conflict(
                 "project is not active for new content work",
             ));
         }
         Ok(())
+    }
+
+    async fn require_project_for_execution(
+        &self,
+        scope: &TenantScope,
+        execution_id: Uuid,
+    ) -> Result<ContentExecution, AppError> {
+        let execution = self
+            .content
+            .get_execution(scope, execution_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("content execution not found"))?;
+        self.require_project_for_origin(scope, &execution.origin)
+            .await?;
+        Ok(execution)
     }
 
     pub fn new(
@@ -153,7 +175,13 @@ impl ContentService {
         base_revision_id: Uuid,
         document: StructuredDocument,
     ) -> Result<ContentRevision, AppError> {
-        self.require_active_project(scope).await?;
+        let asset = self
+            .content
+            .get_asset(scope, asset_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("content asset not found"))?;
+        self.require_project_for_execution(scope, asset.execution_id)
+            .await?;
         let base = self
             .revision(scope, Some(asset_id), base_revision_id)
             .await?;
@@ -223,7 +251,11 @@ impl ContentService {
             .collect::<Result<_, _>>()?;
         let project_guard = self
             .projects
-            .hold_content_project(scope, execution.project_id)
+            .hold_content_project(
+                scope,
+                execution.project_id,
+                matches!(execution.origin, ContentExecutionOrigin::OnDemand { .. }),
+            )
             .await?;
         let knowledge_guard = self.knowledge.hold_content_evidence(scope, &inputs).await?;
         // Another checker may have completed after the snapshot but before
@@ -262,7 +294,8 @@ impl ContentService {
         scope: &TenantScope,
         cycle_id: Uuid,
     ) -> Result<ContentExecution, AppError> {
-        self.require_active_project(scope).await?;
+        self.require_project_for_origin(scope, &ContentExecutionOrigin::Cycle { cycle_id })
+            .await?;
         let project_id = scope
             .project_id
             .ok_or_else(|| AppError::invalid_request("project scope required"))?;
@@ -341,6 +374,60 @@ impl ContentService {
             .await
     }
 
+    /// Freeze only the explicitly selected public versions. A retry reads the
+    /// original execution before consulting current knowledge, so unrelated
+    /// source updates cannot change an already accepted request.
+    pub async fn create_on_demand(
+        &self,
+        scope: &TenantScope,
+        request: ContentCreateRequest,
+    ) -> Result<ContentExecution, AppError> {
+        request.validate()?;
+        let execution_id = request.execution_id(scope)?;
+        if let Some(existing) = self.content.get_execution(scope, execution_id).await? {
+            return match &existing.origin {
+                ContentExecutionOrigin::OnDemand { request: frozen }
+                    if frozen.input_hash()? == request.input_hash()? =>
+                {
+                    Ok(existing)
+                }
+                _ => Err(AppError::conflict(
+                    "content request key was already used with different input",
+                )),
+            };
+        }
+        let origin = ContentExecutionOrigin::OnDemand {
+            request: request.clone(),
+        };
+        self.require_project_for_origin(scope, &origin).await?;
+        let release_id = self
+            .knowledge
+            .current_release(scope)
+            .await?
+            .knowledge_release_id
+            .ok_or_else(|| AppError::conflict("no knowledge release is available for content"))?;
+        let release = self
+            .knowledge
+            .get_release(scope, release_id)
+            .await?
+            .ok_or_else(|| AppError::conflict("current knowledge release is unavailable"))?;
+        let manifest = geo_domain::build_on_demand_manifest(scope, &request, &release)?;
+        let manifest = self
+            .knowledge
+            .save_on_demand_manifest(scope, manifest)
+            .await?;
+        let project_guard = self
+            .projects
+            .hold_content_project(scope, manifest.project_id, true)
+            .await?;
+        let execution = self
+            .content
+            .start_on_demand(scope, request, manifest, POLICY_VERSION)
+            .await;
+        drop(project_guard);
+        execution
+    }
+
     pub async fn prepare(
         &self,
         scope: &TenantScope,
@@ -361,7 +448,9 @@ impl ContentService {
             }
             return Ok(item);
         }
-        self.require_active_project(scope).await?;
+        let execution = self
+            .require_project_for_execution(scope, execution_id)
+            .await?;
         if references.is_empty() {
             return self
                 .content
@@ -382,11 +471,7 @@ impl ContentService {
                 "selected evidence is outside eligible frozen sources",
             ));
         }
-        let brief_title = item.document_key.clone();
-        let brief_objective = format!(
-            "Create a {} document grounded only in the prepared evidence.",
-            item.document_key
-        );
+        let (brief_title, brief_objective) = self.brief_context(&execution, &item)?;
         let (descriptor, manifest_id) = self
             .semantic_descriptor(
                 scope,
@@ -399,7 +484,11 @@ impl ContentService {
             .await?;
         let project_guard = self
             .projects
-            .hold_content_project(scope, scope.project_id.expect("project scope"))
+            .hold_content_project(
+                scope,
+                execution.project_id,
+                matches!(execution.origin, ContentExecutionOrigin::OnDemand { .. }),
+            )
             .await?;
         let knowledge_guard = self
             .knowledge
@@ -442,6 +531,44 @@ impl ContentService {
         prepared
     }
 
+    fn brief_context(
+        &self,
+        execution: &ContentExecution,
+        item: &ContentItem,
+    ) -> Result<(String, String), AppError> {
+        match &execution.origin {
+            ContentExecutionOrigin::Cycle { .. } => Ok((
+                item.document_key.clone(),
+                format!(
+                    "Create a {} document grounded only in the prepared evidence.",
+                    item.document_key
+                ),
+            )),
+            ContentExecutionOrigin::OnDemand { request } => {
+                let document = request
+                    .documents
+                    .iter()
+                    .find(|document| document.key == item.document_key)
+                    .ok_or_else(|| {
+                        AppError::conflict("document branch absent from frozen request")
+                    })?;
+                let title = document
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| request.topic.clone());
+                let mut objective = format!(
+                    "Create a {} document about {} grounded only in the prepared evidence.",
+                    document.content_type, request.topic
+                );
+                if let Some(instructions) = &document.instructions {
+                    objective.push_str(" Writing requirements: ");
+                    objective.push_str(instructions);
+                }
+                Ok((title, objective))
+            }
+        }
+    }
+
     async fn semantic_descriptor(
         &self,
         scope: &TenantScope,
@@ -467,38 +594,58 @@ impl ContentService {
             .iter()
             .find(|planned| planned.document_manifest_item_id == item.item_id)
             .ok_or_else(|| AppError::conflict("document branch absent from manifest"))?;
-        let frozen = self
-            .projects
-            .get_cycle_settings(scope, execution.project_id, execution.cycle_id)
-            .await?
-            .ok_or_else(|| AppError::conflict("frozen cycle configuration unavailable"))?;
+        let (brand_name, product_name, target_audience, objective, mut question_clusters) =
+            match &execution.origin {
+                ContentExecutionOrigin::Cycle { cycle_id } => {
+                    let frozen = self
+                        .projects
+                        .get_cycle_settings(scope, execution.project_id, *cycle_id)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::conflict("frozen cycle configuration unavailable")
+                        })?;
+                    (
+                        Some(frozen.brand_name),
+                        frozen.product_name,
+                        frozen.target_audience,
+                        frozen.objective,
+                        frozen
+                            .document_scope
+                            .question_clusters
+                            .iter()
+                            .map(|cluster| cluster.key.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                ContentExecutionOrigin::OnDemand { request } => (
+                    None,
+                    None,
+                    request.audience.clone(),
+                    Some(request.topic.clone()),
+                    vec![],
+                ),
+            };
         let mut source_version_ids = item.source_version_refs.clone();
         source_version_ids.sort();
         source_version_ids.dedup();
-        let mut question_clusters: Vec<_> = frozen
-            .document_scope
-            .question_clusters
-            .iter()
-            .map(|cluster| cluster.key.clone())
-            .collect();
         question_clusters.sort();
         question_clusters.dedup();
         Ok((
             ContentSemanticDescriptor {
-                version: 1,
+                version: geo_domain::CONTENT_SEMANTIC_DESCRIPTOR_VERSION,
                 scope: scope.clone(),
                 document_key: planned.document_key.clone(),
                 content_type: planned.content_type.clone(),
                 product_id: planned.product_id,
                 market: planned.market.clone(),
                 language: planned.language.clone(),
-                planner_version: DOCUMENT_PLANNER_VERSION.into(),
+                planner_version: manifest.planner_version.clone(),
                 source_version_ids,
                 evidence,
-                brand_name: frozen.brand_name,
-                product_name: frozen.product_name,
-                target_audience: frozen.target_audience,
-                objective: frozen.objective,
+                brand_name,
+                product_name,
+                target_audience,
+                objective,
                 question_clusters,
                 brief_title: brief_title.into(),
                 brief_objective: brief_objective.into(),
@@ -527,7 +674,8 @@ impl ContentService {
             }
             return Err(AppError::conflict("document is not prepared"));
         }
-        self.require_active_project(scope).await?;
+        self.require_project_for_execution(scope, execution_id)
+            .await?;
         let brief = item
             .brief
             .as_ref()
@@ -646,7 +794,8 @@ impl ContentService {
         if item.status != ContentItemStatus::Drafted {
             return Ok(None);
         }
-        self.require_active_project(scope).await?;
+        self.require_project_for_execution(scope, execution_id)
+            .await?;
         let brief = item
             .brief
             .as_ref()
@@ -779,7 +928,11 @@ impl ContentService {
                     .ok_or_else(|| AppError::not_found("content execution not found"))?;
                 let project_guard = match self
                     .projects
-                    .hold_content_project(scope, execution.project_id)
+                    .hold_content_project(
+                        scope,
+                        execution.project_id,
+                        matches!(execution.origin, ContentExecutionOrigin::OnDemand { .. }),
+                    )
                     .await
                 {
                     Ok(guard) => guard,
@@ -844,7 +997,8 @@ impl ContentService {
             }
             return Err(AppError::conflict("document does not need factual repair"));
         }
-        self.require_active_project(scope).await?;
+        self.require_project_for_execution(scope, execution_id)
+            .await?;
         let brief = item
             .brief
             .as_ref()
@@ -983,7 +1137,10 @@ impl ContentService {
                 return Err(error);
             }
         };
-        if let Err(error) = self.require_active_project(scope).await {
+        if let Err(error) = self
+            .require_project_for_execution(scope, execution_id)
+            .await
+        {
             self.content.release_step(scope, lease).await?;
             return Err(error);
         }
@@ -1022,7 +1179,8 @@ impl ContentService {
         base_revision_id: Uuid,
         document: StructuredDocument,
     ) -> Result<ContentRevision, AppError> {
-        self.require_active_project(scope).await?;
+        self.require_project_for_execution(scope, execution_id)
+            .await?;
         let item = self.item(scope, execution_id, item_id).await?;
         if item
             .reuse_binding
@@ -1204,17 +1362,20 @@ impl ContentService {
             else {
                 continue;
             };
+            let execution = self
+                .content
+                .get_execution(scope, item.execution_id)
+                .await?
+                .ok_or_else(|| AppError::not_found("content execution not found"))?;
+            let (brief_title, brief_objective) = self.brief_context(&execution, item)?;
             let (descriptor, _) = self
                 .semantic_descriptor(
                     scope,
                     item.execution_id,
                     item,
                     brief.quotes.clone(),
-                    &item.document_key,
-                    &format!(
-                        "Create a {} document grounded only in the prepared evidence.",
-                        item.document_key
-                    ),
+                    &brief_title,
+                    &brief_objective,
                 )
                 .await?;
             let canonical = descriptor.canonical()?;
@@ -1753,6 +1914,34 @@ pub(crate) async fn scoped(
         tenant.tenant_id,
         Some(project_id),
     ))
+}
+
+pub(crate) async fn create(
+    State(state): State<AppState>,
+    Path(project_id): Path<ProjectId>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(context): Extension<RequestContext>,
+    Json(request): Json<ContentCreateRequest>,
+) -> Result<(StatusCode, Json<ContentExecution>), ApiError> {
+    require_project_writer(&auth).map_err(|e| api_error(e, context.request_id))?;
+    let scope = scoped(&state, &auth.scope, project_id)
+        .await
+        .map_err(|e| api_error(e, context.request_id))?;
+    if !state.content_executor_available() {
+        return Err(api_error(
+            AppError::capability_missing("content workflow executor is not configured"),
+            context.request_id,
+        ));
+    }
+    let execution = state
+        .content_service()
+        .create_on_demand(&scope, request)
+        .await
+        .map_err(|e| api_error(e, context.request_id))?;
+    state
+        .dispatch_content_execution(scope, execution.execution_id)
+        .map_err(|e| api_error(e, context.request_id))?;
+    Ok((StatusCode::ACCEPTED, Json(execution)))
 }
 
 pub(crate) async fn start(
@@ -2580,6 +2769,7 @@ mod tests {
             &'a self,
             _scope: &TenantScope,
             _project_id: ProjectId,
+            _on_demand: bool,
         ) -> Result<ContentProjectGuard<'a>, AppError> {
             Err(AppError::conflict("project is paused"))
         }
@@ -2921,6 +3111,13 @@ mod tests {
             self.inner
                 .plan_document_manifest(scope, request, document_scope)
                 .await
+        }
+        async fn save_on_demand_manifest(
+            &self,
+            scope: &TenantScope,
+            manifest: DocumentManifest,
+        ) -> Result<DocumentManifest, AppError> {
+            self.inner.save_on_demand_manifest(scope, manifest).await
         }
         async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError> {
             self.inner.overview(scope).await
@@ -3355,6 +3552,390 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
+            1
+        );
+    }
+
+    async fn on_demand_fixture() -> (
+        TenantScope,
+        Arc<MemoryProjectRepository>,
+        Arc<MemoryKnowledgeRepository>,
+        Arc<MemoryContentRepository>,
+        ContentCreateRequest,
+    ) {
+        let tenant = TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), None);
+        let projects = Arc::new(MemoryProjectRepository::default());
+        let project = projects
+            .create(
+                &tenant,
+                ProjectCreate {
+                    slug: None,
+                    display_name: "Research documents".into(),
+                    settings: ProjectSettings::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let scope = TenantScope {
+            project_id: Some(project.id),
+            ..tenant
+        };
+        let knowledge = Arc::new(MemoryKnowledgeRepository::default());
+        let imported = knowledge
+            .import_batch(
+                &scope,
+                (0..4)
+                    .map(|index| ImportItem {
+                        client_item_id: format!("source-{index}"),
+                        kind: SourceKind::Text,
+                        name: format!("Source {index}"),
+                        purpose: if index == 3 {
+                            KnowledgePurpose::Internal
+                        } else {
+                            KnowledgePurpose::Public
+                        },
+                        text: Some("Public description".into()),
+                        url: None,
+                        object_id: None,
+                        knowledge_release_id: None,
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let selected = imported
+            .items
+            .iter()
+            .take(2)
+            .map(|item| item.source_version.as_ref().unwrap().source_version_id)
+            .collect();
+        let request = ContentCreateRequest {
+            request_id: Uuid::new_v4(),
+            topic: "Choosing a suitable device".into(),
+            source_version_ids: selected,
+            documents: vec![
+                geo_domain::ContentCreateDocument {
+                    key: "article".into(),
+                    content_type: "article".into(),
+                    title: Some("Device selection guide".into()),
+                    instructions: Some("Compare the supported options".into()),
+                },
+                geo_domain::ContentCreateDocument {
+                    key: "faq".into(),
+                    content_type: "faq".into(),
+                    title: None,
+                    instructions: None,
+                },
+            ],
+            language: "en".into(),
+            market: None,
+            audience: Some("First-time buyers".into()),
+        };
+        (
+            scope,
+            projects,
+            knowledge,
+            Arc::new(MemoryContentRepository::default()),
+            request,
+        )
+    }
+
+    #[tokio::test]
+    async fn on_demand_draft_project_generates_two_checked_assets_without_a_cycle() {
+        let (scope, projects, knowledge, repository, request) = on_demand_fixture().await;
+        let model = Arc::new(GroundedModel {
+            calls: AtomicUsize::new(0),
+            generations: AtomicUsize::new(0),
+            invalid_first: false,
+            fail_first: AtomicBool::new(false),
+        });
+        let service = ContentService::new(repository.clone(), knowledge.clone(), projects.clone())
+            .with_model_provider(model.clone());
+        let execution = service
+            .create_on_demand(&scope, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            execution.origin,
+            ContentExecutionOrigin::OnDemand {
+                request: request.clone()
+            }
+        );
+        assert_eq!(execution.expected_count, 2);
+        let items = repository
+            .list_items(&scope, execution.execution_id)
+            .await
+            .unwrap();
+        for item in &items {
+            assert_eq!(item.source_version_refs, request.source_version_ids);
+            let prepared = service
+                .prepare_fixture(&scope, execution.execution_id, item.item_id)
+                .await
+                .unwrap();
+            let descriptor = prepared.semantic_descriptor.as_ref().unwrap();
+            assert_eq!(descriptor.brand_name, None);
+            assert_eq!(
+                descriptor.objective.as_deref(),
+                Some(request.topic.as_str())
+            );
+            assert_eq!(descriptor.target_audience, request.audience);
+            if item.document_key == "article" {
+                assert_eq!(descriptor.brief_title, "Device selection guide");
+                assert!(
+                    descriptor
+                        .brief_objective
+                        .contains("Compare the supported options")
+                );
+            }
+            let revision = service
+                .generate_fixture(&scope, execution.execution_id, item.item_id)
+                .await
+                .unwrap();
+            assert!(!revision.document.blocks.is_empty());
+            assert!(revision.evidence.iter().all(|evidence| {
+                request
+                    .source_version_ids
+                    .contains(&evidence.source_version_id)
+            }));
+            assert_eq!(
+                service
+                    .check_fixture(&scope, execution.execution_id, item.item_id)
+                    .await
+                    .unwrap()
+                    .status,
+                ContentItemStatus::Ready
+            );
+            assert_eq!(
+                repository
+                    .list_checks(&scope, revision.revision_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(
+            service
+                .close(&scope, execution.execution_id)
+                .await
+                .unwrap()
+                .coverage
+                .ready,
+            2
+        );
+        assert_eq!(
+            repository.list_project_assets(&scope).await.unwrap().len(),
+            2
+        );
+        assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+        assert!(
+            projects
+                .get_current_cycle(&scope, scope.project_id.unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let project = projects
+            .get(&scope, scope.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.status, ProjectStatus::Draft);
+        assert!(project.settings.brand_name.is_empty());
+        let asset = repository
+            .list_project_assets(&scope)
+            .await
+            .unwrap()
+            .remove(0);
+        let revision = repository
+            .get_revision(&scope, asset.asset_id, asset.current_revision_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            service
+                .edit(
+                    &scope,
+                    asset.asset_id,
+                    revision.revision_id,
+                    revision.document
+                )
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_retry_preserves_frozen_input_and_rejects_changed_or_foreign_sources() {
+        let (scope, projects, knowledge, repository, request) = on_demand_fixture().await;
+        let service = ContentService::new(repository.clone(), knowledge.clone(), projects);
+        let execution = service
+            .create_on_demand(&scope, request.clone())
+            .await
+            .unwrap();
+        knowledge
+            .import_batch(
+                &scope,
+                vec![ImportItem {
+                    client_item_id: "later-source".into(),
+                    kind: SourceKind::Text,
+                    name: "Later source".into(),
+                    purpose: KnowledgePurpose::Public,
+                    text: Some("Later content".into()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .create_on_demand(&scope, request.clone())
+                .await
+                .unwrap(),
+            execution
+        );
+        let mut changed = request.clone();
+        changed.topic.push_str(" with a different focus");
+        assert_eq!(
+            service
+                .create_on_demand(&scope, changed)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let mut invalid = request.clone();
+        invalid.request_id = Uuid::new_v4();
+        invalid.source_version_ids = vec![Uuid::new_v4()];
+        assert!(service.create_on_demand(&scope, invalid).await.is_err());
+        let (_, _, _, _, foreign_request) = on_demand_fixture().await;
+        let mut foreign = request.clone();
+        foreign.request_id = Uuid::new_v4();
+        foreign.source_version_ids = foreign_request.source_version_ids;
+        assert!(service.create_on_demand(&scope, foreign).await.is_err());
+        let private_version = knowledge
+            .list_sources(&scope)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|source| source.purpose == KnowledgePurpose::Internal)
+            .unwrap()
+            .current_version_id
+            .unwrap();
+        let mut invalid = request;
+        invalid.request_id = Uuid::new_v4();
+        invalid.source_version_ids = vec![private_version];
+        assert!(service.create_on_demand(&scope, invalid).await.is_err());
+        assert_eq!(
+            repository
+                .list_items(&scope, execution.execution_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_source_revocation_blocks_model_work_but_preserves_request_replay() {
+        let (scope, projects, knowledge, repository, request) = on_demand_fixture().await;
+        let service = ContentService::new(repository.clone(), knowledge.clone(), projects.clone());
+        let execution = service
+            .create_on_demand(&scope, request.clone())
+            .await
+            .unwrap();
+        let item = repository
+            .list_items(&scope, execution.execution_id)
+            .await
+            .unwrap()
+            .remove(0);
+        service
+            .prepare_fixture(&scope, execution.execution_id, item.item_id)
+            .await
+            .unwrap();
+        let revoked = Arc::new(AtomicBool::new(true));
+        let service = ContentService::new(
+            repository.clone(),
+            Arc::new(RevocableKnowledge {
+                inner: knowledge,
+                revoked,
+            }),
+            projects,
+        );
+        assert_eq!(
+            service.create_on_demand(&scope, request).await.unwrap(),
+            execution
+        );
+        assert!(
+            service
+                .begin_generate(&scope, execution.execution_id, item.item_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            repository
+                .get_item(&scope, execution.execution_id, item.item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentItemStatus::Blocked
+        );
+        assert!(
+            repository
+                .list_project_assets(&scope)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_failed_branch_preserves_successful_asset_and_frozen_denominator() {
+        let (scope, projects, knowledge, repository, request) = on_demand_fixture().await;
+        let service = ContentService::new(repository.clone(), knowledge, projects)
+            .with_model_provider(Arc::new(GroundedModel {
+                calls: AtomicUsize::new(0),
+                generations: AtomicUsize::new(0),
+                invalid_first: true,
+                fail_first: AtomicBool::new(false),
+            }));
+        let execution = service.create_on_demand(&scope, request).await.unwrap();
+        let items = repository
+            .list_items(&scope, execution.execution_id)
+            .await
+            .unwrap();
+        for (index, item) in items.iter().enumerate() {
+            service
+                .prepare_fixture(&scope, execution.execution_id, item.item_id)
+                .await
+                .unwrap();
+            let generated = service
+                .generate_fixture(&scope, execution.execution_id, item.item_id)
+                .await;
+            if index == 0 {
+                assert!(generated.is_err());
+            } else {
+                generated.unwrap();
+                service
+                    .check_fixture(&scope, execution.execution_id, item.item_id)
+                    .await
+                    .unwrap();
+            }
+        }
+        let handoff = service.close(&scope, execution.execution_id).await.unwrap();
+        assert_eq!(
+            (
+                handoff.coverage.total,
+                handoff.coverage.ready,
+                handoff.coverage.blocked
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            repository.list_project_assets(&scope).await.unwrap().len(),
             1
         );
     }

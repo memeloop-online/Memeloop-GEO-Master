@@ -154,7 +154,10 @@ impl PublicationSendAuthorizationRepository for MemoryPublicationSendAuthorizati
         let project = scope
             .project_id
             .ok_or_else(|| AppError::forbidden("publication requires project scope"))?;
-        let _guard = self.projects.hold_content_project(scope, project).await?;
+        let _guard = self
+            .projects
+            .hold_content_project(scope, project, false)
+            .await?;
         // No second project lock inside the channel ledger operation.
         self.jobs.register_rich_send(scope, registration).await
     }
@@ -175,7 +178,10 @@ impl PublicationSendAuthorizationRepository for MemoryPublicationSendAuthorizati
             .get_publication_bundle(scope, expected.publication_intent_id)
             .await?;
         let keys = self.verify_actual_bytes(scope, &early).await?;
-        let _project = self.projects.hold_content_project(scope, project).await?;
+        let _project = self
+            .projects
+            .hold_content_project(scope, project, false)
+            .await?;
         let bundle = self
             .distribution
             .get_publication_bundle(scope, expected.publication_intent_id)

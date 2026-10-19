@@ -77,7 +77,7 @@ fn inputs() -> (TenantScope, DocumentManifest, ContentSemanticDescriptor) {
         planner_version: "planner-1".into(),
         source_version_ids: vec![source],
         evidence: vec![evidence],
-        brand_name: "Example".into(),
+        brand_name: Some("Example".into()),
         product_name: None,
         target_audience: None,
         objective: None,

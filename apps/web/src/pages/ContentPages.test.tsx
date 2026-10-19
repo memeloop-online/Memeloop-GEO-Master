@@ -8,6 +8,7 @@ import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
 import type {
+  ContentAsset,
   ContentExecution,
   ContentItem,
   ContentRevision,
@@ -93,7 +94,7 @@ const coverage = {
 const execution: ContentExecution = {
   execution_id: "execution-1",
   project_id: "project-1",
-  cycle_id: "cycle-1",
+  origin: { kind: "cycle", cycle_id: "cycle-1" },
   manifest_id: "manifest-1",
   manifest_revision: 1,
   policy_version: "policy-1",
@@ -102,6 +103,13 @@ const execution: ContentExecution = {
   expected_count: 2,
   coverage,
   handoff_id: "handoff-1",
+};
+const asset: ContentAsset = {
+  asset_id: "asset-1",
+  execution_id: "execution-1",
+  item_id: "item-1",
+  current_revision_id: "revision-1",
+  created_at: "2026-10-01T08:00:00Z",
 };
 const items: ContentItem[] = [
   {
@@ -252,6 +260,8 @@ function json(body: unknown, status = 200) {
 
 function mockApi({
   noCycle = false,
+  assetList = [],
+  assetsStatus = 200,
   executionList = [execution],
   itemList = items,
   editStatus = 201,
@@ -273,6 +283,8 @@ function mockApi({
   editDeferred,
 }: {
   noCycle?: boolean;
+  assetList?: ContentAsset[];
+  assetsStatus?: number;
   executionList?: ContentExecution[];
   itemList?: ContentItem[];
   editStatus?: number;
@@ -312,6 +324,13 @@ function mockApi({
       );
     if (path.endsWith("/projects"))
       return Promise.resolve(json({ items: [], next_cursor: null }));
+    if (path.endsWith("/projects/project-1/contents"))
+      return Promise.resolve(
+        json(
+          assetsStatus === 200 ? assetList : { message: "内容暂不可用" },
+          assetsStatus,
+        ),
+      );
     if (noCycle && path.endsWith("/projects/project-1/cycles/current"))
       return Promise.resolve(json({ error: "not_found" }, 404));
     if (path.endsWith("/projects/project-1/cycles/current"))
@@ -581,6 +600,52 @@ afterEach(() => {
 });
 
 describe("P08 content assets", () => {
+  it("opens saved content without a cycle or setup form", async () => {
+    const requests = mockApi({ noCycle: true, assetList: [asset] });
+    renderPage("/app/tenant-1/project-1/content");
+    const saved = await screen.findByRole("region", { name: "已保存内容" });
+    const link = await within(saved).findByRole("link", {
+      name: "有来源的指南",
+    });
+    expect(link).toHaveAttribute(
+      "href",
+      "/app/tenant-1/project-1/content/asset-1",
+    );
+    expect(screen.queryByText("还没有内容资产")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "启动正文生成" }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(link);
+    expect(
+      await screen.findByRole("heading", { name: "有来源的指南", level: 1 }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("证据原文片段")).toBeInTheDocument();
+    expect(
+      requests.mock.calls.some(([url]) =>
+        String(url).includes("/document-executions"),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps saved content visible alongside the current cycle", async () => {
+    mockApi({ assetList: [asset] });
+    renderPage("/app/tenant-1/project-1/content");
+    const saved = await screen.findByRole("region", { name: "已保存内容" });
+    expect(
+      await within(saved).findByRole("link", { name: "有来源的指南" }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByRole("region", { name: "全部文档分支" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a failed saved-content read instead of an empty state", async () => {
+    mockApi({ noCycle: true, assetsStatus: 503 });
+    renderPage("/app/tenant-1/project-1/content");
+    expect(await screen.findByText("无法读取已保存内容")).toBeInTheDocument();
+    expect(screen.queryByText("还没有内容资产")).not.toBeInTheDocument();
+  });
+
   it("offers the project AI workspace when no content cycle exists", async () => {
     mockApi({ noCycle: true });
     renderPage("/app/tenant-1/project-1/content");

@@ -21,7 +21,7 @@ pub struct ContentSemanticDescriptor {
     pub source_version_ids: Vec<Uuid>,
     /// Evidence selection order may affect generation and is deliberately kept.
     pub evidence: Vec<ContentEvidence>,
-    pub brand_name: String,
+    pub brand_name: Option<String>,
     pub product_name: Option<String>,
     pub target_audience: Option<String>,
     pub objective: Option<String>,
@@ -162,7 +162,7 @@ mod tests {
                 },
                 exact_quote: "answer".into(),
             }],
-            brand_name: "Example".into(),
+            brand_name: Some("Example".into()),
             product_name: None,
             target_audience: None,
             objective: None,
@@ -187,5 +187,28 @@ mod tests {
         assert_eq!(d.fingerprint().unwrap(), other.fingerprint().unwrap());
         other.evidence[0].exact_quote = "changed".into();
         assert_ne!(d.fingerprint().unwrap(), other.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn unspecified_brand_is_distinct_from_an_empty_or_named_brand() {
+        let mut unspecified = descriptor();
+        unspecified.brand_name = None;
+        let mut empty = unspecified.clone();
+        empty.brand_name = Some(String::new());
+        let mut named = unspecified.clone();
+        named.brand_name = Some("Example".into());
+        assert_ne!(
+            unspecified.fingerprint().unwrap(),
+            empty.fingerprint().unwrap()
+        );
+        assert_ne!(
+            unspecified.fingerprint().unwrap(),
+            named.fingerprint().unwrap()
+        );
+        assert!(serde_json::to_value(&unspecified).unwrap()["brand_name"].is_null());
+        assert_eq!(
+            serde_json::to_value(&named).unwrap()["brand_name"],
+            "Example"
+        );
     }
 }

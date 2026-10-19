@@ -24,19 +24,19 @@ use serde::de::DeserializeOwned;
 use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
     ChannelTargetExecuteRequest, ContentCheckFinishRequest, ContentCloseRequest,
-    ContentDistributeReadRequest, ContentDistributeRequest, ContentDocumentReadRequest,
-    ContentExecutionReadRequest, ContentGenerateFinishRequest, ContentItemsReadRequest,
-    ContentMediaBindRequest, ContentMediaInsertRequest, ContentMediaListRequest,
-    ContentPrepareRequest, ContentRepairFinishRequest, ContentSourceReadRequest,
-    ContentStartRequest, ContentStepRequest, CreateQuestionSet, DistributionReadRequest,
-    DistributionResumeRequest, DistributionStartRequest, DistributionTargetsReadRequest,
-    HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError, KnowledgeImportAttachmentsRequest,
-    KnowledgeImportStatusRequest, KnowledgeImportUrlRequest, KnowledgeTextReadRequest,
-    KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest,
-    MeasurementPlanCreateRequest, MeasurementPlanReadRequest, ModelCompletionRequest,
-    ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest,
-    PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest,
-    ReportPreviewRequest, ReportReduceRequest, validate_question_create,
+    ContentCreateRequest, ContentDistributeReadRequest, ContentDistributeRequest,
+    ContentDocumentReadRequest, ContentExecutionReadRequest, ContentGenerateFinishRequest,
+    ContentItemsReadRequest, ContentMediaBindRequest, ContentMediaInsertRequest,
+    ContentMediaListRequest, ContentPrepareRequest, ContentRepairFinishRequest,
+    ContentSourceReadRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
+    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
+    DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
+    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeImportUrlRequest,
+    KnowledgeTextReadRequest, KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest,
+    MeasurementOptionsRequest, MeasurementPlanCreateRequest, MeasurementPlanReadRequest,
+    ModelCompletionRequest, ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest,
+    ProjectStartRequest, PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest,
+    ReportGetRequest, ReportPreviewRequest, ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -280,6 +280,32 @@ pub async fn op_host_content_execution_read_v1(
             bridge
                 .capabilities()
                 .content_execution_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_content_create_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentCreate;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentCreateRequest>(op, &payload)?;
+    request.validate().map_err(|_| {
+        js_error(HostOpError::invalid_request(
+            op,
+            "content request requires a request ID, topic, language, unique source versions and document keys",
+        ))
+    })?;
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .content_create(bridge.scope(), request)
                 .await
         })
         .await?;
@@ -1158,6 +1184,7 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::SerpRead.op_name(),
     HostOp::SerpReparse.op_name(),
     HostOp::KnowledgeImportUrl.op_name(),
+    HostOp::ContentCreate.op_name(),
     // Rust-owned run state: the loop's emit contract and the checkpoint probe.
     "op_host_emit",
     "op_host_checkpoint",

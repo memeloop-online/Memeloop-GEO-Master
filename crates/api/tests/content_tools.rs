@@ -590,7 +590,7 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .unwrap();
     assert_eq!(first.total, 2);
     assert_eq!(first.items.len(), 1);
-    assert_eq!(first.context.brand_name, "Example");
+    assert_eq!(first.context.brand_name.as_deref(), Some("Example"));
     assert_eq!(
         first.context.product_name.as_deref(),
         Some("Example product")

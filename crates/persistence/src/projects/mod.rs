@@ -512,12 +512,13 @@ impl ProjectRepository for PgProjectRepository {
         &'a self,
         scope: &TenantScope,
         project_id: ProjectId,
+        _on_demand: bool,
     ) -> Result<ContentProjectGuard<'a>, AppError> {
         if scope.project_id.is_some_and(|bound| bound != project_id) {
             return Err(AppError::not_found("project not found"));
         }
-        // The PG content repository locks the project row and rechecks active
-        // eligibility inside the content transaction; a separate read lock
+        // The PG content repository locks the project row and rechecks the
+        // execution origin's eligibility inside the transaction; a separate read lock
         // would be released before that transaction can commit.
         Ok(ContentProjectGuard::transactional())
     }

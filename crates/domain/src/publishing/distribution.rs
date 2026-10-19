@@ -767,7 +767,7 @@ pub fn freeze_distribution(
         || input.revision <= 0
         || input.placements.is_empty()
         || execution.project_id != doc.project_id
-        || execution.cycle_id != input.cycle_id
+        || execution.cycle_id() != Some(input.cycle_id)
         || execution.manifest_id != doc.manifest_id
         || execution.manifest_revision != doc.revision
         || execution.status != ContentExecutionStatus::Closed

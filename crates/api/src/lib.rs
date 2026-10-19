@@ -2508,7 +2508,7 @@ pub fn router(state: AppState) -> Router {
             "/projects/{id}/document-executions/{execution_id}/cancel",
             post(content::cancel),
         )
-        .route("/projects/{id}/contents", get(content::contents))
+        .route("/projects/{id}/contents", get(content::contents).post(content::create))
         .route(
             "/projects/{id}/content-distribution-requests",
             post(content_distribution_requests::accept),

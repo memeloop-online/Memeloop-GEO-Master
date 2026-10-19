@@ -165,20 +165,23 @@ impl HostOps for Fixture {
         request: ContentExecutionReadRequest,
     ) -> Result<ContentExecutionRef, HostOpError> {
         assert_eq!(request.execution_id, self.execution_id);
+        let closed = self
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|item| item.status == ContentItemStatus::Ready);
         Ok(ContentExecutionRef {
             execution_id: self.execution_id,
-            cycle_id: self.cycle_id,
-            status: if self
-                .items
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|item| item.status == ContentItemStatus::Ready)
-            {
+            origin: geo_domain::ContentExecutionOrigin::Cycle {
+                cycle_id: self.cycle_id,
+            },
+            status: if closed {
                 ContentExecutionStatus::Closed
             } else {
                 ContentExecutionStatus::Running
             },
+            handoff_id: closed.then_some(self.handoff_id),
             coverage: ContentCoverage {
                 total: 2,
                 ready: 2,
@@ -270,7 +273,7 @@ impl HostOps for Fixture {
             execution_id: self.execution_id,
             context: ContentContext {
                 objective: None,
-                brand_name: "Example".into(),
+                brand_name: Some("Example".into()),
                 product_name: None,
                 target_audience: None,
                 question_clusters: vec![],

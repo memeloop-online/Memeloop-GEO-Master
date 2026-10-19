@@ -109,6 +109,34 @@ impl FakeHostOps {
 
 #[async_trait]
 impl HostOps for FakeHostOps {
+    async fn content_create(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentCreateRequest,
+    ) -> Result<geo_worker::ContentExecutionRef, HostOpError> {
+        let total = request.documents.len() as u64;
+        self.answer(
+            HostOp::ContentCreate,
+            scope,
+            geo_worker::ContentExecutionRef {
+                execution_id: request.execution_id(scope).unwrap(),
+                origin: geo_worker::ContentExecutionOrigin::OnDemand { request },
+                status: geo_domain::ContentExecutionStatus::Running,
+                handoff_id: None,
+                coverage: geo_domain::ContentCoverage {
+                    total,
+                    ready: 0,
+                    blocked: 0,
+                    deferred: 0,
+                    not_applicable: 0,
+                    cancelled: 0,
+                    incomplete: total,
+                },
+            },
+        )
+        .await
+    }
+
     async fn question_discover(
         &self,
         scope: &TenantScope,
@@ -447,6 +475,123 @@ fn assert_success(record: &Value) -> Value {
 // ---------------------------------------------------------------------------
 // The closed surface
 // ---------------------------------------------------------------------------
+
+const CONTENT_CREATE_SCENARIO: &str = r#"
+  import { hostOps, attempt } from "./host-ops.js";
+  const request = {
+    request_id: "00000000-0000-4000-8000-000000000001",
+    topic: "Choosing equipment for a small workshop",
+    source_version_ids: ["00000000-0000-4000-8000-000000000002"],
+    documents: [{key:"article",content_type:"article"},{key:"faq",content_type:"faq"}],
+    language: "en"
+  };
+  await attempt("create", () => hostOps.contentCreate(request));
+  await attempt("retry", () => hostOps.contentCreate(request));
+"#;
+
+#[tokio::test]
+async fn content_create_returns_frozen_request_without_a_cycle_or_brand() {
+    let ops = Arc::new(FakeHostOps::new());
+    let expected_scope = scope();
+    let mut runtime = runtime(
+        CONTENT_CREATE_SCENARIO,
+        HostBridge::new(
+            Arc::clone(&ops) as Arc<dyn HostOps>,
+            expected_scope.clone(),
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    let created = assert_success(&outcome(&runtime.host_state(), "create"));
+    assert_eq!(
+        created,
+        assert_success(&outcome(&runtime.host_state(), "retry"))
+    );
+    assert_eq!(created["origin"]["kind"], "on_demand");
+    assert_eq!(
+        created["origin"]["request"]["documents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(created.get("cycle_id").is_none());
+    assert_eq!(created["coverage"]["incomplete"], 2);
+    assert_eq!(ops.seen(), vec![HostOp::ContentCreate; 2]);
+    assert_eq!(ops.scopes(), vec![expected_scope.storage_key(); 2]);
+}
+
+#[tokio::test]
+async fn content_create_rejects_invalid_requests_before_dispatch() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        const request = {
+          request_id: "00000000-0000-4000-8000-000000000001", topic: "Workshop guide",
+          source_version_ids: ["00000000-0000-4000-8000-000000000002"],
+          documents: [{key:"article",content_type:"article"}], language: "en"
+        };
+        await attempt("foreign", () => hostOps.contentCreate({...request, project_id:request.request_id}));
+        await attempt("empty", () => hostOps.contentCreate({...request, source_version_ids:[]}));
+        await attempt("nil", () => hostOps.contentCreate({...request, request_id:"00000000-0000-0000-0000-000000000000"}));
+        await attempt("duplicate", () => hostOps.contentCreate({...request, documents:[...request.documents,...request.documents]}));
+        "#,
+        bridge(Arc::clone(&ops)),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for topic in ["foreign", "empty", "nil", "duplicate"] {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), topic),
+            "invalid_request",
+            "content_create",
+        );
+    }
+    assert!(ops.seen().is_empty());
+}
+
+#[tokio::test]
+async fn content_create_uses_its_own_budget_and_cancellation() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut budget_runtime = runtime(
+        CONTENT_CREATE_SCENARIO,
+        bridge(Arc::clone(&ops)).with_budgets(
+            HostOpBudgets::default()
+                .with_limits(HostOp::ContentCreate, HostOpLimits::new(30_000, 1)),
+        ),
+    );
+    budget_runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_success(&outcome(&budget_runtime.host_state(), "create"));
+    assert_typed_error(
+        &outcome(&budget_runtime.host_state(), "retry"),
+        "budget_exceeded",
+        "content_create",
+    );
+    let mut cancelled_runtime = runtime(
+        CONTENT_CREATE_SCENARIO,
+        bridge(Arc::clone(&ops))
+            .with_cancellation(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+    );
+    cancelled_runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_typed_error(
+        &outcome(&cancelled_runtime.host_state(), "create"),
+        "cancelled",
+        "content_create",
+    );
+    assert_eq!(ops.seen(), vec![HostOp::ContentCreate]);
+}
 
 #[tokio::test]
 async fn project_onboarding_rejects_scope_overrides_and_missing_capabilities() {
