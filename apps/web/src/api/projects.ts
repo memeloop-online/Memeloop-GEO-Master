@@ -296,14 +296,14 @@ export function startProject(
 export async function getProjectStart(
   projectId: string,
   tenantId: string,
-): Promise<ProjectStartAcceptance | undefined> {
+): Promise<ProjectStartAcceptance | null> {
   try {
     return await apiFetch<ProjectStartAcceptance>(
       `/projects/${encodeURIComponent(projectId)}/start`,
       { tenantId },
     );
   } catch (error) {
-    if (error instanceof ApiError && error.status === 404) return undefined;
+    if (error instanceof ApiError && error.status === 404) return null;
     throw error;
   }
 }
