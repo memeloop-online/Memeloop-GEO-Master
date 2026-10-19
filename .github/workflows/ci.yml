@@ -141,6 +141,8 @@ jobs:
           node scripts/verify-report-pdf.mjs 2>&1 | tee logs/report-pdf-smoke.log
 
       - name: Run generated bundle Rust/V8 compatibility test
+        # Keep bundle evidence independent of an earlier workspace test failure.
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
@@ -187,6 +189,9 @@ jobs:
           mkdir -p logs
           failed=0
           for round in $(seq 1 5); do
+            if ! cargo test -p geo-worker --lib -- --nocapture 2>&1 | tee "logs/v8-worker-lib-${round}.log"; then
+              failed=1
+            fi
             if ! cargo test -p geo-worker --test probe enforces_heap_limit -- --exact --nocapture 2>&1 | tee "logs/v8-heap-alone-${round}.log"; then
               failed=1
             fi

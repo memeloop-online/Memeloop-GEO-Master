@@ -73,7 +73,20 @@ async fn fetch_page_inner(
                 geo_provider::ProviderError::InvalidRequest(_) => {
                     AppError::invalid_request("webpage URL must resolve only to public addresses")
                 }
-                _ => unavailable("webpage address could not be resolved"),
+                geo_provider::ProviderError::Timeout => {
+                    tracing::warn!(
+                        failure_kind = "lookup_timeout",
+                        "webpage client preparation failed"
+                    );
+                    unavailable("webpage address lookup timed out")
+                }
+                _ => {
+                    tracing::warn!(
+                        failure_kind = "client_preparation",
+                        "webpage client preparation failed"
+                    );
+                    unavailable("webpage connection could not be prepared")
+                }
             })?;
         let mut response = client
             .get(current.clone())
