@@ -378,8 +378,8 @@ impl ObservationAnalysisService {
         Ok(admission.revision)
     }
 
-    /// A capture alone does not mean an interrupted extraction: live browser
-    /// parsing may already have produced a trusted observation.
+    /// Recover admission only for sources that have not already been handled.
+    /// Explicit reanalysis remains a separate manual admission.
     pub(crate) async fn needs_source_extraction(
         &self,
         scope: &TenantScope,
@@ -396,13 +396,55 @@ impl ObservationAnalysisService {
         {
             return Ok(false);
         }
-        Ok(geo_domain::effective_observation(
+        if geo_domain::effective_observation(
             &target,
             &[],
             Utc::now(),
             crate::citation_insights::accepted_live_search,
         )
-        .is_none())
+        .is_some()
+        {
+            return Ok(false);
+        }
+        let mut after = None;
+        loop {
+            let revisions = self
+                .repository
+                .list_for_attempt(scope, capture.target_id, capture.attempt_id, after, 100)
+                .await?;
+            for revision in &revisions {
+                // Unresolved manual inference blocks automatic admission for
+                // the whole attempt, even when it uses another saved source.
+                if revision.blocks_automatic_admission() {
+                    return Ok(false);
+                }
+                if revision.state == ObservationAnalysisState::Completed
+                    && revision.request.source_sha256 == capture.source_sha256
+                    && revision.request.observed_at == capture.observed_at
+                    && match revision.request.source {
+                        ObservationAnalysisSource::Capture { capture_id } => {
+                            capture_id == capture.capture_id
+                        }
+                        ObservationAnalysisSource::AttemptEvidence { .. } => true,
+                    }
+                    && observation_analysis_source_json(
+                        scope,
+                        &revision.request,
+                        &target,
+                        Some(capture),
+                    )
+                    .is_ok()
+                {
+                    return Ok(false);
+                }
+            }
+            if revisions.len() < 100 {
+                return Ok(true);
+            }
+            after = revisions
+                .last()
+                .map(|revision| revision.request.revision_id);
+        }
     }
 
     pub(crate) async fn manual_source(
@@ -1658,6 +1700,236 @@ mod tests {
         assert_eq!(intent.state, ObservationExtractionState::Completed);
         assert_eq!(intent.request.prompt_version, PROMPT_VERSION);
         assert_eq!(intent.request.parser_version, PARSER_VERSION);
+    }
+
+    #[tokio::test]
+    async fn source_recovery_preserves_saved_analysis_and_allows_explicit_reanalysis() {
+        let f = fixture(false, true, false).await;
+        // A saved interpretation is sufficient even when no extraction intent
+        // exists. Recovery must not infer the same saved source again.
+        let saved = f
+            .service
+            .project_extraction_response(&f.scope, &received_intent(&f).await)
+            .await
+            .unwrap()
+            .unwrap();
+        let repository = f.service.extraction_repository.as_ref().unwrap().clone();
+        let worker = crate::observation_extraction::ObservationExtractionService::new(
+            repository.clone(),
+            f.service.captures.clone(),
+            f.service.model.clone(),
+            f.service.grounder.clone(),
+        )
+        .with_continuation(Arc::new(f.service.clone()));
+        let mut scan = crate::observation_extraction::SourceAdmissionScan::new();
+        scan.tick(&worker, &f.service).await.unwrap();
+        scan.tick(&worker, &f.service).await.unwrap();
+        assert!(
+            repository
+                .scan_ready(Utc::now(), None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.service
+                .repository
+                .get(&f.scope, saved.request.revision_id)
+                .await
+                .unwrap(),
+            Some(saved.clone())
+        );
+
+        let manual = f
+            .service
+            .submit(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                AnalyzeSavedSource {
+                    idempotency_key: "explicit-saved-reanalysis".into(),
+                    capture_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(manual.request.revision_id, saved.request.revision_id);
+        f.service
+            .execute(&f.scope, manual.request.revision_id)
+            .await
+            .unwrap();
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.service
+                .jobs
+                .get_target(&f.scope, f.target_id)
+                .await
+                .unwrap(),
+            f.original
+        );
+    }
+
+    async fn save_additional_source(f: &Fixture, source: &str, observed_at: DateTime<Utc>) -> Uuid {
+        let capture_id = Uuid::new_v4();
+        f.service
+            .captures
+            .save(
+                &f.scope,
+                ObservationCaptureInput {
+                    capture_id,
+                    target_id: f.target_id,
+                    attempt_id: f.attempt_id,
+                    account_id: f.original.target.input.account_id(),
+                    runner_session_id: Uuid::new_v4(),
+                    original_identity: Some(ObservationProviderIdentity {
+                        provider: "synthetic".into(),
+                        platform_account_id: "synthetic-account".into(),
+                    }),
+                    ordinal: 0,
+                    observed_at,
+                    snapshot: ObservationCaptureSnapshot::Source {
+                        source_json: source.into(),
+                        source_sha256: sha256_hex(source.as_bytes()),
+                    },
+                    owned_conversation: None,
+                    completion: None,
+                },
+            )
+            .await
+            .unwrap();
+        capture_id
+    }
+
+    #[tokio::test]
+    async fn source_recovery_matches_saved_analysis_to_source_bytes_and_time() {
+        // The same attempt can retain another source in its original receipt.
+        // An interpretation of those bytes does not handle a different capture.
+        for (same_source, same_time) in [(true, true), (false, true), (true, false)] {
+            let f = fixture_with_source(false, true, false, "execution_deadline", true, true).await;
+            let source = f
+                .service
+                .sources(&f.scope, &f.original, f.attempt_id)
+                .await
+                .unwrap()
+                .remove(0);
+            f.service
+                .repository
+                .project_response(
+                    &f.scope,
+                    "saved-evidence-analysis",
+                    &"a".repeat(64),
+                    ObservationAnalysisService::request(f.target_id, f.attempt_id, source),
+                    ObservationAnalysisResult {
+                        config_revision: None,
+                        actual_model: Some("synthetic-saved-model".into()),
+                        candidate_json: None,
+                        outcome: ObservationAnalysisOutcome::Unverified {
+                            reason: "source_incomplete".into(),
+                        },
+                        prompt_tokens: 3,
+                        completion_tokens: 1,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            let source = if same_source {
+                r#"{"messages":[{"content":"Synthetic saved answer"}]}"#
+            } else {
+                r#"{"messages":[{"content":"Another synthetic saved answer"}]}"#
+            };
+            let observed_at = f.original.attempts[0].claimed_at
+                + chrono::Duration::milliseconds(if same_time { 1_000 } else { 1_500 });
+            let capture_id = save_additional_source(&f, source, observed_at).await;
+            let needs_extraction = !(same_source && same_time);
+            let repository = f.service.extraction_repository.as_ref().unwrap().clone();
+            let worker = crate::observation_extraction::ObservationExtractionService::new(
+                repository.clone(),
+                f.service.captures.clone(),
+                f.service.model.clone(),
+                f.service.grounder.clone(),
+            )
+            .with_continuation(Arc::new(f.service.clone()));
+            let mut scan = crate::observation_extraction::SourceAdmissionScan::new();
+            scan.tick(&worker, &f.service).await.unwrap();
+            scan.tick(&worker, &f.service).await.unwrap();
+            let ready = repository.scan_ready(Utc::now(), None, 100).await.unwrap();
+            assert_eq!(ready.len(), usize::from(needs_extraction));
+            if let Some(ready) = ready.first() {
+                let intent = repository
+                    .get(&f.scope, ready.intent_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(intent.request.source_capture_id, Some(capture_id));
+                worker.dispatch(&f.scope, ready.intent_id).await.unwrap();
+            }
+            assert_eq!(
+                f.model.0.load(Ordering::SeqCst),
+                usize::from(needs_extraction)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_recovery_does_not_bypass_unresolved_manual_evidence_analysis() {
+        let f = fixture_with_source(false, true, false, "execution_deadline", true, true).await;
+        let manual = f
+            .service
+            .submit(
+                &f.scope,
+                f.target_id,
+                f.attempt_id,
+                AnalyzeSavedSource {
+                    idempotency_key: "unresolved-evidence-analysis".into(),
+                    capture_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let capture_id = save_additional_source(
+            &f,
+            r#"{"messages":[{"content":"Another synthetic saved answer"}]}"#,
+            f.original.attempts[0].claimed_at + chrono::Duration::seconds(1),
+        )
+        .await;
+        let capture = f
+            .service
+            .captures
+            .get_source(&f.scope, capture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !f.service
+                .needs_source_extraction(&f.scope, &capture)
+                .await
+                .unwrap()
+        );
+        let repository = f.service.extraction_repository.as_ref().unwrap().clone();
+        let worker = crate::observation_extraction::ObservationExtractionService::new(
+            repository.clone(),
+            f.service.captures.clone(),
+            f.service.model.clone(),
+            f.service.grounder.clone(),
+        );
+        let mut scan = crate::observation_extraction::SourceAdmissionScan::new();
+        scan.tick(&worker, &f.service).await.unwrap();
+        scan.tick(&worker, &f.service).await.unwrap();
+        let ready = repository.scan_ready(Utc::now(), None, 100).await.unwrap();
+        assert_eq!(ready.len(), 1);
+        let intent = repository
+            .get(&f.scope, ready[0].intent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent.request.manual_revision_id,
+            Some(manual.request.revision_id)
+        );
+        assert_eq!(intent.request.source_capture_id, None);
+        assert_eq!(f.model.0.load(Ordering::SeqCst), 0);
     }
 
     async fn received_intent(f: &Fixture) -> ObservationExtractionIntent {
