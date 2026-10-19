@@ -1,4 +1,4 @@
-# Content archive dependency notices
+# API dependency notices
 
 The content archive adapter uses `zip 8.6.0`
 (https://github.com/zip-rs/zip2), distributed under the MIT license:
@@ -10,9 +10,15 @@ Its `typed-path 0.12.3` dependency
 MIT OR Apache-2.0. The MIT option is reproduced below. Exact dependency
 versions and registry checksums are recorded in `Cargo.lock`.
 
+The single-page knowledge importer uses `html2text 0.17.4`
+(https://github.com/jugglerchris/rust-html2text), distributed under the MIT
+license reproduced below:
+
+Copyright (c) 2016 Chris Emerson
+
 These notices do not change the application's Apache-2.0 license.
 Binary distributions must preserve the applicable dependency notices;
-this file covers the archive dependencies, not every Rust dependency.
+this file covers these direct adapters, not every Rust dependency.
 
 ## MIT License
 

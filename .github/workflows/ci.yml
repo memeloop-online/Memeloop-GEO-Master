@@ -361,9 +361,10 @@ jobs:
           target: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
-      - name: Cache Cargo and rusty_v8
+      - name: Restore Cargo and rusty_v8 cache
+        id: windows-cargo-cache
         if: steps.native-scope.outputs.required == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -481,3 +482,18 @@ jobs:
           name: rusty-v8-msvc-${{ github.sha }}
           if-no-files-found: error
           path: artifacts/rusty-v8-msvc/
+
+      - name: Save Cargo and rusty_v8 cache
+        if: ${{ success() && steps.native-scope.outputs.required == 'true' && steps.windows-cargo-cache.outputs.cache-hit != 'true' }}
+        # Cache upload is optional acceleration, not part of native verification.
+        # Bound compression/upload so a completed test run cannot expire in a post step.
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/.rusty_v8
+            target
+          key: ${{ steps.windows-cargo-cache.outputs.cache-primary-key }}
