@@ -17,6 +17,7 @@ geo-persistence = { path = "../persistence" }
 geo-provider = { path = "../provider" }
 geo-worker = { path = "../worker" }
 hex.workspace = true
+html2text = "=0.17.4"
 http.workspace = true
 image.workspace = true
 png.workspace = true

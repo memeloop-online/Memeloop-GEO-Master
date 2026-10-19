@@ -9,18 +9,19 @@ use geo_domain::{
     AppError, AttachmentObjectBytes, Chunk, ContentKnowledgeGuard, ContentPublicEligibility,
     CurrentKnowledgeRelease, DocumentManifest, DocumentManifestCoverage, DocumentManifestItem,
     DocumentManifestItemState, DocumentManifestPlanRequest, DocumentManifestState, DocumentScope,
-    Fact, ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob, ImportStage,
-    ImportStatus, KnowledgeCapability, KnowledgeCoverage, KnowledgeOverview, KnowledgePurpose,
-    KnowledgeRelease, KnowledgeRepository, MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_BYTES, Operation,
-    OperationStatus, Product, ReviseSourceTextCommand, Source, SourceDetail, SourceKind,
-    SourceState, SourceTextRevisionReceipt, SourceVersion, SourceVersionContent,
-    SourceVersionRepresentation, StoredObject, StoredObjectState, TenantScope,
-    UPLOAD_SESSION_TTL_SECONDS, UploadSession, UploadSessionCommand, UploadSessionState,
-    is_supported_knowledge_media_type, knowledge_parser_version, parsed_knowledge_chunks,
-    plan_document_manifest, sha256_hex,
+    Fact, FetchedUrlPage, ImportAcceptance, ImportBatchAcceptance, ImportItem, ImportJob,
+    ImportStage, ImportStatus, KnowledgeCapability, KnowledgeCoverage, KnowledgeOverview,
+    KnowledgePurpose, KnowledgeRelease, KnowledgeRepository, MAX_INLINE_TEXT_BYTES,
+    MAX_UPLOAD_BYTES, Operation, OperationStatus, Product, ReviseSourceTextCommand, Source,
+    SourceDetail, SourceKind, SourceState, SourceTextRevisionReceipt, SourceVersion,
+    SourceVersionContent, SourceVersionRepresentation, StoredObject, StoredObjectState,
+    TenantScope, UPLOAD_SESSION_TTL_SECONDS, UploadSession, UploadSessionCommand,
+    UploadSessionState, UrlPageFetcher, is_supported_knowledge_media_type,
+    knowledge_parser_version, parsed_knowledge_chunks, plan_document_manifest, sha256_hex,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{Database, set_local_scope};
@@ -36,6 +37,7 @@ pub struct PgKnowledgeRepository {
     pool: PgPool,
     pdf_parser_profile: Option<String>,
     office_parser_profile: Option<String>,
+    url_fetcher: Option<Arc<dyn UrlPageFetcher>>,
 }
 
 impl PgKnowledgeRepository {
@@ -44,6 +46,7 @@ impl PgKnowledgeRepository {
             pool,
             pdf_parser_profile: None,
             office_parser_profile: None,
+            url_fetcher: None,
         }
     }
 
@@ -59,6 +62,50 @@ impl PgKnowledgeRepository {
     pub fn with_office_parser_profile(mut self, parser_profile: String) -> Self {
         self.office_parser_profile = Some(parser_profile);
         self
+    }
+
+    pub fn with_url_fetcher(mut self, fetcher: Arc<dyn UrlPageFetcher>) -> Self {
+        self.url_fetcher = Some(fetcher);
+        self
+    }
+
+    async fn import_url_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        scope: &TenantScope,
+        item: &ImportItem,
+        page: FetchedUrlPage,
+    ) -> Result<ImportAcceptance, AppError> {
+        if page.raw_bytes.is_empty() || page.raw_bytes.len() as u64 > MAX_UPLOAD_BYTES {
+            return Err(AppError::invalid_request(
+                "URL snapshot exceeds the supported size",
+            ));
+        }
+        let project_id = Self::project_id(scope)?;
+        let object_id = Uuid::new_v4();
+        let object = StoredObject {
+            object_id,
+            operator_id: scope.operator_id,
+            tenant_id: scope.tenant_id,
+            project_id,
+            object_version: 1,
+            backend: "postgres_blob".to_owned(),
+            opaque_key: format!("url-snapshot/{object_id}"),
+            actual_size: page.raw_bytes.len() as u64,
+            detected_media_type: page.media_type.clone(),
+            sha256: sha256_hex(&page.raw_bytes),
+            state: StoredObjectState::Committed,
+            created_at: page.captured_at,
+        };
+        Self::import_text_in_transaction(
+            transaction,
+            scope,
+            item,
+            Some(object),
+            page.text.clone(),
+            true,
+            Some(&page),
+        )
+        .await
     }
 
     fn project_id(scope: &TenantScope) -> Result<geo_domain::ProjectId, AppError> {
@@ -452,7 +499,8 @@ impl PgKnowledgeRepository {
         }
         let text = String::from_utf8(bytes.expect("non-PDF content validated"))
             .map_err(|_| AppError::invalid_request("text upload bytes must be valid UTF-8"))?;
-        Self::import_text_in_transaction(transaction, scope, item, Some(object), text, false).await
+        Self::import_text_in_transaction(transaction, scope, item, Some(object), text, false, None)
+            .await
     }
 
     async fn import_text_in_transaction(
@@ -462,6 +510,7 @@ impl PgKnowledgeRepository {
         object: Option<StoredObject>,
         text: String,
         create_object: bool,
+        page: Option<&FetchedUrlPage>,
     ) -> Result<ImportAcceptance, AppError> {
         if text.trim().is_empty() {
             return Err(AppError::invalid_request("text must not be empty"));
@@ -472,15 +521,33 @@ impl PgKnowledgeRepository {
         let source_version_id = Uuid::new_v4();
         let operation_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
-        let content_hash = sha256_hex(text.as_bytes());
+        let content_hash = page
+            .map(|page| sha256_hex(&page.raw_bytes))
+            .unwrap_or_else(|| sha256_hex(text.as_bytes()));
         let media_type = object
             .as_ref()
+            .filter(|_| page.is_none())
             .map(|object| object.detected_media_type.as_str())
             .unwrap_or("text/plain");
-        let parser_version = knowledge_parser_version(media_type);
+        let parser_version = page
+            .map(|page| page.parser_version.as_str())
+            .unwrap_or_else(|| knowledge_parser_version(media_type));
+        let captured_at = page.map(|page| page.captured_at).unwrap_or(now);
         // Batch item errors are recorded in the surrounding transaction, so
         // validate the entire input before creating any successful import state.
-        let chunks = parsed_knowledge_chunks(scope, source_version_id, &text, media_type)?;
+        let mut chunks = parsed_knowledge_chunks(scope, source_version_id, &text, media_type)?;
+        if let (Some(page), Some(object)) = (page, object.as_ref()) {
+            for chunk in &mut chunks {
+                chunk.locator = geo_domain::ChunkLocator::Web {
+                    snapshot_object_id: object.object_id,
+                    original_url: page.requested_url.clone(),
+                    selector: None,
+                    start_char: None,
+                    end_char: None,
+                };
+                chunk.extraction_method = page.parser_version.clone();
+            }
+        }
         if let Some(object) = &object
             && create_object
         {
@@ -503,11 +570,31 @@ impl PgKnowledgeRepository {
             .execute(&mut **transaction)
             .await
             .map_err(database_error)?;
+            if let Some(page) = page {
+                sqlx::query(
+                    "INSERT INTO knowledge_url_snapshot_bytes
+                     (object_id,operator_id,tenant_id,project_id,object_version,content,actual_size,sha256)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                )
+                .bind(object.object_id)
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(project_id.as_uuid())
+                .bind(object.object_version)
+                .bind(&page.raw_bytes)
+                .bind(object.actual_size as i64)
+                .bind(&object.sha256)
+                .execute(&mut **transaction)
+                .await
+                .map_err(database_error)?;
+            }
         }
-        let locator = object
+        let locator = page.map(|page| json!({"kind":"web","url":page.requested_url,
+            "final_url":page.final_url,"captured_at":page.captured_at}))
+            .unwrap_or_else(|| object
             .as_ref()
             .map(|object| json!({"kind":"object","object_id":object.object_id,"object_version":object.object_version}))
-            .unwrap_or_else(|| json!({"kind":"inline_text"}));
+            .unwrap_or_else(|| json!({"kind":"inline_text"})));
         sqlx::query(
             "INSERT INTO knowledge_sources
              (source_id,operator_id,tenant_id,project_id,revision,kind,name,purpose,state,locator,current_version_id,sync_enabled)
@@ -526,8 +613,8 @@ impl PgKnowledgeRepository {
         .map_err(database_error)?;
         sqlx::query(
             "INSERT INTO knowledge_source_versions
-             (source_version_id,operator_id,tenant_id,project_id,source_id,version,object_id,object_version,content_sha256,captured_at,parser_version,extraction_version,created_at)
-             VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,'none-v1',$9)",
+             (source_version_id,operator_id,tenant_id,project_id,source_id,version,object_id,object_version,content_sha256,captured_at,parser_version,extraction_version,created_at,original_url)
+             VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,'none-v1',$11,$12)",
         )
         .bind(source_version_id)
         .bind(scope.operator_id.as_uuid())
@@ -537,8 +624,10 @@ impl PgKnowledgeRepository {
         .bind(object.as_ref().map(|value| value.object_id))
         .bind(object.as_ref().map(|value| value.object_version))
         .bind(&content_hash)
-        .bind(now)
+        .bind(captured_at)
         .bind(parser_version)
+        .bind(now)
+        .bind(page.map(|page| &page.requested_url))
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
@@ -610,8 +699,8 @@ impl PgKnowledgeRepository {
             object_id: object.as_ref().map(|value| value.object_id),
             object_version: object.as_ref().map(|value| value.object_version),
             content_sha256: content_hash.clone(),
-            captured_at: now,
-            original_url: None,
+            captured_at,
+            original_url: page.map(|page| page.requested_url.clone()),
             parent_version_id: None,
             parser_version: parser_version.to_owned(),
             extraction_version: "none-v1".to_owned(),
@@ -1087,6 +1176,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
     async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError> {
         Self::project_id(scope)?;
         let mut capabilities = KnowledgeCapability::durable_text_only();
+        capabilities.url_fetch = self.url_fetcher.is_some();
         if self.pdf_parser_profile.is_some() {
             capabilities.pdf_parser = true;
             capabilities
@@ -1592,6 +1682,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                 Some(object),
                 text,
                 true,
+                None,
             )
             .await?
         };
@@ -1903,6 +1994,39 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                 continue;
             }
             let input_hash = sha256_hex(&serde_json::to_vec(&item).map_err(serialization_error)?);
+            // Check receipts before outbound I/O. Fetching holds neither a database
+            // transaction nor the receipt lock; the write transaction rechecks below.
+            let fetched_page = if item.kind == SourceKind::Url {
+                let mut lookup = self.transaction(scope).await?;
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM knowledge_import_receipts
+                     WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3
+                       AND action='import_item' AND client_item_id=$4)",
+                )
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(project_id.as_uuid())
+                .bind(&item.client_item_id)
+                .fetch_one(&mut *lookup)
+                .await
+                .map_err(database_error)?;
+                lookup.commit().await.map_err(database_error)?;
+                if exists {
+                    None
+                } else {
+                    Some(match (self.url_fetcher.as_ref(), item.url.as_deref()) {
+                        (Some(fetcher), Some(url)) => fetcher.fetch(url).await,
+                        (Some(_), None) => Err(AppError::invalid_request(
+                            "URL imports require the url field",
+                        )),
+                        (None, _) => {
+                            Err(AppError::capability_missing("url_fetch is not configured"))
+                        }
+                    })
+                }
+            } else {
+                None
+            };
             let mut transaction = self.transaction(scope).await?;
             // Serialize a project's receipt key before reading it, including
             // when no receipt exists yet. A row lock cannot protect that gap.
@@ -1959,6 +2083,7 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                             None,
                             text,
                             false,
+                            None,
                         )
                         .await
                     }
@@ -1979,7 +2104,15 @@ impl KnowledgeRepository for PgKnowledgeRepository {
                 )
                 .await
             } else if item.kind == SourceKind::Url {
-                Err(AppError::capability_missing("url_fetch is not configured"))
+                match fetched_page {
+                    Some(Ok(page)) => {
+                        Self::import_url_in_transaction(&mut transaction, scope, &item, page).await
+                    }
+                    Some(Err(error)) => Err(error),
+                    None => Err(AppError::conflict(
+                        "URL import receipt is no longer available",
+                    )),
+                }
             } else {
                 Err(AppError::capability_missing(
                     "import adapter is not configured",

@@ -1,10 +1,9 @@
 //! Versioned, tenant-scoped knowledge-import contracts.
 //!
 //! This module deliberately models the usable first vertical slice only:
-//! verified upload bytes and text / Markdown / UTF-8 CSV can be turned into
-//! deterministic paragraph/table chunks and an immutable release. It does not
-//! pretend that crawling, office/PDF parsing, OCR, embeddings, or an LLM are
-//! available.
+//! verified upload bytes, text / Markdown / UTF-8 CSV, and acquired URL pages
+//! become deterministic chunks and immutable releases. External acquisition
+//! and document parsing are available only through configured adapters.
 
 pub(crate) mod knowledge_csv;
 pub(crate) mod office_parse;
@@ -16,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -41,6 +41,23 @@ pub const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_INLINE_TEXT_BYTES: usize = 256 * 1024;
 pub const UPLOAD_SESSION_TTL_SECONDS: i64 = 60 * 60;
 pub const CONTENT_EVIDENCE_MAX_QUOTE_CHARS: usize = 1600;
+
+/// One acquired page and its immutable original response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedUrlPage {
+    pub requested_url: String,
+    pub final_url: String,
+    pub captured_at: DateTime<Utc>,
+    pub raw_bytes: Vec<u8>,
+    pub media_type: String,
+    pub text: String,
+    pub parser_version: String,
+}
+
+#[async_trait]
+pub trait UrlPageFetcher: Send + Sync + std::fmt::Debug {
+    async fn fetch(&self, url: &str) -> Result<FetchedUrlPage, AppError>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1535,6 +1552,7 @@ impl<'a> ContentKnowledgeGuard<'a> {
 #[derive(Debug, Default)]
 pub struct MemoryKnowledgeRepository {
     state: RwLock<MemoryState>,
+    url_fetcher: Option<Arc<dyn UrlPageFetcher>>,
     pdf_parser_profile: Option<String>,
     docx_parser_profile: Option<String>,
     xlsx_parser_profile: Option<String>,
@@ -1592,6 +1610,11 @@ struct MemoryState {
 }
 
 impl MemoryKnowledgeRepository {
+    pub fn with_url_fetcher(mut self, fetcher: Arc<dyn UrlPageFetcher>) -> Self {
+        self.url_fetcher = Some(fetcher);
+        self
+    }
+
     fn progress_for_job_locked(
         state: &MemoryState,
         scope: &TenantScope,
@@ -1758,6 +1781,7 @@ impl MemoryKnowledgeRepository {
     pub fn with_pdf_parser_profile(profile: String) -> Self {
         Self {
             state: RwLock::new(MemoryState::default()),
+            url_fetcher: None,
             pdf_parser_profile: (!profile.trim().is_empty()).then_some(profile),
             docx_parser_profile: None,
             xlsx_parser_profile: None,
@@ -1778,6 +1802,7 @@ impl MemoryKnowledgeRepository {
     ) -> Self {
         Self {
             state: RwLock::new(MemoryState::default()),
+            url_fetcher: None,
             pdf_parser_profile: pdf_profile.filter(|profile| !profile.trim().is_empty()),
             docx_parser_profile: docx_profile.filter(|profile| !profile.trim().is_empty()),
             xlsx_parser_profile: xlsx_profile.filter(|profile| !profile.trim().is_empty()),
@@ -2079,6 +2104,7 @@ impl MemoryKnowledgeRepository {
         item: &ImportItem,
         text: String,
         object: Option<StoredObject>,
+        page: Option<&FetchedUrlPage>,
     ) -> Result<ImportAcceptance, AppError> {
         if object.is_none() && text.len() > MAX_INLINE_TEXT_BYTES {
             return Err(AppError::invalid_request(
@@ -2088,12 +2114,15 @@ impl MemoryKnowledgeRepository {
         if text.trim().is_empty() {
             return Err(AppError::invalid_request("text must not be empty"));
         }
-        let hash = sha256_hex(text.as_bytes());
+        let hash = page
+            .map(|page| sha256_hex(&page.raw_bytes))
+            .unwrap_or_else(|| sha256_hex(text.as_bytes()));
         let media_type = object
             .as_ref()
+            .filter(|_| page.is_none())
             .map(|object| object.detected_media_type.as_str())
             .unwrap_or("text/plain");
-        let (source, mut version) = Self::source_and_version(
+        let (mut source, mut version) = Self::source_and_version(
             scope,
             item.kind,
             item.name.clone(),
@@ -2115,7 +2144,31 @@ impl MemoryKnowledgeRepository {
         );
         operation.status = OperationStatus::Succeeded;
         version.parser_version = knowledge_parser_version(media_type).to_owned();
-        let chunks = parsed_knowledge_chunks(scope, version.source_version_id, &text, media_type)?;
+        let mut chunks =
+            parsed_knowledge_chunks(scope, version.source_version_id, &text, media_type)?;
+        if let Some(page) = page {
+            let object = object.as_ref().expect("URL import supplies its snapshot");
+            source.locator = json!({
+                "kind": "web",
+                "url": page.requested_url,
+                "final_url": page.final_url,
+                "captured_at": page.captured_at,
+            });
+            source.last_sync_at = Some(page.captured_at);
+            version.captured_at = page.captured_at;
+            version.original_url = Some(page.requested_url.clone());
+            version.parser_version = page.parser_version.clone();
+            for chunk in &mut chunks {
+                chunk.extraction_method = page.parser_version.clone();
+                chunk.locator = ChunkLocator::Web {
+                    snapshot_object_id: object.object_id,
+                    original_url: page.requested_url.clone(),
+                    selector: None,
+                    start_char: None,
+                    end_char: None,
+                };
+            }
+        }
         let job = ImportJob {
             import_job_id: Uuid::new_v4(),
             operator_id: scope.operator_id,
@@ -2142,6 +2195,11 @@ impl MemoryKnowledgeRepository {
         state.chunks.insert(version.source_version_id, chunks);
         state.jobs.insert(job.import_job_id, job.clone());
         if let Some(object) = object {
+            if let Some(page) = page {
+                state
+                    .object_bytes
+                    .insert(object.object_id, page.raw_bytes.clone());
+            }
             state.stored_objects.insert(object.object_id, object);
         }
         let release = Self::make_release_locked(state, scope)?;
@@ -2225,9 +2283,9 @@ impl MemoryKnowledgeRepository {
             .filter_map(|id| state.versions.get(id))
             .map(|version| version.parser_version.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        if parsers.contains("deterministic-csv-v1")
-            || parsers.contains("deterministic-csv-v2")
-            || parsers.iter().any(|parser| parser.starts_with("tika-"))
+        if parsers
+            .iter()
+            .any(|parser| parser != "deterministic-text-v1")
         {
             pipeline_versions["parser"] = json!("deterministic-knowledge-v1");
             pipeline_versions["parsers"] = json!(parsers);
@@ -2400,6 +2458,24 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 text: text.clone(),
                 text_basis: SourceTextBasis::Exact,
             }));
+        }
+        if version.original_url.is_some() {
+            let object = version
+                .object_id
+                .and_then(|id| state.stored_objects.get(&id));
+            let bytes = version.object_id.and_then(|id| state.object_bytes.get(&id));
+            if !matches!((object, bytes), (Some(object), Some(bytes))
+                if Self::in_scope(scope, object)
+                    && object.state == StoredObjectState::Committed
+                    && Some(object.object_version) == version.object_version
+                    && bytes.len() as u64 == object.actual_size
+                    && sha256_hex(bytes) == object.sha256
+                    && object.sha256 == version.content_sha256)
+            {
+                return Err(AppError::conflict(
+                    "URL snapshot bytes do not match source version",
+                ));
+            }
         }
         if let Some(object_id) = version.object_id
             && let (Some(object), Some(bytes)) = (
@@ -2715,6 +2791,18 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 "Office structural import does not execute formulas, fetch external resources, or infer headers; OCR is not configured"
                     .to_owned(),
             );
+        }
+        if self.url_fetcher.is_some() {
+            capability.url_fetch = true;
+            capability
+                .limitations
+                .retain(|line| !line.contains("URL acquisition"));
+            if !capability.pdf_parser || !capability.docx_parser || !capability.xlsx_parser {
+                capability.limitations.push(
+                    "document parsing requires configured adapters; OCR is not configured"
+                        .to_owned(),
+                );
+            }
         }
         Ok(capability)
     }
@@ -4142,7 +4230,7 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
         let mut acceptance = if is_supported_knowledge_media_type(&session.declared_media_type) {
             let text = String::from_utf8(content.clone())
                 .map_err(|_| AppError::invalid_request("text upload bytes must be valid UTF-8"))?;
-            Self::import_text_locked(&mut state, scope, &item, text, Some(object.clone()))?
+            Self::import_text_locked(&mut state, scope, &item, text, Some(object.clone()), None)?
         } else if session.declared_media_type == "application/pdf"
             && self.pdf_parser_profile.is_some()
         {
@@ -4359,7 +4447,6 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                 "imports must contain between 1 and 100 items",
             ));
         }
-        let mut state = self.state.write().await;
         let mut output = Vec::with_capacity(items.len());
         for item in items {
             let item_key = item.client_item_id.trim().to_owned();
@@ -4380,6 +4467,48 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
             }
             let request_hash = import_item_hash(&item)?;
             let key = (scope.storage_key(), item_key.clone());
+            let prior = self.state.read().await.import_items.get(&key).cloned();
+            if let Some((prior_hash, prior)) = prior {
+                if prior_hash == request_hash {
+                    output.push(prior);
+                } else {
+                    output.push(ImportAcceptance {
+                        client_item_id: item.client_item_id,
+                        status: ImportStatus::Failed,
+                        source: None,
+                        source_version: None,
+                        import_job: None,
+                        operation: None,
+                        release: None,
+                        error: Some(AppError::conflict(
+                            "client_item_id was already used with different input",
+                        )),
+                    });
+                }
+                continue;
+            }
+            // Fetch without holding the repository lock. The receipt is checked
+            // again below before storing anything after a concurrent import.
+            let fetched_page = if item.kind == SourceKind::Url {
+                match item.url.as_deref().and_then(|value| {
+                    url::Url::parse(value).ok().filter(|url| {
+                        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                    })
+                }) {
+                    None => Err(AppError::invalid_request(
+                        "url imports require an http or https URL",
+                    )),
+                    Some(_) => match self.url_fetcher.as_ref() {
+                        Some(fetcher) => {
+                            fetcher.fetch(item.url.as_deref().unwrap()).await.map(Some)
+                        }
+                        None => Ok(None),
+                    },
+                }
+            } else {
+                Ok(None)
+            };
+            let mut state = self.state.write().await;
             if let Some((prior_hash, prior)) = state.import_items.get(&key) {
                 if prior_hash != &request_hash {
                     output.push(ImportAcceptance {
@@ -4405,7 +4534,7 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                         AppError::invalid_request("text imports require the text field")
                     });
                     match text.and_then(|text| {
-                        Self::import_text_locked(&mut state, scope, &item, text, None)
+                        Self::import_text_locked(&mut state, scope, &item, text, None, None)
                     }) {
                         Ok(value) => value,
                         Err(error) => ImportAcceptance {
@@ -4421,24 +4550,52 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                     }
                 }
                 SourceKind::Url => {
-                    if !item.url.as_deref().is_some_and(|url| {
-                        url.starts_with("https://") || url.starts_with("http://")
-                    }) {
-                        ImportAcceptance {
-                            client_item_id: item.client_item_id.clone(),
-                            status: ImportStatus::Failed,
-                            source: None,
-                            source_version: None,
-                            import_job: None,
-                            operation: None,
-                            release: None,
-                            error: Some(AppError::invalid_request(
-                                "url imports require an http or https URL",
-                            )),
+                    let result = fetched_page.and_then(|page| {
+                        let Some(page) = page else {
+                            return Ok(Self::failed_missing_adapter(scope, &item, "url_fetch"));
+                        };
+                        if item.url.as_deref() != Some(page.requested_url.as_str())
+                            || page.raw_bytes.is_empty()
+                            || page.raw_bytes.len() as u64 > MAX_UPLOAD_BYTES
+                            || page.text.len() as u64 > MAX_UPLOAD_BYTES
+                            || page.parser_version.trim().is_empty()
+                        {
+                            return Err(AppError::invalid_request("fetched URL page is invalid"));
                         }
-                    } else {
-                        Self::failed_missing_adapter(scope, &item, "url_fetch")
-                    }
+                        let object_id = Uuid::new_v4();
+                        let object = StoredObject {
+                            object_id,
+                            operator_id: scope.operator_id,
+                            tenant_id: scope.tenant_id,
+                            project_id: Self::require_project(scope)?,
+                            object_version: 1,
+                            backend: "memory".to_owned(),
+                            opaque_key: format!("url-snapshots/{object_id}"),
+                            actual_size: page.raw_bytes.len() as u64,
+                            detected_media_type: page.media_type.clone(),
+                            sha256: sha256_hex(&page.raw_bytes),
+                            state: StoredObjectState::Committed,
+                            created_at: page.captured_at,
+                        };
+                        Self::import_text_locked(
+                            &mut state,
+                            scope,
+                            &item,
+                            page.text.clone(),
+                            Some(object),
+                            Some(&page),
+                        )
+                    });
+                    result.unwrap_or_else(|error| ImportAcceptance {
+                        client_item_id: item.client_item_id.clone(),
+                        status: ImportStatus::Failed,
+                        source: None,
+                        source_version: None,
+                        import_job: None,
+                        operation: None,
+                        release: None,
+                        error: Some(error),
+                    })
                 }
                 SourceKind::Object => {
                     let result = (|| {
@@ -4503,7 +4660,7 @@ impl KnowledgeRepository for MemoryKnowledgeRepository {
                         let text = String::from_utf8(bytes.clone()).map_err(|_| {
                             AppError::invalid_request("text upload bytes must be valid UTF-8")
                         })?;
-                        Self::import_text_locked(&mut state, scope, &item, text, Some(object))
+                        Self::import_text_locked(&mut state, scope, &item, text, Some(object), None)
                     })();
                     result.unwrap_or_else(|error| ImportAcceptance {
                         client_item_id: item.client_item_id.clone(),
@@ -4976,6 +5133,302 @@ fn import_item_hash(item: &ImportItem) -> Result<String, AppError> {
                 format!("cannot hash import item: {error}"),
             )
         })
+}
+
+#[cfg(test)]
+mod url_import_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct FakeUrlFetcher {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl UrlPageFetcher for FakeUrlFetcher {
+        async fn fetch(&self, url: &str) -> Result<FetchedUrlPage, AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if url.ends_with("/unavailable") {
+                return Err(AppError::capability_missing("page could not be acquired"));
+            }
+            Ok(FetchedUrlPage {
+                requested_url: url.to_owned(),
+                final_url: "https://example.com/published".to_owned(),
+                captured_at: DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                raw_bytes: b"<html><p>Published facts.</p><p>More facts.</p></html>".to_vec(),
+                media_type: "text/html".to_owned(),
+                text: "Published facts.\n\nMore facts.".to_owned(),
+                parser_version: "test-web-parser-v1".to_owned(),
+            })
+        }
+    }
+
+    fn scope() -> TenantScope {
+        TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        )
+    }
+
+    fn item() -> ImportItem {
+        ImportItem {
+            client_item_id: "page-import".to_owned(),
+            kind: SourceKind::Url,
+            name: "Published page".to_owned(),
+            purpose: KnowledgePurpose::Public,
+            text: None,
+            url: Some("https://example.com/original".to_owned()),
+            object_id: None,
+            knowledge_release_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn url_import_preserves_snapshot_provenance_and_replays_without_fetching() {
+        let fetcher = Arc::new(FakeUrlFetcher::default());
+        let repository = MemoryKnowledgeRepository::default().with_url_fetcher(fetcher.clone());
+        let scope = scope();
+        let request = item();
+        let imported = repository
+            .import_batch(&scope, vec![request.clone()])
+            .await
+            .unwrap();
+        let receipt = &imported.items[0];
+        assert_eq!(receipt.status, ImportStatus::Succeeded);
+        assert!(repository.capabilities(&scope).await.unwrap().url_fetch);
+        let source = receipt.source.as_ref().unwrap();
+        let version = receipt.source_version.as_ref().unwrap();
+        assert_eq!(source.kind, SourceKind::Url);
+        assert_eq!(source.locator["url"], request.url.as_deref().unwrap());
+        assert_eq!(source.locator["final_url"], "https://example.com/published");
+        assert_eq!(version.original_url, request.url);
+        assert_eq!(version.parser_version, "test-web-parser-v1");
+        assert_eq!(
+            version.captured_at.to_rfc3339(),
+            "2026-01-02T03:04:05+00:00"
+        );
+        let snapshot_id = version.object_id.unwrap();
+        {
+            let state = repository.state.read().await;
+            let object = &state.stored_objects[&snapshot_id];
+            let bytes = &state.object_bytes[&snapshot_id];
+            assert_eq!(
+                bytes,
+                b"<html><p>Published facts.</p><p>More facts.</p></html>"
+            );
+            assert_eq!(object.actual_size, bytes.len() as u64);
+            assert_eq!(object.sha256, sha256_hex(bytes));
+            assert_eq!(version.content_sha256, object.sha256);
+            assert_eq!(
+                receipt.import_job.as_ref().unwrap().input_hash,
+                object.sha256
+            );
+            assert_eq!(object.detected_media_type, "text/html");
+            assert!(state.upload_sessions.is_empty());
+            assert!(state.attachment_completions.is_empty());
+        }
+        let detail = repository
+            .get_source_detail(&scope, source.source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.chunks.len(), 2);
+        assert!(detail.chunks.iter().all(|chunk| matches!(
+            &chunk.locator,
+            ChunkLocator::Web { snapshot_object_id, original_url, selector: None, start_char: None, end_char: None }
+                if *snapshot_object_id == snapshot_id && Some(original_url) == request.url.as_ref()
+        )));
+        let content = repository
+            .get_source_version_content(&scope, source.source_id, version.source_version_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(content.text, "Published facts.\n\nMore facts.");
+        assert_eq!(content.text_basis, SourceTextBasis::Extracted);
+        assert!(
+            repository
+                .get_attachment_object_bytes(
+                    &scope,
+                    snapshot_id,
+                    version.object_version.unwrap(),
+                    &version.content_sha256,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repository
+                .import_batch(&scope, vec![request.clone()])
+                .await
+                .unwrap(),
+            imported
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        let progress = repository
+            .resolve_import_receipt(&scope, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.source_version_id, Some(version.source_version_id));
+        assert_eq!(
+            progress.knowledge_release_id,
+            Some(receipt.release.as_ref().unwrap().knowledge_release_id)
+        );
+        let other_scope = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
+        assert!(
+            repository
+                .get_source_detail(&other_scope, source.source_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .get_source_version_content(
+                    &other_scope,
+                    source.source_id,
+                    version.source_version_id
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .resolve_import_receipt(&other_scope, &request)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let other = repository
+            .import_batch(&other_scope, vec![request.clone()])
+            .await
+            .unwrap();
+        assert_ne!(
+            other.items[0].source.as_ref().unwrap().source_id,
+            source.source_id
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+        let mut changed = request;
+        changed.url = Some("https://example.com/changed".to_owned());
+        assert_eq!(
+            repository
+                .import_batch(&scope, vec![changed])
+                .await
+                .unwrap()
+                .items[0]
+                .status,
+            ImportStatus::Failed
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+        repository
+            .state
+            .write()
+            .await
+            .object_bytes
+            .remove(&snapshot_id);
+        assert!(
+            repository
+                .get_source_version_content(&scope, source.source_id, version.source_version_id,)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn url_import_errors_are_per_item_and_receipted() {
+        let fetcher = Arc::new(FakeUrlFetcher::default());
+        let repository = MemoryKnowledgeRepository::default().with_url_fetcher(fetcher.clone());
+        let scope = scope();
+        let mut invalid = item();
+        invalid.url = Some("https://".to_owned());
+        let mut unavailable = item();
+        unavailable.client_item_id = "failed-page".to_owned();
+        unavailable.url = Some("https://example.com/unavailable".to_owned());
+        let mut valid = item();
+        valid.client_item_id = "successful-page".to_owned();
+        let requests = vec![invalid, unavailable, valid];
+        let imported = repository
+            .import_batch(&scope, requests.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            imported
+                .items
+                .iter()
+                .map(|item| item.status)
+                .collect::<Vec<_>>(),
+            vec![
+                ImportStatus::Failed,
+                ImportStatus::Failed,
+                ImportStatus::Succeeded
+            ]
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            repository.import_batch(&scope, requests).await.unwrap(),
+            imported
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Debug, Default)]
+    struct PausedFirstFetcher {
+        calls: AtomicUsize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl UrlPageFetcher for PausedFirstFetcher {
+        async fn fetch(&self, url: &str) -> Result<FetchedUrlPage, AppError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            FakeUrlFetcher::default().fetch(url).await
+        }
+    }
+
+    #[tokio::test]
+    async fn url_import_fetch_releases_lock_and_rechecks_concurrent_receipt() {
+        let fetcher = Arc::new(PausedFirstFetcher::default());
+        let repository =
+            Arc::new(MemoryKnowledgeRepository::default().with_url_fetcher(fetcher.clone()));
+        let scope = scope();
+        let pending_repository = repository.clone();
+        let pending_scope = scope.clone();
+        let pending = tokio::spawn(async move {
+            pending_repository
+                .import_batch(&pending_scope, vec![item()])
+                .await
+        });
+        fetcher.started.notified().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                repository.list_sources(&scope),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty()
+        );
+        let completed = repository.import_batch(&scope, vec![item()]).await.unwrap();
+        fetcher.release.notify_one();
+        assert_eq!(pending.await.unwrap().unwrap(), completed);
+        assert_eq!(repository.list_sources(&scope).await.unwrap().len(), 1);
+        assert_eq!(repository.state.read().await.releases.len(), 1);
+    }
 }
 
 #[cfg(test)]
