@@ -133,6 +133,24 @@ impl ObservationExtractionService {
         source_sha256: &str,
         prompt_version: &str,
     ) -> Result<ObservationExtractionIntent, AppError> {
+        match self
+            .admit_source(scope, capture_id, source_sha256, prompt_version)
+            .await?
+        {
+            AutomaticExtractionAdmission::Intent(intent) => Ok(*intent),
+            AutomaticExtractionAdmission::DeferredManual => {
+                Err(AppError::conflict("extraction deferred by saved analysis"))
+            }
+        }
+    }
+
+    async fn admit_source(
+        &self,
+        scope: &TenantScope,
+        capture_id: Uuid,
+        source_sha256: &str,
+        prompt_version: &str,
+    ) -> Result<AutomaticExtractionAdmission, AppError> {
         if prompt_version != "geo.observation.extract.v4" {
             return Err(AppError::invalid_request("extraction version unsupported"));
         }
@@ -152,18 +170,14 @@ impl ObservationExtractionService {
             parser_version: "geo.observation.extract.v6".into(),
             policy_version: EXTRACTION_POLICY_VERSION.into(),
         };
-        let intent = match self
+        let admission = self
             .repository
             .admit_automatic(scope, request, Utc::now())
-            .await?
-        {
-            AutomaticExtractionAdmission::Intent(intent) => *intent,
-            AutomaticExtractionAdmission::DeferredManual => {
-                return Err(AppError::conflict("extraction deferred by saved analysis"));
-            }
-        };
-        self.wake.notify_one();
-        Ok(intent)
+            .await?;
+        if matches!(admission, AutomaticExtractionAdmission::Intent(_)) {
+            self.wake.notify_one();
+        }
+        Ok(admission)
     }
 
     #[cfg(test)]
@@ -465,7 +479,7 @@ impl SourceAdmissionScan {
                     return Ok(());
                 }
                 service
-                    .enqueue_source(
+                    .admit_source(
                         &item.scope,
                         item.capture_id,
                         &capture.source_sha256,
