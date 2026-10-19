@@ -556,8 +556,8 @@ mod tests {
 
     use super::{EmbeddedIsolate, ProbeRuntime, geo_probe};
 
-    #[test]
-    fn abort_bootstrap_propagates_reason_and_notifies_once() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_bootstrap_propagates_reason_and_notifies_once() {
         let mut runtime = ProbeRuntime::new();
         runtime
             .execute_script(
@@ -598,8 +598,8 @@ mod tests {
             .expect("abort propagation must retain the first reason");
     }
 
-    #[test]
-    fn utf8_bootstrap_handles_unicode_and_buffer_boundaries() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn utf8_bootstrap_handles_unicode_and_buffer_boundaries() {
         let mut runtime = ProbeRuntime::new();
         runtime
             .execute_script(
@@ -656,8 +656,8 @@ mod tests {
             .expect("UTF-8 bootstrap must preserve required text encoding semantics");
     }
 
-    #[test]
-    fn checkpoint_restore_keeps_the_installed_policy_and_is_atomic() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkpoint_restore_keeps_the_installed_policy_and_is_atomic() {
         let mut isolate = EmbeddedIsolate::new(vec![geo_probe::init()], PROBE_BUNDLE, None);
         isolate.install(HostState::with_output_limits(8, 9, 2));
 

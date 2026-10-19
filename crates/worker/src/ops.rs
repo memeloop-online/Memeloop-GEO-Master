@@ -326,8 +326,8 @@ mod tests {
         runtime
     }
 
-    #[test]
-    fn emit_records_a_normal_event_within_the_rust_output_budget() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn emit_records_a_normal_event_within_the_rust_output_budget() {
         let mut runtime = runtime(HostState::with_output_limits(32, 64, 2));
         runtime
             .execute_script(
@@ -351,8 +351,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn emit_rejects_an_oversized_event_with_a_typed_error_without_mutating_state() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn emit_rejects_an_oversized_event_with_a_typed_error_without_mutating_state() {
         let mut runtime = runtime(HostState::with_output_limits(8, 64, 2));
         runtime
             .execute_script(
@@ -383,8 +383,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn emit_rejects_total_bytes_and_event_count_without_mutating_state() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn emit_rejects_total_bytes_and_event_count_without_mutating_state() {
         let mut byte_limited = runtime(HostState::with_output_limits(8, 9, 2));
         byte_limited
             .execute_script(

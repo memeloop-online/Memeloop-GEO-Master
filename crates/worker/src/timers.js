@@ -1,6 +1,6 @@
 // deno_core owns timer scheduling, cancellation and event-loop liveness.
 // This callback-only adapter exposes the globals required by approved bundles;
-// string callbacks are deliberately unsupported (there is no eval capability).
+// string callbacks are deliberately unsupported.
 (() => {
   const { createTimer, cancelTimer } = Deno.core;
   const timers = new Map();
