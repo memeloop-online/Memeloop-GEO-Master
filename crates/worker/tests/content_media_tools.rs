@@ -124,7 +124,7 @@ fn recorded_bridge(recorder: Arc<Recorder>) -> HostBridge {
 
 #[test]
 fn current_surface_and_strict_media_dtos() {
-    assert_eq!(HOST_OPS_VERSION, "geo.hostops.v21");
+    assert_eq!(HOST_OPS_VERSION, "geo.hostops.v22");
     let names = HostRuntime::op_surface();
     assert!(
         !names

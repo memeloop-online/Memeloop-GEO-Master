@@ -258,6 +258,35 @@ fn validate_recorded_return(
             let response: geo_domain::KnowledgeImportProgress = typed(op, result)?;
             validate_import_status(&response, requested.import_job_id).map_err(invalid)?;
         }
+        HostOp::KnowledgeImportUrl => {
+            let response: KnowledgeImportUrlResult = typed(op, result)?;
+            let ready = matches!(
+                response.status,
+                ImportStatus::Succeeded | ImportStatus::Partial
+            );
+            if [
+                response.import_job_id,
+                response.source_id,
+                response.source_version_id,
+                response.knowledge_release_id,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|id| id.is_nil())
+                || (ready
+                    && (response.source_id.is_none()
+                        || response.source_version_id.is_none()
+                        || response.knowledge_release_id.is_none()))
+                || (!ready
+                    && (response.source_version_id.is_some()
+                        || response.knowledge_release_id.is_some()))
+            {
+                return Err(HostOpError::internal(
+                    op,
+                    "webpage import returned invalid evidence references",
+                ));
+            }
+        }
         HostOp::ManifestRead => {
             let requested: ManifestReadRequest = typed(op, request)?;
             let page: ManifestPage = typed(op, result)?;
@@ -632,7 +661,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v21";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v22";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1098,11 +1127,13 @@ pub enum HostOp {
     SerpCreate,
     SerpRead,
     SerpReparse,
+    /// Import one public webpage through the scoped knowledge repository.
+    KnowledgeImportUrl,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 51;
+    pub const COUNT: usize = 52;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -1157,6 +1188,7 @@ impl HostOp {
         Self::SerpCreate,
         Self::SerpRead,
         Self::SerpReparse,
+        Self::KnowledgeImportUrl,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -1213,6 +1245,7 @@ impl HostOp {
             Self::SerpCreate => "serp.create.v1",
             Self::SerpRead => "serp.read.v1",
             Self::SerpReparse => "serp.reparse.v1",
+            Self::KnowledgeImportUrl => "knowledge.import_url.v1",
         }
     }
 
@@ -1270,6 +1303,7 @@ impl HostOp {
             Self::SerpCreate => "op_host_serp_create_v1",
             Self::SerpRead => "op_host_serp_read_v1",
             Self::SerpReparse => "op_host_serp_reparse_v1",
+            Self::KnowledgeImportUrl => "op_host_knowledge_import_url_v1",
         }
     }
 
@@ -1387,6 +1421,7 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(30_000, 8),   // search scheduling, never inline provider I/O
                 HostOpLimits::new(15_000, 32),  // bounded saved search reads
                 HostOpLimits::new(30_000, 8),   // local saved-response parsing
+                HostOpLimits::new(120_000, 16), // scoped single-page knowledge import
             ],
         }
     }
@@ -1704,6 +1739,17 @@ pub trait HostOps: Send + Sync {
         Err(HostOpError::capability_missing(
             HostOp::KnowledgeImportStatus,
             "knowledge import status is not configured",
+        ))
+    }
+
+    async fn knowledge_import_url(
+        &self,
+        _scope: &TenantScope,
+        _request: KnowledgeImportUrlRequest,
+    ) -> Result<KnowledgeImportUrlResult, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::KnowledgeImportUrl,
+            "webpage knowledge import is not configured",
         ))
     }
 
@@ -3747,6 +3793,53 @@ pub struct KnowledgeImportStatusRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct KnowledgeImportUrlRequest {
+    pub url: String,
+    pub purpose: KnowledgePurpose,
+    pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl KnowledgeImportUrlRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.url.trim().is_empty() || self.url.len() > 2048 {
+            return Err("url must contain 1 to 2048 bytes".into());
+        }
+        if self.idempotency_key.trim().is_empty() || self.idempotency_key.len() > 200 {
+            return Err("idempotency_key must contain 1 to 200 bytes".into());
+        }
+        if self
+            .name
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty() || name.len() > 255)
+        {
+            return Err("name must contain 1 to 255 bytes when provided".into());
+        }
+        Ok(())
+    }
+}
+
+/// A bounded import receipt; webpage bytes and extracted text are read only
+/// through the existing exact source-version capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeImportUrlResult {
+    pub status: ImportStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_job_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_release_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AppError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgeImportAttachmentItem {
     pub attachment_id: Uuid,
     pub purpose: KnowledgePurpose,
@@ -5149,6 +5242,7 @@ mod tests {
             (HostOp::KnowledgeTextRevise, 60_000, 16),
             (HostOp::KnowledgeImportAttachments, 120_000, 32),
             (HostOp::KnowledgeImportStatus, 15_000, 16),
+            (HostOp::KnowledgeImportUrl, 120_000, 16),
             (HostOp::SerpReparse, 30_000, 8),
         ] {
             assert_eq!(

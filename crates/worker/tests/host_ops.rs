@@ -20,10 +20,10 @@ use geo_worker::{
     HOST_BUNDLE, HOST_MAIN_MODULE, HOST_OPS_VERSION, HostBridge, HostOp, HostOpBudgets,
     HostOpError, HostOpErrorCode, HostOpLimits, HostOps, HostRuntime, HostState,
     KnowledgeImportAttachmentResultItem, KnowledgeImportAttachmentsRequest,
-    KnowledgeImportAttachmentsResult, KnowledgeImportStatusRequest, ManifestItem, ManifestPage,
-    ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion, ModelCompletionRequest,
-    PublishReceipt, PublishRequest, PublishState, ReportPreviewRequest, ToolCallIdentity,
-    ToolCallOutcome, ToolCallRecorder,
+    KnowledgeImportAttachmentsResult, KnowledgeImportStatusRequest, KnowledgeImportUrlRequest,
+    KnowledgeImportUrlResult, ManifestItem, ManifestPage, ManifestReadRequest, MeasureRequest,
+    MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt, PublishRequest,
+    PublishState, ReportPreviewRequest, ToolCallIdentity, ToolCallOutcome, ToolCallRecorder,
 };
 use serde_json::Value;
 
@@ -48,6 +48,7 @@ struct Behaviour {
     /// isolate boundary redacts what a bridge hands it.
     failure_message: Option<String>,
     import_status: Option<KnowledgeImportProgress>,
+    url_import_result: Option<KnowledgeImportUrlResult>,
     preview_response: Option<ReportPreview>,
 }
 
@@ -58,6 +59,7 @@ struct FakeHostOps {
     seen: Arc<Mutex<Vec<HostOp>>>,
     scopes: Arc<Mutex<Vec<String>>>,
     imported_bindings: Arc<Mutex<Vec<Vec<uuid::Uuid>>>>,
+    url_import_requests: Arc<Mutex<Vec<KnowledgeImportUrlRequest>>>,
 }
 
 impl FakeHostOps {
@@ -219,6 +221,29 @@ impl HostOps for FakeHostOps {
             });
         self.answer(HostOp::KnowledgeImportStatus, scope, progress)
             .await
+    }
+    async fn knowledge_import_url(
+        &self,
+        scope: &TenantScope,
+        request: KnowledgeImportUrlRequest,
+    ) -> Result<KnowledgeImportUrlResult, HostOpError> {
+        self.url_import_requests.lock().unwrap().push(request);
+        self.answer(
+            HostOp::KnowledgeImportUrl,
+            scope,
+            self.behaviour
+                .url_import_result
+                .clone()
+                .unwrap_or(KnowledgeImportUrlResult {
+                    status: ImportStatus::Succeeded,
+                    import_job_id: None,
+                    source_id: Some(uuid::Uuid::new_v4()),
+                    source_version_id: Some(uuid::Uuid::new_v4()),
+                    knowledge_release_id: Some(uuid::Uuid::new_v4()),
+                    error: None,
+                }),
+        )
+        .await
     }
     async fn model_complete(
         &self,
@@ -744,6 +769,111 @@ async fn single_article_ops_reject_scope_injection_and_unknown_format_before_cap
 
 const BOUND_ATTACHMENT: &str = "9e95e603-544c-4778-9f59-0b2b54b7db31";
 const OTHER_ATTACHMENT: &str = "dbbd6700-c410-4264-84a6-01806cc9a207";
+
+#[tokio::test]
+async fn url_import_uses_the_bound_scope_without_attachments_and_preserves_the_request() {
+    let ops = Arc::new(FakeHostOps::new());
+    let run_scope = scope();
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("url", () => hostOps.knowledgeImportUrl({
+          url: "https://example.com/guide?language=en",
+          purpose: "internal", idempotency_key: "url-import-1", name: "Guide"
+        }));
+        "#,
+        HostBridge::new(
+            ops.clone(),
+            run_scope.clone(),
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    let receipt = assert_success(&outcome(&runtime.host_state(), "url"));
+    assert_eq!(receipt["status"], "succeeded");
+    assert!(receipt["source_version_id"].is_string());
+    assert!(receipt["knowledge_release_id"].is_string());
+    assert_eq!(ops.scopes(), vec![run_scope.storage_key()]);
+    assert_eq!(ops.seen(), vec![HostOp::KnowledgeImportUrl]);
+    let requests = ops.url_import_requests.lock().unwrap();
+    assert_eq!(requests[0].url, "https://example.com/guide?language=en");
+    assert_eq!(requests[0].purpose, geo_domain::KnowledgePurpose::Internal);
+    assert_eq!(requests[0].idempotency_key, "url-import-1");
+    assert_eq!(requests[0].name.as_deref(), Some("Guide"));
+}
+
+#[tokio::test]
+async fn url_import_rejects_scope_credentials_and_malformed_requests_before_dispatch() {
+    let ops = Arc::new(FakeHostOps::new());
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        const request = {url:"https://example.com/guide",purpose:"public",idempotency_key:"stable"};
+        const invalid = [
+          {...request, tenant_id:"00000000-0000-4000-8000-000000000001"},
+          {...request, api_key:"forbidden"},
+          {...request, purpose:"marketing"},
+          {...request, idempotency_key:" "},
+          {...request, idempotency_key:"x".repeat(201)},
+          {...request, url:""},
+          {...request, url:"x".repeat(2049)},
+          {...request, name:" "},
+        ];
+        for (let index = 0; index < invalid.length; index++) {
+          await attempt(`invalid-${index}`, () => hostOps.knowledgeImportUrl(invalid[index]));
+        }
+        "#,
+        bridge(ops.clone()),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    for index in 0..8 {
+        assert_typed_error(
+            &outcome(&runtime.host_state(), &format!("invalid-{index}")),
+            "invalid_request",
+            "knowledge_import_url",
+        );
+    }
+    assert!(ops.seen().is_empty());
+}
+
+#[tokio::test]
+async fn url_import_rejects_unready_evidence_before_recording_success() {
+    let ops = Arc::new(FakeHostOps::with(Behaviour {
+        url_import_result: Some(KnowledgeImportUrlResult {
+            status: ImportStatus::Queued,
+            import_job_id: Some(uuid::Uuid::new_v4()),
+            source_id: Some(uuid::Uuid::new_v4()),
+            source_version_id: Some(uuid::Uuid::new_v4()),
+            knowledge_release_id: Some(uuid::Uuid::new_v4()),
+            error: None,
+        }),
+        ..Behaviour::default()
+    }));
+    let mut runtime = runtime(
+        r#"
+        import { hostOps, attempt } from "./host-ops.js";
+        await attempt("url", () => hostOps.knowledgeImportUrl({
+          url:"https://example.com/guide",purpose:"public",idempotency_key:"stable"
+        }));
+        "#,
+        bridge(ops),
+    );
+    runtime
+        .evaluate_module(SCENARIO_MODULE, GENEROUS_DEADLINE)
+        .await
+        .unwrap();
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "url"),
+        "internal",
+        "knowledge_import_url",
+    );
+}
 
 fn attachment(id: &str) -> AttachmentReference {
     AttachmentReference {
