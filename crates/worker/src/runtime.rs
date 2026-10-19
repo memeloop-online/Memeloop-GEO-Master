@@ -143,6 +143,9 @@ impl EmbeddedIsolate {
         runtime
             .execute_script("ext:geo_worker/abort.js", include_str!("abort.js"))
             .expect("the static abort bootstrap must initialize");
+        runtime
+            .execute_script("ext:geo_worker/timers.js", include_str!("timers.js"))
+            .expect("the native timer bootstrap must initialize");
         Self { runtime, loader }
     }
 
@@ -169,9 +172,15 @@ impl EmbeddedIsolate {
         deadline: Duration,
     ) -> Result<(), WorkerError> {
         let mut watchdog = DeadlineWatchdog::start(&mut self.runtime, deadline);
-        let evaluated = self.load_and_evaluate(specifier).await;
+        // The watchdog interrupts synchronous JS. A Tokio deadline also wakes
+        // a turn suspended on a native timer instead of waiting for that timer.
+        let evaluated = tokio::time::timeout(deadline, self.load_and_evaluate(specifier)).await;
         watchdog.disarm();
-        evaluated.map(|_| ())
+        evaluated
+            .map_err(|_| {
+                WorkerError::new("evaluate", "execution terminated at wall-clock deadline")
+            })?
+            .map(|_| ())
     }
 
     /// Evaluates the entry module and then calls its `main` export once with
@@ -197,9 +206,14 @@ impl EmbeddedIsolate {
         deadline: Duration,
     ) -> Result<(), WorkerError> {
         let mut watchdog = DeadlineWatchdog::start(&mut self.runtime, deadline);
-        let called = self.evaluate_and_call_main(specifier, argument_json).await;
+        let called = tokio::time::timeout(
+            deadline,
+            self.evaluate_and_call_main(specifier, argument_json),
+        )
+        .await;
         watchdog.disarm();
         called
+            .map_err(|_| WorkerError::new("call", "execution terminated at wall-clock deadline"))?
     }
 
     async fn evaluate_and_call_main(

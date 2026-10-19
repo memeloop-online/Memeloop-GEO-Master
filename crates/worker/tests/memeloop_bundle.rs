@@ -138,7 +138,9 @@ impl HostOps for RecordingHostOps {
         }
         if self.tool_turn && calls.len() == 1 {
             return Ok(serde_json::from_value(serde_json::json!({
-                "text": "",
+                // Consecutive text/tool chunks exercise MemeLoop's throttled
+                // transient publisher, including its pending timer cleanup.
+                "text": "I will read the manual.",
                 "tool_calls": [{
                     "id": "read-call-1",
                     "type": "function",
@@ -594,6 +596,34 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
         .expect("the generated bundle must construct");
     runtime.install_heap_limit_guard(Arc::new(std::sync::atomic::AtomicBool::new(false)));
     runtime
+        .execute_script(
+            "transient-timer-observer.js",
+            r#"
+            const nativeSetTimeout = globalThis.setTimeout;
+            const nativeClearTimeout = globalThis.clearTimeout;
+            // Keep successive stream chunks in the same throttle window even
+            // on slow CI. Native timers retain their real monotonic clock.
+            Date.now = () => 1_700_000_000_000;
+            const pendingTransientTimers = new Set();
+            let transientTimersScheduled = 0;
+            let transientTimersCancelled = 0;
+            globalThis.setTimeout = (callback, delay, ...args) => {
+              const id = nativeSetTimeout(() => {
+                pendingTransientTimers.delete(id);
+                callback(...args);
+              }, delay);
+              pendingTransientTimers.add(id);
+              transientTimersScheduled++;
+              return id;
+            };
+            globalThis.clearTimeout = id => {
+              if (pendingTransientTimers.delete(id)) transientTimersCancelled++;
+              nativeClearTimeout(id);
+            };
+            "#,
+        )
+        .expect("native timer observers must initialize");
+    runtime
         .call_main(
             BUNDLE_SPECIFIER,
             &serde_json::json!({
@@ -608,6 +638,17 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
         )
         .await
         .expect("MemeLoop must perform model → source read → model through the Rust host");
+    runtime
+        .execute_script(
+            "transient-timer-cleanup.js",
+            r#"
+            if (transientTimersScheduled === 0 || transientTimersCancelled === 0)
+              throw new Error("transient publisher did not schedule and clear a native timer");
+            if (pendingTransientTimers.size !== 0)
+              throw new Error("transient publisher left a timer after completion");
+            "#,
+        )
+        .expect("the actual generated transient publisher must clear pending work");
 
     let calls = provider.model_calls();
     assert_eq!(calls.len(), 2);

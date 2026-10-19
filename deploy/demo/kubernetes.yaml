@@ -20,6 +20,9 @@ spec:
         app.kubernetes.io/part-of: memeloop-geo
     spec:
       automountServiceAccountToken: false
+      dnsConfig:
+        options:
+          - name: use-vc
       securityContext:
         runAsNonRoot: true
         fsGroup: 65532

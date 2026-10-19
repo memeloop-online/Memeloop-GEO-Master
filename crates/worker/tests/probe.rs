@@ -186,3 +186,124 @@ async fn checkpoints_and_restores_rust_owned_state() {
         .expect("checkpoint must deserialise into a fresh runtime");
     assert_eq!(resumed.host_state(), before);
 }
+
+/// Approved bundles use timers for stream throttling and abortable waits. The
+/// callbacks must run on the native event loop, after microtasks and real time.
+#[tokio::test(flavor = "current_thread")]
+async fn native_timers_delay_callbacks_pass_arguments_and_cancel_pending_work() {
+    const ENTRY: &str = "memeloop://bundle/timer-probe.mjs";
+    let mut probe = ProbeRuntime::with_bundle(
+        &[(
+            ENTRY,
+            r#"
+            const order = [];
+            const started = Date.now();
+            const cancelled = setTimeout(() => {
+              throw new Error("cancelled timer fired");
+            }, 60_000);
+            clearTimeout(cancelled);
+            clearTimeout(cancelled);
+            clearTimeout(undefined);
+            clearTimeout(null);
+            clearTimeout(-1);
+            const controller = new AbortController();
+            const aborted = setTimeout(() => {
+              throw new Error("aborted timer fired");
+            }, 60_000);
+            controller.signal.addEventListener("abort", () => clearTimeout(aborted));
+            controller.abort();
+            const delayed = new Promise(resolve => setTimeout((left, right) => {
+              order.push(left + right);
+              resolve();
+            }, 40, "native", "-timer"));
+            if (order.length !== 0) throw new Error("timer callback ran synchronously");
+            await Promise.resolve().then(() => order.push("microtask"));
+            await delayed;
+            if (Date.now() - started < 30) throw new Error("timer ignored its delay");
+            if (order.join(",") !== "microtask,native-timer")
+              throw new Error("timer order or arguments differ");
+            let rejected = false;
+            try { setTimeout("throw new Error('evaluated string')", 0); }
+            catch (error) { rejected = error instanceof TypeError; }
+            if (!rejected) throw new Error("string callback accepted");
+            Deno.core.ops.op_host_emit("timer.completed", "{}");
+            "#,
+        )],
+        None,
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        probe.evaluate_module(ENTRY, GENEROUS_DEADLINE),
+    )
+    .await
+    .expect("cancelled long timers must not keep the event loop alive")
+    .expect("native timers must complete top-level await");
+    assert_eq!(probe.host_state().events[0].topic, "timer.completed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_timer_wait_obeys_turn_deadline_and_isolate_drop() {
+    const ENTRY: &str = "memeloop://bundle/timer-deadline.mjs";
+    let source = r#"
+        export async function main() {
+          await new Promise(resolve => setTimeout(resolve, 60_000));
+          Deno.core.ops.op_host_emit("timer.late", "{}");
+        }
+    "#;
+    let mut probe = ProbeRuntime::with_bundle(&[(ENTRY, source)], None);
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        probe.call_main(ENTRY, "{}", Duration::from_millis(100)),
+    )
+    .await
+    .expect("a sleeping native timer must not hold the worker past its deadline")
+    .expect_err("an awaited timer past the turn deadline must fail");
+    assert!(error.message.contains("terminated"), "{error:?}");
+    assert!(probe.host_state().events.is_empty());
+    drop(probe);
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let mut fresh = ProbeRuntime::with_bundle(
+        &[(
+            ENTRY,
+            r#"
+            export async function main() {
+              await new Promise(resolve => setTimeout(resolve, 10));
+              Deno.core.ops.op_host_emit("timer.fresh", "{}");
+            }
+            "#,
+        )],
+        None,
+    );
+    fresh
+        .call_main(ENTRY, "{}", GENEROUS_DEADLINE)
+        .await
+        .expect("a new isolate must not inherit old timer or cancellation state");
+    assert_eq!(fresh.host_state().events.len(), 1);
+    assert_eq!(fresh.host_state().events[0].topic, "timer.fresh");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_timer_callback_errors_fail_the_event_loop() {
+    const ENTRY: &str = "memeloop://bundle/timer-error.mjs";
+    let mut probe = ProbeRuntime::with_bundle(
+        &[(
+            ENTRY,
+            r#"
+            await new Promise(() => setTimeout(() => {
+              throw new Error("native timer callback failed");
+            }, 1));
+            "#,
+        )],
+        None,
+    );
+    let error = probe
+        .evaluate_module(ENTRY, Duration::from_secs(2))
+        .await
+        .expect_err("timer exceptions must not disappear or become success");
+    assert!(
+        error.message.contains("native timer callback failed"),
+        "{error:?}"
+    );
+}
