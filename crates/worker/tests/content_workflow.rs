@@ -353,7 +353,7 @@ impl HostOps for Fixture {
                     },
                     exact_quote: "a cited document".into(),
                 }],
-                brand_name: "Example".into(),
+                brand_name: Some("Example".into()),
                 product_name: None,
                 target_audience: None,
                 objective: None,

@@ -4,8 +4,8 @@ use geo_domain::{
     ContentBlock, ContentBlockKind, ContentBrief, ContentCreateDocument, ContentCreateRequest,
     ContentEvidence, ContentExecutionOrigin, ContentItemStatus, ContentRepository, ContentStep,
     ErrorCode, EvidenceRef, ImportItem, KnowledgePurpose, KnowledgeRepository, ProjectCreate,
-    ProjectRepository, ProjectSettings, RICH_GENERATION_POLICY_VERSION, SourceKind,
-    StructuredDocument, TenantScope, build_on_demand_manifest,
+    ProjectRepository, ProjectSettings, RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION,
+    SourceKind, StructuredDocument, TenantScope, build_on_demand_manifest,
 };
 use geo_persistence::{
     Database, DatabaseConfig, PgContentRepository, PgKnowledgeRepository, PgProjectRepository,
@@ -353,7 +353,7 @@ async fn draft_on_demand_content_is_scoped_idempotent_and_never_automatically_di
                 execution.execution_id,
                 item.item_id,
                 ContentStep::Check,
-                "test",
+                RICH_CHECK_POLICY_VERSION,
                 Utc::now(),
                 60,
             )

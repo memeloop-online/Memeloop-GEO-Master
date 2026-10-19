@@ -546,16 +546,15 @@ function mockApi({
   return requests;
 }
 
-function renderPage(path: string) {
+function renderPage(
+  path: string,
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  }),
+) {
   return render(
     <FluentProvider theme={webLightTheme}>
-      <QueryClientProvider
-        client={
-          new QueryClient({
-            defaultOptions: { queries: { retry: false } },
-          })
-        }
-      >
+      <QueryClientProvider client={client}>
         <AuthProvider>
           <MemoryRouter initialEntries={[path]}>
             <AppRoutes />
@@ -600,6 +599,61 @@ afterEach(() => {
 });
 
 describe("P08 content assets", () => {
+  it("refreshes a changed asset revision while its cached history is fresh", async () => {
+    const assetList = [{ ...asset }];
+    const requests = mockApi({ noCycle: true, assetList });
+    const originalFetch = requests.getMockImplementation()!;
+    let advanced = false;
+    requests.mockImplementation((url, init) => {
+      const path = new URL(String(url), "http://localhost").pathname;
+      if (advanced && path.endsWith("/contents/asset-1/revisions"))
+        return Promise.resolve(
+          json([
+            revision,
+            {
+              ...revision,
+              revision_id: "revision-2",
+              revision: 2,
+              base_revision_id: revision.revision_id,
+              document: { ...revision.document, title: "更新后的指南" },
+            },
+          ]),
+        );
+      return originalFetch(url, init);
+    });
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: {
+          retry: false,
+          staleTime: 30_000,
+          refetchOnWindowFocus: false,
+        },
+      },
+    });
+    renderPage("/app/tenant-1/project-1/content", client);
+    const saved = await screen.findByRole("region", { name: "已保存内容" });
+    expect(
+      await within(saved).findByRole("link", { name: "有来源的指南" }),
+    ).toBeInTheDocument();
+
+    advanced = true;
+    assetList[0] = { ...asset, current_revision_id: "revision-2" };
+    await userEvent.click(
+      within(saved).getByRole("button", { name: "刷新内容" }),
+    );
+    expect(
+      await within(saved).findByRole("link", { name: "更新后的指南" }),
+    ).toBeInTheDocument();
+    expect(within(saved).getByText("当前版本 v2")).toBeInTheDocument();
+    expect(
+      requests.mock.calls.filter(([url]) =>
+        new URL(String(url), "http://localhost").pathname.endsWith(
+          "/contents/asset-1/revisions",
+        ),
+      ),
+    ).toHaveLength(2);
+  });
+
   it("opens saved content without a cycle or setup form", async () => {
     const requests = mockApi({ noCycle: true, assetList: [asset] });
     renderPage("/app/tenant-1/project-1/content");

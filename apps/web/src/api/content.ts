@@ -447,6 +447,7 @@ export function useContentRevisionsQuery(
   tenantId: string | undefined,
   projectId: string | undefined,
   assetId: string | undefined,
+  currentRevisionId?: string,
 ) {
   const { session } = useAuth();
   const scope =
@@ -459,6 +460,13 @@ export function useContentRevisionsQuery(
       : ["content", "anonymous", tenantId, projectId, "revisions", assetId],
     queryFn: () => listContentRevisions(tenantId!, projectId!, assetId!),
     enabled: Boolean(scope && assetId),
+    refetchOnMount: (query) =>
+      currentRevisionId &&
+      !query.state.data?.some(
+        (revision) => revision.revision_id === currentRevisionId,
+      )
+        ? "always"
+        : true,
   });
 }
 

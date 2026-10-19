@@ -496,7 +496,12 @@ function SavedAssetCard({
   projectId: string;
 }) {
   const { t } = useTranslation();
-  const history = useContentRevisionsQuery(tenantId, projectId, asset.asset_id);
+  const history = useContentRevisionsQuery(
+    tenantId,
+    projectId,
+    asset.asset_id,
+    asset.current_revision_id,
+  );
   const current = history.data?.find(
     (revision) => revision.revision_id === asset.current_revision_id,
   );
