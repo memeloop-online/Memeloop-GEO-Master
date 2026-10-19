@@ -661,7 +661,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v22";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v23";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2612,6 +2612,9 @@ pub struct ContentItemRef {
     pub item_id: Uuid,
     pub branch_key: String,
     pub document_key: String,
+    pub content_type: String,
+    pub market: String,
+    pub language: String,
     pub source_refs: Vec<ContentSourceRef>,
     pub reusable_evidence: Option<Vec<geo_domain::ContentEvidence>>,
     pub status: ContentItemStatus,
@@ -2620,8 +2623,19 @@ pub struct ContentItemRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ContentContext {
+    pub objective: Option<String>,
+    pub brand_name: String,
+    pub product_name: Option<String>,
+    pub target_audience: Option<String>,
+    pub question_clusters: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentItemsPage {
     pub execution_id: Uuid,
+    pub context: ContentContext,
     pub total: u64,
     pub items: Vec<ContentItemRef>,
     pub next_cursor: Option<String>,

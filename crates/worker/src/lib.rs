@@ -43,7 +43,7 @@ pub use host::{
     ChannelPlanReceipt, ChannelPlanRequest, ChannelPublicationLookupObservation,
     ChannelPublicationLookupSummary, ChannelPublicationPlanItem, ChannelTargetExecuteRequest,
     ChannelTargetKind, ChannelTargetSummary, ContentCheckBeginResult, ContentCheckFinishRequest,
-    ContentCloseRequest, ContentDistributeReadRequest, ContentDistributeRef,
+    ContentCloseRequest, ContentContext, ContentDistributeReadRequest, ContentDistributeRef,
     ContentDistributeRequest, ContentDocumentReadRequest, ContentDocumentSnapshot,
     ContentExecutionReadRequest, ContentExecutionRef, ContentGenerateBeginResult,
     ContentGenerateFinishRequest, ContentHandoffRef, ContentItemRef, ContentItemsPage,
