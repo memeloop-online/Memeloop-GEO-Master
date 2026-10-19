@@ -5167,7 +5167,11 @@ mod url_import_tests {
     }
 
     fn scope() -> TenantScope {
-        TenantScope::new(Uuid::new_v4(), Uuid::new_v4(), Some(Uuid::new_v4()))
+        TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        )
     }
 
     fn item() -> ImportItem {
@@ -5247,7 +5251,12 @@ mod url_import_tests {
         assert_eq!(content.text_basis, SourceTextBasis::Extracted);
         assert!(
             repository
-                .get_attachment_object_bytes(&scope, snapshot_id)
+                .get_attachment_object_bytes(
+                    &scope,
+                    snapshot_id,
+                    version.object_version.unwrap(),
+                    &version.content_sha256,
+                )
                 .await
                 .unwrap()
                 .is_none()
@@ -5270,8 +5279,11 @@ mod url_import_tests {
             progress.knowledge_release_id,
             Some(receipt.release.as_ref().unwrap().knowledge_release_id)
         );
-        let other_scope =
-            TenantScope::new(scope.operator_id, scope.tenant_id, Some(Uuid::new_v4()));
+        let other_scope = TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        );
         assert!(
             repository
                 .get_source_detail(&other_scope, source.source_id)

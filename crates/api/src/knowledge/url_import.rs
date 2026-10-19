@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use geo_domain::{AppError, ErrorCode, FetchedUrlPage, UrlPageFetcher};
 use reqwest::{Url, header};
 
@@ -56,13 +56,15 @@ fn redirect_target(current: &Url, location: &str) -> Result<Url, AppError> {
 async fn fetch_page(value: &str) -> Result<FetchedUrlPage, AppError> {
     let requested =
         Url::parse(value).map_err(|_| AppError::invalid_request("invalid webpage URL"))?;
-    tokio::time::timeout(FETCH_DEADLINE, fetch_page_inner(requested))
+    tokio::time::timeout(FETCH_DEADLINE, fetch_page_inner(value, requested))
         .await
         .map_err(|_| unavailable("webpage capture exceeded its time limit"))?
 }
 
-async fn fetch_page_inner(requested: Url) -> Result<FetchedUrlPage, AppError> {
-    let mut current = requested.clone();
+async fn fetch_page_inner(
+    requested_url: &str,
+    mut current: Url,
+) -> Result<FetchedUrlPage, AppError> {
     for redirects in 0..=MAX_REDIRECTS {
         let endpoint = client_url(&current)?;
         let client = geo_provider::public_endpoint_client(&endpoint)
@@ -144,23 +146,33 @@ async fn fetch_page_inner(requested: Url) -> Result<FetchedUrlPage, AppError> {
         let captured_at = Utc::now();
         // HTML parsing is CPU work. The input is bounded before entering the
         // blocking pool; timing out drops its result rather than saving it.
-        let (raw_bytes, text, media_type) = tokio::task::spawn_blocking(move || {
-            let text = parse_page(&raw_bytes, &media_type)?;
-            Ok::<_, AppError>((raw_bytes, text, media_type))
+        let requested_url = requested_url.to_owned();
+        return tokio::task::spawn_blocking(move || {
+            capture_page(requested_url, current, captured_at, raw_bytes, media_type)
         })
         .await
-        .map_err(|_| unavailable("webpage text could not be parsed"))??;
-        return Ok(FetchedUrlPage {
-            requested_url: requested.to_string(),
-            final_url: current.to_string(),
-            captured_at,
-            raw_bytes,
-            media_type,
-            text,
-            parser_version: URL_PARSER_VERSION.to_owned(),
-        });
+        .map_err(|_| unavailable("webpage text could not be parsed"))?;
     }
     unreachable!("redirect limit returns before the loop ends")
+}
+
+fn capture_page(
+    requested_url: String,
+    final_url: Url,
+    captured_at: DateTime<Utc>,
+    raw_bytes: Vec<u8>,
+    media_type: String,
+) -> Result<FetchedUrlPage, AppError> {
+    let text = parse_page(&raw_bytes, &media_type)?;
+    Ok(FetchedUrlPage {
+        requested_url,
+        final_url: final_url.to_string(),
+        captured_at,
+        raw_bytes,
+        media_type,
+        text,
+        parser_version: URL_PARSER_VERSION.to_owned(),
+    })
 }
 
 fn validate_media_type(media_type: &str) -> Result<(), AppError> {
@@ -207,6 +219,27 @@ fn parse_page(bytes: &[u8], media_type: &str) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_preserves_submitted_url_spelling_and_normalizes_final_url() {
+        for (requested, expected_final) in [
+            ("HTTPS://WWW.EXAMPLE.ORG:443", "https://www.example.org/"),
+            ("https://www.example.org", "https://www.example.org/"),
+            ("https://www.example.org/", "https://www.example.org/"),
+            ("HTTP://WWW.EXAMPLE.ORG:80/", "http://www.example.org/"),
+        ] {
+            let page = capture_page(
+                requested.to_owned(),
+                Url::parse(requested).unwrap(),
+                Utc::now(),
+                b"Page text".to_vec(),
+                "text/plain".to_owned(),
+            )
+            .unwrap();
+            assert_eq!(page.requested_url, requested);
+            assert_eq!(page.final_url, expected_final);
+        }
+    }
 
     #[test]
     fn maintained_html_parser_extracts_entities_structure_and_unicode() {
