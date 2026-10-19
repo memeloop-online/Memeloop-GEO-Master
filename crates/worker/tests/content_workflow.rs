@@ -13,7 +13,7 @@ use geo_domain::{
 };
 use geo_domain::{ContentItemStatus, TenantScope};
 use geo_worker::{
-    ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest,
+    ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest, ContentContext,
     ContentExecutionReadRequest, ContentExecutionRef, ContentGenerateBeginResult,
     ContentGenerateFinishRequest, ContentHandoffRef, ContentItemRef, ContentItemsPage,
     ContentItemsReadRequest, ContentModelOutcome, ContentPrepareRequest, ContentRepairBeginResult,
@@ -59,6 +59,9 @@ impl Fixture {
                         item_id: Uuid::from_u128(n),
                         branch_key: format!("cycle:1:document-{n}"),
                         document_key: format!("document-{n}"),
+                        content_type: if n == 1 { "faq" } else { "company_profile" }.into(),
+                        market: "US".into(),
+                        language: "en".into(),
                         source_refs: vec![ContentSourceRef {
                             source_id: Uuid::from_u128(900),
                             source_version_id: Uuid::from_u128(901),
@@ -265,6 +268,13 @@ impl HostOps for Fixture {
         assert_eq!(request.cursor, None);
         Ok(ContentItemsPage {
             execution_id: self.execution_id,
+            context: ContentContext {
+                objective: None,
+                brand_name: "Example".into(),
+                product_name: None,
+                target_audience: None,
+                question_clusters: vec![],
+            },
             total: 2,
             items: self.items.lock().unwrap().clone(),
             next_cursor: None,
@@ -326,10 +336,10 @@ impl HostOps for Fixture {
                 version: CONTENT_SEMANTIC_DESCRIPTOR_VERSION,
                 scope: scope.clone(),
                 document_key: item.document_key,
-                content_type: "faq".into(),
+                content_type: item.content_type,
                 product_id: None,
-                market: "US".into(),
-                language: "en".into(),
+                market: item.market,
+                language: item.language,
                 planner_version: "fixture-planner".into(),
                 source_version_ids: vec![Uuid::from_u128(901)],
                 evidence: vec![ContentEvidence {

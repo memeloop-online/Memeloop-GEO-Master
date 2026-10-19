@@ -2,7 +2,7 @@
 
 use geo_domain::{AppError, ContentExecution, ContentItem, TenantScope, sha256_hex};
 use geo_worker::{
-    ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest,
+    ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest, ContentContext,
     ContentExecutionReadRequest, ContentExecutionRef, ContentGenerateBeginResult,
     ContentGenerateFinishRequest, ContentHandoffRef, ContentItemRef, ContentItemsPage,
     ContentItemsReadRequest, ContentPrepareRequest, ContentRepairBeginResult,
@@ -36,6 +36,9 @@ async fn item_ref(
         item_id: item.item_id,
         branch_key: item.branch_key,
         document_key: item.document_key,
+        content_type: item.content_type,
+        market: item.market,
+        language: item.language,
         source_refs,
         reusable_evidence,
         status: item.status,
@@ -154,6 +157,19 @@ pub(crate) async fn items(
     if !(1..=100).contains(&limit) {
         return Err(AppError::invalid_request("limit must be between 1 and 100"));
     }
+    let frozen = state
+        .project_repository()
+        .get_cycle_settings(scope, execution.project_id, execution.cycle_id)
+        .await?
+        .ok_or_else(|| AppError::conflict("frozen cycle configuration unavailable"))?;
+    let mut question_clusters: Vec<_> = frozen
+        .document_scope
+        .question_clusters
+        .into_iter()
+        .map(|cluster| cluster.key)
+        .collect();
+    question_clusters.sort();
+    question_clusters.dedup();
     let mut items = state
         .content_service()
         .repository()
@@ -174,6 +190,13 @@ pub(crate) async fn items(
     }
     Ok(ContentItemsPage {
         execution_id: execution.execution_id,
+        context: ContentContext {
+            objective: frozen.objective,
+            brand_name: frozen.brand_name,
+            product_name: frozen.product_name,
+            target_audience: frozen.target_audience,
+            question_clusters,
+        },
         total: items.len() as u64,
         items: page_items,
         next_cursor,

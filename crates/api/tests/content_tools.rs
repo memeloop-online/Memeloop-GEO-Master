@@ -13,8 +13,8 @@ use geo_domain::{
     InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
     KnowledgeRepository, MemoryAuthRepository, MemoryContentRepository, MemoryKnowledgeRepository,
     MemoryProjectRepository, ProjectCreate, ProjectPatch, ProjectRepository, ProjectSettings,
-    ProjectStartCommand, ReviseSourceTextCommand, SourceKind, TenantScope, hash_idempotency_key,
-    settings_hash, start_request_hash,
+    ProjectStartCommand, QuestionClusterScope, QuestionClusterState, ReviseSourceTextCommand,
+    SourceKind, TenantScope, hash_idempotency_key, settings_hash, start_request_hash,
 };
 use geo_worker::{
     ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest,
@@ -313,6 +313,9 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
                 display_name: "Host content".into(),
                 settings: ProjectSettings {
                     brand_name: "Example".into(),
+                    product_name: Some("Example product".into()),
+                    target_audience: Some("Product evaluators".into()),
+                    objective: Some("Answer documented selection questions".into()),
                     market: "US".into(),
                     language: "en".into(),
                     initial_sources: vec![InitialSource {
@@ -324,6 +327,13 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
                     }],
                     document_scope: DocumentScope {
                         content_types: vec!["faq".into(), "company_profile".into()],
+                        question_clusters: ["selection", "comparison", "selection"]
+                            .into_iter()
+                            .map(|key| QuestionClusterScope {
+                                key: key.into(),
+                                state: QuestionClusterState::PendingResolution,
+                            })
+                            .collect(),
                         ..DocumentScope::default()
                     },
                     ..ProjectSettings::default()
@@ -387,6 +397,10 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
             project.id,
             latest_project.revision,
             ProjectPatch {
+                brand_name: Some("Edited draft brand".into()),
+                product_name: Some("Edited draft product".into()),
+                target_audience: Some("Edited draft audience".into()),
+                objective: Some("Edited draft objective".into()),
                 document_scope: Some(DocumentScope::default()),
                 ..Default::default()
             },
@@ -576,6 +590,22 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .unwrap();
     assert_eq!(first.total, 2);
     assert_eq!(first.items.len(), 1);
+    assert_eq!(first.context.brand_name, "Example");
+    assert_eq!(
+        first.context.product_name.as_deref(),
+        Some("Example product")
+    );
+    assert_eq!(
+        first.context.target_audience.as_deref(),
+        Some("Product evaluators")
+    );
+    assert_eq!(
+        first.context.objective.as_deref(),
+        Some("Answer documented selection questions")
+    );
+    assert_eq!(first.context.question_clusters, ["comparison", "selection"]);
+    assert_eq!(first.items[0].market, "US");
+    assert_eq!(first.items[0].language, "en");
     assert_eq!(first.items[0].automatic_repair_count, 0);
     let json = serde_json::to_string(&first).unwrap();
     for forbidden in [
@@ -602,6 +632,23 @@ async fn host_ops_use_scoped_references_and_reject_foreign_or_tampered_cursor() 
         .await
         .unwrap();
     assert_ne!(first.items[0].item_id, second.items[0].item_id);
+    assert_eq!(second.context, first.context);
+    let mut content_types = [
+        first.items[0].content_type.as_str(),
+        second.items[0].content_type.as_str(),
+    ];
+    content_types.sort();
+    assert_eq!(content_types, ["company_profile", "faq"]);
+    let persisted = state
+        .content_service()
+        .repository()
+        .get_item(&scope, started_ref.execution_id, first.items[0].item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.items[0].content_type, persisted.content_type);
+    assert_eq!(first.items[0].market, persisted.market);
+    assert_eq!(first.items[0].language, persisted.language);
     assert!(second.next_cursor.is_none());
     let tampered = format!("{cursor}x");
     assert_eq!(
