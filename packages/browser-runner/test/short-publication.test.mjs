@@ -18,6 +18,10 @@ let mode;
 let submits;
 let deleteClicks;
 let confirmations;
+let decoyConfirmations;
+let deleteRequests;
+let deleted;
+let pendingDelete;
 let ownReads;
 let publicCookies;
 const BODY = "Synthetic thought body\nSecond paragraph";
@@ -59,6 +63,20 @@ before(async () => {
       response.end(JSON.stringify({ ok: true }));
       return;
     }
+    if (url.pathname.startsWith("/api/v4/pins/")) {
+      deleteRequests.push({
+        id: url.pathname.split("/").at(-1),
+        method: request.method,
+      });
+      deleted = mode !== "failed-delete";
+      if (mode === "preexisting-delete-response") {
+        pendingDelete = response;
+        return;
+      }
+      response.writeHead(mode === "failed-delete" ? 500 : 204);
+      response.end();
+      return;
+    }
     if (url.pathname === "/fixture-delete") {
       deleteClicks.push(url.searchParams.get("id"));
       response.writeHead(200);
@@ -67,12 +85,29 @@ before(async () => {
     }
     if (url.pathname === "/fixture-confirm") {
       confirmations++;
+      pendingDelete?.writeHead(204);
+      pendingDelete?.end();
+      pendingDelete = undefined;
+      response.writeHead(200);
+      response.end();
+      return;
+    }
+    if (url.pathname === "/fixture-decoy") {
+      decoyConfirmations++;
       response.writeHead(200);
       response.end();
       return;
     }
     response.writeHead(
-      mode === "public-404" &&
+      (mode === "public-404" ||
+        deleted ||
+        [
+          "failed-delete",
+          "wrong-delete-id",
+          "wrong-delete-method",
+          "missing-delete-response",
+          "optimistic-absence",
+        ].includes(mode)) &&
         !request.headers.cookie &&
         url.pathname.startsWith("/pin/")
         ? 404
@@ -103,10 +138,15 @@ before(async () => {
       const body = mode === "body-mismatch" ? "Different synthetic body" : BODY;
       const token =
         mode === "foreign-author" ? "synthetic-stranger" : "synthetic-owner";
+      const id =
+        mode === "wrong-item-id" ? "99" : url.pathname.split("/").at(-1);
       response.end(`<!doctype html><html><body>
-        ${card(url.pathname.split("/").at(-1), body, token)}
+        ${deleted && !request.headers.cookie ? "" : card(id, body, token)}
         ${mode === "ambiguous-item" ? card("99") : ""}
+        <div class="ConfirmModal" role="dialog"><h2>Unrelated synthetic confirmation</h2><button onclick="fetch('/fixture-decoy')">确认</button></div>
+        ${mode === "preexisting-confirmation" ? '<div class="ConfirmModal"><h2>你确定要删除自己的想法吗？</h2><button>确认</button></div>' : ""}
         <script>
+          ${mode === "preexisting-delete-response" ? "fetch('/api/v4/pins/42', {method:'DELETE'});" : ""}
           function openMenu(id) {
             const menu = document.createElement('div');
             menu.className = 'Popover-content PinToolbar-menuContainer';
@@ -118,13 +158,25 @@ before(async () => {
           }
           async function deleteThought(id) {
             await fetch('/fixture-delete?id=' + id, {method:'POST'});
+            ${mode === "optimistic-absence" ? "document.querySelector('.PinItem').remove(); document.body.insertAdjacentHTML('beforeend','<div>想法已删除</div>'); return;" : ""}
             const dialog = document.createElement('div');
+            dialog.className = 'ConfirmModal';
             dialog.setAttribute('role','dialog');
+            const title = document.createElement('h2');
+            title.textContent = ${JSON.stringify(mode === "wrong-confirmation" ? "Unrecognized synthetic title" : "你确定要删除自己的想法吗？")};
             const confirm = document.createElement('button');
-            confirm.textContent = 'Synthetic destructive confirmation';
-            confirm.onclick = () => fetch('/fixture-confirm', {method:'POST'});
-            dialog.append(confirm);
+            confirm.textContent = '确认';
+            confirm.onclick = async () => {
+              dialog.remove();
+              await fetch('/fixture-confirm', {method:'POST'});
+              document.querySelector('.PinItem')?.remove();
+              document.body.insertAdjacentHTML('beforeend','<div>想法已删除</div>');
+              ${["missing-delete-response", "preexisting-delete-response"].includes(mode) ? "return;" : ""}
+              await fetch('/api/v4/pins/' + ${mode === "wrong-delete-id" ? "'99'" : "id"}, {method:${JSON.stringify(mode === "wrong-delete-method" ? "POST" : "DELETE")}});
+            };
+            dialog.append(title, confirm);
             document.body.append(dialog);
+            ${mode === "ambiguous-confirmation" ? "document.body.append(dialog.cloneNode(true));" : ""}
           }
         </script></body></html>`);
       return;
@@ -151,6 +203,10 @@ beforeEach(async () => {
   submits = 0;
   deleteClicks = [];
   confirmations = 0;
+  decoyConfirmations = 0;
+  deleteRequests = [];
+  deleted = false;
+  pendingDelete = undefined;
   ownReads = 0;
   publicCookies = [];
 });
@@ -304,18 +360,84 @@ test("invalid ID and untrusted origin are rejected before any browser request", 
   assert.equal(ownReads, 0);
 });
 
-test("withdrawal clicks only the exact owned item's delete once and leaves unknown confirmation untouched", async () => {
+test("withdrawal confirms only the exact item and known modal, then correlates DELETE and anonymous absence", async () => {
+  const outcome = await withdrawShortPost(
+    page,
+    { external_id: "42", body: BODY },
+    network(),
+  );
+  assert.equal(outcome.status, "completed", JSON.stringify(outcome));
+  assert.deepEqual(deleteClicks, ["42"]);
+  assert.equal(confirmations, 1);
+  assert.equal(decoyConfirmations, 0);
+  assert.deepEqual(deleteRequests, [{ id: "42", method: "DELETE" }]);
+  assert.deepEqual(publicCookies, [null]);
+  assert.equal(outcome.external_id, "42");
+  assert.equal(outcome.evidence[0].withdrawal_verified, true);
+  assert.equal(outcome.evidence[1].http_status, 204);
+  assert.equal(outcome.evidence[2].absence_verified, true);
+});
+
+test("unknown, pre-existing, or ambiguous confirmations are never clicked", async () => {
+  for (const testMode of [
+    "wrong-confirmation",
+    "preexisting-confirmation",
+    "ambiguous-confirmation",
+  ]) {
+    mode = testMode;
+    const outcome = await withdrawShortPost(
+      page,
+      { external_id: "42", body: BODY },
+      network(200),
+    );
+    assert.equal(outcome.status, "unknown", testMode);
+    assert.equal(confirmations, 0, testMode);
+    assert.equal(decoyConfirmations, 0, testMode);
+    assert.deepEqual(deleteRequests, [], testMode);
+  }
+});
+
+test("failed, absent, or mismatched DELETE cannot be rescued by optimistic DOM, toast, or public 404", async () => {
+  for (const testMode of [
+    "failed-delete",
+    "wrong-delete-id",
+    "wrong-delete-method",
+    "missing-delete-response",
+    "optimistic-absence",
+    "preexisting-delete-response",
+  ]) {
+    mode = testMode;
+    deleted = false;
+    const outcome = await withdrawShortPost(
+      page,
+      { external_id: "42", body: BODY },
+      network(250),
+    );
+    assert.equal(outcome.status, "unknown", testMode);
+    assert.equal(outcome.evidence[0].withdrawal_verified, false, testMode);
+    assert.equal(
+      outcome.evidence.some((entry) => entry.kind === "public_absence"),
+      false,
+      testMode,
+    );
+  }
+  assert.deepEqual(publicCookies, []);
+});
+
+test("successful deletion response still requires exact anonymous absence", async () => {
+  await page.route("**/api/v4/pins/42", (route) =>
+    route.fulfill({ status: 204 }),
+  );
   const outcome = await withdrawShortPost(
     page,
     { external_id: "42", body: BODY },
     network(),
   );
   assert.equal(outcome.status, "unknown");
-  assert.equal(outcome.reason, "short_post_withdrawal_confirmation_unverified");
-  await page.getByRole("dialog").waitFor();
-  assert.deepEqual(deleteClicks, ["42"]);
-  assert.equal(confirmations, 0);
-  assert.equal(outcome.evidence[0].withdrawal_verified, false);
+  assert.equal(outcome.reason, "short_post_absence_unverified");
+  assert.equal(outcome.evidence[1].http_status, 204);
+  assert.equal(outcome.evidence[2].http_status, 200);
+  assert.deepEqual(publicCookies, [null]);
 });
 
 test("foreign author, wrong body, and ambiguous items never reach a destructive control", async () => {
@@ -323,6 +445,7 @@ test("foreign author, wrong body, and ambiguous items never reach a destructive 
     "foreign-author",
     "body-mismatch",
     "ambiguous-item",
+    "wrong-item-id",
   ]) {
     mode = testMode;
     const outcome = await withdrawShortPost(
