@@ -194,6 +194,7 @@ async fn explicit_operator_disable_defers_legacy_publication_without_an_attempt(
                     source_id: source.source_id,
                     source_version_id: version.source_version_id,
                     platform: "zhihu".into(),
+                    placement_slot: "primary".into(),
                     account_id: account,
                     title: "Test".into(),
                     body: "Text".into(),

@@ -61,6 +61,22 @@ pub fn plain_text_article_readback_hash(title: &str, body: &str) -> String {
     ))
 }
 
+/// Short posts expose only their body; the title remains an internal label.
+pub fn plain_text_publication_readback_hash(
+    placement_slot: &str,
+    title: &str,
+    body: &str,
+) -> String {
+    plain_text_article_readback_hash(
+        if placement_slot == "short_post" {
+            ""
+        } else {
+            title
+        },
+        body,
+    )
+}
+
 /// SQLx/chrono encodes PostgreSQL `timestamptz` with truncated microseconds;
 /// keep exact Rust receipt-marker comparison, but use persisted precision
 /// for claimed/observed/received ordering and idempotent database replay.
@@ -86,9 +102,10 @@ pub fn saved_publication_verification(
     ) {
         return Ok(None);
     }
-    let (platform, title, body, frozen_hash) = match &target.input {
+    let (platform, placement_slot, title, body, frozen_hash) = match &target.input {
         ChannelTargetInput::Publish {
             platform,
+            placement_slot,
             title,
             body,
             body_sha256,
@@ -96,11 +113,12 @@ pub fn saved_publication_verification(
         }
         | ChannelTargetInput::GeneratedPublish {
             platform,
+            placement_slot,
             title,
             body,
             body_sha256,
             ..
-        } => (platform, title, body, body_sha256),
+        } => (platform, placement_slot, title, body, body_sha256),
         ChannelTargetInput::Measure { .. } => return Ok(None),
     };
     let Some(outcome) = attempt.outcome.as_ref() else {
@@ -117,6 +135,7 @@ pub fn saved_publication_verification(
         || publication_storage_timestamp(outcome.occurred_at)
             > publication_storage_timestamp(received_at)
         || !valid_label(platform)
+        || !valid_label(placement_slot)
         || title.trim().is_empty()
         || body.trim().is_empty()
         || hex::encode(Sha256::digest(body.as_bytes())) != *frozen_hash
@@ -152,7 +171,7 @@ pub fn saved_publication_verification(
     {
         return Ok(None);
     }
-    let hash = plain_text_article_readback_hash(title, body);
+    let hash = plain_text_publication_readback_hash(placement_slot, title, body);
     let readback: Vec<_> = outcome
         .runner_evidence
         .iter()
@@ -170,7 +189,11 @@ pub fn saved_publication_verification(
             Url::parse(raw).is_ok_and(|url| {
                 let zhihu_post = url
                     .path()
-                    .strip_prefix("/p/")
+                    .strip_prefix(if placement_slot == "short_post" {
+                        "/pin/"
+                    } else {
+                        "/p/"
+                    })
                     .unwrap_or_default()
                     .trim_end_matches('/');
                 url.scheme() == "https"
@@ -179,7 +202,13 @@ pub fn saved_publication_verification(
                     && url.password().is_none()
                     && url.fragment().is_none()
                     && (platform != "zhihu"
-                        || (matches!(url.host_str(), Some("www.zhihu.com" | "zhuanlan.zhihu.com"))
+                        || (matches!(placement_slot.as_str(), "primary" | "short_post")
+                            && matches!(
+                                url.host_str(),
+                                Some("www.zhihu.com" | "zhuanlan.zhihu.com")
+                            )
+                            && (placement_slot != "short_post"
+                                || url.host_str() == Some("www.zhihu.com"))
                             && !zhihu_post.is_empty()
                             && zhihu_post.bytes().all(|byte| byte.is_ascii_digit())
                             && url.query().is_none()))
@@ -203,7 +232,7 @@ pub fn saved_publication_verification(
         verification_id: Uuid::from_bytes(id_bytes),
         key: ConnectorKey {
             platform_id: platform.clone(),
-            placement_slot: "primary".into(),
+            placement_slot: placement_slot.clone(),
         },
         connector_version: version.into(),
         content_type: PLAIN_TEXT_ARTICLE_FORMAT.into(),
@@ -812,6 +841,7 @@ mod tests {
         let target = ChannelTarget {
             target_id: Uuid::new_v4(),
             input: ChannelTargetInput::Publish {
+                placement_slot: "primary".into(),
                 source_id: Uuid::new_v4(),
                 source_version_id: Uuid::new_v4(),
                 platform: "creator".into(),
@@ -847,6 +877,17 @@ mod tests {
             outcome: Some(outcome),
             received_at: Some(claimed_at),
         };
+        let mut missing_placement = serde_json::to_value(&target.input).unwrap();
+        missing_placement
+            .as_object_mut()
+            .unwrap()
+            .remove("placement_slot");
+        assert!(
+            serde_json::from_value::<ChannelTargetInput>(missing_placement)
+                .unwrap_err()
+                .to_string()
+                .contains("placement_slot")
+        );
         assert!(
             saved_publication_verification(&target, &attempt)
                 .unwrap()
@@ -925,6 +966,95 @@ mod tests {
         changed.outcome.as_mut().unwrap().public_url = Some("https://example.com/p/other".into());
         assert!(
             saved_publication_verification(&target, &changed)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn short_post_verification_uses_body_and_exact_placement_route() {
+        let now = Utc::now();
+        let target = ChannelTarget {
+            target_id: Uuid::new_v4(),
+            input: ChannelTargetInput::Publish {
+                source_id: Uuid::new_v4(),
+                source_version_id: Uuid::new_v4(),
+                platform: "zhihu".into(),
+                placement_slot: "short_post".into(),
+                account_id: Uuid::new_v4(),
+                title: "Internal title".into(),
+                body: "Short body".into(),
+                body_sha256: hex::encode(Sha256::digest(b"Short body")),
+            },
+        };
+        let attempt_id = Uuid::new_v4();
+        let hash =
+            plain_text_publication_readback_hash("short_post", "Internal title", "Short body");
+        assert_eq!(hash, plain_text_article_readback_hash("", "Short body"));
+        assert_eq!(
+            hash,
+            plain_text_publication_readback_hash("short_post", "Other title", "Short body")
+        );
+        let mut attempt = ChannelAttempt {
+            attempt_id,
+            target_id: target.target_id,
+            claimed_at: now,
+            received_at: Some(now),
+            outcome: Some(ChannelOutcome {
+                status: ChannelOutcomeStatus::Verified,
+                detail: None,
+                occurred_at: now,
+                raw_answer: None,
+                citations: vec![],
+                public_url: None,
+                screenshot_ref: None,
+                connector_version: Some("browser.v1".into()),
+                fixture: false,
+                runner_evidence: vec![
+                    serde_json::json!({"kind":"public_readback","content_matched":true,
+                        "owned_by_account":true,"expected_sha256":hash,"readback_sha256":hash}),
+                    serde_json::json!({"kind":"runner_receipt","schema_version":"geo.runner.receipt.v1",
+                        "provenance":"live","execution_id":attempt_id,
+                        "connector_version":"browser.v1","occurred_at":now}),
+                ],
+            }),
+        };
+        for (url, valid) in [
+            ("https://www.zhihu.com/pin/123456", true),
+            ("https://www.zhihu.com/p/123456", false),
+            ("https://zhuanlan.zhihu.com/pin/123456", false),
+            ("https://www.zhihu.com/pin/not-numeric", false),
+            ("https://www.zhihu.com/pin/123456?redirect=1", false),
+        ] {
+            let outcome = attempt.outcome.as_mut().unwrap();
+            outcome.public_url = Some(url.into());
+            outcome.runner_evidence[0]["url"] = url.into();
+            let proof = saved_publication_verification(&target, &attempt).unwrap();
+            assert_eq!(proof.is_some(), valid, "{url}");
+            if let Some(proof) = proof {
+                assert_eq!(proof.key.placement_slot, "short_post");
+            }
+        }
+        let outcome = attempt.outcome.as_mut().unwrap();
+        outcome.public_url = Some("https://www.zhihu.com/pin/123456".into());
+        outcome.runner_evidence[0]["url"] = "https://www.zhihu.com/pin/123456".into();
+        let article_hash = plain_text_article_readback_hash("Internal title", "Short body");
+        outcome.runner_evidence[0]["expected_sha256"] = article_hash.clone().into();
+        outcome.runner_evidence[0]["readback_sha256"] = article_hash.into();
+        assert!(
+            saved_publication_verification(&target, &attempt)
+                .unwrap()
+                .is_none()
+        );
+        let proof = &mut attempt.outcome.as_mut().unwrap().runner_evidence[0];
+        proof["expected_sha256"] = hash.clone().into();
+        proof["readback_sha256"] = hash.into();
+        let mut article_target = target;
+        if let ChannelTargetInput::Publish { placement_slot, .. } = &mut article_target.input {
+            *placement_slot = "primary".into();
+        }
+        assert!(
+            saved_publication_verification(&article_target, &attempt)
                 .unwrap()
                 .is_none()
         );

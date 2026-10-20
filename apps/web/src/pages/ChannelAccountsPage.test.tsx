@@ -145,6 +145,7 @@ const unverifiedCapability: OperatorConnectorCapability = {
   revision: 0,
   enabled: false,
   content_types: [],
+  requestable_formats: [],
   availability: "unavailable",
   deployed_version: null,
   verified_content_types: [],

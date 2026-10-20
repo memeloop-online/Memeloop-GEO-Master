@@ -6,7 +6,6 @@ use geo_domain::{
     PublicationLookupObservation, PublicationLookupReportObservation, PublicationLookupRepository,
     TenantScope,
 };
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
@@ -125,16 +124,19 @@ fn job(row: &sqlx::postgres::PgRow) -> Result<PublicationLookupJob, AppError> {
     })
 }
 
-fn public_candidate(url: &str, platform: &str) -> bool {
+fn public_candidate(url: &str, platform: &str, placement_slot: &str) -> bool {
     // Currently only the fixed adapter public asset route is supported. No
     // query/fragment/userinfo/redirect/other host can become a lookup hint.
+    let prefixes: &[&str] = match placement_slot {
+        "primary" => &["https://www.zhihu.com/p/", "https://zhuanlan.zhihu.com/p/"],
+        "short_post" => &["https://www.zhihu.com/pin/"],
+        _ => &[],
+    };
     platform == "zhihu"
-        && ["https://www.zhihu.com/p/", "https://zhuanlan.zhihu.com/p/"]
-            .iter()
-            .any(|prefix| {
-                url.strip_prefix(prefix)
-                    .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
-            })
+        && prefixes.iter().any(|prefix| {
+            url.strip_prefix(prefix)
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 
 fn candidate(
@@ -146,19 +148,26 @@ fn candidate(
     claimed_at: DateTime<Utc>,
     received_at: Option<DateTime<Utc>>,
 ) -> Option<String> {
-    let (platform, title, body) = match input {
+    let (platform, placement_slot, title, body) = match input {
         ChannelTargetInput::Publish {
             platform,
+            placement_slot,
             title,
             body,
             ..
         }
         | ChannelTargetInput::GeneratedPublish {
             platform,
+            placement_slot,
             title,
             body,
             ..
-        } => (platform.as_str(), title.as_str(), body.as_str()),
+        } => (
+            platform.as_str(),
+            placement_slot.as_str(),
+            title.as_str(),
+            body.as_str(),
+        ),
         ChannelTargetInput::Measure { .. } => return None,
     };
     let outcome = outcome?;
@@ -166,10 +175,7 @@ fn candidate(
         return None;
     }
     let version = outcome.connector_version.as_deref()?;
-    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let expected = hex::encode(Sha256::digest(
-        format!("{}\n{}", normalize(title), normalize(body)).as_bytes(),
-    ));
+    let expected = geo_domain::plain_text_publication_readback_hash(placement_slot, title, body);
     let mut matches = outcome.runner_evidence.iter().filter_map(|evidence| {
         (evidence.get("kind")?.as_str()? == "publication_candidate"
             && evidence.get("schema_version")?.as_str()? == "geo.publication.candidate.v1"
@@ -194,7 +200,7 @@ fn candidate(
                 }))
         .then(|| evidence.get("url")?.as_str())
         .flatten()
-        .filter(|url| public_candidate(url, platform))
+        .filter(|url| public_candidate(url, platform, placement_slot))
         .map(str::to_string)
     });
     let first = matches.next()?;
@@ -777,6 +783,7 @@ mod tests {
         let target = Uuid::new_v4();
         let account = Uuid::new_v4();
         let input = ChannelTargetInput::Publish {
+            placement_slot: "primary".into(),
             source_id: Uuid::new_v4(),
             source_version_id: Uuid::new_v4(),
             platform: "zhihu".into(),
@@ -889,5 +896,61 @@ mod tests {
             ),
             None
         );
+        let mut short = input;
+        if let ChannelTargetInput::Publish { placement_slot, .. } = &mut short {
+            *placement_slot = "short_post".into();
+        }
+        let short_url = "https://www.zhihu.com/pin/123456";
+        outcome.runner_evidence = vec![evidence(short_url)];
+        assert_eq!(
+            candidate(
+                Some(&outcome),
+                &short,
+                attempt,
+                target,
+                account,
+                now,
+                Some(now)
+            ),
+            None
+        );
+        let short_hash = geo_domain::plain_text_publication_readback_hash(
+            "short_post",
+            "Example title",
+            "Example body",
+        );
+        outcome.runner_evidence[0]["expected_sha256"] = short_hash.into();
+        assert_eq!(
+            candidate(
+                Some(&outcome),
+                &short,
+                attempt,
+                target,
+                account,
+                now,
+                Some(now)
+            ),
+            Some(short_url.into())
+        );
+        for invalid in [
+            "https://www.zhihu.com/p/123456",
+            "https://zhuanlan.zhihu.com/pin/123456",
+            "https://www.zhihu.com/pin/123456?x=1",
+            "https://www.zhihu.com/pin/not-numeric",
+        ] {
+            outcome.runner_evidence[0]["url"] = invalid.into();
+            assert_eq!(
+                candidate(
+                    Some(&outcome),
+                    &short,
+                    attempt,
+                    target,
+                    account,
+                    now,
+                    Some(now)
+                ),
+                None
+            );
+        }
     }
 }

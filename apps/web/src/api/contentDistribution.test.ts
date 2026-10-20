@@ -74,39 +74,42 @@ describe("single-article distribution API", () => {
     expect(distributionFormat(revision(node))).toBe("rich_markdown.v2");
   });
 
-  it("posts only the strict frozen input with a caller-owned retry key", async () => {
-    const input = {
-      content_asset_id: "asset-1",
-      content_revision_id: "rev-1",
-      account_id: "account-1",
-      placement_slot: "primary",
-      format: "markdown.v1" as const,
-    };
-    await submitContentDistributionRequest(
-      "tenant-1",
-      "project-1",
-      input,
-      "retry-1",
-    );
-    expect(apiFetch).toHaveBeenCalledWith(
-      "/projects/project-1/content-distribution-requests",
-      {
-        tenantId: "tenant-1",
-        projectId: "project-1",
-        method: "POST",
-        body: input,
-        idempotencyKey: "retry-1",
-      },
-    );
-    await getContentDistributionRequest("tenant-1", "project-1", "req-1");
-    expect(apiFetch).toHaveBeenLastCalledWith(
-      "/projects/project-1/content-distribution-requests/req-1",
-      { tenantId: "tenant-1", projectId: "project-1" },
-    );
-    await getContentDistributionPublication("tenant-1", "project-1", "req-1");
-    expect(apiFetch).toHaveBeenLastCalledWith(
-      "/projects/project-1/content-distribution-requests/req-1/publication",
-      { tenantId: "tenant-1", projectId: "project-1" },
-    );
-  });
+  it.each(["primary", "short_post"] as const)(
+    "posts a frozen %s input with a caller-owned retry key",
+    async (placement) => {
+      const input = {
+        content_asset_id: "asset-1",
+        content_revision_id: "rev-1",
+        account_id: "account-1",
+        placement_slot: placement,
+        format: "markdown.v1" as const,
+      };
+      await submitContentDistributionRequest(
+        "tenant-1",
+        "project-1",
+        input,
+        "retry-1",
+      );
+      expect(apiFetch).toHaveBeenCalledWith(
+        "/projects/project-1/content-distribution-requests",
+        {
+          tenantId: "tenant-1",
+          projectId: "project-1",
+          method: "POST",
+          body: input,
+          idempotencyKey: "retry-1",
+        },
+      );
+      await getContentDistributionRequest("tenant-1", "project-1", "req-1");
+      expect(apiFetch).toHaveBeenLastCalledWith(
+        "/projects/project-1/content-distribution-requests/req-1",
+        { tenantId: "tenant-1", projectId: "project-1" },
+      );
+      await getContentDistributionPublication("tenant-1", "project-1", "req-1");
+      expect(apiFetch).toHaveBeenLastCalledWith(
+        "/projects/project-1/content-distribution-requests/req-1/publication",
+        { tenantId: "tenant-1", projectId: "project-1" },
+      );
+    },
+  );
 });

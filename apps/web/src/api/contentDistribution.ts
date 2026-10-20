@@ -2,6 +2,7 @@ import { apiFetch } from "./client";
 import type { ContentRevision } from "./content";
 
 export type DistributionFormat = "markdown.v1" | "rich_markdown.v2";
+export type DistributionPlacement = "primary" | "short_post";
 export type MaterializationDeferralReason =
   | "project_paused"
   | "account_unavailable"
@@ -16,7 +17,7 @@ export interface ContentDistributionInput {
   content_asset_id: string;
   content_revision_id: string;
   account_id: string;
-  placement_slot: string;
+  placement_slot: DistributionPlacement;
   format: DistributionFormat;
 }
 

@@ -352,6 +352,7 @@ async fn setup() -> Setup {
     let target = geo_domain::ChannelTarget {
         target_id,
         input: ChannelTargetInput::GeneratedPublish {
+            placement_slot: variant.placement_slot.clone(),
             content_revision_id: revision.revision_id,
             variant_id: variant.variant_id,
             publication_intent_id: intent_id,

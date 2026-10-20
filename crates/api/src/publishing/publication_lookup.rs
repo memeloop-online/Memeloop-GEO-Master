@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use geo_domain::{
     AppError, ChannelTargetInput, ErrorCode, ProjectId, PublicationLookupFinding,
     PublicationLookupJob, PublicationLookupObservation, PublicationLookupRepository, TenantScope,
-    sha256_hex,
+    plain_text_publication_readback_hash,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,7 +20,10 @@ use uuid::Uuid;
 use crate::{
     ApiError, AppState, RequestContext, api_error,
     browser_bridge::{BrowserExecution, BrowserReceiptProvenance},
-    channel_jobs::{execute_and_close_with_cleanup, publication_readback},
+    channel_jobs::{
+        execute_and_close_with_cleanup, publication_readback, text_publication_payload,
+        valid_publication_url,
+    },
 };
 
 const LEASE: Duration = Duration::minutes(5);
@@ -105,27 +108,27 @@ pub(crate) async fn public_observed_url(
     {
         return None;
     }
-    let (platform, title, body) = match &job.frozen_input {
+    let (platform, placement_slot, title, body) = match &job.frozen_input {
         ChannelTargetInput::Publish {
             platform,
+            placement_slot,
             title,
             body,
             ..
         }
         | ChannelTargetInput::GeneratedPublish {
             platform,
+            placement_slot,
             title,
             body,
             ..
-        } => (platform, title, body),
+        } => (platform, placement_slot, title, body),
         ChannelTargetInput::Measure { .. } => return None,
     };
     let evidence = observation.evidence.as_object()?;
     let url = evidence.get("public_url")?.as_str()?;
     let digest = evidence.get("content_sha256")?.as_str()?;
-    let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let expected_digest =
-        sha256_hex(format!("{}\n{}", normalized(title), normalized(body)).as_bytes());
+    let expected_digest = plain_text_publication_readback_hash(placement_slot, title, body);
     let schema = evidence.get("schema_version")?.as_str()?;
     let version = evidence.get("connector_version")?.as_str()?;
     let common = evidence.get("provenance")?.as_str()? == "live"
@@ -140,7 +143,7 @@ pub(crate) async fn public_observed_url(
             .timestamp_micros()
             == observation.observed_at.timestamp_micros()
         && digest == expected_digest
-        && valid_candidate(url, platform);
+        && valid_publication_url(url, platform, placement_slot);
     if !common {
         return None;
     }
@@ -173,6 +176,7 @@ pub(crate) async fn public_observed_url(
                     job.attempt_id,
                     &binding,
                     platform,
+                    placement_slot,
                 )
                 .as_deref()
                 == Some(version))
@@ -384,25 +388,29 @@ async fn lookup_once(
     ) {
         return unknown("lookup_unavailable");
     }
-    let (platform, title, body) = match &job.frozen_input {
+    let (platform, placement_slot, title, body) = match &job.frozen_input {
         ChannelTargetInput::Publish {
             platform,
+            placement_slot,
             title,
             body,
             ..
         }
         | ChannelTargetInput::GeneratedPublish {
             platform,
+            placement_slot,
             title,
             body,
             ..
-        } if job.frozen_input.account_id() == job.account_id => (platform, title, body),
+        } if job.frozen_input.account_id() == job.account_id => {
+            (platform, placement_slot, title, body)
+        }
         _ => return unknown("target_mismatch"),
     };
     // The candidate is never obtained from a caller: it is either the
     // validated immutable hint or discovered inside the bound account.
     let candidate = job.candidate_public_url.as_deref();
-    if candidate.is_some_and(|url| !valid_candidate(url, platform)) {
+    if candidate.is_some_and(|url| !valid_publication_url(url, platform, placement_slot)) {
         return unknown("candidate_invalid");
     }
     if job.connector_version.as_deref().is_some_and(|version| {
@@ -427,6 +435,7 @@ async fn lookup_once(
             job.attempt_id,
             &binding,
             platform,
+            placement_slot,
         )
     else {
         return unknown("binding_unavailable");
@@ -462,6 +471,7 @@ async fn lookup_once(
             &binding,
             session_id,
             reservation_id,
+            placement_slot,
         )
         .await
     {
@@ -493,10 +503,10 @@ async fn lookup_once(
             .await;
         return unknown("lookup_preflight_expired");
     }
-    let payload = match candidate {
-        Some(candidate) => json!({"title":title,"body":body,"public_url":candidate}),
-        None => json!({"title":title,"body":body}),
-    };
+    let mut payload = text_publication_payload(placement_slot, title, body);
+    if let Some(candidate) = candidate {
+        payload["public_url"] = json!(candidate);
+    }
     let (receipt, closed) = execute_and_close_with_cleanup(
         bridge,
         state.channel_service(),
@@ -546,18 +556,6 @@ async fn release_reservation(
     }
 }
 
-fn valid_candidate(candidate: &str, platform: &str) -> bool {
-    platform == "zhihu"
-        && candidate.len() <= 256
-        && ["https://www.zhihu.com/p/", "https://zhuanlan.zhihu.com/p/"]
-            .iter()
-            .any(|prefix| {
-                candidate.strip_prefix(prefix).is_some_and(|id| {
-                    !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
-                })
-            })
-}
-
 /// Keep only bounded, locally reconstructed fields. No arbitrary adapter
 /// evidence, browser storage state, content body or credentials are persisted.
 fn observed_asset(
@@ -579,25 +577,27 @@ fn observed_asset(
     }
     let at = receipt.occurred_at?;
     let version = bound_version;
-    let (platform, title, body) = match &job.frozen_input {
+    let (platform, placement_slot, title, body) = match &job.frozen_input {
         ChannelTargetInput::Publish {
             platform,
+            placement_slot,
             title,
             body,
             ..
         }
         | ChannelTargetInput::GeneratedPublish {
             platform,
+            placement_slot,
             title,
             body,
             ..
-        } => (platform, title, body),
+        } => (platform, placement_slot, title, body),
         ChannelTargetInput::Measure { .. } => return None,
     };
     let url = receipt.public_url.as_deref()?;
     let candidate = job.candidate_public_url.as_deref();
     if job.frozen_input.account_id() != job.account_id
-        || !valid_candidate(url, platform)
+        || !valid_publication_url(url, platform, placement_slot)
         || candidate.is_some_and(|candidate| candidate != url)
         || job
             .connector_version
@@ -621,8 +621,7 @@ fn observed_asset(
     {
         return None;
     }
-    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let digest = sha256_hex(format!("{}\n{}", normalize(title), normalize(body)).as_bytes());
+    let digest = plain_text_publication_readback_hash(placement_slot, title, body);
     if candidate.is_none() {
         let discovery: Vec<_> = receipt
             .evidence
@@ -683,7 +682,7 @@ mod tests {
         http::{Method, StatusCode, Uri},
         routing::any,
     };
-    use geo_domain::{OperatorId, ProjectId, TenantId};
+    use geo_domain::{OperatorId, ProjectId, TenantId, sha256_hex};
     use tokio::sync::Mutex;
 
     #[derive(Clone)]
@@ -993,6 +992,9 @@ mod tests {
             ("GET", "/v1/capabilities") => json!({"connectors":[{
                 "platform":"zhihu","placement_slot":"primary","connector_version":"zhihu.v1",
                 "operations":["publish","lookup"],"verified":false
+            },{
+                "platform":"zhihu","placement_slot":"short_post","connector_version":"zhihu.short.v1",
+                "operations":["publish","lookup"],"verified":false
             }]}),
             ("POST", "/v1/sessions") => {
                 assert_eq!(payload["expected_generation"], generation);
@@ -1009,13 +1011,25 @@ mod tests {
             }
             ("POST", "/v1/executions") => {
                 stub.requests.lock().await.push(payload.clone());
+                let short = payload["payload"]["placement_slot"] == "short_post";
+                if short {
+                    assert!(payload["payload"].get("title").is_none());
+                }
                 let discovery = payload["payload"].get("public_url").is_none();
                 let url = if discovery {
-                    json!("https://www.zhihu.com/p/12345")
+                    json!(if short {
+                        "https://www.zhihu.com/pin/12345"
+                    } else {
+                        "https://www.zhihu.com/p/12345"
+                    })
                 } else {
                     payload["payload"]["public_url"].clone()
                 };
-                let digest = sha256_hex(b"Original title\nOriginal body");
+                let digest = sha256_hex(if short {
+                    b"\nOriginal body".as_slice()
+                } else {
+                    b"Original title\nOriginal body".as_slice()
+                });
                 let at = Utc::now();
                 let mut evidence = vec![json!({"kind":"public_readback","url":url,
                     "content_matched":true,"owned_by_account":true,
@@ -1028,7 +1042,7 @@ mod tests {
                 }
                 json!({
                     "execution_id":payload["execution_id"],"status":"completed",
-                    "stage":"public_readback","provenance":"live","connector_version":"zhihu.v1",
+                    "stage":"public_readback","provenance":"live","connector_version":if short { "zhihu.short.v1" } else { "zhihu.v1" },
                     "occurred_at":at,"public_url":url,"evidence":evidence
                 })
             }
@@ -1043,6 +1057,15 @@ mod tests {
 
     #[tokio::test]
     async fn bound_lookup_never_sends_or_rewrites_original_and_releases_account() {
+        assert_bound_lookup("primary").await;
+    }
+
+    #[tokio::test]
+    async fn short_post_lookup_preserves_placement_and_original_binding() {
+        assert_bound_lookup("short_post").await;
+    }
+
+    async fn assert_bound_lookup(placement_slot: &str) {
         use geo_domain::{
             ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus,
             ChannelOwnerKind, ChannelPlan, ChannelSecret, ChannelStatus, ChannelTarget,
@@ -1068,7 +1091,21 @@ mod tests {
         )
         .unwrap();
         let state = AppState::development().with_channel_service(service);
-        let job = job();
+        let mut job = job();
+        let (connector_version, public_url) = if placement_slot == "short_post" {
+            ("zhihu.short.v1", "https://www.zhihu.com/pin/12345")
+        } else {
+            ("zhihu.v1", "https://www.zhihu.com/p/12345")
+        };
+        if let ChannelTargetInput::Publish {
+            placement_slot: saved_slot,
+            ..
+        } = &mut job.frozen_input
+        {
+            *saved_slot = placement_slot.to_owned();
+        }
+        job.connector_version = Some(connector_version.into());
+        job.candidate_public_url = Some(public_url.into());
         let scope = TenantScope::new(
             Uuid::new_v4().into(),
             Uuid::new_v4().into(),
@@ -1133,7 +1170,7 @@ mod tests {
         .unwrap();
         let (session, binding, _) = state
             .channel_service()
-            .resume_available_browser_bound(&scope, job.account_id, job.attempt_id)
+            .resume_available_browser_bound(&scope, job.account_id, job.attempt_id, placement_slot)
             .await
             .unwrap();
         state
@@ -1141,6 +1178,23 @@ mod tests {
             .close_owned_browser(&scope, session)
             .await
             .unwrap();
+        assert!(
+            state
+                .channel_service()
+                .original_publication_connector_version(
+                    &scope,
+                    job.account_id,
+                    job.attempt_id,
+                    &binding,
+                    "zhihu",
+                    if placement_slot == "short_post" {
+                        "primary"
+                    } else {
+                        "short_post"
+                    },
+                )
+                .is_none()
+        );
         jobs.claim(&scope, job.target_id, job.attempt_id, Utc::now())
             .await
             .unwrap();
@@ -1158,7 +1212,7 @@ mod tests {
             evidence["schema_version"],
             "geo.publication.asset_observation.v2"
         );
-        assert_eq!(evidence["connector_version"], "zhihu.v1");
+        assert_eq!(evidence["connector_version"], connector_version);
         assert!(
             stub.requests.lock().await[0]["payload"]
                 .get("public_url")
@@ -1180,7 +1234,7 @@ mod tests {
         };
         assert_eq!(
             public_observed_url(&state, &scope, &observation, &no_receipt).await,
-            Some("https://www.zhihu.com/p/12345".into())
+            Some(public_url.into())
         );
         let mut corrupted = observation.clone();
         corrupted.evidence["version_authority"] = json!("live_capability");
@@ -1204,7 +1258,7 @@ mod tests {
             citations: vec![],
             public_url: None,
             screenshot_ref: None,
-            connector_version: Some("zhihu.v1".into()),
+            connector_version: Some(connector_version.into()),
             runner_evidence: vec![],
             fixture: true,
         };
@@ -1216,13 +1270,13 @@ mod tests {
         // must not erase the earlier independently bound observation.
         assert_eq!(
             public_observed_url(&state, &scope, &observation, &job).await,
-            Some("https://www.zhihu.com/p/12345".into())
+            Some(public_url.into())
         );
         let mut different_late_hint = job.clone();
         different_late_hint.candidate_public_url = Some("https://www.zhihu.com/p/999".into());
         assert_eq!(
             public_observed_url(&state, &scope, &observation, &different_late_hint).await,
-            Some("https://www.zhihu.com/p/12345".into())
+            Some(public_url.into())
         );
         let read_state =
             state
@@ -1236,7 +1290,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             projection.observations[0].public_url.as_deref(),
-            Some("https://www.zhihu.com/p/12345")
+            Some(public_url)
         );
         let mut future_observation = observation;
         future_observation.received_at = future_observation.observed_at - Duration::seconds(1);
@@ -1290,6 +1344,7 @@ mod tests {
                 source_id: Uuid::new_v4(),
                 source_version_id: Uuid::new_v4(),
                 platform: "zhihu".into(),
+                placement_slot: "primary".into(),
                 account_id,
                 title: "Original title".into(),
                 body: "Original body".into(),
@@ -1321,6 +1376,7 @@ mod tests {
             distribution_target_id: Uuid::nil(),
             origin_request_id: Some(Uuid::new_v4()),
             platform: "zhihu".into(),
+            placement_slot: "primary".into(),
             account_id: job.account_id,
             title: "Original title".into(),
             body: "Original body".into(),
@@ -1373,7 +1429,11 @@ mod tests {
 
     #[test]
     fn candidate_is_only_the_fixed_public_asset_path() {
-        assert!(valid_candidate("https://www.zhihu.com/p/123", "zhihu"));
+        assert!(valid_publication_url(
+            "https://www.zhihu.com/p/123",
+            "zhihu",
+            "primary"
+        ));
         for candidate in [
             "https://www.zhihu.com/p/123?token=secret",
             "https://www.zhihu.com/p/123/",
@@ -1381,7 +1441,7 @@ mod tests {
             "http://www.zhihu.com/p/123",
             "https://www.zhihu.com/p/１２３",
         ] {
-            assert!(!valid_candidate(candidate, "zhihu"));
+            assert!(!valid_publication_url(candidate, "zhihu", "primary"));
         }
     }
 

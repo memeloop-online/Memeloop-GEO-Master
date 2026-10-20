@@ -211,6 +211,7 @@ fn rich_identity_binds_tree_and_exact_ordered_verified_images() {
         "79ea2c42c4bfec9550ef7356c9a475686941bad1f8c676520e5577007d7f4874"
     );
     let generated = geo_domain::ChannelTargetInput::GeneratedPublish {
+        placement_slot: original.placement_slot.clone(),
         content_revision_id: original.content_revision_id,
         variant_id: original.variant_id,
         publication_intent_id: Uuid::from_u128(31),
@@ -231,6 +232,17 @@ fn rich_identity_binds_tree_and_exact_ordered_verified_images() {
         )
         .unwrap(),
         generated
+    );
+    let mut missing_placement = serde_json::to_value(&generated).unwrap();
+    missing_placement
+        .as_object_mut()
+        .unwrap()
+        .remove("placement_slot");
+    assert!(
+        serde_json::from_value::<geo_domain::ChannelTargetInput>(missing_placement)
+            .unwrap_err()
+            .to_string()
+            .contains("placement_slot")
     );
     let mut legacy_input = generated.clone();
     if let geo_domain::ChannelTargetInput::GeneratedPublish { rich_payload, .. } = &mut legacy_input

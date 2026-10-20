@@ -27,6 +27,7 @@ pub struct ConnectorCapabilityView {
     pub revision: i32,
     pub enabled: bool,
     pub content_types: Vec<String>,
+    pub requestable_formats: Vec<String>,
     pub availability: ConnectorAvailability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployed_version: Option<String>,
@@ -42,7 +43,10 @@ pub struct ConfigureConnector {
     pub content_types: Vec<String>,
 }
 
-fn catalog(settings: &[ConnectorSettings]) -> Vec<ConnectorKey> {
+fn catalog(
+    settings: &[ConnectorSettings],
+    connectors: &[crate::browser_bridge::RunnerConnector],
+) -> Vec<ConnectorKey> {
     let mut keys: BTreeSet<(String, String)> = ["baidu_creator", "xiaohongshu", "zhihu"]
         .into_iter()
         .map(|id| (id.to_owned(), "primary".to_owned()))
@@ -52,12 +56,58 @@ fn catalog(settings: &[ConnectorSettings]) -> Vec<ConnectorKey> {
             .iter()
             .map(|row| (row.key.platform_id.clone(), row.key.placement_slot.clone())),
     );
+    keys.extend(
+        connectors
+            .iter()
+            .map(|connector| (connector.platform.clone(), connector.placement_slot.clone())),
+    );
     keys.into_iter()
         .map(|(platform_id, placement_slot)| ConnectorKey {
             platform_id,
             placement_slot,
         })
         .collect()
+}
+
+/// Explicit requests may establish their first publish/readback proof. A
+/// catalog has no selected asset; dispatch passes its actual semantic type.
+pub(crate) fn requested_plaintext_available(
+    connectors: &[crate::browser_bridge::RunnerConnector],
+    key: &ConnectorKey,
+    settings: Option<&ConnectorSettings>,
+    semantic: Option<&str>,
+) -> bool {
+    let mut matching = connectors.iter().filter(|connector| {
+        connector.platform == key.platform_id && connector.placement_slot == key.placement_slot
+    });
+    let Some(connector) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some()
+        || connector.connector_version.trim().is_empty()
+        || !["publish", "lookup"].iter().all(|operation| {
+            connector
+                .operations
+                .iter()
+                .any(|item| item.as_str() == *operation)
+        })
+    {
+        return false;
+    }
+    settings.is_none_or(|settings| {
+        settings.enabled
+            && (settings
+                .content_types
+                .iter()
+                .any(|format| format == PLAIN_TEXT_ARTICLE_FORMAT)
+                || match semantic {
+                    Some(semantic) => configured_publication_format(settings, semantic).is_some(),
+                    None => settings
+                        .content_types
+                        .iter()
+                        .any(|semantic| publication_format_for_semantic_type(semantic).is_some()),
+                })
+    })
 }
 
 /// Resolve a generated document's semantic type to the proven publication
@@ -177,11 +227,28 @@ async fn view(
     } else {
         ConnectorAvailability::Unavailable
     };
+    let mut requestable_formats = Vec::new();
+    if requested_plaintext_available(connectors, &key, settings.as_ref(), None) {
+        requestable_formats.push(geo_domain::TEXT_DISTRIBUTION_FORMAT.to_owned());
+    }
+    if availability == ConnectorAvailability::Available
+        && verified.contains(RICH_MARKDOWN_FORMAT)
+        && settings
+            .as_ref()
+            .is_some_and(|settings| configured_rich_publication_format(settings).is_some())
+        && version.is_some_and(|version| {
+            crate::channel_jobs::rich_runner_operation_available(connectors, &key, version)
+        })
+        && crate::channel_jobs::rich_send_bridge_available(state)
+    {
+        requestable_formats.push(geo_domain::RICH_DISTRIBUTION_FORMAT.to_owned());
+    }
     Ok(ConnectorCapabilityView {
         platform_id: key.platform_id,
         placement_slot: key.placement_slot,
         revision: settings.as_ref().map_or(0, |row| row.revision),
         enabled: settings.as_ref().is_some_and(|row| row.enabled),
+        requestable_formats,
         content_types: settings.map_or_else(Vec::new, |row| {
             if admin {
                 row.content_types
@@ -214,7 +281,7 @@ pub async fn list_operator(
         .map_err(|e| api_error(e, context.request_id))?;
     let connectors = deployed_versions(&state).await;
     let mut items = Vec::new();
-    for key in catalog(&settings) {
+    for key in catalog(&settings, &connectors) {
         let current = settings.iter().find(|row| row.key == key).cloned();
         items.push(
             view(&state, current, key, &connectors, operator, true)
@@ -287,7 +354,7 @@ pub async fn list_project(
         .map_err(|e| api_error(e, context.request_id))?;
     let connectors = deployed_versions(&state).await;
     let mut items = Vec::new();
-    for key in catalog(&settings) {
+    for key in catalog(&settings, &connectors) {
         let current = settings.iter().find(|row| row.key == key).cloned();
         items.push(
             view(&state, current, key, &connectors, operator, false)

@@ -291,17 +291,27 @@ impl StructuredDocument {
         Ok(())
     }
     pub fn markdown(&self) -> String {
-        self.render_rich_markdown(None)
+        self.render_rich_markdown(None, true)
+            .expect("rendering without a media path map cannot fail")
+    }
+    /// Render the persisted blocks without the document's internal title.
+    pub fn markdown_body(&self) -> String {
+        self.render_rich_markdown(None, false)
             .expect("rendering without a media path map cannot fail")
     }
     fn render_rich_markdown(
         &self,
         paths: Option<&HashMap<MediaObjectKey, String>>,
+        include_title: bool,
     ) -> Result<String, AppError> {
-        let mut result = format!(
-            "# {}\n\n",
-            crate::rich_content::escape_markdown(&self.title)
-        );
+        let mut result = if include_title {
+            format!(
+                "# {}\n\n",
+                crate::rich_content::escape_markdown(&self.title)
+            )
+        } else {
+            String::new()
+        };
         for block in &self.blocks {
             match block.kind {
                 ContentBlockKind::Rich => {
@@ -352,7 +362,7 @@ impl StructuredDocument {
     ) -> Result<String, AppError> {
         self.validate(evidence)?;
         self.validate_export_media_identities()?;
-        self.render_rich_markdown(Some(paths))
+        self.render_rich_markdown(Some(paths), true)
     }
     /// HTML contains relative media paths only. A caller must authorize and package all media before export.
     pub fn html(&self, evidence: &[EvidenceRef]) -> Result<String, AppError> {

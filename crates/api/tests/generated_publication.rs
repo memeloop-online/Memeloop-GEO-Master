@@ -154,6 +154,7 @@ async fn generated_input_without_a_frozen_authoritative_bundle_never_claims() {
                     distribution_target_id: Uuid::new_v4(),
                     origin_request_id: None,
                     platform: "zhihu".into(),
+                    placement_slot: "primary".into(),
                     account_id: Uuid::new_v4(),
                     title: "untrusted".into(),
                     body: "untrusted".into(),
@@ -714,6 +715,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
         distribution_target_id: target.target_id,
         origin_request_id: None,
         platform: "zhihu".into(),
+        placement_slot: "primary".into(),
         account_id,
         title: variant.title.clone(),
         body_sha256: sha256_hex(variant.markdown.as_bytes()),
@@ -844,7 +846,7 @@ async fn fixture_command_never_opens_a_runner_context_or_claims() {
     fixture.server.abort();
 }
 
-async fn requested_fixture() -> FrozenFixture {
+async fn requested_fixture_at(placement_slot: &str) -> FrozenFixture {
     // The unused frozen fixture retains the existing coverage tests' setup;
     // this separate command is a real checked, on-demand content request.
     let mut fixture = frozen_fixture(true).await;
@@ -969,7 +971,7 @@ async fn requested_fixture() -> FrozenFixture {
             AcceptContentDistributionRequest {
                 revision: revision.clone(),
                 account,
-                placement_slot: "primary".into(),
+                placement_slot: placement_slot.into(),
                 format: geo_domain::TEXT_DISTRIBUTION_FORMAT.into(),
                 idempotency_key: "first-article".into(),
             },
@@ -996,6 +998,7 @@ async fn requested_fixture() -> FrozenFixture {
             distribution_target_id: Uuid::nil(),
             origin_request_id: Some(accepted.request_id),
             platform: "zhihu".into(),
+            placement_slot: bundle.variant.placement_slot,
             account_id,
             title: bundle.variant.title,
             body_sha256: sha256_hex(bundle.variant.markdown.as_bytes()),
@@ -1013,6 +1016,54 @@ async fn requested_fixture() -> FrozenFixture {
     fixture.command_id = command_id;
     fixture.revision = revision;
     fixture
+}
+
+async fn requested_fixture() -> FrozenFixture {
+    requested_fixture_at("primary").await
+}
+
+#[tokio::test]
+async fn requested_short_post_requires_its_exact_connector_and_sends_only_body() {
+    let fixture = requested_fixture_at("short_post").await;
+    assert!(matches!(
+        execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ConnectorUnavailable)
+    ));
+    assert!(fixture.calls.sends.lock().await.is_empty());
+    let target = fixture
+        .state
+        .channel_job_repository()
+        .get_target(&fixture.scope, fixture.command_id)
+        .await
+        .unwrap();
+    assert!(target.attempts.is_empty());
+    assert!(matches!(target.target.input,
+        ChannelTargetInput::GeneratedPublish { ref placement_slot, .. } if placement_slot == "short_post"));
+
+    *fixture.calls.advertised_connectors.lock().await = Some(json!([
+        {"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish","lookup"],"verified":false},
+        {"platform":"zhihu","placement_slot":"short_post","connector_version":"test-live.v1","operations":["publish","lookup"],"verified":false}
+    ]));
+    let result = execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+        .await
+        .unwrap();
+    let ChannelDispatchResult::Executed(view) = result else {
+        panic!("the requested short-post connector must dispatch");
+    };
+    assert_eq!(view.attempts.len(), 1);
+    let sends = fixture.calls.sends.lock().await;
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0]["operation"], "publish");
+    assert_eq!(
+        sends[0]["payload"],
+        json!({
+        "placement_slot":"short_post", "body":fixture.revision.document.markdown_body()
+        })
+    );
+    drop(sends);
+    fixture.server.abort();
 }
 
 #[tokio::test]
@@ -1068,14 +1119,14 @@ async fn first_requested_plaintext_send_needs_no_settings_or_previous_success() 
 async fn requested_plaintext_requires_one_versioned_publish_and_lookup_adapter() {
     for connectors in [
         json!([]),
-        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish"]}]),
-        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["lookup"]}]),
-        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":" ","operations":["publish","lookup"]}]),
-        json!([{"platform":"other","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish","lookup"]}]),
-        json!([{"platform":"zhihu","placement_slot":"secondary","connector_version":"test-live.v1","operations":["publish","lookup"]}]),
+        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish"],"verified":false}]),
+        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["lookup"],"verified":false}]),
+        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":" ","operations":["publish","lookup"],"verified":false}]),
+        json!([{"platform":"other","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish","lookup"],"verified":false}]),
+        json!([{"platform":"zhihu","placement_slot":"secondary","connector_version":"test-live.v1","operations":["publish","lookup"],"verified":false}]),
         json!([
-            {"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish","lookup"]},
-            {"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":[]}
+            {"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish","lookup"],"verified":false},
+            {"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":[],"verified":false}
         ]),
     ] {
         let fixture = requested_fixture().await;

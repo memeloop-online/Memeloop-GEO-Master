@@ -925,6 +925,7 @@ async fn single_article_host_read_preserves_http_publication_url_and_provenance(
                 distribution_target_id: bundle.command.target_id,
                 origin_request_id: Some(request_id),
                 platform: bundle.variant.platform_id.clone(),
+                placement_slot: bundle.variant.placement_slot.clone(),
                 account_id: f.account_id,
                 title: bundle.variant.title.clone(),
                 body_sha256: geo_domain::sha256_hex(bundle.variant.markdown.as_bytes()),

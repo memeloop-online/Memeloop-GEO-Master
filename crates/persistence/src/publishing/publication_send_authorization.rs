@@ -292,6 +292,7 @@ impl PublicationSendAuthorizationRepository for PgPublicationSendAuthorizationRe
             publication_intent_id,
             account_id,
             platform,
+            placement_slot,
             title,
             body,
             body_sha256,
@@ -389,6 +390,7 @@ impl PublicationSendAuthorizationRepository for PgPublicationSendAuthorizationRe
                 != *distribution_target_id
             || intent_row.get::<Option<Uuid>, _>("origin_request_id") != *origin_request_id
             || intent.payload_hash != *payload_hash
+            || intent.placement_slot != *placement_slot
             || intent.verification != IntentVerification::Unknown
             || intent.verification_evidence_id != Some(expected.attempt_id)
             || intent_row.get::<String, _>("verification") != "unknown"
@@ -437,6 +439,7 @@ impl PublicationSendAuthorizationRepository for PgPublicationSendAuthorizationRe
         validate_rich_publication_payload(&variant)?;
         if variant.variant_id != *variant_id
             || variant.platform_id != *platform
+            || variant.placement_slot != *placement_slot
             || variant.title != *title
             || variant.markdown != *body
             || variant.payload_hash != *payload_hash

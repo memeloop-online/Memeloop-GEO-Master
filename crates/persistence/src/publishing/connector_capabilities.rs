@@ -86,6 +86,7 @@ impl PgConnectorCapabilityRepository {
         ) = match &target.input {
             ChannelTargetInput::Publish {
                 platform,
+                placement_slot,
                 account_id,
                 source_id,
                 source_version_id,
@@ -120,16 +121,18 @@ impl PgConnectorCapabilityRepository {
                     None,
                     None,
                     body_sha256.clone(),
-                    geo_domain::plain_text_article_readback_hash(title, body),
+                    geo_domain::plain_text_publication_readback_hash(placement_slot, title, body),
                 )
             }
             ChannelTargetInput::GeneratedPublish {
                 platform,
+                placement_slot,
                 account_id,
                 content_revision_id,
                 variant_id,
                 publication_intent_id,
                 distribution_target_id,
+                origin_request_id,
                 evidence,
                 title,
                 body,
@@ -153,9 +156,13 @@ impl PgConnectorCapabilityRepository {
                          JOIN content_revisions r ON (r.operator_id,r.tenant_id,r.project_id,r.revision_id)=\
                             (v.operator_id,v.tenant_id,v.project_id,v.content_revision_id) \
                          WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 \
-                            AND c.materialized_target_id=$4 AND c.intent_id=$5 AND c.origin_target_id=$6"
+                            AND c.materialized_target_id=$4 AND c.intent_id=$5 \
+                            AND c.origin_target_id IS NOT DISTINCT FROM $6 \
+                            AND c.origin_request_id IS NOT DISTINCT FROM $7"
                     ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project_id)
-                    .bind(target_id).bind(publication_intent_id).bind(distribution_target_id)
+                    .bind(target_id).bind(publication_intent_id)
+                    .bind((!distribution_target_id.is_nil()).then_some(*distribution_target_id))
+                    .bind(origin_request_id)
                     .fetch_optional(&mut *tx).await.map_err(db)?
                     .ok_or_else(|| AppError::conflict("generated publication dependencies missing"))?;
                 let variant: geo_domain::ChannelVariant = decode(generated.get("variant_body"))?;
@@ -169,17 +176,19 @@ impl PgConnectorCapabilityRepository {
                     || intent.account_id != *account_id
                     || intent.channel_target_id != *distribution_target_id
                     || intent.platform_id != *platform
-                    || intent.placement_slot != variant.placement_slot
+                    || intent.placement_slot != *placement_slot
                     || intent.payload_hash != *payload_hash
                     || variant.variant_id != *variant_id
                     || variant.content_revision_id != *content_revision_id
                     || variant.platform_id != *platform
-                    || variant.placement_slot != "primary"
+                    || variant.placement_slot != *placement_slot
                     || variant.title != *title
                     || variant.markdown != *body
                     || variant.evidence != *evidence
                     || variant.payload_hash != *payload_hash
                     || revision.revision_id != *content_revision_id
+                    || (placement_slot == "short_post"
+                        && revision.document.markdown_body() != *body)
                 {
                     return Err(AppError::conflict("generated publication payload differs"));
                 }

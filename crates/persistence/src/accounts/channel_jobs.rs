@@ -157,6 +157,7 @@ async fn bind_generated_claim(
 fn owned_verified_readback(input: &ChannelTargetInput, outcome: &ChannelOutcome) -> bool {
     let ChannelTargetInput::GeneratedPublish {
         platform,
+        placement_slot,
         title,
         body,
         rich_payload,
@@ -173,10 +174,13 @@ fn owned_verified_readback(input: &ChannelTargetInput, outcome: &ChannelOutcome)
     let Some(url) = outcome.public_url.as_deref() else {
         return false;
     };
-    let Some(post_id) = url
-        .strip_prefix("https://www.zhihu.com/p/")
-        .or_else(|| url.strip_prefix("https://zhuanlan.zhihu.com/p/"))
-    else {
+    let Some(post_id) = (match placement_slot.as_str() {
+        "primary" => url
+            .strip_prefix("https://www.zhihu.com/p/")
+            .or_else(|| url.strip_prefix("https://zhuanlan.zhihu.com/p/")),
+        "short_post" => url.strip_prefix("https://www.zhihu.com/pin/"),
+        _ => None,
+    }) else {
         return false;
     };
     if platform != "zhihu"
@@ -187,10 +191,7 @@ fn owned_verified_readback(input: &ChannelTargetInput, outcome: &ChannelOutcome)
     {
         return false;
     }
-    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let hash = hex::encode(Sha256::digest(
-        format!("{}\n{}", normalize(title), normalize(body)).as_bytes(),
-    ));
+    let hash = geo_domain::plain_text_publication_readback_hash(placement_slot, title, body);
     outcome.runner_evidence.iter().any(|proof| {
         proof.get("kind").and_then(|v| v.as_str()) == Some("public_readback")
             && proof.get("url").and_then(|v| v.as_str()) == Some(url)
@@ -430,6 +431,7 @@ impl ChannelJobRepository for PgChannelJobRepository {
                 || intent.content_revision_id != revision.revision_id
                 || variant.content_revision_id != revision.revision_id
                 || variant.platform_id != intent.platform_id
+                || variant.placement_slot != intent.placement_slot
                 || variant.payload_hash != payload_hash
                 || intent.payload_hash != payload_hash
             {
@@ -453,6 +455,11 @@ impl ChannelJobRepository for PgChannelJobRepository {
                 }
             } else if revision.document.requires_rich_publication() {
                 return Err(AppError::conflict("rich publication payload is missing"));
+            } else if variant.placement_slot == "short_post"
+                && (variant.markdown != revision.document.markdown_body()
+                    || variant.title != revision.document.title)
+            {
+                return Err(AppError::conflict("short publication revision differs"));
             }
             if let Some(target_id) = origin_target_id {
                 let coverage: geo_domain::DistributionTarget =
@@ -495,6 +502,7 @@ impl ChannelJobRepository for PgChannelJobRepository {
                     distribution_target_id: origin_target_id.unwrap_or(Uuid::nil()),
                     origin_request_id,
                     platform: variant.platform_id,
+                    placement_slot: variant.placement_slot,
                     account_id: intent.account_id,
                     title: variant.title,
                     body_sha256: hex::encode(Sha256::digest(variant.markdown.as_bytes())),
@@ -1204,6 +1212,7 @@ mod tests {
     #[test]
     fn generated_verification_requires_owned_matching_non_fixture_readback() {
         let mut input = ChannelTargetInput::GeneratedPublish {
+            placement_slot: "primary".into(),
             content_revision_id: Uuid::new_v4(),
             variant_id: Uuid::new_v4(),
             publication_intent_id: Uuid::new_v4(),
@@ -1270,5 +1279,30 @@ mod tests {
         outcome.runner_evidence[0]["owned_by_account"] = serde_json::json!(true);
         outcome.runner_evidence[0]["readback_sha256"] = serde_json::json!("different");
         assert!(!owned_verified_readback(&input, &outcome));
+        if let ChannelTargetInput::GeneratedPublish { placement_slot, .. } = &mut input {
+            *placement_slot = "short_post".into();
+        }
+        let short_url = "https://www.zhihu.com/pin/12345";
+        outcome.public_url = Some(short_url.into());
+        outcome.runner_evidence[0]["url"] = short_url.into();
+        outcome.runner_evidence[0]["readback_sha256"] = hash.into();
+        assert!(
+            !owned_verified_readback(&input, &outcome),
+            "article proof cannot verify a short post"
+        );
+        let short_hash = geo_domain::plain_text_publication_readback_hash(
+            "short_post",
+            "Frozen title",
+            "Frozen body",
+        );
+        outcome.runner_evidence[0]["expected_sha256"] = short_hash.clone().into();
+        outcome.runner_evidence[0]["readback_sha256"] = short_hash.into();
+        assert!(owned_verified_readback(&input, &outcome));
+        outcome.public_url = Some(url.into());
+        outcome.runner_evidence[0]["url"] = url.into();
+        assert!(
+            !owned_verified_readback(&input, &outcome),
+            "article route cannot verify a short post"
+        );
     }
 }

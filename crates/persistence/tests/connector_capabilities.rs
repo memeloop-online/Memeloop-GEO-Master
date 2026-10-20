@@ -311,6 +311,7 @@ async fn operator_registry_is_durable_revisioned_and_immutable() {
             targets: vec![ChannelTarget {
                 target_id,
                 input: ChannelTargetInput::Publish {
+                    placement_slot: "primary".into(),
                     source_id: source,
                     source_version_id: version,
                     platform: "sourcepub".into(),
