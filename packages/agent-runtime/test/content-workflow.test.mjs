@@ -50,6 +50,8 @@ async function run({
     })),
   itemCount = 1,
   incomplete = false,
+  evidenceCompletion,
+  evidenceError,
   generationError,
   generationCompletion = {
     text: '{"schema_version":2,"title":"Generated","blocks":[]}',
@@ -218,6 +220,8 @@ async function run({
         );
       }
       modelRequests.push(request);
+      if (evidenceError) throw evidenceError;
+      if (evidenceCompletion !== undefined) return evidenceCompletion;
       return {
         text: JSON.stringify({
           evidence: select(JSON.parse(request.prompt), modelRequests.length),
@@ -782,8 +786,130 @@ for (const [label, selection] of [
     });
     assert.equal(result.preparations.length, 0);
     assert.equal(result.item.status, "pending");
+    assert.deepEqual(result.events, [
+      [
+        "content.preparation_failed",
+        {
+          stage: "evidence_validation",
+          reason: {
+            "unknown chunk": "unknown_chunk",
+            "unknown version": "unknown_source_version",
+            "invented quote": "quote_mismatch",
+            "blank quote": "blank_quote",
+            "duplicate chunk": "duplicate_chunk",
+          }[label],
+        },
+      ],
+    ]);
   });
 }
+
+for (const [label, completion, reason] of [
+  ["malformed JSON", { text: "sensitive invalid response" }, "invalid_json"],
+  ["missing evidence", { text: "{}" }, "invalid_evidence_shape"],
+  ["null choice", { text: '{"evidence":[null]}' }, "invalid_choice"],
+  ["tool call", { text: "{}", tool_calls: [{}] }, "invalid_completion"],
+]) {
+  test(`preparation reports ${label} without model output`, async () => {
+    const result = await run({
+      incomplete: true,
+      evidenceCompletion: completion,
+    });
+    assert.deepEqual(result.events, [
+      [
+        "content.preparation_failed",
+        {
+          stage: "evidence_validation",
+          reason,
+        },
+      ],
+    ]);
+    assert.equal(result.preparations.length, 0);
+    assert.equal(result.item.status, "pending");
+    assert.equal(JSON.stringify(result.events).includes("sensitive"), false);
+  });
+}
+
+test("preparation reports only allowlisted model host codes", async () => {
+  for (const code of [
+    "invalid_request",
+    "capability_missing",
+    "sensitive-code",
+  ]) {
+    const error = new Error(
+      JSON.stringify({ code, message: "sensitive-error" }),
+    );
+    error.name = "GeoHostOpError";
+    const result = await run({ incomplete: true, evidenceError: error });
+    assert.deepEqual(result.events, [
+      [
+        "content.preparation_failed",
+        {
+          stage: "evidence_model",
+          reason: code === "sensitive-code" ? "unknown" : code,
+        },
+      ],
+    ]);
+    assert.equal(JSON.stringify(result.events).includes("sensitive"), false);
+    assert.equal(result.preparations.length, 0);
+  }
+});
+
+test("one invalid evidence selection preserves other document progress", async () => {
+  const result = await run({
+    incomplete: true,
+    itemCount: 2,
+    select: (input) =>
+      input.document_key.endsWith("-0")
+        ? [
+            {
+              source_version_id: sourceVersionId,
+              chunk_id: "chunk-0",
+              exact_quote: "sensitive unverified quote",
+            },
+          ]
+        : [
+            {
+              source_version_id: sourceVersionId,
+              chunk_id: "chunk-0",
+              exact_quote: "Source fact 0",
+            },
+          ],
+  });
+  assert.deepEqual(
+    result.items.map((item) => item.status),
+    ["pending", "ready"],
+  );
+  assert.equal(result.preparations.length, 1);
+  assert.deepEqual(result.events, [
+    [
+      "content.preparation_failed",
+      {
+        stage: "evidence_validation",
+        reason: "quote_mismatch",
+      },
+    ],
+  ]);
+});
+
+test("shared preparation failures emit one bounded diagnostic sample", async () => {
+  const result = await run({
+    incomplete: true,
+    itemCount: 2,
+    evidenceCompletion: { text: "not JSON" },
+  });
+  assert.equal(result.modelRequests.length, 2);
+  assert.equal(result.events.length, 1);
+  assert.equal(result.preparations.length, 0);
+});
+
+test("unexpected source preparation errors retain a safe stage", async () => {
+  const result = await run({ incomplete: true, sourceRefs: [null] });
+  assert.deepEqual(result.events, [
+    ["content.preparation_failed", { stage: "source_read", reason: "unknown" }],
+  ]);
+  assert.equal(result.preparations.length, 0);
+});
 
 test("final selection cannot invent a new quote from a candidate", async () => {
   const result = await run({
